@@ -108,7 +108,12 @@ optimizing-tier VMs on hot loops is explicitly out of scope for v1.
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+v12's own code is dual-licensed under MIT or Apache-2.0, at your option.
+
+Bundled dependencies carry their own licenses, which v12 does not modify:
+most are MIT/Apache; the `BigInt` implementation ([malachite]) is
+LGPL-3.0-only — applications embedding v12 should review the dependency
+license list (`cargo deny check licenses`) before distributing binaries.
 
 [regress]: https://crates.io/crates/regress
 [malachite]: https://crates.io/crates/malachite
