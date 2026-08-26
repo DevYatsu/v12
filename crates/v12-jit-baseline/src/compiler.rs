@@ -640,6 +640,7 @@ fn resolve_const_bits(bytecode: &FunctionBytecode, id: u32) -> Result<u64, JitEr
             // for now and would deopt in a full engine.
             Ok(JsValue::undefined().bits())
         }
+        Some(v12_bytecode::Const::Null) => Ok(JsValue::null().bits()),
         Some(other) => Err(JitError::UnsupportedWideOp(format!("const kind {other:?}"))),
         None => Err(JitError::InvalidBytecode(format!(
             "const id {id} out of range"
@@ -721,7 +722,10 @@ fn make_exec_closure(bytecode: FunctionBytecode) -> JitExecFn {
                     WideOp::LoadConstW { dst, const_id } => {
                         let bits = match consts.get(const_id as u16) {
                             Some(v12_bytecode::Const::F64(n)) => runtime::box_number(n).bits(),
-                            _ => JsValue::undefined().bits(),
+                            Some(v12_bytecode::Const::Null) => JsValue::null().bits(),
+                            Some(v12_bytecode::Const::Str32(_)) => JsValue::undefined().bits(),
+                            Some(_) => JsValue::undefined().bits(),
+                            None => JsValue::undefined().bits(),
                         };
                         regs[dst as usize] = JsValue(bits);
                         pc += width;
@@ -763,7 +767,10 @@ fn make_exec_closure(bytecode: FunctionBytecode) -> JitExecFn {
                     let id = u32::from(instr.imm16());
                     let bits = match consts.get(id as u16) {
                         Some(v12_bytecode::Const::F64(n)) => runtime::box_number(n).bits(),
-                        _ => JsValue::undefined().bits(),
+                        Some(v12_bytecode::Const::Null) => JsValue::null().bits(),
+                        Some(v12_bytecode::Const::Str32(_)) => JsValue::undefined().bits(),
+                        Some(_) => JsValue::undefined().bits(),
+                        None => JsValue::undefined().bits(),
                     };
                     regs[dst] = JsValue(bits);
                     pc += 1;

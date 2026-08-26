@@ -893,6 +893,8 @@ impl Interp {
                 self.const_strings.insert(str_id, h);
                 Ok(JsValue::string(h))
             }
+            // `null` is a singleton distinct from `undefined`.
+            Const::Null => Ok(JsValue::null()),
             // BigInt literals are rejected at compile time today; reaching
             // these variants implies hand-built bytecode.
             Const::BigIntId(_) | Const::BigU64(_) => {

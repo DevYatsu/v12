@@ -25,10 +25,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.load_bool(dst, b.value, b.span);
                 Ok(dst)
             }
-            Expression::NullLiteral(n) => Err(self.err(
-                n.span,
-                "`null` is not supported yet: the bytecode constant pool has no null kind",
-            )),
+            Expression::NullLiteral(n) => {
+                let dst = self.new_temp();
+                self.load_const(dst, Const::Null, n.span)?;
+                Ok(dst)
+            }
             Expression::NumericLiteral(n) => {
                 let dst = self.new_temp();
                 self.load_number(dst, n.value, n.span)?;
@@ -133,8 +134,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 if c.optional {
                     return Err(self.err(c.span, "optional chaining is not supported"));
                 }
-                let obj = self.expr(&c.object)?;
+                // Bucket 4: evaluate key expr into temp, then base (single temp
+                // for key). Runtime `GetProperty` does ToPropertyKey via `to_key`.
                 let key = self.expr(&c.expression)?;
+                let obj = self.expr(&c.object)?;
                 let dst = self.new_temp();
                 self.emit_spanned(
                     v12_bytecode::Instr::new(Opcode::GetProperty, dst, obj, key),
@@ -293,7 +296,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         if p.method || p.kind != oxc_ast::ast::PropertyKind::Init {
             return Err(self.err(p.span, "object methods / accessors are not supported"));
         }
-        let key = self.property_key(&p.key)?;
+        // Computed property keys (`{[expr]: value}`) evaluate the key
+        // expression into a temp (ToPropertyKey via runtime `to_key`) and
+        // use dynamic `SetProperty`. Static keys remain interned strings.
+        let key = if p.computed {
+            let Some(expr) = p.key.as_expression() else {
+                return Err(self.err(p.key.span(), "computed property key must be an expression"));
+            };
+            // Evaluate key first, then value — single temp for key, no extra
+            // allocation beyond the key's own evaluation.
+            self.expr(expr)?
+        } else {
+            self.property_key(&p.key)?
+        };
         let val = self.expr(&p.value)?;
         self.emit_spanned(
             v12_bytecode::Instr::new(Opcode::SetProperty, obj, key, val),
@@ -425,14 +440,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             LogicalOperator::Or => self.emit_jump(Opcode::JumpIfTrue, dst, end),
             LogicalOperator::And => self.emit_jump(Opcode::JumpIfFalse, dst, end),
             LogicalOperator::Coalesce => {
-                // Nullish = `undefined` only in this subset: `null` values
-                // cannot be produced yet (see `NullLiteral` rejection).
+                // Nullish = `null` or `undefined` (ES `x ?? y`). Loose
+                // `Eq` against `null` is true exactly for those two values,
+                // so a single `Eq` suffices (covers `null == undefined`).
+                let null_reg = self.new_temp();
+                self.load_const(null_reg, Const::Null, span)?;
                 let t = self.new_temp();
-                let undef = self.undef_reg();
-                self.emit_spanned(
-                    v12_bytecode::Instr::new(Opcode::StrictEq, t, dst, undef),
-                    span,
-                );
+                self.emit_spanned(v12_bytecode::Instr::new(Opcode::Eq, t, dst, null_reg), span);
                 self.emit_jump(Opcode::JumpIfFalse, t, end);
             }
         }
@@ -580,23 +594,31 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// Evaluates object + key once (evaluation-order safe for read-modify-write
     /// targets) and returns their registers.
+    ///
+    /// For computed keys the key expression evaluates into a temp before the
+    /// base (`obj[expr]` → ToPropertyKey then Get/SetProperty with dynamic
+    /// `PropKey`), per bucket 4. Static keys materialize as interned strings.
     fn member_parts(&mut self, m: &MemberExpression<'_>) -> Res<(u8, u8)> {
         if m.optional() {
             return Err(self.err(m.span(), "optional chaining is not supported"));
         }
-        let obj = self.expr(m.object())?;
-        let key = match m {
+        match m {
             MemberExpression::StaticMemberExpression(s) => {
-                let k = self.new_temp();
-                self.load_str(k, s.property.name.as_str(), s.property.span)?;
-                k
+                let obj = self.expr(&s.object)?;
+                let key = self.new_temp();
+                self.load_str(key, s.property.name.as_str(), s.property.span)?;
+                Ok((obj, key))
             }
-            MemberExpression::ComputedMemberExpression(c) => self.expr(&c.expression)?,
+            MemberExpression::ComputedMemberExpression(c) => {
+                // Key first, then base — single temp for key, no extra alloc.
+                let key = self.expr(&c.expression)?;
+                let obj = self.expr(&c.object)?;
+                Ok((obj, key))
+            }
             MemberExpression::PrivateFieldExpression(p) => {
-                return Err(self.err(p.span, "private fields are not supported"));
+                Err(self.err(p.span, "private fields are not supported"))
             }
-        };
-        Ok((obj, key))
+        }
     }
 
     // -- calls ---------------------------------------------------------------------

@@ -35,9 +35,7 @@ enum Val {
     Str(Rc<str>),
     Bool(bool),
     Undefined,
-    /// Unreachable via compiled code today (no null constant kind); kept so
-    /// loose-equality semantics stay explicit.
-    #[allow(dead_code)]
+    /// The `null` singleton (via `Const::Null`).
     Null,
     Obj(Rc<RefCell<Obj>>),
     Closure(Rc<ClosureVal>),
@@ -366,7 +364,9 @@ impl<'p> Mini<'p> {
         match f.consts.get(id as u16) {
             Some(Const::F64(v)) => Val::F64(v),
             Some(Const::Str32(sid)) => Val::Str(self.string(sid).into()),
-            other => panic!("unexpected const {other:?}"),
+            Some(Const::Null) => Val::Null,
+            Some(other) => panic!("unexpected const {other:?}"),
+            None => panic!("constant id {id} out of range"),
         }
     }
 
@@ -1237,7 +1237,6 @@ fn strict_mode_directive_is_recorded() {
 #[test]
 fn unsupported_constructs_fail_as_compile_errors() {
     let cases: &[&str] = &[
-        "null",
         "+x",
         "let x = 1n;",
         "for (let v of [1]) {}",
@@ -1723,4 +1722,121 @@ fn catch_binding_registers_validate() {
     for func in &prog2.functions {
         func.validate().expect("handler ranges should validate");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 3 — `null` literal (Const::Null, typeof null === "object")
+// ---------------------------------------------------------------------------
+
+#[test]
+fn null_literal_constant_pool_contains_null() {
+    // `let x = null` must lower to a `Const::Null` entry.
+    let src = "let x = null;";
+    let (prog, _) = compile_source_with_strings(src).expect("null literal should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    assert!(
+        fb.consts.iter().any(|c| matches!(c, Const::Null)),
+        "ConstantPool should contain Null, got: {:?}",
+        fb.consts.iter().collect::<Vec<_>>()
+    );
+    // Also compiles inside a function and with multiple nulls deduped.
+    let src2 = "function f(a){ return a === null ? 1 : 0; } let x = null; let y = null;";
+    let (prog2, _) = compile_source_with_strings(src2).expect("repeated null should compile");
+    for f in &prog2.functions {
+        f.validate().expect("validate");
+    }
+    let null_count = prog2
+        .functions
+        .iter()
+        .flat_map(|f| f.consts.iter())
+        .filter(|c| matches!(c, Const::Null))
+        .count();
+    assert!(null_count >= 1, "expected at least one Null const");
+}
+
+#[test]
+fn null_typeof_is_object_and_coalesce_treats_null_as_nullish() {
+    // `typeof null` is "object" per spec (type_tag already handles it).
+    expect_str("let x = null; return typeof x;", "object");
+    expect_str("return typeof null;", "object");
+    // Null is falsy but distinct from 0 / "" — loose equality.
+    expect_bool("return null == undefined;", true);
+    expect_bool("return null === null;", true);
+    expect_bool("return null === undefined;", false);
+    // `??` treats both `null` and `undefined` as nullish.
+    expect_num("let x = null; return x ?? 7;", 7.0);
+    expect_num("let y; return y ?? 9;", 9.0);
+    expect_num("return 0 ?? 7;", 0.0);
+    // Property access on nullish base should not be reached here; just check
+    // that `null` round-trips through the mini-interp.
+    expect_bool("return !null;", true);
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 4 — computed property names (`{[k]:1}`, `o[k]`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn computed_property_names_object_literal_and_member_read() {
+    // `{[k]: 1}` must lower to ToPropertyKey + SetProperty with a dynamic key,
+    // and `o[k]` must lower to GetProperty with a dynamic key — no new opcode.
+    let src = r#"let k = "a"; let o = {[k]: 1}; let v = o[k];"#;
+    let (prog, _) = compile_source_with_strings(src).expect("computed props should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    assert!(
+        fb.instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::GetProperty)),
+        "expected GetProperty for o[k] in:\n{fb}"
+    );
+    assert!(
+        fb.instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::SetProperty)),
+        "expected SetProperty for {{[k]:1}} in:\n{fb}"
+    );
+    // End-to-end via mini-interp: value is 1, and non-string keys coerce.
+    expect_num(r#"let k = "a"; let o = {[k]: 1}; return o[k];"#, 1.0);
+    expect_num(r#"let k = "b"; let o = {}; o[k] = 2; return o[k];"#, 2.0);
+    // Numeric key coerces to string via ToPropertyKey / to_key.
+    expect_num(r#"let o = {[1]: 99}; return o[1];"#, 99.0);
+    expect_num(r#"let o = {[1]: 99}; return o["1"];"#, 99.0);
+}
+
+#[test]
+fn computed_member_assignment_and_dynamic_key_evaluation() {
+    // `obj[expr] = value` and `obj[expr]` evaluate `expr` into a temp then
+    // the base, using the existing GetProperty/SetProperty paths.
+    let src = r#"let o = {}; let k = "x"; o[k] = 42; let v = o[k];"#;
+    let (prog, _) = compile_source_with_strings(src).expect("computed member should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    // At least one dynamic GetProperty and one SetProperty.
+    let gets = fb
+        .instrs
+        .iter()
+        .filter(|i| i.op() == Some(Opcode::GetProperty))
+        .count();
+    let sets = fb
+        .instrs
+        .iter()
+        .filter(|i| i.op() == Some(Opcode::SetProperty))
+        .count();
+    assert!(gets >= 1, "expected GetProperty in:\n{fb}");
+    assert!(sets >= 1, "expected SetProperty in:\n{fb}");
+
+    // Mutation through computed key.
+    expect_num(r#"let o = {a: 1}; let k = "a"; o[k] = 9; return o.a;"#, 9.0);
+    // Expression key (not just identifier).
+    expect_num(
+        r#"let o = {}; let p = "a"; o[p + "b"] = 5; return o.ab;"#,
+        5.0,
+    );
+    // Chained computed access: o[k][j]
+    expect_num(
+        r#"let o = {a: {b: 7}}; let k="a"; let j="b"; return o[k][j];"#,
+        7.0,
+    );
 }

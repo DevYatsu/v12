@@ -375,6 +375,62 @@ mod tests {
         assert!(pcs.contains(&0));
         assert!(pcs.contains(&(fb.instrs.len() as u32 - 1)));
     }
+
+    #[test]
+    fn const_null_bakes_to_null_via_load_const() {
+        // `null` via LoadConst should bake to JsValue::null() bits.
+        let mut pool = ConstantPool::new();
+        let k_null = pool.insert(Const::Null).unwrap();
+        let instrs = vec![
+            Instr::new_imm16(Opcode::LoadConst, 0, k_null),
+            Instr::new(Opcode::Return, 0, 0, 0),
+        ];
+        let fb = empty_fn(1, instrs, pool);
+        let fb2 = fb.clone();
+        let mut baseline = JitBaseline::new().unwrap();
+        let compiled = baseline.compile(&fb).unwrap();
+        let mut regs = vec![JsValue::undefined(); 1];
+        let jit_result = compiled.execute(&mut regs);
+        assert!(jit_result.is_null(), "JIT LoadConst Null must be null");
+        let interp_result = interp_throw_result(fb2);
+        assert_eq!(jit_result.bits(), interp_result.bits());
+    }
+
+    #[test]
+    fn const_null_bakes_to_null_via_load_const_w() {
+        // Wide variant LoadConstW with Const::Null.
+        let mut pool = ConstantPool::new();
+        let k_null = pool.insert(Const::Null).unwrap();
+        let mut instrs = WideOp::LoadConstW {
+            dst: 0,
+            const_id: u32::from(k_null),
+        }
+        .encode();
+        instrs.push(Instr::new(Opcode::Return, 0, 0, 0));
+        let fb = empty_fn(1, instrs, pool);
+        let fb2 = fb.clone();
+        let mut baseline = JitBaseline::new().unwrap();
+        let compiled = baseline.compile(&fb).unwrap();
+        let mut regs = vec![JsValue::undefined(); 1];
+        let jit_result = compiled.execute(&mut regs);
+        assert!(jit_result.is_null());
+        let interp_result = interp_throw_result(fb2);
+        assert_eq!(jit_result.bits(), interp_result.bits());
+    }
+
+    #[test]
+    fn typeof_null_via_jit_is_object_when_interpreted() {
+        // Baseline fast path does not yet implement `TypeOf`; this test documents
+        // that interp correctly reports "object" for null via the same bytecode
+        // that the JIT would later lower.
+        let mut interp = v12_interp::Interp::from_source("throw typeof null;").expect("compiles");
+        let thrown = match interp.run() {
+            Err(e) => e.0,
+            Ok(()) => panic!("expected throw"),
+        };
+        assert!(thrown.is_string());
+        assert_eq!(interp.to_display_string(thrown), "object");
+    }
 }
 
 #[cfg(not(feature = "jit"))]

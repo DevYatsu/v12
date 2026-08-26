@@ -112,11 +112,12 @@ pub fn random_wide_op(rng: &mut Rng) -> WideOp {
 
 /// Random constant of a random variant.
 pub fn random_const(rng: &mut Rng) -> Const {
-    match rng.below(4) {
+    match rng.below(5) {
         0 => Const::F64(f64::from_bits(rng.next_u64())),
         1 => Const::Str32(rng.next_u32()),
         2 => Const::BigIntId(rng.next_u32()),
-        _ => Const::BigU64(rng.next_u64()),
+        3 => Const::BigU64(rng.next_u64()),
+        _ => Const::Null,
     }
 }
 

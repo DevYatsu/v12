@@ -520,8 +520,8 @@ mod tests {
     #[test]
     fn typeof_null_is_object_and_undefined_is_undefined() {
         let mut engine = Engine::new();
-        // `null` literal is not yet in the constant pool; test the other
-        // typeof branches that are already implemented.
+        let thrown1 = engine.eval("throw typeof null;").unwrap_err();
+        assert_eq!(engine.to_display_string(thrown1), "object");
         let thrown2 = engine.eval("throw typeof undefined;").unwrap_err();
         assert_eq!(engine.to_display_string(thrown2), "undefined");
         let thrown3 = engine.eval("throw typeof 123;").unwrap_err();
@@ -530,5 +530,24 @@ mod tests {
         assert_eq!(engine.to_display_string(thrown4), "string");
         let thrown5 = engine.eval("throw typeof true;").unwrap_err();
         assert_eq!(engine.to_display_string(thrown5), "boolean");
+    }
+
+    #[test]
+    fn null_literal_is_null_distinct_from_undefined() {
+        let mut engine = Engine::new();
+        let thrown = engine.eval("throw null;").unwrap_err();
+        assert!(
+            thrown.is_null(),
+            "expected null, got bits {:#x}",
+            thrown.bits()
+        );
+        assert!(!thrown.is_undefined());
+        // Loose equality: null == undefined true, strict false.
+        let thrown2 = engine.eval("throw (null == undefined);").unwrap_err();
+        assert!(thrown2.is_true());
+        let thrown3 = engine.eval("throw (null === undefined);").unwrap_err();
+        assert!(thrown3.is_false());
+        let thrown4 = engine.eval("throw (null === null);").unwrap_err();
+        assert!(thrown4.is_true());
     }
 }

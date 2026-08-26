@@ -17,6 +17,7 @@ fn bits(c: Const) -> u64 {
         Const::F64(v) => v.to_bits(),
         Const::BigU64(v) => v,
         Const::Str32(id) | Const::BigIntId(id) => u64::from(id),
+        Const::Null => 0,
     }
 }
 
@@ -78,18 +79,21 @@ fn tag_participates_in_the_dedup_key() {
     let bi = pool.insert(Const::BigIntId(7)).unwrap();
     let u = pool.insert(Const::BigU64(7)).unwrap();
     let f = pool.insert(Const::F64(7.0)).unwrap();
+    let n = pool.insert(Const::Null).unwrap();
 
     assert_ne!(s, bi);
     assert_ne!(bi, u);
     assert_ne!(u, f);
-    assert_eq!(pool.len(), 4);
+    assert_ne!(f, n);
+    assert_eq!(pool.len(), 5);
 
     // Each still dedups within its own variant.
     assert_eq!(pool.insert(Const::Str32(7)).unwrap(), s);
     assert_eq!(pool.insert(Const::BigIntId(7)).unwrap(), bi);
     assert_eq!(pool.insert(Const::BigU64(7)).unwrap(), u);
     assert_eq!(pool.insert(Const::F64(7.0)).unwrap(), f);
-    assert_eq!(pool.len(), 4);
+    assert_eq!(pool.insert(Const::Null).unwrap(), n);
+    assert_eq!(pool.len(), 5);
 }
 
 #[test]

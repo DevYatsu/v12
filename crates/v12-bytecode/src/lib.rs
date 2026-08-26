@@ -640,23 +640,29 @@ mod wide_tests {
 /// Strings and BigInts are referenced by interner id rather than stored
 /// inline, which keeps the pool `Copy`-able per entry and its indices
 /// fixed-width.
+///
+/// `Null` has no payload — a single discriminant byte suffices.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Const {
     F64(f64),
     Str32(u32),
     BigIntId(u32),
     BigU64(u64),
+    /// The `null` singleton (no payload).
+    Null,
 }
 
 impl Const {
     /// Dedup key: discriminant tag plus the payload's exact bits, so
     /// `-0.0`/`0.0` stay distinct while identical NaN payloads dedup.
+    /// `Null` has no payload — all instances share one key.
     fn key(self) -> (u8, u64) {
         match self {
             Self::F64(v) => (0, v.to_bits()),
             Self::Str32(id) => (1, u64::from(id)),
             Self::BigIntId(id) => (2, u64::from(id)),
             Self::BigU64(v) => (3, v),
+            Self::Null => (4, 0),
         }
     }
 }
@@ -668,6 +674,7 @@ impl fmt::Display for Const {
             Self::Str32(id) => write!(f, "str#{id}"),
             Self::BigIntId(id) => write!(f, "bigint#{id}"),
             Self::BigU64(v) => write!(f, "big_u64({v})"),
+            Self::Null => write!(f, "null"),
         }
     }
 }

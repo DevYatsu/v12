@@ -9,18 +9,20 @@
 //!
 //! # Tier coverage
 //!
-//! - **Tier 1** — literals (numeric/string/bool), `let`/`const`/`var` with
-//!   block scoping via registers, arithmetic / logical (`&&`, `||`, `??`) /
-//!   bitwise / comparison / strict-equality / `in` / `instanceof` operators,
-//!   `typeof`, unary `-`/`!`/`~`, `++`/`--` (prefix & postfix), assignment to
-//!   locals, properties, and object members; expression statements; `if`/`else`;
-//!   `while`/`do-while`/`for(;;)`; labeled `break`/`continue`; `return`;
-//!   function declarations/expressions/arrows; plain + method calls;
-//!   property get/set by identifier/string keys; object/array literals;
-//!   string concatenation via `+`; `this`; `throw`/`try`/`catch`/`finally`
-//!   via handler tables with duplicated-completion dispatch; nested
-//!   closures through static capture analysis (`NewEnvironment`,
-//!   `GetEnvSlot`, `SetEnvSlot`).
+//! - **Tier 1** — literals (numeric/string/bool/`null`), `let`/`const`/`var`
+//!   with block scoping via registers, arithmetic / logical (`&&`, `||`, `??`
+//!   with nullish `null`/`undefined`) / bitwise / comparison / strict-equality
+//!   / `in` / `instanceof` operators, `typeof` (with `typeof null ===
+//!   "object"`), unary `-`/`!`/`~`, `++`/`--` (prefix & postfix), assignment
+//!   to locals, properties, and object members (including computed keys
+//!   `obj[expr]` and `{[expr]: value}` via `ToPropertyKey` + dynamic
+//!   `PropKey`); expression statements; `if`/`else`; `while`/`do-while`/
+//!   `for(;;)`; labeled `break`/`continue`; `return`; function
+//!   declarations/expressions/arrows; plain + method calls; property get/set
+//!   by identifier/string keys; object/array literals; string concatenation
+//!   via `+`; `this`; `throw`/`try`/`catch`/`finally` via handler tables
+//!   with duplicated-completion dispatch; nested closures through static
+//!   capture analysis (`NewEnvironment`, `GetEnvSlot`, `SetEnvSlot`).
 //! - **Tier 2** — conditional `?:`, basic flat destructuring declarations
 //!   (`let {a, b} = …`, `let [a, b] = …` lowered to property loads).
 //!
@@ -28,9 +30,8 @@
 //!
 //! - `new Expr()` — no construct opcode exists in the ISA; rejected rather
 //!   than mis-encoded (documented ISA gap).
-//! - `null` literals — the constant pool has no null kind yet.
 //! - Unary `+` (no ToNumber opcode), spread, optional
-//!   chaining/calls, computed property keys, getters/setters/method
+//!   chaining/calls, getters/setters/method
 //!   shorthand in object literals, BigInt/RegExp literals, template literals
 //!   with substitutions, classes, generators/async, `for-in`/`for-of`,
 //!   switch/with, `arguments`, `eval`.
@@ -42,8 +43,7 @@
 //! - Captured variables live one Environment per function unit (block-level
 //!   captures are hoisted into it): closures over a loop-body `let` observe
 //!   the final value, not per-iteration bindings. TDZ is not modeled.
-//! - `??` treats only `undefined` as nullish (`null` values cannot be
-//!   produced in-subset yet).
+//! - `??` is nullish over `null` and `undefined` (loose `== null`).
 //! - Function-declaration hoisting covers direct statement-list items only;
 //!   function declarations bind lexically (strict-mode style) rather than
 //!   Annex B web-compat semantics.

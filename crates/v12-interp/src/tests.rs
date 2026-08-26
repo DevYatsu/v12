@@ -673,3 +673,59 @@ fn arguments_exotic_mapped_access_via_elements() {
     // Verify mapped flag is still present
     assert!(interp.heap().get(args_obj).arguments_mapped.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// `null` literal (Const::Null)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn null_literal_evaluates_to_js_null() {
+    // `null` must be a distinct value from `undefined`.
+    let mut interp = Interp::from_source("throw null;").expect("compiles");
+    let v = expect_throw(&mut interp);
+    assert!(
+        v.is_null(),
+        "expected JsValue::null(), got bits {:#x}",
+        v.bits()
+    );
+    assert!(!v.is_undefined());
+}
+
+#[test]
+fn typeof_null_is_object() {
+    // ECMA-262: `typeof null` is `"object"` (legacy).
+    let mut interp = Interp::from_source("throw typeof null;").expect("compiles");
+    let v = expect_throw(&mut interp);
+    assert!(v.is_string(), "typeof null must be a string");
+    let text = interp.to_display_string(v);
+    assert_eq!(text, "object");
+}
+
+#[test]
+fn null_via_load_const_wide_evaluates_to_js_null() {
+    // Exercise the WideOp::LoadConstW path for Const::Null.
+    let mut pool = ConstantPool::new();
+    let k_null = pool.insert(Const::Null).expect("fits");
+    // Encode a wide load of the null constant into r0 then throw it.
+    let mut instrs = WideOp::LoadConstW {
+        dst: 0,
+        const_id: u32::from(k_null),
+    }
+    .encode();
+    instrs.push(Instr::new(Opcode::Throw, 0, 0, 0));
+    let fb = empty_fn(1, instrs, pool);
+    let mut interp = program_of(fb);
+    let v = expect_throw(&mut interp);
+    assert!(v.is_null(), "wide null must still be JsValue::null()");
+}
+
+#[test]
+fn null_identity_and_strict_equality() {
+    // `null === null` is true, `null == undefined` is true (loose), strict false.
+    let mut interp = Interp::from_source("throw (null === null);").expect("compiles");
+    assert_eq!(expect_throw(&mut interp).as_bool(), Some(true));
+    let mut interp2 = Interp::from_source("throw (null == undefined);").expect("compiles");
+    assert_eq!(expect_throw(&mut interp2).as_bool(), Some(true));
+    let mut interp3 = Interp::from_source("throw (null === undefined);").expect("compiles");
+    assert_eq!(expect_throw(&mut interp3).as_bool(), Some(false));
+}
