@@ -61,12 +61,14 @@ pub fn array_pop(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<Js
 fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> u32 {
     let key = length_prop(heap);
     let shape = heap.root_shape();
-    if let Some(desc) = heap.lookup_property(shape, key) {
-        let slot = desc.slot as usize;
+    if let Some(desc) = heap.lookup_property(shape, key)
+        && let Some(slot) = desc.slot()
+    {
+        let idx = slot as usize;
         let v = heap
             .get(obj)
             .properties
-            .get(slot)
+            .get(idx)
             .copied()
             .unwrap_or(JsValue::undefined());
         if let Some(n) = v.as_smi()
@@ -89,10 +91,12 @@ fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> u32 {
 fn sync_length(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
     let key = length_prop(heap);
     let shape = heap.root_shape();
-    if let Some(desc) = heap.lookup_property(shape, key) {
-        let slot = desc.slot as usize;
-        if slot < heap.get(obj).properties.len() {
-            heap.get_mut(obj).properties[slot] = JsValue::from_f64(f64::from(len));
+    if let Some(desc) = heap.lookup_property(shape, key)
+        && let Some(slot) = desc.slot()
+    {
+        let idx = slot as usize;
+        if idx < heap.get(obj).properties.len() {
+            heap.get_mut(obj).properties[idx] = JsValue::from_f64(f64::from(len));
             return;
         }
     }

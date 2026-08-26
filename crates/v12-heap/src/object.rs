@@ -10,6 +10,19 @@ use crate::shape::ValidityCellId;
 /// as they become needed (function, array, Proxy, …).
 pub const KIND_ORDINARY: u8 = 0;
 
+/// Object kind for user functions created by `Closure`.
+pub const KIND_FUNCTION: u8 = 1;
+
+/// Object kind for array literals.
+pub const KIND_ARRAY: u8 = 2;
+
+/// Object kind for arguments exotic objects (ES `ArgumentsExoticObject`).
+///
+/// Layout: `properties` holds named properties (`length`, `callee`),
+/// `elements` holds indexed arguments, and `arguments_mapped` tracks the
+/// exotic parameter alias (see `JsObject::arguments_mapped`).
+pub const KIND_ARGUMENTS: u8 = 3;
+
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
 /// down. Transitions are monotone — sealing then freezing is legal, nothing
 /// un-seals — so [`Heap::set_integrity_level`] only ever raises flags.
@@ -44,6 +57,12 @@ pub struct JsObject {
     /// identity, attribute stability), assigned lazily on first use. The
     /// registry holding serials lives on the heap.
     pub validity_cell: ValidityCellId,
+    /// Arguments exotic mapping: `Some(map)` where `map[i]` is `Some(slot)`
+    /// when indexed property `i` is aliased to the `slot`-th parameter slot,
+    /// `None` for mapped holes and `None` for unmapped (strict) arguments.
+    ///
+    /// Only meaningful when `kind == KIND_ARGUMENTS`.
+    pub arguments_mapped: Option<Box<[Option<u32>]>>,
 }
 
 impl JsObject {
@@ -110,7 +129,13 @@ const VALUE_BYTES: usize = core::mem::size_of::<crate::JsValue>();
 impl SizeEstimate for JsObject {
     fn approx_size(&self) -> usize {
         // Header (kind, flags, prototype) + capacity of both slot vectors.
-        16 + self.properties.capacity() * VALUE_BYTES + self.elements.capacity() * VALUE_BYTES
+        let mapped = self
+            .arguments_mapped
+            .as_ref()
+            .map_or(0, |m| m.len() * core::mem::size_of::<Option<u32>>());
+        16 + self.properties.capacity() * VALUE_BYTES
+            + self.elements.capacity() * VALUE_BYTES
+            + mapped
     }
 }
 
@@ -173,5 +198,46 @@ mod tests {
         let base = o.approx_size();
         o.properties.reserve(100);
         assert!(o.approx_size() > base);
+    }
+
+    #[test]
+    fn arguments_exotic_mapped_has_mapping() {
+        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
+        let mapped: Box<[Option<u32>]> = vec![Some(0), Some(1), None].into_boxed_slice();
+        let obj = heap.alloc(JsObject {
+            kind: KIND_ARGUMENTS,
+            elements: vec![
+                JsValue::from_i32_smi(10).unwrap(),
+                JsValue::from_i32_smi(20).unwrap(),
+                JsValue::from_i32_smi(30).unwrap(),
+            ],
+            arguments_mapped: Some(mapped),
+            ..JsObject::default()
+        });
+        heap.add_root(JsValue::object(obj));
+        let stored = heap.get(obj);
+        assert_eq!(stored.kind, KIND_ARGUMENTS);
+        assert!(stored.arguments_mapped.is_some());
+        let map = stored.arguments_mapped.as_ref().unwrap();
+        assert_eq!(map[0], Some(0));
+        assert_eq!(map[1], Some(1));
+        assert_eq!(map[2], None);
+        // Mapped arguments are exotic: indexed access via elements should work
+        assert_eq!(stored.elements[0].as_smi(), Some(10));
+    }
+
+    #[test]
+    fn arguments_exotic_unmapped_is_strict() {
+        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
+        let obj = heap.alloc(JsObject {
+            kind: KIND_ARGUMENTS,
+            elements: vec![JsValue::from_i32_smi(1).unwrap()],
+            arguments_mapped: None,
+            ..JsObject::default()
+        });
+        heap.add_root(JsValue::object(obj));
+        assert_eq!(heap.get(obj).arguments_mapped, None);
+        // Unmapped (strict) arguments should not alias parameters
+        assert_eq!(heap.get(obj).elements[0].as_smi(), Some(1));
     }
 }

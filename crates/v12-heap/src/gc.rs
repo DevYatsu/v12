@@ -458,7 +458,48 @@ impl Heap {
                 parent_shape.descriptors.clone(),
             )
         };
-        descriptors.push(Descriptor { key, slot, attrs });
+        descriptors.push(Descriptor::Data { key, slot, attrs });
+        let child_handle = self.alloc(Shape {
+            parent: Some(parent),
+            transitions: Transitions::default(),
+            descriptors,
+            proto_cell,
+            num_own: slot + 1,
+        });
+        self.get_mut(parent).transitions.insert(key, child_handle);
+        child_handle
+    }
+
+    /// Defines an accessor property (getter/setter) on `parent`.
+    ///
+    /// Like [`Self::add_property`], but creates an [`Descriptor::Accessor`]
+    /// instead of a data descriptor. Accessor descriptors occupy a slot index
+    /// for `num_own` stability but store `hole` in the object's `properties`.
+    pub fn define_accessor(
+        &mut self,
+        parent: ShapeHandle,
+        key: PropKey,
+        getter: Option<crate::Handle<crate::V12Str>>,
+        setter: Option<crate::Handle<crate::V12Str>>,
+        attrs: Attrs,
+    ) -> ShapeHandle {
+        if let Some(existing) = self.get(parent).transitions.get(key) {
+            return existing;
+        }
+        let (slot, proto_cell, mut descriptors) = {
+            let parent_shape = self.get(parent);
+            (
+                parent_shape.num_own,
+                parent_shape.proto_cell,
+                parent_shape.descriptors.clone(),
+            )
+        };
+        descriptors.push(Descriptor::Accessor {
+            key,
+            getter,
+            setter,
+            attrs,
+        });
         let child_handle = self.alloc(Shape {
             parent: Some(parent),
             transitions: Transitions::default(),
@@ -948,6 +989,7 @@ mod tests {
             elements: Vec::new(),
             prototype: proto,
             validity_cell: ValidityCellId::NONE,
+            arguments_mapped: None,
         }
     }
 

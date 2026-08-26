@@ -79,6 +79,8 @@ pub const NATIVE_MATH_ABS: u32 = 1400;
 pub const NATIVE_BOOLEAN_CONSTRUCT: u32 = 1500;
 pub const NATIVE_ERROR_CREATE: u32 = 1600;
 pub const NATIVE_QUEUE_MICROTASK: u32 = 1700;
+pub const NATIVE_EVAL: u32 = 1800;
+pub const NATIVE_FUNCTION: u32 = 1801;
 
 /// Installs the core built-ins into `registry`.
 pub fn install_core(registry: &mut NativeRegistry) {
@@ -100,11 +102,97 @@ pub fn install_core(registry: &mut NativeRegistry) {
     registry.register(NATIVE_BOOLEAN_CONSTRUCT, boolean::boolean_construct);
     registry.register(NATIVE_ERROR_CREATE, error::error_create);
     registry.register(NATIVE_QUEUE_MICROTASK, queue_microtask);
+    registry.register(NATIVE_EVAL, eval_stub);
+    registry.register(NATIVE_FUNCTION, function_stub);
 }
 
 fn queue_microtask(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
     let _ = heap;
     Ok(JsValue::undefined())
+}
+
+fn eval_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    // v1 stub: non-string args return as-is; string args are syntax-checked
+    // via the compiler and return `undefined` on success. The full
+    // heap-sharing `eval` path is exercised via `Engine::eval_direct`.
+    if let Some(first) = args.first() {
+        if let Some(h) = first.as_string() {
+            heap.flatten(h);
+            let text = match &heap.get(h).storage {
+                v12_heap::StrStorage::Latin1(b) => String::from_utf8_lossy(b).into_owned(),
+                v12_heap::StrStorage::Utf16(u) => String::from_utf16_lossy(u),
+                _ => String::new(),
+            };
+            if let Err(err) = v12_bccompiler::compile_source_with_strings(&text) {
+                let msg = err.message;
+                let handle = if msg.is_ascii() {
+                    heap.intern_string(v12_heap::V12Str::latin1(msg.into_bytes()))
+                } else {
+                    heap.intern_string(v12_heap::V12Str::utf16(msg.encode_utf16().collect()))
+                };
+                return Err(JsValue::string(handle));
+            }
+            Ok(JsValue::undefined())
+        } else {
+            Ok(*first)
+        }
+    } else {
+        Ok(JsValue::undefined())
+    }
+}
+
+fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    // v1 stub for `new Function`: validate syntax and return a placeholder
+    // function object. Full compilation is via `Engine::create_function`.
+    if args.is_empty() {
+        let func = heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::KIND_FUNCTION,
+            elements: vec![JsValue::from_i32_smi(0).unwrap()],
+            ..Default::default()
+        });
+        heap.add_root(JsValue::object(func));
+        return Ok(JsValue::object(func));
+    }
+    let mut param_parts = Vec::new();
+    for &arg in &args[..args.len() - 1] {
+        if let Some(h) = arg.as_string() {
+            heap.flatten(h);
+            let txt = match &heap.get(h).storage {
+                v12_heap::StrStorage::Latin1(b) => String::from_utf8_lossy(b).into_owned(),
+                v12_heap::StrStorage::Utf16(u) => String::from_utf16_lossy(u),
+                _ => String::new(),
+            };
+            param_parts.push(txt);
+        }
+    }
+    let param_str = param_parts.join(",");
+    let body = if let Some(last) = args.last().and_then(|v| v.as_string()) {
+        heap.flatten(last);
+        match &heap.get(last).storage {
+            v12_heap::StrStorage::Latin1(b) => String::from_utf8_lossy(b).into_owned(),
+            v12_heap::StrStorage::Utf16(u) => String::from_utf16_lossy(u),
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    let src = format!("function __f({param_str}){{{body}}}");
+    if let Err(err) = v12_bccompiler::compile_source_with_strings(&src) {
+        let msg = err.message;
+        let handle = if msg.is_ascii() {
+            heap.intern_string(v12_heap::V12Str::latin1(msg.into_bytes()))
+        } else {
+            heap.intern_string(v12_heap::V12Str::utf16(msg.encode_utf16().collect()))
+        };
+        return Err(JsValue::string(handle));
+    }
+    let func = heap.alloc(v12_heap::JsObject {
+        kind: v12_heap::KIND_FUNCTION,
+        elements: vec![JsValue::from_i32_smi(1).unwrap()],
+        ..Default::default()
+    });
+    heap.add_root(JsValue::object(func));
+    Ok(JsValue::object(func))
 }
 
 fn intern_type_error(heap: &mut Heap, msg: &str) -> JsValue {

@@ -52,6 +52,7 @@
 use crate::gc::{MarkSink, Trace};
 use crate::handle::{Handle, HeapSpace, Space};
 use crate::prop_key::PropKey;
+use crate::string::V12Str;
 
 use std::boxed::Box;
 use std::vec::Vec;
@@ -112,11 +113,85 @@ impl Attrs {
 /// slots `0..n`, and extending a shape assigns slot `num_own`. Where those
 /// slots physically live (in-object vs overflow storage) is the object's
 /// decision, not the shape's.
+///
+/// `Descriptor` has two forms:
+///
+/// * `Data` — an ordinary data property with a value slot and attributes.
+/// * `Accessor` — a getter/setter pair, each an optional heap-string handle
+///   whose text is the JS source of the accessor function body for `v1`.
+///   Accessor descriptors occupy a slot index in `num_own` for layout stability
+///   but hold `hole` in the object's `properties` storage; the getter/setter
+///   handles are traced via the shape.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Descriptor {
-    pub key: PropKey,
-    pub slot: u32,
-    pub attrs: Attrs,
+pub enum Descriptor {
+    Data {
+        key: PropKey,
+        slot: u32,
+        attrs: Attrs,
+    },
+    Accessor {
+        key: PropKey,
+        getter: Option<Handle<V12Str>>,
+        setter: Option<Handle<V12Str>>,
+        attrs: Attrs,
+    },
+}
+
+impl Descriptor {
+    /// Property key.
+    #[must_use]
+    pub fn key(self) -> PropKey {
+        match self {
+            Self::Data { key, .. } | Self::Accessor { key, .. } => key,
+        }
+    }
+
+    /// Attributes.
+    #[must_use]
+    pub fn attrs(self) -> Attrs {
+        match self {
+            Self::Data { attrs, .. } | Self::Accessor { attrs, .. } => attrs,
+        }
+    }
+
+    /// Slot index for data descriptors; `None` for accessors.
+    #[must_use]
+    pub fn slot(self) -> Option<u32> {
+        match self {
+            Self::Data { slot, .. } => Some(slot),
+            Self::Accessor { .. } => None,
+        }
+    }
+
+    /// `true` for data descriptors.
+    #[must_use]
+    pub fn is_data(self) -> bool {
+        matches!(self, Self::Data { .. })
+    }
+
+    /// `true` for accessor descriptors.
+    #[must_use]
+    pub fn is_accessor(self) -> bool {
+        matches!(self, Self::Accessor { .. })
+    }
+
+    /// Getter handle for accessors.
+    #[must_use]
+    pub fn getter(self) -> Option<Handle<V12Str>> {
+        match self {
+            Self::Accessor { getter, .. } => getter,
+            Self::Data { .. } => None,
+        }
+    }
+
+    /// Setter handle for accessors.
+    #[must_use]
+    pub fn setter(self) -> Option<Handle<V12Str>> {
+        match self {
+            Self::Accessor { setter, .. } => setter,
+            Self::Data { .. } => None,
+        }
+    }
 }
 
 /// Maximum number of transition edges kept inline on a shape.
@@ -325,7 +400,7 @@ impl Descriptors {
     /// The descriptor for `key` within this shape alone (no parent walk; see
     /// [`Shape::find_descriptor`] for chain-aware lookup).
     pub fn find(&self, key: PropKey) -> Option<&Descriptor> {
-        self.as_slice().iter().find(|d| d.key == key)
+        self.as_slice().iter().find(|d| d.key() == key)
     }
 
     /// All descriptors, cheapest slice view.
@@ -438,16 +513,25 @@ impl HeapSpace for Shape {
 }
 
 // Tracing: keep the parent alive and keep descriptor keys' string/symbol
-// slots alive. Transition targets are intentionally skipped — retention must
+// slots alive plus accessor getter/setter string handles.
+// Transition targets are intentionally skipped — retention must
 // be anchored by live objects or explicit roots so unreachable branches stay
 // collectable (see module docs).
 impl Trace for Shape {
     fn trace(&self, sink: &mut MarkSink<'_>) {
         self.parent.trace(sink);
         for descriptor in self.descriptors.as_slice() {
-            match descriptor.key.parts() {
+            match descriptor.key().parts() {
                 (false, index) => sink.mark_string(Handle::new(index)),
                 (true, index) => sink.mark_symbol(Handle::new(index)),
+            }
+            if let Descriptor::Accessor { getter, setter, .. } = descriptor {
+                if let Some(g) = getter {
+                    sink.mark_string(*g);
+                }
+                if let Some(s) = setter {
+                    sink.mark_string(*s);
+                }
             }
         }
     }
@@ -492,7 +576,7 @@ mod tests {
         let da = heap.get(sa).descriptors.find(ka).copied();
         assert_eq!(
             da,
-            Some(Descriptor {
+            Some(Descriptor::Data {
                 key: ka,
                 slot: 0,
                 attrs: Attrs::DEFAULT
@@ -501,7 +585,7 @@ mod tests {
         let db = heap.get(sab).descriptors.find(kb).copied();
         assert_eq!(
             db,
-            Some(Descriptor {
+            Some(Descriptor::Data {
                 key: kb,
                 slot: 1,
                 attrs: Attrs::new(false, true, true)
@@ -511,7 +595,7 @@ mod tests {
         // Parent links thread the chain; attributes ride on descriptors.
         assert_eq!(heap.get(sab).parent, Some(sa));
         assert_eq!(heap.get(sa).parent, Some(base));
-        assert!(!db.unwrap().attrs.writable());
+        assert!(!db.unwrap().attrs().writable());
     }
 
     #[test]
@@ -527,18 +611,18 @@ mod tests {
 
         // Own key resolves locally…
         let d = heap.lookup_property(sxy, ky).expect("own key must resolve");
-        assert_eq!((d.key, d.slot), (ky, 1));
+        assert_eq!((d.key(), d.slot()), (ky, Some(1)));
         // …ancestor keys resolve through parent links…
         let d = heap
             .lookup_property(sxy, kx)
             .expect("inherited key must resolve");
-        assert_eq!((d.key, d.slot), (kx, 0));
+        assert_eq!((d.key(), d.slot()), (kx, Some(0)));
         // …and unknown keys resolve nowhere.
         assert_eq!(heap.lookup_property(sxy, missing), None);
 
         // Same lookups work from mid-chain shapes.
         assert!(heap.lookup_property(sx, ky).is_none());
-        assert_eq!(heap.lookup_property(sx, kx).map(|d| d.slot), Some(0));
+        assert_eq!(heap.lookup_property(sx, kx).and_then(|d| d.slot()), Some(0));
     }
 
     #[test]
@@ -562,7 +646,10 @@ mod tests {
         // Branch shapes are distinct nodes with their own descriptor sets.
         assert_ne!(sx, sz);
         assert_eq!(heap.get(sz).descriptors.as_slice().len(), 1);
-        assert_eq!(heap.get(sz).descriptors.find(kz).map(|d| d.slot), Some(0));
+        assert_eq!(
+            heap.get(sz).descriptors.find(kz).and_then(|d| d.slot()),
+            Some(0)
+        );
         assert_eq!(heap.get(sxy).descriptors.len(), 2);
 
         // Walking the same edges converges back onto the existing shapes —
@@ -627,11 +714,11 @@ mod tests {
         assert_eq!(heap.get(shape).num_own, DESCRIPTORS_INLINE_CAP as u32 + 4);
         for (slot, &k) in keys.iter().enumerate() {
             assert_eq!(
-                heap.get(shape).descriptors.find(k).map(|d| d.slot),
+                heap.get(shape).descriptors.find(k).and_then(|d| d.slot()),
                 Some(slot as u32)
             );
             assert_eq!(
-                heap.lookup_property(shape, k).map(|d| d.slot),
+                heap.lookup_property(shape, k).and_then(|d| d.slot()),
                 Some(slot as u32)
             );
         }
@@ -675,8 +762,14 @@ mod tests {
         assert_eq!(heap.get(sx).transitions.get(ky), Some(sxy));
 
         // Live branch data is intact after all the churn.
-        assert_eq!(heap.lookup_property(sxy, kx).map(|d| d.slot), Some(0));
-        assert_eq!(heap.lookup_property(sxy, ky).map(|d| d.slot), Some(1));
+        assert_eq!(
+            heap.lookup_property(sxy, kx).and_then(|d| d.slot()),
+            Some(0)
+        );
+        assert_eq!(
+            heap.lookup_property(sxy, ky).and_then(|d| d.slot()),
+            Some(1)
+        );
 
         // A fresh add on the same key creates a NEW branch (the old edge is
         // gone). The reclaimed slot may legitimately be reused for it; what
@@ -686,5 +779,48 @@ mod tests {
         assert_eq!(heap.get(base).transitions.get(kz), Some(sz2));
         assert_eq!(heap.get(sz2).num_own, 1);
         assert_eq!(heap.get(sz2).parent, Some(base));
+    }
+
+    #[test]
+    fn accessor_descriptor_is_distinct_from_data() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let k = keyed(&mut heap, b"acc");
+        let getter = heap.intern_string(V12Str::latin1(b"42".to_vec()));
+        heap.add_root(crate::JsValue::string(getter));
+        let base = heap.root_shape();
+        let s_acc = heap.define_accessor(base, k, Some(getter), None, Attrs::DEFAULT);
+        heap.add_shape_root(s_acc);
+        let desc = heap
+            .lookup_property(s_acc, k)
+            .expect("accessor must be found");
+        assert!(desc.is_accessor());
+        assert!(!desc.is_data());
+        assert_eq!(desc.getter(), Some(getter));
+        assert_eq!(desc.setter(), None);
+        assert!(desc.slot().is_none());
+        // Data descriptor for a different key remains distinct
+        let k2 = keyed(&mut heap, b"acc2");
+        let s_data = heap.add_property(base, k2, Attrs::DEFAULT);
+        let desc_data = heap.lookup_property(s_data, k2).unwrap();
+        assert!(desc_data.is_data());
+    }
+
+    #[test]
+    fn accessor_getter_and_setter_roundtrip() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let k = keyed(&mut heap, b"x");
+        let getter = heap.intern_string(V12Str::latin1(b"123".to_vec()));
+        let setter = heap.intern_string(V12Str::latin1(b"setter_body".to_vec()));
+        heap.add_root(crate::JsValue::string(getter));
+        heap.add_root(crate::JsValue::string(setter));
+        let base = heap.root_shape();
+        let s = heap.define_accessor(base, k, Some(getter), Some(setter), Attrs::DEFAULT);
+        heap.add_shape_root(s);
+        let d = heap.lookup_property(s, k).unwrap();
+        assert_eq!(d.getter(), Some(getter));
+        assert_eq!(d.setter(), Some(setter));
+        // Ensure GC keeps getter/setter strings alive via shape trace
+        heap.force_collect();
+        assert_eq!(heap.lookup_property(s, k).unwrap().getter(), Some(getter));
     }
 }

@@ -519,3 +519,157 @@ fn instanceof_non_callable_rhs_throws() {
     let msg2 = interp2.to_display_string(thrown2);
     assert!(msg2.contains("TypeError"), "expected TypeError, got {msg2}");
 }
+
+#[test]
+fn accessor_getter_returns_numeric_string() {
+    // Bucket 10: accessor with numeric getter string "42" should return 42
+    let mut interp = Interp::from_source("let x = 1;").expect("compiles");
+    let obj = {
+        let heap = interp.heap_mut_for_test();
+        let o = heap.alloc(v12_heap::JsObject::default());
+        heap.add_root(v12_heap::JsValue::object(o));
+        o
+    };
+    let (key, key_v, getter) = {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.intern_string(v12_heap::V12Str::latin1(b"val".to_vec()));
+        heap.add_root(v12_heap::JsValue::string(s));
+        let key = v12_heap::PropKey::from_string(s);
+        let key_v = v12_heap::JsValue::string(s);
+        let g = heap.intern_string(v12_heap::V12Str::latin1(b"42".to_vec()));
+        heap.add_root(v12_heap::JsValue::string(g));
+        (key, key_v, g)
+    };
+    let shape = {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.define_accessor(
+            heap.root_shape(),
+            key,
+            Some(getter),
+            None,
+            v12_heap::Attrs::DEFAULT,
+        );
+        heap.add_shape_root(s);
+        s
+    };
+    interp.bind_shape_for_test(obj, shape);
+    // Need to push a dummy property for the accessor slot (hole)
+    interp
+        .heap_mut_for_test()
+        .get_mut(obj)
+        .properties
+        .push(v12_heap::JsValue::hole());
+    let obj_v = v12_heap::JsValue::object(obj);
+    let got = interp.get_property_for_test(obj_v, key_v).expect("get");
+    assert_eq!(got.as_smi(), Some(42));
+}
+
+#[test]
+fn accessor_setter_is_noop_without_data_slot() {
+    // Bucket 10: setting an accessor with a setter should not create a data slot
+    let mut interp = Interp::from_source("let x = 1;").expect("compiles");
+    let obj = {
+        let heap = interp.heap_mut_for_test();
+        let o = heap.alloc(v12_heap::JsObject::default());
+        heap.add_root(v12_heap::JsValue::object(o));
+        o
+    };
+    let (key, key_v, getter, setter) = {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.intern_string(v12_heap::V12Str::latin1(b"prop".to_vec()));
+        heap.add_root(v12_heap::JsValue::string(s));
+        let key = v12_heap::PropKey::from_string(s);
+        let key_v = v12_heap::JsValue::string(s);
+        let g = heap.intern_string(v12_heap::V12Str::latin1(b"10".to_vec()));
+        let st = heap.intern_string(v12_heap::V12Str::latin1(b"setter_body".to_vec()));
+        heap.add_root(v12_heap::JsValue::string(g));
+        heap.add_root(v12_heap::JsValue::string(st));
+        (key, key_v, g, st)
+    };
+    let shape = {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.define_accessor(
+            heap.root_shape(),
+            key,
+            Some(getter),
+            Some(setter),
+            v12_heap::Attrs::DEFAULT,
+        );
+        heap.add_shape_root(s);
+        s
+    };
+    interp.bind_shape_for_test(obj, shape);
+    interp
+        .heap_mut_for_test()
+        .get_mut(obj)
+        .properties
+        .push(v12_heap::JsValue::hole());
+    let obj_v = v12_heap::JsValue::object(obj);
+    // Set should invoke setter (no-op) and not change getter value
+    let new_val = v12_heap::JsValue::from_i32_smi(99).unwrap();
+    interp
+        .set_property_for_test(obj_v, key_v, new_val)
+        .expect("set");
+    let got = interp.get_property_for_test(obj_v, key_v).expect("get");
+    assert_eq!(got.as_smi(), Some(10));
+}
+
+#[test]
+fn global_var_alias_for_captured_var() {
+    // Bucket 8: top-level `var` that is captured should alias the global object
+    let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+    let global = heap.alloc(v12_heap::JsObject::default());
+    heap.add_root(v12_heap::JsValue::object(global));
+    // Simulate global with 10 intrinsic slots already
+    heap.get_mut(global)
+        .properties
+        .resize(10, v12_heap::JsValue::undefined());
+    heap.add_root(v12_heap::JsValue::object(global));
+    let src = "var x = 123; function f(){ return x; } throw f();";
+    let (program, strings) = v12_bccompiler::compile_source_with_strings(src).expect("compile");
+    let mut interp2 =
+        Interp::new_with_heap(heap, Some(global), program.functions, program.main, strings);
+    let thrown = expect_throw(&mut interp2);
+    assert_eq!(thrown.as_smi(), Some(123));
+    // Also verify global's property at offset holds the var value
+    let heap = interp2.heap();
+    let val = heap.get(global).properties[10];
+    assert_eq!(val.as_smi(), Some(123));
+}
+
+#[test]
+fn arguments_exotic_mapped_access_via_elements() {
+    // Bucket 8: arguments object with mapped indices stores elements
+    let mut interp = Interp::from_source("let x = 1;").expect("compiles");
+    let args_obj = {
+        let heap = interp.heap_mut_for_test();
+        let mapped: Box<[Option<u32>]> = vec![Some(0), None].into_boxed_slice();
+        let o = heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::KIND_ARGUMENTS,
+            elements: vec![
+                v12_heap::JsValue::from_i32_smi(7).unwrap(),
+                v12_heap::JsValue::from_i32_smi(8).unwrap(),
+            ],
+            arguments_mapped: Some(mapped),
+            ..Default::default()
+        });
+        heap.add_root(v12_heap::JsValue::object(o));
+        o
+    };
+    let args_v = v12_heap::JsValue::object(args_obj);
+    // Indexed access should return elements
+    let key0 = v12_heap::JsValue::from_i32_smi(0).unwrap();
+    let got0 = interp.get_property_for_test(args_v, key0).expect("get");
+    assert_eq!(got0.as_smi(), Some(7));
+    // Setting index 0 should update element
+    let new_val = v12_heap::JsValue::from_i32_smi(99).unwrap();
+    interp
+        .set_property_for_test(args_v, key0, new_val)
+        .expect("set");
+    let got1 = interp
+        .get_property_for_test(args_v, key0)
+        .expect("get after set");
+    assert_eq!(got1.as_smi(), Some(99));
+    // Verify mapped flag is still present
+    assert!(interp.heap().get(args_obj).arguments_mapped.is_some());
+}
