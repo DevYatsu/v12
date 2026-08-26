@@ -7,9 +7,11 @@ garbage-collected runtime implemented from scratch — no bindings to V8,
 JavaScriptCore, or QuickJS. The goal is an embeddable engine that is fast to
 start, small in memory, and correct enough to run real programs.
 
-> **Status: early development.** The compiler front end and the memory-safe
-> heap are working and tested; the interpreter and JIT tiers are being built
-> on top of them. Embedding APIs do not exist yet. Expect breaking changes.
+> **Status: early development — Tier-0 executes, embedding works.**
+> The compiler, heap, interpreter, baseline JIT, and embedding engine are
+> implemented and tested (278 tests, `cargo nextest run --workspace`). The
+> `v12` CLI is in progress; Test262 harness and Tier-2 optimizer are planned.
+> Expect breaking changes.
 
 ## Why another engine?
 
@@ -42,13 +44,13 @@ and [lasso][lasso] interns identifier strings.
 | `v12-bytecode` | Register ISA (fixed-width 32-bit words), constant pool, exception handler tables, disassembler |
 | `v12-heap` | Values, typed handles, hidden classes, elements storage, strings, mark-sweep garbage collector |
 | `v12-bccompiler` | oxc AST → bytecode compiler (scopes, closures, exceptions, peephole pass) |
-| `v12-interp` | Tier-0 bytecode interpreter *(in development)* |
-| `v12-jit-baseline` | Tier-1 template JIT backed by Cranelift *(planned)* |
+| `v12-interp` | Tier-0 bytecode interpreter (iterative loop, handler tables, tier-up feedback) |
+| `v12-jit-baseline` | Tier-1 template JIT backed by Cranelift (feature-gated) |
 | `v12-jit-opt` | Tier-2 speculative optimizing JIT *(planned, post-v1)* |
 | `v12-regex` | ES-semantics wrapper over `regress` |
 | `v12-intl` | `Intl`/Temporal primitives over ICU4X and `temporal_rs` |
-| `v12-engine` | Built-ins, realms, job queue, embedding API *(planned)* |
-| `v12-cli` | The `v12` binary: REPL and script runner *(planned)* |
+| `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error), single realm, microtask queue, `Engine::eval` API |
+| `v12-cli` | The `v12` binary: REPL and script runner *(in progress)* |
 
 ## Try the pieces that exist today
 
@@ -71,7 +73,7 @@ for function in &program.functions {
 }
 ```
 
-Run the test suite (231 tests across the five implemented crates):
+Run the test suite (278 tests, `cargo nextest run --workspace`):
 
 ```sh
 cargo nextest run --workspace
@@ -95,11 +97,11 @@ cargo nextest run --workspace
 - [x] Bytecode ISA, constant pool, exception tables, disassembler
 - [x] Heap: values, handles, hidden classes, elements kinds, strings, GC
 - [x] Compiler front end: statements, closures, exceptions, peephole pass
-- [ ] Tier-0 interpreter (in development)
-- [ ] Built-ins: Object / Array / String / Promise / Map / Set
-- [ ] Tier-1 baseline JIT with inline caches and OSR
+- [x] Tier-0 interpreter — handler-table unwinding, GC-rooted frames, differential vs reference interpreter
+- [x] Built-ins — Object/Array/String/Number/Math/Error + single realm, microtask queue, `Engine::eval` API
+- [x] Tier-1 baseline JIT — Cranelift template (feature-gated, 21 opcodes, deopt pc_map)
+- [ ] `v12` CLI — script runner + REPL *(Wave 5 in progress)*
 - [ ] Test262 conformance harness and benchmark gating
-- [ ] Embedding API and the `v12` CLI
 - [ ] Tier-2 speculative optimizer
 
 Performance targets: match or beat V8 on startup time and memory footprint;
