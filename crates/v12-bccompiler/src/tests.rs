@@ -298,6 +298,50 @@ impl<'p> Mini<'p> {
                     e.slots.borrow_mut()[instr.b() as usize] = regs[instr.c() as usize].clone();
                     pc += 1;
                 }
+                Opcode::In => {
+                    let key = to_key(&regs[instr.b() as usize]);
+                    let obj = &regs[instr.c() as usize];
+                    regs[instr.a() as usize] = Val::Bool(match obj {
+                        Val::Obj(o) => o.borrow().props.contains_key(&key),
+                        _ => {
+                            return Err(Val::Str(
+                                "TypeError: right-hand side of 'in' should be an object".into(),
+                            ));
+                        }
+                    });
+                    pc += 1;
+                }
+                Opcode::InstanceOf => {
+                    let lhs = &regs[instr.b() as usize];
+                    let rhs = &regs[instr.c() as usize];
+                    let rhs_obj = match rhs {
+                        Val::Obj(o) => o,
+                        _ => {
+                            return Err(Val::Str(
+                                "TypeError: right-hand side of 'instanceof' is not an object"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    let proto_val = rhs_obj.borrow().props.get("prototype").cloned();
+                    let Some(Val::Obj(proto_obj)) = proto_val else {
+                        return Err(Val::Str("TypeError: function has non-object prototype 'prototype' in instanceof check".into()));
+                    };
+                    let result = match lhs {
+                        Val::Obj(_) => {
+                            // Mini interpreter has no prototype links, so only direct identity.
+                            // For tests, an object instanceof its own prototype is true only when lhs is the proto itself.
+                            // This suffices for compiler opcode validation; full chain is tested in v12-interp.
+                            match lhs {
+                                Val::Obj(o) => Rc::ptr_eq(o, &proto_obj),
+                                _ => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    regs[instr.a() as usize] = Val::Bool(result);
+                    pc += 1;
+                }
                 Opcode::CreateGenerator | Opcode::SuspendYield | Opcode::Await => {
                     panic!("generator/async opcodes not expected in tier-1 programs")
                 }
@@ -1198,8 +1242,6 @@ fn unsupported_constructs_fail_as_compile_errors() {
         "let x = 1n;",
         "for (let v of [1]) {}",
         "switch (1) { case 1: break; }",
-        "'x' in {}",
-        "({}) instanceof Object",
         "new Object()",
         "missing_global_xyz",
         "[...[1]]",
@@ -1229,6 +1271,68 @@ fn unsupported_constructs_fail_as_compile_errors() {
 fn parse_errors_surface_as_compile_errors() {
     let err = compile_source_with_strings("let let let;").expect_err("parse fails");
     assert!(err.message.contains("parse error"), "{}", err.message);
+}
+
+#[test]
+fn in_operator_compiles_to_opcode() {
+    let (p, _) =
+        compile_source_with_strings("let o = {a: 1}; let k = 'a'; let r = k in o;").unwrap();
+    let fb = &p.functions[p.main as usize];
+    assert!(fb.validate().is_ok());
+    assert!(
+        fb.instrs.iter().any(|i| i.op() == Some(Opcode::In)),
+        "expected In opcode in:\n{fb}"
+    );
+    // Validate operand layout: In dst, key, obj
+    let in_instr = fb
+        .instrs
+        .iter()
+        .find(|i| i.op() == Some(Opcode::In))
+        .unwrap();
+    assert!(u16::from(in_instr.a()) < fb.max_regs);
+}
+
+#[test]
+fn instanceof_operator_compiles_to_opcode() {
+    let src = "let F = function () {}; let o = {}; let r = o instanceof F;";
+    let (p, _) = compile_source_with_strings(src).unwrap();
+    let fb = &p.functions[p.main as usize];
+    assert!(fb.validate().is_ok());
+    assert!(
+        fb.instrs.iter().any(|i| i.op() == Some(Opcode::InstanceOf)),
+        "expected InstanceOf opcode in:\n{fb}"
+    );
+}
+
+#[test]
+fn too_many_locals_returns_compile_error_not_panic() {
+    // Build a source with 300 distinct let bindings in one function scope,
+    // exceeding the u8 register limit (255). The compiler must return a
+    // graceful CompileError with message "too many functions/constants".
+    let mut src = String::new();
+    for i in 0..300 {
+        src.push_str(&format!("let v{i} = {i};\n"));
+    }
+    src.push_str("let sum = 0;\n");
+    let err = compile_source_with_strings(&src).expect_err("should overflow registers");
+    assert!(
+        err.message.contains("too many functions/constants"),
+        "unexpected message: {}",
+        err.message
+    );
+    assert!(
+        err.span.is_some(),
+        "overflow error must carry a span for negative-test fidelity"
+    );
+    // Near-limit program should still compile.
+    let mut ok_src = String::new();
+    for i in 0..80 {
+        ok_src.push_str(&format!("let v{i} = {i};\n"));
+    }
+    assert!(
+        compile_source_with_strings(&ok_src).is_ok(),
+        "80 locals should fit within limits"
+    );
 }
 
 // ---------------------------------------------------------------------------

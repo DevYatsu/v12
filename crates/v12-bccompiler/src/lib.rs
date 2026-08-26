@@ -11,9 +11,9 @@
 //!
 //! - **Tier 1** — literals (numeric/string/bool), `let`/`const`/`var` with
 //!   block scoping via registers, arithmetic / logical (`&&`, `||`, `??`) /
-//!   bitwise / comparison / strict-equality operators, `typeof`, unary
-//!   `-`/`!`/`~`, `++`/`--` (prefix & postfix), assignment to locals,
-//!   properties, and object members; expression statements; `if`/`else`;
+//!   bitwise / comparison / strict-equality / `in` / `instanceof` operators,
+//!   `typeof`, unary `-`/`!`/`~`, `++`/`--` (prefix & postfix), assignment to
+//!   locals, properties, and object members; expression statements; `if`/`else`;
 //!   `while`/`do-while`/`for(;;)`; labeled `break`/`continue`; `return`;
 //!   function declarations/expressions/arrows; plain + method calls;
 //!   property get/set by identifier/string keys; object/array literals;
@@ -29,7 +29,7 @@
 //! - `new Expr()` — no construct opcode exists in the ISA; rejected rather
 //!   than mis-encoded (documented ISA gap).
 //! - `null` literals — the constant pool has no null kind yet.
-//! - Unary `+` (no ToNumber opcode), `in`/`instanceof`, spread, optional
+//! - Unary `+` (no ToNumber opcode), spread, optional
 //!   chaining/calls, computed property keys, getters/setters/method
 //!   shorthand in object literals, BigInt/RegExp literals, template literals
 //!   with substitutions, classes, generators/async, `for-in`/`for-of`,
@@ -354,7 +354,7 @@ fn compile_ast_inner(
     scoping: &Scoping,
     interner: &mut Interner,
 ) -> Result<Program, CompileError> {
-    let plans = collect::collect(program, scoping);
+    let plans = collect::collect(program, scoping)?;
     // Scripts must not carry module linkage.
     if !plans.imports.is_empty() {
         let span = plans.imports.first().and_then(|e| e.span);
@@ -396,7 +396,7 @@ fn compile_ast_as_module_inner(
     scoping: &Scoping,
     interner: &mut Interner,
 ) -> Result<Module, CompileError> {
-    let plans = collect::collect(program, scoping);
+    let plans = collect::collect(program, scoping)?;
     // Modules are always strict, even without a directive.
     let strict = true;
     let imports = plans.imports.clone();

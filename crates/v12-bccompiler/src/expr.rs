@@ -400,9 +400,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             BinaryOperator::LessEqualThan => Opcode::Le,
             BinaryOperator::GreaterThan => Opcode::Gt,
             BinaryOperator::GreaterEqualThan => Opcode::Ge,
-            BinaryOperator::In | BinaryOperator::Instanceof => {
-                return Err(self.err(span, "`in` / `instanceof` have no bytecode opcodes yet"));
-            }
+            BinaryOperator::In => Opcode::In,
+            BinaryOperator::Instanceof => Opcode::InstanceOf,
         };
         let l = self.expr(lhs)?;
         let r = self.expr(rhs)?;

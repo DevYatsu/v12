@@ -29,11 +29,12 @@ use oxc_semantic::{Scoping, SymbolId};
 use oxc_span::GetSpan;
 
 use crate::model::{
-    ExportEntry, ImportEntry, MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan, VarLoc,
+    CompileError, ExportEntry, ImportEntry, MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan,
+    VarLoc,
 };
 
 /// Entry point: produce finalized layout plans for a whole program.
-pub fn collect(program: &Program<'_>, scoping: &Scoping) -> Plans {
+pub fn collect(program: &Program<'_>, scoping: &Scoping) -> Result<Plans, CompileError> {
     let mut c = Collector {
         scoping,
         plans: Plans::default(),
@@ -48,8 +49,8 @@ pub fn collect(program: &Program<'_>, scoping: &Scoping) -> Plans {
     c.stmt_list(&program.body);
     let mut plans = c.plans;
     plans.ref_sites = c.ref_sites;
-    finalize(&mut plans);
-    plans
+    finalize(&mut plans)?;
+    Ok(plans)
 }
 
 struct Collector<'s> {
@@ -663,7 +664,11 @@ fn ident_name_of_binding(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<String>
 /// Layout order per unit is deterministic: declaration order (params first)
 /// for both env slots and registers; the synthetic `this` slot (when an
 /// arrow-descendant reads it) trails all named slots.
-fn finalize(plans: &mut Plans) {
+///
+/// Register and slot counters are `u8`; overflow is reported as a
+/// `CompileError` with message `"too many functions/constants"` instead of
+/// panicking so negative tests can observe a compile failure.
+fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
     // 1. Captures: referenced-from-outside ⇒ escapes.
     let sites = std::mem::take(&mut plans.ref_sites);
     let homes = &plans.home_of;
@@ -689,7 +694,10 @@ fn finalize(plans: &mut Plans) {
         }
 
         let mut slot: u8 = 0;
-        let mut reg: u8 = REG_THIS + 1;
+        let mut reg: u8 = REG_THIS.checked_add(1).ok_or_else(|| CompileError {
+            message: "too many functions/constants".into(),
+            span: Some((0, 0)),
+        })?;
         let decl_count = plans.units[ui].decl_order.len();
         for i in 0..decl_count {
             let sym = plans.units[ui].decl_order[i];
@@ -700,22 +708,34 @@ fn finalize(plans: &mut Plans) {
             if plans.captured.contains(&sym) {
                 plans.units[ui].env_slots.insert(sym, slot);
                 plans.units[ui].vars.insert(sym, VarLoc::Env(slot));
-                slot += 1;
+                slot = slot.checked_add(1).ok_or_else(|| CompileError {
+                    message: "too many functions/constants".into(),
+                    span: Some((0, 0)),
+                })?;
             } else {
                 plans.units[ui].vars.insert(sym, VarLoc::Reg(reg));
-                reg += 1;
+                reg = reg.checked_add(1).ok_or_else(|| CompileError {
+                    message: "too many functions/constants".into(),
+                    span: Some((0, 0)),
+                })?;
             }
         }
         let unit = &mut plans.units[ui];
         if unit.needs_this && unit.has_env {
             unit.this_slot = Some(slot);
-            slot += 1;
+            slot = slot.checked_add(1).ok_or_else(|| CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            })?;
         }
         unit.env_slot_count = slot;
         unit.locals_end = reg;
-        assert!(
-            reg < MAX_REGS && slot < MAX_ENV_SLOTS,
-            "register/slot overflow"
-        );
+        if u16::from(reg) >= u16::from(MAX_REGS) || u16::from(slot) >= u16::from(MAX_ENV_SLOTS) {
+            return Err(CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            });
+        }
     }
+    Ok(())
 }

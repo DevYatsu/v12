@@ -280,3 +280,242 @@ fn catch_binding_inside_function() {
     .expect("catch in function should compile");
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(42));
 }
+
+// ---------------------------------------------------------------------------
+// `in` operator
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_operator_own_property() {
+    let mut interp =
+        Interp::from_source("let o = {a: 1, b: 2}; throw ('a' in o);").expect("compiles");
+    let v = expect_throw(&mut interp);
+    assert_eq!(v.as_bool(), Some(true));
+}
+
+#[test]
+fn in_operator_missing_property() {
+    let mut interp = Interp::from_source("let o = {a: 1}; throw ('z' in o);").expect("compiles");
+    let v = expect_throw(&mut interp);
+    assert_eq!(v.as_bool(), Some(false));
+}
+
+#[test]
+fn in_operator_non_object_rhs_throws() {
+    let mut interp = Interp::from_source("throw ('a' in 123);").expect("compiles");
+    let thrown = expect_throw(&mut interp);
+    let msg = interp.to_display_string(thrown);
+    assert!(msg.contains("TypeError"), "expected TypeError, got {msg}");
+}
+
+#[test]
+fn in_operator_heap_prototype_chain() {
+    // Parent has "inheritedKey", child prototypes parent: `inheritedKey in child` true.
+    let mut interp = program_of(empty_fn(
+        2,
+        vec![Instr::new(Opcode::Return, 0, 0, 0)],
+        ConstantPool::new(),
+    ));
+    let parent = {
+        let heap = interp.heap_mut_for_test();
+        let p = heap.alloc(v12_heap::JsObject::default());
+        heap.add_root(v12_heap::JsValue::object(p));
+        p
+    };
+    let child = {
+        let heap = interp.heap_mut_for_test();
+        let c = heap.alloc(v12_heap::JsObject {
+            prototype: Some(parent),
+            ..Default::default()
+        });
+        heap.add_root(v12_heap::JsValue::object(c));
+        c
+    };
+    let (_key, key_v, shape) = {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.intern_string(v12_heap::V12Str::latin1(b"inheritedKey".to_vec()));
+        heap.add_root(v12_heap::JsValue::string(s));
+        let key = v12_heap::PropKey::from_string(s);
+        let key_v = v12_heap::JsValue::string(s);
+        let shape = heap.add_property(heap.root_shape(), key, v12_heap::Attrs::DEFAULT);
+        heap.add_shape_root(shape);
+        (key, key_v, shape)
+    };
+    interp.bind_shape_for_test(parent, shape);
+    interp
+        .heap_mut_for_test()
+        .get_mut(parent)
+        .properties
+        .push(v12_heap::JsValue::from_i32_smi(1).unwrap());
+    let child_v = v12_heap::JsValue::object(child);
+    assert!(interp.op_in_for_test(key_v, child_v).unwrap());
+    // Missing key is false.
+    let missing_v = {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.intern_string(v12_heap::V12Str::latin1(b"missing".to_vec()));
+        v12_heap::JsValue::string(s)
+    };
+    assert!(!interp.op_in_for_test(missing_v, child_v).unwrap());
+    // Own property on child also true.
+    {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.intern_string(v12_heap::V12Str::latin1(b"own".to_vec()));
+        heap.add_root(v12_heap::JsValue::string(s));
+        let k = v12_heap::PropKey::from_string(s);
+        let child_shape = heap.add_property(heap.root_shape(), k, v12_heap::Attrs::DEFAULT);
+        heap.add_shape_root(child_shape);
+        let s_handle = s;
+        let _k = k;
+        interp.bind_shape_for_test(child, child_shape);
+        interp
+            .heap_mut_for_test()
+            .get_mut(child)
+            .properties
+            .push(v12_heap::JsValue::from_i32_smi(2).unwrap());
+        let own_v = v12_heap::JsValue::string(s_handle);
+        assert!(interp.op_in_for_test(own_v, child_v).unwrap());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `instanceof` operator
+// ---------------------------------------------------------------------------
+
+#[test]
+fn instanceof_plain_objects_false() {
+    // obj not linked to Ctor.prototype => false.
+    let mut interp = Interp::from_source(
+        "
+        let Ctor = function () {};
+        Ctor.prototype = {kind: 'proto'};
+        let obj = {a: 1};
+        throw (obj instanceof Ctor);
+        ",
+    )
+    .expect("compiles");
+    let v = expect_throw(&mut interp);
+    assert_eq!(v.as_bool(), Some(false));
+}
+
+#[test]
+fn instanceof_prototype_chain_via_heap() {
+    // Instance's prototype chain contains Ctor.prototype => true.
+    let mut interp = program_of(empty_fn(
+        2,
+        vec![Instr::new(Opcode::Return, 0, 0, 0)],
+        ConstantPool::new(),
+    ));
+    let proto = {
+        let heap = interp.heap_mut_for_test();
+        let p = heap.alloc(v12_heap::JsObject::default());
+        heap.add_root(v12_heap::JsValue::object(p));
+        p
+    };
+    let ctor = {
+        let heap = interp.heap_mut_for_test();
+        let c = heap.alloc(v12_heap::JsObject {
+            kind: crate::KIND_FUNCTION,
+            ..Default::default()
+        });
+        heap.add_root(v12_heap::JsValue::object(c));
+        c
+    };
+    let instance = {
+        let heap = interp.heap_mut_for_test();
+        let i = heap.alloc(v12_heap::JsObject {
+            prototype: Some(proto),
+            ..Default::default()
+        });
+        heap.add_root(v12_heap::JsValue::object(i));
+        i
+    };
+    // Ctor.prototype = proto
+    let shape = {
+        let heap = interp.heap_mut_for_test();
+        let s = heap.intern_string(v12_heap::V12Str::latin1(b"prototype".to_vec()));
+        heap.add_root(v12_heap::JsValue::string(s));
+        let key = v12_heap::PropKey::from_string(s);
+        let shape = heap.add_property(heap.root_shape(), key, v12_heap::Attrs::DEFAULT);
+        heap.add_shape_root(shape);
+        shape
+    };
+    interp.bind_shape_for_test(ctor, shape);
+    interp
+        .heap_mut_for_test()
+        .get_mut(ctor)
+        .properties
+        .push(v12_heap::JsValue::object(proto));
+    let lhs_v = v12_heap::JsValue::object(instance);
+    let rhs_v = v12_heap::JsValue::object(ctor);
+    assert!(interp.op_instanceof_for_test(lhs_v, rhs_v).unwrap());
+    // Unrelated object is false.
+    let unrelated = {
+        let heap = interp.heap_mut_for_test();
+        let u = heap.alloc(v12_heap::JsObject::default());
+        heap.add_root(v12_heap::JsValue::object(u));
+        u
+    };
+    assert!(
+        !interp
+            .op_instanceof_for_test(v12_heap::JsValue::object(unrelated), rhs_v)
+            .unwrap()
+    );
+    // Primitive lhs is false, not throw.
+    assert!(
+        !interp
+            .op_instanceof_for_test(v12_heap::JsValue::from_i32_smi(5).unwrap(), rhs_v)
+            .unwrap()
+    );
+    // Chain of two hops: instance -> middle -> proto
+    let middle = {
+        let heap = interp.heap_mut_for_test();
+        let m = heap.alloc(v12_heap::JsObject {
+            prototype: Some(proto),
+            ..Default::default()
+        });
+        heap.add_root(v12_heap::JsValue::object(m));
+        m
+    };
+    let instance2 = {
+        let heap = interp.heap_mut_for_test();
+        let i2 = heap.alloc(v12_heap::JsObject {
+            prototype: Some(middle),
+            ..Default::default()
+        });
+        heap.add_root(v12_heap::JsValue::object(i2));
+        i2
+    };
+    assert!(
+        interp
+            .op_instanceof_for_test(v12_heap::JsValue::object(instance2), rhs_v)
+            .unwrap()
+    );
+}
+
+#[test]
+fn instanceof_non_object_lhs_false() {
+    let mut interp = Interp::from_source(
+        "
+        let Ctor = function () {};
+        Ctor.prototype = {};
+        throw (123 instanceof Ctor);
+        ",
+    )
+    .expect("compiles");
+    let v = expect_throw(&mut interp);
+    assert_eq!(v.as_bool(), Some(false));
+}
+
+#[test]
+fn instanceof_non_callable_rhs_throws() {
+    let mut interp = Interp::from_source("let o = {}; throw (o instanceof {});").expect("compiles");
+    let thrown = expect_throw(&mut interp);
+    let msg = interp.to_display_string(thrown);
+    assert!(msg.contains("TypeError"), "expected TypeError, got {msg}");
+
+    let mut interp2 =
+        Interp::from_source("let o = {}; throw (o instanceof 123);").expect("compiles");
+    let thrown2 = expect_throw(&mut interp2);
+    let msg2 = interp2.to_display_string(thrown2);
+    assert!(msg2.contains("TypeError"), "expected TypeError, got {msg2}");
+}

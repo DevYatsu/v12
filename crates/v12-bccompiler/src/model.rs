@@ -346,6 +346,7 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     pub(crate) handler_max: u32,
     pub loops: Vec<LoopCtx>,
     pub finallies: Vec<FinallyCtx<'a>>,
+    overflow: Option<CompileError>,
 }
 
 impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
@@ -360,6 +361,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             handler_max: 0,
             loops: Vec::new(),
             finallies: Vec::new(),
+            overflow: None,
         }
     }
 
@@ -374,17 +376,44 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     // -- registers ----------------------------------------------------------
 
     pub fn new_temp(&mut self) -> u8 {
+        if self.overflow.is_some() {
+            return 0;
+        }
         let r = self.temp_top;
-        self.temp_top += 1;
-        self.track(r);
+        let Some(next) = self.temp_top.checked_add(1) else {
+            self.overflow = Some(CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            });
+            return 0;
+        };
+        self.temp_top = next;
+        if let Err(e) = self.track(r) {
+            self.overflow = Some(e);
+            return 0;
+        }
         r
     }
 
     /// Contiguous block for call layouts and array elements.
     pub fn new_temps(&mut self, n: u8) -> u8 {
+        if self.overflow.is_some() {
+            return 0;
+        }
         let base = self.temp_top;
-        self.temp_top += n;
-        self.track(base + n.saturating_sub(1));
+        let Some(next) = self.temp_top.checked_add(n) else {
+            self.overflow = Some(CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            });
+            return 0;
+        };
+        self.temp_top = next;
+        let top = base.checked_add(n.saturating_sub(1)).unwrap_or(base);
+        if let Err(e) = self.track(top) {
+            self.overflow = Some(e);
+            return 0;
+        }
         base
     }
 
@@ -396,12 +425,15 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.temp_top = mark.min(self.temp_top);
     }
 
-    fn track(&mut self, reg: u8) {
-        assert!(
-            reg < MAX_REGS,
-            "register pressure: more than {MAX_REGS} registers"
-        );
+    fn track(&mut self, reg: u8) -> Result<(), CompileError> {
+        if u16::from(reg) >= u16::from(MAX_REGS) {
+            return Err(CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            });
+        }
         self.high_water = self.high_water.max(reg + 1);
+        Ok(())
     }
 
     /// The reserved never-written register; reading it yields `undefined`
@@ -545,6 +577,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// Assembles, optimizes, and validates the unit's bytecode.
     pub fn finish(mut self) -> Result<v12_bytecode::FunctionBytecode, CompileError> {
+        if let Some(err) = self.overflow.take() {
+            return Err(err);
+        }
         let locals_end = self.comp.plans.units[self.unit].locals_end;
         let mut regs = self.high_water.max(locals_end + 1);
         // Handlers deliver the exception into register `stack_depth`, so the

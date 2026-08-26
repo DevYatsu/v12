@@ -208,6 +208,8 @@ pub struct Interp {
     typeof_names: [Option<Handle<V12Str>>; TYPE_NAME_COUNT],
     /// Cached property key for the array `length` property.
     length_key: Option<PropKey>,
+    /// Cached key for the `prototype` property used by `instanceof`.
+    prototype_key: Option<PropKey>,
     /// Cached `root --length--> child` shape shared by every array.
     length_shape: Option<ShapeHandle>,
     /// Shape indexes already pinned via `add_shape_root` (pinning is
@@ -249,6 +251,7 @@ impl Interp {
             const_strings: std::collections::HashMap::new(),
             typeof_names: [const { None }; TYPE_NAME_COUNT],
             length_key: None,
+            prototype_key: None,
             length_shape: None,
             pinned_shapes: HashSet::new(),
             shape_of_cell: std::collections::HashMap::new(),
@@ -286,6 +289,31 @@ impl Interp {
     #[cfg(test)]
     pub(crate) fn heap_mut_for_test(&mut self) -> &mut Heap {
         &mut self.heap
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_shape_for_test(&mut self, obj: Handle<JsObject>, shape: ShapeHandle) {
+        self.bind_shape(obj, shape);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn op_in_for_test(
+        &mut self,
+        key_v: JsValue,
+        obj_v: JsValue,
+    ) -> Result<bool, JSException> {
+        self.gc_protect();
+        self.op_in(key_v, obj_v)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn op_instanceof_for_test(
+        &mut self,
+        lhs_v: JsValue,
+        rhs_v: JsValue,
+    ) -> Result<bool, JSException> {
+        self.gc_protect();
+        self.op_instanceof(lhs_v, rhs_v)
     }
 
     #[cfg(test)]
@@ -552,6 +580,22 @@ impl Interp {
                     let tag = self.type_tag(v);
                     let name = attempt!(self.typeof_name(tag));
                     self.stack[base + usize::from(instr.a())] = JsValue::string(name);
+                    self.set_pc(pc + 1);
+                }
+                Opcode::In => {
+                    let key_v = self.stack[base + usize::from(instr.b())];
+                    let obj_v = self.stack[base + usize::from(instr.c())];
+                    self.gc_protect();
+                    let present = attempt!(self.op_in(key_v, obj_v));
+                    self.write_bool(base, instr.a(), present);
+                    self.set_pc(pc + 1);
+                }
+                Opcode::InstanceOf => {
+                    let lhs_v = self.stack[base + usize::from(instr.b())];
+                    let rhs_v = self.stack[base + usize::from(instr.c())];
+                    self.gc_protect();
+                    let result = attempt!(self.op_instanceof(lhs_v, rhs_v));
+                    self.write_bool(base, instr.a(), result);
                     self.set_pc(pc + 1);
                 }
 
@@ -1040,6 +1084,16 @@ impl Interp {
         k
     }
 
+    fn prototype_key(&mut self) -> PropKey {
+        if let Some(k) = self.prototype_key {
+            return k;
+        }
+        let h = intern_text(&mut self.heap, "prototype");
+        let k = PropKey::from_string(h);
+        self.prototype_key = Some(k);
+        k
+    }
+
     fn array_shape(&mut self) -> ShapeHandle {
         if let Some(s) = self.length_shape {
             return s;
@@ -1229,6 +1283,89 @@ impl Interp {
             cur = self.heap.get(o).prototype;
         }
         None
+    }
+
+    /// `in` operator: `key in obj`. Throws TypeError if `obj` is not an
+    /// object; otherwise returns true when `key` (after ToPropertyKey)
+    /// exists anywhere on `obj`'s prototype chain, including array indices.
+    fn op_in(&mut self, key_v: JsValue, obj_v: JsValue) -> Result<bool, JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: right-hand side of 'in' should be an object",
+            )));
+        };
+        // Fast path for array indices: check element storage before coercing
+        // the key, which may allocate. Holes count as absent.
+        if self.heap.get(obj).kind == KIND_ARRAY
+            && let Some(idx) = self.array_index_of(key_v)
+            && let Some(slot) = self.heap.get(obj).elements.get(idx as usize)
+            && !slot.is_hole()
+        {
+            return Ok(true);
+        }
+        let key = self.property_key(key_v)?;
+        let mut cur = Some(obj);
+        while let Some(o) = cur {
+            let sh = self.shape_of(o);
+            if self.heap.lookup_property(sh, key).is_some() {
+                return Ok(true);
+            }
+            // For arrays, the prototype chain check after the element fast
+            // path already covers named properties; indices are only in the
+            // element store, so no extra work is needed. We still walk in
+            // case a numeric string was installed as a named property.
+            cur = self.heap.get(o).prototype;
+        }
+        // If we fell through from the array fast path with a hole, and the
+        // shape walk found nothing, the property is absent.
+        Ok(false)
+    }
+
+    /// `instanceof` operator. Throws TypeError if `rhs` is not an object
+    /// with an object-typed `prototype` property; returns false if `lhs`
+    /// is not an object; otherwise walks `lhs`'s prototype chain for
+    /// identity against `rhs.prototype`.
+    fn op_instanceof(&mut self, lhs_v: JsValue, rhs_v: JsValue) -> Result<bool, JSException> {
+        let Some(rhs_obj) = rhs_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: right-hand side of 'instanceof' is not an object",
+            )));
+        };
+        let proto_key = self.prototype_key();
+        // Locate `rhs.prototype` along rhs's prototype chain (own or inherited).
+        let mut rhs_proto_val: Option<JsValue> = None;
+        {
+            let mut cur = Some(rhs_obj);
+            while let Some(o) = cur {
+                let sh = self.shape_of(o);
+                if let Some(d) = self.heap.lookup_property(sh, proto_key) {
+                    rhs_proto_val = Some(self.heap.get(o).properties[d.slot as usize]);
+                    break;
+                }
+                cur = self.heap.get(o).prototype;
+            }
+        }
+        let Some(proto_val) = rhs_proto_val else {
+            return Err(JSException(self.error_value(
+                "TypeError: function has non-object prototype 'prototype' in instanceof check",
+            )));
+        };
+        let Some(proto_obj) = proto_val.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: function has non-object prototype 'prototype' in instanceof check",
+            )));
+        };
+        let Some(mut cur) = lhs_v.as_object() else {
+            return Ok(false);
+        };
+        loop {
+            let next = self.heap.get(cur).prototype;
+            match next {
+                None => return Ok(false),
+                Some(p) if p == proto_obj => return Ok(true),
+                Some(p) => cur = p,
+            }
+        }
     }
 
     /// `DeleteProperty`: configurable own properties become holes (slot

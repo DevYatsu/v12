@@ -72,6 +72,15 @@ pub enum Opcode {
     CreateGenerator = 50,
     SuspendYield = 51,
     Await = 52,
+    /// `key in obj` — `r{a} = (r{b} in r{c})` where `b` is key, `c` is object.
+    /// Throws TypeError if `r{c}` is not an object; otherwise tests
+    /// HasProperty walking the prototype chain after ToPropertyKey on `r{b}`.
+    In = 53,
+    /// `obj instanceof ctor` — `r{a} = (r{b} instanceof r{c})`.
+    /// Throws TypeError if `r{c}` is not an object with an object-typed
+    /// `prototype`; otherwise walks `r{b}`'s prototype chain for identity
+    /// against `r{c}.prototype`.
+    InstanceOf = 54,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -127,6 +136,8 @@ impl TryFrom<u8> for Opcode {
             50 => Ok(Self::CreateGenerator),
             51 => Ok(Self::SuspendYield),
             52 => Ok(Self::Await),
+            53 => Ok(Self::In),
+            54 => Ok(Self::InstanceOf),
             other => Err(other),
         }
     }
@@ -283,6 +294,8 @@ mod encoding_tests {
         Opcode::CreateGenerator,
         Opcode::SuspendYield,
         Opcode::Await,
+        Opcode::In,
+        Opcode::InstanceOf,
     ];
 
     #[test]
@@ -290,6 +303,8 @@ mod encoding_tests {
         assert_eq!(Opcode::Move as u8, 1);
         assert_eq!(Opcode::Wide as u8, 4);
         assert_eq!(Opcode::Await as u8, 52);
+        assert_eq!(Opcode::In as u8, 53);
+        assert_eq!(Opcode::InstanceOf as u8, 54);
         let unique: std::collections::HashSet<u8> = ALL_OPS.iter().map(|&op| op as u8).collect();
         assert_eq!(unique.len(), ALL_OPS.len());
     }
@@ -854,6 +869,8 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::CreateGenerator => "create_generator",
         Opcode::SuspendYield => "suspend_yield",
         Opcode::Await => "await",
+        Opcode::In => "in",
+        Opcode::InstanceOf => "instance_of",
     }
 }
 
@@ -903,6 +920,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::CreateGenerator => write!(f, " r{a}, r{b}"),
         Opcode::SuspendYield => write!(f, " r{a}"),
         Opcode::Await => write!(f, " r{a}, r{b}"),
+        Opcode::In | Opcode::InstanceOf => write!(f, " r{a}, r{b}, r{c}"),
     }
 }
 

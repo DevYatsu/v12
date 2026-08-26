@@ -21,9 +21,10 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     38, 39, 40, // Call, Return, Throw
     41, 42, 43, 44, 45, 46, 47, 48, 49, // GetProperty .. SetEnvSlot
     50, 51, 52, // CreateGenerator, SuspendYield, Await
+    53, 54, // In, InstanceOf
 ];
 
-pub const EXPECTED_OPCODE_COUNT: usize = 47;
+pub const EXPECTED_OPCODE_COUNT: usize = 49;
 
 /// Seeded splitmix64. Deterministic across platforms and runs.
 pub struct Rng(u64);
