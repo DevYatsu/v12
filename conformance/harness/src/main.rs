@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(dead_code)]
 
 //! `test262-runner`: execute Test262 tests via `v12-engine`.
 //!
@@ -321,7 +322,7 @@ mod cli_tests {
     #[test]
     fn normalize_jobs_zero_is_auto() {
         let n = normalize_jobs(0);
-        assert!(n >= 1 && n <= MAX_JOBS);
+        assert!((1..=MAX_JOBS).contains(&n));
     }
 
     #[test]

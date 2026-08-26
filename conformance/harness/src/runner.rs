@@ -173,12 +173,17 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
             let (src, errs) = load_harness_includes(&includes_to_load, harness_dir);
             // Fallback: if assert.js/sta.js missing from checkout but needed,
             // inject the minimal polyfill plus whatever we did load.
-            if !errs.is_empty() && includes_to_load.iter().any(|n| n == "assert.js" || n == "sta.js") {
-                let has_polyfill_needed = test_body.contains("assert.") || test_body.contains("Test262Error");
+            if !errs.is_empty()
+                && includes_to_load
+                    .iter()
+                    .any(|n| n == "assert.js" || n == "sta.js")
+            {
+                let has_polyfill_needed =
+                    test_body.contains("assert.") || test_body.contains("Test262Error");
                 if has_polyfill_needed {
                     let mut combined = src;
                     combined.push_str(MINIMAL_HARNESS_POLYFILL);
-                    combined.push_str("\n");
+                    combined.push('\n');
                     (combined, Vec::new())
                 } else {
                     (src, errs)
@@ -598,12 +603,12 @@ pub fn discover_tests(test262_root: &Path, filter: Option<&str>) -> Vec<PathBuf>
             if !pat.matches(&rel) && !pat.matches(&path.to_string_lossy()) {
                 continue;
             }
-        } else if let Some(sub) = substring_filter {
-            if !sub.is_empty() {
-                let rel = relative_suite_path(path, test262_root);
-                if !rel.contains(sub) && !path.to_string_lossy().contains(sub) {
-                    continue;
-                }
+        } else if let Some(sub) = substring_filter
+            && !sub.is_empty()
+        {
+            let rel = relative_suite_path(path, test262_root);
+            if !rel.contains(sub) && !path.to_string_lossy().contains(sub) {
+                continue;
             }
         }
 

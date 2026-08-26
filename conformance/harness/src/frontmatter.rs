@@ -88,12 +88,12 @@ pub fn parse_frontmatter(source: &str) -> Frontmatter {
 /// Removes the frontmatter comment block from `source`, returning the
 /// remainder. If no block is present, returns `source` unchanged.
 #[must_use]
-pub fn strip_frontmatter<'a>(source: &'a str) -> &'a str {
-    if let Some(start) = source.find("/*---") {
-        if let Some(end_offset) = source[start..].find("---*/") {
-            let end = start + end_offset + "---*/".len();
-            return &source[end..];
-        }
+pub fn strip_frontmatter(source: &str) -> &str {
+    if let Some(start) = source.find("/*---")
+        && let Some(end_offset) = source[start..].find("---*/")
+    {
+        let end = start + end_offset + "---*/".len();
+        return &source[end..];
     }
     source
 }
