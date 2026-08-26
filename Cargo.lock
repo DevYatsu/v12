@@ -1835,6 +1835,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "target-lexicon",
  "v12-bytecode",
  "v12-heap",
  "v12-interp",
