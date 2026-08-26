@@ -184,7 +184,12 @@ fn parse_yaml_block(raw: &str) -> Frontmatter {
 
 /// Parses a scalar that may be inline or a block (`|` / `>`).
 fn parse_scalar_value(value_part: &str, lines: &[&str], idx: &mut usize) -> String {
-    if value_part.is_empty() || value_part == "|" || value_part == ">" || value_part == "|-" || value_part == ">-" {
+    if value_part.is_empty()
+        || value_part == "|"
+        || value_part == ">"
+        || value_part == "|-"
+        || value_part == ">-"
+    {
         // Block scalar — collect indented lines.
         let mut out = String::new();
         let mut j = *idx + 1;
@@ -206,11 +211,7 @@ fn parse_scalar_value(value_part: &str, lines: &[&str], idx: &mut usize) -> Stri
             }
         }
         *idx = j - 1;
-        if out.is_empty() {
-            String::new()
-        } else {
-            out
-        }
+        if out.is_empty() { String::new() } else { out }
     } else {
         // Strip surrounding quotes if present.
         let v = value_part.trim();
@@ -237,12 +238,7 @@ fn parse_string_list(value_part: &str, lines: &[&str], idx: &mut usize) -> Vec<S
         }
         return inner
             .split(',')
-            .map(|s| {
-                s.trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string()
-            })
+            .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
             .filter(|s| !s.is_empty())
             .collect();
     }
@@ -288,11 +284,7 @@ fn parse_string_list(value_part: &str, lines: &[&str], idx: &mut usize) -> Vec<S
 ///   phase: parse
 ///   type: SyntaxError
 /// ```
-fn parse_negative_block(
-    value_part: &str,
-    lines: &[&str],
-    idx: &mut usize,
-) -> Option<Negative> {
+fn parse_negative_block(value_part: &str, lines: &[&str], idx: &mut usize) -> Option<Negative> {
     // Inline form: negative: {phase: parse, type: SyntaxError}
     // Rare, but handle simple case.
     if value_part.starts_with('{') {
@@ -467,7 +459,8 @@ flags: [module, raw]
 
     #[test]
     fn resolution_phase_parsed() {
-        let src = "/*---\nnegative:\n  phase: resolution\n  type: SyntaxError\nflags: [module]\n---*/";
+        let src =
+            "/*---\nnegative:\n  phase: resolution\n  type: SyntaxError\nflags: [module]\n---*/";
         let fm = parse_frontmatter(src);
         assert_eq!(fm.negative.as_ref().unwrap().phase, "resolution");
         assert!(fm.has_flag("module"));

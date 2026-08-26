@@ -1590,3 +1590,33 @@ fn example_03_functions_compiles_and_validates() {
         f.validate().expect("validate");
     }
 }
+/// Regression for the catch-binding register window.
+///
+/// The `catch (e)` binding lives inside the handler's register window whose
+/// size is `stack_depth`. The delivery register itself is `stack_depth`, so
+/// `max_regs` must be at least `stack_depth + 1` and the catch binding's
+/// register (when allocated as a `Reg`) must lie within that window.
+#[test]
+fn catch_binding_registers_validate() {
+    let src = "try { throw 1; } catch (e) { e }";
+    let (prog, _) = compile_source_with_strings(src).expect("catch program should compile");
+    for func in &prog.functions {
+        func.validate().expect("handler ranges should validate");
+        if let Some(max_depth) = func.handlers.iter().map(|h| h.stack_depth).max() {
+            assert!(
+                u32::from(func.max_regs) > max_depth,
+                "max_regs {} must exceed handler stack_depth {}",
+                func.max_regs,
+                max_depth
+            );
+        }
+    }
+    // A second shape with an outer variable that the catch body writes to,
+    // exercising the `move r_caught, r_e` path that previously triggered
+    // `index out of bounds: len 6 but index 7` at `base + reg`.
+    let src2 = "let caught=0; try { throw 99; } catch(e){caught=e;}";
+    let (prog2, _) = compile_source_with_strings(src2).expect("outer catch write should compile");
+    for func in &prog2.functions {
+        func.validate().expect("handler ranges should validate");
+    }
+}

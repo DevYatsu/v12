@@ -249,3 +249,34 @@ fn alloc_inside_call_keeps_arguments_rooted() {
     interp.heap_mut_for_test().gc_stress(Some(1));
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(42));
 }
+/// Regression for file-based `try { throw 99; } catch (e) { caught = e; }`.
+///
+/// The handler delivers the exception into register `stack_depth` and then
+/// copies it into the catch binding. The interpreter must keep the full
+/// register window (`max_regs`) alive across the unwind so handler
+/// temporaries beyond `stack_depth` remain addressable.
+#[test]
+fn catch_binding_delivers_correct_value() {
+    let mut interp =
+        Interp::from_source("let caught=0; try { throw 99; } catch(e){caught=e;} throw caught;")
+            .expect("catch program should compile");
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(99));
+}
+
+/// Catch inside a function, ensuring the delivery register and the binding
+/// work through the call frame's window.
+#[test]
+fn catch_binding_inside_function() {
+    let mut interp = Interp::from_source(
+        "
+        function f() {
+            let caught = 0;
+            try { throw 42; } catch (e) { caught = e; }
+            return caught;
+        }
+        throw f();
+        ",
+    )
+    .expect("catch in function should compile");
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(42));
+}

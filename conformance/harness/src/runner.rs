@@ -187,8 +187,9 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     // onlyStrict handling: ensure strict mode when requested. We prepend a
     // directive if the file does not already contain one, to avoid double
     // strict issues.
-    let needs_strict_prefix =
-        frontmatter.has_flag("onlyStrict") && !test_body.contains("\"use strict\"") && !test_body.contains("'use strict'");
+    let needs_strict_prefix = frontmatter.has_flag("onlyStrict")
+        && !test_body.contains("\"use strict\"")
+        && !test_body.contains("'use strict'");
     if needs_strict_prefix {
         combined.push_str("\"use strict\";\n");
     }
@@ -242,8 +243,17 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     }
 
     match exec_result {
-        Ok(Ok(_ok_value)) => handle_positive_or_negative_ok(&frontmatter, file_path, relative, suite, duration_ms),
-        Ok(Err(thrown_str)) => handle_thrown(&frontmatter, thrown_str, file_path, relative, suite, duration_ms),
+        Ok(Ok(_ok_value)) => {
+            handle_positive_or_negative_ok(&frontmatter, file_path, relative, suite, duration_ms)
+        }
+        Ok(Err(thrown_str)) => handle_thrown(
+            &frontmatter,
+            thrown_str,
+            file_path,
+            relative,
+            suite,
+            duration_ms,
+        ),
         Err(_) => TestOutcome {
             path: file_path.to_path_buf(),
             relative,
@@ -267,7 +277,9 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     }
     // Heuristic: async tests that call $DONE without the async flag (older
     // style) — treat as async skip as well.
-    if source.contains("$DONE") && (source.contains("async") || fm.includes.iter().any(|i| i.contains("doneprint"))) {
+    if source.contains("$DONE")
+        && (source.contains("async") || fm.includes.iter().any(|i| i.contains("doneprint")))
+    {
         // But only if the source looks like an async test (calls $DONE).
         // We do not want to skip sync tests that merely mention $DONE in
         // a comment. Check for `$DONE(` call form.
@@ -294,7 +306,10 @@ fn handle_positive_or_negative_ok(
                 relative,
                 suite,
                 status: Status::Fail,
-                message: format!("expected {} {} but no error thrown", neg.phase, neg.type_name),
+                message: format!(
+                    "expected {} {} but no error thrown",
+                    neg.phase, neg.type_name
+                ),
                 skip_reason: None,
                 duration_ms,
                 frontmatter: fm.clone(),
@@ -304,7 +319,10 @@ fn handle_positive_or_negative_ok(
                 relative,
                 suite,
                 status: Status::Fail,
-                message: format!("expected {} {} but no error thrown", neg.phase, neg.type_name),
+                message: format!(
+                    "expected {} {} but no error thrown",
+                    neg.phase, neg.type_name
+                ),
                 skip_reason: None,
                 duration_ms,
                 frontmatter: fm.clone(),
@@ -432,7 +450,10 @@ fn handle_thrown(
                 relative,
                 suite,
                 status: Status::Fail,
-                message: format!("negative with unknown phase: {} — thrown: {thrown_str}", neg.phase),
+                message: format!(
+                    "negative with unknown phase: {} — thrown: {thrown_str}",
+                    neg.phase
+                ),
                 skip_reason: None,
                 duration_ms,
                 frontmatter: fm.clone(),
@@ -515,7 +536,8 @@ pub fn discover_tests(test262_root: &Path, filter: Option<&str>) -> Vec<PathBuf>
             None
         }
     });
-    let substring_filter = filter.filter(|f| !f.contains('*') && !f.contains('?') && !f.contains('['));
+    let substring_filter =
+        filter.filter(|f| !f.contains('*') && !f.contains('?') && !f.contains('['));
 
     let mut files = Vec::new();
     for entry in walkdir::WalkDir::new(&test_dir)
@@ -625,14 +647,14 @@ mod tests {
         // Use a plain throw without `new` to avoid the `new` opcode gap.
         fs::write(&path, "throw 'oops';").unwrap();
         // Provide minimal harness for Test262Error.
-        fs::write(cfg.test262_root.join("harness").join("sta.js"), MINIMAL_HARNESS_POLYFILL).unwrap();
-        // Use an include so polyfill path is exercised differently.
-        let path2 = dir.join("fail2.js");
         fs::write(
-            &path2,
-            "/*---\nincludes: [sta.js]\n---*/\nthrow 'oops';",
+            cfg.test262_root.join("harness").join("sta.js"),
+            MINIMAL_HARNESS_POLYFILL,
         )
         .unwrap();
+        // Use an include so polyfill path is exercised differently.
+        let path2 = dir.join("fail2.js");
+        fs::write(&path2, "/*---\nincludes: [sta.js]\n---*/\nthrow 'oops';").unwrap();
         let outcome = run_single_test(&path2, &cfg);
         assert_eq!(outcome.status, Status::Fail);
         let _ = fs::remove_dir_all(&cfg.test262_root);
@@ -676,11 +698,21 @@ mod tests {
         let _ = fs::create_dir_all(tmp.join("test").join("built-ins").join("Array"));
         fs::write(tmp.join("test").join("language").join("a.js"), "").unwrap();
         fs::write(
-            tmp.join("test").join("language").join("expressions").join("b.js"),
+            tmp.join("test")
+                .join("language")
+                .join("expressions")
+                .join("b.js"),
             "",
         )
         .unwrap();
-        fs::write(tmp.join("test").join("built-ins").join("Array").join("c.js"), "").unwrap();
+        fs::write(
+            tmp.join("test")
+                .join("built-ins")
+                .join("Array")
+                .join("c.js"),
+            "",
+        )
+        .unwrap();
         let files = discover_tests(&tmp, Some("language/expressions"));
         assert_eq!(files.len(), 1);
         let _ = fs::remove_dir_all(&tmp);
@@ -698,7 +730,10 @@ mod tests {
 
     #[test]
     fn suite_for_language() {
-        assert_eq!(suite_for("language/expressions/a.js"), "language/expressions");
+        assert_eq!(
+            suite_for("language/expressions/a.js"),
+            "language/expressions"
+        );
         assert_eq!(suite_for("built-ins/Array/a.js"), "built-ins/Array");
         assert_eq!(suite_for("intl402/a.js"), "intl402");
         assert_eq!(suite_for("annexB/a.js"), "annexB");

@@ -342,6 +342,8 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     temp_top: u8,
     /// One past the highest register any emission touched.
     high_water: u8,
+    /// Maximum `stack_depth + 1` across all handlers in this unit.
+    pub(crate) handler_max: u32,
     pub loops: Vec<LoopCtx>,
     pub finallies: Vec<FinallyCtx<'a>>,
 }
@@ -355,6 +357,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             unit,
             temp_top: locals_end + 1, // skip the reserved undefined register
             high_water: locals_end + 1,
+            handler_max: 0,
             loops: Vec::new(),
             finallies: Vec::new(),
         }
@@ -543,7 +546,15 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Assembles, optimizes, and validates the unit's bytecode.
     pub fn finish(mut self) -> Result<v12_bytecode::FunctionBytecode, CompileError> {
         let locals_end = self.comp.plans.units[self.unit].locals_end;
-        let regs = self.high_water.max(locals_end + 1);
+        let mut regs = self.high_water.max(locals_end + 1);
+        // Handlers deliver the exception into register `stack_depth`, so the
+        // register window must include that slot. `high_water` already
+        // accounts for the delivery temporary, but an explicit max over the
+        // tracked handler depth guards against future emission paths that
+        // might set `stack_depth` without going through `new_temp`.
+        if self.handler_max > u32::from(regs) {
+            regs = u8::try_from(self.handler_max).unwrap_or(MAX_REGS);
+        }
         self.b.reserve_regs(u16::from(regs));
         let mut fb = self.b.finish();
         // Handler ranges are pushed as regions close (inner regions first),

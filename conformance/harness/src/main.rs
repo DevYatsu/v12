@@ -144,9 +144,15 @@ fn main() {
     );
 
     let outcomes: Vec<TestOutcome> = if jobs <= 1 {
-        files.iter().map(|p| run_single_test(p, &harness_config)).collect()
+        files
+            .iter()
+            .map(|p| run_single_test(p, &harness_config))
+            .collect()
     } else {
-        files.par_iter().map(|p| run_single_test(p, &harness_config)).collect()
+        files
+            .par_iter()
+            .map(|p| run_single_test(p, &harness_config))
+            .collect()
     };
 
     // Verbose per-test line during the run has already happened via stderr;

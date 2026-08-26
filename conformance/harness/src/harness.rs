@@ -30,7 +30,10 @@ pub struct IncludeError {
 /// Files are concatenated in the order listed, separated by a newline and a
 /// `// --- harness: <name> ---` comment for debuggability.
 #[must_use]
-pub fn load_harness_includes(includes: &[String], harness_dir: &Path) -> (String, Vec<IncludeError>) {
+pub fn load_harness_includes(
+    includes: &[String],
+    harness_dir: &Path,
+) -> (String, Vec<IncludeError>) {
     let mut out = String::new();
     let mut errors = Vec::new();
     let mut total = 0usize;

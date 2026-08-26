@@ -516,11 +516,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn push_range(&mut self, start: u32, end: u32, target: u32, depth: u8) {
+        let stack_depth = u32::from(depth);
+        self.handler_max = self.handler_max.max(stack_depth + 1);
         self.b.push_handler(HandlerRange {
             start,
             end,
             target,
-            stack_depth: u32::from(depth),
+            stack_depth,
         });
     }
 }

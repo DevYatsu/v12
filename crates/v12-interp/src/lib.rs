@@ -836,7 +836,8 @@ impl Interp {
                 let args = &self.stack[args_start..args_end];
                 // Disjoint field borrows: heap + natives mut, stack immut.
                 // Borrow checker allows distinct fields in 2024 edition.
-                self.natives.call_native(&mut self.heap, this_v, args, target)
+                self.natives
+                    .call_native(&mut self.heap, this_v, args, target)
             };
             return result.map(CallOutcome::Value).map_err(JSException);
         }
@@ -911,9 +912,17 @@ impl Interp {
             if let Some(h) = covering {
                 let fr = self.frames.last_mut().expect("a frame was just inspected");
                 // Truncate the register window to the handler depth, then
-                // deliver the exception into register `stack_depth`.
-                self.stack.truncate(fr.base + h.stack_depth as usize);
+                // deliver the exception into register `stack_depth`. The
+                // stack must be restored to the full register window so
+                // handler temporaries beyond the delivery register remain
+                // addressable.
+                let base = fr.base;
+                let depth = h.stack_depth as usize;
+                let max_regs = fr.max_regs as usize;
+                self.stack.truncate(base + depth);
                 self.stack.push(exc);
+                self.stack.resize(base + max_regs, JsValue::undefined());
+                self.stack[base + depth] = exc;
                 fr.pc = h.target as usize;
                 return Ok(());
             }
