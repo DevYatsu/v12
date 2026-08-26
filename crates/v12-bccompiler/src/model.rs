@@ -35,6 +35,14 @@ pub const MAX_REGS: u8 = 255;
 /// operand; larger programs should be split).
 pub const MAX_ENV_SLOTS: u8 = 255;
 
+/// Native index reserved for the synchronous module import helper.
+///
+/// See [`crate::unit::NATIVE_IMPORT_INDEX`] and the crate-level docs for
+/// the calling convention. Kept here so callers that only depend on the
+/// model (e.g., the engine) have a single source of truth.
+pub const NATIVE_IMPORT_INDEX: u8 = 254;
+pub const NATIVE_IMPORT_INDEX_U32: u32 = NATIVE_IMPORT_INDEX as u32;
+
 // ---------------------------------------------------------------------------
 // Interner
 // ---------------------------------------------------------------------------
@@ -64,6 +72,44 @@ pub(crate) fn str_id_of(key: lasso::Spur) -> u32 {
 #[allow(dead_code)]
 pub(crate) fn spur_of_str_id(id: u32) -> Option<lasso::Spur> {
     lasso::Key::try_from_usize(usize::try_from(id).ok()?)
+}
+
+// ---------------------------------------------------------------------------
+// Module linkage (ESM import / export)
+// ---------------------------------------------------------------------------
+
+/// One imported binding from an `import` declaration.
+///
+/// `specifier` is the module specifier string (`"./a.js"`). `imported` is
+/// the name exported by that module (`"default"`, `"*"`, or the exported
+/// identifier; empty for side-effect imports). `local` is the local binding
+/// introduced by the import (`None` for `import "./side.js"`). `span`
+/// records the declaration site for diagnostics.
+///
+/// Namespace imports (`import * as ns from`) are represented with
+/// `imported == "*"`.
+#[derive(Debug, Clone)]
+pub struct ImportEntry {
+    pub specifier: String,
+    pub imported: String,
+    pub local: Option<SymbolId>,
+    pub span: Option<(u32, u32)>,
+}
+
+/// One exported binding.
+///
+/// For `export const x = 1`, `exported == "x"` and `local == Some(symbol_of_x)`.
+/// For `export {x as y}`, `exported == "y"` and `local == Some(symbol_of_x)`.
+/// For `export default expr`, `exported == "default"`.
+/// For `export * from "./m.js"`, `specifier == Some("./m.js")` and
+/// `exported == "*"`.
+/// `span` records the export site.
+#[derive(Debug, Clone)]
+pub struct ExportEntry {
+    pub specifier: Option<String>,
+    pub local: Option<SymbolId>,
+    pub exported: String,
+    pub span: Option<(u32, u32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +184,10 @@ pub struct Plans {
     /// `(symbol, referencing unit)` pairs gathered during the walk; joined
     /// into `captured` by the finalize step.
     pub ref_sites: Vec<(SymbolId, usize)>,
+    /// Module linkage: imports recorded during collection (module mode only).
+    pub imports: Vec<ImportEntry>,
+    /// Module linkage: exports recorded during collection (module mode only).
+    pub exports: Vec<ExportEntry>,
 }
 
 impl Plans {

@@ -10,8 +10,8 @@
 //! ranges may share one.
 
 use oxc_ast::ast::{
-    BindingPattern, Expression, ForStatementInit, Function, LabeledStatement, Statement,
-    TryStatement, VariableDeclarationKind,
+    BindingPattern, Declaration, Expression, ForStatementInit, Function, LabeledStatement,
+    ModuleDeclaration, Statement, TryStatement, VariableDeclarationKind,
 };
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{HandlerRange, Instr, Opcode};
@@ -56,6 +56,50 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// Compiles one statement.
     pub fn stmt(&mut self, s: &'a Statement<'a>) -> Res<()> {
+        if let Some(md) = s.as_module_declaration() {
+            return match md {
+                ModuleDeclaration::ImportDeclaration(_) => Ok(()),
+                ModuleDeclaration::ExportDeclaration(d) => match &d.declaration {
+                    Declaration::VariableDeclaration(v) => self.var_decl(v),
+                    Declaration::FunctionDeclaration(_) => Ok(()),
+                    Declaration::ClassDeclaration(_) => {
+                        Err(self.err(d.span, "class declarations are not supported"))
+                    }
+                    _ => Ok(()),
+                },
+                ModuleDeclaration::ExportNamedDeclaration(_) => Ok(()),
+                ModuleDeclaration::ExportFromDeclaration(_) => Ok(()),
+                ModuleDeclaration::ExportDefaultDeclaration(d) => {
+                    use oxc_ast::ast::ExportDefaultDeclarationKind as Kind;
+                    match &d.declaration {
+                        Kind::FunctionDeclaration(f) => {
+                            // Hoisted like a function declaration; binding
+                            // already initialised by the hoist pass.
+                            let _ = f;
+                            Ok(())
+                        }
+                        Kind::ClassDeclaration(_) => {
+                            Err(self.err(d.span, "class declarations are not supported"))
+                        }
+                        Kind::TSInterfaceDeclaration(_) => Ok(()),
+                        _ => {
+                            if let Some(expr) = d.declaration.as_expression() {
+                                // `export default expr` evaluates the expression
+                                // but discards it (module evaluation has no
+                                // completion value).
+                                self.expr(expr)?;
+                            }
+                            Ok(())
+                        }
+                    }
+                }
+                ModuleDeclaration::ExportAllDeclaration(_) => Ok(()),
+                ModuleDeclaration::TSExportAssignment(_) => {
+                    Err(self.err(md.span(), "typescript export assignment is not supported"))
+                }
+                ModuleDeclaration::TSNamespaceExportDeclaration(_) => Ok(()),
+            };
+        }
         match s {
             Statement::BlockStatement(b) => self.stmt_list(&b.body),
             Statement::ExpressionStatement(e) => {
@@ -484,7 +528,22 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 fn fn_decl_of<'a, 'b>(s: &'b Statement<'a>) -> Option<&'b Function<'a>> {
     match s {
         Statement::FunctionDeclaration(f) => Some(f),
-        _ => None,
+        _ => {
+            if let Some(md) = s.as_module_declaration() {
+                if let ModuleDeclaration::ExportDeclaration(ed) = md
+                    && let Declaration::FunctionDeclaration(f) = &ed.declaration
+                {
+                    return Some(f);
+                }
+                if let ModuleDeclaration::ExportDefaultDeclaration(ed) = md
+                    && let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) =
+                        &ed.declaration
+                {
+                    return Some(f);
+                }
+            }
+            None
+        }
     }
 }
 

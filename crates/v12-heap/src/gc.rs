@@ -763,8 +763,7 @@ impl Heap {
         // may still name children nothing else keeps alive. Prune those
         // entries now — before any slot is released — so a cached transition
         // hit can never surface a dead handle.
-        let marked_shapes = collector.marked[Space::Shapes as usize].clone();
-        self.prune_shape_transitions(&marked_shapes);
+        self.prune_shape_transitions(&collector.marked[Space::Shapes as usize]);
 
         let live = live_bytes_of(&self.objects, &collector.marked[Space::Objects as usize])
             + live_bytes_of(&self.strings, &collector.marked[Space::Strings as usize])

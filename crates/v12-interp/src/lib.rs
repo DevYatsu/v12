@@ -738,9 +738,8 @@ impl Interp {
                 let text = self
                     .strings
                     .get(str_id as usize)
-                    .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"))
-                    .clone();
-                let h = intern_text(&mut self.heap, &text);
+                    .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"));
+                let h = intern_text(&mut self.heap, text);
                 self.const_strings.insert(str_id, h);
                 Ok(JsValue::string(h))
             }
@@ -830,11 +829,15 @@ impl Interp {
 
         // Indices beyond the compiled program route to the native seam.
         if (target as usize) >= self.functions.len() {
-            let args = self.stack[callee_slot + 2..callee_slot + 2 + usize::from(argc)].to_vec();
+            let args_start = callee_slot + 2;
+            let args_end = args_start + usize::from(argc);
             self.gc_protect();
-            let result = self
-                .natives
-                .call_native(&mut self.heap, this_v, &args, target);
+            let result = {
+                let args = &self.stack[args_start..args_end];
+                // Disjoint field borrows: heap + natives mut, stack immut.
+                // Borrow checker allows distinct fields in 2024 edition.
+                self.natives.call_native(&mut self.heap, this_v, args, target)
+            };
             return result.map(CallOutcome::Value).map_err(JSException);
         }
 

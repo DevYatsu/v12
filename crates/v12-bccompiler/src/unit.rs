@@ -29,24 +29,48 @@ fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
     }
 }
 
-/// Compiles one function unit and stores it at `comp.functions[idx]`.
+/// Reserved native index for synchronous module loading.
 ///
-/// Nested units recurse through their parents' emitters ([`crate::expr`] →
-/// [`FnCtx::closure_fn`]), so compilation is depth-first in discovery order,
-/// matching how [`crate::collect`] assigned indices.
+/// Calling convention (module linkage):
+/// ```text
+///   Closure rC, #NATIVE_IMPORT_INDEX   // rC = native function object for import
+///   Move    r{C+1}, undef               // this = undefined
+///   LoadConst r{C+2}, k{specifier_id}   // arg0 = module specifier string
+///   Call    rC, rC, argc=1              // rC = import(specifier)
+/// ```
+/// One `Call` is emitted per distinct specifier at the start of the main
+/// function (unit 0). The call returns the module namespace object; per-
+/// binding `GetProperty` + `Store` sequences then materialize individual
+/// imported bindings. When no `ImportCall` opcode exists, this `Closure` +
+/// `Call` pair is the portable lowering. The native at this index is
+/// provided by `v12-engine`'s `NativeRegistry`.
+pub const NATIVE_IMPORT_INDEX: u8 = 254;
+
+/// Compiles one function unit and stores it at `comp.functions[idx]`.
 pub fn compile_unit(
     comp: &mut Compiler<'_, '_>,
     idx: usize,
     node: UnitNode<'_>,
 ) -> Result<(), CompileError> {
-    debug_assert_eq!(
-        idx,
-        comp.functions.len(),
-        "units must reserve slots in order"
-    );
-    let hint = comp.plans.units[idx].name_hint.clone();
+    // Reservation is lenient: `collect` assigns indices depth-first while
+    // `stmt::stmt_list` hoists function declarations. A hoisted declaration
+    // is emitted before earlier arrow initializers that share the same
+    // statement list, so `idx` can arrive out of order (e.g. `let a = () =>
+    // 1; function f(){}; let b = () => 2;` gives plans [main, a, f, b] but
+    // hoisting compiles `f` (idx 2) before `a` (idx 1)). Gaps are filled
+    // with placeholders so later `idx` values land on their intended slots.
+    if idx < comp.functions.len() {
+        // Placeholder already reserved by an earlier gap-fill.
+    } else {
+        while comp.functions.len() < idx {
+            let fill = comp.functions.len();
+            let hint = comp.plans.units[fill].name_hint.clone();
+            comp.functions.push(placeholder(Some(hint)));
+        }
+        let hint = comp.plans.units[idx].name_hint.clone();
+        comp.functions.push(placeholder(Some(hint)));
+    }
     let strict = comp.strict;
-    comp.functions.push(placeholder(Some(hint)));
 
     // Named function *expressions* re-create themselves in their prologue so
     // their own name resolves inside every activation (self-recursion).
@@ -59,6 +83,9 @@ pub fn compile_unit(
 
     let mut cx = FnCtx::new(comp, idx);
     emit_prologue(&mut cx, idx, self_symbol)?;
+    if idx == 0 {
+        emit_import_calls(&mut cx)?;
+    }
     match node {
         UnitNode::Main(p) => cx.stmt_list(&p.body)?,
         UnitNode::Fn(f) => {
@@ -143,6 +170,75 @@ fn emit_prologue(
         cx.emit(Instr::new(Opcode::Closure, dst, idx8, 0));
         let access = cx.access(sym);
         cx.store_access(access, dst, oxc_span::Span::default());
+    }
+    Ok(())
+}
+
+fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {
+    use std::collections::{HashMap, HashSet};
+
+    if cx.comp.plans.imports.is_empty() {
+        return Ok(());
+    }
+    // Group imported bindings by specifier, dedup specifiers for the actual
+    // `import(specifier)` native call, then wire each binding via a
+    // `GetProperty` from the returned namespace object.
+    let mut by_spec: HashMap<String, Vec<crate::model::ImportEntry>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut seen_spec: HashSet<String> = HashSet::new();
+    for e in &cx.comp.plans.imports.clone() {
+        if seen_spec.insert(e.specifier.clone()) {
+            order.push(e.specifier.clone());
+        }
+        by_spec
+            .entry(e.specifier.clone())
+            .or_default()
+            .push(e.clone());
+    }
+
+    for spec in order {
+        let entries = &by_spec[&spec];
+        // Representative span for the call site; use first entry's span or
+        // default when side-effect only.
+        let span = entries
+            .first()
+            .and_then(|e| e.span)
+            .map(|(s, e)| oxc_span::Span::new(s, e))
+            .unwrap_or_default();
+
+        // Call native import helper: Closure + Call with one string arg.
+        // Layout: [callee][this][arg] -> Call rC, rC, argc=1
+        let block = cx.new_temps(crate::model::CALL_HEADER_REGS + 1);
+        let callee = block;
+        cx.emit_spanned(
+            Instr::new(Opcode::Closure, callee, NATIVE_IMPORT_INDEX, 0),
+            span,
+        );
+        cx.load_undefined(callee + 1, span);
+        cx.load_str(callee + 2, &spec, span)?;
+        cx.emit_call(callee, callee, 1, span);
+        let ns_reg = callee;
+
+        // Wire named imports: `local = ns[imported]`. Side-effect imports
+        // (local == None) produce no wiring; the call's side effect is the
+        // whole effect.
+        for e in entries {
+            let Some(local) = e.local else { continue };
+            if e.imported == "*" {
+                // `import * as ns from` : whole namespace object.
+                let access = cx.access(local);
+                cx.store_access(access, ns_reg, span);
+            } else if e.imported.is_empty() {
+                continue;
+            } else {
+                let key = cx.new_temp();
+                cx.load_str(key, &e.imported, span)?;
+                let dst = cx.new_temp();
+                cx.emit_spanned(Instr::new(Opcode::GetProperty, dst, ns_reg, key), span);
+                let access = cx.access(local);
+                cx.store_access(access, dst, span);
+            }
+        }
     }
     Ok(())
 }

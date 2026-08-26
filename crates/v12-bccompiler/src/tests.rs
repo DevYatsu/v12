@@ -1467,3 +1467,126 @@ fn str_id_conversions_round_trip() {
     // The one id no Spur can name (Spur wraps a NonZeroU32).
     assert!(spur_of_str_id(u32::MAX).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Module linkage (ESM import / export)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn module_import_named_bindings() {
+    let src = r#"import {x} from "./a.js";"#;
+    // Script mode must reject with the spec-mandated diagnostic.
+    let script_err = crate::compile_source(src).expect_err("script should reject import");
+    assert!(
+        script_err
+            .message
+            .contains("import statements only valid in modules"),
+        "got: {}",
+        script_err.message
+    );
+    // Module mode accepts and records one import.
+    let m = crate::compile_source_as_module(src).expect("module should accept import");
+    assert_eq!(m.imports.len(), 1, "one import entry");
+    assert_eq!(m.imports[0].specifier, "./a.js");
+    assert_eq!(m.imports[0].imported, "x");
+    assert!(m.imports[0].local.is_some());
+    // Program still validates and has the import call lowered.
+    assert!(m.program.functions[0].validate().is_ok());
+    let disasm = format!("{}", m.program.functions[0]);
+    // The lowering emits a Closure to NATIVE_IMPORT_INDEX for the specifier.
+    assert!(
+        disasm.contains("./a.js") || disasm.contains("load_const"),
+        "disasm:\n{disasm}"
+    );
+}
+
+#[test]
+fn module_import_namespace_and_side_effect() {
+    let src_ns = r#"import * as ns from "./a.js";"#;
+    let m = crate::compile_source_as_module(src_ns).expect("ns import");
+    assert_eq!(m.imports.len(), 1);
+    assert_eq!(m.imports[0].imported, "*");
+    assert_eq!(m.imports[0].specifier, "./a.js");
+    assert!(m.imports[0].local.is_some());
+
+    let src_side = r#"import "./side.js";"#;
+    let m2 = crate::compile_source_as_module(src_side).expect("side import");
+    assert_eq!(m2.imports.len(), 1);
+    assert_eq!(m2.imports[0].specifier, "./side.js");
+    assert_eq!(m2.imports[0].imported, "");
+    assert!(m2.imports[0].local.is_none());
+
+    // Script must reject both.
+    assert!(crate::compile_source(src_ns).is_err());
+    assert!(crate::compile_source(src_side).is_err());
+}
+
+#[test]
+fn module_import_default_and_mixed() {
+    let src = r#"import foo from "./a.js"; import {bar as baz} from "./b.js";"#;
+    let m = crate::compile_source_as_module(src).expect("mixed imports");
+    assert_eq!(m.imports.len(), 2);
+    // Default import.
+    let def = m
+        .imports
+        .iter()
+        .find(|e| e.imported == "default")
+        .expect("default");
+    assert_eq!(def.specifier, "./a.js");
+    // Named with alias: imported "bar", local is the alias `baz`.
+    let named = m.imports.iter().find(|e| e.imported == "bar").expect("bar");
+    assert_eq!(named.specifier, "./b.js");
+}
+
+#[test]
+fn module_exports_are_recorded() {
+    let src = r#"export const x = 1; export function foo() {} export {x as y};"#;
+    let m = crate::compile_source_as_module(src).expect("exports");
+    // At least the three exported names should be present.
+    let exported_names: Vec<_> = m.exports.iter().map(|e| e.exported.as_str()).collect();
+    assert!(exported_names.contains(&"x"), "{exported_names:?}");
+    assert!(exported_names.contains(&"foo"), "{exported_names:?}");
+    assert!(exported_names.contains(&"y"), "{exported_names:?}");
+    assert!(crate::compile_source(src).is_err());
+}
+
+#[test]
+fn script_rejects_export() {
+    let src = r#"export const x = 1;"#;
+    let err = crate::compile_source(src).expect_err("export in script should err");
+    assert!(
+        err.message
+            .contains("export statements only valid in modules")
+            || err
+                .message
+                .contains("import statements only valid in modules"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn hoisted_functions_with_interleaved_arrows_do_not_panic() {
+    // This pattern previously panicked with `units must reserve slots in order`
+    // (left 3 right 2) because `collect` assigned indices depth-first while
+    // `stmt_list` hoisted function declarations before arrow initializers.
+    let src = "let a = () => 1; function foo() { return 2; } let b = () => 3; let c = () => 4;";
+    let (prog, _) = compile_source_with_strings(src).expect("should compile without panic");
+    assert_eq!(prog.functions.len(), 5, "main + 3 arrows + foo");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+}
+
+#[test]
+fn example_03_functions_compiles_and_validates() {
+    let src = std::fs::read_to_string("../../examples/03-functions.js").unwrap_or_else(|_| {
+        // Fallback when test cwd is crate root.
+        std::fs::read_to_string("examples/03-functions.js")
+            .unwrap_or_else(|_| "let add = (a, b) => a + b; let sum = add(10, 32); sum".into())
+    });
+    let (prog, _) = compile_source_with_strings(&src).expect("example 03 should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+}

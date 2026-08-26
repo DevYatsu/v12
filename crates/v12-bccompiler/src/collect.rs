@@ -22,12 +22,15 @@
 
 use oxc_ast::ast::{
     ArrayExpressionElement, ArrowFunctionExpression, BindingPattern, Expression, ForStatementInit,
-    Function, Program, PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
+    Function, ModuleDeclaration, ModuleExportName, Program, PropertyKey, SimpleAssignmentTarget,
+    Statement, VariableDeclaration,
 };
 use oxc_semantic::{Scoping, SymbolId};
 use oxc_span::GetSpan;
 
-use crate::model::{MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan, VarLoc};
+use crate::model::{
+    ExportEntry, ImportEntry, MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan, VarLoc,
+};
 
 /// Entry point: produce finalized layout plans for a whole program.
 pub fn collect(program: &Program<'_>, scoping: &Scoping) -> Plans {
@@ -163,6 +166,21 @@ impl<'s> Collector<'s> {
     }
 
     fn stmt(&mut self, s: &Statement<'_>) {
+        // Module declarations are also Statement variants via `INHERIT(ModuleDeclaration)`.
+        // Handle them first so they do not fall through to the `_` ignore case.
+        if let Some(md) = s.as_module_declaration() {
+            match md {
+                ModuleDeclaration::ImportDeclaration(d) => self.import_decl(d),
+                ModuleDeclaration::ExportAllDeclaration(d) => self.export_all_decl(d),
+                ModuleDeclaration::ExportDefaultDeclaration(d) => self.export_default_decl(d),
+                ModuleDeclaration::ExportDeclaration(d) => self.export_decl(d),
+                ModuleDeclaration::ExportNamedDeclaration(d) => self.export_named_decl(d),
+                ModuleDeclaration::ExportFromDeclaration(d) => self.export_from_decl(d),
+                ModuleDeclaration::TSExportAssignment(_) => {}
+                ModuleDeclaration::TSNamespaceExportDeclaration(_) => {}
+            }
+            return;
+        }
         match s {
             Statement::BlockStatement(b) => self.stmt_list(&b.body),
             Statement::ExpressionStatement(e) => self.expr(&e.expression),
@@ -226,6 +244,215 @@ impl<'s> Collector<'s> {
             // break / continue / empty / debugger carry no references.
             _ => {}
         }
+    }
+
+    fn import_decl(&mut self, d: &oxc_ast::ast::ImportDeclaration<'_>) {
+        let specifier = d.source.value.to_string();
+        let span = Some((d.span.start, d.span.end));
+        if let Some(specs) = &d.specifiers {
+            if specs.is_empty() {
+                // `import {} from "x"` – no bindings, but still a module dependency.
+                self.plans.imports.push(ImportEntry {
+                    specifier: specifier.clone(),
+                    imported: String::new(),
+                    local: None,
+                    span,
+                });
+            }
+            for s in specs {
+                match s {
+                    oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(sp) => {
+                        let imported = module_export_name_to_string(&sp.imported);
+                        let local_sym = sp.local.symbol_id.get();
+                        if let Some(sym) = local_sym {
+                            self.declare(sym);
+                        }
+                        self.plans.imports.push(ImportEntry {
+                            specifier: specifier.clone(),
+                            imported,
+                            local: local_sym,
+                            span: Some((sp.span.start, sp.span.end)),
+                        });
+                    }
+                    oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(sp) => {
+                        let local_sym = sp.local.symbol_id.get();
+                        if let Some(sym) = local_sym {
+                            self.declare(sym);
+                        }
+                        self.plans.imports.push(ImportEntry {
+                            specifier: specifier.clone(),
+                            imported: "default".to_string(),
+                            local: local_sym,
+                            span: Some((sp.span.start, sp.span.end)),
+                        });
+                    }
+                    oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(sp) => {
+                        let local_sym = sp.local.symbol_id.get();
+                        if let Some(sym) = local_sym {
+                            self.declare(sym);
+                        }
+                        self.plans.imports.push(ImportEntry {
+                            specifier: specifier.clone(),
+                            imported: "*".to_string(),
+                            local: local_sym,
+                            span: Some((sp.span.start, sp.span.end)),
+                        });
+                    }
+                }
+            }
+        } else {
+            // `import "./side.js"` – side-effect only.
+            self.plans.imports.push(ImportEntry {
+                specifier,
+                imported: String::new(),
+                local: None,
+                span,
+            });
+        }
+    }
+
+    fn export_decl(&mut self, d: &oxc_ast::ast::ExportDeclaration<'_>) {
+        let span = Some((d.span.start, d.span.end));
+        match &d.declaration {
+            oxc_ast::ast::Declaration::VariableDeclaration(v) => {
+                // Record each binding as an export.
+                for decl in &v.declarations {
+                    if let Some(sym) = binding_symbol(&decl.id) {
+                        let exported = ident_name_of_binding(&decl.id)
+                            .unwrap_or_else(|| self.scoping.symbol_name(sym).to_string());
+                        self.plans.exports.push(ExportEntry {
+                            specifier: None,
+                            local: Some(sym),
+                            exported,
+                            span,
+                        });
+                    }
+                }
+                self.var_decl(v);
+            }
+            oxc_ast::ast::Declaration::FunctionDeclaration(f) => {
+                if let Some(id) = &f.id
+                    && let Some(sym) = id.symbol_id.get()
+                {
+                    let exported = id.name.to_string();
+                    self.plans.exports.push(ExportEntry {
+                        specifier: None,
+                        local: Some(sym),
+                        exported,
+                        span,
+                    });
+                }
+                self.fn_unit(f, true, "<fn>");
+            }
+            oxc_ast::ast::Declaration::ClassDeclaration(c) => {
+                if let Some(id) = &c.id
+                    && let Some(sym) = id.symbol_id.get()
+                {
+                    let exported = id.name.to_string();
+                    self.plans.exports.push(ExportEntry {
+                        specifier: None,
+                        local: Some(sym),
+                        exported,
+                        span,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn export_named_decl(&mut self, d: &oxc_ast::ast::ExportNamedDeclaration<'_>) {
+        let span = Some((d.span.start, d.span.end));
+        for sp in &d.specifiers {
+            let local = module_export_name_to_symbol(&sp.local, self.scoping);
+            let exported = module_export_name_to_string(&sp.exported);
+            self.plans.exports.push(ExportEntry {
+                specifier: None,
+                local,
+                exported,
+                span,
+            });
+            if let Some(sym) = local {
+                self.note_ref(sym);
+            }
+        }
+    }
+
+    fn export_from_decl(&mut self, d: &oxc_ast::ast::ExportFromDeclaration<'_>) {
+        let specifier = d.source.value.to_string();
+        let span = Some((d.span.start, d.span.end));
+        for sp in &d.specifiers {
+            let exported = module_export_name_to_string(&sp.exported);
+            let local = module_export_name_to_symbol(&sp.local, self.scoping);
+            self.plans.exports.push(ExportEntry {
+                specifier: Some(specifier.clone()),
+                local,
+                exported,
+                span,
+            });
+        }
+    }
+
+    fn export_default_decl(&mut self, d: &oxc_ast::ast::ExportDefaultDeclaration<'_>) {
+        let span = Some((d.span.start, d.span.end));
+        let local_sym: Option<SymbolId> = match &d.declaration {
+            oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                f.id.as_ref().and_then(|id| id.symbol_id.get())
+            }
+            oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                c.id.as_ref().and_then(|id| id.symbol_id.get())
+            }
+            _ => None,
+        };
+        if let Some(sym) = local_sym {
+            // The binding is declared at module top level if it has a name.
+            // Ensure it is counted as a declaration for layout; `fn_unit`
+            // will declare it when we walk the inner function.
+            if !self.plans.home_of.contains_key(&sym) {
+                self.declare(sym);
+            }
+        }
+        self.plans.exports.push(ExportEntry {
+            specifier: None,
+            local: local_sym,
+            exported: "default".to_string(),
+            span,
+        });
+        // Walk the inner declaration for capture analysis where applicable.
+        match &d.declaration {
+            oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
+                // `export default function foo(){}` – function name binds
+                // inside itself for declaration forms, but for default export
+                // the name is not visible outside; treat as expression.
+                self.fn_unit(f, false, "<default fn>");
+            }
+            oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                let _ = c;
+            }
+            oxc_ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {}
+            _ => {
+                // Expression form: `export default 1` – no extra decls.
+                if let Some(expr) = d.declaration.as_expression() {
+                    self.expr(expr);
+                }
+            }
+        }
+    }
+
+    fn export_all_decl(&mut self, d: &oxc_ast::ast::ExportAllDeclaration<'_>) {
+        let specifier = d.source.value.to_string();
+        let span = Some((d.span.start, d.span.end));
+        let exported = d
+            .exported
+            .as_ref()
+            .map(|n| module_export_name_to_string(n))
+            .unwrap_or_else(|| "*".to_string());
+        self.plans.exports.push(ExportEntry {
+            specifier: Some(specifier),
+            local: None,
+            exported,
+            span,
+        });
     }
 
     fn var_decl(&mut self, v: &VariableDeclaration<'_>) {
@@ -392,6 +619,41 @@ fn u_target<'a>(e: &'a Expression<'a>) -> &'a SimpleAssignmentTarget<'a> {
     match e {
         Expression::UpdateExpression(u) => &u.argument,
         _ => unreachable!("collect update target on non-update expression"),
+    }
+}
+
+fn module_export_name_to_string(name: &ModuleExportName<'_>) -> String {
+    match name {
+        ModuleExportName::IdentifierName(id) => id.name.to_string(),
+        ModuleExportName::IdentifierReference(r) => r.name.to_string(),
+        ModuleExportName::StringLiteral(s) => s.value.to_string(),
+    }
+}
+
+fn module_export_name_to_symbol(
+    name: &ModuleExportName<'_>,
+    scoping: &Scoping,
+) -> Option<SymbolId> {
+    match name {
+        ModuleExportName::IdentifierReference(r) => r
+            .reference_id
+            .get()
+            .and_then(|rid| scoping.get_reference(rid).symbol_id()),
+        ModuleExportName::IdentifierName(_) | ModuleExportName::StringLiteral(_) => None,
+    }
+}
+
+fn binding_symbol(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<SymbolId> {
+    match p {
+        oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
+        _ => None,
+    }
+}
+
+fn ident_name_of_binding(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<String> {
+    match p {
+        oxc_ast::ast::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+        _ => None,
     }
 }
 
