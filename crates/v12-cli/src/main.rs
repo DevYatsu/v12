@@ -13,7 +13,8 @@
 //!   microtask queue, and exits `1` on an uncaught exception.
 //! * `v12 --disasm script.js` compiles the file with `v12-bccompiler` and
 //!   prints the bytecode disassembly of each function instead of executing it.
-//! * `v12` with no file and a TTY on stdin enters a line-by-line REPL.
+//! * `v12` with no file and a TTY on stdin enters a line-by-line REPL backed
+//!   by `rustyline` (arrow navigation, history, line editing).
 //! * `--expose-gc` enables GC stress mode (collect on every allocation).
 //!
 //! # REPL limitations
@@ -25,7 +26,7 @@
 //! and synchronous. A future iteration can accumulate input until the parser
 //! accepts it.
 
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use v12_engine::Engine;
 
 /// Prompt printed before each REPL input line.
@@ -230,10 +231,13 @@ fn run_script(path: &str, disasm: bool, expose_gc: bool) -> i32 {
     }
 }
 
-/// Runs the interactive REPL.
+/// Runs the interactive REPL with line editing and history.
 ///
-/// Reads one line at a time from stdin, evaluates each line as an independent
-/// script, and prints the result or `Uncaught <msg>`.
+/// Uses `rustyline` for arrow navigation (Left/Right), history traversal
+/// (Up/Down), and in-line editing. Each line is evaluated as an independent
+/// script via a single reused [`Engine`], and the microtask queue is drained
+/// after every evaluation. History is in-memory only and is not persisted to
+/// disk.
 ///
 /// # Parameters
 ///
@@ -241,67 +245,64 @@ fn run_script(path: &str, disasm: bool, expose_gc: bool) -> i32 {
 ///
 /// # Returns
 ///
-/// `EXIT_SUCCESS` on clean EOF, `EXIT_FAILURE` on a fatal I/O error.
+/// `EXIT_SUCCESS` on clean EOF / `.exit`, `EXIT_FAILURE` on a fatal editor
+/// initialization or I/O error.
 ///
 /// # Limitations
 ///
-/// Each line is evaluated in isolation; bindings do not persist across lines.
-/// Multi-line input must be entered as a single line.
+/// Each line is evaluated in isolation; bindings do not persist across lines
+/// because the underlying [`Engine::eval`] creates a fresh interpreter state
+/// per call. Multi-line input must be entered as a single line (the parser
+/// has no incremental multi-line accumulation yet).
 fn run_repl(expose_gc: bool) -> i32 {
     let mut engine = Engine::new();
     if expose_gc {
         engine.heap_mut().gc_stress(Some(1));
     }
 
-    let stdin = io::stdin();
-    let mut reader = stdin.lock();
-    let mut stdout = io::stdout();
-    let mut line = String::new();
-
-    loop {
-        // Prompt. Flush explicitly because stdout is line-buffered.
-        print!("{PROMPT}");
-        if stdout.flush().is_err() {
+    let mut rl = match rustyline::DefaultEditor::new() {
+        Ok(editor) => editor,
+        Err(err) => {
+            eprintln!("failed to initialize line editor: {err}");
             return EXIT_FAILURE;
         }
+    };
 
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+    loop {
+        match rl.readline(PROMPT) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed == ".exit" || trimmed == "exit" || trimmed == "quit" {
+                    break;
+                }
+                if trimmed.len() > MAX_LINE_LEN {
+                    eprintln!("input too long (>{MAX_LINE_LEN} bytes)");
+                    continue;
+                }
+                let _ = rl.add_history_entry(line.as_str());
+                match engine.eval(trimmed) {
+                    Ok(value) => {
+                        if !value.is_undefined() {
+                            let text = engine.to_display_string(value);
+                            println!("{text}");
+                        }
+                        let _ = engine.run_jobs();
+                    }
+                    Err(thrown) => {
+                        let text = engine.to_display_string(thrown);
+                        eprintln!("Uncaught {text}");
+                        let _ = engine.run_jobs();
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => break,
+            Err(rustyline::error::ReadlineError::Eof) => break,
             Err(err) => {
                 eprintln!("repl read error: {err}");
-                return EXIT_FAILURE;
-            }
-        }
-
-        // Strip trailing newline(s) but keep other whitespace.
-        let trimmed_end = line.trim_end_matches(['\r', '\n']);
-        // Handle empty lines: skip evaluation.
-        if trimmed_end.is_empty() {
-            continue;
-        }
-        // Allow explicit exit commands.
-        if trimmed_end == ".exit" || trimmed_end == "exit" || trimmed_end == "quit" {
-            break;
-        }
-        if trimmed_end.len() > MAX_LINE_LEN {
-            eprintln!("input too long (>{MAX_LINE_LEN} bytes)");
-            continue;
-        }
-
-        match engine.eval(trimmed_end) {
-            Ok(value) => {
-                if !value.is_undefined() {
-                    let text = engine.to_display_string(value);
-                    println!("{text}");
-                }
-                let _ = engine.run_jobs();
-            }
-            Err(thrown) => {
-                let text = engine.to_display_string(thrown);
-                eprintln!("Uncaught {text}");
-                let _ = engine.run_jobs();
+                break;
             }
         }
     }

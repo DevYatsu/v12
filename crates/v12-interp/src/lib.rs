@@ -496,11 +496,8 @@ impl Interp {
                     let n = match op {
                         Opcode::Shl => ops::to_int32(ln) << shift,
                         Opcode::Shr => ops::to_int32(ln) >> shift,
-                        // Unsigned shift: to_int32 output always fits u32.
-                        _ => {
-                            (u32::try_from(ops::to_int32(ln)).expect("to_int32 output fits u32")
-                                >> shift) as i32
-                        }
+                        // Unsigned shift reinterprets the int32 bits as u32.
+                        _ => (ops::to_int32(ln) as u32 >> shift) as i32,
                     };
                     self.stack[base + usize::from(instr.a())] = ops::box_number(f64::from(n));
                     self.set_pc(pc + 1);

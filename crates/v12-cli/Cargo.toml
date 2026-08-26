@@ -12,3 +12,4 @@ path = "src/main.rs"
 [dependencies]
 v12-engine.workspace = true
 v12-bccompiler.workspace = true
+rustyline = "14"
