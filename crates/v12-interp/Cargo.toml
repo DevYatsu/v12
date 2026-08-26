@@ -8,3 +8,7 @@ license.workspace = true
 [dependencies]
 v12-bytecode.workspace = true
 v12-heap.workspace = true
+# The interpreter executes `bccompiler::Program`s, so the compiler is a runtime
+# dependency (not merely a dev dependency): `Interp::new` consumes a `Program`.
+# No cycle: the compiler never depends on the interpreter.
+v12-bccompiler.workspace = true

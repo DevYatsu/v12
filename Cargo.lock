@@ -1813,6 +1813,7 @@ dependencies = [
 name = "v12-interp"
 version = "0.1.0"
 dependencies = [
+ "v12-bccompiler",
  "v12-bytecode",
  "v12-heap",
 ]
