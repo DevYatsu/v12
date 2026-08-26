@@ -23,6 +23,9 @@ pub const KIND_ARRAY: u8 = 2;
 /// exotic parameter alias (see `JsObject::arguments_mapped`).
 pub const KIND_ARGUMENTS: u8 = 3;
 
+/// Object kind for generator objects (suspended frames).
+pub const KIND_GENERATOR: u8 = 4;
+
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
 /// down. Transitions are monotone — sealing then freezing is legal, nothing
 /// un-seals — so [`Heap::set_integrity_level`] only ever raises flags.

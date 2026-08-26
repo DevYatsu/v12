@@ -85,7 +85,9 @@ fn sweep_all_256_opcode_bytes_through_every_decode_path() {
                         WideOp::LoadConstW { dst, .. }
                         | WideOp::LoadIntW { dst, .. }
                         | WideOp::GetEnvSlotW { dst, .. }
-                        | WideOp::CallW { dst, .. } => dst,
+                        | WideOp::CallW { dst, .. }
+                        | WideOp::CopyObjectRestW { dst, .. }
+                        | WideOp::CopyArrayRestW { dst, .. } => dst,
                         WideOp::SetEnvSlotW { src, .. } => src,
                     };
                     assert_eq!(reg, a, "header slot `a` carries the register");
@@ -125,6 +127,9 @@ fn sweep_all_256_opcode_bytes_through_every_decode_path() {
                 spans: vec![(0, 0)],
                 pc_map: Vec::new(),
                 is_strict: false,
+                fixed_params: 0,
+                has_rest: false,
+                rest_reg: 0,
             };
             let text = render(&fb_one);
             assert!(!text.is_empty());
@@ -237,7 +242,7 @@ fn structured_wide_op_roundtrip_and_truncation_fuzz() {
 /// "unknown discriminant" diagnostic.
 #[test]
 fn wide_headers_with_unknown_discriminants_error_cleanly() {
-    for disc in [5u32, 6, 31, 99, 255] {
+    for disc in [7u32, 31, 99, 255] {
         let words = [
             Instr::new_imm24(Opcode::Wide, disc),
             Instr(0x1234_5678),

@@ -203,6 +203,19 @@ pub fn compile_source_as_module(src: &str) -> Result<Module, CompileError> {
     compile_source_as_module_with_interner(src, &mut Interner::default())
 }
 
+/// Compiles `src` as an ES module and returns the string table as well.
+pub fn compile_source_as_module_with_strings(
+    src: &str,
+) -> Result<(Module, Vec<String>), CompileError> {
+    let mut interner = Interner::default();
+    let module = compile_source_as_module_with_interner(src, &mut interner)?;
+    let strings = freeze_interner(interner)
+        .iter()
+        .map(|(_, s)| s.to_string())
+        .collect();
+    Ok((module, strings))
+}
+
 /// Module compilation with a caller-owned interner (see
 /// [`compile_source_with_interner`]).
 pub fn compile_source_as_module_with_interner(
@@ -354,7 +367,8 @@ fn compile_ast_inner(
     scoping: &Scoping,
     interner: &mut Interner,
 ) -> Result<Program, CompileError> {
-    let plans = collect::collect(program, scoping)?;
+    let strict = has_use_strict(program);
+    let plans = collect::collect(program, scoping, strict)?;
     // Scripts must not carry module linkage.
     if !plans.imports.is_empty() {
         let span = plans.imports.first().and_then(|e| e.span);
@@ -370,7 +384,6 @@ fn compile_ast_inner(
             span,
         });
     }
-    let strict = has_use_strict(program);
     let mut comp = model::Compiler {
         scoping,
         strict,
@@ -396,9 +409,9 @@ fn compile_ast_as_module_inner(
     scoping: &Scoping,
     interner: &mut Interner,
 ) -> Result<Module, CompileError> {
-    let plans = collect::collect(program, scoping)?;
     // Modules are always strict, even without a directive.
     let strict = true;
+    let plans = collect::collect(program, scoping, strict)?;
     let imports = plans.imports.clone();
     let exports = plans.exports.clone();
     let mut comp = model::Compiler {

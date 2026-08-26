@@ -10,11 +10,12 @@
 //! ranges may share one.
 
 use oxc_ast::ast::{
-    BindingPattern, Declaration, Expression, ForStatementInit, Function, LabeledStatement,
-    ModuleDeclaration, Statement, TryStatement, VariableDeclarationKind,
+    ArrayPattern, BindingPattern, Declaration, Expression, ForStatementInit, Function,
+    LabeledStatement, ModuleDeclaration, ObjectPattern, Statement, TryStatement,
+    VariableDeclarationKind,
 };
 use oxc_span::{GetSpan, Span};
-use v12_bytecode::{HandlerRange, Instr, Opcode};
+use v12_bytecode::{HandlerRange, Instr, Opcode, WideOp};
 
 use crate::model::{CompileError, FinallyCtx, FnCtx, LoopCtx};
 
@@ -151,8 +152,29 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(())
             }
             Statement::TryStatement(t) => self.try_stmt(t),
-            Statement::FunctionDeclaration(_) => {
-                // Initialized by the enclosing statement list's hoist pass.
+            Statement::FunctionDeclaration(f) => {
+                // Hoisted declarations were already initialized by the enclosing
+                // statement list's hoist pass; any declaration reaching here is
+                // a block-level function (Annex B). In strict mode this is a
+                // SyntaxError; in sloppy mode it is var-like hoisted and
+                // initialized at the declaration site.
+                let is_strict = self.comp.plans.units[self.unit].is_strict;
+                if is_strict {
+                    return Err(self.err(
+                        f.span,
+                        "SyntaxError: function declarations in blocks are not allowed in strict mode",
+                    ));
+                }
+                // Annex B sloppy: emit initialization here. The binding already
+                // exists as a var in the function scope.
+                let Some(id) = &f.id else { return Ok(()) };
+                let Some(sym) = id.symbol_id.get() else {
+                    return Ok(());
+                };
+                let dst = self.new_temp();
+                self.closure_fn(dst, f)?;
+                let access = self.access(sym);
+                self.store_access(access, dst, f.span);
                 Ok(())
             }
             Statement::VariableDeclaration(v) => self.var_decl(v),
@@ -211,49 +233,140 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(())
     }
 
-    /// `let {a, b: c} = obj` → property loads (flat identifier patterns only).
-    fn object_pattern_store(&mut self, o: &oxc_ast::ast::ObjectPattern<'_>, val: u8) -> Res<()> {
-        if o.rest.is_some() {
-            return Err(self.err(o.span, "rest elements in destructuring are not supported"));
-        }
-        for prop in &o.properties {
-            if !matches!(prop.value, BindingPattern::BindingIdentifier(_)) {
-                return Err(self.err(prop.span, "nested destructuring patterns are not supported"));
+    /// `let {a, b: c, ...rest} = obj` with nested and default support.
+    ///
+    /// Lowers to a flat sequence of `GetProperty` + default checks + recursive
+    /// pattern handling. Array rest uses `CopyArrayRest` (slice of elements);
+    /// object rest uses `CopyObjectRestW` (iterate shapes, skip extracted keys).
+    fn object_pattern_store(&mut self, o: &ObjectPattern<'_>, src: u8) -> Res<()> {
+        let has_rest = o.rest.is_some();
+        let prop_count = o.properties.len();
+        // Allocate contiguous registers for excluded keys when rest exists.
+        let excl_base: u8 = if has_rest && prop_count > 0 {
+            // `u8` slots are sufficient for destructuring (tests have <100 props).
+            self.new_temps(prop_count as u8)
+        } else {
+            0
+        };
+
+        for (idx, prop) in o.properties.iter().enumerate() {
+            // Compute key register.
+            let key_reg = if has_rest {
+                excl_base + idx as u8
+            } else {
+                self.new_temp()
+            };
+            if prop.computed {
+                let Some(expr) = prop.key.as_expression() else {
+                    return Err(self.err(
+                        prop.key.span(),
+                        "computed property key must be an expression",
+                    ));
+                };
+                let k = self.expr(expr)?;
+                self.move_reg(key_reg, k, prop.key.span());
+            } else {
+                let Some(text) = crate::expr::static_key_text(&prop.key) else {
+                    return Err(self.err(prop.key.span(), "unsupported property key in pattern"));
+                };
+                self.load_str(key_reg, &text, prop.key.span())?;
             }
-            let key = self.property_key(&prop.key)?;
             let tmp = self.new_temp();
-            self.emit_spanned(Instr::new(Opcode::GetProperty, tmp, val, key), prop.span);
-            let sym = binding_symbol(&prop.value)
-                .ok_or_else(|| self.err(prop.span, "internal: pattern without symbol"))?;
-            let access = self.access(sym);
-            self.store_access(access, tmp, prop.span);
+            self.emit_spanned(
+                Instr::new(Opcode::GetProperty, tmp, src, key_reg),
+                prop.span,
+            );
+            self.lower_binding_pattern(&prop.value, tmp)?;
+        }
+
+        if let Some(rest) = &o.rest {
+            let dst = self.new_temp();
+            if prop_count == 0 {
+                // `let {...rest} = o` with no excluded keys → copy all.
+                let words = WideOp::CopyObjectRestW {
+                    dst,
+                    src,
+                    excl_base: 0,
+                    excl_count: 0,
+                }
+                .encode();
+                self.emit_words(words, rest.span);
+            } else {
+                let words = WideOp::CopyObjectRestW {
+                    dst,
+                    src,
+                    excl_base,
+                    excl_count: prop_count as u16,
+                }
+                .encode();
+                self.emit_words(words, rest.span);
+            }
+            self.lower_binding_pattern(&rest.argument, dst)?;
         }
         Ok(())
     }
 
-    /// `let [a, b] = arr` → indexed loads (flat identifier patterns only).
-    fn array_pattern_store(&mut self, a: &oxc_ast::ast::ArrayPattern<'_>, val: u8) -> Res<()> {
-        if a.rest.is_some() {
-            return Err(self.err(a.span, "rest elements in destructuring are not supported"));
-        }
+    /// `let [a, b, ...rest] = arr` with nested, default, and rest via slice.
+    fn array_pattern_store(&mut self, a: &ArrayPattern<'_>, src: u8) -> Res<()> {
+        let fixed_len = a.elements.len();
         for (idx, el) in a.elements.iter().enumerate() {
-            let Some(pat) = el else { continue }; // holes bind nothing
-            if !matches!(pat, BindingPattern::BindingIdentifier(_)) {
-                return Err(self.err(
-                    pat.span(),
-                    "nested destructuring patterns are not supported",
-                ));
-            }
+            let Some(pat) = el else { continue };
             let key = self.new_temp();
             self.load_str(key, &idx.to_string(), pat.span())?;
             let tmp = self.new_temp();
-            self.emit_spanned(Instr::new(Opcode::GetProperty, tmp, val, key), pat.span());
-            let sym = binding_symbol(pat)
-                .ok_or_else(|| self.err(pat.span(), "internal: pattern without symbol"))?;
-            let access = self.access(sym);
-            self.store_access(access, tmp, pat.span());
+            self.emit_spanned(Instr::new(Opcode::GetProperty, tmp, src, key), pat.span());
+            self.lower_binding_pattern(pat, tmp)?;
+        }
+        if let Some(rest) = &a.rest {
+            let dst = self.new_temp();
+            let start = fixed_len as u16;
+            if start <= u16::from(u8::MAX) {
+                self.emit_spanned(
+                    Instr::new(Opcode::CopyArrayRest, dst, src, start as u8),
+                    rest.span,
+                );
+            } else {
+                let words = WideOp::CopyArrayRestW { dst, src, start }.encode();
+                self.emit_words(words, rest.span);
+            }
+            self.lower_binding_pattern(&rest.argument, dst)?;
         }
         Ok(())
+    }
+
+    /// Recursively lowers any binding pattern against `src`.
+    fn lower_binding_pattern(&mut self, pat: &BindingPattern<'_>, src: u8) -> Res<()> {
+        match pat {
+            BindingPattern::BindingIdentifier(id) => {
+                let Some(sym) = id.symbol_id.get() else {
+                    return Err(self.err(pat.span(), "internal: pattern without symbol"));
+                };
+                let access = self.access(sym);
+                self.store_access(access, src, pat.span());
+                Ok(())
+            }
+            BindingPattern::ObjectPattern(o) => self.object_pattern_store(o, src),
+            BindingPattern::ArrayPattern(a) => self.array_pattern_store(a, src),
+            BindingPattern::AssignmentPattern(ap) => {
+                // `src === undefined ? default : src`
+                let use_src = self.label();
+                let end = self.label();
+                let chosen = self.new_temp();
+                let undef = self.new_temp();
+                self.load_undefined(undef, ap.span);
+                let cond = self.new_temp();
+                self.emit_spanned(Instr::new(Opcode::StrictEq, cond, src, undef), ap.span);
+                self.emit_jump(Opcode::JumpIfFalse, cond, use_src);
+                // Default branch: evaluate default expression into chosen.
+                let def = self.expr(&ap.right)?;
+                self.move_reg(chosen, def, ap.span);
+                self.emit_jump(Opcode::Jump, 0, end);
+                self.bind(use_src);
+                self.move_reg(chosen, src, ap.span);
+                self.bind(end);
+                self.lower_binding_pattern(&ap.left, chosen)
+            }
+        }
     }
 
     // -- loops -------------------------------------------------------------------

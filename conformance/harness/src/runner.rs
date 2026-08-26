@@ -256,9 +256,15 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     // Execute in a fresh engine. Catch panics to avoid killing the parallel
     // runner.
     let exec_start = Instant::now();
+    let is_module = frontmatter.has_flag("module");
+    let base_path = file_path.parent().unwrap_or_else(|| Path::new("."));
     let exec_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = v12_engine::Engine::new();
-        let res = engine.eval(&combined);
+        let res = if is_module {
+            engine.eval_module_source(&combined, base_path)
+        } else {
+            engine.eval(&combined)
+        };
         let _ = engine.run_jobs();
         match res {
             Ok(v) => Ok(engine.to_display_string(v)),
@@ -309,9 +315,10 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
 
 /// Returns `Some(reason)` if the test should be skipped before execution.
 fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
-    if fm.has_flag("module") {
-        return Some("module not yet wired (ESM stub)".to_string());
-    }
+    // Module tests are now wired for `language` (and generally via eval_module);
+    // keep the skip only for non-language suites if needed. For the language
+    // gate we want them executable, so do not skip here — `run_single_test`
+    // will dispatch to `eval_module` when the flag is present.
     if fm.has_flag("async") {
         return Some("async harness not yet implemented".to_string());
     }
@@ -651,8 +658,10 @@ mod tests {
             ..Default::default()
         };
         let reason = skip_reason_for(&fm, "var x = 1;");
-        assert!(reason.is_some());
-        assert!(reason.unwrap().contains("module"));
+        assert!(
+            reason.is_none(),
+            "module should no longer be skipped (now wired), got {reason:?}"
+        );
     }
 
     #[test]

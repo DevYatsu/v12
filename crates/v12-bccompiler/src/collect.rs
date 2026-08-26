@@ -34,21 +34,43 @@ use crate::model::{
 };
 
 /// Entry point: produce finalized layout plans for a whole program.
-pub fn collect(program: &Program<'_>, scoping: &Scoping) -> Result<Plans, CompileError> {
+pub fn collect(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    is_strict: bool,
+) -> Result<Plans, CompileError> {
     let mut c = Collector {
         scoping,
         plans: Plans::default(),
+        strict_stack: Vec::new(),
         ref_sites: Vec::new(),
         unit_stack: Vec::new(),
     };
     // Unit 0 = main script body.
-    c.plans
-        .units
-        .push(UnitPlan::new(None, false, "<main>".into()));
+    let mut main_plan = UnitPlan::new(None, false, "<main>".into());
+    main_plan.is_strict = is_strict;
+    c.plans.units.push(main_plan);
     c.unit_stack.push(0);
+    c.strict_stack.push(is_strict);
     c.stmt_list(&program.body);
     let mut plans = c.plans;
     plans.ref_sites = c.ref_sites;
+    // Strict-mode eval/arguments checks for declarations.
+    for (idx, unit) in plans.units.iter().enumerate() {
+        if !unit.is_strict {
+            continue;
+        }
+        for &sym in &unit.decl_order {
+            let name = scoping.symbol_name(sym);
+            if name == "eval" || name == "arguments" {
+                return Err(CompileError {
+                    message: format!("SyntaxError: '{name}' is not a valid binding in strict mode"),
+                    span: None,
+                });
+            }
+        }
+        let _ = idx;
+    }
     finalize(&mut plans)?;
     Ok(plans)
 }
@@ -56,6 +78,7 @@ pub fn collect(program: &Program<'_>, scoping: &Scoping) -> Result<Plans, Compil
 struct Collector<'s> {
     scoping: &'s Scoping,
     plans: Plans,
+    strict_stack: Vec<bool>,
     /// `(symbol, referencing unit)` pairs; joined against homes in `finalize`.
     ref_sites: Vec<(SymbolId, usize)>,
     unit_stack: Vec<usize>,
@@ -98,11 +121,19 @@ impl<'s> Collector<'s> {
             Some(id) => format!("{hint}:{}", id.name),
             None => hint.to_string(),
         };
-        self.plans
-            .units
-            .push(UnitPlan::new(Some(parent), false, name_hint));
+        let parent_strict = *self.strict_stack.last().unwrap_or(&false);
+        let own_strict = f.body.as_deref().is_some_and(|b| {
+            b.directives
+                .iter()
+                .any(|d| d.expression.value == "use strict")
+        });
+        let is_strict = parent_strict || own_strict;
+        let mut plan = UnitPlan::new(Some(parent), false, name_hint);
+        plan.is_strict = is_strict;
+        self.plans.units.push(plan);
         self.plans.fn_index.insert(f.span(), idx);
         self.unit_stack.push(idx);
+        self.strict_stack.push(is_strict);
 
         // Params register first so `decl_order[..param_count]` really is the
         // parameter list; the named-function-expression's own name follows.
@@ -115,6 +146,7 @@ impl<'s> Collector<'s> {
         // Params are exactly the declarations registered so far in this unit.
         let param_count = self.plans.units[idx].decl_order.len();
         self.plans.units[idx].param_count = param_count;
+        self.plans.units[idx].has_rest = f.params.rest.is_some();
 
         // Named function *expressions* bind their own name inside themselves,
         // after the params (it is an ordinary local of the body).
@@ -129,17 +161,28 @@ impl<'s> Collector<'s> {
             self.stmt_list(&body.statements);
         }
         self.unit_stack.pop();
+        self.strict_stack.pop();
         idx
     }
 
     fn arrow_unit(&mut self, a: &ArrowFunctionExpression<'_>) -> usize {
         let parent = self.cur_unit();
         let idx = self.plans.units.len();
-        self.plans
-            .units
-            .push(UnitPlan::new(Some(parent), true, format!("<arrow>{}", idx)));
+        let parent_strict = *self.strict_stack.last().unwrap_or(&false);
+        let own_strict = match a.get_function_body() {
+            Some(body) => body
+                .directives
+                .iter()
+                .any(|d| d.expression.value == "use strict"),
+            None => false,
+        };
+        let is_strict = parent_strict || own_strict;
+        let mut plan = UnitPlan::new(Some(parent), true, format!("<arrow>{}", idx));
+        plan.is_strict = is_strict;
+        self.plans.units.push(plan);
         self.plans.fn_index.insert(a.span(), idx);
         self.unit_stack.push(idx);
+        self.strict_stack.push(is_strict);
         for p in &a.params.items {
             self.binding_pattern(&p.pattern);
         }
@@ -148,6 +191,7 @@ impl<'s> Collector<'s> {
         }
         let param_count = self.plans.units[idx].decl_order.len();
         self.plans.units[idx].param_count = param_count;
+        self.plans.units[idx].has_rest = a.params.rest.is_some();
         match a.get_function_body() {
             Some(body) => self.stmt_list(&body.statements),
             None => {
@@ -157,6 +201,7 @@ impl<'s> Collector<'s> {
             }
         }
         self.unit_stack.pop();
+        self.strict_stack.pop();
         idx
     }
 
@@ -457,10 +502,47 @@ impl<'s> Collector<'s> {
     }
 
     fn var_decl(&mut self, v: &VariableDeclaration<'_>) {
+        let is_const = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
         for d in &v.declarations {
+            if is_const {
+                if let Some(sym) = binding_symbol(&d.id) {
+                    self.plans.const_bindings.insert(sym);
+                } else {
+                    self.collect_const_bindings(&d.id);
+                }
+            }
             self.binding_pattern(&d.id);
             if let Some(init) = &d.init {
                 self.expr(init);
+            }
+        }
+    }
+
+    fn collect_const_bindings(&mut self, pat: &BindingPattern<'_>) {
+        match pat {
+            BindingPattern::BindingIdentifier(id) => {
+                if let Some(sym) = id.symbol_id.get() {
+                    self.plans.const_bindings.insert(sym);
+                }
+            }
+            BindingPattern::ObjectPattern(o) => {
+                for prop in &o.properties {
+                    self.collect_const_bindings(&prop.value);
+                }
+                if let Some(rest) = &o.rest {
+                    self.collect_const_bindings(&rest.argument);
+                }
+            }
+            BindingPattern::ArrayPattern(a) => {
+                for el in a.elements.iter().flatten() {
+                    self.collect_const_bindings(el);
+                }
+                if let Some(rest) = &a.rest {
+                    self.collect_const_bindings(&rest.argument);
+                }
+            }
+            BindingPattern::AssignmentPattern(ap) => {
+                self.collect_const_bindings(&ap.left);
             }
         }
     }

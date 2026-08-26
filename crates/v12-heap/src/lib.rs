@@ -126,8 +126,8 @@ mod value;
 pub use gc::{GcPolicy, Heap, MarkSink, RootSet, Trace};
 pub use handle::{Handle, HeapSpace, Space};
 pub use object::{
-    IntegrityLevel, JsObject, KIND_ARGUMENTS, KIND_ARRAY, KIND_FUNCTION, KIND_ORDINARY, V12BigInt,
-    V12Symbol,
+    IntegrityLevel, JsObject, KIND_ARGUMENTS, KIND_ARRAY, KIND_FUNCTION, KIND_GENERATOR,
+    KIND_ORDINARY, V12BigInt, V12Symbol,
 };
 pub use prop_key::PropKey;
 pub use shape::{

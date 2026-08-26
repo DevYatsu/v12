@@ -105,6 +105,9 @@ fn display_renders_documented_malformed_wide_shapes() {
         handlers: Vec::new(),
         pc_map: Vec::new(),
         is_strict: false,
+        fixed_params: 0,
+        has_rest: false,
+        rest_reg: 0,
     };
 
     let text = render(&fb);

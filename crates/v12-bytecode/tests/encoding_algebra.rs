@@ -144,6 +144,9 @@ fn fb_of(words: Vec<Instr>) -> FunctionBytecode {
         handlers: Vec::new(),
         pc_map: Vec::new(),
         is_strict: false,
+        fixed_params: 0,
+        has_rest: false,
+        rest_reg: 0,
     }
 }
 

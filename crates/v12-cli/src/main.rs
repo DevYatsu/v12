@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn disasm_invalid_source_reports_syntax_error() {
-        let code = run_disasm("let = 1;");
+        let code = run_disasm("let x = ;");
         assert_eq!(code, EXIT_FAILURE);
     }
 
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn disasm_spawn_syntax_error_exits_one() {
         let path = temp_script_path("disasm_err");
-        fs::write(&path, "let = 1;").expect("write temp file");
+        fs::write(&path, "let x = ;").expect("write temp file");
         let output = cargo_cmd()
             .args(["--disasm"])
             .arg(path.to_str().expect("utf8 path"))

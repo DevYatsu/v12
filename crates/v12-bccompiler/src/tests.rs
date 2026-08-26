@@ -152,6 +152,9 @@ impl<'p> Mini<'p> {
                         WideOp::CallW { dst, func, argc } => {
                             regs[dst as usize] = self.do_call(&regs, func, argc, &mut cur_env)?;
                         }
+                        WideOp::CopyObjectRestW { .. } | WideOp::CopyArrayRestW { .. } => {
+                            panic!("wide copy rest not expected in mini interpreter")
+                        }
                     }
                     pc += width;
                 }
@@ -340,8 +343,22 @@ impl<'p> Mini<'p> {
                     regs[instr.a() as usize] = Val::Bool(result);
                     pc += 1;
                 }
-                Opcode::CreateGenerator | Opcode::SuspendYield | Opcode::Await => {
-                    panic!("generator/async opcodes not expected in tier-1 programs")
+                Opcode::GetGlobal => {
+                    regs[instr.a() as usize] = Val::Undefined;
+                    pc += 1;
+                }
+                Opcode::SetGlobal => {
+                    pc += 1;
+                }
+                Opcode::CreateGenerator
+                | Opcode::SuspendYield
+                | Opcode::Await
+                | Opcode::CopyArrayRest
+                | Opcode::CheckIsArray
+                | Opcode::CallApply
+                | Opcode::CopyObjectRest
+                | Opcode::ArrayAppend => {
+                    panic!("generator/async/copy opcodes not expected in tier-1 mini programs")
                 }
             }
         }
@@ -1242,15 +1259,9 @@ fn unsupported_constructs_fail_as_compile_errors() {
         "for (let v of [1]) {}",
         "switch (1) { case 1: break; }",
         "new Object()",
-        "missing_global_xyz",
-        "[...[1]]",
         "({m() {}})",
         "`tpl ${1}`",
         "class C {}",
-        "async function af() { await 1; }",
-        "function* gen() { yield 1; }",
-        "let {a = 1} = {};",
-        "let [...rest] = [];",
         "[a, b] = [1, 2]",
         "return 1;",
     ];
@@ -1839,4 +1850,173 @@ fn computed_member_assignment_and_dynamic_key_evaluation() {
         r#"let o = {a: {b: 7}}; let k="a"; let j="b"; return o[k][j];"#,
         7.0,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 5 — Destructuring (array/object, rest, nested, defaults)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn destructuring_object_rest() {
+    let src = "let {a, ...rest} = {a:1, b:2, c:3};";
+    let (prog, _) = compile_source_with_strings(src).expect("object rest should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    // Nested
+    let src2 = "let {a: {b}} = {a: {b: 42}};";
+    let (prog2, _) = compile_source_with_strings(src2).expect("nested object should compile");
+    for f in &prog2.functions {
+        f.validate().expect("validate");
+    }
+}
+
+#[test]
+fn destructuring_array_rest_and_nested() {
+    let src = "let [a, [b, c], ...rest] = [1, [2,3], 4,5];";
+    let (prog, _) = compile_source_with_strings(src).expect("array rest nested should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    let src2 = "let [x = 10, y = 20] = [5];";
+    let (prog2, _) = compile_source_with_strings(src2).expect("array defaults should compile");
+    for f in &prog2.functions {
+        f.validate().expect("validate");
+    }
+}
+
+#[test]
+fn destructuring_object_defaults() {
+    let src = "let {a = 1, b: {c = 2}} = {};";
+    let (prog, _) = compile_source_with_strings(src).expect("object defaults should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 6 — Rest parameters & spread
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rest_params_compile() {
+    let src = "function f(a, ...rest) { return rest.length; }";
+    let (prog, _) = compile_source_with_strings(src).expect("rest params should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    assert!(prog.functions.iter().any(|f| f.has_rest));
+}
+
+#[test]
+fn spread_call_and_array_compile() {
+    let src = "let arr=[1,2]; let x=[...arr, 3]; function g(...a){return a[0];} g(...arr);";
+    let (prog, _) = compile_source_with_strings(src).expect("spread should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    // Check that spread lowered to CheckIsArray and ArrayAppend / CallApply
+    let text = format!("{}", prog.functions[prog.main as usize]);
+    assert!(
+        text.contains("check_is_array")
+            || text.contains("array_append")
+            || text.contains("call_apply")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 9 — function-code strict & Annex B
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strict_const_reassign_is_syntax_error() {
+    let src = "\"use strict\"; const x=1; x=2;";
+    let err =
+        compile_source_with_strings(src).expect_err("strict const reassign should be SyntaxError");
+    assert!(
+        err.message.contains("SyntaxError") || err.message.contains("constant"),
+        "got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn strict_eval_binding_is_syntax_error() {
+    let src = "\"use strict\"; var eval = 1;";
+    let err =
+        compile_source_with_strings(src).expect_err("strict eval binding should be SyntaxError");
+    assert!(err.message.contains("eval"), "got: {}", err.message);
+}
+
+#[test]
+fn annex_b_sloppy_block_function_compiles() {
+    let src = "if (true) function f(){ return 1; }";
+    let (prog, _) = compile_source_with_strings(src).expect("sloppy block function should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    // Strict should reject
+    let src2 = "\"use strict\"; if (true) function f(){ return 1; }";
+    assert!(
+        compile_source_with_strings(src2).is_err(),
+        "strict block function should be error"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 11 — import/export module-code
+// ---------------------------------------------------------------------------
+
+#[test]
+fn module_import_export_compile() {
+    let src = "import {x} from \"./a.js\"; export const y = 1;";
+    let m = crate::compile_source_as_module(src).expect("module should compile");
+    assert_eq!(m.imports.len(), 1);
+    assert!(m.exports.iter().any(|e| e.exported == "y"));
+    for f in &m.program.functions {
+        f.validate().expect("validate");
+    }
+}
+
+#[test]
+fn module_re_export_compile() {
+    let src = "export * from \"./other.js\"; export {x as y} from \"./a.js\";";
+    let m = crate::compile_source_as_module(src).expect("re-export should compile");
+    assert!(m.exports.iter().any(|e| e.exported == "*"));
+    for f in &m.program.functions {
+        f.validate().expect("validate");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 12 — Generators / async
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generator_function_compiles() {
+    let src = "function* gen(){ yield 1; yield 2; }";
+    let (prog, _) = compile_source_with_strings(src).expect("generator should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    // Check that generator opcodes appear
+    let has_yield = prog
+        .functions
+        .iter()
+        .any(|f| format!("{f}").contains("suspend_yield"));
+    assert!(has_yield, "expected suspend_yield in generator");
+}
+
+#[test]
+fn async_function_compiles() {
+    let src = "async function af(){ await 1; }";
+    let (prog, _) = compile_source_with_strings(src).expect("async should compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    let has_await = prog
+        .functions
+        .iter()
+        .any(|f| format!("{f}").contains("await"));
+    assert!(has_await, "expected await in async");
 }

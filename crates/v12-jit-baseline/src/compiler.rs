@@ -255,7 +255,10 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                         builder.ins().jump(exit_block, &[]);
                     }
                 }
-                WideOp::GetEnvSlotW { .. } | WideOp::SetEnvSlotW { .. } => {
+                WideOp::GetEnvSlotW { .. }
+                | WideOp::SetEnvSlotW { .. }
+                | WideOp::CopyObjectRestW { .. }
+                | WideOp::CopyArrayRestW { .. } => {
                     return Err(JitError::UnsupportedWideOp(format!("{wide:?}")));
                 }
             }

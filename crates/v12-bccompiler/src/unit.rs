@@ -26,6 +26,9 @@ fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
         spans: Vec::new(),
         pc_map: Vec::new(),
         is_strict: false,
+        fixed_params: 0,
+        has_rest: false,
+        rest_reg: 0,
     }
 }
 
@@ -70,7 +73,7 @@ pub fn compile_unit(
         let hint = comp.plans.units[idx].name_hint.clone();
         comp.functions.push(placeholder(Some(hint)));
     }
-    let strict = comp.strict;
+    let strict = comp.plans.units[idx].is_strict;
 
     // Named function *expressions* re-create themselves in their prologue so
     // their own name resolves inside every activation (self-recursion).
@@ -111,6 +114,18 @@ pub fn compile_unit(
     let mut fb = cx.finish()?;
     fb.name_hint = Some(comp.plans.units[idx].name_hint.clone());
     fb.is_strict = strict;
+    let plan = &comp.plans.units[idx];
+    fb.has_rest = plan.has_rest;
+    fb.fixed_params = if plan.has_rest {
+        plan.param_count.saturating_sub(1) as u16
+    } else {
+        plan.param_count as u16
+    };
+    fb.rest_reg = if plan.has_rest {
+        (fb.fixed_params + 1) as u8
+    } else {
+        0
+    };
     comp.functions[idx] = fb;
     Ok(())
 }

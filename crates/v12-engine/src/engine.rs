@@ -1,6 +1,8 @@
 //! Embedding engine: heap, realm, interpreter, and job queue.
 
-use v12_heap::{GcPolicy, Heap, JsValue, V12Str};
+use std::path::Path;
+
+use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
 use v12_interp::{Interp, JSException};
 
 use crate::builtins::{NativeRegistry, install_core};
@@ -175,6 +177,94 @@ impl Engine {
         }
     }
 
+    /// Evaluates `source` as an ES module.
+    ///
+    /// Compiles with `SourceType::module` (always strict) and runs the
+    /// resulting program. Imports are resolved via a dummy handler that
+    /// returns an empty namespace object for any specifier; this is
+    /// sufficient for syntax and linkage tests that do not check imported
+    /// values. Real file-based imports are handled by `eval_module_file`.
+    pub fn eval_module(&mut self, source: &str) -> Result<JsValue, JsValue> {
+        self.eval_module_source(source, Path::new("."))
+    }
+
+    /// Evaluates `source` as a module with `base` for import resolution.
+    pub fn eval_module_source(&mut self, source: &str, _base: &Path) -> Result<JsValue, JsValue> {
+        if source.len() > MAX_SOURCE_LEN {
+            let h = self
+                .heap
+                .intern_string(V12Str::latin1(b"RangeError: source too large".to_vec()));
+            return Err(JsValue::string(h));
+        }
+        let global = self.realm.global();
+        self.heap.add_root(JsValue::object(global));
+        // Compile as module.
+        let mut interner = v12_bccompiler::Interner::default();
+        let module = v12_bccompiler::compile_source_as_module_with_interner(source, &mut interner)
+            .map_err(|err| {
+                let msg = err.message;
+                let handle = if msg.is_ascii() {
+                    self.heap.intern_string(V12Str::latin1(msg.into_bytes()))
+                } else {
+                    self.heap
+                        .intern_string(V12Str::utf16(msg.encode_utf16().collect()))
+                };
+                JsValue::string(handle)
+            })?;
+        let strings: Vec<String> = v12_bccompiler::freeze_interner(interner)
+            .iter()
+            .map(|(_, s)| s.to_string())
+            .collect();
+        let program = module.program;
+        // Share heap.
+        let heap = std::mem::replace(&mut self.heap, Heap::new(GcPolicy::NoGC));
+        let mut interp =
+            Interp::new_with_heap(heap, Some(global), program.functions, program.main, strings);
+        // Install module-aware natives: 254 returns empty namespace.
+        struct ModuleImportNatives {
+            inner: NativeRegistry,
+        }
+        impl v12_interp::NativeRegistry for ModuleImportNatives {
+            fn call_native(
+                &mut self,
+                heap: &mut Heap,
+                this: JsValue,
+                args: &[JsValue],
+                index: u32,
+            ) -> Result<JsValue, JsValue> {
+                if index == 254 {
+                    let h = heap.alloc(JsObject::default());
+                    // Empty namespace object (no properties).
+                    heap.add_root(JsValue::object(h));
+                    return Ok(JsValue::object(h));
+                }
+                self.inner.call_native(heap, this, args, index)
+            }
+        }
+        let natives = ModuleImportNatives {
+            inner: self.registry.clone(),
+        };
+        interp.set_natives(Box::new(natives));
+        let outcome = interp.run();
+        let heap = interp.into_heap();
+        self.heap = heap;
+        let _ = self.jobs.drain(&mut self.heap);
+        match outcome {
+            Ok(()) => Ok(JsValue::undefined()),
+            Err(JSException(thrown)) => Err(thrown),
+        }
+    }
+
+    /// Evaluates a module file at `path`, resolving imports relative to its directory.
+    pub fn eval_module_file(&mut self, path: &Path) -> Result<JsValue, JsValue> {
+        let source = std::fs::read_to_string(path).map_err(|e| {
+            let msg = format!("Error reading {}: {e}", path.display());
+            let h = self.heap.intern_string(V12Str::latin1(msg.into_bytes()));
+            JsValue::string(h)
+        })?;
+        self.eval_module_source(&source, path.parent().unwrap_or(Path::new(".")))
+    }
+
     /// Creates a function object from `params` and `body` strings.
     ///
     /// `params` is a comma-separated parameter list (e.g. `"a, b"`), `body`
@@ -346,7 +436,7 @@ mod tests {
     #[test]
     fn eval_compile_error_reports_string() {
         let mut engine = Engine::new();
-        let err = engine.eval("let = 1;").unwrap_err();
+        let err = engine.eval("let x = ;").unwrap_err();
         assert!(err.is_string());
         let text = engine.to_display_string(err);
         assert!(
@@ -549,5 +639,32 @@ mod tests {
         assert!(thrown3.is_false());
         let thrown4 = engine.eval("throw (null === null);").unwrap_err();
         assert!(thrown4.is_true());
+    }
+
+    #[test]
+    fn module_export_import_via_engine() {
+        let mut engine = Engine::new();
+        // Simple module with export, no external import.
+        let src = "export const x = 42;";
+        let result = engine.eval_module(src);
+        assert!(result.is_ok(), "module should evaluate: {:?}", result);
+        // Module with import (dummy handler returns empty namespace).
+        let src2 = "import {x} from \"./dummy.js\"; export const y = 1;";
+        let result2 = engine.eval_module(src2);
+        assert!(
+            result2.is_ok(),
+            "module with import should not panic: {:?}",
+            result2
+        );
+    }
+
+    #[test]
+    fn module_syntax_error_is_reported() {
+        let mut engine = Engine::new();
+        let src = "import {"; // incomplete
+        let err = engine.eval_module(src).unwrap_err();
+        assert!(err.is_string());
+        let text = engine.to_display_string(err);
+        assert!(!text.is_empty());
     }
 }

@@ -81,6 +81,21 @@ pub enum Opcode {
     /// `prototype`; otherwise walks `r{b}`'s prototype chain for identity
     /// against `r{c}.prototype`.
     InstanceOf = 54,
+    /// Array rest slice for destructuring: `r{a} = r{b}[c..]`.
+    /// Throws TypeError if `r{b}` is not an array.
+    CopyArrayRest = 55,
+    /// Check that `r{a}` is an array, else throw TypeError for spread.
+    CheckIsArray = 56,
+    /// Call with args array: `r{a} = r{b}(...r{c})` where `r{c}` is an array of arguments, `this` is `r{b+1}`.
+    CallApply = 57,
+    /// Object rest copy placeholder (narrow form unused; wide form carries excluded list).
+    CopyObjectRest = 58,
+    /// Append spread array's elements to destination array.
+    ArrayAppend = 59,
+    /// Global property get: `r_a = global["name"]` where name is Str32 const id.
+    GetGlobal = 60,
+    /// Global property set: `global["name"] = r_a`.
+    SetGlobal = 61,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -138,6 +153,13 @@ impl TryFrom<u8> for Opcode {
             52 => Ok(Self::Await),
             53 => Ok(Self::In),
             54 => Ok(Self::InstanceOf),
+            55 => Ok(Self::CopyArrayRest),
+            56 => Ok(Self::CheckIsArray),
+            57 => Ok(Self::CallApply),
+            58 => Ok(Self::CopyObjectRest),
+            59 => Ok(Self::ArrayAppend),
+            60 => Ok(Self::GetGlobal),
+            61 => Ok(Self::SetGlobal),
             other => Err(other),
         }
     }
@@ -296,6 +318,13 @@ mod encoding_tests {
         Opcode::Await,
         Opcode::In,
         Opcode::InstanceOf,
+        Opcode::CopyArrayRest,
+        Opcode::CheckIsArray,
+        Opcode::CallApply,
+        Opcode::CopyObjectRest,
+        Opcode::ArrayAppend,
+        Opcode::GetGlobal,
+        Opcode::SetGlobal,
     ];
 
     #[test]
@@ -305,6 +334,13 @@ mod encoding_tests {
         assert_eq!(Opcode::Await as u8, 52);
         assert_eq!(Opcode::In as u8, 53);
         assert_eq!(Opcode::InstanceOf as u8, 54);
+        assert_eq!(Opcode::CopyArrayRest as u8, 55);
+        assert_eq!(Opcode::CheckIsArray as u8, 56);
+        assert_eq!(Opcode::CallApply as u8, 57);
+        assert_eq!(Opcode::CopyObjectRest as u8, 58);
+        assert_eq!(Opcode::ArrayAppend as u8, 59);
+        assert_eq!(Opcode::GetGlobal as u8, 60);
+        assert_eq!(Opcode::SetGlobal as u8, 61);
         let unique: std::collections::HashSet<u8> = ALL_OPS.iter().map(|&op| op as u8).collect();
         assert_eq!(unique.len(), ALL_OPS.len());
     }
@@ -386,13 +422,44 @@ mod encoding_tests {
 /// | `GetEnvSlotW`  | dst register    | 1: `depth << 16 \| slot`                             |
 /// | `SetEnvSlotW`  | src register    | 1: `depth << 16 \| slot`                             |
 /// | `CallW`        | dst register    | 1: `func << 16 \| argc` (`argc` is u16)              |
+/// | `CopyObjectRestW` | dst register | 2: `src << 16 \| excl_base`, excl_count (u16)       |
+/// | `CopyArrayRestW`  | dst register | 1: `src << 16 \| start` (u16)                        |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WideOp {
-    LoadConstW { dst: u8, const_id: u32 },
-    LoadIntW { dst: u8, value: i64 },
-    GetEnvSlotW { dst: u8, depth: u16, slot: u16 },
-    SetEnvSlotW { src: u8, depth: u16, slot: u16 },
-    CallW { dst: u8, func: u8, argc: u16 },
+    LoadConstW {
+        dst: u8,
+        const_id: u32,
+    },
+    LoadIntW {
+        dst: u8,
+        value: i64,
+    },
+    GetEnvSlotW {
+        dst: u8,
+        depth: u16,
+        slot: u16,
+    },
+    SetEnvSlotW {
+        src: u8,
+        depth: u16,
+        slot: u16,
+    },
+    CallW {
+        dst: u8,
+        func: u8,
+        argc: u16,
+    },
+    CopyObjectRestW {
+        dst: u8,
+        src: u8,
+        excl_base: u8,
+        excl_count: u16,
+    },
+    CopyArrayRestW {
+        dst: u8,
+        src: u8,
+        start: u16,
+    },
 }
 
 fn pack_hi_lo(hi: u16, lo: u16) -> u32 {
@@ -410,6 +477,8 @@ impl WideOp {
     pub const DISC_GET_ENV_SLOT_W: u32 = 2;
     pub const DISC_SET_ENV_SLOT_W: u32 = 3;
     pub const DISC_CALL_W: u32 = 4;
+    pub const DISC_COPY_OBJECT_REST_W: u32 = 5;
+    pub const DISC_COPY_ARRAY_REST_W: u32 = 6;
 
     /// Serializes to a header word plus the documented payload words.
     ///
@@ -440,6 +509,23 @@ impl WideOp {
             Self::CallW { dst, func, argc } => {
                 let packed = pack_hi_lo(u16::from(func), argc);
                 vec![hdr(dst, Self::DISC_CALL_W), Instr(packed)]
+            }
+            Self::CopyObjectRestW {
+                dst,
+                src,
+                excl_base,
+                excl_count,
+            } => {
+                let packed = pack_hi_lo(u16::from(src), u16::from(excl_base));
+                vec![
+                    hdr(dst, Self::DISC_COPY_OBJECT_REST_W),
+                    Instr(packed),
+                    Instr(u32::from(excl_count)),
+                ]
+            }
+            Self::CopyArrayRestW { dst, src, start } => {
+                let packed = pack_hi_lo(u16::from(src), start);
+                vec![hdr(dst, Self::DISC_COPY_ARRAY_REST_W), Instr(packed)]
             }
         }
     }
@@ -516,6 +602,30 @@ impl WideOp {
                     2,
                 ))
             }
+            Self::DISC_COPY_OBJECT_REST_W => {
+                let (src, excl_base) = unpack_hi_lo(payload(1)?);
+                let excl_count = payload(2)? as u16;
+                Ok((
+                    Self::CopyObjectRestW {
+                        dst: header.a(),
+                        src: src as u8,
+                        excl_base: excl_base as u8,
+                        excl_count,
+                    },
+                    3,
+                ))
+            }
+            Self::DISC_COPY_ARRAY_REST_W => {
+                let (src, start) = unpack_hi_lo(payload(1)?);
+                Ok((
+                    Self::CopyArrayRestW {
+                        dst: header.a(),
+                        src: src as u8,
+                        start,
+                    },
+                    2,
+                ))
+            }
             other => Err(format!("wide op: unknown discriminant {other:#x}")),
         }
     }
@@ -533,6 +643,18 @@ impl fmt::Display for WideOp {
                 write!(f, "set_env_slot_w r{src}, depth={depth} slot={slot}")
             }
             Self::CallW { dst, func, argc } => write!(f, "call_w r{dst}, r{func}, argc={argc}"),
+            Self::CopyObjectRestW {
+                dst,
+                src,
+                excl_base,
+                excl_count,
+            } => write!(
+                f,
+                "copy_object_rest_w r{dst}, r{src}, excl_base=r{excl_base} count={excl_count}"
+            ),
+            Self::CopyArrayRestW { dst, src, start } => {
+                write!(f, "copy_array_rest_w r{dst}, r{src}, start={start}")
+            }
         }
     }
 }
@@ -567,6 +689,17 @@ mod wide_tests {
                 dst: 0,
                 func: 4,
                 argc: 1000,
+            },
+            WideOp::CopyObjectRestW {
+                dst: 1,
+                src: 2,
+                excl_base: 3,
+                excl_count: 7,
+            },
+            WideOp::CopyArrayRestW {
+                dst: 4,
+                src: 5,
+                start: 258,
             },
         ];
         for op in ops {
@@ -763,6 +896,12 @@ pub struct FunctionBytecode {
     pub spans: Vec<SpanPair>,
     pub pc_map: Vec<PcMapEntry>,
     pub is_strict: bool,
+    /// Number of fixed (non-rest) parameters. `0` when no parameters.
+    pub fixed_params: u16,
+    /// `true` when the function has a rest parameter.
+    pub has_rest: bool,
+    /// Register index of the rest parameter (valid when `has_rest`).
+    pub rest_reg: u8,
 }
 
 impl FunctionBytecode {
@@ -878,6 +1017,13 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::Await => "await",
         Opcode::In => "in",
         Opcode::InstanceOf => "instance_of",
+        Opcode::CopyArrayRest => "copy_array_rest",
+        Opcode::CheckIsArray => "check_is_array",
+        Opcode::CallApply => "call_apply",
+        Opcode::CopyObjectRest => "copy_object_rest",
+        Opcode::ArrayAppend => "array_append",
+        Opcode::GetGlobal => "get_global",
+        Opcode::SetGlobal => "set_global",
     }
 }
 
@@ -887,7 +1033,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
     let (a, b, c) = (i.a(), i.b(), i.c());
     match op {
         Opcode::Move => write!(f, " r{a}, r{b}"),
-        Opcode::LoadConst => write!(f, " r{a}, k{b}"),
+        Opcode::LoadConst => write!(f, " r{a}, k{}", i.imm16()),
         Opcode::LoadInt => write!(f, " r{a}, #{}", c as i8),
         Opcode::Wide => Ok(()), // caller decodes header + payload words
         Opcode::Add
@@ -928,6 +1074,13 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::SuspendYield => write!(f, " r{a}"),
         Opcode::Await => write!(f, " r{a}, r{b}"),
         Opcode::In | Opcode::InstanceOf => write!(f, " r{a}, r{b}, r{c}"),
+        Opcode::CopyArrayRest => write!(f, " r{a}, r{b}, start={c}"),
+        Opcode::CheckIsArray => write!(f, " r{a}"),
+        Opcode::CallApply => write!(f, " r{a}, r{b}, r{c}"),
+        Opcode::CopyObjectRest => write!(f, " r{a}, r{b}, r{c}"),
+        Opcode::ArrayAppend => write!(f, " r{a}, r{b}"),
+        Opcode::GetGlobal => write!(f, " r{a}, k{}", i.imm16()),
+        Opcode::SetGlobal => write!(f, " k{}, r{a}", i.imm16()),
     }
 }
 
@@ -997,6 +1150,9 @@ mod data_tests {
             spans: vec![(0, 0); 4],
             pc_map: Vec::new(),
             is_strict: false,
+            fixed_params: 0,
+            has_rest: false,
+            rest_reg: 0,
         }
     }
 
@@ -1178,6 +1334,9 @@ mod data_tests {
             spans: vec![(0, 0); 5],
             pc_map: Vec::new(),
             is_strict: true,
+            fixed_params: 0,
+            has_rest: false,
+            rest_reg: 0,
         };
         let text = format!("{fb}");
         for needle in [
@@ -1354,6 +1513,9 @@ impl FunctionBuilder {
             spans: self.spans,
             pc_map: Vec::new(),
             is_strict: false,
+            fixed_params: 0,
+            has_rest: false,
+            rest_reg: 0,
         }
     }
 }

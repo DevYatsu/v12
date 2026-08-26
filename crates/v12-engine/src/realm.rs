@@ -44,7 +44,15 @@ impl Realm {
         let mut intrinsics = HashMap::with_capacity(MAX_INTRINSICS);
 
         for &name in INTRINSIC_NAMES {
-            let ctor = heap.alloc(JsObject::default());
+            let kind = if name == "Math" {
+                v12_heap::KIND_ORDINARY
+            } else {
+                v12_heap::KIND_FUNCTION
+            };
+            let ctor = heap.alloc(JsObject {
+                kind,
+                ..JsObject::default()
+            });
             // Publish the placeholder immediately to honor the allocation contract.
             heap.add_root(JsValue::object(ctor));
             let key = intern_key(heap, name);

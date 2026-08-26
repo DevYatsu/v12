@@ -27,6 +27,9 @@ fn empty_fn(max_regs: u16, instrs: Vec<Instr>, consts: ConstantPool) -> Function
         spans,
         pc_map: Vec::new(),
         is_strict: false,
+        fixed_params: 0,
+        has_rest: false,
+        rest_reg: 0,
     }
 }
 
@@ -728,4 +731,84 @@ fn null_identity_and_strict_equality() {
     assert_eq!(expect_throw(&mut interp2).as_bool(), Some(true));
     let mut interp3 = Interp::from_source("throw (null === undefined);").expect("compiles");
     assert_eq!(expect_throw(&mut interp3).as_bool(), Some(false));
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 5 — Destructuring (interp eval)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn destructuring_object_rest_via_interp() {
+    let mut interp =
+        Interp::from_source("let {a, ...rest} = {a:1, b:2, c:3}; throw rest.b + rest.c;")
+            .expect("compiles");
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(5));
+}
+
+#[test]
+fn destructuring_array_rest_and_nested_via_interp() {
+    let mut interp = Interp::from_source(
+        "let [a, [b, c], ...rest] = [1, [2,3], 4,5]; throw a + b + c + rest[0];",
+    )
+    .expect("compiles");
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(10));
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 6 — Rest params & spread (interp eval)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rest_params_collect_via_interp() {
+    let mut interp = Interp::from_source("function f(a, ...rest){ throw rest.length; } f(1,2,3);")
+        .expect("compiles");
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(2));
+}
+
+#[test]
+fn spread_array_and_call_via_interp() {
+    let mut interp2 =
+        Interp::from_source("let arr=[1,2]; let v=[...arr,3]; throw v[2];").expect("compiles");
+    assert_eq!(expect_throw(&mut interp2).as_smi(), Some(3));
+    let mut interp3 =
+        Interp::from_source("function f(...a){ throw a[1]; } f(...[5,6]);").expect("compiles");
+    assert_eq!(expect_throw(&mut interp3).as_smi(), Some(6));
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 9 — function-code strict & Annex B (interp eval)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn annex_b_sloppy_block_function_via_interp() {
+    let mut interp = Interp::from_source("if (true) function f(){ return 1; } throw typeof f;")
+        .expect("compiles");
+    let v = expect_throw(&mut interp);
+    let text = interp.to_display_string(v);
+    assert_eq!(text, "function");
+    let mut interp2 = Interp::from_source("if (false) function f(){ return 1; } throw typeof f;")
+        .expect("compiles");
+    let v2 = expect_throw(&mut interp2);
+    let text2 = interp2.to_display_string(v2);
+    assert_eq!(text2, "undefined");
+}
+
+// ---------------------------------------------------------------------------
+// Bucket 12 — Generators / async (interp eval, stub)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn generator_yield_does_not_panic() {
+    let mut interp =
+        Interp::from_source("function* gen(){ yield 1; yield 2; } let g=gen(); throw 42;")
+            .expect("compiles");
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(42));
+}
+
+#[test]
+fn async_await_does_not_panic() {
+    let mut interp =
+        Interp::from_source("async function af(){ await 1; } af(); throw 100;").expect("compiles");
+    // async function is not actually async in stub, but should not panic on await
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(100));
 }

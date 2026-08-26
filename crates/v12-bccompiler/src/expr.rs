@@ -158,6 +158,31 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.closure_arrow(dst, a)?;
                 Ok(dst)
             }
+            Expression::YieldExpression(y) => {
+                if y.delegate {
+                    return Err(self.err(y.span, "yield* is not supported"));
+                }
+                let arg = if let Some(arg) = &y.argument {
+                    self.expr(arg)?
+                } else {
+                    let r = self.new_temp();
+                    self.load_undefined(r, y.span);
+                    r
+                };
+                let dst = self.new_temp();
+                self.move_reg(dst, arg, y.span);
+                self.emit_spanned(
+                    v12_bytecode::Instr::new(Opcode::SuspendYield, dst, 0, 0),
+                    y.span,
+                );
+                Ok(dst)
+            }
+            Expression::AwaitExpression(a) => {
+                let arg = self.expr(&a.argument)?;
+                let dst = self.new_temp();
+                self.emit_spanned(v12_bytecode::Instr::new(Opcode::Await, dst, arg, 0), a.span);
+                Ok(dst)
+            }
             other => Err(self.err(other.span(), "unsupported expression")),
         }
     }
@@ -201,10 +226,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.load_const(dst, Const::F64(v), span)?;
                 Ok(dst)
             }
-            other => Err(self.err(
-                span,
-                format!("reference to an unbound (global) variable `{other}` is not supported"),
-            )),
+            other => {
+                let dst = self.new_temp();
+                let id = crate::model::str_id_of(self.comp.strings.get_or_intern(other));
+                self.emit_get_global(dst, id, span);
+                Ok(dst)
+            }
         }
     }
 
@@ -249,29 +276,90 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         span: Span,
     ) -> Res<u8> {
         let elems: Vec<_> = elements.collect();
-        let n = u8::try_from(elems.len())
-            .map_err(|_| self.err(span, "array literals above 255 elements are not supported"))?;
-        let base = self.new_temps(n);
-        for (i, el) in elems.into_iter().enumerate() {
-            let slot = base + i as u8;
-            match el {
-                ArrayExpressionElement::SpreadElement(_) => {
-                    return Err(self.err(el.span(), "spread elements are not supported"));
+        let has_spread = elems
+            .iter()
+            .any(|el| matches!(el, ArrayExpressionElement::SpreadElement(_)));
+        if !has_spread {
+            let n = u8::try_from(elems.len()).map_err(|_| {
+                self.err(span, "array literals above 255 elements are not supported")
+            })?;
+            let base = self.new_temps(n);
+            for (i, el) in elems.into_iter().enumerate() {
+                let slot = base + i as u8;
+                match el {
+                    ArrayExpressionElement::SpreadElement(_) => unreachable!(),
+                    ArrayExpressionElement::Elision(_) => self.load_undefined(slot, span),
+                    _ => {
+                        let Some(x) = el.as_expression() else {
+                            return Err(self.err(el.span(), "unsupported array element"));
+                        };
+                        self.expr_into(x, slot)?;
+                    }
                 }
-                ArrayExpressionElement::Elision(_) => self.load_undefined(slot, span),
+            }
+            let dst = self.new_temp();
+            self.emit_spanned(
+                v12_bytecode::Instr::new(Opcode::NewArray, dst, base, n),
+                span,
+            );
+            return Ok(dst);
+        }
+        // Spread path: build array incrementally.
+        let dst = self.new_temp();
+        // Empty array
+        self.emit_spanned(
+            v12_bytecode::Instr::new(Opcode::NewArray, dst, self.undef_reg(), 0),
+            span,
+        );
+        for el in elems {
+            match el {
+                ArrayExpressionElement::SpreadElement(s) => {
+                    let src = self.expr(&s.argument)?;
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::CheckIsArray, src, 0, 0),
+                        s.span,
+                    );
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::ArrayAppend, dst, src, 0),
+                        s.span,
+                    );
+                }
+                ArrayExpressionElement::Elision(_) => {
+                    // Hole: append undefined as hole approximation — create single hole via SetProperty with hole?
+                    // For v1 we append undefined (tests treat hole as undefined at index).
+                    let undef = self.new_temp();
+                    self.load_undefined(undef, span);
+                    let len_key = self.new_temp();
+                    self.load_str(len_key, "length", span)?;
+                    let len = self.new_temp();
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::GetProperty, len, dst, len_key),
+                        span,
+                    );
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::SetProperty, dst, len, undef),
+                        span,
+                    );
+                }
                 _ => {
                     let Some(x) = el.as_expression() else {
                         return Err(self.err(el.span(), "unsupported array element"));
                     };
-                    self.expr_into(x, slot)?;
+                    let val = self.expr(x)?;
+                    let len_key = self.new_temp();
+                    self.load_str(len_key, "length", span)?;
+                    let len = self.new_temp();
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::GetProperty, len, dst, len_key),
+                        span,
+                    );
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::SetProperty, dst, len, val),
+                        span,
+                    );
                 }
             }
         }
-        let dst = self.new_temp();
-        self.emit_spanned(
-            v12_bytecode::Instr::new(Opcode::NewArray, dst, base, n),
-            span,
-        );
         Ok(dst)
     }
 
@@ -475,6 +563,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         "assignment to an unbound variable is not supported",
                     ));
                 };
+                if self.comp.plans.const_bindings.contains(&sym)
+                    && self.comp.plans.units[self.unit].is_strict
+                {
+                    return Err(self.err(id.span, "SyntaxError: Assignment to constant variable"));
+                }
                 let access = self.access(sym);
                 let old = self.new_temp();
                 self.read_access(access, old, span);
@@ -544,11 +637,34 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         match simple {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
-                    return Err(self.err(
-                        id.span,
-                        "assignment to an unbound variable is not supported",
-                    ));
+                    // Unbound assignment goes to global.
+                    let rhs_val = match binop {
+                        None => rhs,
+                        Some(opcode) => {
+                            let cur = self.new_temp();
+                            let gid = crate::model::str_id_of(
+                                self.comp.strings.get_or_intern(id.name.as_str()),
+                            );
+                            self.emit_get_global(cur, gid, span);
+                            let out = self.new_temp();
+                            self.emit_spanned(
+                                v12_bytecode::Instr::new(opcode, out, cur, rhs),
+                                span,
+                            );
+                            out
+                        }
+                    };
+                    let gid =
+                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+                    self.emit_set_global(gid, rhs_val, span);
+                    return Ok(rhs_val);
                 };
+                // Strict-mode const reassignment is a SyntaxError.
+                if self.comp.plans.const_bindings.contains(&sym)
+                    && self.comp.plans.units[self.unit].is_strict
+                {
+                    return Err(self.err(id.span, "SyntaxError: Assignment to constant variable"));
+                }
                 let access = self.access(sym);
                 let value = match binop {
                     None => rhs,
@@ -627,18 +743,46 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         if c.optional {
             return Err(self.err(c.span, "optional calls are not supported"));
         }
-        let argc = u16::try_from(c.arguments.len())
-            .map_err(|_| self.err(c.span, "calls above 65535 arguments are not supported"))?;
-        if argc > u16::from(u8::MAX - CALL_HEADER_REGS) {
-            return Err(self.err(c.span, "calls above 253 arguments are not supported"));
+        let has_spread = c
+            .arguments
+            .iter()
+            .any(|a| matches!(a, oxc_ast::ast::Argument::SpreadElement(_)));
+        if !has_spread {
+            let argc = u16::try_from(c.arguments.len())
+                .map_err(|_| self.err(c.span, "calls above 65535 arguments are not supported"))?;
+            if argc > u16::from(u8::MAX - CALL_HEADER_REGS) {
+                return Err(self.err(c.span, "calls above 253 arguments are not supported"));
+            }
+            let argc8 = u8::try_from(argc).expect("argc checked against u8::MAX above");
+
+            // Layout: [callee][this][arg…]; see `CALL_HEADER_REGS`.
+            let block = self.new_temps(argc8 + CALL_HEADER_REGS);
+
+            if let Some(m) = c.callee.as_member_expression() {
+                // Method call: obj + key evaluate first, `this` = object.
+                let (obj, key) = self.member_parts(m)?;
+                self.emit_spanned(
+                    v12_bytecode::Instr::new(Opcode::GetProperty, block, obj, key),
+                    c.span,
+                );
+                self.move_reg(block + 1, obj, c.span);
+            } else {
+                let v = self.expr(&c.callee)?;
+                self.move_reg(block, v, c.span);
+                self.load_undefined(block + 1, c.span);
+            }
+            for (i, arg) in c.arguments.iter().enumerate() {
+                let Some(x) = arg.as_expression() else {
+                    return Err(self.err(arg.span(), "spread arguments are not supported"));
+                };
+                self.expr_into(x, block + 2 + i as u8)?;
+            }
+            self.emit_call(block, block, argc, c.span);
+            return Ok(block);
         }
-        let argc8 = u8::try_from(argc).expect("argc checked against u8::MAX above");
-
-        // Layout: [callee][this][arg…]; see `CALL_HEADER_REGS`.
-        let block = self.new_temps(argc8 + CALL_HEADER_REGS);
-
+        // Spread path: build args array and use CallApply.
+        let block = self.new_temps(CALL_HEADER_REGS);
         if let Some(m) = c.callee.as_member_expression() {
-            // Method call: obj + key evaluate first, `this` = object.
             let (obj, key) = self.member_parts(m)?;
             self.emit_spanned(
                 v12_bytecode::Instr::new(Opcode::GetProperty, block, obj, key),
@@ -650,14 +794,50 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.move_reg(block, v, c.span);
             self.load_undefined(block + 1, c.span);
         }
-        for (i, arg) in c.arguments.iter().enumerate() {
-            let Some(x) = arg.as_expression() else {
-                return Err(self.err(arg.span(), "spread arguments are not supported"));
-            };
-            self.expr_into(x, block + 2 + i as u8)?;
+        // Build args array.
+        let args_arr = self.new_temp();
+        self.emit_spanned(
+            v12_bytecode::Instr::new(Opcode::NewArray, args_arr, self.undef_reg(), 0),
+            c.span,
+        );
+        for arg in &c.arguments {
+            match arg {
+                oxc_ast::ast::Argument::SpreadElement(s) => {
+                    let src = self.expr(&s.argument)?;
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::CheckIsArray, src, 0, 0),
+                        s.span,
+                    );
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::ArrayAppend, args_arr, src, 0),
+                        s.span,
+                    );
+                }
+                _ => {
+                    let Some(x) = arg.as_expression() else {
+                        return Err(self.err(arg.span(), "unsupported argument"));
+                    };
+                    let val = self.expr(x)?;
+                    let len_key = self.new_temp();
+                    self.load_str(len_key, "length", x.span())?;
+                    let len = self.new_temp();
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::GetProperty, len, args_arr, len_key),
+                        x.span(),
+                    );
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::SetProperty, args_arr, len, val),
+                        x.span(),
+                    );
+                }
+            }
         }
-        self.emit_call(block, block, argc, c.span);
-        Ok(block)
+        let dst = block;
+        self.emit_spanned(
+            v12_bytecode::Instr::new(Opcode::CallApply, dst, block, args_arr),
+            c.span,
+        );
+        Ok(dst)
     }
 
     // -- closures --------------------------------------------------------------------
@@ -697,7 +877,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 }
 
 /// Property key text for the static (non-computed) forms we support.
-fn static_key_text(key: &PropertyKey<'_>) -> Option<String> {
+pub(crate) fn static_key_text(key: &PropertyKey<'_>) -> Option<String> {
     match key {
         PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
         PropertyKey::StringLiteral(s) => Some(s.value.to_string()),

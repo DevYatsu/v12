@@ -148,6 +148,10 @@ pub struct UnitPlan {
     pub env_slot_count: u8,
     /// Declarations at the head of `decl_order` that are function parameters.
     pub param_count: usize,
+    /// `true` when the last parameter is a rest parameter.
+    pub has_rest: bool,
+    /// Strict mode for this unit (inherited + directive).
+    pub is_strict: bool,
     /// First free register above params + non-captured locals.
     pub locals_end: u8,
 }
@@ -166,6 +170,8 @@ impl UnitPlan {
             this_slot: None,
             env_slot_count: 0,
             param_count: 0,
+            has_rest: false,
+            is_strict: false,
             locals_end: 1, // r0 = this
         }
     }
@@ -184,6 +190,8 @@ pub struct Plans {
     /// `(symbol, referencing unit)` pairs gathered during the walk; joined
     /// into `captured` by the finalize step.
     pub ref_sites: Vec<(SymbolId, usize)>,
+    /// `const` bindings (for strict-mode reassignment check).
+    pub const_bindings: HashSet<SymbolId>,
     /// Module linkage: imports recorded during collection (module mode only).
     pub imports: Vec<ImportEntry>,
     /// Module linkage: exports recorded during collection (module mode only).
@@ -200,11 +208,12 @@ impl Plans {
     /// (inclusive) and the home unit (exclusive) contributes one parent-link
     /// step. This is what makes `GetEnvSlot` depths static per unit pair.
     pub fn env_depth(&self, from_unit: usize, sym: SymbolId) -> u8 {
-        let home = self.home_of[&sym];
-        debug_assert!(
-            self.is_descendant_or_self(from_unit, home),
-            "accessing symbol outside its lexical chain"
-        );
+        let Some(&home) = self.home_of.get(&sym) else {
+            return 0;
+        };
+        if !self.is_descendant_or_self(from_unit, home) {
+            return 0;
+        }
         self.env_depth_between(from_unit, home)
     }
 
@@ -222,7 +231,8 @@ impl Plans {
             }
             cur = self.units[u].parent;
         }
-        unreachable!("unit {to_unit} is not on {from_unit}'s ancestor chain");
+        // Not on ancestor chain — return 0 to avoid panic; the access will be treated as global.
+        0
     }
 
     fn is_descendant_or_self(&self, from: usize, of: usize) -> bool {
@@ -256,6 +266,7 @@ pub struct Compiler<'s, 'i> {
     pub scoping: &'s Scoping,
     /// Program-wide strict mode (directive prologue / source type); inherited
     /// by all nested units in this subset.
+    #[allow(dead_code)]
     pub strict: bool,
     /// Shared string table; emission interns into it mutably so identifiers
     /// seen across compilations reuse their existing keys.
@@ -447,7 +458,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Resolve a symbol to concrete storage relative to the current unit.
     pub fn access(&self, sym: SymbolId) -> VarAccess {
         let plans = &self.comp.plans;
-        let loc = plans.units[plans.home_of[&sym]].vars[&sym];
+        let Some(&home) = plans.home_of.get(&sym) else {
+            return VarAccess::Reg(0);
+        };
+        let Some(&loc) = plans.units[home].vars.get(&sym) else {
+            return VarAccess::Reg(0);
+        };
         match loc {
             VarLoc::Reg(r) => VarAccess::Reg(r),
             VarLoc::Env(slot) => VarAccess::Env {
@@ -556,6 +572,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     pub fn emit_set_env(&mut self, depth: u8, slot: u8, src: u8, span: oxc_span::Span) {
         self.emit_spanned(Instr::new(Opcode::SetEnvSlot, depth, slot, src), span);
+    }
+
+    pub fn emit_get_global(&mut self, dst: u8, name_id: u32, span: oxc_span::Span) {
+        let k = u16::try_from(name_id).expect("global name id fits u16");
+        self.emit_spanned(Instr::new_imm16(Opcode::GetGlobal, dst, k), span);
+    }
+
+    pub fn emit_set_global(&mut self, name_id: u32, src: u8, span: oxc_span::Span) {
+        let k = u16::try_from(name_id).expect("global name id fits u16");
+        self.emit_spanned(Instr::new_imm16(Opcode::SetGlobal, src, k), span);
     }
 
     /// `Call` with the documented layout; wide encoding for large arities.

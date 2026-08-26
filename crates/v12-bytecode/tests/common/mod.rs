@@ -22,9 +22,11 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     41, 42, 43, 44, 45, 46, 47, 48, 49, // GetProperty .. SetEnvSlot
     50, 51, 52, // CreateGenerator, SuspendYield, Await
     53, 54, // In, InstanceOf
+    55, 56, 57, 58, 59, 60,
+    61, // CopyArrayRest, CheckIsArray, CallApply, CopyObjectRest, ArrayAppend, GetGlobal, SetGlobal
 ];
 
-pub const EXPECTED_OPCODE_COUNT: usize = 49;
+pub const EXPECTED_OPCODE_COUNT: usize = 56;
 
 /// Seeded splitmix64. Deterministic across platforms and runs.
 pub struct Rng(u64);
@@ -72,18 +74,21 @@ pub fn fn_with(len: u32, handlers: Vec<HandlerRange>) -> FunctionBytecode {
         handlers,
         pc_map: Vec::new(),
         is_strict: false,
+        fixed_params: 0,
+        has_rest: false,
+        rest_reg: 0,
     }
 }
 
 /// Wide payload word count per discriminant (header excluded).
-pub const WIDE_PAYLOAD_WORDS: [u32; 5] = [1, 2, 1, 1, 1];
+pub const WIDE_PAYLOAD_WORDS: [u32; 7] = [1, 2, 1, 1, 1, 2, 1];
 
 /// Total encoded width per discriminant (header included).
-pub const WIDE_TOTAL_WORDS: [u32; 5] = [2, 3, 2, 2, 2];
+pub const WIDE_TOTAL_WORDS: [u32; 7] = [2, 3, 2, 2, 2, 3, 2];
 
 /// Builds a random `WideOp` for structured roundtrip fuzzing.
 pub fn random_wide_op(rng: &mut Rng) -> WideOp {
-    match rng.below(5) {
+    match rng.below(7) {
         0 => WideOp::LoadConstW {
             dst: rng.next_u32() as u8,
             const_id: rng.next_u32(),
@@ -102,10 +107,21 @@ pub fn random_wide_op(rng: &mut Rng) -> WideOp {
             depth: rng.next_u32() as u16,
             slot: rng.next_u32() as u16,
         },
-        _ => WideOp::CallW {
+        4 => WideOp::CallW {
             dst: rng.next_u32() as u8,
             func: rng.next_u32() as u8,
             argc: rng.next_u32() as u16,
+        },
+        5 => WideOp::CopyObjectRestW {
+            dst: rng.next_u32() as u8,
+            src: rng.next_u32() as u8,
+            excl_base: rng.next_u32() as u8,
+            excl_count: rng.next_u32() as u16,
+        },
+        _ => WideOp::CopyArrayRestW {
+            dst: rng.next_u32() as u8,
+            src: rng.next_u32() as u8,
+            start: rng.next_u32() as u16,
         },
     }
 }
@@ -198,6 +214,9 @@ pub fn random_function(rng: &mut Rng, min_words: usize) -> RandomFunction {
             handlers,
             pc_map: Vec::new(),
             is_strict: rng.coin(50),
+            fixed_params: 0,
+            has_rest: false,
+            rest_reg: 0,
         },
     }
 }
