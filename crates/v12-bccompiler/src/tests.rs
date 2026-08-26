@@ -2020,3 +2020,81 @@ fn async_function_compiles() {
         .any(|f| format!("{f}").contains("await"));
     assert!(has_await, "expected await in async");
 }
+
+// ---------------------------------------------------------------------------
+// Bucket 3 — Global object & property model (`Object`/`Array`/etc. via `GetGlobal`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn global_intrinsics_compile_to_get_global() {
+    for name in [
+        "Object", "Array", "String", "Number", "Boolean", "Math", "JSON", "Error",
+    ] {
+        let src = format!("let x = {name};");
+        let (prog, _) = compile_source_with_strings(&src)
+            .unwrap_or_else(|e| panic!("{name} should compile: {e}"));
+        let fb = &prog.functions[prog.main as usize];
+        assert!(fb.validate().is_ok(), "validate failed for {name}:\n{fb}");
+        assert!(
+            fb.instrs.iter().any(|i| i.op() == Some(Opcode::GetGlobal)),
+            "expected GetGlobal for {name} in:\n{fb}"
+        );
+        // Also ensure `typeof` on the intrinsic does not early-return to "undefined"
+        // but goes through GetGlobal + TypeOf.
+        let src2 = format!("let y = typeof {name};");
+        let (prog2, _) = compile_source_with_strings(&src2).expect("typeof global should compile");
+        let fb2 = &prog2.functions[prog2.main as usize];
+        assert!(
+            fb2.instrs.iter().any(|i| i.op() == Some(Opcode::GetGlobal)),
+            "typeof {name} should still use GetGlobal in:\n{fb2}"
+        );
+        assert!(
+            fb2.instrs.iter().any(|i| i.op() == Some(Opcode::TypeOf)),
+            "typeof {name} should use TypeOf in:\n{fb2}"
+        );
+    }
+    // Unknown globals also compile via GetGlobal (missing → undefined at runtime)
+    let src3 = "let x = __unknownGlobalXYZ;";
+    let (prog3, _) = compile_source_with_strings(src3).expect("unknown global should compile");
+    assert!(
+        prog3.functions[0]
+            .instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::GetGlobal))
+    );
+}
+
+#[test]
+fn global_assign_and_update_compile_to_set_global() {
+    let src = "Object = 1; Array = 2; let y = Object; let z = Array;";
+    let (prog, _) = compile_source_with_strings(src).expect("global assign should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    assert!(
+        fb.instrs.iter().any(|i| i.op() == Some(Opcode::SetGlobal)),
+        "expected SetGlobal in:\n{fb}"
+    );
+    assert!(
+        fb.instrs.iter().any(|i| i.op() == Some(Opcode::GetGlobal)),
+        "expected GetGlobal in:\n{fb}"
+    );
+    // Global update `Object++` should lower to GetGlobal + Add + SetGlobal
+    let src2 = "Object++; ++Array;";
+    let (prog2, _) = compile_source_with_strings(src2).expect("global update should compile");
+    let fb2 = &prog2.functions[prog2.main as usize];
+    assert!(fb2.validate().is_ok(), "validate failed:\n{fb2}");
+    assert!(
+        fb2.instrs.iter().any(|i| i.op() == Some(Opcode::GetGlobal)),
+        "global update should use GetGlobal in:\n{fb2}"
+    );
+    assert!(
+        fb2.instrs.iter().any(|i| i.op() == Some(Opcode::SetGlobal)),
+        "global update should use SetGlobal in:\n{fb2}"
+    );
+    // Computed property with dynamic key via let
+    let src3 = r#"let k="a"; let o={[k]:1}; let v=o[k];"#;
+    let (prog3, _) = compile_source_with_strings(src3).expect("computed via let should compile");
+    let fb3 = &prog3.functions[prog3.main as usize];
+    assert!(fb3.validate().is_ok(), "validate failed:\n{fb3}");
+    expect_num(r#"let k="a"; let o={[k]:1}; return o[k];"#, 1.0);
+}

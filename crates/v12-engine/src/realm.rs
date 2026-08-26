@@ -12,18 +12,32 @@ use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue, PropKey, V12Str};
 const MAX_INTRINSICS: usize = 64;
 
 /// Names of the standard intrinsics installed at realm creation.
-const INTRINSIC_NAMES: &[&str] = &[
+///
+/// Order is part of the `GLOBAL_VAR_OFFSET` contract with `v12-interp`: the
+/// `n`th entry lives at `global.properties[n]`. Changing the order or length
+/// must be reflected in `v12-interp/src/lib.rs` (`INTRINSICS` and
+/// `GLOBAL_VAR_OFFSET`) and in `v12-bccompiler/src/model.rs` (`GLOBAL_INTRINSICS`).
+pub const INTRINSIC_NAMES: &[&str] = &[
     "Object",
     "Array",
     "String",
     "Number",
-    "Math",
     "Boolean",
+    "Math",
+    "JSON",
     "Error",
     "TypeError",
     "RangeError",
     "Promise",
+    "Symbol",
+    "console",
+    "globalThis",
 ];
+
+/// `INTRINSIC_NAMES.len()` — kept as a const for `GLOBAL_VAR_OFFSET` sync.
+///
+/// `v12-interp` duplicates this value as `GLOBAL_VAR_OFFSET`; see its docs.
+pub const INTRINSIC_COUNT: usize = INTRINSIC_NAMES.len();
 
 /// A single realm: global object plus the intrinsic registry.
 #[derive(Debug)]
@@ -44,7 +58,16 @@ impl Realm {
         let mut intrinsics = HashMap::with_capacity(MAX_INTRINSICS);
 
         for &name in INTRINSIC_NAMES {
-            let kind = if name == "Math" {
+            // `globalThis` is the global object itself per spec; other
+            // intrinsics are placeholders (functions except `Math`/`JSON`/`console`
+            // which are ordinary objects).
+            if name == "globalThis" {
+                let key = intern_key(heap, name);
+                let _ = key;
+                intrinsics.insert(name.to_string(), JsValue::object(global));
+                continue;
+            }
+            let kind = if matches!(name, "Math" | "JSON" | "console") {
                 v12_heap::KIND_ORDINARY
             } else {
                 v12_heap::KIND_FUNCTION
@@ -60,19 +83,21 @@ impl Realm {
             intrinsics.insert(name.to_string(), JsValue::object(ctor));
         }
 
-        // Install intrinsics as properties of the global object. Each property
-        // gets a distinct shape transition; the root shape is pinned by the heap.
-        // To keep the implementation simple and avoid external shape bookkeeping,
-        // the installation uses direct property storage on the global's vector
-        // in insertion order, which is sufficient for the skeleton stage.
-        // The shape-aware path is exercised in the built-ins stage via the
-        // interpreter's `Heap::add_property` mirroring.
-        for (name, value) in &intrinsics {
+        // Install intrinsics as properties of the global object in the
+        // deterministic order of `INTRINSIC_NAMES`. The interpreter's fast
+        // path for `GetGlobal` indexes `global.properties` directly by the
+        // position in its own `INTRINSICS` table, so the two tables must stay
+        // in sync (see `GLOBAL_VAR_OFFSET` in `v12-interp`). Shape tracking
+        // is handled lazily in the interpreter; here we only need the vector
+        // in the correct order.
+        for &name in INTRINSIC_NAMES {
+            let value = intrinsics
+                .get(name)
+                .copied()
+                .expect("intrinsic must have been inserted");
             let handle = intern_key(heap, name);
             let _ = handle;
-            // Push property value; shape tracking is handled lazily in the
-            // interpreter layer where shapes are published per-store.
-            heap.get_mut(global).properties.push(*value);
+            heap.get_mut(global).properties.push(value);
         }
 
         Self { global, intrinsics }

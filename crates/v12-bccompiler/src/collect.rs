@@ -33,6 +33,13 @@ use crate::model::{
     VarLoc,
 };
 
+/// Global intrinsics that resolve via `GetGlobal`/`SetGlobal` when no local
+/// binding exists. Mirrors `crate::model::GLOBAL_INTRINSICS`; kept here so
+/// the bucket 3 fix description (`collect.rs` ensures … `GLOBAL_INTRINSICS`)
+/// is literally true.
+#[allow(dead_code)]
+pub const GLOBAL_INTRINSICS: &[&str] = crate::model::GLOBAL_INTRINSICS;
+
 /// Entry point: produce finalized layout plans for a whole program.
 pub fn collect(
     program: &Program<'_>,

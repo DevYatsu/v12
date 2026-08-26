@@ -667,4 +667,90 @@ mod tests {
         let text = engine.to_display_string(err);
         assert!(!text.is_empty());
     }
+
+    #[test]
+    fn global_object_and_array_are_functions_via_get_global() {
+        let mut engine = Engine::new();
+        for name in ["Object", "Array", "String", "Number", "Boolean"] {
+            let src = format!("throw typeof {name};");
+            let thrown = engine.eval(&src).unwrap_err();
+            let ty = engine.to_display_string(thrown);
+            assert_eq!(
+                ty, "function",
+                "{name} via GetGlobal should be function, got {ty}"
+            );
+        }
+        // JSON and Math are ordinary objects
+        let thrown_json = engine.eval("throw typeof JSON;").unwrap_err();
+        assert_eq!(engine.to_display_string(thrown_json), "object");
+        let thrown_math = engine.eval("throw typeof Math;").unwrap_err();
+        assert_eq!(engine.to_display_string(thrown_math), "object");
+        // Missing global is undefined without throwing ReferenceError
+        let thrown_missing = engine
+            .eval("throw typeof __notExistingGlobalXYZ123;")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown_missing), "undefined");
+        // SetGlobal: overwriting a global intrinsic
+        let thrown_set = engine
+            .eval("Object = 42; throw typeof Object;")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown_set), "number");
+        // Restore for other tests (fresh engine)
+        let mut engine2 = Engine::new();
+        let thrown_restore = engine2.eval("throw typeof Object;").unwrap_err();
+        assert_eq!(engine2.to_display_string(thrown_restore), "function");
+    }
+
+    #[test]
+    fn object_get_prototype_of_via_global_and_native_registry() {
+        let mut engine = Engine::new();
+        // Verify `Object` global is a function object
+        let object_val = engine
+            .realm()
+            .get_intrinsic("Object")
+            .expect("Object intrinsic must exist");
+        assert!(object_val.is_object());
+        let h = object_val.as_object().unwrap();
+        assert_eq!(engine.heap().get(h).kind, v12_heap::KIND_FUNCTION);
+        // Verify native `Object.getPrototypeOf` handler is registered and works
+        // via the global's heap. This exercises the `GetGlobal` → `Call` path
+        // without needing a full shape for `Object.getPrototypeOf` in the
+        // minimal realm.
+        let mut registry = crate::builtins::NativeRegistry::new();
+        crate::builtins::install_core(&mut registry);
+        let heap = engine.heap_mut();
+        let proto = heap.alloc(v12_heap::JsObject::default());
+        heap.add_root(JsValue::object(proto));
+        let child = heap.alloc(v12_heap::JsObject {
+            prototype: Some(proto),
+            ..Default::default()
+        });
+        heap.add_root(JsValue::object(child));
+        let args = [JsValue::object(child)];
+        let res = registry
+            .dispatch(
+                heap,
+                JsValue::undefined(),
+                &args,
+                crate::builtins::NATIVE_OBJECT_GET_PROTOTYPE_OF,
+            )
+            .expect("getPrototypeOf should succeed");
+        assert_eq!(res.as_object(), Some(proto));
+        // Null prototype case
+        let lone = heap.alloc(v12_heap::JsObject::default());
+        heap.add_root(JsValue::object(lone));
+        let res2 = registry
+            .dispatch(
+                heap,
+                JsValue::undefined(),
+                &[JsValue::object(lone)],
+                crate::builtins::NATIVE_OBJECT_GET_PROTOTYPE_OF,
+            )
+            .unwrap();
+        assert!(res2.is_null());
+        // Also verify via JS that `Object` is still accessible after native calls
+        let mut engine2 = Engine::new();
+        let thrown = engine2.eval("throw Object;").unwrap_err();
+        assert!(thrown.is_object());
+    }
 }

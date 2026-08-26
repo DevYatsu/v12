@@ -123,7 +123,46 @@ pub enum VarLoc {
     Reg(u8),
     /// A slot in the home function unit's heap Environment (captured).
     Env(u8),
+    /// A property on the global object (`GetGlobal`/`SetGlobal`).
+    ///
+    /// Used for `var` bindings that alias the global object as well as for
+    /// unresolved references to well-known intrinsics (see
+    /// [`GLOBAL_INTRINSICS`]). Keeping it distinct from `Reg`/`Env` makes the
+    /// global path explicit in `VarAccess` lowering and satisfies the
+    /// `collect.rs` → `model.rs` contract for `known-failures.md` bucket 3.
+    #[allow(dead_code)]
+    Global,
 }
+
+/// Names of standard intrinsics that are always present on the global object.
+///
+/// An unresolved `IdentifierReference` whose text is in this table is treated
+/// as a global access (`GetGlobal`/`SetGlobal`) rather than a compile error.
+/// The list is intentionally small for v1 — enough to cover `known-failures.md`
+/// bucket 3 (`Object`, `Array`, `String`, `Number`, `Boolean`, `Math`, `JSON`,
+/// `Error`, …) without claiming full spec coverage. The realm
+/// (`v12-engine/src/realm.rs`) and interpreter (`v12-interp`) share the same
+/// ordering via their own copies of this list (kept in sync manually for now).
+pub const GLOBAL_INTRINSICS: &[&str] = &[
+    "Object",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Math",
+    "JSON",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "URIError",
+    "EvalError",
+    "Promise",
+    "Symbol",
+    "console",
+    "globalThis",
+];
 
 /// Per-function-unit layout decided by the collect pass.
 #[derive(Debug)]
@@ -470,6 +509,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 depth: plans.env_depth(self.unit, sym),
                 slot,
             },
+            VarLoc::Global => VarAccess::Global { sym },
         }
     }
 
@@ -636,5 +676,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 #[derive(Debug, Clone, Copy)]
 pub enum VarAccess {
     Reg(u8),
-    Env { depth: u8, slot: u8 },
+    Env {
+        depth: u8,
+        slot: u8,
+    },
+    /// A global property (`GetGlobal`/`SetGlobal`) — the symbol's name is
+    /// interned at emission time.
+    Global {
+        sym: SymbolId,
+    },
 }

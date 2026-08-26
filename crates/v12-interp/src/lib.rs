@@ -93,8 +93,10 @@ pub const KIND_GENERATOR: u8 = HEAP_KIND_GENERATOR;
 /// Offset for global var slots when the main env aliases the global object.
 ///
 /// The global object's `properties` vector starts with this many intrinsic
-/// slots; main-env slot `0` maps to `properties[GLOBAL_VAR_OFFSET]`.
-const GLOBAL_VAR_OFFSET: usize = 10;
+/// slots; main-env slot `0` maps to `properties[GLOBAL_VAR_OFFSET]`. Must
+/// stay in sync with `v12-engine/src/realm.rs` `INTRINSIC_NAMES.len()` and
+/// `v12-bccompiler/src/model.rs` `GLOBAL_INTRINSICS.len()` (v1: 14).
+const GLOBAL_VAR_OFFSET: usize = 14;
 
 /// Maximum simultaneous JavaScript activations.
 ///
@@ -1994,18 +1996,23 @@ impl Interp {
             .cloned()
             .unwrap_or_default();
         // Fast path for intrinsics that live at fixed indices in the global's
-        // properties vector (see `realm::INTRINSIC_NAMES` order).
+        // properties vector (see `realm::INTRINSIC_NAMES` order). Must stay
+        // in sync with `v12-engine/src/realm.rs` and `v12-bccompiler/src/model.rs`.
         const INTRINSICS: &[&str] = &[
             "Object",
             "Array",
             "String",
             "Number",
-            "Math",
             "Boolean",
+            "Math",
+            "JSON",
             "Error",
             "TypeError",
             "RangeError",
             "Promise",
+            "Symbol",
+            "console",
+            "globalThis",
         ];
         if let Some(idx) = INTRINSICS.iter().position(|&n| n == text)
             && idx < self.heap.get(global).properties.len()
@@ -2046,12 +2053,16 @@ impl Interp {
             "Array",
             "String",
             "Number",
-            "Math",
             "Boolean",
+            "Math",
+            "JSON",
             "Error",
             "TypeError",
             "RangeError",
             "Promise",
+            "Symbol",
+            "console",
+            "globalThis",
         ];
         if let Some(idx) = INTRINSICS.iter().position(|&n| n == text) {
             // Intrinsics are at fixed indices; allow overwriting.

@@ -240,6 +240,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         match access {
             VarAccess::Reg(r) => self.move_reg(dst, r, span),
             VarAccess::Env { depth, slot } => self.emit_get_env(dst, depth, slot, span),
+            VarAccess::Global { sym } => {
+                let name = self.comp.scoping.symbol_name(sym);
+                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(name));
+                self.emit_get_global(dst, name_id, span);
+            }
         }
     }
 
@@ -252,6 +257,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 }
             }
             VarAccess::Env { depth, slot } => self.emit_set_env(depth, slot, src, span),
+            VarAccess::Global { sym } => {
+                let name = self.comp.scoping.symbol_name(sym);
+                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(name));
+                self.emit_set_global(name_id, src, span);
+            }
         }
     }
 
@@ -445,13 +455,24 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn typeof_(&mut self, arg: &Expression<'_>, span: Span) -> Res<u8> {
-        // `typeof undeclared` is specified not to throw.
+        // `typeof undeclared` is specified not to throw. For v1 `GetGlobal`
+        // on a missing global already yields `undefined`, so the early return
+        // is just an optimisation. It must not fire for well-known globals
+        // like `Object`/`Array` where `typeof Object` should be `"function"` /
+        // `"object"` rather than `"undefined"`. The same applies to the
+        // non-writable globals `undefined`/`NaN`/`Infinity` which have
+        // dedicated value materialisation in `read_identifier`.
         if let Expression::Identifier(id) = arg
             && self.comp.symbol_of(id.reference_id.get()).is_none()
         {
-            let dst = self.new_temp();
-            self.load_str(dst, "undefined", span)?;
-            return Ok(dst);
+            let name = id.name.as_str();
+            let is_global_intrinsic = crate::model::GLOBAL_INTRINSICS.contains(&name);
+            let is_special = matches!(name, "undefined" | "NaN" | "Infinity");
+            if !is_global_intrinsic && !is_special {
+                let dst = self.new_temp();
+                self.load_str(dst, "undefined", span)?;
+                return Ok(dst);
+            }
         }
         let v = self.expr(arg)?;
         let dst = self.new_temp();
@@ -558,10 +579,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         match target {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
-                    return Err(self.err(
-                        id.span,
-                        "assignment to an unbound variable is not supported",
-                    ));
+                    // Unbound identifier → global property via `GetGlobal`/`SetGlobal`.
+                    // Mirrors the `assign` global path and keeps `x++` on an
+                    // intrinsic working without a `CompileError`. For v1 any
+                    // unbound name is treated as a global (missing globals read
+                    // as `undefined`, writes create the property).
+                    let gid =
+                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+                    let old = self.new_temp();
+                    self.emit_get_global(old, gid, span);
+                    let one = self.new_temp();
+                    self.load_int(one, delta, span);
+                    let new = self.new_temp();
+                    self.emit_spanned(v12_bytecode::Instr::new(Opcode::Add, new, old, one), span);
+                    self.emit_set_global(gid, new, span);
+                    return Ok(if prefix { new } else { old });
                 };
                 if self.comp.plans.const_bindings.contains(&sym)
                     && self.comp.plans.units[self.unit].is_strict
