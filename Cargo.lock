@@ -1785,6 +1785,7 @@ dependencies = [
 name = "v12-cli"
 version = "0.1.0"
 dependencies = [
+ "v12-bccompiler",
  "v12-engine",
 ]
 

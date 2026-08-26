@@ -7,11 +7,11 @@ garbage-collected runtime implemented from scratch — no bindings to V8,
 JavaScriptCore, or QuickJS. The goal is an embeddable engine that is fast to
 start, small in memory, and correct enough to run real programs.
 
-> **Status: early development — Tier-0 executes, embedding works.**
-> The compiler, heap, interpreter, baseline JIT, and embedding engine are
-> implemented and tested (278 tests, `cargo nextest run --workspace`). The
-> `v12` CLI is in progress; Test262 harness and Tier-2 optimizer are planned.
-> Expect breaking changes.
+> **Status: early development — Tier-0 executes, embedding works, CLI ships.**
+> The compiler, heap, interpreter, baseline JIT, embedding engine, and
+> `v12` CLI (REPL + script runner) are implemented and tested (296 tests,
+> `cargo nextest run --workspace`). Test262 harness and Tier-2 optimizer
+> remain planned. Expect breaking changes.
 
 ## Why another engine?
 
@@ -73,7 +73,7 @@ for function in &program.functions {
 }
 ```
 
-Run the test suite (278 tests, `cargo nextest run --workspace`):
+Run the test suite (296 tests, `cargo nextest run --workspace`):
 
 ```sh
 cargo nextest run --workspace
@@ -100,7 +100,7 @@ cargo nextest run --workspace
 - [x] Tier-0 interpreter — handler-table unwinding, GC-rooted frames, differential vs reference interpreter
 - [x] Built-ins — Object/Array/String/Number/Math/Error + single realm, microtask queue, `Engine::eval` API
 - [x] Tier-1 baseline JIT — Cranelift template (feature-gated, 21 opcodes, deopt pc_map)
-- [ ] `v12` CLI — script runner + REPL *(Wave 5 in progress)*
+- [x] `v12` CLI — script runner + REPL (`--disasm`, `--expose-gc`, pipe fallback)
 - [ ] Test262 conformance harness and benchmark gating
 - [ ] Tier-2 speculative optimizer
 
