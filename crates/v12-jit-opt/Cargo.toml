@@ -1,0 +1,25 @@
+[package]
+name = "v12-jit-opt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+v12-bytecode.workspace = true
+v12-heap.workspace = true
+v12-interp.workspace = true
+cranelift-frontend = { workspace = true, optional = true }
+cranelift-codegen = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-native = { workspace = true, optional = true }
+
+[features]
+# Interpreter-only builds stay first-class: the JIT is a cargo feature (plan §4).
+default = ["jit"]
+jit = [
+  "dep:cranelift-frontend",
+  "dep:cranelift-codegen",
+  "dep:cranelift-module",
+  "dep:cranelift-native",
+]

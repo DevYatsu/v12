@@ -1,0 +1,10 @@
+[package]
+name = "v12-bytecode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Carries oxc Span pairs for traces/deopt metadata (plan §6); zero internal deps.
+oxc_span.workspace = true

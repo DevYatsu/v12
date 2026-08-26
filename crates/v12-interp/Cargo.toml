@@ -1,0 +1,10 @@
+[package]
+name = "v12-interp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+v12-bytecode.workspace = true
+v12-heap.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "v12-bccompiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+lasso.workspace = true
+oxc_allocator = "=0.147.0"
+oxc_parser.workspace = true
+oxc_ast.workspace = true
+oxc_semantic.workspace = true
+oxc_span.workspace = true
+v12-bytecode.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "v12-intl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Compiled-data builds avoid baked/databake blob plumbing; see lib.rs coverage notes.
+icu = { workspace = true, features = ["compiled_data"] }
+temporal_rs.workspace = true

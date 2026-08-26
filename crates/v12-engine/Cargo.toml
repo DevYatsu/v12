@@ -1,0 +1,21 @@
+[package]
+name = "v12-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+v12-bytecode.workspace = true
+v12-heap.workspace = true
+v12-interp.workspace = true
+v12-bccompiler.workspace = true
+v12-regex.workspace = true
+v12-intl.workspace = true
+malachite.workspace = true
+v12-jit-baseline = { workspace = true, optional = true }
+
+[features]
+# Interpreter-only builds stay first-class: the JIT is a cargo feature (plan §4).
+default = ["jit"]
+jit = ["dep:v12-jit-baseline"]

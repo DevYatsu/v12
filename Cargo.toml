@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = ""
+
+[workspace.dependencies]
+# Front end (ADR-1): weekly 0.x releases with breaking changes — pin exact,
+# upgrade deliberately.
+oxc_parser = "=0.147.0"
+oxc_ast = "=0.147.0"
+oxc_semantic = "=0.147.0"
+oxc_span = "=0.147.0"
+
+# JIT backend (ADR-3).
+cranelift-frontend = "0.135"
+cranelift-codegen = "0.135"
+cranelift-module = "0.135"
+cranelift-native = "0.135"
+cranelift-jit = "0.135"
+
+# ECMA-262 RegExp engine.
+regress = "0.12"
+
+# BigInt.
+malachite = "0.10"
+
+# Intl / Temporal.
+icu = "2.3"
+temporal_rs = "0.2"
+
+# Identifier interning.
+lasso = "=0.7.3"
+
+# Arena allocation.
+bumpalo = "3.20"
+
+# Hash tables / hashing.
+hashbrown = "0.17"
+foldhash = "0.2"
+
+# Insertion-ordered maps.
+indexmap = "2"
+
+# Benchmarks (dev-only).
+criterion = "0.8"
+
+# Internal crates.
+v12-bytecode = { path = "crates/v12-bytecode" }
+v12-heap = { path = "crates/v12-heap" }
+v12-bccompiler = { path = "crates/v12-bccompiler" }
+v12-interp = { path = "crates/v12-interp" }
+v12-jit-baseline = { path = "crates/v12-jit-baseline" }
+v12-jit-opt = { path = "crates/v12-jit-opt" }
+v12-regex = { path = "crates/v12-regex" }
+v12-intl = { path = "crates/v12-intl" }
+v12-engine = { path = "crates/v12-engine" }
