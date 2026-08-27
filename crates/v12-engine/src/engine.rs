@@ -1,16 +1,30 @@
 //! Embedding engine: heap, realm, interpreter, and job queue.
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
+use v12_bytecode::FunctionBytecode;
 use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
 use v12_interp::{Interp, JSException};
 
 use crate::builtins::{NativeRegistry, install_core};
-use crate::job_queue::JobQueue;
+use crate::job_queue::{Job, JobCtx, JobQueue};
 use crate::realm::Realm;
 
 /// Maximum length of a source text accepted by `eval`.
 const MAX_SOURCE_LEN: usize = 1_000_000;
+
+/// Program of the last direct-eval, retained so [`Engine::run_jobs`] can
+/// rebuild an interpreter for jobs that activate user functions (Promise
+/// reaction handlers, `queueMicrotask` callbacks). One program is retained at
+/// a time; a queued job belonging to an older program would mis-index — in
+/// practice each eval drains its own checkpoint before the next compiles.
+struct RetainedProgram {
+    functions: Vec<FunctionBytecode>,
+    main: u32,
+    strings: Vec<String>,
+}
 
 /// The JavaScript engine.
 pub struct Engine {
@@ -18,6 +32,10 @@ pub struct Engine {
     realm: Realm,
     jobs: JobQueue,
     registry: NativeRegistry,
+    /// Enqueue side channel shared with the registry: natives push jobs here
+    /// during interpreter execution; the engine adopts them at checkpoints.
+    pending: Rc<RefCell<Vec<Job>>>,
+    retained: Option<RetainedProgram>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -35,13 +53,17 @@ impl Engine {
     pub fn new() -> Self {
         let mut heap = Heap::new(GcPolicy::default());
         let realm = Realm::new(&mut heap);
+        let pending: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
         let mut registry = NativeRegistry::new();
+        registry.set_pending(Rc::clone(&pending));
         install_core(&mut registry);
         Self {
             heap,
             realm,
             jobs: JobQueue::new(),
             registry,
+            pending,
+            retained: None,
         }
     }
 
@@ -107,6 +129,13 @@ impl Engine {
                 };
                 JsValue::string(handle)
             })?;
+        // Retain the program so queued jobs can rebuild an interpreter and
+        // activate the script's functions later (Promise reactions).
+        self.retained = Some(RetainedProgram {
+            functions: program.functions.clone(),
+            main: program.main,
+            strings: strings.clone(),
+        });
         // Share the heap: move it into the interpreter, run, then reclaim.
         let heap = std::mem::replace(&mut self.heap, Heap::new(GcPolicy::NoGC));
         let mut interp =
@@ -114,9 +143,13 @@ impl Engine {
         let natives = self.registry.clone();
         interp.set_natives(Box::new(natives));
         let outcome = interp.run();
+        // Drain the checkpoint against the still-live interpreter so jobs can
+        // activate user functions; natives' follow-ups join the same drain.
+        self.adopt_pending();
+        let _ = self.jobs.drain(&mut interp, Rc::clone(&self.pending));
+        self.adopt_pending();
         let heap = interp.into_heap();
         self.heap = heap;
-        let _ = self.jobs.drain(&mut self.heap);
         match outcome {
             Ok(()) => Ok(JsValue::undefined()),
             Err(JSException(thrown)) => Err(thrown),
@@ -150,9 +183,22 @@ impl Engine {
             })?;
         let mut interp =
             Interp::new_with_heap(heap, Some(global), program.functions, program.main, strings);
+        // Route this realm's native enqueues to a local side channel so its
+        // jobs (which reference the fresh heap) never reach the engine queue.
+        let local: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
+        self.registry.set_pending(Rc::clone(&local));
         let natives = self.registry.clone();
         interp.set_natives(Box::new(natives));
         let outcome = interp.run();
+        // Drain this realm's checkpoint against its own interpreter; the
+        // engine's own queued jobs reference the engine heap and are left
+        // untouched for the next engine checkpoint.
+        let mut local_queue = JobQueue::new();
+        for job in local.borrow_mut().drain(..) {
+            local_queue.enqueue(job);
+        }
+        let _ = local_queue.drain(&mut interp, Rc::clone(&local));
+        self.registry.set_pending(Rc::clone(&self.pending));
         match outcome {
             Ok(()) => Ok(JsValue::undefined()),
             Err(JSException(thrown)) => {
@@ -160,8 +206,7 @@ impl Engine {
                 if let Some(h) = thrown.as_string() {
                     // Need to get text from the fresh heap's string, then intern in caller.
                     // For v1, we use the interpreter's display helper.
-                    let mut tmp = interp;
-                    let text = tmp.to_display_string(thrown);
+                    let text = interp.to_display_string(thrown);
                     let _ = h;
                     let handle = if text.is_ascii() {
                         self.heap.intern_string(V12Str::latin1(text.into_bytes()))
@@ -216,6 +261,11 @@ impl Engine {
             .map(|(_, s)| s.to_string())
             .collect();
         let program = module.program;
+        self.retained = Some(RetainedProgram {
+            functions: program.functions.clone(),
+            main: program.main,
+            strings: strings.clone(),
+        });
         // Share heap.
         let heap = std::mem::replace(&mut self.heap, Heap::new(GcPolicy::NoGC));
         let mut interp =
@@ -246,9 +296,11 @@ impl Engine {
         };
         interp.set_natives(Box::new(natives));
         let outcome = interp.run();
+        self.adopt_pending();
+        let _ = self.jobs.drain(&mut interp, Rc::clone(&self.pending));
+        self.adopt_pending();
         let heap = interp.into_heap();
         self.heap = heap;
-        let _ = self.jobs.drain(&mut self.heap);
         match outcome {
             Ok(()) => Ok(JsValue::undefined()),
             Err(JSException(thrown)) => Err(thrown),
@@ -307,15 +359,43 @@ impl Engine {
 
     /// Drains the microtask queue.
     ///
+    /// Rebuilds an interpreter from the retained program of the last eval so
+    /// jobs can activate user functions (Promise reaction handlers,
+    /// `queueMicrotask` callbacks). Without a retained program, jobs still
+    /// run against the engine heap but cannot call into bytecode.
     /// Returns the number of jobs executed.
     pub fn run_jobs(&mut self) -> usize {
-        self.jobs.drain(&mut self.heap)
+        self.adopt_pending();
+        if self.jobs.is_empty() {
+            return 0;
+        }
+        let global = self.realm.global();
+        let (functions, main, strings) = match &self.retained {
+            Some(r) => (r.functions.clone(), r.main, r.strings.clone()),
+            None => (Vec::new(), 0, Vec::new()),
+        };
+        let heap = std::mem::replace(&mut self.heap, Heap::new(GcPolicy::NoGC));
+        let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
+        interp.set_natives(Box::new(self.registry.clone()));
+        let count = self.jobs.drain(&mut interp, Rc::clone(&self.pending));
+        self.adopt_pending();
+        self.heap = interp.into_heap();
+        count
+    }
+
+    /// Moves native-enqueued follow-up jobs into the queue.
+    fn adopt_pending(&mut self) {
+        for job in self.registry.take_pending() {
+            if !self.jobs.enqueue(job) {
+                break;
+            }
+        }
     }
 
     /// Enqueues a microtask.
     pub fn enqueue_job<F>(&mut self, job: F) -> bool
     where
-        F: FnOnce(&mut Heap) + 'static,
+        F: FnOnce(&mut JobCtx<'_>) + 'static,
     {
         self.jobs.enqueue(Box::new(job))
     }
@@ -458,7 +538,7 @@ mod tests {
         let mut engine = Engine::new();
         let counter = std::rc::Rc::new(std::cell::RefCell::new(0i32));
         let c = std::rc::Rc::clone(&counter);
-        engine.enqueue_job(move |_heap| {
+        engine.enqueue_job(move |_ctx: &mut crate::job_queue::JobCtx<'_>| {
             *c.borrow_mut() += 1;
         });
         // eval triggers checkpoint
@@ -469,8 +549,8 @@ mod tests {
     #[test]
     fn run_jobs_drains_explicitly() {
         let mut engine = Engine::new();
-        engine.enqueue_job(|_heap| {});
-        engine.enqueue_job(|_heap| {});
+        engine.enqueue_job(|_ctx: &mut crate::job_queue::JobCtx<'_>| {});
+        engine.enqueue_job(|_ctx: &mut crate::job_queue::JobCtx<'_>| {});
         assert_eq!(engine.run_jobs(), 2);
         assert_eq!(engine.run_jobs(), 0);
     }

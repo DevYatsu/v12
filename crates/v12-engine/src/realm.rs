@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue, PropKey, V12Str};
 
+use crate::builtins::NATIVE_STRING_CONSTRUCT;
+
 /// Maximum number of intrinsics a realm may host.
 const MAX_INTRINSICS: usize = 64;
 
@@ -98,6 +100,30 @@ impl Realm {
             let handle = intern_key(heap, name);
             let _ = handle;
             heap.get_mut(global).properties.push(value);
+        }
+
+        // Minimal Promise wiring: the Promise constructor's `prototype` link
+        // hosts `Promise.prototype` (an ordinary object). Promise instances
+        // created by the built-ins link to it, and the interpreter's
+        // `get_property` fast path serves `then` on objects recognized by
+        // that prototype identity (natives cannot attach shape-bound
+        // properties). The intrinsic order above is untouched — only the
+        // placeholder's prototype field is filled — preserving the
+        // `GLOBAL_VAR_OFFSET` contract.
+        let promise_proto = heap.alloc(JsObject::default());
+        heap.add_root(JsValue::object(promise_proto));
+        let promise_ctor = intrinsics.get("Promise").and_then(|v| v.as_object());
+        if let Some(promise_ctor) = promise_ctor {
+            heap.get_mut(promise_ctor).prototype = Some(promise_proto);
+        }
+        // `String(x)` must be callable (ES ToString): point the placeholder's
+        // target at the native constructor index.
+        let string_ctor = intrinsics.get("String").and_then(|v| v.as_object());
+        if let Some(string_ctor) = string_ctor {
+            heap.get_mut(string_ctor).elements = vec![JsValue::from_i32_smi(
+                NATIVE_STRING_CONSTRUCT as i32,
+            )
+            .expect("native index fits Smi")];
         }
 
         Self { global, intrinsics }

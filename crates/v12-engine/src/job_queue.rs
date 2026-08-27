@@ -3,14 +3,63 @@
 //! Promise reactions and queued microtasks run at checkpoints.
 //! The queue is a ring buffer; the engine drains it explicitly.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
+
+use v12_heap::{Handle, Heap, JsObject, JsValue};
+use v12_interp::{Interp, JSException};
 
 /// Maximum number of queued microtasks before backpressure would be applied.
 /// The limit prevents unbounded growth when a microtask enqueues another.
 const MAX_QUEUE_LEN: usize = 10_000;
 
-/// A microtask job.
-pub type Job = Box<dyn FnOnce(&mut v12_heap::Heap)>;
+/// Execution context handed to each job during a drain.
+///
+/// The interpreter that owns the heap is built by the engine for the
+/// duration of the checkpoint (from the retained program of the last eval);
+/// jobs may touch the heap directly or activate user function objects via
+/// [`JobCtx::call_object`] — the seam Promise reaction handlers run through.
+pub struct JobCtx<'a> {
+    interp: &'a mut Interp,
+    /// Follow-up jobs enqueued while this job ran (by the job itself or by
+    /// natives it called); they join the same drain per microtask checkpoint
+    /// semantics. Shared with the native registry through the engine.
+    pending: Rc<RefCell<Vec<Job>>>,
+}
+
+impl JobCtx<'_> {
+    /// Mutable heap access for the job.
+    pub fn heap_mut(&mut self) -> &mut Heap {
+        self.interp.heap_mut()
+    }
+
+    /// Activates a function object (see `Interp::call_object`); used to run
+    /// reaction handlers and queued callbacks. The callee's environment
+    /// capture and native routing are preserved by `prepare_call`.
+    pub fn call_object(
+        &mut self,
+        callee: Handle<JsObject>,
+        this: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        self.interp.call_object(callee, this, args)
+    }
+
+    /// Queues a follow-up microtask discovered while this job ran.
+    /// Returns `false` when the queue is full.
+    pub fn enqueue(&mut self, job: Job) -> bool {
+        if self.pending.borrow().len() >= MAX_QUEUE_LEN {
+            return false;
+        }
+        self.pending.borrow_mut().push(job);
+        true
+    }
+}
+
+/// A microtask job. Runs with a [`JobCtx`] so it can reach the heap and
+/// activate user functions.
+pub type Job = Box<dyn FnOnce(&mut JobCtx<'_>)>;
 
 /// Ordered queue of pending microtasks.
 #[derive(Default)]
@@ -56,17 +105,33 @@ impl JobQueue {
         true
     }
 
-    /// Drains the queue, executing each job against `heap`.
+    /// Drains the queue against `interp`'s heap.
     ///
-    /// New jobs enqueued while draining run in the same checkpoint
-    /// until the queue empties, matching the microtask checkpoint
-    /// semantics. Returns the number of jobs executed.
-    pub fn drain(&mut self, heap: &mut v12_heap::Heap) -> usize {
+    /// `pending` is the native-shared side channel: follow-up jobs enqueued
+    /// during the checkpoint join the same drain (microtask checkpoint
+    /// semantics). Returns the number of jobs executed.
+    pub fn drain(&mut self, interp: &mut Interp, pending: Rc<RefCell<Vec<Job>>>) -> usize {
         let mut count = 0usize;
-        while let Some(job) = self.jobs.pop_front() {
+        loop {
+            // Adopt follow-ups discovered by the previous job/natives before
+            // picking the next one, keeping FIFO order.
+            if !pending.borrow().is_empty() {
+                let mut p = pending.borrow_mut();
+                for job in p.drain(..) {
+                    self.jobs.push_back(job);
+                }
+            }
+            let Some(job) = self.jobs.pop_front() else {
+                break;
+            };
             // Each job runs to completion; panics from engine bugs propagate,
             // while jobs themselves should be panic-free.
-            job(heap);
+            let mut ctx = JobCtx {
+                interp,
+                pending: Rc::clone(&pending),
+            };
+            job(&mut ctx);
+            drop(ctx);
             count += 1;
             if count > MAX_QUEUE_LEN * 2 {
                 break;

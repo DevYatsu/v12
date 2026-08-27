@@ -19,18 +19,25 @@ mod realm_tests {
 
 #[cfg(test)]
 mod job_queue_tests {
-    use crate::job_queue::JobQueue;
-    use v12_heap::{GcPolicy, Heap};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::job_queue::{JobCtx, JobQueue};
+    use v12_interp::Interp;
+
+    fn interp() -> Interp {
+        Interp::new(Vec::new(), 0, Vec::new())
+    }
 
     #[test]
     fn enqueue_and_drain() {
         let mut q = JobQueue::new();
-        let mut heap = Heap::new(GcPolicy::NoGC);
-        let count = std::rc::Rc::new(std::cell::RefCell::new(0));
-        let c = std::rc::Rc::clone(&count);
-        q.enqueue(Box::new(move |_heap| *c.borrow_mut() += 1));
+        let mut interp = interp();
+        let count = Rc::new(RefCell::new(0));
+        let c = Rc::clone(&count);
+        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_>| *c.borrow_mut() += 1));
         assert_eq!(q.len(), 1);
-        assert_eq!(q.drain(&mut heap), 1);
+        assert_eq!(q.drain(&mut interp, Rc::new(RefCell::new(Vec::new()))), 1);
         assert_eq!(*count.borrow(), 1);
         assert!(q.is_empty());
     }
@@ -39,7 +46,7 @@ mod job_queue_tests {
     fn queue_respects_capacity() {
         let mut q = JobQueue::new();
         for _ in 0..10_001 {
-            let _ = q.enqueue(Box::new(|_h| {}));
+            let _ = q.enqueue(Box::new(|_ctx: &mut JobCtx<'_>| {}));
         }
         // Capacity is 10_000, so some enqueues must have failed
         assert!(q.len() <= 10_000);
@@ -48,16 +55,13 @@ mod job_queue_tests {
     #[test]
     fn drain_runs_newly_enqueued_jobs() {
         let mut q = JobQueue::new();
-        let mut heap = Heap::new(GcPolicy::NoGC);
-        let flag = std::rc::Rc::new(std::cell::RefCell::new(false));
-        let f = std::rc::Rc::clone(&flag);
-        q.enqueue(Box::new(move |_heap| {
-            // This job enqueues another job via external queue handle would need heap,
-            // but drain's loop already handles new jobs enqueued during drain if we
-            // re-enqueue through a captured queue reference. Simulate by just setting flag.
+        let mut interp = interp();
+        let flag = Rc::new(RefCell::new(false));
+        let f = Rc::clone(&flag);
+        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_>| {
             *f.borrow_mut() = true;
         }));
-        q.drain(&mut heap);
+        q.drain(&mut interp, Rc::new(RefCell::new(Vec::new())));
         assert!(*flag.borrow());
     }
 }
@@ -222,8 +226,6 @@ mod builtin_tests {
 
 #[cfg(test)]
 mod promise_job_tests {
-    use v12_heap::Heap;
-
     use crate::engine::Engine;
 
     #[test]
@@ -232,7 +234,7 @@ mod promise_job_tests {
         let flag = std::rc::Rc::new(std::cell::RefCell::new(false));
         let f = std::rc::Rc::clone(&flag);
         // Simulate Promise.resolve enqueuing a microtask
-        engine.enqueue_job(move |_heap: &mut Heap| {
+        engine.enqueue_job(move |_ctx: &mut crate::job_queue::JobCtx<'_>| {
             *f.borrow_mut() = true;
         });
         let count = engine.run_jobs();
@@ -248,7 +250,7 @@ mod promise_job_tests {
         let mut engine = Engine::new();
         let flag = std::rc::Rc::new(std::cell::RefCell::new(0i32));
         let c = std::rc::Rc::clone(&flag);
-        engine.enqueue_job(move |_heap| *c.borrow_mut() += 1);
+        engine.enqueue_job(move |_ctx: &mut crate::job_queue::JobCtx<'_>| *c.borrow_mut() += 1);
         let _ = engine.eval("throw 1;");
         assert_eq!(*flag.borrow(), 1);
     }
