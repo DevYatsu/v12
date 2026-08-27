@@ -2182,6 +2182,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-support"
+version = "0.1.0"
+dependencies = [
+ "v12-bccompiler",
+ "v12-bytecode",
+]
+
+[[package]]
 name = "test262-runner"
 version = "0.1.0"
 dependencies = [

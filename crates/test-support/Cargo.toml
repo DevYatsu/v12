@@ -1,0 +1,10 @@
+[package]
+name = "test-support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Shared dev-only test harness: mini reference interpreter + eval matchers"
+
+[dependencies]
+v12-bytecode = { workspace = true }
+v12-bccompiler = { workspace = true }
