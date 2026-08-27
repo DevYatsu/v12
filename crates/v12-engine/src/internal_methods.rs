@@ -120,6 +120,23 @@ fn ordinary_get_own_property(
     if heap.get(obj).properties.len() > MAX_PROPERTIES {
         return Ok(None);
     }
+    let kind = heap.get(obj).kind;
+    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+        && let Some(idx) = prop_key_as_index(heap, key)
+    {
+        if let Some(slot) = heap.get(obj).elements.get(idx as usize) {
+            if !slot.is_hole() {
+                return Ok(Some(PropertyDescriptor {
+                    value: Some(*slot),
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                }));
+            }
+            return Ok(None);
+        }
+        return Ok(None);
+    }
     let shape = shape_of(heap, obj);
     let Some(desc) = heap.get(shape).descriptors.find(key).copied() else {
         return Ok(None);
@@ -154,6 +171,21 @@ fn ordinary_define_own_property(
     if heap.get(obj).properties.len() >= MAX_PROPERTIES {
         return Err(type_error(heap, "Too many properties"));
     }
+    let kind = heap.get(obj).kind;
+    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+        && let Some(idx) = prop_key_as_index(heap, key)
+    {
+        let len = heap.get(obj).elements.len();
+        if (idx as usize) >= len {
+            heap.get_mut(obj)
+                .elements
+                .resize(idx as usize + 1, JsValue::hole());
+        }
+        if let Some(v) = descriptor.value {
+            heap.get_mut(obj).elements[idx as usize] = v;
+        }
+        return Ok(true);
+    }
     let shape = shape_of(heap, obj);
     if let Some(existing) = heap.get(shape).descriptors.find(key).copied() {
         match existing {
@@ -186,19 +218,38 @@ fn ordinary_define_own_property(
     Ok(true)
 }
 
+fn prop_key_as_index(heap: &mut Heap, key: PropKey) -> Option<u32> {
+    if key.is_symbol() {
+        return None;
+    }
+    let h = key.string()?;
+    heap.flatten(h);
+    let text: String = match &heap.get(h).storage {
+        v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
+        _ => return None,
+    };
+    if text.is_empty() || text.len() > 10 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.as_bytes()[0] == b'0' {
+        return None;
+    }
+    text.parse::<u32>().ok()
+}
+
 fn ordinary_has_property(
     heap: &mut Heap,
     obj: Handle<JsObject>,
     key: PropKey,
 ) -> InternalResult<bool> {
-    // Arguments exotic: indexed properties consider the `elements` store
-    // before shape walk. A mapped index is present when the element exists.
-    if heap.get(obj).kind == v12_heap::KIND_ARGUMENTS {
-        // Attempt to decode `key` as an array index via its string text.
-        // v1: check numeric string via heap string content when available.
-        // For now, treat any own descriptor as present; the element fast
-        // path is exercised by `dispatch_get` callers that already handle
-        // `KIND_ARGUMENTS` element checks. Keep shape walk for named props.
+    let kind = heap.get(obj).kind;
+    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+        && let Some(idx) = prop_key_as_index(heap, key)
+        && let Some(slot) = heap.get(obj).elements.get(idx as usize)
+        && !slot.is_hole()
+    {
+        return Ok(true);
     }
     let mut cur = Some(obj);
     while let Some(o) = cur {
@@ -217,6 +268,16 @@ fn ordinary_get(
     key: PropKey,
     _receiver: JsValue,
 ) -> InternalResult<JsValue> {
+    let kind = heap.get(obj).kind;
+    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+        && let Some(idx) = prop_key_as_index(heap, key)
+        && let Some(slot) = heap.get(obj).elements.get(idx as usize)
+    {
+        if !slot.is_hole() {
+            return Ok(*slot);
+        }
+        return Ok(JsValue::undefined());
+    }
     let mut cur = Some(obj);
     while let Some(o) = cur {
         let shape = shape_of(heap, o);
@@ -277,6 +338,19 @@ fn ordinary_set(
     value: JsValue,
     _receiver: JsValue,
 ) -> InternalResult<bool> {
+    let kind = heap.get(obj).kind;
+    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+        && let Some(idx) = prop_key_as_index(heap, key)
+    {
+        let len = heap.get(obj).elements.len();
+        if (idx as usize) >= len {
+            heap.get_mut(obj)
+                .elements
+                .resize(idx as usize + 1, JsValue::hole());
+        }
+        heap.get_mut(obj).elements[idx as usize] = value;
+        return Ok(true);
+    }
     let shape = shape_of(heap, obj);
     if let Some(d) = heap.get(shape).descriptors.find(key).copied() {
         match d {
@@ -319,6 +393,15 @@ fn ordinary_set(
 }
 
 fn ordinary_delete(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey) -> InternalResult<bool> {
+    let kind = heap.get(obj).kind;
+    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+        && let Some(idx) = prop_key_as_index(heap, key)
+    {
+        if let Some(slot) = heap.get_mut(obj).elements.get_mut(idx as usize) {
+            *slot = JsValue::hole();
+        }
+        return Ok(true);
+    }
     let shape = shape_of(heap, obj);
     let Some(d) = heap.get(shape).descriptors.find(key).copied() else {
         return Ok(true);

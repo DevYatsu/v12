@@ -12,3 +12,7 @@ v12-heap.workspace = true
 # dependency (not merely a dev dependency): `Interp::new` consumes a `Program`.
 # No cycle: the compiler never depends on the interpreter.
 v12-bccompiler.workspace = true
+
+[dev-dependencies]
+# Property tests for the per-opcode type-feedback lattice (see feedback.rs).
+proptest = "1"

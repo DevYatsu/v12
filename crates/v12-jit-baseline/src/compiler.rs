@@ -68,7 +68,7 @@ impl JitBaseline {
         // Build the executable closure that the tests run. The closure mirrors
         // the Cranelift template: same opcode coverage, same helpers, same
         // control-flow translation.
-        let exec = make_exec_closure(bytecode.clone());
+        let exec = make_exec_closure(bytecode);
 
         Ok(CompiledFn::new(pc_map, bytecode.max_regs, exec))
     }
@@ -688,10 +688,16 @@ impl ExtData {
 // Execution closure — mirrors the Cranelift template for testing
 // ---------------------------------------------------------------------------
 
-fn make_exec_closure(bytecode: FunctionBytecode) -> JitExecFn {
-    // Clone what the closure needs.
-    let consts = bytecode.consts.clone();
-    let instrs = bytecode.instrs.clone();
+fn make_exec_closure(bytecode: &FunctionBytecode) -> JitExecFn {
+    // `JitExecFn` is a `'static` boxed closure while callers hand us only a
+    // `&FunctionBytecode`, so the closure must own its instruction/const data.
+    // Both elements are small `Copy` types (`Instr` is a u32 word, `Const` a
+    // plain enum), so the cheapest correct representation is a flat snapshot
+    // into `Arc<[T]>`: one allocation each, copied once per compile, with no
+    // heap-backed payload inside the elements.
+    let consts: std::sync::Arc<[v12_bytecode::Const]> = bytecode.consts.iter().collect();
+    let instrs: std::sync::Arc<[v12_bytecode::Instr]> =
+        std::sync::Arc::from(bytecode.instrs.as_slice());
     let max_regs = bytecode.max_regs;
 
     Box::new(move |regs: &mut [JsValue]| {
@@ -723,7 +729,7 @@ fn make_exec_closure(bytecode: FunctionBytecode) -> JitExecFn {
                 };
                 match wide {
                     WideOp::LoadConstW { dst, const_id } => {
-                        let bits = match consts.get(const_id as u16) {
+                        let bits = match consts.get(usize::from(const_id as u16)).copied() {
                             Some(v12_bytecode::Const::F64(n)) => runtime::box_number(n).bits(),
                             Some(v12_bytecode::Const::Null) => JsValue::null().bits(),
                             Some(v12_bytecode::Const::Str32(_)) => JsValue::undefined().bits(),
@@ -768,7 +774,7 @@ fn make_exec_closure(bytecode: FunctionBytecode) -> JitExecFn {
                 Opcode::LoadConst => {
                     let dst = instr.a() as usize;
                     let id = u32::from(instr.imm16());
-                    let bits = match consts.get(id as u16) {
+                    let bits = match consts.get(usize::from(id as u16)).copied() {
                         Some(v12_bytecode::Const::F64(n)) => runtime::box_number(n).bits(),
                         Some(v12_bytecode::Const::Null) => JsValue::null().bits(),
                         Some(v12_bytecode::Const::Str32(_)) => JsValue::undefined().bits(),

@@ -634,9 +634,12 @@ fn global_var_alias_for_captured_var() {
         Interp::new_with_heap(heap, Some(global), program.functions, program.main, strings);
     let thrown = expect_throw(&mut interp2);
     assert_eq!(thrown.as_smi(), Some(123));
-    // Also verify global's property at offset holds the var value
+    // Also verify the global holds the var value. Under shape-descriptor
+    // slot numbering every top-level binding gets a descriptor slot in
+    // declaration order, physically stored at `GLOBAL_VAR_OFFSET + slot`;
+    // the hoisted function declaration takes slot 0, so `x` occupies slot 1.
     let heap = interp2.heap();
-    let val = heap.get(global).properties[14];
+    let val = heap.get(global).properties[15];
     assert_eq!(val.as_smi(), Some(123));
 }
 

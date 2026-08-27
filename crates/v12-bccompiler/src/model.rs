@@ -251,6 +251,12 @@ pub struct Plans {
     pub ref_sites: Vec<(SymbolId, usize)>,
     /// `const` bindings (for strict-mode reassignment check).
     pub const_bindings: HashSet<SymbolId>,
+    /// `var` bindings declared at the top level (unit 0) that alias the
+    /// global object (`VarLoc::Global` → `GetGlobal`/`SetGlobal`).
+    pub global_vars: HashSet<SymbolId>,
+    /// `true` when the source was parsed as a module (top-level `var` stays
+    /// module-scoped, not global). Scripts have `false`.
+    pub is_module: bool,
     /// Module linkage: imports recorded during collection (module mode only).
     pub imports: Vec<ImportEntry>,
     /// Module linkage: exports recorded during collection (module mode only).

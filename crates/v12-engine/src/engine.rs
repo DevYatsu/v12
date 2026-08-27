@@ -74,8 +74,8 @@ impl Engine {
     /// are allocated in the engine's heap when they are strings.
     ///
     /// Global-code `var` declarations become properties of the realm's global
-    /// object via the interpreter's `GLOBAL_VAR_OFFSET` alias (see
-    /// `v12-interp` env handling).
+    /// object via `SetGlobal`/`GetGlobal` (with the documented
+    /// `GLOBAL_VAR_OFFSET` physical-slot bias on shape-derived slots).
     pub fn eval(&mut self, source: &str) -> Result<JsValue, JsValue> {
         self.eval_direct(source)
     }
@@ -767,7 +767,10 @@ mod tests {
         // Without `throw` the IIFE should not throw.
         let mut engine3 = Engine::new();
         let ok = engine3.eval("(x => x)(2);");
-        assert!(ok.is_ok(), "arrow IIFE without throw should not throw: {ok:?}");
+        assert!(
+            ok.is_ok(),
+            "arrow IIFE without throw should not throw: {ok:?}"
+        );
     }
 
     #[test]

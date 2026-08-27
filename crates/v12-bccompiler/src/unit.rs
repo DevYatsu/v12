@@ -201,14 +201,12 @@ fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError>
     let mut by_spec: HashMap<String, Vec<crate::model::ImportEntry>> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut seen_spec: HashSet<String> = HashSet::new();
-    for e in &cx.comp.plans.imports.clone() {
-        if seen_spec.insert(e.specifier.clone()) {
-            order.push(e.specifier.clone());
+    for e in &cx.comp.plans.imports {
+        let s = e.specifier.clone();
+        if seen_spec.insert(s.clone()) {
+            order.push(s.clone());
         }
-        by_spec
-            .entry(e.specifier.clone())
-            .or_default()
-            .push(e.clone());
+        by_spec.entry(s).or_default().push(e.clone());
     }
 
     for spec in order {

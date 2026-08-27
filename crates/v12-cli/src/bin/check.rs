@@ -1,4 +1,4 @@
-use v12_bccompiler::{compile_source_with_interner, freeze_interner, Interner};
+use v12_bccompiler::{Interner, compile_source_with_interner, freeze_interner};
 use v12_bytecode::{Const, Opcode};
 
 fn main() {
@@ -9,7 +9,10 @@ fn main() {
     let strings: Vec<String> = resolver.iter().map(|(_, s)| s.to_string()).collect();
     println!("strings vec: {:?}", strings);
     let arrow = &prog.functions[1];
-    println!("arrow consts: {:?}", arrow.consts.iter().collect::<Vec<_>>());
+    println!(
+        "arrow consts: {:?}",
+        arrow.consts.iter().collect::<Vec<_>>()
+    );
     for (pc, instr) in arrow.instrs.iter().enumerate() {
         println!(
             "pc {}: {:?} a={} b={} c={} imm16={}",
@@ -29,7 +32,7 @@ fn main() {
             println!("  GetGlobal str_id {} => {:?}", str_id, text);
         }
         if instr.op() == Some(Opcode::LoadConst) {
-            let pool_idx = instr.imm16() as u16;
+            let pool_idx = instr.imm16();
             if let Some(c) = arrow.consts.get(pool_idx) {
                 println!("  LoadConst pool_idx {} => {:?}", pool_idx, c);
                 if let Const::Str32(sid) = c {
@@ -61,7 +64,7 @@ fn main() {
         .instrs
         .iter()
         .find(|i| i.op() == Some(Opcode::LoadConst))
-        .map(|i| i.imm16() as u16)
+        .map(|i| i.imm16())
         .unwrap();
     let load_const_str_id = match arrow.consts.get(load_const_pool_idx).unwrap() {
         Const::Str32(id) => id,

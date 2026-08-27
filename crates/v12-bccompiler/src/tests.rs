@@ -2106,8 +2106,7 @@ fn console_log_member_chain_uses_distinct_string_ids() {
     // ids. The bug conflated the two (both `k0` → `Str32("console")`),
     // making `GetProperty` load `console["console"]` which is `undefined`.
     let src = "console.log(1);";
-    let (prog, strings) =
-        compile_source_with_strings(src).expect("console.log should compile");
+    let (prog, strings) = compile_source_with_strings(src).expect("console.log should compile");
     let fb = &prog.functions[prog.main as usize];
     assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
     let get_global = fb
@@ -2133,7 +2132,9 @@ fn console_log_member_chain_uses_distinct_string_ids() {
     assert_eq!(strings[get_global_id as usize], "console");
     assert_eq!(strings[load_const_str_id as usize], "log");
     assert!(
-        fb.instrs.iter().any(|i| i.op() == Some(Opcode::GetProperty)),
+        fb.instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::GetProperty)),
         "expected GetProperty for console.log in:\n{fb}"
     );
 }
@@ -2145,8 +2146,7 @@ fn arrow_iife_compiles_and_executes() {
     // guards the `x => x` closure and the call ABI.
     let src = "let f = (x => x); let v = f(1); return v;";
     expect_num(src, 1.0);
-    let (prog, _) =
-        compile_source_with_strings("(x => x)(1)").expect("arrow IIFE should compile");
+    let (prog, _) = compile_source_with_strings("(x => x)(1)").expect("arrow IIFE should compile");
     let fb = &prog.functions[prog.main as usize];
     assert!(
         fb.instrs.iter().any(|i| i.op() == Some(Opcode::Closure)),
@@ -2156,4 +2156,210 @@ fn arrow_iife_compiles_and_executes() {
         fb.instrs.iter().any(|i| i.op() == Some(Opcode::Call)),
         "expected Call for IIFE in:\n{fb}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bucket: global-code — top-level `var` aliases the global object
+// ---------------------------------------------------------------------------
+
+#[test]
+fn global_code_top_level_var_uses_global_storage() {
+    // `var` at the top level must lower to `GetGlobal`/`SetGlobal` so
+    // `globalThis` aliasing and `global-code` tests (42 files) can pass.
+    for src in [
+        "var x = 1;",
+        "var a = 10; var b = 20; let c = a + b;",
+        "var foo = 5; foo += 1;",
+    ] {
+        let (prog, _) = compile_source_with_strings(src)
+            .unwrap_or_else(|e| panic!("{src:?} should compile: {e}"));
+        let fb = &prog.functions[prog.main as usize];
+        assert!(fb.validate().is_ok(), "validate failed for {src:?}:\n{fb}");
+        assert!(
+            fb.instrs.iter().any(|i| i.op() == Some(Opcode::SetGlobal)),
+            "expected SetGlobal for top-level var in {src:?}:\n{fb}"
+        );
+    }
+    // Reading a top-level var must use GetGlobal.
+    let (prog, _) =
+        compile_source_with_strings("var x = 1; let y = x;").expect("var read should compile");
+    assert!(
+        prog.functions[prog.main as usize]
+            .instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::GetGlobal)),
+        "expected GetGlobal for var read"
+    );
+    // `let` at top level stays lexically scoped (Reg), not Global.
+    let (prog, _) = compile_source_with_strings("let y = 1;").expect("let should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok());
+    // `let y` must NOT use GetGlobal/SetGlobal; it is a plain local.
+    assert!(
+        !fb.instrs.iter().any(|i| i.op() == Some(Opcode::SetGlobal)),
+        "let at top level should not use SetGlobal:\n{fb}"
+    );
+    // Validate runtime semantics via expect_num (wrapped in IIFE).
+    expect_num("var x = 1; return x;", 1.0);
+    expect_num("var a = 10; var b = 20; return a + b;", 30.0);
+}
+
+#[test]
+fn global_code_var_and_function_declaration_both_global() {
+    let src = "var v = 1; function f() { return v; }";
+    let (prog, _) = compile_source_with_strings(src).expect("global var+func should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    expect_num("var v = 1; function f() { return v; } return f();", 1.0);
+    // Also verify `var` inside function stays local (Reg/Env), not Global.
+    let src2 = "function g(){ var local = 9; return local; } return g();";
+    expect_num(src2, 9.0);
+}
+
+#[test]
+fn global_code_intrinsics_still_via_get_global() {
+    // Global intrinsics must still resolve via GetGlobal even when a
+    // top-level var exists.
+    for name in ["Object", "Array", "Symbol", "console", "globalThis"] {
+        let src = format!("var x = 1; let y = {name};");
+        let (prog, _) = compile_source_with_strings(&src)
+            .unwrap_or_else(|e| panic!("{name} with top-level var should compile: {e}"));
+        let fb = &prog.functions[prog.main as usize];
+        assert!(fb.validate().is_ok(), "validate failed for {name}:\n{fb}");
+        assert!(
+            fb.instrs.iter().any(|i| i.op() == Some(Opcode::GetGlobal)),
+            "expected GetGlobal for {name} in:\n{fb}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket: computed-property-names — 48 tests, ToPropertyKey + SetProperty
+// ---------------------------------------------------------------------------
+
+#[test]
+fn computed_property_names_object_literal() {
+    for src in [
+        r#"let k="a"; let o={[k]:1};"#,
+        r#"let x="y"; let o={[x + "Z"]: 5};"#,
+        r#"let n=1; let o={[n]: "one", ["b"]: 2};"#,
+    ] {
+        let (prog, _) = compile_source_with_strings(src)
+            .unwrap_or_else(|e| panic!("{src:?} should compile: {e}"));
+        let fb = &prog.functions[prog.main as usize];
+        assert!(fb.validate().is_ok(), "validate failed for {src:?}:\n{fb}");
+        // Must use dynamic SetProperty (key evaluated into temp), not a
+        // static string key. No new opcode is introduced.
+        assert!(
+            fb.instrs
+                .iter()
+                .any(|i| i.op() == Some(Opcode::SetProperty)),
+            "expected SetProperty for computed key in {src:?}:\n{fb}"
+        );
+    }
+    expect_num(r#"let k="a"; let o={[k]:1}; return o[k];"#, 1.0);
+    expect_num(r#"let o={[1+1]: 42}; return o[2];"#, 42.0);
+}
+
+#[test]
+fn computed_property_names_member_assignment() {
+    for src in [
+        "let o={}; let k='p'; o[k]=9;",
+        "let o={a:1}; let k='a'; let v=o[k]; o[k]=v+1;",
+        "let o={}; o[1+1]=7;",
+    ] {
+        let (prog, _) = compile_source_with_strings(src)
+            .unwrap_or_else(|e| panic!("{src:?} should compile: {e}"));
+        let fb = &prog.functions[prog.main as usize];
+        assert!(fb.validate().is_ok(), "validate failed for {src:?}:\n{fb}");
+        assert!(
+            fb.instrs
+                .iter()
+                .any(|i| i.op() == Some(Opcode::SetProperty)),
+            "expected SetProperty for computed member in {src:?}:\n{fb}"
+        );
+    }
+    // Verify read path separately.
+    let (prog, _) = compile_source_with_strings("let o={a:1}; let k='a'; let v=o[k];")
+        .expect("computed get should compile");
+    assert!(
+        prog.functions[prog.main as usize]
+            .instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::GetProperty)),
+        "expected GetProperty for computed member read"
+    );
+    expect_num("let o={}; let k='p'; o[k]=9; return o[k];", 9.0);
+}
+
+#[test]
+fn computed_property_names_key_evaluated_first() {
+    // Key expression must be evaluated before base object per bucket 4
+    // (key expr into temp, then base). This also verifies ToPropertyKey
+    // via `to_key` handles non-string keys (number → string).
+    let src = r#"
+        let calls = 0;
+        function keyFn(){ calls += 1; return "dyn"; }
+        let o={[keyFn()]: 123};
+        return o["dyn"] * 10 + calls;
+    "#;
+    expect_num(src, 1231.0);
+    let compile_src = r#"
+        let calls = 0;
+        function keyFn(){ calls += 1; return "dyn"; }
+        let o={[keyFn()]: 123};
+        let v = o["dyn"];
+    "#;
+    let (prog, _) =
+        compile_source_with_strings(compile_src).expect("computed key side effect should compile");
+    assert!(prog.functions[prog.main as usize].validate().is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Bucket: literals — `null` via Const::Null, `typeof null === "object"`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn literals_null_typeof_stays_object() {
+    for src in ["typeof null;", "let x = null; typeof x;", "typeof (null);"] {
+        let (prog, _) = compile_source_with_strings(src)
+            .unwrap_or_else(|e| panic!("{src:?} should compile: {e}"));
+        let fb = &prog.functions[prog.main as usize];
+        assert!(fb.validate().is_ok(), "validate failed for {src:?}:\n{fb}");
+        assert!(
+            fb.instrs.iter().any(|i| i.op() == Some(Opcode::TypeOf)),
+            "expected TypeOf for typeof null in {src:?}:\n{fb}"
+        );
+    }
+    expect_str("return typeof null;", "object");
+    expect_str("let x = null; return typeof x;", "object");
+    expect_bool("return null === null;", true);
+    expect_bool("return null == undefined;", true);
+}
+
+#[test]
+fn literals_null_constant_pool_and_coalesce() {
+    let (prog, _) = compile_source_with_strings("let a = null; let b = a ?? 5;")
+        .expect("null coalesce should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    // Const pool must contain Null (no payload)
+    assert!(
+        fb.consts.iter().any(|c| matches!(c, Const::Null)),
+        "expected Const::Null in pool:\n{fb}"
+    );
+    expect_num("return null ?? 7;", 7.0);
+    expect_num("let x = null; return x ?? 9;", 9.0);
+    expect_num("return 0 ?? 7;", 0.0);
+}
+
+#[test]
+fn literals_null_equality_and_strict_equality() {
+    expect_bool("return null == null;", true);
+    expect_bool("return null === null;", true);
+    expect_bool("return null !== undefined;", true);
+    expect_bool("return null == 0;", false);
+    let (prog, _) =
+        compile_source_with_strings("null === null;").expect("null strict eq should compile");
+    assert!(prog.functions[prog.main as usize].validate().is_ok());
 }

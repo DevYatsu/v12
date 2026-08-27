@@ -206,9 +206,7 @@ fn console_log(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsVa
         let text = if let Some(handle) = v.as_string() {
             heap.flatten(handle);
             match &heap.get(handle).storage {
-                v12_heap::StrStorage::Latin1(bytes) => {
-                    String::from_utf8_lossy(bytes).into_owned()
-                }
+                v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
                 v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
                 _ => String::new(),
             }

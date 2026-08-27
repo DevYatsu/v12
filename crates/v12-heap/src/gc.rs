@@ -853,7 +853,10 @@ impl Heap {
                 *flag = false;
             }
         }
-        self.alive[s] = marked.to_vec();
+        // Reuse the existing bitmap allocation: on steady state the length
+        // matches and this never allocates, unlike `marked.to_vec()`.
+        self.alive[s].clear();
+        self.alive[s].extend_from_slice(marked);
         self.pending_dead[s] = marked
             .iter()
             .enumerate()

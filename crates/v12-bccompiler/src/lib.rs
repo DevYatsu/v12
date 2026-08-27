@@ -411,7 +411,7 @@ fn compile_ast_as_module_inner(
 ) -> Result<Module, CompileError> {
     // Modules are always strict, even without a directive.
     let strict = true;
-    let plans = collect::collect(program, scoping, strict)?;
+    let plans = collect::collect_module(program, scoping, strict)?;
     let imports = plans.imports.clone();
     let exports = plans.exports.clone();
     let mut comp = model::Compiler {

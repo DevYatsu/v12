@@ -17,7 +17,11 @@ impl JitOpt {
     pub fn is_enabled(&self) -> bool {
         false
     }
-    pub fn compile(&mut self, _fb: &FunctionBytecode, _id: FunctionId) -> Result<CompiledFn, JitError> {
+    pub fn compile(
+        &mut self,
+        _fb: &FunctionBytecode,
+        _id: FunctionId,
+    ) -> Result<CompiledFn, JitError> {
         Err(JitError::Disabled)
     }
     pub fn clear(&mut self) {}

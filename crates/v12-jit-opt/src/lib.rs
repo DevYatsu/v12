@@ -11,10 +11,10 @@ pub use v12_jit_baseline::{
     CompiledFn, FunctionId, JitCache, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS,
 };
 
-mod deopt;
-mod guard;
 #[cfg(feature = "jit")]
 mod compile;
+mod deopt;
+mod guard;
 #[cfg(not(feature = "jit"))]
 mod stub;
 
@@ -44,7 +44,11 @@ impl JitOpt {
     pub fn is_enabled(&self) -> bool {
         self.inner.is_some()
     }
-    pub fn compile(&mut self, fb: &FunctionBytecode, _id: FunctionId) -> Result<CompiledFn, JitError> {
+    pub fn compile(
+        &mut self,
+        fb: &FunctionBytecode,
+        _id: FunctionId,
+    ) -> Result<CompiledFn, JitError> {
         match &mut self.inner {
             Some(p) => p.compile(fb),
             None => Err(JitError::Disabled),

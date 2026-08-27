@@ -46,6 +46,24 @@ pub fn collect(
     scoping: &Scoping,
     is_strict: bool,
 ) -> Result<Plans, CompileError> {
+    collect_inner(program, scoping, is_strict, false)
+}
+
+/// Module-mode collection: top-level `var` stays module-scoped.
+pub fn collect_module(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    is_strict: bool,
+) -> Result<Plans, CompileError> {
+    collect_inner(program, scoping, is_strict, true)
+}
+
+fn collect_inner(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    is_strict: bool,
+    is_module: bool,
+) -> Result<Plans, CompileError> {
     let mut c = Collector {
         scoping,
         plans: Plans::default(),
@@ -53,6 +71,7 @@ pub fn collect(
         ref_sites: Vec::new(),
         unit_stack: Vec::new(),
     };
+    c.plans.is_module = is_module;
     // Unit 0 = main script body.
     let mut main_plan = UnitPlan::new(None, false, "<main>".into());
     main_plan.is_strict = is_strict;
@@ -121,6 +140,9 @@ impl<'s> Collector<'s> {
             && let Some(sym) = id.symbol_id.get()
         {
             self.declare(sym);
+            if self.cur_unit() == 0 && !self.plans.is_module {
+                self.plans.global_vars.insert(sym);
+            }
         }
         let parent = self.cur_unit();
         let idx = self.plans.units.len();
@@ -510,6 +532,9 @@ impl<'s> Collector<'s> {
 
     fn var_decl(&mut self, v: &VariableDeclaration<'_>) {
         let is_const = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+        let is_var_at_top = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var)
+            && self.cur_unit() == 0
+            && !self.plans.is_module;
         for d in &v.declarations {
             if is_const {
                 if let Some(sym) = binding_symbol(&d.id) {
@@ -518,9 +543,41 @@ impl<'s> Collector<'s> {
                     self.collect_const_bindings(&d.id);
                 }
             }
+            if is_var_at_top {
+                self.collect_global_bindings(&d.id);
+            }
             self.binding_pattern(&d.id);
             if let Some(init) = &d.init {
                 self.expr(init);
+            }
+        }
+    }
+
+    fn collect_global_bindings(&mut self, pat: &BindingPattern<'_>) {
+        match pat {
+            BindingPattern::BindingIdentifier(id) => {
+                if let Some(sym) = id.symbol_id.get() {
+                    self.plans.global_vars.insert(sym);
+                }
+            }
+            BindingPattern::ObjectPattern(o) => {
+                for prop in &o.properties {
+                    self.collect_global_bindings(&prop.value);
+                }
+                if let Some(rest) = &o.rest {
+                    self.collect_global_bindings(&rest.argument);
+                }
+            }
+            BindingPattern::ArrayPattern(a) => {
+                for el in a.elements.iter().flatten() {
+                    self.collect_global_bindings(el);
+                }
+                if let Some(rest) = &a.rest {
+                    self.collect_global_bindings(&rest.argument);
+                }
+            }
+            BindingPattern::AssignmentPattern(ap) => {
+                self.collect_global_bindings(&ap.left);
             }
         }
     }
@@ -792,6 +849,12 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
             let sym = plans.units[ui].decl_order[i];
             let is_home = homes.get(&sym).is_some_and(|h| *h == ui);
             if !is_home {
+                continue;
+            }
+            // Top-level `var`/`function` bindings alias the global object
+            // (scripts only; modules keep their own scope).
+            if ui == 0 && !plans.is_module && plans.global_vars.contains(&sym) {
+                plans.units[ui].vars.insert(sym, VarLoc::Global);
                 continue;
             }
             if plans.captured.contains(&sym) {

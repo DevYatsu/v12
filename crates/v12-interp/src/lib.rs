@@ -56,7 +56,7 @@
 //! unique to a living object, and reset when a slot is freed — a reused
 //! object handle therefore cannot alias a stale entry.
 
-mod feedback;
+pub mod feedback;
 mod ops;
 
 #[cfg(test)]
@@ -72,7 +72,7 @@ use v12_heap::{
     ShapeHandle, V12Str,
 };
 
-use crate::feedback::{FeedbackVector, MonoIc, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
+use crate::feedback::{FeedbackVector, Lattice, MonoIc, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
 
 /// Object kind for user functions created by `Closure`.
 ///
@@ -95,13 +95,40 @@ pub const KIND_GENERATOR: u8 = HEAP_KIND_GENERATOR;
 /// function count, matching `v12_engine::builtins::NATIVE_CONSOLE_LOG`.
 pub const NATIVE_CONSOLE_LOG: u32 = 1900;
 
-/// Offset for global var slots when the main env aliases the global object.
+/// Offset of user-declared global slots in the global object's `properties`.
 ///
-/// The global object's `properties` vector starts with this many intrinsic
-/// slots; main-env slot `0` maps to `properties[GLOBAL_VAR_OFFSET]`. Must
-/// stay in sync with `v12-engine/src/realm.rs` `INTRINSIC_NAMES.len()` and
+/// The realm pushes this many intrinsic slots (`INTRINSIC_NAMES`) onto the
+/// global's `properties` vector without shape descriptors, so any slot a
+/// shape descriptor reports for the global must be biased by this constant
+/// before indexing storage (see [`Interp::global_slot_index`]). Must stay in
+/// sync with `v12-engine/src/realm.rs` `INTRINSIC_NAMES.len()` and
 /// `v12-bccompiler/src/model.rs` `GLOBAL_INTRINSICS.len()` (v1: 14).
 const GLOBAL_VAR_OFFSET: usize = 14;
+
+/// Names of the intrinsic slots installed by the realm at fixed positions
+/// in the global object's `properties` vector.
+///
+/// Mirrors `v12-engine/src/realm.rs` `INTRINSIC_NAMES` exactly (same names,
+/// same order, same length as [`GLOBAL_VAR_OFFSET`]); duplicated here because
+/// the interpreter sits below the engine crate. Deliberately *not* the
+/// compiler's longer [`v12_bccompiler::model::GLOBAL_INTRINSICS`] table,
+/// which lists more names than the v1 realm installs.
+const GLOBAL_INTRINSIC_NAMES: &[&str] = &[
+    "Object",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Math",
+    "JSON",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "Promise",
+    "Symbol",
+    "console",
+    "globalThis",
+];
 
 /// Maximum simultaneous JavaScript activations.
 ///
@@ -250,11 +277,12 @@ pub struct Interp {
     feedback: std::collections::HashMap<u32, FeedbackVector>,
     /// Functions that crossed the tier-up threshold since the last drain.
     tier_up_pending: Vec<u32>,
-    /// Optional global object handle for global-code `var` aliasing.
+    /// Optional embedder-provided global object for `GetGlobal`/`SetGlobal`.
     ///
-    /// When `Some(g)`, `NewEnvironment` for the main function aliases `g`
-    /// (with `GLOBAL_VAR_OFFSET` slot bias) so top-level `var` declarations
-    /// that escape to an env become properties of the global object.
+    /// When `None` at construction, a private default is allocated in
+    /// [`Interp::ensure_default_global`], so it is always `Some` afterwards.
+    /// Shape-derived property slots on this object map to
+    /// `properties[GLOBAL_VAR_OFFSET + slot]`; see [`Self::global_slot_index`].
     global: Option<Handle<JsObject>>,
     /// Cached `console.log` function object, synthesized lazily on first
     /// `get_property` for `console.log`. The object is a `KIND_FUNCTION`
@@ -267,16 +295,17 @@ impl Interp {
     /// Builds an interpreter over `program`, resolving `Const::Str32` ids
     /// against `strings` (as produced by
     /// `v12_bccompiler::compile_source_with_strings`).
-    /// Builds an interpreter over a compiled program, resolving
-    /// `Const::Str32` ids against `strings` (as produced by
-    /// `v12_bccompiler::compile_source_with_strings`).
-    /// Builds an interpreter over a compiled program, resolving
-    /// `Const::Str32` ids against `strings` (as produced by
-    /// `v12_bccompiler::compile_source_with_strings`).
+    ///
+    /// Top-level code addresses globals through `GetGlobal`/`SetGlobal`, so a
+    /// global object must exist even when no embedder provides one: without an
+    /// explicit [`Self::set_global`], a private default global is allocated
+    /// and rooted here. It carries the `GLOBAL_VAR_OFFSET` leading intrinsic
+    /// slots (all `undefined` outside a realm) so shared `GetGlobal` fast
+    /// paths stay in bounds.
     pub fn new(functions: Vec<FunctionBytecode>, main: u32, strings: Vec<String>) -> Self {
         let mut heap = Heap::new(GcPolicy::default());
         heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
-        Self {
+        let mut interp = Self {
             functions: std::sync::Arc::from(functions.into_boxed_slice()),
             main,
             strings: std::sync::Arc::from(strings.into_boxed_slice()),
@@ -296,7 +325,9 @@ impl Interp {
             tier_up_pending: Vec::new(),
             global: None,
             console_log: None,
-        }
+        };
+        interp.ensure_default_global();
+        interp
     }
 
     /// Convenience constructor: compiles `source` and resolves its string
@@ -324,7 +355,8 @@ impl Interp {
     /// Builds an interpreter that reuses an existing heap and optional global.
     ///
     /// The caller must ensure `global` (if any) is allocated in `heap` and
-    /// rooted.
+    /// rooted. When `global` is `None`, a private default global is allocated
+    /// and rooted in `heap` (see [`Self::new`]).
     pub fn new_with_heap(
         heap: Heap,
         global: Option<Handle<JsObject>>,
@@ -334,7 +366,7 @@ impl Interp {
     ) -> Self {
         let mut heap = heap;
         heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
-        Self {
+        let mut interp = Self {
             functions: std::sync::Arc::from(functions.into_boxed_slice()),
             main,
             strings: std::sync::Arc::from(strings.into_boxed_slice()),
@@ -354,7 +386,26 @@ impl Interp {
             tier_up_pending: Vec::new(),
             global,
             console_log: None,
+        };
+        interp.ensure_default_global();
+        interp
+    }
+
+    /// Allocates the standalone default global when no embedder supplied one.
+    ///
+    /// The object is rooted immediately (allocation contract) and carries the
+    /// `GLOBAL_VAR_OFFSET` intrinsic prefix slots so intrinsics fast paths can
+    /// index without bounds concerns.
+    fn ensure_default_global(&mut self) {
+        if self.global.is_some() {
+            return;
         }
+        let g = self.heap.alloc(JsObject {
+            properties: vec![JsValue::undefined(); GLOBAL_VAR_OFFSET],
+            ..JsObject::default()
+        });
+        self.heap.add_root(JsValue::object(g));
+        self.global = Some(g);
     }
 
     /// Consumes the interpreter and returns its heap.
@@ -601,18 +652,35 @@ impl Interp {
                     self.gc_protect();
                     let v = attempt!(ops::add(&mut self.heap, l, r));
                     self.stack[base + usize::from(instr.a())] = v;
+                    let lat = Lattice::from_value(v, None);
+                    self.feedback
+                        .entry(fn_idx)
+                        .or_default()
+                        .record_type(pc as u32, lat);
                     self.set_pc(pc + 1);
                 }
                 Opcode::Sub => {
                     let l = self.stack[base + usize::from(instr.b())];
                     let r = self.stack[base + usize::from(instr.c())];
-                    self.stack[base + usize::from(instr.a())] = ops::sub(&mut self.heap, l, r);
+                    let v = ops::sub(&mut self.heap, l, r);
+                    self.stack[base + usize::from(instr.a())] = v;
+                    let lat = Lattice::from_value(v, None);
+                    self.feedback
+                        .entry(fn_idx)
+                        .or_default()
+                        .record_type(pc as u32, lat);
                     self.set_pc(pc + 1);
                 }
                 Opcode::Mul => {
                     let l = self.stack[base + usize::from(instr.b())];
                     let r = self.stack[base + usize::from(instr.c())];
-                    self.stack[base + usize::from(instr.a())] = ops::mul(&mut self.heap, l, r);
+                    let v = ops::mul(&mut self.heap, l, r);
+                    self.stack[base + usize::from(instr.a())] = v;
+                    let lat = Lattice::from_value(v, None);
+                    self.feedback
+                        .entry(fn_idx)
+                        .or_default()
+                        .record_type(pc as u32, lat);
                     self.set_pc(pc + 1);
                 }
                 Opcode::Div | Opcode::Mod | Opcode::Pow => {
@@ -624,6 +692,11 @@ impl Interp {
                         _ => ops::js_pow(&mut self.heap, l, r),
                     };
                     self.stack[base + usize::from(instr.a())] = n;
+                    let lat = Lattice::from_value(n, None);
+                    self.feedback
+                        .entry(fn_idx)
+                        .or_default()
+                        .record_type(pc as u32, lat);
                     self.set_pc(pc + 1);
                 }
 
@@ -783,6 +856,11 @@ impl Interp {
                     self.gc_protect();
                     let v = attempt!(self.get_property(fn_idx, pc as u32, obj_v, key_v));
                     self.stack[base + usize::from(instr.a())] = v;
+                    let lat = Lattice::from_value(v, v.as_object().map(|h| self.shape_of(h)));
+                    self.feedback
+                        .entry(fn_idx)
+                        .or_default()
+                        .record_type(pc as u32, lat);
                     self.set_pc(pc + 1);
                 }
                 Opcode::SetProperty => {
@@ -847,30 +925,19 @@ impl Interp {
                 Opcode::NewEnvironment => {
                     let slots = usize::from(instr.b());
                     self.gc_protect();
-                    // Global-code var hoisting: main's env aliases the global
-                    // object with a slot bias so top-level `var`s become global
-                    // properties.
-                    if let Some(g) = self.global
-                        && fn_idx == self.main
-                    {
-                        let needed = GLOBAL_VAR_OFFSET + slots;
-                        let cur_len = self.heap.get(g).properties.len();
-                        if cur_len < needed {
-                            self.heap
-                                .get_mut(g)
-                                .properties
-                                .resize(needed, JsValue::undefined());
-                        }
-                        self.frames.last_mut().expect("frame").env = Some(g);
-                    } else {
-                        let parent = self.frames.last().expect("frame").env;
-                        let h = self.heap.alloc(JsObject {
-                            properties: vec![JsValue::undefined(); slots],
-                            prototype: parent,
-                            ..JsObject::default()
-                        });
-                        self.frames.last_mut().expect("frame").env = Some(h);
-                    }
+                    // Environments are always fresh objects, mirroring the
+                    // reference interpreter in `v12-bccompiler/tests.rs`: the
+                    // global object lives *outside* the environment chain
+                    // (top-level `var`s route through `SetGlobal`/`GetGlobal`),
+                    // so aliased environments cannot collide with user global
+                    // properties that occupy the same physical storage.
+                    let parent = self.frames.last().expect("frame").env;
+                    let h = self.heap.alloc(JsObject {
+                        properties: vec![JsValue::undefined(); slots],
+                        prototype: parent,
+                        ..JsObject::default()
+                    });
+                    self.frames.last_mut().expect("frame").env = Some(h);
                     self.set_pc(pc + 1);
                 }
                 Opcode::GetEnvSlot => {
@@ -1008,12 +1075,17 @@ impl Interp {
                 if let Some(&h) = self.const_strings.get(&str_id) {
                     return Ok(JsValue::string(h));
                 }
+                // Interning allocates, so republish roots first: values
+                // created since the last gc_protect point (e.g. the operand
+                // of a preceding Closure) are otherwise invisible to the
+                // collector.
                 self.gc_protect();
-                let text = self
+                let text: String = self
                     .strings
                     .get(str_id as usize)
-                    .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"));
-                let h = intern_text(&mut self.heap, text);
+                    .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"))
+                    .clone();
+                let h = intern_text(&mut self.heap, &text);
                 self.const_strings.insert(str_id, h);
                 Ok(JsValue::string(h))
             }
@@ -1259,7 +1331,7 @@ impl Interp {
 
     fn env_read(&mut self, depth: u16, slot: u16) -> Result<JsValue, JSException> {
         let env = self.walk_env_expect(depth)?;
-        let idx = self.env_slot_index(env, slot);
+        let idx = usize::from(slot);
         let len = self.heap.get(env).properties.len();
         if idx < len {
             Ok(self.heap.get(env).properties[idx])
@@ -1272,7 +1344,7 @@ impl Interp {
 
     fn env_write(&mut self, depth: u16, slot: u16, v: JsValue) -> Result<(), JSException> {
         let env = self.walk_env_expect(depth)?;
-        let idx = self.env_slot_index(env, slot);
+        let idx = usize::from(slot);
         let len = self.heap.get(env).properties.len();
         if idx < len {
             self.heap.get_mut(env).properties[idx] = v;
@@ -1281,18 +1353,6 @@ impl Interp {
             Err(JSException(self.error_value(
                 "InternalError: environment slot out of range",
             )))
-        }
-    }
-
-    /// Maps a logical env `slot` to a physical index in `env`'s `properties`.
-    ///
-    /// Global-aliased envs reserve `GLOBAL_VAR_OFFSET` leading slots for the
-    /// realm's intrinsics; other envs use the slot directly.
-    fn env_slot_index(&self, env: Handle<JsObject>, slot: u16) -> usize {
-        if Some(env) == self.global {
-            GLOBAL_VAR_OFFSET + usize::from(slot)
-        } else {
-            usize::from(slot)
         }
     }
 
@@ -1441,8 +1501,9 @@ impl Interp {
         self.gc_protect();
         let func = self.heap.alloc(JsObject {
             kind: KIND_FUNCTION,
-            elements: vec![JsValue::from_i32_smi(NATIVE_CONSOLE_LOG as i32)
-                .expect("native index fits Smi")],
+            elements: vec![
+                JsValue::from_i32_smi(NATIVE_CONSOLE_LOG as i32).expect("native index fits Smi"),
+            ],
             ..JsObject::default()
         });
         let value = JsValue::object(func);
@@ -1487,10 +1548,7 @@ impl Interp {
                 match &self.heap.get(handle).storage {
                     v12_heap::StrStorage::Latin1(bytes) => bytes == b"log",
                     v12_heap::StrStorage::Utf16(units) => {
-                        units.len() == 3
-                            && units[0] == 108
-                            && units[1] == 111
-                            && units[2] == 103
+                        units.len() == 3 && units[0] == 108 && units[1] == 111 && units[2] == 103
                     }
                     _ => false,
                 }
@@ -1522,7 +1580,11 @@ impl Interp {
             .copied();
         if let Some(ic) = cached
             && ic.shape == shape
-            && let Some(v) = self.heap.get(obj).properties.get(ic.slot as usize)
+            && let Some(v) = self
+                .heap
+                .get(obj)
+                .properties
+                .get(self.global_slot_index(obj, ic.slot as usize))
         {
             return Ok(*v);
         }
@@ -1541,7 +1603,8 @@ impl Interp {
         match hit {
             Some((owner, desc)) => match desc {
                 Descriptor::Data { slot, .. } => {
-                    let value = self.heap.get(owner).properties[slot as usize];
+                    let value = self.heap.get(owner).properties
+                        [self.global_slot_index(owner, slot as usize)];
                     if owner == obj {
                         self.feedback
                             .entry(site_fn)
@@ -1616,7 +1679,8 @@ impl Interp {
             match d {
                 Descriptor::Data { slot, attrs, .. } => {
                     if attrs.writable() {
-                        self.heap.get_mut(obj).properties[slot as usize] = value;
+                        let idx = self.global_slot_index(obj, slot as usize);
+                        self.heap.get_mut(obj).properties[idx] = value;
                     }
                     return Ok(());
                 }
@@ -1658,7 +1722,25 @@ impl Interp {
         self.gc_protect();
         let child = self.heap.add_property(shape, key, Attrs::DEFAULT);
         self.bind_shape(obj, child);
-        self.heap.get_mut(obj).properties.push(value);
+        if Some(obj) == self.global {
+            // Global storage keeps the intrinsic prefix; slot numbering from
+            // the shared shape chain must not overlap it. The invariant
+            // `properties.len() == GLOBAL_VAR_OFFSET + num_own` restores
+            // itself by appending (and backfilling if an embedder's global
+            // was assembled with fewer slots).
+            let idx = GLOBAL_VAR_OFFSET
+                + usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
+            let len = self.heap.get(obj).properties.len();
+            if len <= idx {
+                self.heap
+                    .get_mut(obj)
+                    .properties
+                    .resize(idx + 1, JsValue::undefined());
+            }
+            self.heap.get_mut(obj).properties[idx] = value;
+        } else {
+            self.heap.get_mut(obj).properties.push(value);
+        }
         Ok(())
     }
 
@@ -1807,7 +1889,7 @@ impl Interp {
             return Ok(true);
         };
 
-        if self.heap.get(obj).kind == KIND_ARRAY
+        if (self.heap.get(obj).kind == KIND_ARRAY || self.heap.get(obj).kind == KIND_ARGUMENTS)
             && let Some(idx) = self.array_index_of(key_v)
         {
             let els = &mut self.heap.get_mut(obj).elements;
@@ -1827,7 +1909,8 @@ impl Interp {
         }
         match d {
             Descriptor::Data { slot, .. } => {
-                self.heap.get_mut(obj).properties[slot as usize] = JsValue::hole();
+                let idx = self.global_slot_index(obj, slot as usize);
+                self.heap.get_mut(obj).properties[idx] = JsValue::hole();
             }
             Descriptor::Accessor { .. } => {
                 // Accessor: no slot to hole; deletion succeeds if configurable.
@@ -1959,7 +2042,12 @@ impl Interp {
         }
 
         let shape = self.shape_of(src_obj);
-        // Snapshot descriptors to avoid borrow across allocation.
+        // Snapshot descriptors + properties before the loop below: each
+        // iteration calls `add_property`, which allocates a shape slot and
+        // may trigger a collection; a borrowed `&sh.descriptors` would dangle
+        // across that mutation (and cannot borrow-check against `&mut
+        // self.heap`). Descriptors are handles, so a stale-by-one-GC snapshot
+        // is fine as long as `src_obj` keeps its shape alive as a root.
         let descs: Vec<v12_heap::Descriptor> = {
             let sh = self.heap.get(shape);
             sh.descriptors.as_slice().to_vec()
@@ -1980,10 +2068,11 @@ impl Interp {
                 continue;
             };
             let slot_usize = slot as usize;
-            if slot_usize >= src_props.len() {
+            let phys = self.global_slot_index(src_obj, slot_usize);
+            if phys >= src_props.len() {
                 continue;
             }
-            let val = src_props[slot_usize];
+            let val = src_props[phys];
             if val.is_hole() {
                 continue;
             }
@@ -2058,35 +2147,38 @@ impl Interp {
         Ok(())
     }
 
+    /// Physical index for a shape-derived property `slot` on object `obj`.
+    ///
+    /// The global object's `properties` vector is prefixed by
+    /// `GLOBAL_VAR_OFFSET` intrinsic slots that the shape graph does not
+    /// track (the realm installs them by pushing directly), so every
+    /// descriptor slot on the global maps to `GLOBAL_VAR_OFFSET + slot`;
+    /// ordinary objects use the slot as-is.
+    fn global_slot_index(&self, obj: Handle<JsObject>, slot: usize) -> usize {
+        if Some(obj) == self.global {
+            GLOBAL_VAR_OFFSET + slot
+        } else {
+            slot
+        }
+    }
+
     fn op_get_global(&mut self, str_id: u32) -> Result<JsValue, JSException> {
         let Some(global) = self.global else {
             return Ok(JsValue::undefined());
         };
-        let text = self
+        // The fast path allocates only when interning an unseen key, but any
+        // `Heap::alloc` can collect — publish roots first so values written
+        // since the last opcode-level protect stay reachable.
+        self.gc_protect();
+        // Borrow the compiler's string table entry: comparing against the
+        // intrinsics list and interning both take &str, so no String clone
+        // is needed on this fast path.
+        let text: &str = self
             .strings
             .get(str_id as usize)
-            .cloned()
-            .unwrap_or_default();
-        // Fast path for intrinsics that live at fixed indices in the global's
-        // properties vector (see `realm::INTRINSIC_NAMES` order). Must stay
-        // in sync with `v12-engine/src/realm.rs` and `v12-bccompiler/src/model.rs`.
-        const INTRINSICS: &[&str] = &[
-            "Object",
-            "Array",
-            "String",
-            "Number",
-            "Boolean",
-            "Math",
-            "JSON",
-            "Error",
-            "TypeError",
-            "RangeError",
-            "Promise",
-            "Symbol",
-            "console",
-            "globalThis",
-        ];
-        if let Some(idx) = INTRINSICS.iter().position(|&n| n == text)
+            .map(String::as_str)
+            .unwrap_or("");
+        if let Some(idx) = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == text)
             && idx < self.heap.get(global).properties.len()
         {
             let v = self.heap.get(global).properties[idx];
@@ -2094,13 +2186,13 @@ impl Interp {
                 return Ok(v);
             }
         }
-        let h = intern_text(&mut self.heap, &text);
+        let h = intern_text(&mut self.heap, text);
         let key = PropKey::from_string(h);
         let shape = self.shape_of(global);
         if let Some(desc) = self.heap.lookup_property(shape, key)
             && let Some(slot) = desc.slot()
         {
-            let idx = slot as usize;
+            let idx = self.global_slot_index(global, slot as usize);
             if idx < self.heap.get(global).properties.len() {
                 let v = self.heap.get(global).properties[idx];
                 if !v.is_hole() {
@@ -2115,28 +2207,15 @@ impl Interp {
         let Some(global) = self.global else {
             return Ok(());
         };
+        // Interning a new key and the shape transition below can each
+        // allocate; publish roots first so `val` survives any collection.
+        self.gc_protect();
         let text = self
             .strings
             .get(str_id as usize)
             .cloned()
             .unwrap_or_default();
-        const INTRINSICS: &[&str] = &[
-            "Object",
-            "Array",
-            "String",
-            "Number",
-            "Boolean",
-            "Math",
-            "JSON",
-            "Error",
-            "TypeError",
-            "RangeError",
-            "Promise",
-            "Symbol",
-            "console",
-            "globalThis",
-        ];
-        if let Some(idx) = INTRINSICS.iter().position(|&n| n == text) {
+        if let Some(idx) = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == text) {
             // Intrinsics are at fixed indices; allow overwriting.
             if idx < self.heap.get(global).properties.len() {
                 self.heap.get_mut(global).properties[idx] = val;
@@ -2150,17 +2229,36 @@ impl Interp {
         if let Some(desc) = self.heap.lookup_property(shape, key)
             && let Some(slot) = desc.slot()
         {
-            let idx = slot as usize;
-            if idx < self.heap.get(global).properties.len() {
-                self.heap.get_mut(global).properties[idx] = val;
-                return Ok(());
+            let idx = self.global_slot_index(global, slot as usize);
+            let len = self.heap.get(global).properties.len();
+            if idx >= len {
+                // Repair the vector if an embedder assembled the global
+                // without the full intrinsic prefix.
+                self.heap
+                    .get_mut(global)
+                    .properties
+                    .resize(idx + 1, JsValue::undefined());
             }
+            self.heap.get_mut(global).properties[idx] = val;
+            return Ok(());
         }
-        // Otherwise, create new global property.
-        self.gc_protect();
+        // Otherwise, create new global property. The shape transition may
+        // allocate, but roots were published at the top of this handler and
+        // nothing here introduces values beyond that set (the interned key is
+        // kept alive by the strong intern table), so no re-protect is needed.
+        // Keep the physical index in sync with the shape's slot numbering.
         let child = self.heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
         self.bind_shape(global, child);
-        self.heap.get_mut(global).properties.push(val);
+        let new_slot = usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
+        let idx = self.global_slot_index(global, new_slot);
+        let len = self.heap.get(global).properties.len();
+        if len <= idx {
+            self.heap
+                .get_mut(global)
+                .properties
+                .resize(idx + 1, JsValue::undefined());
+        }
+        self.heap.get_mut(global).properties[idx] = val;
         Ok(())
     }
 
@@ -2322,6 +2420,27 @@ impl Interp {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn type_feedback_at(&self, fn_idx: u32, pc: u32) -> Lattice {
+        self.feedback
+            .get(&fn_idx)
+            .map(|fv| fv.type_at(pc))
+            .unwrap_or(Lattice::Unknown)
+    }
+
+    /// Returns the per-function feedback vector collected by the interpreter,
+    /// if one was allocated. The tier-2 driver reads this when deciding
+    /// whether to speculate.
+    #[must_use]
+    pub fn feedback_vector(&self, fn_idx: u32) -> Option<&FeedbackVector> {
+        self.feedback.get(&fn_idx)
+    }
+
+    #[cfg(test)]
+    pub fn feedback_vector_mut(&mut self, fn_idx: u32) -> Option<&mut FeedbackVector> {
+        self.feedback.get_mut(&fn_idx)
+    }
+
     // ------------------------------------------------------------------
     // GC coordination
     // ------------------------------------------------------------------
@@ -2331,6 +2450,11 @@ impl Interp {
     /// that can reach `Heap::alloc`.
     fn gc_protect(&mut self) {
         let roots = &mut self.heap.roots_mut().0;
+        // The root set is fully republished here, so long-lived interpreter
+        // state kept outside the stack/frames — the global object and the
+        // cached `console.log` native — must be re-rooted on every pass or
+        // a collection between allocations drops their referents.
+        let persistent: [Option<JsValue>; 2] = [self.global.map(JsValue::object), self.console_log];
         roots.clear();
         roots.extend_from_slice(&self.stack);
         for frame in &self.frames {
@@ -2338,6 +2462,7 @@ impl Interp {
                 roots.push(JsValue::object(env));
             }
         }
+        roots.extend(persistent.into_iter().flatten());
     }
 }
 
