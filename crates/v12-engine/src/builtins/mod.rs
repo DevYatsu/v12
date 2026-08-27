@@ -81,6 +81,7 @@ pub const NATIVE_ERROR_CREATE: u32 = 1600;
 pub const NATIVE_QUEUE_MICROTASK: u32 = 1700;
 pub const NATIVE_EVAL: u32 = 1800;
 pub const NATIVE_FUNCTION: u32 = 1801;
+pub const NATIVE_CONSOLE_LOG: u32 = 1900;
 
 /// Installs the core built-ins into `registry`.
 pub fn install_core(registry: &mut NativeRegistry) {
@@ -104,6 +105,7 @@ pub fn install_core(registry: &mut NativeRegistry) {
     registry.register(NATIVE_QUEUE_MICROTASK, queue_microtask);
     registry.register(NATIVE_EVAL, eval_stub);
     registry.register(NATIVE_FUNCTION, function_stub);
+    registry.register(NATIVE_CONSOLE_LOG, console_log);
 }
 
 fn queue_microtask(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
@@ -193,6 +195,50 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
     });
     heap.add_root(JsValue::object(func));
     Ok(JsValue::object(func))
+}
+
+fn console_log(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    // Mirrors `Engine::to_display_string` for the subset of values that
+    // `console.log` observes in Tier-0. Strings are flattened first so
+    // composite/sliced representations print correctly.
+    let mut parts = Vec::with_capacity(args.len());
+    for &v in args {
+        let text = if let Some(handle) = v.as_string() {
+            heap.flatten(handle);
+            match &heap.get(handle).storage {
+                v12_heap::StrStorage::Latin1(bytes) => {
+                    String::from_utf8_lossy(bytes).into_owned()
+                }
+                v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
+                _ => String::new(),
+            }
+        } else if let Some(number) = v.as_smi().map(f64::from).or(v.as_f64()) {
+            if number.is_nan() {
+                "NaN".to_string()
+            } else if number == f64::INFINITY {
+                "Infinity".to_string()
+            } else if number == f64::NEG_INFINITY {
+                "-Infinity".to_string()
+            } else {
+                format!("{number}")
+            }
+        } else if v.is_true() {
+            "true".to_string()
+        } else if v.is_false() {
+            "false".to_string()
+        } else if v.is_undefined() {
+            "undefined".to_string()
+        } else if v.is_null() {
+            "null".to_string()
+        } else if v.is_object() {
+            "[object Object]".to_string()
+        } else {
+            "<unprintable>".to_string()
+        };
+        parts.push(text);
+    }
+    println!("{}", parts.join(" "));
+    Ok(JsValue::undefined())
 }
 
 fn intern_type_error(heap: &mut Heap, msg: &str) -> JsValue {

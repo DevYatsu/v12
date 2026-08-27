@@ -54,6 +54,22 @@ pub const NATIVE_IMPORT_INDEX_U32: u32 = NATIVE_IMPORT_INDEX as u32;
 /// identifiers and literals intern into it and repeats reuse existing keys;
 /// once compilation is done, [`crate::freeze_interner`] turns it into a
 /// resolver for key→string lookups.
+///
+/// String identities are split across two bytecode namespaces that happen to
+/// share the same underlying `Rodeo` storage but must never be conflated:
+///
+/// - `GetGlobal`/`SetGlobal` carry a `PropKey` via `lasso::Spur` directly: the
+///   instruction's 16-bit immediate is the string table index (`Spur`'s
+///   `into_usize`) for the global name (`"console"`).
+/// - `LoadConst` carries a `Const::Str32(u32)` via the per-function
+///   `ConstantPool`: the instruction's immediate is a pool index, and the
+///   pooled `Str32` payload is the string table index for the literal
+///   (`"log"`).
+///
+/// Both string ids originate from the same `Rodeo`, but the immediates live in
+/// different tables (`strings` vs `consts`), so `k0` in `get_global r,a,k0`
+/// and `k0` in `load_const r,k0` are unrelated. `str_id_of` / `spur_of_str_id`
+/// are the only conversion points between the two representations.
 pub type Interner = lasso::Rodeo<lasso::Spur>;
 
 /// The [`v12_bytecode::Const::Str32`] payload for `key`.
@@ -62,6 +78,10 @@ pub type Interner = lasso::Rodeo<lasso::Spur>;
 /// different representations (`Spur` wraps a `NonZeroU32`, offset by one).
 /// These two functions are the single translation point; they delegate to
 /// lasso's own `Key` codec rather than poking at the wrapped integer.
+///
+/// See the `Interner` docs for why `Spur` (used for `GetGlobal`'s `PropKey`)
+/// and `Str32` (used for `LoadConst`'s pooled string) share the `Rodeo` but
+/// occupy distinct immediate namespaces.
 pub(crate) fn str_id_of(key: lasso::Spur) -> u32 {
     u32::try_from(key.into_usize()).expect("a Spur always names a 32-bit table index")
 }
@@ -562,7 +582,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(())
     }
 
-    /// Loads a string literal (interned) into `dst`.
+    /// Loads a string literal (interned) into `dst` via `ConstantPool`.
+    ///
+    /// The `Rodeo` interns `s` to a `Spur`; `str_id_of` converts it to a
+    /// `Str32` payload, which is pooled and whose pool index becomes the
+    /// `LoadConst` immediate. This is distinct from `GetGlobal`'s
+    /// `PropKey` (Spur) immediate — see `Interner` docs.
     pub fn load_str(&mut self, dst: u8, s: &str, span: oxc_span::Span) -> Result<(), CompileError> {
         let id = str_id_of(self.comp.strings.get_or_intern(s));
         self.load_const(dst, Const::Str32(id), span)
@@ -614,11 +639,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_spanned(Instr::new(Opcode::SetEnvSlot, depth, slot, src), span);
     }
 
+    /// `GetGlobal dst, name_id` where `name_id` is the `Spur`'s
+    /// `str_id_of` (string table index) for the global name. The immediate
+    /// is a direct string table id, not a pool index — distinct from
+    /// `LoadConst`'s `Str32` pool immediate. See `Interner` docs.
     pub fn emit_get_global(&mut self, dst: u8, name_id: u32, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
         self.emit_spanned(Instr::new_imm16(Opcode::GetGlobal, dst, k), span);
     }
 
+    /// `SetGlobal name_id, src` — same `Spur`-derived string table id as
+    /// `GetGlobal`.
     pub fn emit_set_global(&mut self, name_id: u32, src: u8, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
         self.emit_spanned(Instr::new_imm16(Opcode::SetGlobal, src, k), span);

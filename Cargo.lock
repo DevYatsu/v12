@@ -2127,8 +2127,10 @@ dependencies = [
 name = "v12-cli"
 version = "0.1.0"
 dependencies = [
+ "lasso",
  "rustyline",
  "v12-bccompiler",
+ "v12-bytecode",
  "v12-engine",
 ]
 

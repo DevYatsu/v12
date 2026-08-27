@@ -753,4 +753,34 @@ mod tests {
         let thrown = engine2.eval("throw Object;").unwrap_err();
         assert!(thrown.is_object());
     }
+
+    #[test]
+    fn arrow_iife_via_engine() {
+        // `(x => x)(2)` should evaluate to `2` (observed via `throw` because
+        // `Engine::eval` returns `Ok(undefined)` on normal completion).
+        let mut engine = Engine::new();
+        let thrown = engine.eval("throw (x => x)(2);").unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(2));
+        let mut engine2 = Engine::new();
+        let thrown2 = engine2.eval("throw (x => x+1)(41);").unwrap_err();
+        assert_eq!(thrown2.as_smi(), Some(42));
+        // Without `throw` the IIFE should not throw.
+        let mut engine3 = Engine::new();
+        let ok = engine3.eval("(x => x)(2);");
+        assert!(ok.is_ok(), "arrow IIFE without throw should not throw: {ok:?}");
+    }
+
+    #[test]
+    fn console_log_does_not_throw() {
+        let mut engine = Engine::new();
+        let result = engine.eval("(x => console.log(x))(2);");
+        assert!(
+            result.is_ok(),
+            "console.log call should not throw, got {:?}",
+            result.map_err(|e| engine.to_display_string(e))
+        );
+        let mut engine2 = Engine::new();
+        let thrown = engine2.eval("throw typeof console.log;").unwrap_err();
+        assert_eq!(engine2.to_display_string(thrown), "function");
+    }
 }

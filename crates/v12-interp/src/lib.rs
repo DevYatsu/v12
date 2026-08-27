@@ -90,6 +90,11 @@ pub const KIND_ARGUMENTS: u8 = HEAP_KIND_ARGUMENTS;
 /// Object kind for generator objects.
 pub const KIND_GENERATOR: u8 = HEAP_KIND_GENERATOR;
 
+/// Native index for `console.log` — a console method that prints its
+/// arguments and returns `undefined`. Chosen beyond any plausible program
+/// function count, matching `v12_engine::builtins::NATIVE_CONSOLE_LOG`.
+pub const NATIVE_CONSOLE_LOG: u32 = 1900;
+
 /// Offset for global var slots when the main env aliases the global object.
 ///
 /// The global object's `properties` vector starts with this many intrinsic
@@ -251,6 +256,11 @@ pub struct Interp {
     /// (with `GLOBAL_VAR_OFFSET` slot bias) so top-level `var` declarations
     /// that escape to an env become properties of the global object.
     global: Option<Handle<JsObject>>,
+    /// Cached `console.log` function object, synthesized lazily on first
+    /// `get_property` for `console.log`. The object is a `KIND_FUNCTION`
+    /// whose `elements[0]` is `NATIVE_CONSOLE_LOG`, so `prepare_call` routes
+    /// it through the `NativeRegistry`.
+    console_log: Option<JsValue>,
 }
 
 impl Interp {
@@ -285,6 +295,7 @@ impl Interp {
             feedback: std::collections::HashMap::new(),
             tier_up_pending: Vec::new(),
             global: None,
+            console_log: None,
         }
     }
 
@@ -342,6 +353,7 @@ impl Interp {
             feedback: std::collections::HashMap::new(),
             tier_up_pending: Vec::new(),
             global,
+            console_log: None,
         }
     }
 
@@ -1415,6 +1427,30 @@ impl Interp {
     /// `Engine::eval` path lives in `v12-engine` where the caller's heap is
     /// shared. `HasProperty` for arguments exotic indices is handled via the
     /// element store.
+    /// Lazily materializes the `console.log` native function object.
+    ///
+    /// The function is a `KIND_FUNCTION` whose `elements[0]` is
+    /// `NATIVE_CONSOLE_LOG`, so `prepare_call` routes it through the
+    /// `NativeRegistry`. The object is cached in `self.console_log` and
+    /// rooted, so repeated `get_property` for `console.log` returns the
+    /// same handle.
+    fn console_log_fn(&mut self) -> JsValue {
+        if let Some(cached) = self.console_log {
+            return cached;
+        }
+        self.gc_protect();
+        let func = self.heap.alloc(JsObject {
+            kind: KIND_FUNCTION,
+            elements: vec![JsValue::from_i32_smi(NATIVE_CONSOLE_LOG as i32)
+                .expect("native index fits Smi")],
+            ..JsObject::default()
+        });
+        let value = JsValue::object(func);
+        self.heap.add_root(value);
+        self.console_log = Some(value);
+        value
+    }
+
     fn get_property(
         &mut self,
         site_fn: u32,
@@ -1427,6 +1463,42 @@ impl Interp {
         let Some(obj) = obj_v.as_object() else {
             return Ok(JsValue::undefined());
         };
+
+        // Fast path for `console.log`: the console object lives at
+        // `global.properties[12]` (INTRINSICS[12] == "console"). When the
+        // lookup is for `"log"` on that object, synthesize the native
+        // function. This avoids needing a shape for `console`'s `log`
+        // property and keeps `Realm` free of interpreter shape bookkeeping.
+        let console_obj_opt = if let Some(g) = self.global {
+            let val_opt = {
+                let heap = &self.heap;
+                heap.get(g).properties.get(12).copied()
+            };
+            val_opt.and_then(|v| v.as_object())
+        } else {
+            None
+        };
+        if let Some(console_obj) = console_obj_opt
+            && obj == console_obj
+            && let Some(handle) = key_v.as_string()
+        {
+            let is_log = {
+                self.heap.flatten(handle);
+                match &self.heap.get(handle).storage {
+                    v12_heap::StrStorage::Latin1(bytes) => bytes == b"log",
+                    v12_heap::StrStorage::Utf16(units) => {
+                        units.len() == 3
+                            && units[0] == 108
+                            && units[1] == 111
+                            && units[2] == 103
+                    }
+                    _ => false,
+                }
+            };
+            if is_log {
+                return Ok(self.console_log_fn());
+            }
+        }
 
         // Arguments and arrays store integer indices in `elements`.
         let kind = self.heap.get(obj).kind;

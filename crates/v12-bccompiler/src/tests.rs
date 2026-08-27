@@ -2098,3 +2098,62 @@ fn global_assign_and_update_compile_to_set_global() {
     assert!(fb3.validate().is_ok(), "validate failed:\n{fb3}");
     expect_num(r#"let k="a"; let o={[k]:1}; return o[k];"#, 1.0);
 }
+
+#[test]
+fn console_log_member_chain_uses_distinct_string_ids() {
+    // `console.log(x)` compiles to `GetGlobal` for `console` (PropKey/Spur)
+    // and `LoadConst` for `"log"` (Str32/pool) with distinct string table
+    // ids. The bug conflated the two (both `k0` → `Str32("console")`),
+    // making `GetProperty` load `console["console"]` which is `undefined`.
+    let src = "console.log(1);";
+    let (prog, strings) =
+        compile_source_with_strings(src).expect("console.log should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    let get_global = fb
+        .instrs
+        .iter()
+        .find(|i| i.op() == Some(Opcode::GetGlobal))
+        .expect("expected GetGlobal for console");
+    let load_const = fb
+        .instrs
+        .iter()
+        .find(|i| i.op() == Some(Opcode::LoadConst))
+        .expect("expected LoadConst for log");
+    let get_global_id = u32::from(get_global.imm16());
+    let pool_idx = load_const.imm16();
+    let load_const_str_id = match fb.consts.get(pool_idx).expect("pool entry") {
+        Const::Str32(id) => id,
+        other => panic!("expected Str32 for log, got {other:?}"),
+    };
+    assert_ne!(
+        get_global_id, load_const_str_id,
+        "console and log must be distinct string ids: console id {get_global_id}, log id {load_const_str_id} in:\n{fb}\nstrings: {strings:?}"
+    );
+    assert_eq!(strings[get_global_id as usize], "console");
+    assert_eq!(strings[load_const_str_id as usize], "log");
+    assert!(
+        fb.instrs.iter().any(|i| i.op() == Some(Opcode::GetProperty)),
+        "expected GetProperty for console.log in:\n{fb}"
+    );
+}
+
+#[test]
+fn arrow_iife_compiles_and_executes() {
+    // `(x => x)(1)` is the minimal arrow IIFE — the outer call must not be
+    // conflated with the inner `console.log` property lookup. This test
+    // guards the `x => x` closure and the call ABI.
+    let src = "let f = (x => x); let v = f(1); return v;";
+    expect_num(src, 1.0);
+    let (prog, _) =
+        compile_source_with_strings("(x => x)(1)").expect("arrow IIFE should compile");
+    let fb = &prog.functions[prog.main as usize];
+    assert!(
+        fb.instrs.iter().any(|i| i.op() == Some(Opcode::Closure)),
+        "expected Closure for arrow in:\n{fb}"
+    );
+    assert!(
+        fb.instrs.iter().any(|i| i.op() == Some(Opcode::Call)),
+        "expected Call for IIFE in:\n{fb}"
+    );
+}

@@ -120,6 +120,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 if s.optional {
                     return Err(self.err(s.span, "optional chaining is not supported"));
                 }
+                // Static member `obj.prop`: `obj` may be a global (`console`)
+                // via `GetGlobal` (PropKey/Spur), `prop` (`log`) is a string
+                // literal via `LoadConst` (Str32/ConstantPool). Even though both
+                // string ids originate from the same `Rodeo`, the immediates
+                // occupy distinct namespaces (string table vs pool index), so
+                // the `GetProperty` key must be `Str32("log")`, not the `Spur`
+                // for `"console"`.
                 let obj = self.expr(&s.object)?;
                 let key = self.new_temp();
                 self.load_str(key, s.property.name.as_str(), s.property.span)?;
@@ -396,7 +403,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         // Computed property keys (`{[expr]: value}`) evaluate the key
         // expression into a temp (ToPropertyKey via runtime `to_key`) and
-        // use dynamic `SetProperty`. Static keys remain interned strings.
+        // use dynamic `SetProperty`. Static keys remain interned strings via
+        // `LoadConst` (Str32/pool) — distinct from any `GetGlobal` (PropKey)
+        // for the same identifier text.
         let key = if p.computed {
             let Some(expr) = p.key.as_expression() else {
                 return Err(self.err(p.key.span(), "computed property key must be an expression"));
@@ -746,12 +755,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// For computed keys the key expression evaluates into a temp before the
     /// base (`obj[expr]` → ToPropertyKey then Get/SetProperty with dynamic
     /// `PropKey`), per bucket 4. Static keys materialize as interned strings.
+    ///
+    /// For a chain like `console.log`, the base (`console`) is emitted via
+    /// `GetGlobal` (PropKey/Spur, string table id) and the property (`log`)
+    /// via `LoadConst` (Str32, pool index → string table id). Both originate
+    /// from the same `Rodeo` but the `GetProperty` key operand must be the
+    /// `Str32` for `"log"`, not the `Spur` for `"console"`. The two
+    /// namespaces are documented in `crate::model::Interner`.
     fn member_parts(&mut self, m: &MemberExpression<'_>) -> Res<(u8, u8)> {
         if m.optional() {
             return Err(self.err(m.span(), "optional chaining is not supported"));
         }
         match m {
             MemberExpression::StaticMemberExpression(s) => {
+                // `console.log`: `console` → `GetGlobal` (PropKey), `log` →
+                // `LoadConst` (Str32). Keep the ids distinct.
                 let obj = self.expr(&s.object)?;
                 let key = self.new_temp();
                 self.load_str(key, s.property.name.as_str(), s.property.span)?;
