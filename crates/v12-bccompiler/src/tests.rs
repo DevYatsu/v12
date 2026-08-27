@@ -725,6 +725,20 @@ fn switch_evaluates_tests_in_order_once() {
 }
 
 #[test]
+fn switch_duplicate_default_is_a_syntax_error() {
+    // ES §14.12: at most one default clause. oxc accepts the parse, so the
+    // compiler must reject it — a second default would bind the shared
+    // `default_entry` label twice and panic in `FunctionBuilder::bind`.
+    let err = compile_source_with_strings("switch (1) { default: ; break; default: ; break; }")
+        .map_err(|e| e.message)
+        .expect_err("duplicate default clauses must fail compilation");
+    assert!(
+        err.contains("SyntaxError") && err.contains("default"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
 fn switch_break_jumps_out_labeled_too() {
     expect_str(
         "

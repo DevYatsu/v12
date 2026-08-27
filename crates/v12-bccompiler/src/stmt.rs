@@ -558,6 +558,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     ) -> Res<()> {
         let disc = self.expr(&s.discriminant)?;
         let end = self.label();
+        // ES §14.12 allows at most one `default` clause. oxc parses
+        // duplicates without complaint, so enforce it here: phase 2 binds
+        // the single `default_entry` label once per `None` entry, so two
+        // defaults would bind it twice (a builder invariant violation).
+        let default_count = s.cases.iter().filter(|c| c.test.is_none()).count();
+        if default_count > 1 {
+            return Err(self.err(
+                s.span,
+                "SyntaxError: more than one default clause in switch statement",
+            ));
+        }
         // Pre-scan for a default clause so the fallback jump target exists
         // only when needed (the builder asserts every label gets bound).
         let has_default = s.cases.iter().any(|c| c.test.is_none());

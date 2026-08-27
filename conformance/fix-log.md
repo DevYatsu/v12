@@ -24,6 +24,20 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-08-27 — Switch duplicate-`default` panic → SyntaxError
+
+- **Filter:** `language` (24 873 files, 8 jobs)
+- **Before:** 4 957 pass / 14 955 fail / 4 961 skip, 24.9 % pass (1 × `engine panic`)
+- **After:**  4 958 pass / 14 954 fail / 4 961 skip, 24.9 % pass (0 panics)
+- **Delta:** +1 pass, −1 fail, 0 skips — `engine panic` count on `language` now 0
+- **Engine change:** `switch_stmt` rejects duplicate `default` clauses with `SyntaxError: more than one default clause in switch statement`. Root cause: phase 2 bound the single shared `default_entry` label once per `None` entry, so a second default double-bound it and `FunctionBuilder::bind` panicked (`label Label(1) bound more than once`). Builder kept strict (double-bind stays a hard panic); the compiler-side emission flow is the fix. Minimal repro: `switch (1) { default: ; break; default: ; break; }` — panics pre-fix, SyntaxError post-fix.
+- **Files:** `crates/v12-bccompiler/src/stmt.rs` (validation + comment), `crates/v12-bccompiler/src/tests.rs` (`switch_duplicate_default_is_a_syntax_error`)
+- **Bucket:** `known-failures.md` — panics bucket stays closed (regression found by Test262 `language/statements/switch/S12.11_A2_T1.js`, a negative parse-phase test, which now passes)
+- **Runner:** `cargo run --release -p test262-runner -- --filter language --jobs 8`
+- **Notes:**
+  - `cargo fmt` clean; `cargo clippy -p v12-bytecode -p v12-bccompiler -p v12-interp --all-targets` 0 warnings; `cargo nextest run -p v12-bytecode -p v12-bccompiler -p v12-interp` 244/244 pass.
+  - Located via `--format tap`: only one panicking test in the whole `language` filter (S12.11_A2_T1.js); the aggregate panic message is printed once regardless of jobs.
+
 ### 2026-08-27 — SSA optimizer Phase 2 + GC root fix re-score
 
 - **Filter:** `language` (24 873 files, 8 jobs) and `language/expressions/assignment` (818 files, 4 jobs)
