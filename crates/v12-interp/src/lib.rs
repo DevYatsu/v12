@@ -95,6 +95,32 @@ pub const KIND_GENERATOR: u8 = HEAP_KIND_GENERATOR;
 /// function count, matching `v12_engine::builtins::NATIVE_CONSOLE_LOG`.
 pub const NATIVE_CONSOLE_LOG: u32 = 1900;
 
+/// Native index for `Array.prototype.push`, mirroring
+/// `v12_engine::builtins::NATIVE_ARRAY_PUSH` (same duplication pattern as
+/// `NATIVE_CONSOLE_LOG`; the interpreter sits below the engine crate).
+pub const NATIVE_ARRAY_PUSH: u32 = 1100;
+
+/// Native index for `Array.prototype.join`, mirroring
+/// `v12_engine::builtins::NATIVE_ARRAY_JOIN`.
+pub const NATIVE_ARRAY_JOIN: u32 = 1102;
+
+/// Native indices of the minimal Promise surface (`Promise.resolve`,
+/// `Promise.reject`, `Promise.prototype.then`), mirroring
+/// `v12_engine::builtins` constants.
+pub const NATIVE_PROMISE_RESOLVE: u32 = 1710;
+pub const NATIVE_PROMISE_REJECT: u32 = 1711;
+pub const NATIVE_PROMISE_THEN: u32 = 1712;
+
+/// Selector for [`Interp::cached_native`].
+#[derive(Clone, Copy)]
+enum NativeFn {
+    PromiseResolve,
+    PromiseReject,
+    PromiseThen,
+    ArrayPush,
+    ArrayJoin,
+}
+
 /// Native indices of the only constructor-shaped built-ins (`new Boolean`,
 /// `new Error`, and subclasses), mirroring `v12_engine::builtins`
 /// constants so `Construct` can route them through the shared registry.
@@ -398,6 +424,18 @@ pub struct Interp {
     /// whose `elements[0]` is `NATIVE_CONSOLE_LOG`, so `prepare_call` routes
     /// it through the `NativeRegistry`.
     console_log: Option<JsValue>,
+    /// Cached native function objects for the Promise surface and the array
+    /// `push`/`join` methods, synthesized lazily like `console_log` (see the
+    /// `get_property` fast paths).
+    promise_resolve_fn: Option<JsValue>,
+    promise_reject_fn: Option<JsValue>,
+    promise_then_fn: Option<JsValue>,
+    array_push_fn: Option<JsValue>,
+    array_join_fn: Option<JsValue>,
+    /// Completion value of the bottom frame when the dispatch loop ends.
+    ///
+    /// `run` ignores it; `call_object` reads it to return the callee's result.
+    top_result: Option<JsValue>,
 }
 
 impl Interp {
@@ -434,6 +472,12 @@ impl Interp {
             tier_up_pending: Vec::new(),
             global: None,
             console_log: None,
+            promise_resolve_fn: None,
+            promise_reject_fn: None,
+            promise_then_fn: None,
+            array_push_fn: None,
+            array_join_fn: None,
+            top_result: None,
         };
         interp.ensure_default_global();
         interp
@@ -495,6 +539,12 @@ impl Interp {
             tier_up_pending: Vec::new(),
             global,
             console_log: None,
+            promise_resolve_fn: None,
+            promise_reject_fn: None,
+            promise_then_fn: None,
+            array_push_fn: None,
+            array_join_fn: None,
+            top_result: None,
         };
         interp.ensure_default_global();
         interp
@@ -608,6 +658,63 @@ impl Interp {
         });
         self.note_entry(self.main);
         self.execute()
+    }
+
+    /// Calls a function by bytecode/native index from outside the machine.
+    ///
+    /// Host-driven activation seam (Promise reaction jobs, embedder calls):
+    /// synthesizes the callee object `prepare_call` expects — a
+    /// `KIND_FUNCTION` whose `elements[0]` selects the target, bytecode index
+    /// below `functions.len()` or native index above — then delegates to
+    /// [`Self::call_object`]. Must not be called while `run()` is active.
+    pub fn call_function(
+        &mut self,
+        fn_idx: u32,
+        this: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        self.gc_protect();
+        let callee = self.heap.alloc(JsObject {
+            kind: KIND_FUNCTION,
+            elements: vec![JsValue::from_i32_smi(fn_idx as i32)
+                .expect("function index fits Smi")],
+            ..JsObject::default()
+        });
+        self.call_object(callee, this, args)
+    }
+
+    /// Calls an existing function object from outside the machine.
+    ///
+    /// Going through `prepare_call` (rather than pushing a frame by hand)
+    /// preserves closure environment capture and native routing; the captured
+    /// environment of a closure lives in the function object's `prototype`
+    /// slot. Requires an empty frame stack — jobs run between `run()`
+    /// activations, never inside one.
+    pub fn call_object(
+        &mut self,
+        callee: Handle<JsObject>,
+        this: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        debug_assert!(self.frames.is_empty(), "call_object must run outside of run()");
+        // Lay out `[callee][this][args…]` exactly as a parked `Call` would.
+        self.stack.clear();
+        self.stack.push(JsValue::object(callee));
+        self.stack.push(this);
+        self.stack.extend_from_slice(args);
+        let caller_max_regs =
+            u16::try_from(self.stack.len()).expect("arguments fit a frame window");
+        let argc = u16::try_from(args.len()).expect("argument count fits u16");
+        self.top_result = None;
+        match self.prepare_call(0, caller_max_regs, 0, argc)? {
+            CallOutcome::Pushed => {
+                self.execute()?;
+                self.top_result.take().ok_or_else(|| {
+                    JSException(self.error_value("InternalError: call completed without a result"))
+                })
+            }
+            CallOutcome::Value(v) => Ok(v),
+        }
     }
 
     /// Applies ES `ToString` from outside the machine — diagnostics and test
@@ -1424,6 +1531,9 @@ impl Interp {
         self.notify_tier_ups();
         let Some(caller) = self.frames.last_mut() else {
             self.stack.truncate(finished.base);
+            // Record the bottom frame's completion value for `call_object`;
+            // `run` ignores it.
+            self.top_result = Some(result);
             return Ok(true);
         };
         // The caller is parked on its Call/Construct header — narrow, the
@@ -1683,6 +1793,54 @@ impl Interp {
         value
     }
 
+    /// Compares a key value's string text against `text` (flattening first).
+    fn key_is(&mut self, key_v: JsValue, text: &str) -> bool {
+        let Some(handle) = key_v.as_string() else {
+            return false;
+        };
+        self.heap.flatten(handle);
+        match &self.heap.get(handle).storage {
+            v12_heap::StrStorage::Latin1(bytes) => bytes == text.as_bytes(),
+            v12_heap::StrStorage::Utf16(units) => {
+                units.iter().copied().eq(text.encode_utf16())
+            }
+            _ => false,
+        }
+    }
+
+    /// Which lazily-synthesized native function object to produce.
+    ///
+    /// Grouped so the synthesis body is written once; `console_log_fn`
+    /// predates it and keeps its own copy.
+    fn cached_native(&mut self, which: NativeFn) -> JsValue {
+        let (index, cached) = match which {
+            NativeFn::PromiseResolve => (NATIVE_PROMISE_RESOLVE, self.promise_resolve_fn),
+            NativeFn::PromiseReject => (NATIVE_PROMISE_REJECT, self.promise_reject_fn),
+            NativeFn::PromiseThen => (NATIVE_PROMISE_THEN, self.promise_then_fn),
+            NativeFn::ArrayPush => (NATIVE_ARRAY_PUSH, self.array_push_fn),
+            NativeFn::ArrayJoin => (NATIVE_ARRAY_JOIN, self.array_join_fn),
+        };
+        if let Some(cached) = cached {
+            return cached;
+        }
+        self.gc_protect();
+        let func = self.heap.alloc(JsObject {
+            kind: KIND_FUNCTION,
+            elements: vec![JsValue::from_i32_smi(index as i32).expect("native index fits Smi")],
+            ..JsObject::default()
+        });
+        let value = JsValue::object(func);
+        self.heap.add_root(value);
+        match which {
+            NativeFn::PromiseResolve => self.promise_resolve_fn = Some(value),
+            NativeFn::PromiseReject => self.promise_reject_fn = Some(value),
+            NativeFn::PromiseThen => self.promise_then_fn = Some(value),
+            NativeFn::ArrayPush => self.array_push_fn = Some(value),
+            NativeFn::ArrayJoin => self.array_join_fn = Some(value),
+        }
+        value
+    }
+
     fn get_property(
         &mut self,
         site_fn: u32,
@@ -1726,6 +1884,46 @@ impl Interp {
             };
             if is_log {
                 return Ok(self.console_log_fn());
+            }
+        }
+
+        // Fast paths for the Promise surface and the array `push`/`join`
+        // methods, mirroring the `console.log` synthesis above. Natives cannot
+        // attach shape-bound properties (shape binding is interpreter state),
+        // so these reads are recognized structurally:
+        // - `Promise.resolve` / `Promise.reject` on the Promise constructor
+        //   (intrinsic slot 10 of the duplicated `GLOBAL_INTRINSIC_NAMES`).
+        // - `then` on any object whose prototype is the Promise constructor's
+        //   `prototype` link — the realm installs that link, and the engine's
+        //   promise built-ins give every promise instance the same prototype.
+        // - `push` / `join` on array-kind objects.
+        if let Some(g) = self.global {
+            let promise_ctor = {
+                let heap = &self.heap;
+                heap.get(g).properties.get(10).and_then(|v| v.as_object())
+            };
+            if let Some(promise_ctor) = promise_ctor {
+                if obj == promise_ctor {
+                    if self.key_is(key_v, "resolve") {
+                        return Ok(self.cached_native(NativeFn::PromiseResolve));
+                    }
+                    if self.key_is(key_v, "reject") {
+                        return Ok(self.cached_native(NativeFn::PromiseReject));
+                    }
+                } else if self.key_is(key_v, "then")
+                    && self.heap.get(obj).prototype.is_some()
+                    && self.heap.get(obj).prototype == self.heap.get(promise_ctor).prototype
+                {
+                    return Ok(self.cached_native(NativeFn::PromiseThen));
+                }
+            }
+        }
+        if self.heap.get(obj).kind == KIND_ARRAY {
+            if self.key_is(key_v, "push") {
+                return Ok(self.cached_native(NativeFn::ArrayPush));
+            }
+            if self.key_is(key_v, "join") {
+                return Ok(self.cached_native(NativeFn::ArrayJoin));
             }
         }
 
