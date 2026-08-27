@@ -9,6 +9,7 @@ license.workspace = true
 v12-bytecode.workspace = true
 v12-heap.workspace = true
 v12-interp.workspace = true
+v12-jit-baseline.workspace = true
 cranelift-frontend = { workspace = true, optional = true }
 cranelift-codegen = { workspace = true, optional = true }
 cranelift-module = { workspace = true, optional = true }

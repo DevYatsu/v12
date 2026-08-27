@@ -2197,6 +2197,7 @@ dependencies = [
  "v12-bytecode",
  "v12-heap",
  "v12-interp",
+ "v12-jit-baseline",
 ]
 
 [[package]]
