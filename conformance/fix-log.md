@@ -24,7 +24,23 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-08-27 — `$262` host shim wired; async skip kept (gate failed)
+
+- **Filter:** `language/expressions` (11 190 files, 8 jobs)
+- **Before:** 2 094 pass / 6 844 fail / 2 252 skip, 23.4 % pass
+- **After:**  2 094 pass / 6 861 fail / 2 235 skip, 23.4 % pass
+- **Delta:** 0 pass, +17 fail, −17 skip — 17 previously-skipped `$262` tests (incl. the 26-file annexB slice: 17 skip → 17 fail) became executable; all 17 fail on real engine gaps, which is the honest outcome. annexB mini-bucket re-score: 11.1 % → 3.8 % (denominator grew by 17).
+- **Engine change:** none — harness-only change. `TEST262_HOST_SHIM` preamble defines `print` + `$262` (`createRealm`/`detachArrayBuffer`/`getReport`/`destroy`/`gc`/`global`) captured into `globalThis.__test262Prints`; skips narrowed to `createRealm(`, `$262.agent`, async-flagged, and `$DONE(` tests.
+- **Gate result (plan Task 6 Step 3): FAILED.** Self-test `async_doneprint_test_completes_via_captured_print` proves a resolved `Promise.then` continuation does NOT execute via `run_jobs()` — `engine.eval` throws on `Promise.resolve()` itself (`Promise` is only an intrinsic name, no constructor). Evidence kept as an `#[ignore]`d test in `runner.rs`. Async skips stay honest: "async harness not yet implemented". Full async verdict path NOT implemented (would convert ~4.9k skips into guaranteed failures).
+- **Files:** `conformance/harness/src/runner.rs` (shim constant, `skip_reason_for`, combined-source preamble), `conformance/known-failures.md`, `conformance/fix-log.md`
+- **Bucket:** `known-failures.md` C — partially closed ($262 half); async half blocked on Promise reaction jobs
+- **Runner:** `cargo run --release -p test262-runner -- --filter language/expressions --jobs 8`
+- **Notes:**
+  - `cargo nextest run -p test262-runner` 37/37 pass, 1 ignored (the gate test).
+  - Engine follow-up needed: Promise constructor + `PerformPromiseThen` reaction jobs enqueued on `run_jobs()`; re-enable the gate test, then wire the async verdict path.
+
 ### 2026-08-27 — Switch duplicate-`default` panic → SyntaxError
+
 
 - **Filter:** `language` (24 873 files, 8 jobs)
 - **Before:** 4 957 pass / 14 955 fail / 4 961 skip, 24.9 % pass (1 × `engine panic`)

@@ -32,12 +32,14 @@ This file is the fix-it queue. Each bullet is a bucket — a single engine gap t
 - **Symptom:** was a panic at collect.rs:706 (`attempt to add with overflow`, caught as engine panic); since `262aed8` it is a clean compile error, but the index counters still saturate on large files.
 - **Fix location:** widen counters, dedupe constants in plans, or spill to a second plan segment. Zero panics now, so this is purely a capacity fix.
 
-### C. Async harness + `$262` skips — 4 961 skips (all remaining skips)
+### C. Async harness + `$262` skips — 4 944 skips remaining
 
 - **Counts at f47ec78:** async harness 4 883 (`expressions`+`statements`, mostly generators/async), `$262` host object 78 (annexB/eval-code).
-- **Fix order:**
-  1. `$262` host stub (`$262.createRealm`, `detachArrayBuffer`, `getReport`) — unblocks the 78.
-  2. Async `done` via print-watched job queue (`doneprintHandle.js` prints `Test262:AsyncTestComplete`) — adds ~4.9k executable tests without hurting pass%.
+- **Progress (2026-08-27, this commit):** the `$262` host shim landed — tests using `$262.global`/`detachArrayBuffer`/`gc`/`getReport` now run. Skips narrowed from 4 961; remaining skips are only `createRealm(` (multi-realm), `$262.agent`, and async-flagged/`$DONE` tests.
+- **Blocked on engine, not harness:** the async verdict path is gated behind a failing self-test — `Promise.resolve().then(...)` never executes (Promise reaction jobs are not scheduled through `run_jobs()`; `Promise` exists only as an intrinsic name). Self-test kept `#[ignore]`d in `runner.rs` as evidence (`async_doneprint_test_completes_via_captured_print`). Do not narrow the async skip until it passes.
+- **Fix order (remaining):**
+  1. Engine: wire Promise reaction jobs into the job queue (`Promise` intrinsics only exist as names today).
+  2. Then the async `done` print-watched verdict (`doneprintHandle.js` prints `Test262:AsyncTestComplete` → re-read captured `__test262Prints` array) — adds ~4.9k executable tests without hurting pass%.
 - **Note:** Skips do not count toward the `pass%` denominator, so wiring them does not hurt the percentage — it only adds executable tests that must then pass.
 
 ## Done (moved out of the queue)

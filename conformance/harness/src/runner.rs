@@ -23,6 +23,24 @@ const MAX_COMBINED_SOURCE_LEN: usize = 2_000_000;
 /// preemption is attempted.
 const TEST_TIMEOUT_MS: u128 = 5_000;
 
+/// JS preamble defining the `print` sink and the `$262` host object that
+/// Test262 harness files expect. Output is captured in a global array that
+/// the runner can re-read with a second `engine.eval` on the same engine;
+/// nothing touches process stdout (the runner is parallel).
+const TEST262_HOST_SHIM: &str = r#"
+globalThis.__test262Prints = [];
+function __consolePrintHandle__(s) { globalThis.__test262Prints.push(String(s)); }
+function print(s) { globalThis.__test262Prints.push(String(s)); }
+var $262 = {
+    createRealm: function () { throw new Error('$262.createRealm: not implemented'); },
+    detachArrayBuffer: function (b) { return b; },
+    getReport: function () { return null; },
+    destroy: function () {},
+    gc: function () {},
+    global: globalThis,
+};
+"#;
+
 /// Outcome status for a single test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -234,6 +252,11 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
         combined.push_str("\"use strict\";\n");
     }
 
+    // $262 host shim: goes after the strict directive, before harness
+    // includes, so Test262 harness files and test bodies can reference it.
+    combined.push_str(TEST262_HOST_SHIM);
+    combined.push('\n');
+
     combined.push_str(&harness_source);
     if !harness_source.is_empty() && !harness_source.ends_with('\n') {
         combined.push('\n');
@@ -322,24 +345,25 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     if fm.has_flag("async") {
         return Some("async harness not yet implemented".to_string());
     }
-    // Host-dependent tests that require the `$262` test262 host object.
-    // v12 does not yet expose `$262` (createRealm, etc.).
-    if source.contains("$262") {
-        return Some("requires $262 host object".to_string());
+    // Multi-realm and agent API remain unsupported: tests that actually call
+    // them would fail, so keep an honest skip instead of a guaranteed red.
+    if source.contains("createRealm(") {
+        return Some("requires $262.createRealm (multi-realm)".to_string());
     }
-    // Heuristic: async tests that call $DONE without the async flag (older
-    // style) — treat as async skip as well.
-    if source.contains("$DONE")
-        && (source.contains("async") || fm.includes.iter().any(|i| i.contains("doneprint")))
-    {
-        // But only if the source looks like an async test (calls $DONE).
-        // We do not want to skip sync tests that merely mention $DONE in
-        // a comment. Check for `$DONE(` call form.
-        if source.contains("$DONE(") {
-            return Some("async harness not yet implemented ($DONE)".to_string());
-        }
+    if source.contains("agent.") || source.contains("$262.agent") {
+        return Some("requires $262.agent (worker/Atomics harness)".to_string());
     }
-    // Generated flag is informational only — not a skip.
+    // Async tests that call $DONE without the async flag (older style) —
+    // the async verdict path is not implemented yet (Promise reaction jobs
+    // are not scheduled by run_jobs), so keep the honest skip.
+    if source.contains("$DONE(") {
+        return Some("async harness not yet implemented ($DONE)".to_string());
+    }
+    // Other `$262` uses (`$262.global`, `detachArrayBuffer`, `gc`,
+    // `getReport`) now run via the TEST262_HOST_SHIM preamble. The `async`
+    // flag is handled at the verdict, not as a skip — once the async verdict
+    // lands.
+    let _ = &fm;
     None
 }
 
@@ -791,6 +815,31 @@ mod tests {
         assert_eq!(suite_for("built-ins/Array/a.js"), "built-ins/Array");
         assert_eq!(suite_for("intl402/a.js"), "intl402");
         assert_eq!(suite_for("annexB/a.js"), "annexB");
+    }
+
+    // GATE (plan Task 6 Step 3): FAILS — `Promise.resolve()` throws at eval,
+    // so Promise reaction jobs are not scheduled through `run_jobs()`.
+    // Kept `#[ignore]`d as recorded evidence; re-enable when the engine
+    // resolves thenables via the job queue, then narrow the async skip.
+    #[test]
+    #[ignore = "Promise reaction jobs not wired: Promise.resolve().then(...) never runs (engine gap, see known-failures.md)"]
+    fn async_doneprint_test_completes_via_captured_print() {
+        // Arrange: a tiny async-shaped source; the real doneprintHandle.js
+        // semantics are `$DONE()` → prints Test262:AsyncTestComplete.
+        let src = "globalThis.__test262Prints = [];\n\
+                   function print(s) { globalThis.__test262Prints.push(String(s)); }\n\
+                   Promise.resolve().then(function () { print('Test262:AsyncTestComplete'); });";
+        let mut engine = v12_engine::Engine::new();
+        engine.eval(src).expect("eval");
+        engine.run_jobs();
+        let printed = engine
+            .eval("globalThis.__test262Prints.join('\\n')")
+            .map(|v| engine.to_display_string(v))
+            .unwrap_or_default();
+        assert!(
+            printed.contains("Test262:AsyncTestComplete"),
+            "printed: {printed:?}"
+        );
     }
 
     #[test]
