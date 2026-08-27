@@ -60,6 +60,7 @@ v12-jit-opt = { path = "crates/v12-jit-opt" }
 v12-regex = { path = "crates/v12-regex" }
 v12-intl = { path = "crates/v12-intl" }
 v12-engine = { path = "crates/v12-engine" }
+test-support = { path = "crates/test-support" }
 
 [profile.release]
 opt-level = 3

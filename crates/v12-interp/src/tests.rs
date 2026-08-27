@@ -1,41 +1,26 @@
 //! Focused unit tests over hand-built bytecode: the wide-operand encodings,
 //! handler delivery depth, the call-depth guard, the native seam, and
 //! fall-off-the-end completion. The differential suite in
-//! `tests/differential.rs` covers compiled Tier-1 programs end to end.
+//! `tests/differential.rs` covers compiled Tier-1 programs end to end
+//! (added in Task 4 of the test-coverage plan; it will not exist until that
+//! task lands — until then this pointer is forward-looking).
 
 use v12_bytecode::{Const, ConstantPool, FunctionBytecode, HandlerRange, Instr, Opcode, WideOp};
 use v12_heap::{Heap, JsValue};
 
+use test_support::*;
 use crate::{Interp, JSException, NativeRegistry};
 
+// NOTE: `expect_throw` cannot live in `test-support`: in a dev-dependency
+// cycle, `test-support` links a *separate compilation* of `v12-interp`'s lib,
+// so its `Interp`/`JSException` types are distinct from the ones in this test
+// unit. It only crosses the boundary via `v12_heap::JsValue` (unified), which
+// is why `eval_thrown` and `fn_with_instrs` can be shared.
 /// Runs `interp`, expecting an uncaught throw; returns the thrown value.
 fn expect_throw(interp: &mut Interp) -> JsValue {
     match interp.run() {
         Err(JSException(v)) => v,
         Ok(()) => panic!("expected an uncaught exception"),
-    }
-}
-
-/// Compiles + runs `src` (via `throw` completion) returning the thrown value.
-fn eval_thrown(src: &str) -> JsValue {
-    let mut interp = Interp::from_source(src).expect("compile");
-    expect_throw(&mut interp)
-}
-
-fn empty_fn(max_regs: u16, instrs: Vec<Instr>, consts: ConstantPool) -> FunctionBytecode {
-    let spans = vec![(0, 0); instrs.len()];
-    FunctionBytecode {
-        name_hint: None,
-        max_regs,
-        instrs,
-        consts,
-        handlers: Vec::new(),
-        spans,
-        pc_map: Vec::new(),
-        is_strict: false,
-        fixed_params: 0,
-        has_rest: false,
-        rest_reg: 0,
     }
 }
 
@@ -76,7 +61,7 @@ fn wide_operands_execute_with_documented_layouts() {
     instrs.push(Instr::new(Opcode::Add, 4, 1, 3));
     instrs.push(Instr::new(Opcode::Throw, 4, 0, 0));
 
-    let mut interp = program_of(empty_fn(5, instrs, pool));
+    let mut interp = program_of(fn_with_instrs(5, instrs, pool));
     let thrown = expect_throw(&mut interp);
     assert_eq!(thrown.as_smi(), Some(1300));
 }
@@ -89,7 +74,7 @@ fn handler_delivery_lands_in_register_stack_depth() {
         Instr::new(Opcode::Throw, 0, 0, 0),  // pc 0
         Instr::new(Opcode::Return, 0, 0, 0), // pc 1: handler target
     ];
-    let mut fb = empty_fn(1, instrs, ConstantPool::new());
+    let mut fb = fn_with_instrs(1, instrs, ConstantPool::new());
     fb.handlers.push(HandlerRange {
         start: 0,
         end: 1,
@@ -320,7 +305,7 @@ fn in_operator_non_object_rhs_throws() {
 #[test]
 fn in_operator_heap_prototype_chain() {
     // Parent has "inheritedKey", child prototypes parent: `inheritedKey in child` true.
-    let mut interp = program_of(empty_fn(
+    let mut interp = program_of(fn_with_instrs(
         2,
         vec![Instr::new(Opcode::Return, 0, 0, 0)],
         ConstantPool::new(),
@@ -409,7 +394,7 @@ fn instanceof_plain_objects_false() {
 #[test]
 fn instanceof_prototype_chain_via_heap() {
     // Instance's prototype chain contains Ctor.prototype => true.
-    let mut interp = program_of(empty_fn(
+    let mut interp = program_of(fn_with_instrs(
         2,
         vec![Instr::new(Opcode::Return, 0, 0, 0)],
         ConstantPool::new(),
@@ -725,7 +710,7 @@ fn null_via_load_const_wide_evaluates_to_js_null() {
     }
     .encode();
     instrs.push(Instr::new(Opcode::Throw, 0, 0, 0));
-    let fb = empty_fn(1, instrs, pool);
+    let fb = fn_with_instrs(1, instrs, pool);
     let mut interp = program_of(fb);
     let v = expect_throw(&mut interp);
     assert!(v.is_null(), "wide null must still be JsValue::null()");

@@ -8,3 +8,5 @@ description = "Shared dev-only test harness: mini reference interpreter + eval m
 [dependencies]
 v12-bytecode = { workspace = true }
 v12-bccompiler = { workspace = true }
+v12-heap = { workspace = true }
+v12-interp = { workspace = true }

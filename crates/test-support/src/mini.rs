@@ -666,6 +666,28 @@ pub fn value_to_string(v: &Val) -> String {
     to_string(v)
 }
 
+/// A `FunctionBytecode` wrapping exactly `instrs` with an empty span table.
+pub fn fn_with_instrs(
+    max_regs: u16,
+    instrs: Vec<v12_bytecode::Instr>,
+    consts: v12_bytecode::ConstantPool,
+) -> v12_bytecode::FunctionBytecode {
+    let spans = vec![(0, 0); instrs.len()];
+    v12_bytecode::FunctionBytecode {
+        name_hint: None,
+        max_regs,
+        instrs,
+        consts,
+        handlers: Vec::new(),
+        spans,
+        pc_map: Vec::new(),
+        is_strict: false,
+        fixed_params: 0,
+        has_rest: false,
+        rest_reg: 0,
+    }
+}
+
 #[cfg(test)]
 mod self_tests {
     use super::*;

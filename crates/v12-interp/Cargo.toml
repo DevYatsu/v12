@@ -14,5 +14,6 @@ v12-heap.workspace = true
 v12-bccompiler.workspace = true
 
 [dev-dependencies]
+test-support.workspace = true
 # Property tests for the per-opcode type-feedback lattice (see feedback.rs).
 proptest = "1"
