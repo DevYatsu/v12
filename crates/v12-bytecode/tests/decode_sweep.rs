@@ -232,6 +232,27 @@ fn structured_wide_op_roundtrip_and_truncation_fuzz() {
     }
 }
 
+/// Bidirectional drift guard for the hardcoded inventory: every discriminant
+/// the enum actually assigns must be listed, and every listed discriminant
+/// must actually be assigned. Catches renumberings that keep the count
+/// constant — which the exhaustive sweep alone would miss.
+#[test]
+fn known_discriminants_exactly_match_opcode_enum() {
+    for d in 0u8..=255 {
+        let assigned = Instr((u32::from(d) << 24)).op().is_some();
+        let listed = KNOWN_DISCRIMINANTS.contains(&d);
+        assert_eq!(
+            assigned, listed,
+            "discriminant {d}: enum says assigned={assigned}, KNOWN_DISCRIMINANTS says listed={listed}"
+        );
+    }
+    assert_eq!(
+        KNOWN_DISCRIMINANTS.len(),
+        EXPECTED_OPCODE_COUNT,
+        "list length drifted from EXPECTED_OPCODE_COUNT"
+    );
+}
+
 /// Unknown discriminants on a real Wide header produce the documented
 /// "unknown discriminant" diagnostic.
 #[test]
