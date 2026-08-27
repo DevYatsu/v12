@@ -42,14 +42,11 @@ This file is the fix-it queue. Each bullet is a bucket — a single engine gap t
   2. Then the async `done` print-watched verdict (`doneprintHandle.js` prints `Test262:AsyncTestComplete` → re-read captured `__test262Prints` array) — adds ~4.9k executable tests without hurting pass%.
 - **Note:** Skips do not count toward the `pass%` denominator, so wiring them does not hurt the percentage — it only adds executable tests that must then pass.
 
-### E. Loose equality lacks number↔string coercion — found by the new differential suite (e4902d4)
-
-- **Symptom:** `1 == '1'` → `false` (should be `true`); `0 == '0'` → `false`. Strict equality and same-type `==` are correct.
-- **Root cause:** `loose_equals` (crates/v12-interp/src/ops.rs:300) is missing the number↔string coercion arm of ES 7.2.14 (compare `ToNumber(string)` with the number).
-- **Reproducing filter:** `cargo nextest run -p v12-interp --test differential --  known_gap_loose_equals_number_string_coercion --include-ignored`.
-- **Fix location:** crates/v12-interp/src/ops.rs:300 — add the ToNumber(string) arm; un-ignore the pinned test after fixing.
-
 ## Done (moved out of the queue)
+
+### D5. ~~Loose equality number↔string coercion~~ — **closed** (found by the differential suite, e4902d4)
+
+- `loose_equals` (crates/v12-interp/src/ops.rs) was missing the number↔string arm of ES 7.2.14 (`1 == '1'` → `false`). Fixed: number↔string compares `ToNumber(string)` with the number, and boolean operands are coerced via ToNumber then re-dispatched (the old bool arm also panicked on bool↔number). Pinned differential test `known_gap_loose_equals_number_string_coercion` un-ignored and green.
 
 ### D1. ~~`in` / `instanceof` opcodes~~ — **closed** (262aed8 → verified f47ec78)
 

@@ -118,12 +118,11 @@ fn mini_and_real_agree_on_corpus() {
     assert!(failures.is_empty(), "{} disagreement(s):\n{}", failures.len(), failures.join("\n"));
 }
 
-/// Known engine gap, kept as an explicit ignored case (never deleted):
-/// `loose_equals` (v12-interp/src/ops.rs) lacks the number↔string coercion
-/// arm of ES 7.2.14, so `1 == '1'` yields `false` on the real interp while
-/// the mini reference interpreter returns `true`. Un-ignore once fixed.
+/// Gap, fixed: `loose_equals` (v12-interp/src/ops.rs) lacked the number↔string
+/// coercion arm of ES 7.2.14, so `1 == '1'` yielded `false` on the real interp
+/// while the mini reference interpreter returned `true`. Kept as a regression
+/// case after the fix.
 #[test]
-#[ignore = "engine gap: loose_equals lacks number<->string coercion (ES 7.2.14)"]
 fn known_gap_loose_equals_number_string_coercion() {
     assert_want("return 1 == '1';", &Want::Bool(true));
     assert_want("return '1' == 1;", &Want::Bool(true));

@@ -293,10 +293,10 @@ pub(crate) fn strict_equals(heap: &Heap, a: JsValue, b: JsValue) -> bool {
     a.bits() == b.bits() && (a.is_undefined() || a.is_null())
 }
 
-/// ES IsLooseEqual restricted to the cases reachable without ToPrimitive:
-/// the null/undefined pair, number↔string numeric comparison, booleans
-/// coerced to numbers first, and same-type strict comparison otherwise.
-/// Object↔non-object is false — no user-defined conversion exists yet.
+/// ES IsLooseEqual (7.2.14) restricted to the cases reachable without
+/// ToPrimitive: the null/undefined pair, boolean operands coerced to numbers
+/// first, number↔string numeric comparison, and same-type comparison
+/// otherwise. Object↔non-object is false — no user-defined conversion exists.
 pub(crate) fn loose_equals(heap: &mut Heap, a: JsValue, b: JsValue) -> bool {
     if a.is_null() || a.is_undefined() {
         return b.is_null() || b.is_undefined();
@@ -304,33 +304,36 @@ pub(crate) fn loose_equals(heap: &mut Heap, a: JsValue, b: JsValue) -> bool {
     if b.is_null() || b.is_undefined() {
         return false;
     }
-    if let (Some(x), Some(y)) = (num_of(a), num_of(b)) {
+    // ES 7.2.14 step 3: a boolean operand becomes a number, then the
+    // comparison re-dispatches through the remaining arms.
+    if a.as_bool().is_some() || b.as_bool().is_some() {
+        let na = to_number(heap, a);
+        let nb = to_number(heap, b);
+        return loose_equals(heap, JsValue::from_f64(na), JsValue::from_f64(nb));
+    }
+    let (a_num, b_num) = (num_of(a), num_of(b));
+    if let (Some(x), Some(y)) = (a_num, b_num) {
         return x == y;
     }
-    let a_str = a.is_string();
-    let b_str = b.is_string();
-    if a_str != b_str {
-        // One side is a string, the other a non-string non-number reference:
-        // only the boolean arm can proceed (booleans were not caught above).
-        let (num_side, other) = if a_str { (b, a) } else { (a, b) };
-        if let Some(bool_val) = other.as_bool() {
-            return to_number(heap, JsValue::from_f64(if bool_val { 1.0 } else { 0.0 }))
-                == to_number(heap, num_side);
+    // ES 7.2.14 step 4: number vs string compares ToNumber(string) with the
+    // number (a string that does not parse yields NaN, which equals nothing).
+    if let Some(x) = a_num {
+        if b.is_string() {
+            return x == to_number(heap, b);
         }
-        return false;
     }
-    if a_str {
+    if let Some(y) = b_num {
+        if a.is_string() {
+            return y == to_number(heap, a);
+        }
+    }
+    if a.is_string() && b.is_string() {
         // Both strings: textual comparison.
         let (x, y) = (
             a.as_string().expect("string"),
             b.as_string().expect("string"),
         );
         return heap.strings_equal(x, y);
-    }
-    if a.as_bool().is_some() || b.as_bool().is_some() {
-        let na = f64::from(u8::from(a.as_bool().expect("bool arm")));
-        let nb = f64::from(u8::from(b.as_bool().expect("bool arm")));
-        return na == nb;
     }
     if a.is_object() && b.is_object() {
         return strict_equals(heap, a, b);

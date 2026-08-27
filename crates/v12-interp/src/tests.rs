@@ -730,6 +730,36 @@ fn null_identity_and_strict_equality() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn loose_equality_number_string_and_boolean_coercion() {
+    // ES 7.2.14 steps 3-4: boolean operands coerce to numbers, and a number
+    // equals a string whose ToNumber matches.
+    const CASES: &[(&str, bool)] = &[
+        ("1 == '1'", true),
+        ("'1' == 1", true),
+        ("0 == '0'", true),
+        ("'' == 0", true),
+        ("'2' == 2", true),
+        ("'3' == 3", true),
+        ("NaN == 'NaN'", false),
+        ("'abc' == 1", false),
+        ("1 == true", true),
+        ("0 == false", true),
+        ("2 == true", false),
+        ("true == 1", true),
+        ("false == 0", true),
+        ("true == '1'", true),
+        ("1 == 1.0", true),
+        ("1 == '1' && 1 === 1 && 1 !== '1'", true),
+        ("'a' == 'a'", true),
+        ("'a' == 'b'", false),
+    ];
+    for (src, want) in CASES {
+        let mut interp = Interp::from_source(&format!("throw ({src});")).expect("compiles");
+        assert_eq!(expect_throw(&mut interp).as_bool(), Some(*want), "{src}");
+    }
+}
+
+#[test]
 fn destructuring_object_rest_via_interp() {
     let mut interp =
         Interp::from_source("let {a, ...rest} = {a:1, b:2, c:3}; throw rest.b + rest.c;")
