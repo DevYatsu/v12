@@ -1137,6 +1137,12 @@ impl Interp {
                     let obj_v = self.stack[base + usize::from(ra)];
                     let key_v = self.stack[base + usize::from(rb)];
                     let value = self.stack[base + usize::from(rc)];
+                    // Guard: null/undefined base throws TypeError per ES 9.1.9 / 13.14.3.
+                    if obj_v.is_null() || obj_v.is_undefined() {
+                        return Err(JSException(self.error_value(
+                            "TypeError: cannot set properties of null or undefined",
+                        )));
+                    }
                     self.gc_protect();
                     attempt!(self.set_property(obj_v, key_v, value));
                     self.set_pc(pc + op_width);
@@ -1278,6 +1284,15 @@ impl Interp {
                     let src = instr.a();
                     let const_id = u32::from(narrow.imm16());
                     let val = self.stack[base + usize::from(src)];
+                    // Guard: global base must be an object (invariant; defensive).
+                    if let Some(global) = self.global {
+                        let global_v = JsValue::object(global);
+                        if global_v.is_null() || global_v.is_undefined() {
+                            return Err(JSException(self.error_value(
+                                "TypeError: cannot set properties of null or undefined",
+                            )));
+                        }
+                    }
                     attempt!(self.op_set_global(const_id, val));
                     self.set_pc(pc + op_width);
                 }
