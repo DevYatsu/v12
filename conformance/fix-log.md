@@ -24,6 +24,22 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-08-27 — SSA optimizer Phase 2 + GC root fix re-score
+
+- **Filter:** `language` (24 873 files, 8 jobs) and `language/expressions/assignment` (818 files, 4 jobs)
+- **Before (previous run):** 4 889 pass / 19 984 fail (est.) / 24.6 % pass on `language`; assignment slice 401 / 409 / 8 skip, 49.5 %
+- **After (full language):** 4 940 pass / 14 972 fail / 4 961 skip, **24.8 %** pass
+- **After (assignment slice):** 411 pass / 405 fail / 2 skip, **50.4 %** pass — delta vs baseline **+10 pass, −0 fail net of 6 un-skipped, +0.85 pts**
+- **Delta:** +51 pass vs previous run (+428 vs bootstrap), −290 "fail" is restated panics→clean compile errors, skips 5 679 → 4 961 (−718)
+- **Engine change:** f47ec78 — Tier-2 SSA+inlining+loop versioning behind guards (fail-closed, no conformance flip by itself), GC root fix. Credit also to earlier `262aed8`–`0466cb5` (in/instanceof opcodes, overflow path, eval/accessors, destructuring/rest/spread/modules/generators, ESM loader)
+- **Files:** crates/v12-jit-opt/*, crates/v12-engine/src/gc.rs, crates/v12-bccompiler/*
+- **Bucket:** #2 (`collect.rs` overflow panic) — **closed**: zero `engine panic` results; overflow now surfaces as clean compile error. #1 (`in`/`instanceof`) — **closed** (zero opcode/unbound errors). #3 (globals) — **closed**. #4 — **shrank**: module skips 721 → 0
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8` / `--filter language/expressions/assignment --jobs 4`
+- **Notes:**
+  - Top failures on `language`: `threw: unsupported expression` ×12 625, `threw: too many functions/constants` ×1 303, `unsupported statement` ×296, `TypeError: callee is not a function` ×256, `export/import statements only valid in modules` ×214, `object methods / accessors are not supported` ×56.
+  - Per-suite movers vs bootstrap: `module-code` 43 % (was ~all-skip), `import` 24 pass (was skip-stub), `keywords` 100 %, `punctuators` 90.9 %, `future-reserved-words` 89.1 %; no suite regressed below its bootstrap rate.
+  - Remaining skips: async harness 4 883 + `$262` host object 78. Next target: async job queue, then the new `unsupported expression` mega-bucket (split by expression kind).
+
 ### 2026-08-26 — Harness bootstrap (baseline)
 
 - **Filter:** `language` (24 873 files, 8 jobs) and `language/expressions/assignment` (818 files, 4 jobs)
