@@ -13,3 +13,6 @@ oxc_ast.workspace = true
 oxc_semantic.workspace = true
 oxc_span.workspace = true
 v12-bytecode.workspace = true
+
+[dev-dependencies]
+test-support.workspace = true
