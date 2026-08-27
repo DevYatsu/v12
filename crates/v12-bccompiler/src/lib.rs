@@ -16,25 +16,36 @@
 //!   "object"`), unary `-`/`!`/`~`, `++`/`--` (prefix & postfix), assignment
 //!   to locals, properties, and object members (including computed keys
 //!   `obj[expr]` and `{[expr]: value}` via `ToPropertyKey` + dynamic
-//!   `PropKey`); expression statements; `if`/`else`; `while`/`do-while`/
-//!   `for(;;)`; labeled `break`/`continue`; `return`; function
+//!   `PropKey`); logical assignment ops (`&&=`/`||=`/`??=`); expression
+//!   statements; `if`/`else`; `while`/`do-while`/`for(;;)`; `switch` with
+//!   fallthrough and labeled/unlabeled `break`; labeled
+//!   `break`/`continue`; `return`; function
 //!   declarations/expressions/arrows; plain + method calls; property get/set
-//!   by identifier/string keys; object/array literals; string concatenation
-//!   via `+`; `this`; `throw`/`try`/`catch`/`finally` via handler tables
-//!   with duplicated-completion dispatch; nested closures through static
-//!   capture analysis (`NewEnvironment`, `GetEnvSlot`, `SetEnvSlot`).
+//!   by identifier/string keys; object/array literals; object-literal method
+//!   shorthand (`{m() {…}}`); template literals with substitutions
+//!   (lowered to string concatenation); string concatenation
+//!   via `+`; `this`; constructor invocation `new F(args)` ([`Opcode::Construct`]
+//!   with real instance allocation, lazy `F.prototype` creation, and the
+//!   return-value override rule); optional chains `a?.b.c(x)` (whole-chain
+//!   short-circuit through one exit label); `throw`/`try`/`catch`/`finally`
+//!   via handler tables with duplicated-completion dispatch; nested closures
+//!   through static capture analysis (`NewEnvironment`, `GetEnvSlot`,
+//!   `SetEnvSlot`).
 //! - **Tier 2** — conditional `?:`, basic flat destructuring declarations
 //!   (`let {a, b} = …`, `let [a, b] = …` lowered to property loads).
 //!
 //! # Deviations / subset limits (all fail loudly as `CompileError`s)
 //!
-//! - `new Expr()` — no construct opcode exists in the ISA; rejected rather
-//!   than mis-encoded (documented ISA gap).
-//! - Unary `+` (no ToNumber opcode), spread, optional
-//!   chaining/calls, getters/setters/method
-//!   shorthand in object literals, BigInt/RegExp literals, template literals
-//!   with substitutions, classes, generators/async, `for-in`/`for-of`,
-//!   switch/with, `arguments`, `eval`.
+//! - Unary `+` (no ToNumber opcode), spread arguments in `new`
+//!   expressions, getters/setters in object literals, BigInt/RegExp literals,
+//!   classes, generators/async beyond stubs, `for-in` (needs a key-listing
+//!   builtin), `for-of` (needs `Symbol.iterator`), `with`, tagged templates,
+//!   dynamic `import()`.
+//! - Optional chains guard per link into one shared chain-exit; the spec's
+//!   full "delete this chain part" reference semantics are not modeled.
+//! - Logical assignment to member targets keeps the resolved `(obj, key)`
+//!   pair instead of re-evaluating the reference (unobservable without
+//!   accessors, which are rejected).
 //! - Unbound identifier reads are errors (no global object yet), except
 //!   `typeof undeclared` which correctly yields `"undefined"`.
 //! - Calls use the documented ABI: callee at `callee_reg`, `this` at

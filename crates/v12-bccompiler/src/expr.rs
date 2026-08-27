@@ -10,7 +10,7 @@ use oxc_ast::ast::{
     UnaryOperator, UpdateOperator,
 };
 use oxc_span::{GetSpan, Span};
-use v12_bytecode::{Const, Opcode};
+use v12_bytecode::{Const, Label, Opcode};
 
 use crate::model::{CALL_HEADER_REGS, CompileError, FnCtx, REG_THIS, VarAccess};
 
@@ -40,18 +40,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.load_str(dst, s.value.as_str(), s.span)?;
                 Ok(dst)
             }
-            Expression::TemplateLiteral(t) => {
-                if !t.expressions.is_empty() || t.quasis.len() != 1 {
-                    return Err(self.err(
-                        t.span,
-                        "template literals with substitutions are not supported",
-                    ));
-                }
-                let cooked = t.quasis[0].value.cooked.as_deref().unwrap_or_default();
-                let dst = self.new_temp();
-                self.load_str(dst, cooked, t.span)?;
-                Ok(dst)
-            }
+            Expression::TemplateLiteral(t) => self.template_literal(t),
             Expression::BigIntLiteral(b) => {
                 Err(self.err(b.span, "BigInt literals are not supported"))
             }
@@ -116,20 +105,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(dst)
             }
             Expression::CallExpression(c) => self.call(c),
+            Expression::ChainExpression(c) => self.chain_expr(c),
+            Expression::NewExpression(n) => self.new_expr(n),
             Expression::StaticMemberExpression(s) => {
-                if s.optional {
-                    return Err(self.err(s.span, "optional chaining is not supported"));
-                }
-                // Static member `obj.prop`: `obj` may be a global (`console`)
-                // via `GetGlobal` (PropKey/Spur), `prop` (`log`) is a string
-                // literal via `LoadConst` (Str32/ConstantPool). Even though both
+                // Standalone member `obj.prop` (chains route through
+                // `chain_expr`, wrapped by oxc `ChainExpression`). The base
+                // (`obj`) may be a global (`console`) via `GetGlobal`
+                // (PropKey/Spur), the property (`log`) is a string literal
+                // via `LoadConst` (Str32/ConstantPool). Even though both
                 // string ids originate from the same `Rodeo`, the immediates
-                // occupy distinct namespaces (string table vs pool index), so
-                // the `GetProperty` key must be `Str32("log")`, not the `Spur`
-                // for `"console"`.
+                // occupy distinct namespaces, so the `GetProperty` key must
+                // be `Str32("log")`, not the `Spur` for `"console"`.
                 let obj = self.expr(&s.object)?;
                 let key = self.new_temp();
                 self.load_str(key, s.property.name.as_str(), s.property.span)?;
+                if s.optional {
+                    return self.optional_deref(s.span, obj, key);
+                }
                 let dst = self.new_temp();
                 self.emit_spanned(
                     v12_bytecode::Instr::new(Opcode::GetProperty, dst, obj, key),
@@ -138,13 +130,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(dst)
             }
             Expression::ComputedMemberExpression(c) => {
-                if c.optional {
-                    return Err(self.err(c.span, "optional chaining is not supported"));
-                }
-                // Bucket 4: evaluate key expr into temp, then base (single temp
-                // for key). Runtime `GetProperty` does ToPropertyKey via `to_key`.
+                // Bucket 4: evaluate key expr into temp, then base. Runtime
+                // `GetProperty` does ToPropertyKey via `to_key`.
                 let key = self.expr(&c.expression)?;
                 let obj = self.expr(&c.object)?;
+                if c.optional {
+                    return self.optional_deref(c.span, obj, key);
+                }
                 let dst = self.new_temp();
                 self.emit_spanned(
                     v12_bytecode::Instr::new(Opcode::GetProperty, dst, obj, key),
@@ -190,7 +182,40 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_spanned(v12_bytecode::Instr::new(Opcode::Await, dst, arg, 0), a.span);
                 Ok(dst)
             }
-            other => Err(self.err(other.span(), "unsupported expression")),
+            Expression::ClassExpression(c) => {
+                let _ = c;
+                Err(self.err(e.span(), "class expressions are not supported"))
+            }
+            Expression::TaggedTemplateExpression(t) => {
+                Err(self.err(t.span, "tagged template literals are not supported"))
+            }
+            Expression::ImportExpression(i) => {
+                Err(self.err(i.span, "dynamic import() is not supported"))
+            }
+            Expression::Super(x) => Err(self.err(x.span, "`super` references are not supported")),
+            Expression::ImportMeta(x) => Err(self.err(x.span, "`import.meta` is not supported")),
+            Expression::NewTarget(x) => Err(self.err(x.span, "`new.target` is not supported")),
+            Expression::PrivateInExpression(x) => Err(self.err(
+                x.span,
+                "private field membership checks (`#field in obj`) are not supported",
+            )),
+            // TypeScript-only forms never reach here through `script()` /
+            // `mjs()` parsing; named rejection keeps direct AST callers safe.
+            Expression::TSAsExpression(_)
+            | Expression::TSSatisfiesExpression(_)
+            | Expression::TSTypeAssertion(_)
+            | Expression::TSNonNullExpression(_)
+            | Expression::TSInstantiationExpression(_) => Err(self.err(
+                e.span(),
+                "TypeScript assertion expressions are not supported",
+            )),
+            Expression::JSXElement(x) => Err(self.err(x.span, "JSX expressions are not supported")),
+            Expression::JSXFragment(x) => {
+                Err(self.err(x.span, "JSX expressions are not supported"))
+            }
+            Expression::V8IntrinsicExpression(x) => {
+                Err(self.err(x.span, "V8 intrinsic calls (`%name`) are not supported"))
+            }
         }
     }
 
@@ -307,8 +332,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     ArrayExpressionElement::SpreadElement(_) => unreachable!(),
                     ArrayExpressionElement::Elision(_) => self.load_undefined(slot, span),
                     _ => {
+                        // Non-spread, non-elision elements are always
+                        // expressions; the guard only protects against future
+                        // oxc variants.
                         let Some(x) = el.as_expression() else {
-                            return Err(self.err(el.span(), "unsupported array element"));
+                            return Err(self.err(el.span(), "array element must be an expression"));
                         };
                         self.expr_into(x, slot)?;
                     }
@@ -360,7 +388,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 }
                 _ => {
                     let Some(x) = el.as_expression() else {
-                        return Err(self.err(el.span(), "unsupported array element"));
+                        return Err(self.err(el.span(), "array element must be an expression"));
                     };
                     let val = self.expr(x)?;
                     let len_key = self.new_temp();
@@ -398,8 +426,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn object_prop(&mut self, obj: u8, p: &ObjectProperty<'_>) -> Res<()> {
-        if p.method || p.kind != oxc_ast::ast::PropertyKind::Init {
-            return Err(self.err(p.span, "object methods / accessors are not supported"));
+        // Getters/setters need accessor descriptors; shorthand methods are
+        // just function-valued properties and lower like any other value.
+        if p.kind != oxc_ast::ast::PropertyKind::Init {
+            return Err(self.err(p.span, "object accessors (get/set) are not supported"));
         }
         // Computed property keys (`{[expr]: value}`) evaluate the key
         // expression into a temp (ToPropertyKey via runtime `to_key`) and
@@ -416,7 +446,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         } else {
             self.property_key(&p.key)?
         };
-        let val = self.expr(&p.value)?;
+        // `{m(x){…}}` ≡ `{m: function m(x){…}}` — method shorthand reuses
+        // the function-expression closure path, so `this` flows through the
+        // standard call ABI when invoked as `obj.m(…)`.
+        let val = match &p.value {
+            Expression::FunctionExpression(f) if p.method => {
+                let r = self.new_temp();
+                self.closure_fn(r, f)?;
+                r
+            }
+            other => self.expr(other)?,
+        };
         self.emit_spanned(
             v12_bytecode::Instr::new(Opcode::SetProperty, obj, key, val),
             p.span,
@@ -621,7 +661,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             _ => {
                 let Some(m) = target.as_member_expression() else {
-                    return Err(self.err(span, "unsupported update target"));
+                    // The only remaining simple targets are TypeScript
+                    // assertion forms, which no runtime location can back.
+                    return Err(self.err(
+                        span,
+                        "TypeScript assertion expressions cannot be increment/decrement targets",
+                    ));
                 };
                 let (obj, key) = self.member_parts(m)?;
                 let old = self.new_temp();
@@ -666,7 +711,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             AssignmentOperator::LogicalAnd
             | AssignmentOperator::LogicalOr
             | AssignmentOperator::LogicalNullish => {
-                return Err(self.err(span, "logical assignment operators are not supported"));
+                return self.logical_assign(op, left, right, span);
             }
         };
 
@@ -722,7 +767,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             _ => {
                 let Some(m) = simple.as_member_expression() else {
-                    return Err(self.err(span, "unsupported assignment target"));
+                    // The only remaining simple targets are TypeScript
+                    // assertion forms, which no runtime location can back.
+                    return Err(self.err(
+                        span,
+                        "TypeScript assertion expressions cannot be assignment targets",
+                    ));
                 };
                 let (obj, key) = self.member_parts(m)?;
                 let value = match binop {
@@ -787,8 +837,494 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
     }
 
+    // -- template literals ------------------------------------------------------
+
+    /// Lowers `` p₀${e₁}p₁…${eₙ}pₙ `` to a left-fold of `Add` ops.
+    ///
+    /// The leading quasi is pinned as the left operand, so every subsequent
+    /// `Add` has a string left side and takes the ToPrimitive/ToString
+    /// concat path (ES `+` semantics: `"" + undefined === "undefined"`).
+    /// Intermediate quasis may be empty strings and are skipped when they
+    /// contribute nothing.
+    fn template_literal(&mut self, t: &oxc_ast::ast::TemplateLiteral<'_>) -> Res<u8> {
+        let quasi_text = |q: &oxc_ast::ast::TemplateElement| {
+            q.value.cooked.as_deref().unwrap_or_default().to_string()
+        };
+        // Invariant head of any TemplateLiteral; guarded so malformed parses
+        // surface as clean errors rather than indexing panics.
+        let Some(first) = t.quasis.first() else {
+            return Err(self.err(t.span, "malformed template literal"));
+        };
+        let mut acc = self.new_temp();
+        self.load_str(acc, &quasi_text(first), first.span)?;
+        for (i, e) in t.expressions.iter().enumerate() {
+            let v = self.expr(e)?;
+            let nxt = self.new_temp();
+            self.emit_spanned(v12_bytecode::Instr::new(Opcode::Add, nxt, acc, v), e.span());
+            acc = nxt;
+            if let Some(q) = t.quasis.get(i + 1) {
+                let text = quasi_text(q);
+                if !text.is_empty() {
+                    let s = self.new_temp();
+                    self.load_str(s, &text, q.span)?;
+                    let nxt = self.new_temp();
+                    self.emit_spanned(v12_bytecode::Instr::new(Opcode::Add, nxt, acc, s), q.span);
+                    acc = nxt;
+                }
+            }
+        }
+        Ok(acc)
+    }
+
+    // -- optional chains -------------------------------------------------------
+
+    /// `r = v is nullish` — loose equality against `null` covers exactly
+    /// the two nullish values (`null`, `undefined`).
+    fn nullish_cmp(&mut self, v: u8, span: Span) -> Res<u8> {
+        let null = self.new_temp();
+        self.load_const(null, Const::Null, span)?;
+        let cmp = self.new_temp();
+        self.emit_spanned(v12_bytecode::Instr::new(Opcode::Eq, cmp, v, null), span);
+        Ok(cmp)
+    }
+
+    /// One optional deref guard: `obj[key]` becomes `obj == null ? undefined
+    /// : obj[key]`. Returns the result register.
+    fn optional_deref(&mut self, span: Span, obj: u8, key: u8) -> Res<u8> {
+        let dst = self.new_temp();
+        let done = self.label();
+        let cmp = self.nullish_cmp(obj, span)?;
+        self.emit_jump(Opcode::JumpIfTrue, cmp, done);
+        self.emit_spanned(
+            v12_bytecode::Instr::new(Opcode::GetProperty, dst, obj, key),
+            span,
+        );
+        self.emit_jump(Opcode::Jump, 0, done);
+        self.bind(done);
+        Ok(dst)
+    }
+
+    /// Short-circuits to `undefined` when `v` is nullish; control flow
+    /// otherwise continues at the bind point of the returned label.
+    fn nullish_exit(&mut self, v: u8, dst: u8, exit: Label, span: Span) -> Res<()> {
+        let cmp = self.nullish_cmp(v, span)?;
+        let keep_going = self.label();
+        self.emit_jump(Opcode::JumpIfFalse, cmp, keep_going);
+        self.load_undefined(dst, span);
+        self.emit_jump(Opcode::Jump, 0, exit);
+        self.bind(keep_going);
+        Ok(())
+    }
+
+    /// Lowering for an entire optional chain (`a?.b[c(x)].d(y)`), which oxc
+    /// wraps in a single `ChainExpression` node regardless of nesting depth
+    /// or expression position.
+    ///
+    /// The spine (nested member / call nodes from root down to the base
+    /// value) is flattened and evaluated innermost-first. Each `?.` link
+    /// guards its *incoming* value: a nullish value short-circuits the whole
+    /// chain out through one shared exit label with an `undefined` result,
+    /// skipping every remaining link including later argument evaluation.
+    ///
+    /// Receiver bookkeeping: `f.m(a)` binds `this` to the object preceding
+    /// the last member deref; direct calls on call results or plain
+    /// identifiers use `undefined`.
+    fn chain_expr(&mut self, cx: &oxc_ast::ast::ChainExpression<'_>) -> Res<u8> {
+        use oxc_ast::ast::{ChainElement, MemberExpression};
+
+        /// One flattened spine element. Outermost links are pushed first;
+        /// evaluation walks the list backwards (base-side first).
+        enum SpineLink<'x> {
+            Member {
+                span: Span,
+                optional: bool,
+                member: &'x MemberExpression<'x>,
+            },
+            Call {
+                span: Span,
+                optional: bool,
+                args: &'x [oxc_ast::ast::Argument<'x>],
+            },
+        }
+
+        // Walk from the chain root down to the base value, flattening as we
+        // go. Private fields remain rejected with a named construct error.
+        fn collect<'x>(
+            links: &mut Vec<SpineLink<'x>>,
+            mut cur: &'x Expression<'x>,
+        ) -> Result<&'x Expression<'x>, Span> {
+            loop {
+                match cur {
+                    Expression::StaticMemberExpression(s) => {
+                        links.push(SpineLink::Member {
+                            span: s.span,
+                            optional: s.optional,
+                            member: cur.as_member_expression().expect("static member"),
+                        });
+                        cur = &s.object;
+                    }
+                    Expression::ComputedMemberExpression(c) => {
+                        links.push(SpineLink::Member {
+                            span: c.span,
+                            optional: c.optional,
+                            member: cur.as_member_expression().expect("computed member"),
+                        });
+                        cur = &c.object;
+                    }
+                    Expression::CallExpression(c) => {
+                        links.push(SpineLink::Call {
+                            span: c.span,
+                            optional: c.optional,
+                            args: &c.arguments,
+                        });
+                        cur = &c.callee;
+                    }
+                    Expression::PrivateFieldExpression(p) => return Err(p.span),
+                    _ => return Ok(cur),
+                }
+            }
+        }
+
+        let mut links: Vec<SpineLink<'_>> = Vec::new();
+        // The root chain element may be a member or a call; push its link
+        // manually (it has no wrapping `Expression` to reuse) and continue
+        // collecting toward the base value.
+        let after_root = match &cx.expression {
+            ChainElement::StaticMemberExpression(s) => {
+                links.push(SpineLink::Member {
+                    span: s.span,
+                    optional: s.optional,
+                    member: cx.expression.member_expression().expect("static member"),
+                });
+                &s.object
+            }
+            ChainElement::ComputedMemberExpression(c) => {
+                links.push(SpineLink::Member {
+                    span: c.span,
+                    optional: c.optional,
+                    member: cx.expression.member_expression().expect("computed member"),
+                });
+                &c.object
+            }
+            ChainElement::CallExpression(c) => {
+                links.push(SpineLink::Call {
+                    span: c.span,
+                    optional: c.optional,
+                    args: &c.arguments,
+                });
+                &c.callee
+            }
+            ChainElement::PrivateFieldExpression(p) => {
+                return Err(self.err(p.span, "private fields are not supported"));
+            }
+            ChainElement::TSNonNullExpression(t) => {
+                return Err(self.err(t.span, "non-null assertions are TypeScript-only"));
+            }
+        };
+        let base = collect(&mut links, after_root)
+            .map_err(|span| self.err(span, "private fields are not supported"))?;
+
+        let exit = self.label();
+        let dst = self.new_temp();
+        let mut cur = self.expr(base)?;
+        // Register holding the object before the most recent member deref —
+        // the receiver candidate for a following call link.
+        let mut prev_recv: Option<u8> = None;
+        for link in links.iter().rev() {
+            match link {
+                SpineLink::Member {
+                    span,
+                    optional,
+                    member,
+                } => {
+                    if *optional {
+                        self.nullish_exit(cur, dst, exit, *span)?;
+                    }
+                    let kreg = match member {
+                        MemberExpression::StaticMemberExpression(s) => {
+                            let r = self.new_temp();
+                            self.load_str(r, s.property.name.as_str(), s.property.span)?;
+                            r
+                        }
+                        MemberExpression::ComputedMemberExpression(c) => {
+                            self.expr(&c.expression)?
+                        }
+                        MemberExpression::PrivateFieldExpression(_) => {
+                            unreachable!("rejected during collect")
+                        }
+                    };
+                    prev_recv = Some(cur);
+                    let nxt = self.new_temp();
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::GetProperty, nxt, cur, kreg),
+                        *span,
+                    );
+                    cur = nxt;
+                }
+                SpineLink::Call {
+                    span,
+                    optional,
+                    args,
+                } => {
+                    if *optional {
+                        // `?.()` guards the callee value itself.
+                        self.nullish_exit(cur, dst, exit, *span)?;
+                    }
+                    if args.len()
+                        > usize::from(u8::MAX) - usize::from(crate::model::CALL_HEADER_REGS) - 1
+                    {
+                        return Err(self.err(*span, "calls above 253 arguments are not supported"));
+                    }
+                    // Layout: [callee][this][arg…]; see `CALL_HEADER_REGS`.
+                    let window_base =
+                        self.new_temps(crate::model::CALL_HEADER_REGS + args.len() as u8);
+                    self.move_reg(window_base, cur, *span);
+                    match prev_recv {
+                        Some(r) => self.move_reg(window_base + 1, r, *span),
+                        None => self.load_undefined(window_base + 1, *span),
+                    }
+                    let has_spread = args
+                        .iter()
+                        .any(|a| matches!(a, oxc_ast::ast::Argument::SpreadElement(_)));
+                    if !has_spread {
+                        for (i, arg) in args.iter().enumerate() {
+                            let x = arg.as_expression().expect("non-spread argument");
+                            self.expr_into(x, window_base + 2 + i as u8)?;
+                        }
+                        let argc = u16::try_from(args.len()).unwrap_or(u16::from(u8::MAX));
+                        self.emit_call(window_base, window_base, argc, *span);
+                    } else {
+                        let arr = self.build_args_array(args, *span)?;
+                        self.emit_spanned(
+                            v12_bytecode::Instr::new(
+                                Opcode::CallApply,
+                                window_base,
+                                window_base,
+                                arr,
+                            ),
+                            *span,
+                        );
+                    }
+                    cur = window_base;
+                    prev_recv = None; // call results carry no receiver context
+                }
+            }
+        }
+        self.move_reg(dst, cur, cx.span);
+        self.bind(exit);
+        Ok(dst)
+    }
+    /// `a &&= b`, `a ||= b`, `a ??= b`.
+    ///
+    /// Read-modify-write with a logical guard: the current value is read
+    /// once, a condition decides whether the right-hand side is evaluated,
+    /// assigned, and yielded, or whether the original value flows through.
+    ///
+    /// Deviation (member targets only): ES re-evaluates the target reference
+    /// (`a.b ??= c` reads `b` again for the store); we keep the already
+    /// resolved `(obj, key)` pair, so getter/setter re-entry between read
+    /// and write is not observable here anyway — this subset has no accessors
+    /// on plain member targets with observable intermediate state.
+    fn logical_assign(
+        &mut self,
+        op: AssignmentOperator,
+        left: &AssignmentTarget<'_>,
+        right: &Expression<'_>,
+        span: Span,
+    ) -> Res<u8> {
+        let Some(simple) = left.as_simple_assignment_target() else {
+            return Err(self.err(span, "destructuring in logical assignment is not supported"));
+        };
+        // Storage slot pair: (read register, writer closure context).
+        enum Target {
+            Id(VarAccess),
+            Member { obj: u8, key: u8 },
+        }
+        let target = match simple {
+            oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
+                    // Unbound identifier → global property.
+                    return self.logical_assign_global(op, id, right, span);
+                };
+                if self.comp.plans.const_bindings.contains(&sym)
+                    && self.comp.plans.units[self.unit].is_strict
+                {
+                    return Err(self.err(id.span, "SyntaxError: Assignment to constant variable"));
+                }
+                Target::Id(self.access(sym))
+            }
+            _ => {
+                let Some(m) = simple.as_member_expression() else {
+                    return Err(self.err(
+                        span,
+                        "TypeScript assertion expressions cannot be logical assignment targets",
+                    ));
+                };
+                let (obj, key) = self.member_parts(m)?;
+                Target::Member { obj, key }
+            }
+        };
+        // Read current value.
+        let cur = self.new_temp();
+        match &target {
+            Target::Id(access) => self.read_access(*access, cur, span),
+            Target::Member { obj, key } => self.emit_spanned(
+                v12_bytecode::Instr::new(Opcode::GetProperty, cur, *obj, *key),
+                span,
+            ),
+        }
+
+        let end = self.label();
+        match op {
+            AssignmentOperator::LogicalAnd => {
+                // falsy → keep `cur` untouched.
+                self.emit_jump(Opcode::JumpIfFalse, cur, end);
+            }
+            AssignmentOperator::LogicalOr => {
+                // truthy → keep `cur` untouched.
+                self.emit_jump(Opcode::JumpIfTrue, cur, end);
+            }
+            AssignmentOperator::LogicalNullish => {
+                // non-nullish → keep `cur`; nullish → assign. Reuse the
+                // shared guard: invert by jumping on non-nullish to `end`.
+                let cmp = self.nullish_cmp(cur, span)?;
+                self.emit_jump(Opcode::JumpIfFalse, cmp, end);
+            }
+            _ => unreachable!("only logical ops routed here"),
+        }
+        // Assign + yield the right-hand side.
+        let rhs = self.expr(right)?;
+        match &target {
+            Target::Id(access) => self.store_access(*access, rhs, span),
+            Target::Member { obj, key } => self.emit_spanned(
+                v12_bytecode::Instr::new(Opcode::SetProperty, *obj, *key, rhs),
+                span,
+            ),
+        }
+        self.bind(end);
+        Ok(rhs)
+    }
+
+    /// Logical assignment against an unbound (global) identifier.
+    fn logical_assign_global(
+        &mut self,
+        op: AssignmentOperator,
+        id: &oxc_ast::ast::IdentifierReference<'_>,
+        right: &Expression<'_>,
+        span: Span,
+    ) -> Res<u8> {
+        let gid = crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+        let cur = self.new_temp();
+        self.emit_get_global(cur, gid, span);
+        let end = self.label();
+        match op {
+            AssignmentOperator::LogicalAnd => self.emit_jump(Opcode::JumpIfFalse, cur, end),
+            AssignmentOperator::LogicalOr => self.emit_jump(Opcode::JumpIfTrue, cur, end),
+            AssignmentOperator::LogicalNullish => {
+                let cmp = self.nullish_cmp(cur, span)?;
+                self.emit_jump(Opcode::JumpIfFalse, cmp, end);
+            }
+            _ => unreachable!("only logical ops routed here"),
+        }
+        let rhs = self.expr(right)?;
+        self.emit_set_global(gid, rhs, span);
+        self.bind(end);
+        Ok(rhs)
+    }
+
+    // -- constructor invocations ------------------------------------------------
+
+    /// `new F(args)` → [`Opcode::Construct`].
+    ///
+    /// Same register layout as a call (`[callee][this][arg…]`); the `this`
+    /// slot stays `undefined` because the interpreter supplies the freshly
+    /// allocated instance itself. Spread arguments are rejected at compile
+    /// time with a named error rather than silently truncating the argument
+    /// list (there is no ConstructApply opcode yet).
+    fn new_expr(&mut self, n: &oxc_ast::ast::NewExpression<'_>) -> Res<u8> {
+        if n.arguments.len()
+            > usize::from(u8::MAX) - usize::from(crate::model::CALL_HEADER_REGS) - 1
+        {
+            return Err(self.err(
+                n.span,
+                "constructor calls above 253 arguments are not supported",
+            ));
+        }
+        let argc = u8::try_from(n.arguments.len()).expect("argc checked against u8::MAX above");
+        let window = self.new_temps(argc + crate::model::CALL_HEADER_REGS);
+        if let Some(m) = n.callee.as_member_expression() {
+            // Property-style constructor reference (`new lib.Widget()`).
+            let (obj, key) = self.member_parts(m)?;
+            self.emit_spanned(
+                v12_bytecode::Instr::new(Opcode::GetProperty, window, obj, key),
+                n.span,
+            );
+        } else {
+            let v = self.expr(&n.callee)?;
+            self.move_reg(window, v, n.span);
+        }
+        self.load_undefined(window + 1, n.span);
+        for (i, arg) in n.arguments.iter().enumerate() {
+            if matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)) {
+                return Err(self.err(arg.span(), "spread arguments in `new` are not supported"));
+            }
+            let x = arg.as_expression().expect("non-spread argument");
+            self.expr_into(x, window + 2 + i as u8)?;
+        }
+        self.emit_spanned(
+            v12_bytecode::Instr::new(Opcode::Construct, window, window, argc),
+            n.span,
+        );
+        Ok(window)
+    }
+
     // -- calls ---------------------------------------------------------------------
 
+    /// Builds an argument array from a mixed argument list: spread elements
+    /// are validated as arrays (`CheckIsArray`) and appended element-wise.
+    fn build_args_array(&mut self, args: &[oxc_ast::ast::Argument<'_>], span: Span) -> Res<u8> {
+        let arr = self.new_temp();
+        self.emit_spanned(
+            v12_bytecode::Instr::new(Opcode::NewArray, arr, self.undef_reg(), 0),
+            span,
+        );
+        for arg in args {
+            match arg {
+                oxc_ast::ast::Argument::SpreadElement(s) => {
+                    let src = self.expr(&s.argument)?;
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::CheckIsArray, src, 0, 0),
+                        s.span,
+                    );
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::ArrayAppend, arr, src, 0),
+                        s.span,
+                    );
+                }
+                _ => {
+                    let x = arg
+                        .as_expression()
+                        .expect("non-spread argument is an expression");
+                    let val = self.expr(x)?;
+                    let len_key = self.new_temp();
+                    self.load_str(len_key, "length", x.span())?;
+                    let len = self.new_temp();
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::GetProperty, len, arr, len_key),
+                        x.span(),
+                    );
+                    self.emit_spanned(
+                        v12_bytecode::Instr::new(Opcode::SetProperty, arr, len, val),
+                        x.span(),
+                    );
+                }
+            }
+        }
+        Ok(arr)
+    }
+
+    /// Compiles one call. Non-optional calls (`f(x)`); optional-call forms
+    /// route through `chain_expr`.
     fn call(&mut self, c: &CallExpression<'_>) -> Res<u8> {
         if c.optional {
             return Err(self.err(c.span, "optional calls are not supported"));
@@ -844,44 +1380,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.move_reg(block, v, c.span);
             self.load_undefined(block + 1, c.span);
         }
-        // Build args array.
-        let args_arr = self.new_temp();
-        self.emit_spanned(
-            v12_bytecode::Instr::new(Opcode::NewArray, args_arr, self.undef_reg(), 0),
-            c.span,
-        );
-        for arg in &c.arguments {
-            match arg {
-                oxc_ast::ast::Argument::SpreadElement(s) => {
-                    let src = self.expr(&s.argument)?;
-                    self.emit_spanned(
-                        v12_bytecode::Instr::new(Opcode::CheckIsArray, src, 0, 0),
-                        s.span,
-                    );
-                    self.emit_spanned(
-                        v12_bytecode::Instr::new(Opcode::ArrayAppend, args_arr, src, 0),
-                        s.span,
-                    );
-                }
-                _ => {
-                    let Some(x) = arg.as_expression() else {
-                        return Err(self.err(arg.span(), "unsupported argument"));
-                    };
-                    let val = self.expr(x)?;
-                    let len_key = self.new_temp();
-                    self.load_str(len_key, "length", x.span())?;
-                    let len = self.new_temp();
-                    self.emit_spanned(
-                        v12_bytecode::Instr::new(Opcode::GetProperty, len, args_arr, len_key),
-                        x.span(),
-                    );
-                    self.emit_spanned(
-                        v12_bytecode::Instr::new(Opcode::SetProperty, args_arr, len, val),
-                        x.span(),
-                    );
-                }
-            }
-        }
+        // Build args array: spread elements are validated and appended.
+        let args_arr = self.build_args_array(&c.arguments, c.span)?;
         let dst = block;
         self.emit_spanned(
             v12_bytecode::Instr::new(Opcode::CallApply, dst, block, args_arr),

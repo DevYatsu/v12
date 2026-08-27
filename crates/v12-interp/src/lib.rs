@@ -68,8 +68,8 @@ use v12_bytecode::{Const, FunctionBytecode, Opcode, WideOp};
 use v12_heap::{
     Attrs, Descriptor, GcPolicy, Handle, Heap, JsObject, JsValue,
     KIND_ARGUMENTS as HEAP_KIND_ARGUMENTS, KIND_ARRAY as HEAP_KIND_ARRAY,
-    KIND_FUNCTION as HEAP_KIND_FUNCTION, KIND_GENERATOR as HEAP_KIND_GENERATOR, PropKey,
-    ShapeHandle, V12Str,
+    KIND_FUNCTION as HEAP_KIND_FUNCTION, KIND_GENERATOR as HEAP_KIND_GENERATOR,
+    KIND_ORDINARY as HEAP_KIND_ORDINARY, PropKey, ShapeHandle, V12Str,
 };
 
 use crate::feedback::{FeedbackVector, Lattice, MonoIc, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
@@ -94,6 +94,12 @@ pub const KIND_GENERATOR: u8 = HEAP_KIND_GENERATOR;
 /// arguments and returns `undefined`. Chosen beyond any plausible program
 /// function count, matching `v12_engine::builtins::NATIVE_CONSOLE_LOG`.
 pub const NATIVE_CONSOLE_LOG: u32 = 1900;
+
+/// Native indices of the only constructor-shaped built-ins (`new Boolean`,
+/// `new Error`, and subclasses), mirroring `v12_engine::builtins`
+/// constants so `Construct` can route them through the shared registry.
+pub const NATIVE_BOOLEAN_CONSTRUCT: u32 = 1500;
+pub const NATIVE_ERROR_CREATE: u32 = 1600;
 
 /// Offset of user-declared global slots in the global object's `properties`.
 ///
@@ -836,6 +842,17 @@ impl Interp {
                     }
                     continue 'drive;
                 }
+                Opcode::Construct => {
+                    let argc = u16::from(instr.c());
+                    match attempt!(self.prepare_construct(base, max_regs, instr.b(), argc)) {
+                        CallOutcome::Pushed => continue 'drive,
+                        CallOutcome::Value(v) => {
+                            self.stack[base + usize::from(instr.a())] = v;
+                            self.set_pc(pc + 1);
+                        }
+                    }
+                    continue 'drive;
+                }
                 Opcode::Return => {
                     let v = self.stack[base + usize::from(instr.a())];
                     if self.complete_frame(v)? {
@@ -912,9 +929,6 @@ impl Interp {
                     let env = self.frames.last().expect("frame").env;
                     let h = self.heap.alloc(JsObject {
                         kind: KIND_FUNCTION,
-                        // Element slot 0 carries the program function index;
-                        // the prototype link doubles as the captured
-                        // environment so the collector traces the chain.
                         elements: vec![ops::box_number(f64::from(instr.b()))],
                         prototype: env,
                         ..JsObject::default()
@@ -1266,12 +1280,26 @@ impl Interp {
             self.stack.truncate(finished.base);
             return Ok(true);
         };
-        // The caller is parked on its Call/Wide header; step past it and
-        // deposit the result into the destination register recorded there.
+        // The caller is parked on its Call/Construct/Wide header; step past
+        // it and deposit the result into the destination register recorded
+        // there. Construct adds the spec's return-value adjustment: a body
+        // that returns an object replaces the instance, otherwise the newly
+        // allocated instance (still sitting in the callee's r0) is returned.
         let call_instr = self.functions[caller.fn_idx as usize].instrs[caller.pc];
         let width = usize::from(call_instr.op() == Some(Opcode::Wide));
         let dst = usize::from(call_instr.a());
         let caller_base = caller.base;
+        let result = if call_instr.op() == Some(Opcode::Construct)
+            && result.as_object().is_none()
+            && !result.is_hole()
+        {
+            // Callee frame still intact at this point (truncation happens
+            // below), so its `this` register — the constructed instance.
+            let v = self.stack[finished.base];
+            if v.as_object().is_some() { v } else { result }
+        } else {
+            result
+        };
         self.stack.truncate(finished.base);
         self.stack[caller_base + dst] = result;
         caller.pc += 1 + width;
@@ -2390,9 +2418,180 @@ impl Interp {
         Ok(CallOutcome::Pushed)
     }
 
-    // ------------------------------------------------------------------
-    // Feedback
-    // ------------------------------------------------------------------
+    /// `new F(args)` ([`Opcode::Construct`]).
+    ///
+    /// Only constructors are constructible here:
+    /// - a bytecode function (`Closure`) gets real construct semantics — an
+    ///   instance is allocated with [[Prototype]] = `F.prototype` (the
+    ///   property is created on first use, as spec-mandated for plain
+    ///   functions), bound as `this`, and the body runs;
+    /// - the constructor-shaped natives ([`NATIVE_ERROR_CREATE`],
+    ///   [`NATIVE_BOOLEAN_CONSTRUCT`]) route through the registry ignoring
+    ///   the receiver, like their spec counterparts do when called;
+    /// - everything else throws TypeError "not a constructor".
+    ///
+    /// The return-value adjustment (body result if it returns an object,
+    /// otherwise the instance) happens in [`Interp::complete_frame`], which
+    /// can see that the caller parked on a `Construct` opcode.
+    fn prepare_construct(
+        &mut self,
+        base: usize,
+        caller_max_regs: u16,
+        callee_reg: u8,
+        argc: u16,
+    ) -> Result<CallOutcome, JSException> {
+        let callee_slot = base + usize::from(callee_reg);
+        let callee_v = self.stack[callee_slot];
+
+        let Some(callee_obj) = callee_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: value is not a constructor"),
+            ));
+        };
+        if self.heap.get(callee_obj).kind != KIND_FUNCTION {
+            return Err(JSException(
+                self.error_value("TypeError: value is not a constructor"),
+            ));
+        }
+        let idx = {
+            let c = self.heap.get(callee_obj);
+            c.elements.first().and_then(|v| v.as_smi()).unwrap_or(-1)
+        };
+
+        // Native seam: only known constructor-shaped built-ins are
+        // constructible; the realm's placeholder intrinsics carry no valid
+        // function index and therefore reject like any other non-constructor.
+        if idx < 0 || usize::try_from(idx).expect("checked non-negative") >= self.functions.len() {
+            let Ok(target) = u32::try_from(idx) else {
+                return Err(JSException(
+                    self.error_value("TypeError: value is not a constructor"),
+                ));
+            };
+            if target != NATIVE_BOOLEAN_CONSTRUCT && target != NATIVE_ERROR_CREATE {
+                return Err(JSException(
+                    self.error_value("TypeError: value is not a constructor"),
+                ));
+            }
+            let args_start = callee_slot + 2;
+            let args_end = args_start + usize::from(argc);
+            self.gc_protect();
+            let result = {
+                let args = &self.stack[args_start..args_end];
+                self.natives
+                    .call_native(&mut self.heap, JsValue::undefined(), args, target)
+            };
+            return result.map(CallOutcome::Value).map_err(JSException);
+        }
+
+        // Bytecode function. Resolve or lazily create `.prototype`.
+        let proto_key = self.prototype_key();
+        let proto_val: Option<JsValue> = {
+            let shape = self.shape_of(callee_obj);
+            match self.heap.lookup_property(shape, proto_key) {
+                Some(Descriptor::Data { slot, .. }) => {
+                    Some(self.heap.get(callee_obj).properties[*slot as usize])
+                }
+                _ => None,
+            }
+        };
+        let proto_v = match proto_val {
+            Some(v) if v.as_object().is_some() => v,
+            _ => {
+                // Fallback for function objects created outside `Closure`
+                // (host-created) that lack the spec-mandated property.
+                self.gc_protect();
+                let key_handle = intern_text(&mut self.heap, "prototype");
+                let p = self.heap.alloc(JsObject {
+                    kind: HEAP_KIND_ORDINARY,
+                    ..JsObject::default()
+                });
+                // Untracked until `set_property` stores it behind the callee;
+                // that path allocates, so root it for the duration.
+                let p_val = JsValue::object(p);
+                self.heap.add_root(p_val);
+                self.set_property(callee_v, JsValue::string(key_handle), p_val)?;
+                p_val
+            }
+        };
+        let Some(proto) = proto_v.as_object() else {
+            // Guarded above by `v.as_object().is_some()`; kept exhaustive.
+            return Err(JSException(
+                self.error_value("TypeError: value is not a constructor"),
+            ));
+        };
+
+        if self.frames.len() >= MAX_CALL_DEPTH {
+            return Err(JSException(
+                self.error_value("RangeError: maximum call stack size exceeded"),
+            ));
+        }
+
+        // Allocate the instance with [[Prototype]] linking, then push the
+        // frame with `this` = instance.
+        self.gc_protect();
+        let instance = self.heap.alloc(JsObject {
+            kind: HEAP_KIND_ORDINARY,
+            prototype: Some(proto),
+            ..JsObject::default()
+        });
+        let instance_v = JsValue::object(instance);
+
+        let target_u32 = u32::try_from(idx).expect("checked non-negative");
+        let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
+            let f = &self.functions[target_u32 as usize];
+            (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
+        };
+        let new_base = base + usize::from(caller_max_regs);
+        let window_end = new_base + usize::from(callee_max_regs);
+
+        let arg_src = callee_slot + 2;
+        self.stack.resize(window_end, JsValue::undefined());
+        self.stack[new_base] = instance_v;
+        if callee_has_rest {
+            let fixed = callee_fixed as usize;
+            let rest_reg = callee_rest_reg as usize;
+            let fixed_to_copy = fixed
+                .min(argc as usize)
+                .min(usize::from(callee_max_regs).saturating_sub(1));
+            for i in 0..fixed_to_copy {
+                self.stack[new_base + 1 + i] = self.stack[arg_src + i];
+            }
+            let rest_start = fixed;
+            let rest_len = (argc as usize).saturating_sub(rest_start);
+            let rest_slice = if rest_len > 0 {
+                self.stack[arg_src + rest_start..arg_src + rest_start + rest_len].to_vec()
+            } else {
+                Vec::new()
+            };
+            self.gc_protect();
+            let shape = self.array_shape();
+            let h = self.heap.alloc(JsObject {
+                kind: KIND_ARRAY,
+                properties: vec![ops::box_number(f64::from(rest_len as u32))],
+                elements: rest_slice,
+                ..JsObject::default()
+            });
+            self.bind_shape(h, shape);
+            if rest_reg < usize::from(callee_max_regs) {
+                self.stack[new_base + rest_reg] = JsValue::object(h);
+            }
+        } else {
+            let copied = usize::from(argc).min(usize::from(callee_max_regs).saturating_sub(1));
+            for i in 0..copied {
+                self.stack[new_base + 1 + i] = self.stack[arg_src + i];
+            }
+        }
+
+        self.frames.push(Frame {
+            fn_idx: target_u32,
+            pc: 0,
+            base: new_base,
+            max_regs: callee_max_regs,
+            env: self.heap.get(callee_obj).prototype,
+        });
+        self.note_entry(target_u32);
+        Ok(CallOutcome::Pushed)
+    }
 
     /// Counts one loop-header crossing for `fn_idx`.
     fn note_loop(&mut self, fn_idx: u32) {

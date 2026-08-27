@@ -15,7 +15,7 @@ use oxc_ast::ast::{
     VariableDeclarationKind,
 };
 use oxc_span::{GetSpan, Span};
-use v12_bytecode::{HandlerRange, Instr, Opcode, WideOp};
+use v12_bytecode::{HandlerRange, Instr, Label, Opcode, WideOp};
 
 use crate::model::{CompileError, FinallyCtx, FnCtx, LoopCtx};
 
@@ -55,53 +55,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(())
     }
 
-    /// Compiles one statement.
+    /// Compiles one statement. Module declarations are routed through
+    /// [`Self::module_decl`] (see the guarded first arm).
     pub fn stmt(&mut self, s: &'a Statement<'a>) -> Res<()> {
-        if let Some(md) = s.as_module_declaration() {
-            return match md {
-                ModuleDeclaration::ImportDeclaration(_) => Ok(()),
-                ModuleDeclaration::ExportDeclaration(d) => match &d.declaration {
-                    Declaration::VariableDeclaration(v) => self.var_decl(v),
-                    Declaration::FunctionDeclaration(_) => Ok(()),
-                    Declaration::ClassDeclaration(_) => {
-                        Err(self.err(d.span, "class declarations are not supported"))
-                    }
-                    _ => Ok(()),
-                },
-                ModuleDeclaration::ExportNamedDeclaration(_) => Ok(()),
-                ModuleDeclaration::ExportFromDeclaration(_) => Ok(()),
-                ModuleDeclaration::ExportDefaultDeclaration(d) => {
-                    use oxc_ast::ast::ExportDefaultDeclarationKind as Kind;
-                    match &d.declaration {
-                        Kind::FunctionDeclaration(f) => {
-                            // Hoisted like a function declaration; binding
-                            // already initialised by the hoist pass.
-                            let _ = f;
-                            Ok(())
-                        }
-                        Kind::ClassDeclaration(_) => {
-                            Err(self.err(d.span, "class declarations are not supported"))
-                        }
-                        Kind::TSInterfaceDeclaration(_) => Ok(()),
-                        _ => {
-                            if let Some(expr) = d.declaration.as_expression() {
-                                // `export default expr` evaluates the expression
-                                // but discards it (module evaluation has no
-                                // completion value).
-                                self.expr(expr)?;
-                            }
-                            Ok(())
-                        }
-                    }
-                }
-                ModuleDeclaration::ExportAllDeclaration(_) => Ok(()),
-                ModuleDeclaration::TSExportAssignment(_) => {
-                    Err(self.err(md.span(), "typescript export assignment is not supported"))
-                }
-                ModuleDeclaration::TSNamespaceExportDeclaration(_) => Ok(()),
-            };
-        }
         match s {
+            // Module declarations share one handler; listing the variants
+            // here (instead of a guard) proves exhaustiveness to the
+            // compiler, so a new oxc statement kind breaks compilation.
+            Statement::ImportDeclaration(_)
+            | Statement::ExportDeclaration(_)
+            | Statement::ExportNamedDeclaration(_)
+            | Statement::ExportFromDeclaration(_)
+            | Statement::ExportDefaultDeclaration(_)
+            | Statement::ExportAllDeclaration(_)
+            | Statement::TSExportAssignment(_)
+            | Statement::TSNamespaceExportDeclaration(_) => self.module_decl(s),
             Statement::BlockStatement(b) => self.stmt_list(&b.body),
             Statement::ExpressionStatement(e) => {
                 self.expr(&e.expression)?;
@@ -178,7 +146,88 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(())
             }
             Statement::VariableDeclaration(v) => self.var_decl(v),
-            other => Err(self.err(other.span(), "unsupported statement")),
+            Statement::SwitchStatement(s) => self.switch_stmt(s, None),
+            Statement::ClassDeclaration(c) => {
+                let _ = c;
+                Err(self.err(s.span(), "class declarations are not supported"))
+            }
+            Statement::ForInStatement(f) => Err(self.err(
+                f.span,
+                "for-in requires property-key enumeration — no key-listing builtin exists yet",
+            )),
+            Statement::ForOfStatement(f) => Err(self.err(
+                f.span,
+                "for-of requires the iterator protocol — Symbol.iterator is not available yet",
+            )),
+            Statement::WithStatement(w) => {
+                Err(self.err(w.span, "with statements are not supported"))
+            }
+            Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => {
+                Err(self.err(
+                    s.span(),
+                    "TypeScript type-level declarations (`type`, `interface`) are erased at \
+                 compile time and are not supported",
+                ))
+            }
+            Statement::TSEnumDeclaration(_) => {
+                Err(self.err(s.span(), "TypeScript enums are not supported"))
+            }
+            Statement::TSNamespaceDeclaration(_)
+            | Statement::TSGlobalDeclaration(_)
+            | Statement::TSExternalModuleDeclaration(_)
+            | Statement::TSImportEqualsDeclaration(_) => Err(self.err(
+                s.span(),
+                "TypeScript namespace / import-equals declarations are not supported",
+            )),
+        }
+    }
+
+    /// Module declarations (`import` / `export`).
+    ///
+    /// Binding semantics in this subset: imports are elided entirely (the
+    /// linker pre-populates the realm), function/`export default fn`
+    /// declarations were already initialized by the enclosing statement
+    /// list's hoist pass, and exported variables compile like any other.
+    fn module_decl(&mut self, s: &'a Statement<'a>) -> Res<()> {
+        let Some(md) = s.as_module_declaration() else {
+            unreachable!("only module-declaration statement variants route here")
+        };
+        match md {
+            ModuleDeclaration::ImportDeclaration(_) => Ok(()),
+            ModuleDeclaration::ExportDeclaration(d) => match &d.declaration {
+                Declaration::VariableDeclaration(v) => self.var_decl(v),
+                Declaration::FunctionDeclaration(_) => Ok(()),
+                Declaration::ClassDeclaration(_) => {
+                    Err(self.err(d.span, "class declarations are not supported"))
+                }
+                _ => Ok(()),
+            },
+            ModuleDeclaration::ExportNamedDeclaration(_) => Ok(()),
+            ModuleDeclaration::ExportFromDeclaration(_) => Ok(()),
+            ModuleDeclaration::ExportDefaultDeclaration(d) => {
+                use oxc_ast::ast::ExportDefaultDeclarationKind as Kind;
+                match &d.declaration {
+                    Kind::FunctionDeclaration(_) => Ok(()),
+                    Kind::ClassDeclaration(_) => {
+                        Err(self.err(d.span, "class declarations are not supported"))
+                    }
+                    Kind::TSInterfaceDeclaration(_) => Ok(()),
+                    _ => {
+                        if let Some(expr) = d.declaration.as_expression() {
+                            // `export default expr` evaluates the expression
+                            // but discards it (module evaluation has no
+                            // completion value).
+                            self.expr(expr)?;
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            ModuleDeclaration::ExportAllDeclaration(_) => Ok(()),
+            ModuleDeclaration::TSExportAssignment(_) => {
+                Err(self.err(md.span(), "TypeScript export assignment is not supported"))
+            }
+            ModuleDeclaration::TSNamespaceExportDeclaration(_) => Ok(()),
         }
     }
 
@@ -267,7 +316,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.move_reg(key_reg, k, prop.key.span());
             } else {
                 let Some(text) = crate::expr::static_key_text(&prop.key) else {
-                    return Err(self.err(prop.key.span(), "unsupported property key in pattern"));
+                    // Remaining non-computed keys are private names or exotic
+                    // expressions (e.g. untagged template literals).
+                    return Err(self.err(
+                        prop.key.span(),
+                        "destructuring pattern keys must be identifiers, strings, or numbers",
+                    ));
                 };
                 self.load_str(key_reg, &text, prop.key.span())?;
             }
@@ -430,7 +484,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Some(ForStatementInit::VariableDeclaration(v)) => self.var_decl(v)?,
             Some(init) => {
                 let Some(e) = init.as_expression() else {
-                    return Err(self.err(f.span, "unsupported for-init"));
+                    // The only non-declaration, non-expression init is a
+                    // `using` declaration, which only the iterator protocols
+                    // could consume anyway.
+                    return Err(self.err(
+                        f.span,
+                        "`using` declarations in for-loop initializers are not supported",
+                    ));
                 };
                 self.expr(e)?;
             }
@@ -467,6 +527,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Statement::WhileStatement(w) => self.while_loop(&w.test, &w.body, Some(name)),
             Statement::DoWhileStatement(d) => self.do_while_loop(&d.body, &d.test, Some(name)),
             Statement::ForStatement(f) => self.for_loop(f, Some(name)),
+            Statement::SwitchStatement(s) => self.switch_stmt(s, Some(name)),
             // Labeled non-loop statement: break-only target.
             body => {
                 let end = self.label();
@@ -482,6 +543,82 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(())
             }
         }
+    }
+
+    /// `switch (d) { case t₁: … case t₂: … default: … }`.
+    ///
+    /// Lowering: evaluate `d` once, then emit a sequential StrictEq chain —
+    /// each `case` test jumps to its body's entry label on match; after the
+    /// last test control falls into the `default` clause (or past the whole
+    /// statement when there is none). Bodies are emitted in source order so
+    /// fallthrough between consecutive clauses is plain control flow.
+    ///
+    /// `break` (labeled or not) targets the end of the switch via the loop
+    /// context stack (`continue` is untouched: a switch is not a loop, so an
+    /// unlabeled `continue` resolves against any enclosing loop as usual).
+    pub fn switch_stmt(
+        &mut self,
+        s: &'a oxc_ast::ast::SwitchStatement<'a>,
+        name: Option<String>,
+    ) -> Res<()> {
+        let disc = self.expr(&s.discriminant)?;
+        let end = self.label();
+        // Pre-scan for a default clause so the fallback jump target exists
+        // only when needed (the builder asserts every label gets bound).
+        let has_default = s.cases.iter().any(|c| c.test.is_none());
+        let default_entry = if has_default {
+            Some(self.label())
+        } else {
+            None
+        };
+
+        // Phase 1: one equality guard per labeled clause, in source order.
+        let mut entries: Vec<Option<Label>> = Vec::with_capacity(s.cases.len());
+        for case in &s.cases {
+            match &case.test {
+                None => entries.push(None),
+                Some(test) => {
+                    let tv = self.expr(test)?;
+                    let eq = self.new_temp();
+                    self.emit_spanned(Instr::new(Opcode::StrictEq, eq, disc, tv), case.span);
+                    let entry = self.label();
+                    entries.push(Some(entry));
+                    self.emit_jump(Opcode::JumpIfTrue, eq, entry);
+                }
+            }
+        }
+        match default_entry {
+            Some(d) => self.emit_jump(Opcode::Jump, 0, d),
+            None => self.emit_jump(Opcode::Jump, 0, end),
+        }
+
+        // Phase 2: bodies in source order (fallthrough = straight-line flow).
+        self.loops.push(LoopCtx {
+            break_label: end,
+            continue_label: None,
+            name,
+            finally_base: self.finallies.len(),
+        });
+        let mut bound_default = false;
+        for (case, entry) in s.cases.iter().zip(entries) {
+            match entry {
+                Some(entry) => self.bind(entry),
+                None => {
+                    if let Some(d) = default_entry {
+                        self.bind(d);
+                        bound_default = true;
+                    }
+                }
+            }
+            self.stmt_list(&case.consequent)?;
+        }
+        debug_assert!(
+            !has_default || bound_default,
+            "default clause must bind its label"
+        );
+        self.loops.pop();
+        self.bind(end);
+        Ok(())
     }
 
     /// `break` / `continue`, including labeled forms and finalizer runs for

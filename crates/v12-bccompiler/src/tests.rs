@@ -117,6 +117,16 @@ impl<'p> Mini<'p> {
             };
 
             // Exception delivery: innermost enclosing handler wins.
+            // `attempt!(expr)` mirrors `throw!` for fallible opcodes; using
+            // plain `?` here would bypass the handler table entirely.
+            macro_rules! attempt {
+                ($e:expr) => {
+                    match $e {
+                        Ok(v) => v,
+                        Err(v) => throw!(v),
+                    }
+                };
+            }
             macro_rules! throw {
                 ($v:expr) => {{
                     let v = $v;
@@ -150,7 +160,8 @@ impl<'p> Mini<'p> {
                             e.slots.borrow_mut()[slot as usize] = regs[src as usize].clone();
                         }
                         WideOp::CallW { dst, func, argc } => {
-                            regs[dst as usize] = self.do_call(&regs, func, argc, &mut cur_env)?;
+                            regs[dst as usize] =
+                                attempt!(self.do_call(&regs, func, argc, &mut cur_env));
                         }
                         WideOp::CopyObjectRestW { .. } | WideOp::CopyArrayRestW { .. } => {
                             panic!("wide copy rest not expected in mini interpreter")
@@ -192,7 +203,7 @@ impl<'p> Mini<'p> {
                 | Opcode::StrictNe => {
                     let l = regs[instr.b() as usize].clone();
                     let r = regs[instr.c() as usize].clone();
-                    regs[instr.a() as usize] = binop(op, l, r)?;
+                    regs[instr.a() as usize] = attempt!(binop(op, l, r));
                     pc += 1;
                 }
                 Opcode::Neg => {
@@ -232,8 +243,12 @@ impl<'p> Mini<'p> {
                 Opcode::LoopHeader => pc += 1,
                 Opcode::Call => {
                     let dst = instr.a();
-                    regs[dst as usize] =
-                        self.do_call(&regs, instr.b(), u16::from(instr.c()), &mut cur_env)?;
+                    regs[dst as usize] = attempt!(self.do_call(
+                        &regs,
+                        instr.b(),
+                        u16::from(instr.c()),
+                        &mut cur_env
+                    ));
                     pc += 1;
                 }
                 Opcode::Return => return Ok(regs[instr.a() as usize].clone()),
@@ -244,20 +259,20 @@ impl<'p> Mini<'p> {
                 Opcode::GetProperty => {
                     let obj = &regs[instr.b() as usize];
                     let key = to_key(&regs[instr.c() as usize]);
-                    regs[instr.a() as usize] = get_prop(obj, &key)?;
+                    regs[instr.a() as usize] = attempt!(get_prop(obj, &key));
                     pc += 1;
                 }
                 Opcode::SetProperty => {
                     let obj = &regs[instr.a() as usize];
                     let key = to_key(&regs[instr.b() as usize]);
                     let value = regs[instr.c() as usize].clone();
-                    set_prop(obj, &key, value)?;
+                    attempt!(set_prop(obj, &key, value));
                     pc += 1;
                 }
                 Opcode::DeleteProperty => {
                     let obj = &regs[instr.b() as usize];
                     let key = to_key(&regs[instr.c() as usize]);
-                    regs[instr.a() as usize] = delete_prop(obj, &key)?;
+                    regs[instr.a() as usize] = attempt!(delete_prop(obj, &key));
                     pc += 1;
                 }
                 Opcode::NewObject => {
@@ -359,6 +374,29 @@ impl<'p> Mini<'p> {
                 | Opcode::CopyObjectRest
                 | Opcode::ArrayAppend => {
                     panic!("generator/async/copy opcodes not expected in tier-1 mini programs")
+                }
+                Opcode::Construct => {
+                    // `new F(args)`: fresh instance object as receiver; the
+                    // body's own returned value wins only when it is an
+                    // object. Prototype linking is not modeled here (real
+                    // coverage lives in v12-interp).
+                    let callee_reg = instr.b();
+                    let argc = u16::from(instr.c());
+                    let Val::Closure(c) = &regs[callee_reg as usize] else {
+                        throw!(Val::Str("TypeError: value is not a constructor".into()))
+                    };
+                    let instance = Val::Obj(Rc::new(RefCell::new(Obj::default())));
+                    let args: Vec<Val> = (0..argc as usize)
+                        .map(|i| regs[callee_reg as usize + 2 + i].clone())
+                        .collect();
+                    let env = c.env.clone();
+                    let fn_idx = c.fn_idx;
+                    let result = self.run_fn(fn_idx, instance.clone(), &args, env)?;
+                    regs[instr.a() as usize] = match result {
+                        Val::Obj(_) => result,
+                        _ => instance,
+                    };
+                    pc += 1;
                 }
             }
         }
@@ -623,6 +661,181 @@ fn expect_str(src: &str, want: &str) {
 
 fn expect_undefined(src: &str) {
     assert!(matches!(eval_src(src), Val::Undefined), "{src}");
+}
+
+// ---------------------------------------------------------------------------
+// Switch statements
+// ---------------------------------------------------------------------------
+
+#[test]
+fn switch_matches_case_and_falls_through() {
+    // Matching clause enters at its body start; missing `break` falls through
+    // into subsequent clauses.
+    expect_str(
+        "
+            let s = '';
+            switch (2) {
+                case 1: s += 'A';
+                case 2: s += 'B';
+                case 3: s += 'C'; break;
+                default: s += 'D';
+            }
+            return s;
+        ",
+        "BC",
+    );
+}
+
+#[test]
+fn switch_default_runs_only_without_match() {
+    expect_str(
+        "
+            let s = '';
+            switch (7) {
+                case 1: s += 'A';
+                default: s += 'D';
+                case 2: s += 'E';
+            }
+            return s;
+        ",
+        "DE",
+    );
+}
+
+#[test]
+fn switch_no_match_no_default_is_pass_through() {
+    expect_str(
+        "let s = 'x'; switch (9) { case 1: s = 'y'; } return s;",
+        "x",
+    );
+}
+
+#[test]
+fn switch_evaluates_tests_in_order_once() {
+    // Discriminant is evaluated once; case tests strictly equal it.
+    expect_num("let d = 1; switch ('1') { case 1: d = 2; } return d;", 1.0);
+}
+
+#[test]
+fn switch_break_jumps_out_labeled_too() {
+    expect_str(
+        "
+            let s = '';
+            outer: switch (1) {
+                case 1: s += 'A'; break outer;
+                case 2: s += 'B';
+            }
+            return s;
+        ",
+        "A",
+    );
+}
+
+#[test]
+fn switch_continue_resolves_to_enclosing_loop() {
+    expect_num(
+        "
+            let n = 0;
+            for (let i = 0; i < 4; i++) {
+                switch (i % 2) {
+                    case 0: continue;
+                }
+                n++;
+            }
+            return n;
+        ",
+        2.0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Optional chains
+// ---------------------------------------------------------------------------
+
+#[test]
+fn optional_chain_dereferences_present_path() {
+    let src = "let o = {a: {b: 41}}; return o?.a.b;";
+    match eval_src(src) {
+        Val::F64(v) => assert_eq!(v, 41.0),
+        other => panic!("{src}: expected number, got {other:?}"),
+    }
+}
+
+#[test]
+fn optional_chain_short_circuits_at_first_nullish_link() {
+    expect_undefined("let o = null; return o?.a.b;");
+    expect_undefined("return undefined?.a?.b?.c();");
+    expect_undefined("function get() { return null; } return get()?.x;");
+}
+
+#[test]
+fn optional_chain_still_throws_after_non_nullish_link() {
+    // `o?.a.b` checks `o` only; a nullish `o.a` throws inside the chain,
+    // mirroring the spec rather than yielding undefined.
+    expect_str(
+        "
+            let o = {a: null};
+            try {
+                return o?.a.b;
+            } catch (e) {
+                return 'caught';
+            }
+        ",
+        "caught",
+    );
+}
+
+#[test]
+fn optional_call_skips_arguments_when_nullish() {
+    // Nullish callee: whole call is skipped — result undefined, no args run.
+    expect_undefined("let hits = 0; let f = null; let r = f?.(hits++); return r;");
+    expect_num("let hits = 0; let f = null; f?.(hits++); return hits;", 0.0);
+    expect_str(
+        "
+            let hits = 0;
+            function f(n) { return 'called'; }
+            null?.(hits++);
+            const v = f?.(hits++);
+            return (v === 'called' ? 'ok' : 'bad') + ':' + hits;
+        ",
+        "ok:1",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Logical assignment operators
+// ---------------------------------------------------------------------------
+
+#[test]
+fn logical_nullish_assignment() {
+    expect_num("let x = null; x ??= 5; return x;", 5.0);
+    expect_undefined("let x = 0; x ??= 5; return void x;"); // 0 is not nullish
+    expect_num("let x = 0; x ??= 5; return x;", 0.0);
+}
+
+#[test]
+fn logical_and_or_assignment() {
+    expect_num("let x = 1; x &&= 3; return x;", 3.0);
+    expect_num("let x = 0; x &&= 3; return x;", 0.0);
+    expect_num("let x = 0; x ||= 3; return x;", 3.0);
+    expect_num("let x = 2; x ||= 3; return x;", 2.0);
+}
+
+// ---------------------------------------------------------------------------
+// Template literals with substitutions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn template_literal_no_substitution() {
+    expect_str("return `plain`;", "plain");
+}
+
+#[test]
+fn template_literal_substitutions_concat_in_order() {
+    expect_str(r"return `a${1}b`;", "a1b");
+    expect_str(r"return `x${'s'}y${2 + 3}z`;", "xsy5z");
+    expect_str(r"return `${undefined}`;", "undefined");
+    expect_str(r"return `v=${1} w=${true} n=${null}`;", "v=1 w=true n=null");
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,6 +1461,104 @@ fn strict_mode_directive_is_recorded() {
 }
 
 // ---------------------------------------------------------------------------
+// Constructor invocation (`new`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn construct_binds_this_and_returns_instance() {
+    expect_num(
+        "
+            function Point(x, y) { this.x = x; this.y = y; }
+            const p = new Point(3, 4);
+            return p.x + p.y;
+        ",
+        7.0,
+    );
+}
+
+#[test]
+fn construct_uses_returned_object_when_object_returned() {
+    expect_str(
+        "
+            function Box(v) { this.v = v; }
+            function Factory(v) {
+                if (v) { return { tag: 'explicit' }; }
+                // falls through: implicit instance
+            }
+            return new Factory(false).tag ?? 'instance';
+        ",
+        "instance",
+    );
+    expect_str(
+        "
+            function Factory() { return { tag: 'explicit' }; }
+            const f = new Factory();
+            return f.tag;
+        ",
+        "explicit",
+    );
+}
+
+#[test]
+fn construct_rejects_non_constructors() {
+    // Primitive callees throw TypeError; plain functions stay constructible.
+    expect_str(
+        "
+            function f() {
+                try { new 5; return 'no-error'; }
+                catch (e) { return e === 'TypeError: value is not a constructor' ? 'yes' : 'wrong-error'; }
+            }
+            return f();
+        ",
+        "yes",
+    );
+    expect_num(
+        "
+            const C = function () {};
+            const inst = new C();
+            let ok = false;
+            try { inst.x = 1; ok = inst.x === 1; } catch (e) { ok = false; }
+            return ok ? 1 : 0;
+        ",
+        1.0,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Object-literal method shorthand
+// ---------------------------------------------------------------------------
+
+#[test]
+fn method_shorthand_binds_this_when_invoked_on_object() {
+    expect_str(
+        "
+            const counter = {
+                n: 3,
+                inc() { this.n += 1; },
+                label() { return 'n' + this.n; }
+            };
+            counter.inc();
+            counter.inc();
+            return counter.label();
+        ",
+        "n5",
+    );
+}
+
+#[test]
+fn construct_and_method_shorthand_together() {
+    expect_num(
+        "
+            function Bag(size) { this.size = size; }
+            const b = new Bag(21);
+            b.double = function () { return this.size * 2; };
+            return b.double();
+        ",
+        42.0,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Error paths
 // ---------------------------------------------------------------------------
 
@@ -1257,10 +1568,9 @@ fn unsupported_constructs_fail_as_compile_errors() {
         "+x",
         "let x = 1n;",
         "for (let v of [1]) {}",
-        "switch (1) { case 1: break; }",
-        "new Object()",
-        "({m() {}})",
-        "`tpl ${1}`",
+        // `new Object()` and `` `tpl ${1}` `` are now lowered (Construct /
+        // template fold); method shorthand lowers as a closure property.
+        "({ get x() { return 1; } })",
         "class C {}",
         "[a, b] = [1, 2]",
         "return 1;",

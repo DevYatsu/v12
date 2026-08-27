@@ -16,6 +16,12 @@ fn expect_throw(interp: &mut Interp) -> JsValue {
     }
 }
 
+/// Compiles + runs `src` (via `throw` completion) returning the thrown value.
+fn eval_thrown(src: &str) -> JsValue {
+    let mut interp = Interp::from_source(src).expect("compile");
+    expect_throw(&mut interp)
+}
+
 fn empty_fn(max_regs: u16, instrs: Vec<Instr>, consts: ConstantPool) -> FunctionBytecode {
     let spans = vec![(0, 0); instrs.len()];
     FunctionBytecode {
@@ -926,4 +932,54 @@ fn global_object_get_prototype_property_is_reachable() {
     let proto_val = v12_heap::JsValue::object(obj);
     // Use the interpreter's getProperty path to verify prototype chain handling still works without invoking the native.
     let _ = proto_val;
+}
+
+// ---------------------------------------------------------------------------
+// Opcode::Construct — `new F(args)`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn construct_binds_this_and_persists_properties() {
+    let v = eval_thrown("function P(x) { this.v = x; } throw (new P(9)).v;");
+    assert_eq!(v.as_smi(), Some(9));
+}
+
+#[test]
+fn construct_creates_prototype_once_per_function() {
+    // Instances created by separate `new` calls share one prototype object,
+    // so instanceof succeeds for both.
+    let v = eval_thrown(
+        "function C() {} \
+         const a = new C(), b = new C(); \
+         throw ((a instanceof C) && (b instanceof C)) ? 1 : 0;",
+    );
+    assert_eq!(v.as_smi(), Some(1));
+}
+
+#[test]
+fn construct_property_writes_landing_on_instance_not_prototype() {
+    let v = eval_thrown(
+        "function T() { this.x = 5; } \
+         const a = new T(); a.y = 6; \
+         throw (T.prototype.x === undefined && T.prototype.y === undefined) ? 1 : 0;",
+    );
+    assert_eq!(v.as_smi(), Some(1));
+}
+
+#[test]
+fn construct_return_object_overrides_instance() {
+    let v = eval_thrown("function F() { return { marker: 3 }; } throw (new F()).marker;");
+    assert_eq!(v.as_smi(), Some(3));
+}
+
+#[test]
+fn construct_non_constructor_throws_type_error() {
+    let mut interp =
+        Interp::from_source("throw (() => { try { new 5; } catch (e) { return e; } })();").unwrap();
+    let v = expect_throw(&mut interp);
+    let msg = interp.to_display_string(v);
+    assert!(
+        msg.contains("not a constructor"),
+        "unexpected message: {msg}"
+    );
 }

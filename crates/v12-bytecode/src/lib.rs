@@ -96,6 +96,17 @@ pub enum Opcode {
     GetGlobal = 60,
     /// Global property set: `global["name"] = r_a`.
     SetGlobal = 61,
+    /// Constructor invocation (`new f(args)`): same register layout as
+    /// [`Opcode::Call`] (`a` = dst/header base, `b` = callee reg, `c` = argc
+    /// narrow form; see [`WideOp`] notes for wide encoding parity).
+    ///
+    /// Semantics implemented by executors: only constructors ([[Construct]])
+    /// may be invoked. For a bytecode function the executor allocates an
+    /// instance whose [[Prototype]] is `callee.prototype` (created on first
+    /// use when absent), binds it as `this`, runs the body, and yields the
+    /// returned object when the body returns one, otherwise the instance
+    /// itself. Anything else throws TypeError "not a constructor".
+    Construct = 62,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -160,6 +171,7 @@ impl TryFrom<u8> for Opcode {
             59 => Ok(Self::ArrayAppend),
             60 => Ok(Self::GetGlobal),
             61 => Ok(Self::SetGlobal),
+            62 => Ok(Self::Construct),
             other => Err(other),
         }
     }
@@ -325,6 +337,7 @@ mod encoding_tests {
         Opcode::ArrayAppend,
         Opcode::GetGlobal,
         Opcode::SetGlobal,
+        Opcode::Construct,
     ];
 
     #[test]
@@ -341,6 +354,7 @@ mod encoding_tests {
         assert_eq!(Opcode::ArrayAppend as u8, 59);
         assert_eq!(Opcode::GetGlobal as u8, 60);
         assert_eq!(Opcode::SetGlobal as u8, 61);
+        assert_eq!(Opcode::Construct as u8, 62);
         let unique: std::collections::HashSet<u8> = ALL_OPS.iter().map(|&op| op as u8).collect();
         assert_eq!(unique.len(), ALL_OPS.len());
     }
@@ -1024,6 +1038,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::ArrayAppend => "array_append",
         Opcode::GetGlobal => "get_global",
         Opcode::SetGlobal => "set_global",
+        Opcode::Construct => "construct",
     }
 }
 
@@ -1060,7 +1075,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::Jump => write!(f, " -> {}", i.imm24()),
         Opcode::JumpIfFalse | Opcode::JumpIfTrue => write!(f, " r{a}, -> {}", i.imm16()),
         Opcode::LoopHeader => Ok(()),
-        Opcode::Call => write!(f, " r{a}, r{b}, argc={c}"),
+        Opcode::Call | Opcode::Construct => write!(f, " r{a}, r{b}, argc={c}"),
         Opcode::Return | Opcode::Throw => write!(f, " r{a}"),
         Opcode::GetProperty | Opcode::DeleteProperty => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::SetProperty => write!(f, " r{a}, r{b}, r{c}"),
