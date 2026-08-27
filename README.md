@@ -7,11 +7,11 @@ garbage-collected runtime implemented from scratch — no bindings to V8,
 JavaScriptCore, or QuickJS. The goal is an embeddable engine that is fast to
 start, small in memory, and correct enough to run real programs.
 
-> **Status: early development — Tier-0 executes, embedding works, CLI ships.**
-> The compiler, heap, interpreter, baseline JIT, embedding engine, and
-> `v12` CLI (REPL + script runner) are implemented and tested (296 tests,
-> `cargo nextest run --workspace`). Test262 harness and Tier-2 optimizer
-> remain planned. Expect breaking changes.
+> **Status: early development — full pipeline works: compile → run → optimize.**
+> The compiler, heap, interpreter, baseline JIT, embedding engine, the `v12`
+> CLI, a Test262 harness, and a Tier-2 optimizer scaffold are implemented and
+> tested (484 tests, `cargo nextest run --workspace`). Current Test262
+> `language` pass rate: 4 958/24 873 (24.9%). Expect breaking changes.
 
 ## Why another engine?
 
@@ -29,7 +29,7 @@ commit —
 - **A handle-based heap**: objects live in arenas addressed by 32-bit indices,
   so garbage collection never scans the native stack and never moves data under
   a running mutator
-- **Cranelift-backed JIT tiers** (in progress) instead of hand-written assembly
+- **Cranelift-backed JIT tiers** — a baseline template tier today, a speculative optimizing tier landing now
 
 Where a best-in-class crate exists, v12 uses it rather than rebuilding it:
 [oxc](https://oxc.rs) parses and analyzes all JavaScript, [regress][] implements
@@ -45,12 +45,12 @@ and [lasso][lasso] interns identifier strings.
 | `v12-heap` | Values, typed handles, hidden classes, elements storage, strings, mark-sweep garbage collector |
 | `v12-bccompiler` | oxc AST → bytecode compiler (scopes, closures, exceptions, peephole pass) |
 | `v12-interp` | Tier-0 bytecode interpreter (iterative loop, handler tables, tier-up feedback) |
-| `v12-jit-baseline` | Tier-1 template JIT backed by Cranelift (feature-gated) |
-| `v12-jit-opt` | Tier-2 speculative optimizing JIT *(planned, post-v1)* |
+| `v12-jit-baseline` | Tier-1 template JIT backed by Cranelift (feature-gated, `brif` guards + deopt map) |
+| `v12-jit-opt` | Tier-2 speculative optimizer — type lattice, guards, SSA, inlining, loop versioning *(driver wiring pending)* |
 | `v12-regex` | ES-semantics wrapper over `regress` |
 | `v12-intl` | `Intl`/Temporal primitives over ICU4X and `temporal_rs` |
-| `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error), single realm, microtask queue, `Engine::eval` API |
-| `v12-cli` | The `v12` binary: REPL and script runner *(in progress)* |
+| `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error), single realm, microtask queue, `Engine::eval` API, ESM module compilation |
+| `v12-cli` | The `v12` binary: REPL (rustyline — history + arrows) and script runner |
 
 ## Try the pieces that exist today
 
@@ -73,7 +73,7 @@ for function in &program.functions {
 }
 ```
 
-Run the test suite (296 tests, `cargo nextest run --workspace`):
+Run the test suite (484 tests, `cargo nextest run --workspace`):
 
 ```sh
 cargo nextest run --workspace
@@ -99,10 +99,14 @@ cargo nextest run --workspace
 - [x] Compiler front end: statements, closures, exceptions, peephole pass
 - [x] Tier-0 interpreter — handler-table unwinding, GC-rooted frames, differential vs reference interpreter
 - [x] Built-ins — Object/Array/String/Number/Math/Error + single realm, microtask queue, `Engine::eval` API
-- [x] Tier-1 baseline JIT — Cranelift template (feature-gated, 21 opcodes, deopt pc_map)
-- [x] `v12` CLI — script runner + REPL (`--disasm`, `--expose-gc`, pipe fallback)
-- [ ] Test262 conformance harness and benchmark gating
-- [ ] Tier-2 speculative optimizer
+- [x] Tier-1 baseline JIT — Cranelift template (feature-gated, deopt pc_map)
+- [x] `v12` CLI — script runner + REPL (rustyline: history + arrows)
+- [x] Test262 harness — parallel runner, TAP/JSON/human output, per-suite gating (`conformance/run.sh`)
+- [x] Tier-2 speculative optimizer — type lattice, guards, SSA, inlining, loop versioning
+- [x] ESM modules — `compile_source_as_module`, import/export linkage, `Engine` module compilation
+- [ ] Test262 `language` conformance burn-down — 4 958/24 873 (24.9%); queue in `conformance/known-failures.md`
+- [ ] Tier-2 driver wiring — second tier-up fire → `JitOpt::compile`, deopt backoff
+- [ ] Built-in breadth — `Object.getOwnPropertyNames`, Promise, Map/Set, error objects with proper classes
 
 Performance targets: match or beat V8 on startup time and memory footprint;
 interpreter performance in the class of modern production interpreters. Beating
