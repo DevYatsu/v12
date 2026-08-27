@@ -1,0 +1,33 @@
+# .github/workflows/ci.yml
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace
+      # JIT is feature-gated on v12-jit-baseline; --all-features (not
+      # `--features jit`, which needs a package qualifier in a virtual
+      # workspace) ensures gated tests are not silently skipped.
+      - run: cargo nextest run --workspace --all-features
+
+  conformance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: ./conformance/run.sh --filter language --jobs 4 --format tap --tap-out /tmp/t262.tap
+      - name: Report pass rate
+        if: always()
+        run: |
+          tail -n 40 /tmp/t262.tap || true
