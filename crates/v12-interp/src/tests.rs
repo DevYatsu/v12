@@ -1,9 +1,7 @@
 //! Focused unit tests over hand-built bytecode: the wide-operand encodings,
 //! handler delivery depth, the call-depth guard, the native seam, and
 //! fall-off-the-end completion. The differential suite in
-//! `tests/differential.rs` covers compiled Tier-1 programs end to end
-//! (added in Task 4 of the test-coverage plan; it will not exist until that
-//! task lands — until then this pointer is forward-looking).
+//! `tests/differential.rs` covers compiled Tier-1 programs end to end.
 
 use v12_bytecode::{Const, ConstantPool, FunctionBytecode, HandlerRange, Instr, Opcode, WideOp};
 use v12_heap::{Heap, JsValue};
