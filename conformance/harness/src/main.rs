@@ -14,9 +14,11 @@ mod harness;
 mod report;
 mod runner;
 
+use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressIterator, ProgressStyle};
 use rayon::prelude::*;
 
 use crate::report::{Summary, emit_json, emit_summary, emit_tap};
@@ -27,6 +29,35 @@ const DEFAULT_JOBS: usize = 8;
 
 /// Maximum value for `--jobs`.
 const MAX_JOBS: usize = 64;
+
+/// Template for the run progress bar. `{msg}` shows the current test's
+/// relative path; colors keep the counters cyan and the bar green.
+const PROGRESS_TEMPLATE: &str = "{pos:.cyan}/{len:.cyan} [{bar:40.green}] {percent}% {eta} {msg}";
+
+/// Maximum characters shown in the progress-bar message (the test's
+/// relative path) before it is truncated.
+const MAX_PROGRESS_MSG_CHARS: usize = 48;
+
+/// Build the per-run progress bar, or a hidden bar when stdout is not a TTY
+/// (so machine consumers of stdout never see escape codes).
+fn make_progress_bar(total: usize, is_terminal: bool) -> ProgressBar {
+    if !is_terminal {
+        return ProgressBar::hidden();
+    }
+    let style = ProgressStyle::with_template(PROGRESS_TEMPLATE)
+        .expect("PROGRESS_TEMPLATE is a valid indicatif template")
+        .progress_chars("█▓░");
+    ProgressBar::new(total as u64).with_style(style)
+}
+
+/// Shorten a relative path so the progress-bar message stays on one line.
+fn truncate_progress_msg(msg: &str) -> String {
+    if msg.chars().count() <= MAX_PROGRESS_MSG_CHARS {
+        return msg.to_owned();
+    }
+    let kept: String = msg.chars().take(MAX_PROGRESS_MSG_CHARS - 1).collect();
+    format!("{kept}…")
+}
 
 /// CLI for the Test262 runner.
 #[derive(Debug, Parser)]
@@ -144,17 +175,32 @@ fn main() {
         test262_root.display()
     );
 
+    // Progress renders to stderr only (indicatif's default draw target);
+    // hidden when stdout is not a TTY so machine consumers see clean output.
+    let pb = make_progress_bar(files.len(), stdout().is_terminal());
+
     let outcomes: Vec<TestOutcome> = if jobs <= 1 {
         files
             .iter()
-            .map(|p| run_single_test(p, &harness_config))
+            .progress_with(pb.clone())
+            .map(|p| {
+                let outcome = run_single_test(p, &harness_config);
+                pb.set_message(truncate_progress_msg(&outcome.relative));
+                outcome
+            })
             .collect()
     } else {
         files
             .par_iter()
-            .map(|p| run_single_test(p, &harness_config))
+            .progress_with(pb.clone())
+            .map(|p| {
+                let outcome = run_single_test(p, &harness_config);
+                pb.set_message(truncate_progress_msg(&outcome.relative));
+                outcome
+            })
             .collect()
     };
+    pb.finish_and_clear();
 
     // Verbose per-test line during the run has already happened via stderr;
     // additionally echo each outcome if --verbose and not TAP (which already
@@ -335,5 +381,27 @@ mod cli_tests {
     fn resolve_explicit_wins() {
         let p = PathBuf::from("/tmp/foo");
         assert_eq!(resolve_test262_root(Some(&p)), p);
+    }
+
+    #[test]
+    fn progress_template_has_required_keys() {
+        for key in ["{pos", "{len", "{bar", "{percent}", "{eta}", "{msg}"] {
+            assert!(
+                PROGRESS_TEMPLATE.contains(key),
+                "PROGRESS_TEMPLATE missing {key}"
+            );
+        }
+        // Sanity: the style helper accepts its own template.
+        make_progress_bar(10, false).finish_and_clear();
+    }
+
+    #[test]
+    fn truncate_progress_msg_respects_limit() {
+        let short = "language/expressions/optional-chaining.js";
+        assert_eq!(truncate_progress_msg(short), short);
+        let long = "a".repeat(200);
+        let truncated = truncate_progress_msg(&long);
+        assert_eq!(truncated.chars().count(), MAX_PROGRESS_MSG_CHARS);
+        assert!(truncated.ends_with('…'));
     }
 }
