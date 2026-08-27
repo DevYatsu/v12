@@ -163,8 +163,16 @@ impl<'p> Mini<'p> {
                             regs[dst as usize] =
                                 attempt!(self.do_call(&regs, func, argc, &mut cur_env));
                         }
-                        WideOp::CopyObjectRestW { .. } | WideOp::CopyArrayRestW { .. } => {
-                            panic!("wide copy rest not expected in mini interpreter")
+                        // Wide constructs beyond calls are exercised by the
+                        // real interpreter; the mini-interp only proves the
+                        // narrow semantics of compiled snippets.
+                        WideOp::ClosureW { .. }
+                        | WideOp::NewEnvironmentW { .. }
+                        | WideOp::ConstructW { .. }
+                        | WideOp::CopyObjectRestW { .. }
+                        | WideOp::CopyArrayRestW { .. }
+                        | WideOp::RegExt { .. } => {
+                            panic!("wide op not expected in mini-interp snippets")
                         }
                     }
                     pc += width;
@@ -245,7 +253,7 @@ impl<'p> Mini<'p> {
                     let dst = instr.a();
                     regs[dst as usize] = attempt!(self.do_call(
                         &regs,
-                        instr.b(),
+                        u16::from(instr.b()),
                         u16::from(instr.c()),
                         &mut cur_env
                     ));
@@ -402,7 +410,7 @@ impl<'p> Mini<'p> {
         }
     }
 
-    fn do_call(&self, regs: &[Val], callee_reg: u8, argc: u16, _env: &mut Rc<Env>) -> Step {
+    fn do_call(&self, regs: &[Val], callee_reg: u16, argc: u16, _env: &mut Rc<Env>) -> Step {
         let callee = &regs[callee_reg as usize];
         let Val::Closure(c) = callee else {
             return Err(Val::Str("TypeError: not a function".into()));
@@ -1626,11 +1634,11 @@ fn instanceof_operator_compiles_to_opcode() {
 
 #[test]
 fn too_many_locals_returns_compile_error_not_panic() {
-    // Build a source with 300 distinct let bindings in one function scope,
-    // exceeding the u8 register limit (255). The compiler must return a
+    // Build a source with 70_000 distinct let bindings in one function scope,
+    // exceeding the u16 register limit (65 535). The compiler must return a
     // graceful CompileError with message "too many functions/constants".
     let mut src = String::new();
-    for i in 0..300 {
+    for i in 0..70_000 {
         src.push_str(&format!("let v{i} = {i};\n"));
     }
     src.push_str("let sum = 0;\n");
@@ -1646,12 +1654,12 @@ fn too_many_locals_returns_compile_error_not_panic() {
     );
     // Near-limit program should still compile.
     let mut ok_src = String::new();
-    for i in 0..80 {
+    for i in 0..300 {
         ok_src.push_str(&format!("let v{i} = {i};\n"));
     }
     assert!(
         compile_source_with_strings(&ok_src).is_ok(),
-        "80 locals should fit within limits"
+        "300 locals should fit within u16 limits"
     );
 }
 

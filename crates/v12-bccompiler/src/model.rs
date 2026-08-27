@@ -18,29 +18,43 @@ use oxc_span::Span;
 use v12_bytecode::{Const, FunctionBuilder, Instr, Label, Opcode, WideOp};
 
 /// Register 0 of every frame holds `this` (main unit: `undefined`).
-pub const REG_THIS: u8 = 0;
+pub const REG_THIS: u16 = 0;
 
 /// Calling convention (see `emit_call`): the callee's register window starts
 /// at `callee_reg + 1`, so callee `r0` == caller `r{callee_reg + 1}` == the
 /// `this` value, and callee `r{i}` == argument `i - 1`. Arguments therefore
 /// occupy `callee_reg + 2 .. callee_reg + 2 + argc` on the caller side and no
 /// copying is needed at either boundary.
-pub const CALL_HEADER_REGS: u8 = 2; // callee + this
+pub const CALL_HEADER_REGS: u16 = 2;
 
-/// Hard cap on registers per function: instruction operand slots are u8 and
-/// one slot is reserved as the never-written `undefined` source register.
-pub const MAX_REGS: u8 = 255;
+/// Hard cap on registers per function.
+///
+/// WHY u16: narrow instructions address registers with 8-bit slots, so
+/// functions whose register window exceeds 255 escape through the
+/// [`WideOp::RegExt`] prefix (16-bit register operands). 65 535 is the
+/// largest value the escape can express (high byte + low byte); it also
+/// bounds the interpreter frame window, which is indexed by
+/// [`FunctionBytecode::max_regs`].
+pub const MAX_REGS: u16 = 65_535;
 
-/// Upper bound for a single function's environment slot count (narrow u8
-/// operand; larger programs should be split).
-pub const MAX_ENV_SLOTS: u8 = 255;
+/// Upper bound for a single function's environment slot count.
+///
+/// Mirrors [`MAX_REGS`]: narrow `GetEnvSlot`/`SetEnvSlot`/`NewEnvironment`
+/// carry 8-bit slot operands; larger slot counts escape through
+/// `WideOp::GetEnvSlotW`/`SetEnvSlotW`/`NewEnvironmentW` (16-bit operands).
+pub const MAX_ENV_SLOTS: u16 = 65_535;
 
 /// Native index reserved for the synchronous module import helper.
 ///
 /// See [`crate::unit::NATIVE_IMPORT_INDEX`] and the crate-level docs for
 /// the calling convention. Kept here so callers that only depend on the
 /// model (e.g., the engine) have a single source of truth.
-pub const NATIVE_IMPORT_INDEX: u8 = 254;
+///
+/// Caveat: the engine's `NativeRegistry` hardcodes this index, so it cannot
+/// move to free the whole u16 function-index range. A module program whose
+/// function table reaches index 254 would collide with it; such programs are
+/// outside the supported envelope (see the `emit_closure_instr` limit).
+pub const NATIVE_IMPORT_INDEX: u16 = 254;
 pub const NATIVE_IMPORT_INDEX_U32: u32 = NATIVE_IMPORT_INDEX as u32;
 
 // ---------------------------------------------------------------------------
@@ -139,10 +153,12 @@ pub struct ExportEntry {
 /// Where a declared variable lives at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VarLoc {
-    /// A frame register (plain local).
-    Reg(u8),
+    /// A frame register (plain local). u16: functions with more than 255
+    /// registers address the upper range through `WideOp::RegExt`.
+    Reg(u16),
     /// A slot in the home function unit's heap Environment (captured).
-    Env(u8),
+    /// u16: slot counts beyond 255 escape through the `…W` env-slot ops.
+    Env(u16),
     /// A property on the global object (`GetGlobal`/`SetGlobal`).
     ///
     /// Used for `var` bindings that alias the global object as well as for
@@ -202,9 +218,9 @@ pub struct UnitPlan {
     pub has_env: bool,
     /// An arrow-descendant reads `this`, forcing an Environment to thread it.
     pub needs_this: bool,
-    pub env_slots: HashMap<SymbolId, u8>,
-    pub this_slot: Option<u8>,
-    pub env_slot_count: u8,
+    pub env_slots: HashMap<SymbolId, u16>,
+    pub this_slot: Option<u16>,
+    pub env_slot_count: u16,
     /// Declarations at the head of `decl_order` that are function parameters.
     pub param_count: usize,
     /// `true` when the last parameter is a rest parameter.
@@ -212,7 +228,7 @@ pub struct UnitPlan {
     /// Strict mode for this unit (inherited + directive).
     pub is_strict: bool,
     /// First free register above params + non-captured locals.
-    pub locals_end: u8,
+    pub locals_end: u16,
 }
 
 impl UnitPlan {
@@ -415,9 +431,9 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     pub unit: usize,
     /// Next temporary register (starts above `locals_end`; `locals_end`
     /// itself stays reserved as the undefined source register).
-    temp_top: u8,
+    temp_top: u16,
     /// One past the highest register any emission touched.
-    high_water: u8,
+    high_water: u16,
     /// Maximum `stack_depth + 1` across all handlers in this unit.
     pub(crate) handler_max: u32,
     pub loops: Vec<LoopCtx>,
@@ -451,16 +467,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     // -- registers ----------------------------------------------------------
 
-    pub fn new_temp(&mut self) -> u8 {
+    pub fn new_temp(&mut self) -> u16 {
         if self.overflow.is_some() {
             return 0;
         }
         let r = self.temp_top;
         let Some(next) = self.temp_top.checked_add(1) else {
-            self.overflow = Some(CompileError {
-                message: "too many functions/constants".into(),
-                span: Some((0, 0)),
-            });
+            self.overflow = Some(self.overflow_err());
             return 0;
         };
         self.temp_top = next;
@@ -472,16 +485,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// Contiguous block for call layouts and array elements.
-    pub fn new_temps(&mut self, n: u8) -> u8 {
+    pub fn new_temps(&mut self, n: u16) -> u16 {
         if self.overflow.is_some() {
             return 0;
         }
         let base = self.temp_top;
         let Some(next) = self.temp_top.checked_add(n) else {
-            self.overflow = Some(CompileError {
-                message: "too many functions/constants".into(),
-                span: Some((0, 0)),
-            });
+            self.overflow = Some(self.overflow_err());
             return 0;
         };
         self.temp_top = next;
@@ -493,20 +503,28 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         base
     }
 
-    pub fn temp_mark(&self) -> u8 {
+    pub fn temp_mark(&self) -> u16 {
         self.temp_top
     }
 
-    pub fn temp_release(&mut self, mark: u8) {
+    pub fn temp_release(&mut self, mark: u16) {
         self.temp_top = mark.min(self.temp_top);
     }
 
-    fn track(&mut self, reg: u8) -> Result<(), CompileError> {
-        if u16::from(reg) >= u16::from(MAX_REGS) {
-            return Err(CompileError {
-                message: "too many functions/constants".into(),
-                span: Some((0, 0)),
-            });
+    /// The single capacity error message. Named for the historical bucket:
+    /// Test262 negative handling keys off a clean compile failure, and every
+    /// saturating counter (registers, env slots, temps) shares it.
+    fn overflow_err(&self) -> CompileError {
+        CompileError {
+            message: "too many functions/constants".into(),
+            span: Some((0, 0)),
+        }
+    }
+
+    fn track(&mut self, reg: u16) -> Result<(), CompileError> {
+        #[allow(clippy::absurd_extreme_comparisons)]
+        if reg >= MAX_REGS {
+            return Err(self.overflow_err());
         }
         self.high_water = self.high_water.max(reg + 1);
         Ok(())
@@ -514,7 +532,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// The reserved never-written register; reading it yields `undefined`
     /// (all registers initialize to `undefined` — frame ABI).
-    pub fn undef_reg(&self) -> u8 {
+    pub fn undef_reg(&self) -> u16 {
         self.comp.plans.units[self.unit].locals_end
     }
 
@@ -541,12 +559,71 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     // -- primitive emissions -------------------------------------------------
 
+    /// Emits a pre-built instruction word. Narrow-only: registers above u8
+    /// must go through the `emit_reg*` helpers, which add the `RegExt`
+    /// prefix. Kept for direct single-word emissions that carry no register
+    /// operands (e.g. `LoopHeader`).
+    #[allow(dead_code)] // narrow escape hatch; most emission routes through helpers now
     pub fn emit(&mut self, instr: Instr) {
         self.b.emit(instr);
     }
 
-    pub fn emit_op(&mut self, op: Opcode, a: u8, bb: u8, c: u8) {
-        self.b.emit(Instr::new(op, a, bb, c));
+    /// Emits `op a, b, c` where **all three slots are registers**; falls back
+    /// to a `WideOp::RegExt` prefix when a register exceeds the narrow 8-bit
+    /// slot. Never use for ops whose slots carry immediates.
+    pub fn emit_reg3(&mut self, op: Opcode, a: u16, b: u16, c: u16, span: oxc_span::Span) {
+        self.emit_regs(op, a, b, c, 0b0111, span);
+    }
+
+    /// Two register slots (`c` stays 0 and unextended).
+    pub fn emit_reg2(&mut self, op: Opcode, a: u16, b: u16, span: oxc_span::Span) {
+        self.emit_regs(op, a, b, 0, 0b0011, span);
+    }
+
+    /// One register slot in `a`.
+    pub fn emit_reg1(&mut self, op: Opcode, a: u16, span: oxc_span::Span) {
+        self.emit_regs(op, a, 0, 0, 0b0001, span);
+    }
+
+    /// Two register slots plus an 8-bit immediate in `c` (never extended).
+    pub fn emit_reg2_imm8(&mut self, op: Opcode, a: u16, b: u16, imm8: u8, span: oxc_span::Span) {
+        self.emit_regs(op, a, b, u16::from(imm8), 0b0011, span);
+    }
+
+    /// The narrow/wide funnel for register operands.
+    ///
+    /// `reg_mask` bit 0/1/2 marks slots `a`/`b`/`c` as registers, so only
+    /// those may receive a `RegExt` high byte; immediate slots (e.g. `c`
+    /// holding an argc or array length) must fit u8 and stay unmasked.
+    fn emit_regs(
+        &mut self,
+        op: Opcode,
+        a: u16,
+        b: u16,
+        c: u16,
+        reg_mask: u8,
+        span: oxc_span::Span,
+    ) {
+        let fits_narrow = |v: u16| v <= u16::from(u8::MAX);
+        if fits_narrow(a) && fits_narrow(b) && fits_narrow(c) {
+            self.emit_spanned(Instr::new(op, a as u8, b as u8, c as u8), span);
+            return;
+        }
+        debug_assert!(
+            (fits_narrow(a) || reg_mask & 1 != 0)
+                && (fits_narrow(b) || reg_mask & 2 != 0)
+                && (fits_narrow(c) || reg_mask & 4 != 0),
+            "only register slots may be RegExt-extended"
+        );
+        let words = WideOp::RegExt {
+            mask: reg_mask,
+            a_hi: (a >> 8) as u8,
+            b_hi: (b >> 8) as u8,
+            c_hi: (c >> 8) as u8,
+        }
+        .encode();
+        self.emit_words(words, span);
+        self.emit_spanned(Instr::new(op, a as u8, b as u8, c as u8), span);
     }
 
     pub fn emit_spanned(&mut self, instr: Instr, span: oxc_span::Span) {
@@ -565,8 +642,26 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.b.pc()
     }
 
-    pub fn emit_jump(&mut self, op: Opcode, cond: u8, target: Label) {
-        self.b.emit_jump(op, cond, target);
+    /// Emits a branch to `target`, with a `RegExt` prefix when the condition
+    /// register exceeds the narrow 8-bit slot. `Jump` ignores `cond`.
+    pub fn emit_jump(&mut self, op: Opcode, cond: u16, target: Label) {
+        if cond <= u16::from(u8::MAX) {
+            self.b.emit_jump(op, cond as u8, target);
+            return;
+        }
+        // The prefix is emitted first so the builder's fixup still points at
+        // the branch word itself.
+        self.emit_words(
+            WideOp::RegExt {
+                mask: 0b0001,
+                a_hi: (cond >> 8) as u8,
+                b_hi: 0,
+                c_hi: 0,
+            }
+            .encode(),
+            oxc_span::Span::default(),
+        );
+        self.b.emit_jump(op, cond as u8, target);
     }
 
     pub fn add_const(&mut self, c: Const) -> Result<u16, CompileError> {
@@ -579,12 +674,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Loads a pooled constant into `dst` (16-bit const ids always fit).
     pub fn load_const(
         &mut self,
-        dst: u8,
+        dst: u16,
         konst: Const,
         span: oxc_span::Span,
     ) -> Result<(), CompileError> {
         let k = self.add_const(konst)?;
-        self.emit_spanned(Instr::new_imm16(Opcode::LoadConst, dst, k), span);
+        self.emit_regs(Opcode::LoadConst, dst, k >> 8, k & 0xFF, 0b0001, span);
         Ok(())
     }
 
@@ -594,15 +689,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// `Str32` payload, which is pooled and whose pool index becomes the
     /// `LoadConst` immediate. This is distinct from `GetGlobal`'s
     /// `PropKey` (Spur) immediate — see `Interner` docs.
-    pub fn load_str(&mut self, dst: u8, s: &str, span: oxc_span::Span) -> Result<(), CompileError> {
+    pub fn load_str(
+        &mut self,
+        dst: u16,
+        s: &str,
+        span: oxc_span::Span,
+    ) -> Result<(), CompileError> {
         let id = str_id_of(self.comp.strings.get_or_intern(s));
         self.load_const(dst, Const::Str32(id), span)
     }
 
     /// Loads an i64 as narrowly as the encoding allows.
-    pub fn load_int(&mut self, dst: u8, v: i64, span: oxc_span::Span) {
-        if (-128..=127).contains(&v) {
-            self.emit_spanned(Instr::new(Opcode::LoadInt, dst, 0, v as i8 as u8), span);
+    pub fn load_int(&mut self, dst: u16, v: i64, span: oxc_span::Span) {
+        if (-128..=127).contains(&v) && dst <= u16::from(u8::MAX) {
+            self.emit_spanned(
+                Instr::new(Opcode::LoadInt, dst as u8, 0, v as i8 as u8),
+                span,
+            );
         } else {
             let words = WideOp::LoadIntW { dst, value: v }.encode();
             self.emit_words(words, span);
@@ -618,58 +721,160 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// `undefined` materialization: copy from the reserved register.
-    pub fn load_undefined(&mut self, dst: u8, span: oxc_span::Span) {
+    pub fn load_undefined(&mut self, dst: u16, span: oxc_span::Span) {
         let src = self.undef_reg();
-        self.emit_spanned(Instr::new(Opcode::Move, dst, src, 0), span);
+        self.move_reg(dst, src, span);
     }
 
     /// Boolean literals: comparisons yield booleans, so `0 == 0` / `0 != 0`
     /// materialize `true` / `false` without a boolean constant kind.
-    pub fn load_bool(&mut self, dst: u8, v: bool, span: oxc_span::Span) {
+    pub fn load_bool(&mut self, dst: u16, v: bool, span: oxc_span::Span) {
         let t = self.new_temp();
         self.load_int(t, 0, span);
         let op = if v { Opcode::Eq } else { Opcode::Ne };
-        self.emit_spanned(Instr::new(op, dst, t, t), span);
+        self.emit_reg3(op, dst, t, t, span);
     }
 
-    pub fn move_reg(&mut self, dst: u8, src: u8, span: oxc_span::Span) {
-        self.emit_spanned(Instr::new(Opcode::Move, dst, src, 0), span);
+    pub fn move_reg(&mut self, dst: u16, src: u16, span: oxc_span::Span) {
+        self.emit_reg2(Opcode::Move, dst, src, span);
     }
 
-    /// `GetEnvSlot` with wide fallback once depth/slot exceed u8.
-    pub fn emit_get_env(&mut self, dst: u8, depth: u8, slot: u8, span: oxc_span::Span) {
-        self.emit_spanned(Instr::new(Opcode::GetEnvSlot, dst, depth, slot), span);
+    /// `GetEnvSlot` with wide fallback once the slot (or destination)
+    /// exceeds the narrow 8-bit operand.
+    pub fn emit_get_env(&mut self, dst: u16, depth: u8, slot: u16, span: oxc_span::Span) {
+        if dst <= u16::from(u8::MAX) && slot <= u16::from(u8::MAX) {
+            self.emit_spanned(
+                Instr::new(Opcode::GetEnvSlot, dst as u8, depth, slot as u8),
+                span,
+            );
+        } else {
+            let words = WideOp::GetEnvSlotW {
+                dst,
+                depth: u16::from(depth),
+                slot,
+            }
+            .encode();
+            self.emit_words(words, span);
+        }
     }
 
-    pub fn emit_set_env(&mut self, depth: u8, slot: u8, src: u8, span: oxc_span::Span) {
-        self.emit_spanned(Instr::new(Opcode::SetEnvSlot, depth, slot, src), span);
+    pub fn emit_set_env(&mut self, depth: u8, slot: u16, src: u16, span: oxc_span::Span) {
+        if src <= u16::from(u8::MAX) && slot <= u16::from(u8::MAX) {
+            self.emit_spanned(
+                Instr::new(Opcode::SetEnvSlot, depth, slot as u8, src as u8),
+                span,
+            );
+        } else {
+            let words = WideOp::SetEnvSlotW {
+                src,
+                depth: u16::from(depth),
+                slot,
+            }
+            .encode();
+            self.emit_words(words, span);
+        }
     }
 
     /// `GetGlobal dst, name_id` where `name_id` is the `Spur`'s
     /// `str_id_of` (string table index) for the global name. The immediate
     /// is a direct string table id, not a pool index — distinct from
     /// `LoadConst`'s `Str32` pool immediate. See `Interner` docs.
-    pub fn emit_get_global(&mut self, dst: u8, name_id: u32, span: oxc_span::Span) {
+    pub fn emit_get_global(&mut self, dst: u16, name_id: u32, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
-        self.emit_spanned(Instr::new_imm16(Opcode::GetGlobal, dst, k), span);
+        self.emit_regs(Opcode::GetGlobal, dst, k >> 8, k & 0xFF, 0b0001, span);
     }
 
     /// `SetGlobal name_id, src` — same `Spur`-derived string table id as
     /// `GetGlobal`.
-    pub fn emit_set_global(&mut self, name_id: u32, src: u8, span: oxc_span::Span) {
+    pub fn emit_set_global(&mut self, name_id: u32, src: u16, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
-        self.emit_spanned(Instr::new_imm16(Opcode::SetGlobal, src, k), span);
+        self.emit_regs(Opcode::SetGlobal, src, k >> 8, k & 0xFF, 0b0001, span);
     }
 
-    /// `Call` with the documented layout; wide encoding for large arities.
-    pub fn emit_call(&mut self, dst: u8, callee: u8, argc: u16, span: oxc_span::Span) {
-        if argc <= u16::from(u8::MAX) {
-            self.emit_spanned(Instr::new(Opcode::Call, dst, callee, argc as u8), span);
-        } else {
+    /// `Call` with the documented layout; wide encodings for large arities
+    /// (`CallW`) and wide registers (`RegExt`).
+    pub fn emit_call(&mut self, dst: u16, callee: u16, argc: u16, span: oxc_span::Span) {
+        if argc > u16::from(u8::MAX) {
             let words = WideOp::CallW {
                 dst,
                 func: callee,
                 argc,
+            }
+            .encode();
+            self.emit_words(words, span);
+            return;
+        }
+        // argc rides in slot `c`, which stays unmasked.
+        self.emit_regs(
+            Opcode::Call,
+            dst,
+            callee,
+            u16::from(argc as u8),
+            0b0011,
+            span,
+        );
+    }
+
+    /// `Construct` with the same layout as `emit_call`; wide escapes for
+    /// large arities (`ConstructW`) and wide registers (`RegExt`).
+    pub fn emit_construct(&mut self, dst: u16, callee: u16, argc: u16, span: oxc_span::Span) {
+        if argc > u16::from(u8::MAX) {
+            let words = WideOp::ConstructW {
+                dst,
+                func: callee,
+                argc,
+            }
+            .encode();
+            self.emit_words(words, span);
+            return;
+        }
+        self.emit_regs(
+            Opcode::Construct,
+            dst,
+            callee,
+            u16::from(argc as u8),
+            0b0011,
+            span,
+        );
+    }
+
+    /// `NewArray dst, base, len` — `len` is an immediate and must fit the
+    /// narrow slot (array literals above 255 elements are rejected by the
+    /// caller); `dst`/`base` may escape through `RegExt`.
+    pub fn emit_new_array(&mut self, dst: u16, base: u16, len: u8, span: oxc_span::Span) {
+        self.emit_regs(Opcode::NewArray, dst, base, u16::from(len), 0b0011, span);
+    }
+
+    /// `NewEnvironment depth, slots` with a `NewEnvironmentW` escape once
+    /// the slot count exceeds the narrow 8-bit operand.
+    pub fn emit_new_env(&mut self, depth: u8, slots: u16, span: oxc_span::Span) {
+        if slots <= u16::from(u8::MAX) {
+            self.emit_spanned(
+                Instr::new(Opcode::NewEnvironment, depth, slots as u8, 0),
+                span,
+            );
+        } else {
+            let words = WideOp::NewEnvironmentW {
+                depth: u16::from(depth),
+                slots,
+            }
+            .encode();
+            self.emit_words(words, span);
+        }
+    }
+
+    /// `Closure dst, fn#idx` — escapes to `ClosureW` once the function
+    /// index or destination exceeds the narrow 8-bit operands.
+    pub fn emit_closure(&mut self, dst: u16, function_index: u16, span: oxc_span::Span) {
+        if dst <= u16::from(u8::MAX) && function_index <= u16::from(u8::MAX) {
+            self.emit_spanned(
+                Instr::new(Opcode::Closure, dst as u8, function_index as u8, 0),
+                span,
+            );
+        } else {
+            let words = WideOp::ClosureW {
+                dst,
+                function_index,
             }
             .encode();
             self.emit_words(words, span);
@@ -691,9 +896,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // tracked handler depth guards against future emission paths that
         // might set `stack_depth` without going through `new_temp`.
         if self.handler_max > u32::from(regs) {
-            regs = u8::try_from(self.handler_max).unwrap_or(MAX_REGS);
+            regs = u16::try_from(self.handler_max).unwrap_or(MAX_REGS);
         }
-        self.b.reserve_regs(u16::from(regs));
+        self.b.reserve_regs(regs);
         let mut fb = self.b.finish();
         // Handler ranges are pushed as regions close (inner regions first),
         // so sort by start pc; equal starts mean shared entry points, where
@@ -712,10 +917,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 /// Concrete storage for one symbol relative to the emitting unit.
 #[derive(Debug, Clone, Copy)]
 pub enum VarAccess {
-    Reg(u8),
+    Reg(u16),
     Env {
         depth: u8,
-        slot: u8,
+        slot: u16,
     },
     /// A global property (`GetGlobal`/`SetGlobal`) — the symbol's name is
     /// interned at emission time.

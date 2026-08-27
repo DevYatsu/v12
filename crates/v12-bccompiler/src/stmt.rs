@@ -109,14 +109,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     }
                 };
                 self.run_finally_copies(0)?;
-                self.emit_spanned(Instr::new(Opcode::Return, v, 0, 0), r.span);
+                self.emit_reg3(Opcode::Return, v, 0, 0, r.span);
                 Ok(())
             }
             Statement::ThrowStatement(t) => {
                 // Throws are *not* intercepted by inline finalizer copies: the
                 // handler table routes them through unwinding instead.
                 let v = self.expr(&t.argument)?;
-                self.emit_spanned(Instr::new(Opcode::Throw, v, 0, 0), t.span);
+                self.emit_reg3(Opcode::Throw, v, 0, 0, t.span);
                 Ok(())
             }
             Statement::TryStatement(t) => self.try_stmt(t),
@@ -287,13 +287,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Lowers to a flat sequence of `GetProperty` + default checks + recursive
     /// pattern handling. Array rest uses `CopyArrayRest` (slice of elements);
     /// object rest uses `CopyObjectRestW` (iterate shapes, skip extracted keys).
-    fn object_pattern_store(&mut self, o: &ObjectPattern<'_>, src: u8) -> Res<()> {
+    fn object_pattern_store(&mut self, o: &ObjectPattern<'_>, src: u16) -> Res<()> {
         let has_rest = o.rest.is_some();
         let prop_count = o.properties.len();
         // Allocate contiguous registers for excluded keys when rest exists.
-        let excl_base: u8 = if has_rest && prop_count > 0 {
-            // `u8` slots are sufficient for destructuring (tests have <100 props).
-            self.new_temps(prop_count as u8)
+        let excl_base: u16 = if has_rest && prop_count > 0 {
+            self.new_temps(prop_count as u16)
         } else {
             0
         };
@@ -301,7 +300,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         for (idx, prop) in o.properties.iter().enumerate() {
             // Compute key register.
             let key_reg = if has_rest {
-                excl_base + idx as u8
+                excl_base + idx as u16
             } else {
                 self.new_temp()
             };
@@ -326,10 +325,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.load_str(key_reg, &text, prop.key.span())?;
             }
             let tmp = self.new_temp();
-            self.emit_spanned(
-                Instr::new(Opcode::GetProperty, tmp, src, key_reg),
-                prop.span,
-            );
+            self.emit_reg3(Opcode::GetProperty, tmp, src, key_reg, prop.span);
             self.lower_binding_pattern(&prop.value, tmp)?;
         }
 
@@ -361,24 +357,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// `let [a, b, ...rest] = arr` with nested, default, and rest via slice.
-    fn array_pattern_store(&mut self, a: &ArrayPattern<'_>, src: u8) -> Res<()> {
+    fn array_pattern_store(&mut self, a: &ArrayPattern<'_>, src: u16) -> Res<()> {
         let fixed_len = a.elements.len();
         for (idx, el) in a.elements.iter().enumerate() {
             let Some(pat) = el else { continue };
             let key = self.new_temp();
             self.load_str(key, &idx.to_string(), pat.span())?;
             let tmp = self.new_temp();
-            self.emit_spanned(Instr::new(Opcode::GetProperty, tmp, src, key), pat.span());
+            self.emit_reg3(Opcode::GetProperty, tmp, src, key, pat.span());
             self.lower_binding_pattern(pat, tmp)?;
         }
         if let Some(rest) = &a.rest {
             let dst = self.new_temp();
             let start = fixed_len as u16;
             if start <= u16::from(u8::MAX) {
-                self.emit_spanned(
-                    Instr::new(Opcode::CopyArrayRest, dst, src, start as u8),
-                    rest.span,
-                );
+                // Registers may exceed 255 while `start` fits its immediate
+                // slot: a RegExt prefix extends only the register slots.
+                self.emit_reg2_imm8(Opcode::CopyArrayRest, dst, src, start as u8, rest.span);
             } else {
                 let words = WideOp::CopyArrayRestW { dst, src, start }.encode();
                 self.emit_words(words, rest.span);
@@ -389,7 +384,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// Recursively lowers any binding pattern against `src`.
-    fn lower_binding_pattern(&mut self, pat: &BindingPattern<'_>, src: u8) -> Res<()> {
+    fn lower_binding_pattern(&mut self, pat: &BindingPattern<'_>, src: u16) -> Res<()> {
         match pat {
             BindingPattern::BindingIdentifier(id) => {
                 let Some(sym) = id.symbol_id.get() else {
@@ -409,7 +404,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 let undef = self.new_temp();
                 self.load_undefined(undef, ap.span);
                 let cond = self.new_temp();
-                self.emit_spanned(Instr::new(Opcode::StrictEq, cond, src, undef), ap.span);
+                self.emit_reg3(Opcode::StrictEq, cond, src, undef, ap.span);
                 self.emit_jump(Opcode::JumpIfFalse, cond, use_src);
                 // Default branch: evaluate default expression into chosen.
                 let def = self.expr(&ap.right)?;
@@ -580,7 +575,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Some(test) => {
                     let tv = self.expr(test)?;
                     let eq = self.new_temp();
-                    self.emit_spanned(Instr::new(Opcode::StrictEq, eq, disc, tv), case.span);
+                    self.emit_reg3(Opcode::StrictEq, eq, disc, tv, case.span);
                     let entry = self.label();
                     entries.push(Some(entry));
                     self.emit_jump(Opcode::JumpIfTrue, eq, entry);
@@ -720,7 +715,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     // Exceptional path from the catch clause.
                     let fin_exc_start = self.pc();
                     self.copy_finalizer(fin)?;
-                    self.emit_spanned(Instr::new(Opcode::Throw, exc_try, 0, 0), t.span);
+                    self.emit_reg3(Opcode::Throw, exc_try, 0, 0, t.span);
                     self.bind(done);
                     self.push_range(catch_start, catch_end, fin_exc_start, exc_try);
                 }
@@ -731,7 +726,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_jump(Opcode::Jump, 0, normal);
                 let fin_exc_start = self.pc();
                 self.copy_finalizer(fin)?;
-                self.emit_spanned(Instr::new(Opcode::Throw, exc_try, 0, 0), t.span);
+                self.emit_reg3(Opcode::Throw, exc_try, 0, 0, t.span);
                 self.bind(normal);
                 self.copy_finalizer(fin)?;
                 self.push_range(try_start, try_end, fin_exc_start, exc_try);
@@ -746,7 +741,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     fn bind_catch_param(
         &mut self,
         param: &oxc_ast::ast::CatchParameter<'_>,
-        exc: u8,
+        exc: u16,
         span: Span,
     ) -> Res<()> {
         let Some(sym) = binding_symbol_pattern(param) else {
@@ -765,7 +760,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         r
     }
 
-    fn push_range(&mut self, start: u32, end: u32, target: u32, depth: u8) {
+    fn push_range(&mut self, start: u32, end: u32, target: u32, depth: u16) {
         let stack_depth = u32::from(depth);
         self.handler_max = self.handler_max.max(stack_depth + 1);
         self.b.push_handler(HandlerRange {

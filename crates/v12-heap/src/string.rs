@@ -189,6 +189,14 @@ impl V12Str {
         }
     }
 
+    /// Length in UTF-16 code units as `u32` — the width composite storage
+    /// uses — for offset arithmetic without a usize round-trip. A flat leaf
+    /// longer than `u32::MAX` units cannot exist: composite lengths are
+    /// `u32`, so the heap could not reference it.
+    pub fn len_u32(&self) -> u32 {
+        u32::try_from(self.len()).expect("string exceeds u32::MAX code units")
+    }
+
     /// True when there are no code units.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -270,6 +278,18 @@ enum LeafRun<'a> {
     Utf16(&'a [u16]),
 }
 
+/// Slices a validated `[skip, skip + take)` window out of a flat leaf.
+///
+/// The `u32`→`usize` widening is the single conversion point for the walk's
+/// u32 offset domain (JS string offsets) meeting Rust slice indexing.
+#[inline]
+fn leaf_window<T>(leaf: &[T], skip: u32, take: u32) -> &[T] {
+    let start = skip as usize;
+    let end = start + take as usize;
+    debug_assert!(end <= leaf.len(), "walk range exceeds leaf");
+    &leaf[start..end]
+}
+
 /// Queues the children of a Cons for `[skip, skip + take)` in visit order.
 /// The right-hand piece goes on the stack first so the left pops first —
 /// LIFO yields left-to-right emission.
@@ -281,7 +301,7 @@ fn queue_cons_range(
     skip: u32,
     take: u32,
 ) {
-    let left_len = heap.get(left).len() as u32;
+    let left_len = heap.get(left).len_u32();
     let end = skip + take;
     if end > left_len {
         let right_skip = skip.saturating_sub(left_len);
@@ -307,7 +327,7 @@ fn walk_leaves<'a>(heap: &'a Heap, seed: Seed<'a>, visit: &mut impl FnMut(LeafRu
     let mut stack: Vec<WalkTask> = Vec::new();
     match seed {
         Seed::Resident(handle) => {
-            let len = heap.get(handle).len() as u32;
+            let len = heap.get(handle).len_u32();
             if len > 0 {
                 stack.push(WalkTask {
                     node: handle,
@@ -328,7 +348,7 @@ fn walk_leaves<'a>(heap: &'a Heap, seed: Seed<'a>, visit: &mut impl FnMut(LeafRu
                 }
             }
             StrStorage::Cons { left, right, .. } => {
-                let len = value.len() as u32;
+                let len = value.len_u32();
                 if len > 0 {
                     queue_cons_range(heap, &mut stack, *left, *right, 0, len);
                 }
@@ -352,16 +372,10 @@ fn walk_leaves<'a>(heap: &'a Heap, seed: Seed<'a>, visit: &mut impl FnMut(LeafRu
     while let Some(task) = stack.pop() {
         match &heap.get(task.node).storage {
             StrStorage::Latin1(bytes) => {
-                let start = task.skip as usize;
-                let end = start + task.take as usize;
-                debug_assert!(end <= bytes.len(), "walk range exceeds leaf");
-                visit(LeafRun::Latin1(&bytes[start..end]));
+                visit(LeafRun::Latin1(leaf_window(bytes, task.skip, task.take)))
             }
             StrStorage::Utf16(units) => {
-                let start = task.skip as usize;
-                let end = start + task.take as usize;
-                debug_assert!(end <= units.len(), "walk range exceeds leaf");
-                visit(LeafRun::Utf16(&units[start..end]));
+                visit(LeafRun::Utf16(leaf_window(units, task.skip, task.take)))
             }
             StrStorage::Cons { left, right, .. } => {
                 queue_cons_range(heap, &mut stack, *left, *right, task.skip, task.take);

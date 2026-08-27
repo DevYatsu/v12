@@ -811,9 +811,11 @@ fn ident_name_of_binding(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<String>
 /// for both env slots and registers; the synthetic `this` slot (when an
 /// arrow-descendant reads it) trails all named slots.
 ///
-/// Register and slot counters are `u8`; overflow is reported as a
-/// `CompileError` with message `"too many functions/constants"` instead of
-/// panicking so negative tests can observe a compile failure.
+/// Register and slot counters are u16 (functions above 255 registers/slots
+/// escape through the wide operand encodings); overflow past
+/// [`MAX_REGS`]/[`MAX_ENV_SLOTS`] is reported as a `CompileError` with
+/// message `"too many functions/constants"` instead of panicking so negative
+/// tests can observe a compile failure.
 fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
     // 1. Captures: referenced-from-outside ⇒ escapes.
     let sites = std::mem::take(&mut plans.ref_sites);
@@ -839,8 +841,8 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
             unit.has_env = escapes_here || needs_this;
         }
 
-        let mut slot: u8 = 0;
-        let mut reg: u8 = REG_THIS.checked_add(1).ok_or_else(|| CompileError {
+        let mut slot: u16 = 0;
+        let mut reg: u16 = REG_THIS.checked_add(1).ok_or_else(|| CompileError {
             message: "too many functions/constants".into(),
             span: Some((0, 0)),
         })?;
@@ -882,7 +884,12 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
         }
         unit.env_slot_count = slot;
         unit.locals_end = reg;
-        if u16::from(reg) >= u16::from(MAX_REGS) || u16::from(slot) >= u16::from(MAX_ENV_SLOTS) {
+        // `checked_add` above already rejects overflow; this bounds check
+        // rejects programs that *fit* u16 arithmetic but exceed the ISA's
+        // usable register/slot ranges (the last value is reserved by the
+        // wide-operand escape).
+        #[allow(clippy::absurd_extreme_comparisons)]
+        if reg >= MAX_REGS || slot >= MAX_ENV_SLOTS {
             return Err(CompileError {
                 message: "too many functions/constants".into(),
                 span: Some((0, 0)),

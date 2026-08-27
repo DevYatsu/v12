@@ -5,7 +5,7 @@
 use oxc_ast::ast::{ArrowFunctionExpression, Function, FunctionType, Program};
 use oxc_semantic::SymbolId;
 use oxc_span::GetSpan;
-use v12_bytecode::{FunctionBytecode, Instr, Opcode};
+use v12_bytecode::{FunctionBytecode, Opcode};
 
 use crate::model::{CompileError, Compiler, FnCtx, REG_THIS, VarLoc};
 
@@ -47,7 +47,7 @@ fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
 /// imported bindings. When no `ImportCall` opcode exists, this `Closure` +
 /// `Call` pair is the portable lowering. The native at this index is
 /// provided by `v12-engine`'s `NativeRegistry`.
-pub const NATIVE_IMPORT_INDEX: u8 = 254;
+pub use crate::model::NATIVE_IMPORT_INDEX;
 
 /// Compiles one function unit and stores it at `comp.functions[idx]`.
 pub fn compile_unit(
@@ -107,7 +107,7 @@ pub fn compile_unit(
                     return Err(cx.err(a.span(), "internal: arrow body missing"));
                 };
                 let v = cx.expr(expr)?;
-                cx.emit_spanned(Instr::new(Opcode::Return, v, 0, 0), expr.span());
+                cx.emit_reg1(Opcode::Return, v, expr.span());
             }
         },
     }
@@ -122,7 +122,7 @@ pub fn compile_unit(
         plan.param_count as u16
     };
     fb.rest_reg = if plan.has_rest {
-        (fb.fixed_params + 1) as u8
+        fb.fixed_params + 1
     } else {
         0
     };
@@ -160,14 +160,14 @@ fn emit_prologue(
         } else {
             cx.comp.plans.env_depth_between(cx.unit, 0)
         };
-        cx.emit_op(Opcode::NewEnvironment, ancestor_envs, env_slots, 0);
+        cx.emit_new_env(ancestor_envs, env_slots, oxc_span::Span::default());
 
         for pi in 0..param_count {
             let Some(sym) = cx.comp.plans.units[cx.unit].decl_order.get(pi).copied() else {
                 continue;
             };
             if let VarLoc::Env(slot) = cx.comp.plans.units[cx.unit].vars[&sym] {
-                let incoming = pi as u8 + 1; // r0 is `this`
+                let incoming = pi as u16 + 1; // r0 is `this`
                 cx.emit_set_env(0, slot, incoming, oxc_span::Span::default());
             }
         }
@@ -177,12 +177,12 @@ fn emit_prologue(
     }
 
     if let Some(sym) = self_symbol {
-        let idx8 = u8::try_from(idx).map_err(|_| CompileError {
-            message: "programs above 255 functions are not supported".into(),
+        let idx16 = u16::try_from(idx).map_err(|_| CompileError {
+            message: "programs above 65535 functions are not supported".into(),
             span: None,
         })?;
         let dst = cx.new_temp();
-        cx.emit(Instr::new(Opcode::Closure, dst, idx8, 0));
+        cx.emit_closure(dst, idx16, oxc_span::Span::default());
         let access = cx.access(sym);
         cx.store_access(access, dst, oxc_span::Span::default());
     }
@@ -223,10 +223,7 @@ fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError>
         // Layout: [callee][this][arg] -> Call rC, rC, argc=1
         let block = cx.new_temps(crate::model::CALL_HEADER_REGS + 1);
         let callee = block;
-        cx.emit_spanned(
-            Instr::new(Opcode::Closure, callee, NATIVE_IMPORT_INDEX, 0),
-            span,
-        );
+        cx.emit_closure(callee, NATIVE_IMPORT_INDEX, span);
         cx.load_undefined(callee + 1, span);
         cx.load_str(callee + 2, &spec, span)?;
         cx.emit_call(callee, callee, 1, span);
@@ -247,7 +244,7 @@ fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError>
                 let key = cx.new_temp();
                 cx.load_str(key, &e.imported, span)?;
                 let dst = cx.new_temp();
-                cx.emit_spanned(Instr::new(Opcode::GetProperty, dst, ns_reg, key), span);
+                cx.emit_reg3(Opcode::GetProperty, dst, ns_reg, key, span);
                 let access = cx.access(local);
                 cx.store_access(access, dst, span);
             }

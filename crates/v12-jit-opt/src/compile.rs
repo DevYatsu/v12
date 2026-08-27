@@ -254,7 +254,7 @@ pub fn inline_at(
     }
     let call_instr = caller.instrs[call_idx];
     let (dst_reg, call_width) = if call_instr.op() == Some(Opcode::Call) {
-        (call_instr.a(), 1usize)
+        (u16::from(call_instr.a()), 1usize)
     } else if call_instr.op() == Some(Opcode::Wide) {
         if let Ok((v12_bytecode::WideOp::CallW { dst, .. }, w)) =
             v12_bytecode::WideOp::try_decode(&caller.instrs[call_idx..])
@@ -277,6 +277,9 @@ pub fn inline_at(
         return None;
     }
     let ret_src = callee.instrs[last_pc].a();
+    // Inlined moves need u8 register slots; wide destinations would require
+    // a RegExt prefix this path does not yet emit — skip inlining instead.
+    let dst_reg8 = u8::try_from(dst_reg).ok()?;
 
     let mut new_instrs = Vec::new();
     new_instrs.extend_from_slice(&caller.instrs[..call_idx]);
@@ -294,8 +297,8 @@ pub fn inline_at(
         new_instrs.push(instr);
         pc += 1;
     }
-    if ret_src != dst_reg {
-        new_instrs.push(v12_bytecode::Instr::new(Opcode::Move, dst_reg, ret_src, 0));
+    if ret_src != dst_reg8 {
+        new_instrs.push(v12_bytecode::Instr::new(Opcode::Move, dst_reg8, ret_src, 0));
     }
     let suffix_start = call_idx + call_width;
     if suffix_start < caller.instrs.len() {

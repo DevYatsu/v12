@@ -45,7 +45,7 @@ fn mirror_build(rng: &mut Rng) -> (v12_bytecode::FunctionBytecode, Vec<SpanPair>
                 // shape a front-end produces for oversized operands.
                 let span = (i as u32 * 10, i as u32 * 10 + 7);
                 let wide = WideOp::LoadIntW {
-                    dst: i as u8,
+                    dst: i as u16,
                     value: i as i64,
                 };
                 for w in wide.encode() {

@@ -258,7 +258,11 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 WideOp::GetEnvSlotW { .. }
                 | WideOp::SetEnvSlotW { .. }
                 | WideOp::CopyObjectRestW { .. }
-                | WideOp::CopyArrayRestW { .. } => {
+                | WideOp::CopyArrayRestW { .. }
+                | WideOp::ClosureW { .. }
+                | WideOp::NewEnvironmentW { .. }
+                | WideOp::ConstructW { .. }
+                | WideOp::RegExt { .. } => {
                     return Err(JitError::UnsupportedWideOp(format!("{wide:?}")));
                 }
             }

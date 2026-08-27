@@ -101,9 +101,9 @@ impl MarkSink<'_> {
 
 /// Mark bits plus the explicit worklist. Iterative by construction.
 struct Collector {
-    // Indexed by `Space as usize`; array order must match the enum.
+    // Indexed by `Space::as_index`; array order must match the enum.
     marked: [Vec<bool>; 5],
-    work: Vec<(Space, u32)>,
+    work: Vec<(Space, usize)>,
 }
 
 impl Collector {
@@ -115,13 +115,15 @@ impl Collector {
     }
 
     fn mark(&mut self, space: Space, index: u32) {
+        // Single widening point: the worklist stores usize slot indices so
+        // the trace/sweep passes index storage without re-widening.
         let i = index as usize;
-        let bits = &mut self.marked[space as usize];
+        let bits = &mut self.marked[space.as_index()];
         // Out-of-range handles can only come from forged values; ignore rather
         // than panic inside the collector.
         if i < bits.len() && !bits[i] {
             bits[i] = true;
-            self.work.push((space, index));
+            self.work.push((space, i));
         }
     }
 
@@ -132,13 +134,13 @@ impl Collector {
     }
 }
 
-fn trace_referents(heap: &Heap, space: Space, index: u32, sink: &mut MarkSink<'_>) {
+fn trace_referents(heap: &Heap, space: Space, index: usize, sink: &mut MarkSink<'_>) {
     match space {
-        Space::Objects => heap.objects[index as usize].trace(sink),
-        Space::Strings => heap.strings[index as usize].trace(sink),
-        Space::Symbols => heap.symbols[index as usize].trace(sink),
-        Space::Bigints => heap.bigints[index as usize].trace(sink),
-        Space::Shapes => heap.shapes[index as usize].trace(sink),
+        Space::Objects => heap.objects[index].trace(sink),
+        Space::Strings => heap.strings[index].trace(sink),
+        Space::Symbols => heap.symbols[index].trace(sink),
+        Space::Bigints => heap.bigints[index].trace(sink),
+        Space::Shapes => heap.shapes[index].trace(sink),
     }
 }
 
@@ -233,7 +235,8 @@ pub struct Heap {
     bigints: Vec<V12BigInt>,
     shapes: Vec<Shape>,
     // Indexed by `Space as usize`.
-    free: [Vec<u32>; 5],
+    // usize slot indices; handles narrow to u32 once, at `alloc`.
+    free: [Vec<usize>; 5],
     alive: [Vec<bool>; 5],
     /// Per-slot "payload released, index sits in the free list" flag.
     /// Invariant: `released[s][i] == free[s].contains(&i)`. Lets the sweeper
@@ -346,11 +349,13 @@ impl Heap {
         self.stress_collect_if_due();
 
         let size = value.approx_size();
-        let s = T::SPACE as usize;
-        let index: u32 = loop {
+        let s = T::SPACE.as_index();
+        // Free lists and slot vectors index by usize; the u32 narrowing to
+        // `Handle` happens exactly once, at the handle boundary below.
+        let index: usize = loop {
             if let Some(i) = self.free[s].pop() {
-                self.released[s][i as usize] = false;
-                T::slots_mut(self)[i as usize] = value;
+                self.released[s][i] = false;
+                T::slots_mut(self)[i] = value;
                 break i;
             }
             // A step may have released dead slots into the free list, so
@@ -361,13 +366,13 @@ impl Heap {
                 let new_index = slots.len() - 1;
                 self.alive[s].push(false);
                 self.released[s].push(false);
-                break new_index as u32;
+                break new_index;
             }
         };
-        self.alive[s][index as usize] = true;
+        self.alive[s][index] = true;
 
         self.allocated_since_gc += size;
-        Handle::new(index)
+        Handle::new(u32::try_from(index).expect("slot count exceeds u32::MAX"))
     }
 
     /// Object content by handle.
@@ -376,8 +381,8 @@ impl Heap {
     /// was taken); see "Handles and liveness" in the crate docs for release
     /// behavior and the reuse caveat.
     pub fn get<T: SpaceOps>(&self, h: Handle<T>) -> &T {
-        let i = h.index() as usize;
-        if cfg!(debug_assertions) && !self.alive[T::SPACE as usize][i] {
+        let i = h.slot();
+        if cfg!(debug_assertions) && !self.alive[T::SPACE.as_index()][i] {
             panic!(
                 "stale {} handle: index {} refers to a dead slot",
                 T::SPACE.name(),
@@ -389,8 +394,8 @@ impl Heap {
 
     /// Mutable object content by handle; same liveness rules as [`Heap::get`].
     pub fn get_mut<T: SpaceOps>(&mut self, h: Handle<T>) -> &mut T {
-        let i = h.index() as usize;
-        if cfg!(debug_assertions) && !self.alive[T::SPACE as usize][i] {
+        let i = h.slot();
+        if cfg!(debug_assertions) && !self.alive[T::SPACE.as_index()][i] {
             panic!(
                 "stale {} handle: index {} refers to a dead slot",
                 T::SPACE.name(),
@@ -529,7 +534,8 @@ impl Heap {
     pub fn new_validity_cell(&mut self) -> ValidityCellId {
         let id = self.validity_cells.len() + 1;
         self.validity_cells.push(0);
-        ValidityCellId(id as u32)
+        // Ids are 1-based (zero is `NONE`), so cell `id` lives at `id - 1`.
+        ValidityCellId(u32::try_from(id).expect("validity cell count exceeds u32::MAX"))
     }
 
     /// The cell watching assumptions about `obj`, creating it on first use.
@@ -551,7 +557,9 @@ impl Heap {
         if cell == ValidityCellId::NONE {
             return None;
         }
-        self.validity_cells.get((cell.0 - 1) as usize).copied()
+        // Ids are 1-based (zero is `NONE`), so the stored serial sits at
+        // `index - 1`.
+        self.validity_cells.get(cell.cell_index() - 1).copied()
     }
 
     /// True when a guard that recorded `seen` against `cell` still holds.
@@ -566,7 +574,7 @@ impl Heap {
     /// 2³² times simply starts a fresh era instead of aborting.
     pub fn bump_validity(&mut self, cell: ValidityCellId) {
         if let Some(serial) = self.validity_serial(cell) {
-            self.validity_cells[(cell.0 - 1) as usize] = serial.wrapping_add(1);
+            self.validity_cells[cell.cell_index() - 1] = serial.wrapping_add(1);
         }
     }
 
@@ -620,20 +628,27 @@ impl Heap {
     /// payload and the text is materialized immediately (see the string
     /// module docs for the economics).
     pub fn concat(&mut self, left: Handle<V12Str>, right: Handle<V12Str>) -> Handle<V12Str> {
-        let total = self.get(left).len() + self.get(right).len();
-        debug_assert!(
-            total <= u32::MAX as usize,
-            "combined string exceeds u32 length"
-        );
-        let len = total as u32;
+        // u32 arithmetic throughout: composite lengths are stored as u32, so
+        // an overflow here is a genuine "too large for the heap" condition.
+        let total = self
+            .get(left)
+            .len_u32()
+            .checked_add(self.get(right).len_u32())
+            .expect("combined string exceeds u32 length");
 
         let handle = self.with_pinned_string_roots(&[left, right], |heap| {
             heap.alloc(V12Str {
-                storage: StrStorage::Cons { left, right, len },
+                storage: StrStorage::Cons {
+                    left,
+                    right,
+                    len: total,
+                },
                 hash: None,
             })
         });
-        if total <= CONCAT_EAGER_FLATTEN_MAX_UNITS {
+        // The threshold is a tiny usize constant; widen it to the string
+        // domain (u32) rather than narrowing the computed length.
+        if total <= CONCAT_EAGER_FLATTEN_MAX_UNITS as u32 {
             self.flatten(handle);
         }
         handle
@@ -650,7 +665,7 @@ impl Heap {
         len: u32,
     ) -> Option<Handle<V12Str>> {
         let end = start_utf16.checked_add(len)?;
-        if end > self.get(parent).len() as u32 {
+        if end > self.get(parent).len_u32() {
             return None;
         }
         Some(self.with_pinned_string_roots(&[parent], |heap| {
@@ -804,19 +819,19 @@ impl Heap {
         // may still name children nothing else keeps alive. Prune those
         // entries now — before any slot is released — so a cached transition
         // hit can never surface a dead handle.
-        self.prune_shape_transitions(&collector.marked[Space::Shapes as usize]);
+        self.prune_shape_transitions(&collector.marked[Space::Shapes.as_index()]);
 
-        let live = live_bytes_of(&self.objects, &collector.marked[Space::Objects as usize])
-            + live_bytes_of(&self.strings, &collector.marked[Space::Strings as usize])
-            + live_bytes_of(&self.symbols, &collector.marked[Space::Symbols as usize])
-            + live_bytes_of(&self.bigints, &collector.marked[Space::Bigints as usize])
-            + live_bytes_of(&self.shapes, &collector.marked[Space::Shapes as usize]);
+        let live = live_bytes_of(&self.objects, &collector.marked[Space::Objects.as_index()])
+            + live_bytes_of(&self.strings, &collector.marked[Space::Strings.as_index()])
+            + live_bytes_of(&self.symbols, &collector.marked[Space::Symbols.as_index()])
+            + live_bytes_of(&self.bigints, &collector.marked[Space::Bigints.as_index()])
+            + live_bytes_of(&self.shapes, &collector.marked[Space::Shapes.as_index()]);
 
-        self.publish_mark::<JsObject>(&collector.marked[Space::Objects as usize]);
-        self.publish_mark::<V12Str>(&collector.marked[Space::Strings as usize]);
-        self.publish_mark::<V12Symbol>(&collector.marked[Space::Symbols as usize]);
-        self.publish_mark::<V12BigInt>(&collector.marked[Space::Bigints as usize]);
-        self.publish_mark::<Shape>(&collector.marked[Space::Shapes as usize]);
+        self.publish_mark::<JsObject>(&collector.marked[Space::Objects.as_index()]);
+        self.publish_mark::<V12Str>(&collector.marked[Space::Strings.as_index()]);
+        self.publish_mark::<V12Symbol>(&collector.marked[Space::Symbols.as_index()]);
+        self.publish_mark::<V12BigInt>(&collector.marked[Space::Bigints.as_index()]);
+        self.publish_mark::<Shape>(&collector.marked[Space::Shapes.as_index()]);
 
         self.allocated_since_gc = 0;
         self.live_after_gc = live;
@@ -831,9 +846,7 @@ impl Heap {
             if !marked[i] {
                 continue; // dead shapes are about to be released wholesale
             }
-            shape
-                .transitions
-                .retain(|_, child| marked[child.index() as usize]);
+            shape.transitions.retain(|_, child| marked[child.slot()]);
         }
     }
 
@@ -843,11 +856,11 @@ impl Heap {
     /// must not re-count or re-default — and only dead slots *not* yet in
     /// the free list are handed to the lazy sweeper.
     fn publish_mark<T: SpaceOps>(&mut self, marked: &[bool]) {
-        let s = T::SPACE as usize;
+        let s = T::SPACE.as_index();
         debug_assert_eq!(marked.len(), T::slots(self).len());
         // A root still naming a previously freed slot resurrects it: evict it
         // from the free list so the allocator can never hand it out twice.
-        self.free[s].retain(|&i| !marked[i as usize]);
+        self.free[s].retain(|&i| !marked[i]);
         for (flag, &m) in self.released[s].iter_mut().zip(marked) {
             if m {
                 *flag = false;
@@ -882,7 +895,7 @@ impl Heap {
     /// when unswept slots may remain; `false` once the space is fully swept
     /// (the caller may then extend the slot vector).
     fn sweep_step<T: SpaceOps>(&mut self) -> bool {
-        let s = T::SPACE as usize;
+        let s = T::SPACE.as_index();
         let slot_count = T::slots(self).len();
         if self.pending_dead[s] == 0 {
             self.sweep_cursor[s] = slot_count;
@@ -898,7 +911,7 @@ impl Heap {
                 T::slots_mut(self)[i] = T::default();
                 self.released[s][i] = true;
                 self.pending_dead[s] -= 1;
-                self.free[s].push(i as u32);
+                self.free[s].push(i);
                 break;
             }
         }
@@ -928,17 +941,17 @@ impl Heap {
     /// Live-bytes estimate recomputed from current liveness
     /// (approximate; see the crate-private size estimator).
     pub fn live_bytes_estimate(&self) -> usize {
-        live_bytes_of(&self.objects, &self.alive[Space::Objects as usize])
-            + live_bytes_of(&self.strings, &self.alive[Space::Strings as usize])
-            + live_bytes_of(&self.symbols, &self.alive[Space::Symbols as usize])
-            + live_bytes_of(&self.bigints, &self.alive[Space::Bigints as usize])
-            + live_bytes_of(&self.shapes, &self.alive[Space::Shapes as usize])
+        live_bytes_of(&self.objects, &self.alive[Space::Objects.as_index()])
+            + live_bytes_of(&self.strings, &self.alive[Space::Strings.as_index()])
+            + live_bytes_of(&self.symbols, &self.alive[Space::Symbols.as_index()])
+            + live_bytes_of(&self.bigints, &self.alive[Space::Bigints.as_index()])
+            + live_bytes_of(&self.shapes, &self.alive[Space::Shapes.as_index()])
     }
 
     /// Number of occupied (non-freed) slots in a space. Dead slots found by
     /// the last mark count as freed even before the lazy sweeper reaches them.
     pub fn live_count<T: SpaceOps>(&self) -> usize {
-        let s = T::SPACE as usize;
+        let s = T::SPACE.as_index();
         T::slots(self)
             .len()
             .saturating_sub(self.free[s].len())

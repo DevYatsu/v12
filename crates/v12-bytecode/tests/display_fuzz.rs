@@ -81,20 +81,20 @@ fn display_never_panics_on_10k_random_functions() {
 #[test]
 fn display_renders_documented_malformed_wide_shapes() {
     let instrs = vec![
-        // Header only, no payload at all.
-        Instr::new_imm24(Opcode::Wide, 0),
-        // LoadIntW needs two payload words; provide one whose own opcode
-        // byte is unassigned so the orphan renders as .word.
-        Instr::new_imm24(Opcode::Wide, 1),
-        Instr(0x0011_1111),
         // Unknown discriminant with plenty of trailing words.
         Instr::new_imm24(Opcode::Wide, 200),
         Instr(0x2222_2222),
         Instr(0x3333_3333),
         // Valid LoadConstW followed by an unassigned opcode byte.
-        Instr::new(Opcode::Wide, 7, 0, 0),
-        Instr(42),
+        Instr::new(Opcode::Wide, 0, 0, 0),
+        Instr(0x0007_0000), // dst = 7, const_id high = 0
+        Instr(42),          // const_id low
         Instr(0x0500_0000),
+        // LoadIntW needs three payload words (value lo/hi + dst) but gets
+        // only one: the header fails to decode and advances one word, so the
+        // orphan payload renders as its own .word line.
+        Instr::new_imm24(Opcode::Wide, 1),
+        Instr(0x0011_1111),
     ];
     let fb = FunctionBytecode {
         name_hint: Some("torture".into()),
@@ -124,7 +124,7 @@ fn display_renders_documented_malformed_wide_shapes() {
     // The lone 0x1111_1111 orphaned by the truncated LoadIntW renders as its
     // own .word line, proving failed decodes advance exactly one word.
     assert!(
-        text.contains("0002: .word 0x00111111"),
-        "orphaned payload must be listed at pc 2:\n{text}"
+        text.contains("0008: .word 0x00111111"),
+        "orphaned payload must be listed at pc 8:\n{text}"
     );
 }

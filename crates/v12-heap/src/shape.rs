@@ -432,6 +432,11 @@ impl ValidityCellId {
     /// The null cell: never registered, never bumped, always fails a guard
     /// check — assumptions with no cell are assumptions worth nothing.
     pub const NONE: ValidityCellId = ValidityCellId(0);
+
+    /// The registry index this id denotes (the id *is* the index).
+    pub fn cell_index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// The null cell, so objects and shapes can derive `Default` with "no guard

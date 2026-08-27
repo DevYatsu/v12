@@ -79,18 +79,12 @@ fn sweep_all_256_opcode_bytes_through_every_decode_path() {
                     let disc = usize::try_from(u32::from(c)).unwrap();
                     assert!(disc < WIDE_TOTAL_WORDS.len(), "disc {disc} unknown");
                     assert_eq!(width, WIDE_TOTAL_WORDS[disc] as usize, "word {word:#010x}");
-                    // Register always travels in header slot `a`, whatever
-                    // the variant calls it.
-                    let reg = match op {
-                        WideOp::LoadConstW { dst, .. }
-                        | WideOp::LoadIntW { dst, .. }
-                        | WideOp::GetEnvSlotW { dst, .. }
-                        | WideOp::CallW { dst, .. }
-                        | WideOp::CopyObjectRestW { dst, .. }
-                        | WideOp::CopyArrayRestW { dst, .. } => dst,
-                        WideOp::SetEnvSlotW { src, .. } => src,
-                    };
-                    assert_eq!(reg, a, "header slot `a` carries the register");
+                    // `RegExt` is the one variant that uses the header `a`
+                    // slot (for its slot mask); all others carry registers
+                    // exclusively in payload words.
+                    if let WideOp::RegExt { mask, .. } = op {
+                        assert_eq!(mask, a, "RegExt mask rides in header slot `a`");
+                    }
                 }
                 Err(reason) => {
                     if known == Some(Opcode::Wide) {
@@ -242,7 +236,9 @@ fn structured_wide_op_roundtrip_and_truncation_fuzz() {
 /// "unknown discriminant" diagnostic.
 #[test]
 fn wide_headers_with_unknown_discriminants_error_cleanly() {
-    for disc in [7u32, 31, 99, 255] {
+    // Discriminants 11.. are unassigned (7..10 name RegExt, ClosureW,
+    // NewEnvironmentW, and ConstructW).
+    for disc in [11u32, 31, 99, 255] {
         let words = [
             Instr::new_imm24(Opcode::Wide, disc),
             Instr(0x1234_5678),

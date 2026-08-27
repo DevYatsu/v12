@@ -31,6 +31,14 @@ impl Space {
             Space::Shapes => "shape",
         }
     }
+
+    /// Index into the `Heap`'s per-space arrays (`marked`, `alive`, `free`,
+    /// …). Single conversion point for the enum-to-array-index cast; the
+    /// array order in `Heap` must match this enum's declaration order.
+    #[inline]
+    pub fn as_index(self) -> usize {
+        self as usize
+    }
 }
 
 /// Marks a type as living in exactly one heap space.
@@ -59,6 +67,16 @@ impl<T> Handle<T> {
     /// The slot index within its space.
     pub fn index(self) -> u32 {
         self.index
+    }
+
+    /// The slot index as a storage-array index.
+    ///
+    /// `index()` stays `u32` because handle indices ride in the `JsValue`
+    /// payload encoding; this is the single widening point for the many
+    /// `slots[i]` accesses.
+    #[inline]
+    pub fn slot(self) -> usize {
+        self.index as usize
     }
 }
 

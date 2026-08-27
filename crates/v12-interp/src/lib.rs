@@ -64,7 +64,7 @@ mod tests;
 
 use std::collections::HashSet;
 
-use v12_bytecode::{Const, FunctionBytecode, Opcode, WideOp};
+use v12_bytecode::{Const, FunctionBytecode, Instr, Opcode, WideOp};
 use v12_heap::{
     Attrs, Descriptor, GcPolicy, Handle, Heap, JsObject, JsValue,
     KIND_ARGUMENTS as HEAP_KIND_ARGUMENTS, KIND_ARRAY as HEAP_KIND_ARRAY,
@@ -242,6 +242,109 @@ struct Frame {
     /// Innermost environment object (`None` until `NewEnvironment` runs).
     /// Kept here rather than derived so closure capture has one source.
     env: Option<Handle<JsObject>>,
+}
+
+/// Decodes the instruction at `pc` into
+/// `(op, a, b, c, word_width, narrow_word)`.
+///
+/// - Narrow op: operands are the instruction's own byte slots, width 1.
+/// - `Wide` header with discriminant [`WideOp::DISC_REG_EXT`]: merges the
+///   prefix's high bytes into the following narrow instruction's register
+///   slots per the prefix mask; header + payload + narrow instruction
+///   execute as one logical op of width 3.
+/// - Any other `Wide` header: returned as [`Opcode::Wide`] (width 1) so
+///   the wide arm decodes the payload itself.
+///
+/// The returned `narrow_word` is the instruction whose *immediates*
+/// (imm16/imm24, unmerged byte slots) apply; it equals the header word
+/// for plain narrow ops and the third word for `RegExt` pairs.
+fn decode_instr(instrs: &[Instr], pc: usize) -> (Opcode, u16, u16, u16, usize, Instr) {
+    let instr = instrs[pc];
+    let Some(op) = instr.op() else {
+        panic!("corrupt bytecode: unassigned opcode byte at pc {pc}");
+    };
+    if op != Opcode::Wide {
+        return (
+            op,
+            u16::from(instr.a()),
+            u16::from(instr.b()),
+            u16::from(instr.c()),
+            1,
+            instr,
+        );
+    }
+    if u32::from(instr.c()) == WideOp::DISC_REG_EXT {
+        let (wide, _) = WideOp::try_decode(&instrs[pc..]).expect("malformed wide opcode sequence");
+        let WideOp::RegExt {
+            mask,
+            a_hi,
+            b_hi,
+            c_hi,
+        } = wide
+        else {
+            unreachable!("discriminant matched REG_EXT")
+        };
+        let narrow = instrs.get(pc + 2).copied().unwrap_or_else(|| {
+            panic!("corrupt bytecode: RegExt prefix at pc {pc} without its narrow instruction")
+        });
+        let narrow_op = narrow.op().unwrap_or_else(|| {
+            panic!(
+                "corrupt bytecode: RegExt prefix at pc {pc} not followed by a narrow instruction"
+            )
+        });
+        let merge = |slot: u8, hi: u8, bit: u8| -> u16 {
+            if mask & bit != 0 {
+                (u16::from(hi) << 8) | u16::from(slot)
+            } else {
+                u16::from(slot)
+            }
+        };
+        return (
+            narrow_op,
+            merge(narrow.a(), a_hi, 1),
+            merge(narrow.b(), b_hi, 2),
+            merge(narrow.c(), c_hi, 4),
+            3,
+            narrow,
+        );
+    }
+    (Opcode::Wide, 0, 0, 0, 1, instr)
+}
+
+/// Destination register and total word width of the Call/Construct header
+/// parked at `pc` while a callee frame runs, plus whether it is a
+/// `Construct` (which needs the spec's return-value adjustment).
+///
+/// Handles the narrow forms, the wide `CallW`/`ConstructW` escapes, and the
+/// `RegExt`-prefixed narrow form (parked pc is the prefix header).
+fn decode_parked_call(instrs: &[Instr], pc: usize) -> (bool, u16, usize) {
+    let instr = instrs[pc];
+    match instr.op() {
+        Some(Opcode::Wide) => match WideOp::try_decode(&instrs[pc..]) {
+            Ok((WideOp::CallW { dst, .. }, width)) => (false, dst, width),
+            Ok((WideOp::ConstructW { dst, .. }, width)) => (true, dst, width),
+            Ok((WideOp::RegExt { mask, a_hi, .. }, _)) => {
+                // The narrow call/construct follows the 2-word prefix.
+                let narrow = instrs
+                    .get(pc + 2)
+                    .copied()
+                    .expect("RegExt prefix without its narrow instruction");
+                let dst = if mask & 1 != 0 {
+                    (u16::from(a_hi) << 8) | u16::from(narrow.a())
+                } else {
+                    u16::from(narrow.a())
+                };
+                let is_construct = narrow.op() == Some(Opcode::Construct);
+                (is_construct, dst, 3)
+            }
+            other => panic!("call parked on malformed wide header: {other:?}"),
+        },
+        _ => (
+            instr.op() == Some(Opcode::Construct),
+            u16::from(instr.a()),
+            1,
+        ),
+    }
 }
 
 /// The Tier-0 interpreter over one compiled program's bytecode.
@@ -552,8 +655,16 @@ impl Interp {
                 }
                 continue 'drive;
             };
-            let Some(op) = instr.op() else {
+            let Some(_op) = instr.op() else {
                 panic!("corrupt bytecode: unassigned opcode byte at {fn_idx}:{pc}");
+            };
+            // Decode operands: narrow ops expose their byte slots directly;
+            // a `RegExt` prefix merges high bytes into the following narrow
+            // instruction's register slots and executes as one 3-word op
+            // (see `WideOp::RegExt`).
+            let (op, ra, rb, rc, op_width, narrow) = {
+                let instrs = &self.functions[fn_idx as usize].instrs;
+                decode_instr(instrs, pc)
             };
 
             macro_rules! throw_js {
@@ -576,19 +687,18 @@ impl Interp {
                 // Data movement and constants
                 // ------------------------------------------------------
                 Opcode::Move => {
-                    self.stack[base + usize::from(instr.a())] =
-                        self.stack[base + usize::from(instr.b())];
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = self.stack[base + usize::from(rb)];
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::LoadInt => {
-                    let v = i8::from_be_bytes([instr.c()]);
-                    self.stack[base + usize::from(instr.a())] = ops::box_number(f64::from(v));
-                    self.set_pc(pc + 1);
+                    let v = i8::from_be_bytes([narrow.c()]);
+                    self.stack[base + usize::from(ra)] = ops::box_number(f64::from(v));
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::LoadConst => {
-                    let value = attempt!(self.const_value(fn_idx, u32::from(instr.imm16())));
-                    self.stack[base + usize::from(instr.a())] = value;
-                    self.set_pc(pc + 1);
+                    let value = attempt!(self.const_value(fn_idx, u32::from(narrow.imm16())));
+                    self.stack[base + usize::from(ra)] = value;
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Wide => {
                     let words = &self.functions[fn_idx as usize].instrs[pc..];
@@ -618,10 +728,48 @@ impl Interp {
                                 CallOutcome::Value(v) => {
                                     let caller_base = base;
                                     self.stack[caller_base + usize::from(dst)] = v;
-                                    self.set_pc(pc + 2);
+                                    self.set_pc(pc + width);
                                 }
                             }
                             continue 'drive;
+                        }
+                        WideOp::ConstructW { dst, func, argc } => {
+                            match attempt!(self.prepare_construct(base, max_regs, func, argc)) {
+                                CallOutcome::Pushed => continue 'drive,
+                                CallOutcome::Value(v) => {
+                                    let caller_base = base;
+                                    self.stack[caller_base + usize::from(dst)] = v;
+                                    self.set_pc(pc + width);
+                                }
+                            }
+                            continue 'drive;
+                        }
+                        WideOp::ClosureW {
+                            dst,
+                            function_index,
+                        } => {
+                            self.gc_protect();
+                            let env = self.frames.last().expect("frame").env;
+                            let h = self.heap.alloc(JsObject {
+                                kind: KIND_FUNCTION,
+                                elements: vec![ops::box_number(f64::from(function_index))],
+                                prototype: env,
+                                ..JsObject::default()
+                            });
+                            self.stack[base + usize::from(dst)] = JsValue::object(h);
+                        }
+                        WideOp::NewEnvironmentW { depth: _, slots } => {
+                            // The static `depth` operand duplicates the
+                            // dynamic parent chain (see crate docs); only the
+                            // slot count matters here, matching the narrow op.
+                            self.gc_protect();
+                            let parent = self.frames.last().expect("frame").env;
+                            let h = self.heap.alloc(JsObject {
+                                properties: vec![JsValue::undefined(); usize::from(slots)],
+                                prototype: parent,
+                                ..JsObject::default()
+                            });
+                            self.frames.last_mut().expect("frame").env = Some(h);
                         }
                         WideOp::CopyObjectRestW {
                             dst,
@@ -645,6 +793,12 @@ impl Interp {
                             let dst_val = attempt!(self.op_copy_array_rest(src_v, start));
                             self.stack[base + usize::from(dst)] = dst_val;
                         }
+                        // RegExt is decoded by `decode_instr` before dispatch
+                        // (it merges the wide register halves into the narrow
+                        // operand); reaching this arm means corrupt bytecode.
+                        WideOp::RegExt { .. } => {
+                            panic!("corrupt bytecode: bare RegExt reached dispatch")
+                        }
                     }
                     self.set_pc(pc + width);
                 }
@@ -653,81 +807,77 @@ impl Interp {
                 // Arithmetic
                 // ------------------------------------------------------
                 Opcode::Add => {
-                    let l = self.stack[base + usize::from(instr.b())];
-                    let r = self.stack[base + usize::from(instr.c())];
+                    let l = self.stack[base + usize::from(rb)];
+                    let r = self.stack[base + usize::from(rc)];
                     self.gc_protect();
                     let v = attempt!(ops::add(&mut self.heap, l, r));
-                    self.stack[base + usize::from(instr.a())] = v;
+                    self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
                         .entry(fn_idx)
                         .or_default()
                         .record_type(pc as u32, lat);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Sub => {
-                    let l = self.stack[base + usize::from(instr.b())];
-                    let r = self.stack[base + usize::from(instr.c())];
+                    let l = self.stack[base + usize::from(rb)];
+                    let r = self.stack[base + usize::from(rc)];
                     let v = ops::sub(&mut self.heap, l, r);
-                    self.stack[base + usize::from(instr.a())] = v;
+                    self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
                         .entry(fn_idx)
                         .or_default()
                         .record_type(pc as u32, lat);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Mul => {
-                    let l = self.stack[base + usize::from(instr.b())];
-                    let r = self.stack[base + usize::from(instr.c())];
+                    let l = self.stack[base + usize::from(rb)];
+                    let r = self.stack[base + usize::from(rc)];
                     let v = ops::mul(&mut self.heap, l, r);
-                    self.stack[base + usize::from(instr.a())] = v;
+                    self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
                         .entry(fn_idx)
                         .or_default()
                         .record_type(pc as u32, lat);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Div | Opcode::Mod | Opcode::Pow => {
-                    let l = self.stack[base + usize::from(instr.b())];
-                    let r = self.stack[base + usize::from(instr.c())];
+                    let l = self.stack[base + usize::from(rb)];
+                    let r = self.stack[base + usize::from(rc)];
                     let n = match op {
                         Opcode::Div => ops::div(&mut self.heap, l, r),
                         Opcode::Mod => ops::modulo(&mut self.heap, l, r),
                         _ => ops::js_pow(&mut self.heap, l, r),
                     };
-                    self.stack[base + usize::from(instr.a())] = n;
+                    self.stack[base + usize::from(ra)] = n;
                     let lat = Lattice::from_value(n, None);
                     self.feedback
                         .entry(fn_idx)
                         .or_default()
                         .record_type(pc as u32, lat);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
 
                 // ------------------------------------------------------
                 // Bitwise operations and shifts (ES ToInt32/ToUint32)
                 // ------------------------------------------------------
                 Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
-                    let ln =
-                        ops::to_number(&mut self.heap, self.stack[base + usize::from(instr.b())]);
-                    let rn =
-                        ops::to_number(&mut self.heap, self.stack[base + usize::from(instr.c())]);
+                    let ln = ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
+                    let rn = ops::to_number(&mut self.heap, self.stack[base + usize::from(rc)]);
                     let (a, b) = (ops::to_int32(ln), ops::to_int32(rn));
                     let n = match op {
                         Opcode::BitAnd => a & b,
                         Opcode::BitOr => a | b,
                         _ => a ^ b,
                     };
-                    self.stack[base + usize::from(instr.a())] = ops::box_number(f64::from(n));
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = ops::box_number(f64::from(n));
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Shl | Opcode::Shr | Opcode::UShr => {
-                    let ln =
-                        ops::to_number(&mut self.heap, self.stack[base + usize::from(instr.b())]);
-                    let rn =
-                        ops::to_number(&mut self.heap, self.stack[base + usize::from(instr.c())]);
+                    let ln = ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
+                    let rn = ops::to_number(&mut self.heap, self.stack[base + usize::from(rc)]);
                     let shift = ops::to_uint32(rn) & 31;
                     let n = match op {
                         Opcode::Shl => ops::to_int32(ln) << shift,
@@ -735,165 +885,161 @@ impl Interp {
                         // Unsigned shift reinterprets the int32 bits as u32.
                         _ => (ops::to_int32(ln) as u32 >> shift) as i32,
                     };
-                    self.stack[base + usize::from(instr.a())] = ops::box_number(f64::from(n));
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = ops::box_number(f64::from(n));
+                    self.set_pc(pc + op_width);
                 }
 
                 // ------------------------------------------------------
                 // Equality, comparison, unary operators
                 // ------------------------------------------------------
                 Opcode::Eq | Opcode::Ne => {
-                    let l = self.stack[base + usize::from(instr.b())];
-                    let r = self.stack[base + usize::from(instr.c())];
+                    let l = self.stack[base + usize::from(rb)];
+                    let r = self.stack[base + usize::from(rc)];
                     let eq = ops::loose_equals(&mut self.heap, l, r);
-                    self.write_bool(base, instr.a(), eq ^ (op == Opcode::Ne));
-                    self.set_pc(pc + 1);
+                    self.write_bool(base, ra, eq ^ (op == Opcode::Ne));
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::StrictEq | Opcode::StrictNe => {
-                    let l = self.stack[base + usize::from(instr.b())];
-                    let r = self.stack[base + usize::from(instr.c())];
+                    let l = self.stack[base + usize::from(rb)];
+                    let r = self.stack[base + usize::from(rc)];
                     let eq = ops::strict_equals(&self.heap, l, r);
-                    self.write_bool(base, instr.a(), eq ^ (op == Opcode::StrictNe));
-                    self.set_pc(pc + 1);
+                    self.write_bool(base, ra, eq ^ (op == Opcode::StrictNe));
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
-                    let l = self.stack[base + usize::from(instr.b())];
-                    let r = self.stack[base + usize::from(instr.c())];
+                    let l = self.stack[base + usize::from(rb)];
+                    let r = self.stack[base + usize::from(rc)];
                     let ord = ops::compare(op, &mut self.heap, l, r);
-                    self.write_bool(base, instr.a(), ord);
-                    self.set_pc(pc + 1);
+                    self.write_bool(base, ra, ord);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Neg => {
-                    let n =
-                        -ops::to_number(&mut self.heap, self.stack[base + usize::from(instr.b())]);
-                    self.stack[base + usize::from(instr.a())] = ops::box_number(n);
-                    self.set_pc(pc + 1);
+                    let n = -ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
+                    self.stack[base + usize::from(ra)] = ops::box_number(n);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::BitNot => {
-                    let n =
-                        ops::to_number(&mut self.heap, self.stack[base + usize::from(instr.b())]);
-                    self.stack[base + usize::from(instr.a())] =
+                    let n = ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
+                    self.stack[base + usize::from(ra)] =
                         ops::box_number(f64::from(!ops::to_int32(n)));
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Not => {
-                    let truthy =
-                        ops::to_boolean(&self.heap, self.stack[base + usize::from(instr.b())]);
-                    self.write_bool(base, instr.a(), !truthy);
-                    self.set_pc(pc + 1);
+                    let truthy = ops::to_boolean(&self.heap, self.stack[base + usize::from(rb)]);
+                    self.write_bool(base, ra, !truthy);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::TypeOf => {
-                    let v = self.stack[base + usize::from(instr.b())];
+                    let v = self.stack[base + usize::from(rb)];
                     self.gc_protect();
                     let tag = self.type_tag(v);
                     let name = attempt!(self.typeof_name(tag));
-                    self.stack[base + usize::from(instr.a())] = JsValue::string(name);
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = JsValue::string(name);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::In => {
-                    let key_v = self.stack[base + usize::from(instr.b())];
-                    let obj_v = self.stack[base + usize::from(instr.c())];
+                    let key_v = self.stack[base + usize::from(rb)];
+                    let obj_v = self.stack[base + usize::from(rc)];
                     self.gc_protect();
                     let present = attempt!(self.op_in(key_v, obj_v));
-                    self.write_bool(base, instr.a(), present);
-                    self.set_pc(pc + 1);
+                    self.write_bool(base, ra, present);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::InstanceOf => {
-                    let lhs_v = self.stack[base + usize::from(instr.b())];
-                    let rhs_v = self.stack[base + usize::from(instr.c())];
+                    let lhs_v = self.stack[base + usize::from(rb)];
+                    let rhs_v = self.stack[base + usize::from(rc)];
                     self.gc_protect();
                     let result = attempt!(self.op_instanceof(lhs_v, rhs_v));
-                    self.write_bool(base, instr.a(), result);
-                    self.set_pc(pc + 1);
+                    self.write_bool(base, ra, result);
+                    self.set_pc(pc + op_width);
                 }
 
                 // ------------------------------------------------------
                 // Control flow
                 // ------------------------------------------------------
                 Opcode::Jump => {
-                    self.set_pc(instr.imm24() as usize);
+                    self.set_pc(narrow.imm24() as usize);
                 }
                 Opcode::JumpIfFalse | Opcode::JumpIfTrue => {
-                    let truthy =
-                        ops::to_boolean(&self.heap, self.stack[base + usize::from(instr.a())]);
+                    let truthy = ops::to_boolean(&self.heap, self.stack[base + usize::from(ra)]);
                     let taken = truthy ^ (op == Opcode::JumpIfFalse);
                     self.set_pc(if taken {
-                        usize::from(instr.imm16())
+                        usize::from(narrow.imm16())
                     } else {
-                        pc + 1
+                        pc + op_width
                     });
                 }
                 Opcode::LoopHeader => {
                     self.note_loop(fn_idx);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
 
                 // ------------------------------------------------------
                 // Calls, returns, throws
                 // ------------------------------------------------------
                 Opcode::Call => {
-                    let argc = u16::from(instr.c());
-                    match attempt!(self.prepare_call(base, max_regs, instr.b(), argc)) {
+                    let argc = rc;
+                    match attempt!(self.prepare_call(base, max_regs, rb, argc)) {
                         CallOutcome::Pushed => continue 'drive,
                         CallOutcome::Value(v) => {
-                            self.stack[base + usize::from(instr.a())] = v;
-                            self.set_pc(pc + 1);
+                            self.stack[base + usize::from(ra)] = v;
+                            self.set_pc(pc + op_width);
                         }
                     }
                     continue 'drive;
                 }
                 Opcode::Construct => {
-                    let argc = u16::from(instr.c());
-                    match attempt!(self.prepare_construct(base, max_regs, instr.b(), argc)) {
+                    let argc = rc;
+                    match attempt!(self.prepare_construct(base, max_regs, rb, argc)) {
                         CallOutcome::Pushed => continue 'drive,
                         CallOutcome::Value(v) => {
-                            self.stack[base + usize::from(instr.a())] = v;
-                            self.set_pc(pc + 1);
+                            self.stack[base + usize::from(ra)] = v;
+                            self.set_pc(pc + op_width);
                         }
                     }
                     continue 'drive;
                 }
                 Opcode::Return => {
-                    let v = self.stack[base + usize::from(instr.a())];
+                    let v = self.stack[base + usize::from(ra)];
                     if self.complete_frame(v)? {
                         return Ok(());
                     }
                     continue 'drive;
                 }
                 Opcode::Throw => {
-                    throw_js!(self.stack[base + usize::from(instr.a())]);
+                    throw_js!(self.stack[base + usize::from(ra)]);
                 }
 
                 // ------------------------------------------------------
                 // Property access
                 // ------------------------------------------------------
                 Opcode::GetProperty => {
-                    let obj_v = self.stack[base + usize::from(instr.b())];
-                    let key_v = self.stack[base + usize::from(instr.c())];
+                    let obj_v = self.stack[base + usize::from(rb)];
+                    let key_v = self.stack[base + usize::from(rc)];
                     self.gc_protect();
                     let v = attempt!(self.get_property(fn_idx, pc as u32, obj_v, key_v));
-                    self.stack[base + usize::from(instr.a())] = v;
+                    self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, v.as_object().map(|h| self.shape_of(h)));
                     self.feedback
                         .entry(fn_idx)
                         .or_default()
                         .record_type(pc as u32, lat);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::SetProperty => {
-                    let obj_v = self.stack[base + usize::from(instr.a())];
-                    let key_v = self.stack[base + usize::from(instr.b())];
-                    let value = self.stack[base + usize::from(instr.c())];
+                    let obj_v = self.stack[base + usize::from(ra)];
+                    let key_v = self.stack[base + usize::from(rb)];
+                    let value = self.stack[base + usize::from(rc)];
                     self.gc_protect();
                     attempt!(self.set_property(obj_v, key_v, value));
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::DeleteProperty => {
-                    let obj_v = self.stack[base + usize::from(instr.b())];
-                    let key_v = self.stack[base + usize::from(instr.c())];
+                    let obj_v = self.stack[base + usize::from(rb)];
+                    let key_v = self.stack[base + usize::from(rc)];
                     let deleted = attempt!(self.delete_property(obj_v, key_v));
-                    self.write_bool(base, instr.a(), deleted);
-                    self.set_pc(pc + 1);
+                    self.write_bool(base, ra, deleted);
+                    self.set_pc(pc + op_width);
                 }
 
                 // ------------------------------------------------------
@@ -902,12 +1048,12 @@ impl Interp {
                 Opcode::NewObject => {
                     self.gc_protect();
                     let h = self.heap.alloc(JsObject::default());
-                    self.stack[base + usize::from(instr.a())] = JsValue::object(h);
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = JsValue::object(h);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::NewArray => {
-                    let first = base + usize::from(instr.b());
-                    let len = usize::from(instr.c());
+                    let first = base + usize::from(rb);
+                    let len = usize::from(rc);
                     self.gc_protect();
                     let elements = self.stack[first..first + len].to_vec();
                     let shape = self.array_shape();
@@ -921,23 +1067,23 @@ impl Interp {
                     // else can allocate (the shape is pinned in
                     // `array_shape`, satisfying the allocation contract).
                     self.bind_shape(h, shape);
-                    self.stack[base + usize::from(instr.a())] = JsValue::object(h);
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = JsValue::object(h);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Closure => {
                     self.gc_protect();
                     let env = self.frames.last().expect("frame").env;
                     let h = self.heap.alloc(JsObject {
                         kind: KIND_FUNCTION,
-                        elements: vec![ops::box_number(f64::from(instr.b()))],
+                        elements: vec![ops::box_number(f64::from(rb))],
                         prototype: env,
                         ..JsObject::default()
                     });
-                    self.stack[base + usize::from(instr.a())] = JsValue::object(h);
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = JsValue::object(h);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::NewEnvironment => {
-                    let slots = usize::from(instr.b());
+                    let slots = usize::from(rb);
                     self.gc_protect();
                     // Environments are always fresh objects, mirroring the
                     // reference interpreter in `v12-bccompiler/tests.rs`: the
@@ -952,29 +1098,29 @@ impl Interp {
                         ..JsObject::default()
                     });
                     self.frames.last_mut().expect("frame").env = Some(h);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::GetEnvSlot => {
-                    let v = attempt!(self.env_read(u16::from(instr.b()), u16::from(instr.c())));
-                    self.stack[base + usize::from(instr.a())] = v;
-                    self.set_pc(pc + 1);
+                    let v = attempt!(self.env_read(rb, rc));
+                    self.stack[base + usize::from(ra)] = v;
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::SetEnvSlot => {
-                    let v = self.stack[base + usize::from(instr.c())];
-                    attempt!(self.env_write(u16::from(instr.a()), u16::from(instr.b()), v));
-                    self.set_pc(pc + 1);
+                    let v = self.stack[base + usize::from(rc)];
+                    attempt!(self.env_write(ra, rb, v));
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::CopyArrayRest => {
-                    let src_v = self.stack[base + usize::from(instr.b())];
-                    let start = u16::from(instr.c());
+                    let src_v = self.stack[base + usize::from(rb)];
+                    let start = rc;
                     let dst_val = attempt!(self.op_copy_array_rest(src_v, start));
-                    self.stack[base + usize::from(instr.a())] = dst_val;
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = dst_val;
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::CheckIsArray => {
-                    let v = self.stack[base + usize::from(instr.a())];
+                    let v = self.stack[base + usize::from(ra)];
                     attempt!(self.op_check_is_array(v));
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::CallApply => {
                     let callee = instr.b();
@@ -990,43 +1136,43 @@ impl Interp {
                         CallOutcome::Pushed => continue 'drive,
                         CallOutcome::Value(v) => {
                             self.stack[base + usize::from(dst)] = v;
-                            self.set_pc(pc + 1);
+                            self.set_pc(pc + op_width);
                         }
                     }
                     continue 'drive;
                 }
                 Opcode::CopyObjectRest => {
                     // Narrow form with single excluded key in c (or 0).
-                    let src_v = self.stack[base + usize::from(instr.b())];
+                    let src_v = self.stack[base + usize::from(rb)];
                     let excl_vec = if instr.c() == 0 {
                         Vec::new()
                     } else {
-                        let start = base + usize::from(instr.c());
+                        let start = base + usize::from(rc);
                         self.stack[start..start + 1].to_vec()
                     };
                     let dst_val = attempt!(self.op_copy_object_rest(src_v, &excl_vec));
-                    self.stack[base + usize::from(instr.a())] = dst_val;
-                    self.set_pc(pc + 1);
+                    self.stack[base + usize::from(ra)] = dst_val;
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::ArrayAppend => {
-                    let dst_v = self.stack[base + usize::from(instr.a())];
-                    let src_v = self.stack[base + usize::from(instr.b())];
+                    let dst_v = self.stack[base + usize::from(ra)];
+                    let src_v = self.stack[base + usize::from(rb)];
                     attempt!(self.op_array_append(dst_v, src_v));
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::GetGlobal => {
                     let dst = instr.a();
-                    let const_id = u32::from(instr.imm16());
+                    let const_id = u32::from(narrow.imm16());
                     let val = attempt!(self.op_get_global(const_id));
                     self.stack[base + usize::from(dst)] = val;
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::SetGlobal => {
                     let src = instr.a();
-                    let const_id = u32::from(instr.imm16());
+                    let const_id = u32::from(narrow.imm16());
                     let val = self.stack[base + usize::from(src)];
                     attempt!(self.op_set_global(const_id, val));
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
 
                 Opcode::CreateGenerator => {
@@ -1041,19 +1187,19 @@ impl Interp {
                     // (returns the generator itself for chaining; real resume
                     // is not implemented in this stub).
                     self.stack[base + usize::from(dst)] = JsValue::object(h);
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::SuspendYield => {
                     // Dummy: `yield value` just passes the value through.
                     // Real suspend would save frame and return to `next()` caller.
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Await => {
                     // Dummy: `await value` just passes through.
                     let src = instr.b();
                     let dst = instr.a();
                     self.stack[base + usize::from(dst)] = self.stack[base + usize::from(src)];
-                    self.set_pc(pc + 1);
+                    self.set_pc(pc + op_width);
                 }
             }
         }
@@ -1066,7 +1212,7 @@ impl Interp {
             .pc = pc;
     }
 
-    fn write_bool(&mut self, base: usize, reg: u8, b: bool) {
+    fn write_bool(&mut self, base: usize, reg: u16, b: bool) {
         self.stack[base + usize::from(reg)] = if b {
             JsValue::true_()
         } else {
@@ -1160,7 +1306,7 @@ impl Interp {
         &mut self,
         base: usize,
         caller_max_regs: u16,
-        callee_reg: u8,
+        callee_reg: u16,
         argc: u16,
     ) -> Result<CallOutcome, JSException> {
         let callee_slot = base + usize::from(callee_reg);
@@ -1280,19 +1426,16 @@ impl Interp {
             self.stack.truncate(finished.base);
             return Ok(true);
         };
-        // The caller is parked on its Call/Construct/Wide header; step past
-        // it and deposit the result into the destination register recorded
-        // there. Construct adds the spec's return-value adjustment: a body
-        // that returns an object replaces the instance, otherwise the newly
+        // The caller is parked on its Call/Construct header — narrow, the
+        // wide `CallW`/`ConstructW` escape, or a `RegExt` prefix — so decode
+        // the destination register and total word width from that header.
+        // Construct adds the spec's return-value adjustment: a body that
+        // returns an object replaces the instance, otherwise the newly
         // allocated instance (still sitting in the callee's r0) is returned.
-        let call_instr = self.functions[caller.fn_idx as usize].instrs[caller.pc];
-        let width = usize::from(call_instr.op() == Some(Opcode::Wide));
-        let dst = usize::from(call_instr.a());
+        let instrs = &self.functions[caller.fn_idx as usize].instrs;
+        let (is_construct, dst, width) = decode_parked_call(instrs, caller.pc);
         let caller_base = caller.base;
-        let result = if call_instr.op() == Some(Opcode::Construct)
-            && result.as_object().is_none()
-            && !result.is_hole()
-        {
+        let result = if is_construct && result.as_object().is_none() && !result.is_hole() {
             // Callee frame still intact at this point (truncation happens
             // below), so its `this` register — the constructed instance.
             let v = self.stack[finished.base];
@@ -1301,8 +1444,8 @@ impl Interp {
             result
         };
         self.stack.truncate(finished.base);
-        self.stack[caller_base + dst] = result;
-        caller.pc += 1 + width;
+        self.stack[caller_base + usize::from(dst)] = result;
+        caller.pc += width;
         Ok(false)
     }
 
@@ -2437,7 +2580,7 @@ impl Interp {
         &mut self,
         base: usize,
         caller_max_regs: u16,
-        callee_reg: u8,
+        callee_reg: u16,
         argc: u16,
     ) -> Result<CallOutcome, JSException> {
         let callee_slot = base + usize::from(callee_reg);

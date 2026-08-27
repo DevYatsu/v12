@@ -167,15 +167,17 @@ fn wide_load_int_negative_values_survive_encode_decode_end_to_end() {
 
     for &v in &VALUES {
         let words = WideOp::LoadIntW { dst: 5, value: v }.encode();
-        assert_eq!(words.len(), 3);
+        assert_eq!(words.len(), 4);
 
-        // Documented layout: low u32 first, then high u32, two's complement.
+        // Documented layout: low u32 first, then high u32 (two's
+        // complement), then the 16-bit destination register.
         let bits = v as u64;
         assert_eq!(words[1].0, bits as u32, "low word of {v}");
         assert_eq!(words[2].0, (bits >> 32) as u32, "high word of {v}");
+        assert_eq!(words[3].0, 5, "dst word of {v}");
 
         let (back, width) = WideOp::try_decode(&words).unwrap();
-        assert_eq!(width, 3);
+        assert_eq!(width, 4);
         assert_eq!(back, WideOp::LoadIntW { dst: 5, value: v });
 
         // And the disassembler shows the signed decimal value.

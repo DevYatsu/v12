@@ -286,38 +286,38 @@ fn jumps_across_wide_sequences_patch_to_word_accurate_pcs() {
             b.emit(*w);
         }
     }
-    // Words so far: 1 (branch) + 2+3+2+2+2 (wides) = 12. Next pc is 12...
-    assert_eq!(b.pc(), 12);
+    // Words so far: 1 (branch) + 3+4+3+3+3 (wides) = 17. Next pc is 17...
+    assert_eq!(b.pc(), 17);
     let mid = b.label();
-    b.bind(mid); // binds to pc 12
+    b.bind(mid); // binds to pc 17
 
     // Another forward hop from inside the block over a trailing wide pair.
     let done = b.label();
-    b.emit_jump(Opcode::Jump, 0, done); // pc 12
+    b.emit_jump(Opcode::Jump, 0, done); // pc 17
     for w in load_int_w.iter().chain(load_const_w.iter()) {
         b.emit(*w);
-    } // 3 + 2 payload words: pcs 13..17
-    b.bind(done); // binds to pc 18
+    } // 4 + 3 words: pcs 18..24
+    b.bind(done); // binds to pc 25
 
     // Backward unconditional jump all the way to the head.
-    let back_at = b.pc(); // 18
+    let back_at = b.pc(); // 25
     b.emit_jump(Opcode::Jump, 0, head);
 
-    b.bind(exit); // pc 19: fall-through target of the opening conditional
+    b.bind(exit); // pc 26: fall-through target of the opening conditional
     b.emit(Instr::new(Opcode::Return, 0, 0, 0));
 
     let fb = b.finish();
-    assert_eq!(fb.instrs.len(), 20);
+    assert_eq!(fb.instrs.len(), 27);
 
     // Conditional forward branch (imm16) lands exactly on the wide-free zone.
     assert_eq!(fb.instrs[0].a(), 9, "cond register survives patching");
     assert_eq!(
         fb.instrs[0].imm16(),
-        19,
+        26,
         "exit binds after the backward jump"
     );
     // Unconditional forward hop over the trailing wides.
-    assert_eq!(fb.instrs[12].imm24(), 18);
+    assert_eq!(fb.instrs[17].imm24(), 25);
     // Unconditional backward hop over all five wide sequences.
     assert_eq!(fb.instrs[back_at as usize].imm24(), 0);
 

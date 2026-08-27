@@ -80,47 +80,66 @@ pub fn fn_with(len: u32, handlers: Vec<HandlerRange>) -> FunctionBytecode {
 }
 
 /// Wide payload word count per discriminant (header excluded).
-pub const WIDE_PAYLOAD_WORDS: [u32; 7] = [1, 2, 1, 1, 1, 2, 1];
+pub const WIDE_PAYLOAD_WORDS: [u32; 11] = [2, 3, 2, 2, 2, 2, 2, 1, 1, 1, 2];
 
 /// Total encoded width per discriminant (header included).
-pub const WIDE_TOTAL_WORDS: [u32; 7] = [2, 3, 2, 2, 2, 3, 2];
+pub const WIDE_TOTAL_WORDS: [u32; 11] = [3, 4, 3, 3, 3, 3, 3, 2, 2, 2, 3];
 
 /// Builds a random `WideOp` for structured roundtrip fuzzing.
 pub fn random_wide_op(rng: &mut Rng) -> WideOp {
-    match rng.below(7) {
+    match rng.below(11) {
         0 => WideOp::LoadConstW {
-            dst: rng.next_u32() as u8,
+            dst: rng.next_u32() as u16,
             const_id: rng.next_u32(),
         },
         1 => WideOp::LoadIntW {
-            dst: rng.next_u32() as u8,
+            dst: rng.next_u32() as u16,
             value: rng.next_u64() as i64,
         },
         2 => WideOp::GetEnvSlotW {
-            dst: rng.next_u32() as u8,
+            dst: rng.next_u32() as u16,
             depth: rng.next_u32() as u16,
             slot: rng.next_u32() as u16,
         },
         3 => WideOp::SetEnvSlotW {
-            src: rng.next_u32() as u8,
+            src: rng.next_u32() as u16,
             depth: rng.next_u32() as u16,
             slot: rng.next_u32() as u16,
         },
         4 => WideOp::CallW {
-            dst: rng.next_u32() as u8,
-            func: rng.next_u32() as u8,
+            dst: rng.next_u32() as u16,
+            func: rng.next_u32() as u16,
             argc: rng.next_u32() as u16,
         },
         5 => WideOp::CopyObjectRestW {
-            dst: rng.next_u32() as u8,
-            src: rng.next_u32() as u8,
-            excl_base: rng.next_u32() as u8,
+            dst: rng.next_u32() as u16,
+            src: rng.next_u32() as u16,
+            excl_base: rng.next_u32() as u16,
             excl_count: rng.next_u32() as u16,
         },
-        _ => WideOp::CopyArrayRestW {
-            dst: rng.next_u32() as u8,
-            src: rng.next_u32() as u8,
+        6 => WideOp::CopyArrayRestW {
+            dst: rng.next_u32() as u16,
+            src: rng.next_u32() as u16,
             start: rng.next_u32() as u16,
+        },
+        7 => WideOp::RegExt {
+            mask: rng.next_u32() as u8,
+            a_hi: rng.next_u32() as u8,
+            b_hi: rng.next_u32() as u8,
+            c_hi: rng.next_u32() as u8,
+        },
+        8 => WideOp::ClosureW {
+            dst: rng.next_u32() as u16,
+            function_index: rng.next_u32() as u16,
+        },
+        9 => WideOp::NewEnvironmentW {
+            depth: rng.next_u32() as u16,
+            slots: rng.next_u32() as u16,
+        },
+        _ => WideOp::ConstructW {
+            dst: rng.next_u32() as u16,
+            func: rng.next_u32() as u16,
+            argc: rng.next_u32() as u16,
         },
     }
 }

@@ -292,6 +292,24 @@ impl ElementsArray {
         }
     }
 
+    /// Element count in the JS array-index domain (`u32`). Flat kinds are
+    /// capped far below `u32::MAX` by [`ELEMENTS_TO_DICTIONARY_INDEX`];
+    /// dictionaries key on `u32`, so their length view fits by construction.
+    fn len_u32(&self) -> u32 {
+        match &self.storage {
+            ElementsStorage::PackedSmi(v)
+            | ElementsStorage::HoleySmi(v)
+            | ElementsStorage::PackedDouble(v)
+            | ElementsStorage::HoleyDouble(v)
+            | ElementsStorage::PackedObject(v)
+            | ElementsStorage::HoleyObject(v) => {
+                debug_assert!(v.len() < ELEMENTS_TO_DICTIONARY_INDEX as usize);
+                v.len() as u32
+            }
+            ElementsStorage::Dictionary(dict) => dict.length(),
+        }
+    }
+
     /// True when no elements are stored (or the length view is zero).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -473,8 +491,25 @@ impl ElementsArray {
     }
 }
 
+/// Flat-storage index for a JS element index. JS array indices are `u32`
+/// by spec (the `ElementsArray` API surface) while `Vec`s index by `usize`;
+/// this is the single lossless widening point for the two domains.
+#[inline]
+fn flat_index(index: u32) -> usize {
+    index as usize
+}
+
+/// Dense flat-storage position → JS element index. Flat vectors never grow
+/// beyond [`ELEMENTS_TO_DICTIONARY_INDEX`] entries, so the narrowing is
+/// safe; debug builds assert it.
+#[inline]
+fn dense_index(i: usize) -> u32 {
+    debug_assert!(i < ELEMENTS_TO_DICTIONARY_INDEX as usize);
+    i as u32
+}
+
 fn put_at<T: Clone>(v: &mut Vec<T>, index: u32, item: T) {
-    let i = index as usize;
+    let i = flat_index(index);
     if i < v.len() {
         v[i] = item;
     } else {
