@@ -1348,9 +1348,6 @@ impl Interp {
                     let gen_obj = self.frames.last().expect("frame").generator.expect("yield outside generator");
                     let snapshot = self.stack[base..base + usize::from(max_regs)].to_vec();
                     let resume_pc = pc + op_width;
-                    let yielded_boxed = ops::box_number(yielded.as_f64().unwrap_or(0.0));
-                    // Preserve yielded value identity: use original yielded, but ensure GC root before alloc above.
-                    let _ = yielded_boxed;
                     self.heap.get_mut(gen_obj).properties[1] = ops::box_number(resume_pc as f64);
                     if self.heap.get(gen_obj).properties.len() < 4 {
                         self.heap.get_mut(gen_obj).properties.resize(4, JsValue::undefined());
