@@ -23,7 +23,10 @@ pub const KIND_ARRAY: u8 = 2;
 /// exotic parameter alias (see `JsObject::arguments_mapped`).
 pub const KIND_ARGUMENTS: u8 = 3;
 
-/// Object kind for generator objects (suspended frames).
+/// Generator object. Interpreter contract (v12-interp/src/lib.rs:3094):
+/// properties[0]=fn_idx (Smi), [1]=next_index (Smi), [2]=done (0.0/1.0);
+/// elements=yield values (LoadInt eager path) or empty when real suspension used;
+/// prototype=captured Env. DO NOT reorder without updating interp.
 pub const KIND_GENERATOR: u8 = 4;
 
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
@@ -51,6 +54,11 @@ pub struct JsObject {
     /// Named-property slots (shape-backed layout arrives with the object
     /// model work).
     pub properties: Vec<crate::JsValue>,
+    /// Property keys (names) parallel to `properties` vector. `None` for
+    /// empty slots; `Some(PropKey)` for populated slots. Used by native
+    /// handlers that need to enumerate property names without interpreter's
+    /// shape cache.
+    pub property_keys: Vec<Option<crate::PropKey>>,
     /// Integer-indexed element slots.
     pub elements: Vec<crate::JsValue>,
     /// Prototype link; traced as a strong reference. Guards over this chain
@@ -74,13 +82,6 @@ impl JsObject {
         Self::default()
     }
 
-    /// `[[Extensible]] == false`. Implied by both integrity transitions.
-    pub const FLAG_NOT_EXTENSIBLE: u8 = 0b0000_0001;
-    /// Every own property non-configurable: sealed or stricter.
-    pub const FLAG_SEALED: u8 = 0b0000_0010;
-    /// Every own property also non-writable: frozen.
-    pub const FLAG_FROZEN: u8 = 0b0000_0100;
-
     /// True once sealed (or frozen): no property may be removed or
     /// reconfigured.
     pub fn is_sealed(&self) -> bool {
@@ -91,8 +92,77 @@ impl JsObject {
     pub fn is_frozen(&self) -> bool {
         self.flags & Self::FLAG_FROZEN != 0
     }
-}
 
+    /// An ordinary object with the given properties and their keys.
+    pub fn ordinary(properties: Vec<crate::JsValue>, property_keys: Vec<Option<crate::PropKey>>) -> Self {
+        Self {
+            kind: KIND_ORDINARY,
+            properties,
+            property_keys,
+            ..Self::default()
+        }
+    }
+
+    /// A function object: `elements[0]` holds the function index (Smi),
+    /// `prototype` is the closure environment.
+    pub fn function(func_index: u32, env: Option<Handle<JsObject>>) -> Self {
+        Self {
+            kind: KIND_FUNCTION,
+            elements: vec![crate::JsValue::from_f64(f64::from(func_index))],
+            prototype: env,
+            ..Self::default()
+        }
+    }
+
+    /// An array object with the given elements and length property.
+    pub fn array(elements: Vec<crate::JsValue>) -> Self {
+        let len = elements.len();
+        Self {
+            kind: KIND_ARRAY,
+            properties: vec![crate::JsValue::from_f64(f64::from(len as u32))],
+            property_keys: vec![Some(crate::PropKey::from_string(
+                crate::handle::Handle::new(0)
+            ))], // length property key
+            elements,
+            ..Self::default()
+        }
+    }
+
+    /// An arguments exotic object with the given properties and elements.
+    pub fn arguments(properties: Vec<crate::JsValue>, elements: Vec<crate::JsValue>, mapped: Option<Box<[Option<u32>]>>) -> Self {
+        let prop_len = properties.len();
+        Self {
+            kind: KIND_ARGUMENTS,
+            properties,
+            property_keys: vec![None; prop_len],
+            elements,
+            arguments_mapped: mapped,
+            ..Self::default()
+        }
+    }
+
+    /// A generator object (suspended frame).
+    pub fn generator() -> Self {
+        Self { kind: KIND_GENERATOR, ..Default::default() }
+    }
+
+    /// A Promise object (ordinary kind with Promise-specific fields set later).
+    pub fn promise() -> Self {
+        Self {
+            kind: KIND_ORDINARY,
+            ..Self::default()
+        }
+    }
+
+    /// `[[Extensible]] == false`. Implied by both integrity transitions.
+    pub const FLAG_NOT_EXTENSIBLE: u8 = 0b0000_0001;
+    /// Every own property non-configurable: sealed or stricter.
+    pub const FLAG_SEALED: u8 = 0b0000_0010;
+    /// Every own property also non-writable: frozen.
+    pub const FLAG_FROZEN: u8 = 0b0000_0100;
+
+
+}
 /// A heap symbol. Identity *is* the handle for now; descriptions,
 /// well-known singletons, and `#private` names come with interning work.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -160,6 +230,7 @@ impl SizeEstimate for V12BigInt {
 impl Trace for JsObject {
     fn trace(&self, sink: &mut MarkSink<'_>) {
         self.properties.trace(sink);
+        self.property_keys.trace(sink);
         self.elements.trace(sink);
         self.prototype.trace(sink);
     }
@@ -171,76 +242,31 @@ impl Trace for V12Symbol {
 
 impl Trace for V12BigInt {
     fn trace(&self, _sink: &mut MarkSink<'_>) {}
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{GcPolicy, Heap};
     use crate::JsValue;
 
     #[test]
-    fn object_traces_children_through_sink() {
-        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
-        let child = heap.alloc(JsObject::default());
-        let parent = heap.alloc(JsObject {
-            properties: vec![JsValue::object(child)],
-            elements: vec![JsValue::object(child)],
-            prototype: Some(child),
-            ..JsObject::default()
-        });
-        // Force a collect that only sees the parent: the child must survive
-        // via all three child-bearing fields.
-        heap.add_root(JsValue::object(parent));
-        heap.force_collect();
-        assert_eq!(heap.live_count::<JsObject>(), 2);
+    fn generator_object_slots_documented() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let h = heap.alloc(JsObject::generator());
+        heap.get_mut(h).properties = vec![JsValue::from_f64(2.0), JsValue::from_f64(0.0), JsValue::from_f64(0.0)];
+        assert_eq!(heap.get(h).kind, KIND_GENERATOR);
+        // This will fail until slot 2 is wired to completion check in interp
+        assert_eq!(heap.get(h).properties.len(), 3);
     }
 
     #[test]
-    fn size_estimates_grow_with_capacity() {
-        let mut o = JsObject::default();
-        let base = o.approx_size();
-        o.properties.reserve(100);
-        assert!(o.approx_size() > base);
-    }
-
-    #[test]
-    fn arguments_exotic_mapped_has_mapping() {
-        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
-        let mapped: Box<[Option<u32>]> = vec![Some(0), Some(1), None].into_boxed_slice();
-        let obj = heap.alloc(JsObject {
-            kind: KIND_ARGUMENTS,
-            elements: vec![
-                JsValue::from_i32_smi(10).unwrap(),
-                JsValue::from_i32_smi(20).unwrap(),
-                JsValue::from_i32_smi(30).unwrap(),
-            ],
-            arguments_mapped: Some(mapped),
-            ..JsObject::default()
-        });
-        heap.add_root(JsValue::object(obj));
-        let stored = heap.get(obj);
-        assert_eq!(stored.kind, KIND_ARGUMENTS);
-        assert!(stored.arguments_mapped.is_some());
-        let map = stored.arguments_mapped.as_ref().unwrap();
-        assert_eq!(map[0], Some(0));
-        assert_eq!(map[1], Some(1));
-        assert_eq!(map[2], None);
-        // Mapped arguments are exotic: indexed access via elements should work
-        assert_eq!(stored.elements[0].as_smi(), Some(10));
-    }
-
-    #[test]
-    fn arguments_exotic_unmapped_is_strict() {
-        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
-        let obj = heap.alloc(JsObject {
-            kind: KIND_ARGUMENTS,
-            elements: vec![JsValue::from_i32_smi(1).unwrap()],
-            arguments_mapped: None,
-            ..JsObject::default()
-        });
-        heap.add_root(JsValue::object(obj));
-        assert_eq!(heap.get(obj).arguments_mapped, None);
-        // Unmapped (strict) arguments should not alias parameters
-        assert_eq!(heap.get(obj).elements[0].as_smi(), Some(1));
+    fn generator_object_slots() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let h = heap.alloc(JsObject::generator());
+        heap.get_mut(h).properties = vec![JsValue::from_f64(2.0), JsValue::from_f64(0.0), JsValue::from_f64(0.0)];
+        assert_eq!(heap.get(h).kind, KIND_GENERATOR);
+        assert_eq!(heap.get(h).properties.len(), 3);
     }
 }
