@@ -6,4 +6,6 @@ fn yield_suspends_and_next_resumes() {
     let mut interp = Interp::from_source(src).unwrap();
     let res = interp.run();
     assert!(res.is_err());
+    let v = match res { Err(e) => e.0, Ok(()) => panic!("expected throw") };
+    assert_eq!(interp.to_display_string(v), "42");
 }

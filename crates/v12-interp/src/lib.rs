@@ -1341,51 +1341,27 @@ impl Interp {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::SuspendYield => {
+                    // Suspend generator: save register window and resume pc, then exit inner execute.
+                    self.gc_protect();
                     let dst = instr.a();
                     let yielded = self.stack[base + usize::from(dst)];
                     let gen_obj = self.frames.last().expect("frame").generator.expect("yield outside generator");
                     let snapshot = self.stack[base..base + usize::from(max_regs)].to_vec();
                     let resume_pc = pc + op_width;
+                    let yielded_boxed = ops::box_number(yielded.as_f64().unwrap_or(0.0));
+                    // Preserve yielded value identity: use original yielded, but ensure GC root before alloc above.
+                    let _ = yielded_boxed;
                     self.heap.get_mut(gen_obj).properties[1] = ops::box_number(resume_pc as f64);
-                    // store yield_dst in properties[3] (extend to 4 slots)
                     if self.heap.get(gen_obj).properties.len() < 4 {
                         self.heap.get_mut(gen_obj).properties.resize(4, JsValue::undefined());
                     }
                     self.heap.get_mut(gen_obj).properties[3] = ops::box_number(f64::from(dst));
+                    self.heap.get_mut(gen_obj).properties[2] = ops::box_number(2.0); // 2.0 = suspended
                     self.heap.get_mut(gen_obj).elements = snapshot;
                     self.heap.get_mut(gen_obj).prototype = self.frames.last().and_then(|f| f.env);
-                    // unwind current frame
                     let finished_base = self.frames.pop().expect("pop").base;
                     self.stack.truncate(finished_base);
-                    // Suspend signal: store yielded for generator_next to pick up via heap? We use top_result as suspeded flag
                     self.top_result = Some(yielded);
-                    // Do not advance caller pc here; generator_next will handle iterator wrapping
-                    // If frames is not empty (main still there), we return from execute to let generator_next handle;
-                    // Signal suspension by returning Ok(()) after setting top_result and a marker.
-                    // To avoid continuing normal dispatch, we keep frames but need to tell outer loop we suspended.
-                    // Use a custom flag: we set a sentinel in heap? Instead we make execute check top_result after SuspendYield
-                    // For now, break out of execute via special error path: we cannot easily break, so we set a flag and return.
-                    // We store suspended gen in a thread-local via heap root? Simpler: we leave top_result and let generator_next's inner loop detect suspension via frame count.
-                    // Here we just continue dispatch which will drive caller; but generator_next's outer caller expects Value return, not dispatch continuation.
-                    // For Task 3, this path is only reached when generator body is running inside generator_next's run loop, not main dispatch.
-                    // So we need to make the inner run loop handle this. For main dispatch (should not happen), just treat as yield value.
-                    // If we're inside generator_next inner loop, the frame was popped and top_result holds yielded; inner loop will detect frames.len decreased and return.
-                    // For now, if we are in main dispatch (frames not empty after pop), store yielded into caller's dst? But we don't know dst.
-                    // Instead, just set top_result and return; outer execute will see suspended state via checking generator object's done flag?
-                    // To make inner loop work, we make SuspendYield set a separate field `suspended_value` and then return.
-                    // Use heap property as signal: store yielded in a temporary global slot (stack base 0 temp) - not needed.
-                    // The inner loop in generator_next will check self.top_result after each step.
-                    // So we leave it and continue; the outer `execute` will now dispatch caller frame.
-                    // To prevent caller from running, we push a marker frame? Simpler to just return now and let generator_next's caller handle.
-                    // We signal by setting pc of caller? No.
-                    // Approach: after suspend, we do not continue 'drive; we return from execute early by setting a flag on Interp.
-                    // Add a flag `suspended` and make execute check it. For now, just store and continue; generator_next's loop will poll heap.
-                    // Minimal: just keep top_result and continue; the main loop will run main frame, which is not desired for resume path.
-                    // But for resume path, frames = [main, gen] ; after suspend, frames = [main]; execute would then continue executing main which would proceed past the `it.next()` call incorrectly without iterator result.
-                    // So we need to prevent that: we make SuspendYield not continue to main but instead make execute return early when it detects suspension via `self.heap.get(gen_obj).properties[2]==0 and top_result set`.
-                    // We achieve this by setting a special `execute_suspended` flag and checking at top of loop.
-                    // For minimal diff, store yielded in heap's roots and make execute check: if top_result is Some and last pop was generator frame, return Ok(()).
-                    // We implement that check via an early return here: we cannot return from inside match without breaking loop, so we use `return Ok(())` to exit execute.
                     return Ok(());
                 }
                 Opcode::Await => {
@@ -1634,14 +1610,14 @@ impl Interp {
         let finished = self.frames.pop().expect("complete_frame requires a frame");
         self.notify_tier_ups();
         if let Some(r#gen) = finished.generator {
-            // Generator frame completed (return or fallthrough): mark done.
+            // Generator frame completed (return or fallthrough): mark done and exit inner execute.
             self.stack.truncate(finished.base);
             if self.heap.get(r#gen).properties.len() >= 3 {
                 self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
             }
             self.top_result = Some(result);
-            // For resumed generator, exit execute to let generator_next wrap as iterator result.
-            // Returning true makes outer execute return to generator_next caller instead of continuing caller dispatch.
+            // Always exit inner execute so generator_next can wrap as {value,done:true}.
+            // If frames is empty this is top-level completion; otherwise still exit to caller.
             return Ok(true);
         }
         let Some(caller) = self.frames.last_mut() else {
@@ -3260,25 +3236,17 @@ impl Interp {
         // or Ok(()) on completion (complete_frame popped gen frame and set top_result)
         match exec_res {
             Ok(()) => {
-                if self.frames.len() < frames_before {
-                    // Suspended: top_result holds yielded value
+                // Discriminate suspend (done==2.0, frames popped) vs completion (done==1.0).
+                let done_val = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64))).unwrap_or(0.0);
+                if done_val == 2.0 && self.frames.len() < frames_before {
                     let yielded = self.top_result.take().unwrap_or(JsValue::undefined());
-                    // Ensure stack truncated already by SuspendYield
                     return Ok(self.make_iterator_result(yielded, false));
                 } else {
-                    // Completed without suspension? Should have been popped and top_result set
                     let ret = self.top_result.take().unwrap_or(JsValue::undefined());
-                    // Check if generator marked done
-                    let is_done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) == 1.0;
-                    if is_done {
-                        return Ok(self.make_iterator_result(ret, true));
-                    } else {
-                        // Mark done and return
-                        if self.heap.get(r#gen).properties.len() >= 3 {
-                            self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
-                        }
-                        return Ok(self.make_iterator_result(ret, true));
+                    if done_val != 1.0 && self.heap.get(r#gen).properties.len() >= 3 {
+                        self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
                     }
+                    return Ok(self.make_iterator_result(ret, true));
                 }
             }
             Err(e) => {

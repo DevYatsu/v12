@@ -23,10 +23,9 @@ pub const KIND_ARRAY: u8 = 2;
 /// exotic parameter alias (see `JsObject::arguments_mapped`).
 pub const KIND_ARGUMENTS: u8 = 3;
 
-/// Generator object. Interpreter contract (v12-interp/src/lib.rs:3094):
-/// properties[0]=fn_idx (Smi), [1]=next_index (Smi), [2]=done (0.0/1.0);
-/// elements=yield values (LoadInt eager path) or empty when real suspension used;
-/// prototype=captured Env. DO NOT reorder without updating interp.
+/// Generator object. Interpreter contract (v12-interp/src/lib.rs):
+/// properties[0]=fn_idx, [1]=resume_pc, [2]=done (0.0 running / 1.0 completed / 2.0 suspended), [3]=yield_dst;
+/// elements=saved register window snapshot; prototype=captured Env. DO NOT reorder without updating interp.
 pub const KIND_GENERATOR: u8 = 4;
 
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
