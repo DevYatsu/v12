@@ -82,6 +82,13 @@ impl JsObject {
         Self::default()
     }
 
+    /// `[[Extensible]] == false`. Implied by both integrity transitions.
+    pub const FLAG_NOT_EXTENSIBLE: u8 = 0b0000_0001;
+    /// Every own property non-configurable: sealed or stricter.
+    pub const FLAG_SEALED: u8 = 0b0000_0010;
+    /// Every own property also non-writable: frozen.
+    pub const FLAG_FROZEN: u8 = 0b0000_0100;
+
     /// True once sealed (or frozen): no property may be removed or
     /// reconfigured.
     pub fn is_sealed(&self) -> bool {
@@ -120,9 +127,7 @@ impl JsObject {
         Self {
             kind: KIND_ARRAY,
             properties: vec![crate::JsValue::from_f64(f64::from(len as u32))],
-            property_keys: vec![Some(crate::PropKey::from_string(
-                crate::handle::Handle::new(0)
-            ))], // length property key
+            property_keys: vec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
             elements,
             ..Self::default()
         }
@@ -153,13 +158,6 @@ impl JsObject {
             ..Self::default()
         }
     }
-
-    /// `[[Extensible]] == false`. Implied by both integrity transitions.
-    pub const FLAG_NOT_EXTENSIBLE: u8 = 0b0000_0001;
-    /// Every own property non-configurable: sealed or stricter.
-    pub const FLAG_SEALED: u8 = 0b0000_0010;
-    /// Every own property also non-writable: frozen.
-    pub const FLAG_FROZEN: u8 = 0b0000_0100;
 
 
 }
@@ -201,13 +199,14 @@ const VALUE_BYTES: usize = core::mem::size_of::<crate::JsValue>();
 
 impl SizeEstimate for JsObject {
     fn approx_size(&self) -> usize {
-        // Header (kind, flags, prototype) + capacity of both slot vectors.
+        // Header (kind, flags, prototype) + capacity of all slot vectors.
         let mapped = self
             .arguments_mapped
             .as_ref()
             .map_or(0, |m| m.len() * core::mem::size_of::<Option<u32>>());
         16 + self.properties.capacity() * VALUE_BYTES
             + self.elements.capacity() * VALUE_BYTES
+            + self.property_keys.capacity() * core::mem::size_of::<Option<crate::PropKey>>()
             + mapped
     }
 }
@@ -248,22 +247,77 @@ impl Trace for V12BigInt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GcPolicy, Heap};
     use crate::JsValue;
 
     #[test]
-    fn generator_object_slots_documented() {
-        let mut heap = Heap::new(GcPolicy::NoGC);
-        let h = heap.alloc(JsObject::generator());
-        heap.get_mut(h).properties = vec![JsValue::from_f64(2.0), JsValue::from_f64(0.0), JsValue::from_f64(0.0)];
-        assert_eq!(heap.get(h).kind, KIND_GENERATOR);
-        // This will fail until slot 2 is wired to completion check in interp
-        assert_eq!(heap.get(h).properties.len(), 3);
+    fn object_traces_children_through_sink() {
+        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
+        let child = heap.alloc(JsObject::default());
+        let parent = heap.alloc(JsObject {
+            properties: vec![JsValue::object(child)],
+            elements: vec![JsValue::object(child)],
+            prototype: Some(child),
+            ..JsObject::default()
+        });
+        // Force a collect that only sees the parent: the child must survive
+        // via all three child-bearing fields.
+        heap.add_root(JsValue::object(parent));
+        heap.force_collect();
+        assert_eq!(heap.live_count::<JsObject>(), 2);
+    }
+
+    #[test]
+    fn size_estimates_grow_with_capacity() {
+        let mut o = JsObject::default();
+        let base = o.approx_size();
+        o.properties.reserve(100);
+        assert!(o.approx_size() > base);
+    }
+
+    #[test]
+    fn arguments_exotic_mapped_has_mapping() {
+        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
+        let mapped: Box<[Option<u32>]> = vec![Some(0), Some(1), None].into_boxed_slice();
+        let obj = heap.alloc(JsObject {
+            kind: KIND_ARGUMENTS,
+            elements: vec![
+                JsValue::from_i32_smi(10).unwrap(),
+                JsValue::from_i32_smi(20).unwrap(),
+                JsValue::from_i32_smi(30).unwrap(),
+            ],
+            arguments_mapped: Some(mapped),
+            ..JsObject::default()
+        });
+        heap.add_root(JsValue::object(obj));
+        let stored = heap.get(obj);
+        assert_eq!(stored.kind, KIND_ARGUMENTS);
+        assert!(stored.arguments_mapped.is_some());
+        let map = stored.arguments_mapped.as_ref().unwrap();
+        assert_eq!(map[0], Some(0));
+        assert_eq!(map[1], Some(1));
+        assert_eq!(map[2], None);
+        // Mapped arguments are exotic: indexed access via elements should work
+        assert_eq!(stored.elements[0].as_smi(), Some(10));
+    }
+
+    #[test]
+    fn arguments_exotic_unmapped_is_strict() {
+        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
+        let obj = heap.alloc(JsObject {
+            kind: KIND_ARGUMENTS,
+            elements: vec![JsValue::from_i32_smi(1).unwrap()],
+            arguments_mapped: None,
+            ..JsObject::default()
+        });
+        heap.add_root(JsValue::object(obj));
+        assert_eq!(heap.get(obj).arguments_mapped, None);
+        // Unmapped (strict) arguments should not alias parameters
+        assert_eq!(heap.get(obj).elements[0].as_smi(), Some(1));
     }
 
     #[test]
     fn generator_object_slots() {
-        let mut heap = Heap::new(GcPolicy::NoGC);
+        let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
         let h = heap.alloc(JsObject::generator());
         heap.get_mut(h).properties = vec![JsValue::from_f64(2.0), JsValue::from_f64(0.0), JsValue::from_f64(0.0)];
         assert_eq!(heap.get(h).kind, KIND_GENERATOR);
