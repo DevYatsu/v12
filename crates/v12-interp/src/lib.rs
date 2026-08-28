@@ -457,6 +457,8 @@ pub struct Interp {
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
     top_result: Option<JsValue>,
+    /// Pending async resumes: (generator state object, resolved value for Await dst).
+    pending_awaits: Vec<(Handle<JsObject>, JsValue)>,
 }
 
 impl Interp {
@@ -503,6 +505,7 @@ impl Interp {
             generator_return_fn: None,
             generator_throw_fn: None,
             top_result: None,
+            pending_awaits: Vec::new(),
         };
         interp.ensure_default_global();
         interp
@@ -574,6 +577,7 @@ impl Interp {
             generator_return_fn: None,
             generator_throw_fn: None,
             top_result: None,
+            pending_awaits: Vec::new(),
         };
         interp.ensure_default_global();
         interp
@@ -1374,11 +1378,40 @@ impl Interp {
                     return Ok(());
                 }
                 Opcode::Await => {
-                    // TODO: suspend async function similar to SuspendYield; for now pass-through.
+                    self.gc_protect();
                     let src = instr.b();
                     let dst = instr.a();
-                    self.stack[base + usize::from(dst)] = self.stack[base + usize::from(src)];
-                    self.set_pc(pc + op_width);
+                    let arg = self.stack[base + usize::from(src)];
+                    // Resolve thenable minimally: if arg is fulfilled promise (engine shape), unwrap payload.
+                    let resolved = self.try_unwrap_promise(arg).unwrap_or(arg);
+                    let r#gen = self.frames.last().expect("frame").generator.expect("await outside async");
+                    let snapshot = self.stack[base..base + usize::from(max_regs)].to_vec();
+                    let resume_pc = pc + op_width;
+                    self.heap.get_mut(r#gen).properties[1] = ops::box_number(resume_pc as f64);
+                    if self.heap.get(r#gen).properties.len() < 4 {
+                        self.heap.get_mut(r#gen).properties.resize(4, JsValue::undefined());
+                    }
+                    self.heap.get_mut(r#gen).properties[3] = ops::box_number(f64::from(dst));
+                    self.heap.get_mut(r#gen).properties[2] = ops::box_number(2.0);
+                    self.heap.get_mut(r#gen).elements = snapshot;
+                    self.heap.get_mut(r#gen).prototype = self.frames.last().and_then(|f| f.env);
+                    let finished_frame = self.frames.pop().expect("pop");
+                    let finished_base = finished_frame.base;
+                    self.stack.truncate(finished_base);
+                    self.heap.add_root(resolved);
+                    self.pending_awaits.push((r#gen, resolved));
+                    self.top_result = None;
+                    // Advance caller past its Call header so main can continue (async call returns undefined for now; task 7 will return Promise)
+                    if let Some(caller) = self.frames.last_mut() {
+                        let instrs = &self.functions[caller.fn_idx as usize].instrs;
+                        let (_, dst, width) = decode_parked_call(instrs, caller.pc);
+                        let caller_base = caller.base;
+                        self.stack[caller_base + usize::from(dst)] = JsValue::undefined();
+                        caller.pc += width;
+                    } else {
+                        return Ok(());
+                    }
+                    continue 'drive;
                 }
             }
         }
@@ -1632,13 +1665,33 @@ impl Interp {
             }
         }
 
+        let is_async = self.is_async_fn(target);
+        let async_gen = if is_async {
+            self.gc_protect();
+            let g = self.heap.alloc(JsObject {
+                kind: KIND_GENERATOR,
+                properties: vec![
+                    ops::box_number(f64::from(target)),
+                    ops::box_number(0.0),
+                    ops::box_number(0.0),
+                    ops::box_number(0.0),
+                ],
+                elements: Vec::new(),
+                prototype: captured_env,
+                ..JsObject::default()
+            });
+            self.heap.add_root(JsValue::object(g));
+            Some(g)
+        } else {
+            None
+        };
         self.frames.push(Frame {
             fn_idx: target,
             pc: 0,
             base: new_base,
             max_regs: callee_max_regs,
             env: captured_env,
-            generator: None,
+            generator: async_gen,
             yield_dst: None,
         });
         self.note_entry(target);
@@ -3183,6 +3236,10 @@ impl Interp {
         false
     }
 
+    fn is_async_fn(&self, fn_idx: u32) -> bool {
+        self.functions[fn_idx as usize].is_async
+    }
+
     fn create_generator_object(
         &mut self,
         fn_idx: u32,
@@ -3419,6 +3476,54 @@ impl Interp {
         Ok(ops::box_number(f64::from(new_len)))
     }
 
+    fn try_unwrap_promise(&self, v: JsValue) -> Option<JsValue> {
+        let obj = v.as_object()?;
+        let p = self.heap.get(obj);
+        if p.properties.len() == 3 && p.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s)) {
+            let state = p.properties[0].as_smi().unwrap();
+            if state == 1 {
+                return Some(p.properties[1]);
+            }
+        }
+        None
+    }
+
+    fn resume_async(&mut self, r#gen: Handle<JsObject>, value: JsValue) -> Result<(), JSException> {
+        let fn_idx = self.heap.get(r#gen).properties.first().and_then(|v| v.as_smi().map(|n| n as u32 as f64).or(v.as_f64())).unwrap_or(0.0) as u32;
+        let resume_pc = self.heap.get(r#gen).properties.get(1).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as usize;
+        let snapshot = self.heap.get(r#gen).elements.clone();
+        let env = self.heap.get(r#gen).prototype;
+        let f_max_regs = self.functions[fn_idx as usize].max_regs;
+        let new_base = self.stack.len();
+        self.stack.resize(new_base + usize::from(f_max_regs), JsValue::undefined());
+        let copy_len = snapshot.len().min(usize::from(f_max_regs));
+        for i in 0..copy_len {
+            self.stack[new_base + i] = snapshot[i];
+        }
+        let yield_dst = self.heap.get(r#gen).properties.get(3).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as u16;
+        if (yield_dst as usize) < usize::from(f_max_regs) {
+            self.stack[new_base + usize::from(yield_dst)] = value;
+        }
+        self.frames.push(Frame { fn_idx, pc: resume_pc, base: new_base, max_regs: f_max_regs, env, generator: Some(r#gen), yield_dst: None });
+        self.top_result = None;
+        self.execute()?;
+        Ok(())
+    }
+
+    /// Drains pending async awaits (microtask checkpoint). Returns number executed.
+    pub fn run_jobs(&mut self) -> usize {
+        let mut count = 0;
+        while let Some((r#gen, val)) = self.pending_awaits.pop() {
+            let _ = self.resume_async(r#gen, val);
+            count += 1;
+            if count > 10000 { break; }
+        }
+        count
+    }
+
+    /// Number of pending async jobs.
+    pub fn pending_jobs(&self) -> usize { self.pending_awaits.len() }
+
     /// Republishes every live reference as a GC root — the whole value stack
     /// plus each active frame's environment — immediately before opcodes
     /// that can reach `Heap::alloc`.
@@ -3439,6 +3544,11 @@ impl Interp {
                 roots.push(JsValue::object(g));
             }
         }
+        for (g, v) in &self.pending_awaits {
+            roots.push(JsValue::object(*g));
+            roots.push(*v);
+        }
+        if let Some(v) = self.top_result { roots.push(v); }
         roots.extend(persistent.into_iter().flatten());
     }
 }
