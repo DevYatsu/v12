@@ -154,35 +154,97 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::YieldExpression(y) => {
                 if y.delegate {
                     let iterable = self.expr(y.argument.as_ref().unwrap())?;
-                    // v1: array-only delegation — index loop over iterable.length.
-                    // TODO: generic iterator protocol (Symbol.iterator) for non-arrays — v1 supports arrays only
-                    // Array index loop: for (idx=0; idx < iterable.length; idx++) yield iterable[idx]
-                    let idx = self.new_temp();
-                    self.load_int(idx, 0, y.span);
-                    let len_key = self.new_temp();
-                    self.load_str(len_key, "length", y.span)?;
+                    // Generic iterator protocol with array fallback.
+                    let sym_key = self.new_temp();
+                    self.load_str(sym_key, "Symbol.iterator", y.span)?;
+                    let method = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, method, iterable, sym_key, y.span);
+                    let iter = self.new_temp();
+                    let ret = self.new_temp();
+                    let has_iter = self.label();
+                    let no_iter = self.label();
+                    let iter_ready = self.label();
+                    let done_label = self.label();
+                    self.emit_jump(Opcode::JumpIfTrue, method, has_iter);
+                    self.bind(no_iter);
+                    let probe_key = self.new_temp();
+                    self.load_str(probe_key, "next", y.span)?;
+                    let probe_next = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, probe_next, iterable, probe_key, y.span);
+                    let array_fallback = self.label();
+                    self.emit_jump(Opcode::JumpIfFalse, probe_next, array_fallback);
+                    self.move_reg(iter, iterable, y.span);
+                    self.emit_jump(Opcode::Jump, 0, iter_ready);
+                    self.bind(array_fallback);
+                    {
+                        let idx = self.new_temp();
+                        self.load_int(idx, 0, y.span);
+                        let len_key = self.new_temp();
+                        self.load_str(len_key, "length", y.span)?;
+                        let arr_loop_start = self.label();
+                        let arr_loop_end = self.label();
+                        self.bind(arr_loop_start);
+                        let len = self.new_temp();
+                        self.emit_reg3(Opcode::GetProperty, len, iterable, len_key, y.span);
+                        let cond = self.new_temp();
+                        self.emit_reg3(Opcode::Lt, cond, idx, len, y.span);
+                        self.emit_jump(Opcode::JumpIfFalse, cond, arr_loop_end);
+                        let elem = self.new_temp();
+                        self.emit_reg3(Opcode::GetProperty, elem, iterable, idx, y.span);
+                        let ydst = self.new_temp();
+                        self.move_reg(ydst, elem, y.span);
+                        self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, y.span);
+                        let one = self.new_temp();
+                        self.load_int(one, 1, y.span);
+                        let nxt = self.new_temp();
+                        self.emit_reg3(Opcode::Add, nxt, idx, one, y.span);
+                        self.move_reg(idx, nxt, y.span);
+                        self.emit_jump(Opcode::Jump, 0, arr_loop_start);
+                        self.bind(arr_loop_end);
+                        self.load_undefined(ret, y.span);
+                        self.emit_jump(Opcode::Jump, 0, done_label);
+                    }
+                    self.bind(has_iter);
+                    {
+                        let block = self.new_temps(CALL_HEADER_REGS);
+                        self.move_reg(block, method, y.span);
+                        self.move_reg(block + 1, iterable, y.span);
+                        self.emit_call(block, block, 0, y.span);
+                        self.move_reg(iter, block, y.span);
+                    }
+                    self.bind(iter_ready);
+                    let next_key = self.new_temp();
+                    self.load_str(next_key, "next", y.span)?;
+                    let done_key = self.new_temp();
+                    self.load_str(done_key, "done", y.span)?;
+                    let value_key = self.new_temp();
+                    self.load_str(value_key, "value", y.span)?;
                     let loop_start = self.label();
                     let loop_end = self.label();
+                    let result = self.new_temp();
+                    self.load_undefined(result, y.span);
                     self.bind(loop_start);
-                    let len = self.new_temp();
-                    self.emit_reg3(Opcode::GetProperty, len, iterable, len_key, y.span);
-                    let cond = self.new_temp();
-                    self.emit_reg3(Opcode::Lt, cond, idx, len, y.span);
-                    self.emit_jump(Opcode::JumpIfFalse, cond, loop_end);
-                    let elem = self.new_temp();
-                    self.emit_reg3(Opcode::GetProperty, elem, iterable, idx, y.span);
+                    {
+                        let next_fn = self.new_temp();
+                        self.emit_reg3(Opcode::GetProperty, next_fn, iter, next_key, y.span);
+                        let block = self.new_temps(CALL_HEADER_REGS);
+                        self.move_reg(block, next_fn, y.span);
+                        self.move_reg(block + 1, iter, y.span);
+                        self.emit_call(block, block, 0, y.span);
+                        self.move_reg(result, block, y.span);
+                    }
+                    let done_val = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, done_val, result, done_key, y.span);
+                    self.emit_jump(Opcode::JumpIfTrue, done_val, loop_end);
+                    let yielded = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, yielded, result, value_key, y.span);
                     let ydst = self.new_temp();
-                    self.move_reg(ydst, elem, y.span);
+                    self.move_reg(ydst, yielded, y.span);
                     self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, y.span);
-                    let one = self.new_temp();
-                    self.load_int(one, 1, y.span);
-                    let nxt = self.new_temp();
-                    self.emit_reg3(Opcode::Add, nxt, idx, one, y.span);
-                    self.move_reg(idx, nxt, y.span);
                     self.emit_jump(Opcode::Jump, 0, loop_start);
                     self.bind(loop_end);
-                    let ret = self.new_temp();
-                    self.load_undefined(ret, y.span);
+                    self.emit_reg3(Opcode::GetProperty, ret, result, value_key, y.span);
+                    self.bind(done_label);
                     return Ok(ret);
                 }
                 let arg = if let Some(arg) = &y.argument {

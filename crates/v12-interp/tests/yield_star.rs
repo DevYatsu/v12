@@ -7,3 +7,11 @@ fn yield_star_delegates_array() {
     let thrown = interp.run().unwrap_err();
     assert_eq!(interp.to_display_string(thrown.0), "1,2,true");
 }
+
+#[test]
+fn yield_star_delegates_generator() {
+    let src = "function* inner(){yield 1;} function* outer(){yield* inner();} let it=outer(); let a=it.next(); let b=it.next(); throw [a.value,b.done].join(',');";
+    let mut interp = Interp::from_source(src).unwrap();
+    let thrown = interp.run().unwrap_err();
+    assert_eq!(interp.to_display_string(thrown.0), "1,true");
+}
