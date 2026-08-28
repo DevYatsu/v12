@@ -59,11 +59,12 @@
 //!   function declarations bind lexically (strict-mode style) rather than
 //!   Annex B web-compat semantics.
 //!
-//! # Stretch items not reached (TODO)
+//! # Generator and async support
 //!
-//! Generator functions (`CreateGenerator`/`SuspendYield` lowering) and
-//! async/await desugaring to `Await` remain unimplemented; both need the
-//! interpreter's pausable-frame execution model to be testable.
+//! Generator functions are flagged via `FunctionBytecode::is_generator` and
+//! lower with a `CreateGenerator` prologue. Async functions are flagged via
+//! `is_async`; `await` lowers to `Await` (interpreter pausable-frame support
+//! is implemented separately).
 
 #![forbid(unsafe_code)]
 

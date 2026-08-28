@@ -29,6 +29,8 @@ fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
         fixed_params: 0,
         has_rest: false,
         rest_reg: 0,
+        is_generator: false,
+        is_async: false,
     }
 }
 
@@ -85,7 +87,27 @@ pub fn compile_unit(
     };
 
     let mut cx = FnCtx::new(comp, idx);
+    // Flag generator/async on the underlying FunctionBuilder before emission.
+    match &node {
+        UnitNode::Fn(f) => {
+            cx.b.is_generator = f.generator;
+            cx.b.is_async = f.r#async;
+        }
+        UnitNode::Arrow(a) => {
+            cx.b.is_generator = false;
+            cx.b.is_async = a.r#async;
+        }
+        UnitNode::Main(_) => {
+            cx.b.is_generator = false;
+            cx.b.is_async = false;
+        }
+    }
     emit_prologue(&mut cx, idx, self_symbol)?;
+    if cx.b.is_generator {
+        let dst = cx.new_temp();
+        let func_idx = u16::try_from(idx).unwrap_or(0);
+        cx.emit_reg3(Opcode::CreateGenerator, dst, func_idx, 0, oxc_span::Span::default());
+    }
     if idx == 0 {
         emit_import_calls(&mut cx)?;
     }

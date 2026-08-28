@@ -331,6 +331,8 @@ pub fn inline_at(
         fixed_params: caller.fixed_params,
         has_rest: caller.has_rest,
         rest_reg: caller.rest_reg,
+        is_generator: caller.is_generator,
+        is_async: caller.is_async,
     })
 }
 

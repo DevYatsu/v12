@@ -1064,7 +1064,7 @@ pub struct PcMapEntry {
 ///
 /// Register conventions: binary ops write `r{a} <- r{b} op r{c}`; jumps
 /// store absolute pc targets; `Call` is `r{a} <- call r{b}, argc={c}`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FunctionBytecode {
     pub name_hint: Option<String>,
     pub max_regs: u16,
@@ -1084,6 +1084,8 @@ pub struct FunctionBytecode {
     /// u16: rest parameters sit right after the fixed params, which can pass
     /// 255 in functions with many parameters (u16 register addressing).
     pub rest_reg: u16,
+    pub is_generator: bool,
+    pub is_async: bool,
 }
 
 impl FunctionBytecode {
@@ -1336,6 +1338,8 @@ mod data_tests {
             fixed_params: 0,
             has_rest: false,
             rest_reg: 0,
+            is_generator: false,
+            is_async: false,
         }
     }
 
@@ -1577,6 +1581,8 @@ pub struct FunctionBuilder {
     handlers: Vec<HandlerRange>,
     labels: Vec<Option<u32>>,
     fixups: Vec<Fixup>,
+    pub is_generator: bool,
+    pub is_async: bool,
 }
 
 impl FunctionBuilder {
@@ -1699,6 +1705,8 @@ impl FunctionBuilder {
             fixed_params: 0,
             has_rest: false,
             rest_reg: 0,
+            is_generator: self.is_generator,
+            is_async: self.is_async,
         }
     }
 }

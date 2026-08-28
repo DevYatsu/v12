@@ -685,6 +685,8 @@ pub fn fn_with_instrs(
         fixed_params: 0,
         has_rest: false,
         rest_reg: 0,
+        is_generator: false,
+        is_async: false,
     }
 }
 
