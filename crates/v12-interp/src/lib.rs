@@ -457,8 +457,8 @@ pub struct Interp {
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
     top_result: Option<JsValue>,
-    /// Pending async resumes: (generator state object, resolved value for Await dst).
-    pending_awaits: Vec<(Handle<JsObject>, JsValue)>,
+    /// Pending async resumes as FIFO microtask queue: (generator, value, is_reject).
+    pending_awaits: std::collections::VecDeque<(Handle<JsObject>, JsValue, bool)>,
 }
 
 impl Interp {
@@ -505,7 +505,7 @@ impl Interp {
             generator_return_fn: None,
             generator_throw_fn: None,
             top_result: None,
-            pending_awaits: Vec::new(),
+            pending_awaits: std::collections::VecDeque::new(),
         };
         interp.ensure_default_global();
         interp
@@ -577,7 +577,7 @@ impl Interp {
             generator_return_fn: None,
             generator_throw_fn: None,
             top_result: None,
-            pending_awaits: Vec::new(),
+            pending_awaits: std::collections::VecDeque::new(),
         };
         interp.ensure_default_global();
         interp
@@ -597,6 +597,17 @@ impl Interp {
             ..JsObject::default()
         });
         self.heap.add_root(JsValue::object(g));
+        // Minimal Promise wiring for standalone interp tests (mirrors realm.rs)
+        let promise_proto = self.heap.alloc(JsObject::default());
+        self.heap.add_root(JsValue::object(promise_proto));
+        let promise_ctor = self.heap.alloc(JsObject { kind: KIND_FUNCTION, prototype: Some(promise_proto), ..JsObject::default() });
+        self.heap.add_root(JsValue::object(promise_ctor));
+        {
+            let props = &mut self.heap.get_mut(g).properties;
+            if props.len() > 10 {
+                props[10] = JsValue::object(promise_ctor);
+            }
+        }
         self.global = Some(g);
     }
 
@@ -1382,8 +1393,6 @@ impl Interp {
                     let src = instr.b();
                     let dst = instr.a();
                     let arg = self.stack[base + usize::from(src)];
-                    // Resolve thenable minimally: if arg is fulfilled promise (engine shape), unwrap payload.
-                    let resolved = self.try_unwrap_promise(arg).unwrap_or(arg);
                     let r#gen = self.frames.last().expect("frame").generator.expect("await outside async");
                     let snapshot = self.stack[base..base + usize::from(max_regs)].to_vec();
                     let resume_pc = pc + op_width;
@@ -1393,24 +1402,40 @@ impl Interp {
                     }
                     self.heap.get_mut(r#gen).properties[3] = ops::box_number(f64::from(dst));
                     self.heap.get_mut(r#gen).properties[2] = ops::box_number(2.0);
+                    // Ensure async promise slot exists (task 6/7: async returns Promise)
+                    let async_promise = if self.heap.get(r#gen).properties.len() > 4 {
+                        self.heap.get(r#gen).properties[4]
+                    } else {
+                        JsValue::undefined()
+                    };
+                    let has_promise = async_promise.as_object().is_some();
                     self.heap.get_mut(r#gen).elements = snapshot;
                     self.heap.get_mut(r#gen).prototype = self.frames.last().and_then(|f| f.env);
                     let finished_frame = self.frames.pop().expect("pop");
                     let finished_base = finished_frame.base;
                     self.stack.truncate(finished_base);
-                    self.heap.add_root(resolved);
-                    self.pending_awaits.push((r#gen, resolved));
+                    // Promise.resolve(arg) -> enqueue reaction that resumes
+                    let (promise, is_rejected, payload) = self.promise_resolve_for_await(arg);
+                    self.heap.add_root(payload);
+                    if let Some(ph) = promise.as_object() { self.heap.add_root(JsValue::object(ph)); }
+                    self.pending_awaits.push_back((r#gen, payload, is_rejected));
                     self.top_result = None;
-                    // Advance caller past its Call header so main can continue (async call returns undefined for now; task 7 will return Promise)
+                    // Advance caller past its Call header: async call returns Promise if available else undefined (task 7)
                     if let Some(caller) = self.frames.last_mut() {
                         let instrs = &self.functions[caller.fn_idx as usize].instrs;
-                        let (_, dst, width) = decode_parked_call(instrs, caller.pc);
+                        let (_, cdst, width) = decode_parked_call(instrs, caller.pc);
                         let caller_base = caller.base;
-                        self.stack[caller_base + usize::from(dst)] = JsValue::undefined();
+                        if has_promise {
+                            self.stack[caller_base + usize::from(cdst)] = async_promise;
+                        } else {
+                            // No promise slot yet (legacy path) – keep undefined for backward compat
+                            self.stack[caller_base + usize::from(cdst)] = JsValue::undefined();
+                        }
                         caller.pc += width;
                     } else {
                         return Ok(());
                     }
+                    let _ = promise;
                     continue 'drive;
                 }
             }
@@ -1591,6 +1616,41 @@ impl Interp {
                 let res = self.array_push_fallback(this_v, &args_slice)?;
                 return Ok(CallOutcome::Value(res));
             }
+            if target == NATIVE_PROMISE_RESOLVE {
+                let args_start = callee_slot + 2;
+                let args_end = args_start + usize::from(argc);
+                let args_slice = self.stack[args_start..args_end].to_vec();
+                let v = args_slice.first().copied().unwrap_or(JsValue::undefined());
+                if self.is_promise(v) {
+                    return Ok(CallOutcome::Value(v));
+                }
+                self.gc_protect();
+                let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+                self.heap.add_root(JsValue::object(reactions));
+                let p = self.heap.alloc(JsObject {
+                    kind: HEAP_KIND_ORDINARY,
+                    properties: vec![JsValue::from_i32_smi(1).expect("fits"), v, JsValue::object(reactions)],
+                    ..JsObject::default()
+                });
+                self.heap.add_root(JsValue::object(p));
+                return Ok(CallOutcome::Value(JsValue::object(p)));
+            }
+            if target == NATIVE_PROMISE_REJECT {
+                let args_start = callee_slot + 2;
+                let args_end = args_start + usize::from(argc);
+                let args_slice = self.stack[args_start..args_end].to_vec();
+                let v = args_slice.first().copied().unwrap_or(JsValue::undefined());
+                self.gc_protect();
+                let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+                self.heap.add_root(JsValue::object(reactions));
+                let p = self.heap.alloc(JsObject {
+                    kind: HEAP_KIND_ORDINARY,
+                    properties: vec![JsValue::from_i32_smi(2).expect("fits"), v, JsValue::object(reactions)],
+                    ..JsObject::default()
+                });
+                self.heap.add_root(JsValue::object(p));
+                return Ok(CallOutcome::Value(JsValue::object(p)));
+            }
             let args_start = callee_slot + 2;
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
@@ -1668,6 +1728,16 @@ impl Interp {
         let is_async = self.is_async_fn(target);
         let async_gen = if is_async {
             self.gc_protect();
+            // Create pending promise for async return value (task 6/7)
+            let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+            self.heap.add_root(JsValue::object(reactions));
+            let promise = self.heap.alloc(JsObject {
+                kind: HEAP_KIND_ORDINARY,
+                properties: vec![JsValue::from_i32_smi(0).expect("0 fits Smi"), JsValue::undefined(), JsValue::object(reactions)],
+                prototype: None,
+                ..JsObject::default()
+            });
+            self.heap.add_root(JsValue::object(promise));
             let g = self.heap.alloc(JsObject {
                 kind: KIND_GENERATOR,
                 properties: vec![
@@ -1675,6 +1745,7 @@ impl Interp {
                     ops::box_number(0.0),
                     ops::box_number(0.0),
                     ops::box_number(0.0),
+                    JsValue::object(promise),
                 ],
                 elements: Vec::new(),
                 prototype: captured_env,
@@ -1705,10 +1776,49 @@ impl Interp {
         let finished = self.frames.pop().expect("complete_frame requires a frame");
         self.notify_tier_ups();
         if let Some(r#gen) = finished.generator {
-            // Generator frame completed (return or fallthrough): mark done and exit inner execute.
+            // Async completion: settle stored promise and don't overwrite caller dst (promise already delivered)
+            let is_async = self.is_async_fn(finished.fn_idx);
+            let has_promise_slot = self.heap.get(r#gen).properties.len() > 4;
+            if is_async && has_promise_slot {
+                if let Some(ph) = self.heap.get(r#gen).properties[4].as_object() {
+                    self.heap.get_mut(ph).properties[0] = JsValue::from_i32_smi(1).expect("fits");
+                    self.heap.get_mut(ph).properties[1] = result;
+                }
+            }
             self.stack.truncate(finished.base);
             if self.heap.get(r#gen).properties.len() >= 3 {
                 self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+            }
+            // For async jobs, caller already resumed with Promise; just settle and exit
+            if is_async && has_promise_slot {
+                // If this was a direct call without prior await suspension (no caller advancement),
+                // ensure caller gets the promise
+                if let Some(caller) = self.frames.last_mut() {
+                    // Check if caller is still parked on a Call to this async function
+                    let pc = caller.pc;
+                    if let Some(&instr) = self.functions[caller.fn_idx as usize].instrs.get(pc) {
+                        if instr.op() == Some(v12_bytecode::Opcode::Call) || instr.op() == Some(v12_bytecode::Opcode::Wide) {
+                            // Heuristic: if pending_awaits empty and result not yet delivered, deliver promise
+                            let instrs = &self.functions[caller.fn_idx as usize].instrs;
+                            // Only deliver if caller dst currently undefined and we have a promise
+                            if let Some(ph) = self.heap.get(r#gen).properties.get(4).copied() {
+                                // Decode dst without advancing if it's a call
+                                let try_decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_parked_call(instrs, pc)));
+                                if let Ok((_, dst, width)) = try_decode {
+                                    let caller_base = caller.base;
+                                    if self.stack[caller_base + usize::from(dst)].is_undefined() {
+                                        self.stack[caller_base + usize::from(dst)] = ph;
+                                        caller.pc += width;
+                                        self.top_result = None;
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                self.top_result = Some(result);
+                return Ok(true);
             }
             self.top_result = Some(result);
             // Always exit inner execute so generator_next can wrap as {value,done:true}.
@@ -3476,10 +3586,43 @@ impl Interp {
         Ok(ops::box_number(f64::from(new_len)))
     }
 
+    fn is_promise(&self, v: JsValue) -> bool {
+        let Some(obj) = v.as_object() else { return false; };
+        let o = self.heap.get(obj);
+        o.properties.len() >= 3 && o.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s))
+    }
+
+    fn promise_resolve_for_await(&mut self, v: JsValue) -> (JsValue, bool, JsValue) {
+        if self.is_promise(v) {
+            let obj = v.as_object().unwrap();
+            let state = self.heap.get(obj).properties[0].as_smi().unwrap_or(0);
+            let payload = self.heap.get(obj).properties[1];
+            if state == 1 {
+                return (v, false, payload);
+            } else if state == 2 {
+                return (v, true, payload);
+            } else {
+                // Pending promise: for task 6, treat as fulfilled with undefined payload (no thenable unwrapping)
+                return (v, false, JsValue::undefined());
+            }
+        }
+        // Create fulfilled promise for non-promise arg
+        self.gc_protect();
+        let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+        self.heap.add_root(JsValue::object(reactions));
+        let promise = self.heap.alloc(JsObject {
+            kind: HEAP_KIND_ORDINARY,
+            properties: vec![JsValue::from_i32_smi(1).expect("fits"), v, JsValue::object(reactions)],
+            ..JsObject::default()
+        });
+        self.heap.add_root(JsValue::object(promise));
+        (JsValue::object(promise), false, v)
+    }
+
     fn try_unwrap_promise(&self, v: JsValue) -> Option<JsValue> {
         let obj = v.as_object()?;
         let p = self.heap.get(obj);
-        if p.properties.len() == 3 && p.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s)) {
+        if p.properties.len() >= 3 && p.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s)) {
             let state = p.properties[0].as_smi().unwrap();
             if state == 1 {
                 return Some(p.properties[1]);
@@ -3510,11 +3653,32 @@ impl Interp {
         Ok(())
     }
 
-    /// Drains pending async awaits (microtask checkpoint). Returns number executed.
+    fn resume_async_throw(&mut self, r#gen: Handle<JsObject>, exc: JsValue) -> Result<(), JSException> {
+        let fn_idx = self.heap.get(r#gen).properties.first().and_then(|v| v.as_smi().map(|n| n as u32 as f64).or(v.as_f64())).unwrap_or(0.0) as u32;
+        let resume_pc = self.heap.get(r#gen).properties.get(1).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as usize;
+        let snapshot = self.heap.get(r#gen).elements.clone();
+        let env = self.heap.get(r#gen).prototype;
+        let f_max_regs = self.functions[fn_idx as usize].max_regs;
+        let new_base = self.stack.len();
+        self.stack.resize(new_base + usize::from(f_max_regs), JsValue::undefined());
+        let copy_len = snapshot.len().min(usize::from(f_max_regs));
+        for i in 0..copy_len {
+            self.stack[new_base + i] = snapshot[i];
+        }
+        self.frames.push(Frame { fn_idx, pc: resume_pc, base: new_base, max_regs: f_max_regs, env, generator: Some(r#gen), yield_dst: None });
+        self.top_result = None;
+        // Inject exception via unwind then execute
+        self.unwind(exc)?;
+        self.execute()?;
+        Ok(())
+    }
+
+    /// Drains pending async awaits FIFO (microtask checkpoint). Returns number executed.
     pub fn run_jobs(&mut self) -> usize {
         let mut count = 0;
-        while let Some((r#gen, val)) = self.pending_awaits.pop() {
-            let _ = self.resume_async(r#gen, val);
+        while let Some((r#gen, val, is_reject)) = self.pending_awaits.pop_front() {
+            let res = if is_reject { self.resume_async_throw(r#gen, val) } else { self.resume_async(r#gen, val) };
+            let _ = res;
             count += 1;
             if count > 10000 { break; }
         }
@@ -3544,7 +3708,7 @@ impl Interp {
                 roots.push(JsValue::object(g));
             }
         }
-        for (g, v) in &self.pending_awaits {
+        for (g, v, _) in &self.pending_awaits {
             roots.push(JsValue::object(*g));
             roots.push(*v);
         }
