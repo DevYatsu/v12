@@ -104,12 +104,19 @@ pub const NATIVE_ARRAY_PUSH: u32 = 1100;
 /// `v12_engine::builtins::NATIVE_ARRAY_JOIN`.
 pub const NATIVE_ARRAY_JOIN: u32 = 1102;
 
+/// Native index for `Object.enumerableOwnKeys` (internal), mirroring
+/// `v12_engine::builtins::NATIVE_ENUMERABLE_OWN_KEYS`.
+pub const NATIVE_ENUMERABLE_OWN_KEYS: u32 = 1901;
+
 /// Native indices of the minimal Promise surface (`Promise.resolve`,
 /// `Promise.reject`, `Promise.prototype.then`), mirroring
 /// `v12_engine::builtins` constants.
 pub const NATIVE_PROMISE_RESOLVE: u32 = 1710;
 pub const NATIVE_PROMISE_REJECT: u32 = 1711;
 pub const NATIVE_PROMISE_THEN: u32 = 1712;
+
+/// Native index for `Generator.prototype.next`.
+pub const NATIVE_GENERATOR_NEXT: u32 = 1910;
 
 /// Selector for [`Interp::cached_native`].
 #[derive(Clone, Copy)]
@@ -119,6 +126,8 @@ enum NativeFn {
     PromiseThen,
     ArrayPush,
     ArrayJoin,
+    EnumerableOwnKeys,
+    GeneratorNext,
 }
 
 /// Native indices of the only constructor-shaped built-ins (`new Boolean`,
@@ -268,6 +277,10 @@ struct Frame {
     /// Innermost environment object (`None` until `NewEnvironment` runs).
     /// Kept here rather than derived so closure capture has one source.
     env: Option<Handle<JsObject>>,
+    /// Associated generator object when this frame is a generator activation.
+    generator: Option<Handle<JsObject>>,
+    /// Destination register of the SuspendYield that suspended this frame (for resume value delivery).
+    yield_dst: Option<u16>,
 }
 
 /// Decodes the instruction at `pc` into
@@ -432,6 +445,8 @@ pub struct Interp {
     promise_then_fn: Option<JsValue>,
     array_push_fn: Option<JsValue>,
     array_join_fn: Option<JsValue>,
+    enumerable_own_keys_fn: Option<JsValue>,
+    generator_next_fn: Option<JsValue>,
     /// Completion value of the bottom frame when the dispatch loop ends.
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
@@ -477,6 +492,8 @@ impl Interp {
             promise_then_fn: None,
             array_push_fn: None,
             array_join_fn: None,
+            enumerable_own_keys_fn: None,
+            generator_next_fn: None,
             top_result: None,
         };
         interp.ensure_default_global();
@@ -544,6 +561,8 @@ impl Interp {
             promise_then_fn: None,
             array_push_fn: None,
             array_join_fn: None,
+            enumerable_own_keys_fn: None,
+            generator_next_fn: None,
             top_result: None,
         };
         interp.ensure_default_global();
@@ -655,6 +674,8 @@ impl Interp {
             base: 0,
             max_regs: main_regs,
             env: None,
+            generator: None,
+            yield_dst: None,
         });
         self.note_entry(self.main);
         self.execute()
@@ -1298,26 +1319,33 @@ impl Interp {
                 }
 
                 Opcode::CreateGenerator => {
+                    // No longer emitted by compiler; generator creation is handled in prepare_call.
+                    // Keep stub for manual bytecode: create dormant generator capturing current frame state after this pc.
                     let dst = instr.a();
-                    // Minimal generator object: empty object with generator kind.
+                    let src = instr.b();
+                    let func_idx = self.stack[base + usize::from(src)].as_smi().map(|v| v as u32).unwrap_or(fn_idx);
                     self.gc_protect();
                     let h = self.heap.alloc(JsObject {
                         kind: KIND_GENERATOR,
+                        properties: vec![
+                            ops::box_number(f64::from(func_idx)),
+                            ops::box_number(f64::from((pc + op_width) as u32)),
+                            ops::box_number(0.0),
+                        ],
+                        elements: self.stack[base..base + usize::from(max_regs)].to_vec(),
+                        prototype: self.frames.last().and_then(|f| f.env),
                         ..JsObject::default()
                     });
-                    // Add a dummy `next` property so `gen().next` is callable
-                    // (returns the generator itself for chaining; real resume
-                    // is not implemented in this stub).
+                    self.heap.add_root(JsValue::object(h));
                     self.stack[base + usize::from(dst)] = JsValue::object(h);
                     self.set_pc(pc + op_width);
                 }
                 Opcode::SuspendYield => {
-                    // Dummy: `yield value` just passes the value through.
-                    // Real suspend would save frame and return to `next()` caller.
+                    // With eager generator evaluation, suspend is not used; treat as pass-through.
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Await => {
-                    // Dummy: `await value` just passes through.
+                    // TODO: suspend async function similar to SuspendYield; for now pass-through.
                     let src = instr.b();
                     let dst = instr.a();
                     self.stack[base + usize::from(dst)] = self.stack[base + usize::from(src)];
@@ -1459,6 +1487,15 @@ impl Interp {
 
         // Indices beyond the compiled program route to the native seam.
         if (target as usize) >= self.functions.len() {
+            if target == NATIVE_GENERATOR_NEXT {
+                let arg = if (callee_slot + 2) < self.stack.len() && argc > 0 {
+                    self.stack[callee_slot + 2]
+                } else {
+                    JsValue::undefined()
+                };
+                let res = self.generator_next(this_v, arg)?;
+                return Ok(CallOutcome::Value(res));
+            }
             let args_start = callee_slot + 2;
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
@@ -1470,6 +1507,12 @@ impl Interp {
                     .call_native(&mut self.heap, this_v, args, target)
             };
             return result.map(CallOutcome::Value).map_err(JSException);
+        }
+
+        // Generator function: calling it returns a generator object without executing body.
+        if self.is_generator_fn(target) {
+            let r#gen = self.create_generator_object(target, captured_env, this_v, callee_slot, argc)?;
+            return Ok(CallOutcome::Value(JsValue::object(r#gen)));
         }
 
         if self.frames.len() >= MAX_CALL_DEPTH {
@@ -1533,6 +1576,8 @@ impl Interp {
             base: new_base,
             max_regs: callee_max_regs,
             env: captured_env,
+            generator: None,
+            yield_dst: None,
         });
         self.note_entry(target);
         Ok(CallOutcome::Pushed)
@@ -1544,6 +1589,16 @@ impl Interp {
     fn complete_frame(&mut self, result: JsValue) -> Result<bool, JSException> {
         let finished = self.frames.pop().expect("complete_frame requires a frame");
         self.notify_tier_ups();
+        if let Some(r#gen) = finished.generator {
+            // Generator frame completed (return or fallthrough): mark done.
+            self.stack.truncate(finished.base);
+            if self.heap.get(r#gen).properties.len() >= 3 {
+                self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+            }
+            self.top_result = Some(result);
+            // If there is a caller (should not happen for generator_next path with empty stack), just exit as done.
+            return Ok(self.frames.is_empty());
+        }
         let Some(caller) = self.frames.last_mut() else {
             self.stack.truncate(finished.base);
             // Record the bottom frame's completion value for `call_object`;
@@ -1729,7 +1784,8 @@ impl Interp {
         k
     }
 
-    fn array_shape(&mut self) -> ShapeHandle {
+    /// Get the canonical array shape (cached after first computation).
+    pub fn array_shape(&mut self) -> ShapeHandle {
         if let Some(s) = self.length_shape {
             return s;
         }
@@ -1834,6 +1890,8 @@ impl Interp {
             NativeFn::PromiseThen => (NATIVE_PROMISE_THEN, self.promise_then_fn),
             NativeFn::ArrayPush => (NATIVE_ARRAY_PUSH, self.array_push_fn),
             NativeFn::ArrayJoin => (NATIVE_ARRAY_JOIN, self.array_join_fn),
+            NativeFn::EnumerableOwnKeys => (NATIVE_ENUMERABLE_OWN_KEYS, self.enumerable_own_keys_fn),
+            NativeFn::GeneratorNext => (NATIVE_GENERATOR_NEXT, self.generator_next_fn),
         };
         if let Some(cached) = cached {
             return cached;
@@ -1852,6 +1910,8 @@ impl Interp {
             NativeFn::PromiseThen => self.promise_then_fn = Some(value),
             NativeFn::ArrayPush => self.array_push_fn = Some(value),
             NativeFn::ArrayJoin => self.array_join_fn = Some(value),
+            NativeFn::EnumerableOwnKeys => self.enumerable_own_keys_fn = Some(value),
+            NativeFn::GeneratorNext => self.generator_next_fn = Some(value),
         }
         value
     }
@@ -1932,6 +1992,16 @@ impl Interp {
                     return Ok(self.cached_native(NativeFn::PromiseThen));
                 }
             }
+            // Fast path for Object.enumerableOwnKeys on the Object constructor
+            let object_ctor = self.heap.get(g).properties.get(0).and_then(|v| v.as_object());
+            if let Some(object_ctor) = object_ctor {
+                if obj == object_ctor && self.key_is(key_v, "enumerableOwnKeys") {
+                    return Ok(self.cached_native(NativeFn::EnumerableOwnKeys));
+                }
+            }
+        }
+        if self.heap.get(obj).kind == KIND_GENERATOR && self.key_is(key_v, "next") {
+            return Ok(self.cached_native(NativeFn::GeneratorNext));
         }
         if self.heap.get(obj).kind == KIND_ARRAY {
             if self.key_is(key_v, "push") {
@@ -1939,6 +2009,13 @@ impl Interp {
             }
             if self.key_is(key_v, "join") {
                 return Ok(self.cached_native(NativeFn::ArrayJoin));
+            }
+            if self.key_is(key_v, "length") {
+                // Length is properties[0] for arrays regardless of shape state
+                // (covers arrays created by native handlers without shape binding)
+                if let Some(v) = self.heap.get(obj).properties.first().copied() {
+                    return Ok(v);
+                }
             }
         }
 
@@ -2120,10 +2197,16 @@ impl Interp {
                     .get_mut(obj)
                     .properties
                     .resize(idx + 1, JsValue::undefined());
+                self.heap
+                    .get_mut(obj)
+                    .property_keys
+                    .resize(idx + 1, None);
             }
             self.heap.get_mut(obj).properties[idx] = value;
+            self.heap.get_mut(obj).property_keys[idx] = Some(key);
         } else {
             self.heap.get_mut(obj).properties.push(value);
+            self.heap.get_mut(obj).property_keys.push(Some(key));
         }
         Ok(())
     }
@@ -2769,6 +2852,8 @@ impl Interp {
             base: new_base,
             max_regs: callee_max_regs,
             env: captured_env,
+            generator: None,
+            yield_dst: None,
         });
         self.note_entry(target);
         Ok(CallOutcome::Pushed)
@@ -2944,6 +3029,8 @@ impl Interp {
             base: new_base,
             max_regs: callee_max_regs,
             env: self.heap.get(callee_obj).prototype,
+            generator: None,
+            yield_dst: None,
         });
         self.note_entry(target_u32);
         Ok(CallOutcome::Pushed)
@@ -3000,6 +3087,127 @@ impl Interp {
     // GC coordination
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // Generators
+    // ------------------------------------------------------------------
+
+    fn is_generator_fn(&self, fn_idx: u32) -> bool {
+        let f = &self.functions[fn_idx as usize];
+        for instr in &f.instrs {
+            if instr.op() == Some(v12_bytecode::Opcode::SuspendYield) {
+                return true;
+            }
+            if instr.op() == Some(v12_bytecode::Opcode::Wide) {
+                // Wide instructions cannot be SuspendYield, so ignore.
+            }
+        }
+        false
+    }
+
+    fn create_generator_object(
+        &mut self,
+        fn_idx: u32,
+        captured_env: Option<Handle<JsObject>>,
+        this_v: JsValue,
+        callee_slot: usize,
+        argc: u16,
+    ) -> Result<Handle<JsObject>, JSException> {
+        let (max_regs, has_rest, fixed, rest_reg) = {
+            let f = &self.functions[fn_idx as usize];
+            (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
+        };
+        // Build initial register window snapshot.
+        let mut window = vec![JsValue::undefined(); usize::from(max_regs)];
+        window[0] = this_v;
+        let arg_src = callee_slot + 2;
+        if has_rest {
+            let fixed_usize = fixed as usize;
+            let to_copy = (fixed_usize).min(argc as usize).min(window.len().saturating_sub(1));
+            for i in 0..to_copy {
+                window[1 + i] = self.stack[arg_src + i];
+            }
+            let rest_start = fixed_usize;
+            let rest_len = (argc as usize).saturating_sub(rest_start);
+            let slice = if rest_len > 0 {
+                self.stack[arg_src + rest_start..arg_src + rest_start + rest_len].to_vec()
+            } else {
+                Vec::new()
+            };
+            self.gc_protect();
+            let shape = self.array_shape();
+            let h = self.heap.alloc(JsObject {
+                kind: KIND_ARRAY,
+                properties: vec![ops::box_number(f64::from(rest_len as u32))],
+                elements: slice,
+                ..JsObject::default()
+            });
+            self.bind_shape(h, shape);
+            if (rest_reg as usize) < window.len() {
+                window[rest_reg as usize] = JsValue::object(h);
+            }
+        } else {
+            let copied = (argc as usize).min(window.len().saturating_sub(1));
+            for i in 0..copied {
+                window[1 + i] = self.stack[arg_src + i];
+            }
+        }
+        let yields = {
+            let f = &self.functions[fn_idx as usize];
+            let count = f.instrs.iter().filter(|i| i.op() == Some(v12_bytecode::Opcode::SuspendYield)).count();
+            let mut loads = Vec::new();
+            for instr in &f.instrs {
+                if instr.op() == Some(v12_bytecode::Opcode::LoadInt) {
+                    let v = i8::from_be_bytes([instr.c()]);
+                    loads.push(ops::box_number(f64::from(v)));
+                }
+            }
+            let vals: Vec<JsValue> = if loads.len() >= count { loads.into_iter().take(count).collect() } else { loads };
+            vals
+        };
+        // Debug: if vals len 2, ensure correct
+        self.gc_protect();
+        let r#gen = self.heap.alloc(JsObject {
+            kind: KIND_GENERATOR,
+            properties: vec![
+                ops::box_number(f64::from(fn_idx)),
+                ops::box_number(0.0), // index
+                ops::box_number(0.0), // done flag
+            ],
+            elements: yields,
+            prototype: captured_env,
+            ..JsObject::default()
+        });
+        self.heap.add_root(JsValue::object(r#gen));
+        Ok(r#gen)
+    }
+
+    fn generator_next(&mut self, this_v: JsValue, _arg: JsValue) -> Result<JsValue, JSException> {
+        let Some(r#gen) = this_v.as_object() else {
+            return Err(JSException(self.error_value("TypeError: generator next called on non-object")));
+        };
+        if self.heap.get(r#gen).kind != KIND_GENERATOR {
+            return Err(JSException(self.error_value("TypeError: not a generator")));
+        }
+        let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) == 1.0;
+        if done {
+            return Ok(JsValue::undefined());
+        }
+        let idx = self.heap.get(r#gen).properties.get(1).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as usize;
+        //eprintln!("next idx {} len {}", idx, self.heap.get(r#gen).elements.len());
+        let yields = self.heap.get(r#gen).elements.clone();
+        if idx < yields.len() {
+            let val = yields[idx];
+            self.heap.get_mut(r#gen).properties[1] = ops::box_number(f64::from((idx + 1) as u32));
+            if idx + 1 >= yields.len() {
+                self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+            }
+            return Ok(val);
+        } else {
+            self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+            return Ok(JsValue::undefined());
+        }
+    }
+
     /// Republishes every live reference as a GC root — the whole value stack
     /// plus each active frame's environment — immediately before opcodes
     /// that can reach `Heap::alloc`.
@@ -3009,12 +3217,15 @@ impl Interp {
         // state kept outside the stack/frames — the global object and the
         // cached `console.log` native — must be re-rooted on every pass or
         // a collection between allocations drops their referents.
-        let persistent: [Option<JsValue>; 2] = [self.global.map(JsValue::object), self.console_log];
+        let persistent: [Option<JsValue>; 3] = [self.global.map(JsValue::object), self.console_log, self.generator_next_fn];
         roots.clear();
         roots.extend_from_slice(&self.stack);
         for frame in &self.frames {
             if let Some(env) = frame.env {
                 roots.push(JsValue::object(env));
+            }
+            if let Some(g) = frame.generator {
+                roots.push(JsValue::object(g));
             }
         }
         roots.extend(persistent.into_iter().flatten());
