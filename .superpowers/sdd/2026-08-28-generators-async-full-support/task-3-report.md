@@ -32,3 +32,16 @@ Findings addressed:
 8. feedback.rs left as-is.
 
 Tests: cargo nextest run -p v12-interp → 61 passed, 0 failed.
+
+---
+## Fix 2026-08-28 — dead allocation in SuspendYield
+
+Commit: a767cc823a8bf1215089f59fb4d7dd0c7b154837
+
+Finding: `let yielded_boxed = box_number(yielded.as_f64().unwrap_or(0.0))` then discarded (`let _ = yielded_boxed`); type-loss for non-number yields, extra alloc/GC pressure. Misleading comment.
+
+Fix: Removed yielded_boxed allocation and its comment in `crates/v12-interp/src/lib.rs:1351-1353`. Keeps `gc_protect()` at arm top; yielded (original JsValue) already rooted via top_result/stack snapshot. Properties writes, frame pop, top_result=yielded, return Ok(()) unchanged.
+
+Tests:
+- `cargo nextest run -p v12-interp --test generator_suspend -v` → PASS (1 passed)
+- `cargo nextest run -p v12-interp -v` → PASS (61 passed, 0 failed)
