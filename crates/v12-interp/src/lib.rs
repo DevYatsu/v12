@@ -451,6 +451,8 @@ pub struct Interp {
     array_join_fn: Option<JsValue>,
     enumerable_own_keys_fn: Option<JsValue>,
     generator_next_fn: Option<JsValue>,
+    generator_return_fn: Option<JsValue>,
+    generator_throw_fn: Option<JsValue>,
     /// Completion value of the bottom frame when the dispatch loop ends.
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
@@ -498,6 +500,8 @@ impl Interp {
             array_join_fn: None,
             enumerable_own_keys_fn: None,
             generator_next_fn: None,
+            generator_return_fn: None,
+            generator_throw_fn: None,
             top_result: None,
         };
         interp.ensure_default_global();
@@ -567,6 +571,8 @@ impl Interp {
             array_join_fn: None,
             enumerable_own_keys_fn: None,
             generator_next_fn: None,
+            generator_return_fn: None,
+            generator_throw_fn: None,
             top_result: None,
         };
         interp.ensure_default_global();
@@ -1947,8 +1953,8 @@ impl Interp {
             NativeFn::ArrayJoin => (NATIVE_ARRAY_JOIN, self.array_join_fn),
             NativeFn::EnumerableOwnKeys => (NATIVE_ENUMERABLE_OWN_KEYS, self.enumerable_own_keys_fn),
             NativeFn::GeneratorNext => (NATIVE_GENERATOR_NEXT, self.generator_next_fn),
-            NativeFn::GeneratorReturn => (NATIVE_GENERATOR_RETURN, self.generator_next_fn),
-            NativeFn::GeneratorThrow => (NATIVE_GENERATOR_THROW, self.generator_next_fn),
+            NativeFn::GeneratorReturn => (NATIVE_GENERATOR_RETURN, self.generator_return_fn),
+            NativeFn::GeneratorThrow => (NATIVE_GENERATOR_THROW, self.generator_throw_fn),
         };
         if let Some(cached) = cached {
             return cached;
@@ -1969,8 +1975,8 @@ impl Interp {
             NativeFn::ArrayJoin => self.array_join_fn = Some(value),
             NativeFn::EnumerableOwnKeys => self.enumerable_own_keys_fn = Some(value),
             NativeFn::GeneratorNext => self.generator_next_fn = Some(value),
-            NativeFn::GeneratorReturn => self.generator_next_fn = Some(value),
-            NativeFn::GeneratorThrow => self.generator_next_fn = Some(value),
+            NativeFn::GeneratorReturn => self.generator_return_fn = Some(value),
+            NativeFn::GeneratorThrow => self.generator_throw_fn = Some(value),
         }
         value
     }
@@ -3349,6 +3355,8 @@ impl Interp {
         if self.heap.get(r#gen).properties.len() >= 3 {
             self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
         }
+        self.heap.get_mut(r#gen).elements.clear();
+        self.gc_protect();
         Ok(self.make_iterator_result(arg, true))
     }
 
@@ -3366,6 +3374,7 @@ impl Interp {
         if self.heap.get(r#gen).properties.len() >= 3 {
             self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
         }
+        self.heap.get_mut(r#gen).elements.clear();
         Err(JSException(arg))
     }
 
@@ -3417,7 +3426,7 @@ impl Interp {
         // state kept outside the stack/frames — the global object and the
         // cached `console.log` native — must be re-rooted on every pass or
         // a collection between allocations drops their referents.
-        let persistent: [Option<JsValue>; 3] = [self.global.map(JsValue::object), self.console_log, self.generator_next_fn];
+        let persistent: [Option<JsValue>; 5] = [self.global.map(JsValue::object), self.console_log, self.generator_next_fn, self.generator_return_fn, self.generator_throw_fn];
         roots.clear();
         roots.extend_from_slice(&self.stack);
         for frame in &self.frames {
