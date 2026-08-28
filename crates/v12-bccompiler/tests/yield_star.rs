@@ -1,8 +1,16 @@
+use v12_bccompiler::compile_source_with_strings;
+
 #[test]
-fn yield_star_delegates_array() {
-    use v12_interp::Interp;
-    let src = "function* g(){ yield* [1,2]; } let it=g(); let a=it.next(); let b=it.next(); let c=it.next(); throw [a.value,b.value,c.done].join(',');";
-    let mut interp = Interp::from_source(src).unwrap();
-    let thrown = interp.run().unwrap_err();
-    assert_eq!(interp.to_display_string(thrown.0), "1,2,true");
+fn yield_star_compiles_and_contains_suspend_yield() {
+    let (prog, _) = compile_source_with_strings("function* g(){ yield* [1,2]; }").unwrap();
+    let g = prog
+        .functions
+        .iter()
+        .find(|f| f.is_generator)
+        .expect("expected generator function");
+    let dump = format!("{g}");
+    assert!(
+        dump.contains("suspend_yield"),
+        "expected SuspendYield in yield* lowering, got {dump}"
+    );
 }

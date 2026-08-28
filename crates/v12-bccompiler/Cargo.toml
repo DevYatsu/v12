@@ -16,4 +16,3 @@ v12-bytecode.workspace = true
 
 [dev-dependencies]
 test-support.workspace = true
-v12-interp = { path = "../v12-interp" }
