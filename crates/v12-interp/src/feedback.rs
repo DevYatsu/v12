@@ -498,6 +498,8 @@ mod tests {
             fixed_params: 0,
             has_rest: false,
             rest_reg: 0,
+            is_generator: false,
+            is_async: false,
         };
         let mut interp = Interp::new(vec![fb], 0, Vec::new());
         let _ = interp.run(); // will throw 2
@@ -528,6 +530,8 @@ mod tests {
             fixed_params: 0,
             has_rest: false,
             rest_reg: 0,
+            is_generator: false,
+            is_async: false,
         };
         let mut interp2 = Interp::new(vec![fb2], 0, Vec::new());
         let _ = interp2.run();

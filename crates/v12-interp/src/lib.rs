@@ -1341,8 +1341,52 @@ impl Interp {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::SuspendYield => {
-                    // With eager generator evaluation, suspend is not used; treat as pass-through.
-                    self.set_pc(pc + op_width);
+                    let dst = instr.a();
+                    let yielded = self.stack[base + usize::from(dst)];
+                    let gen_obj = self.frames.last().expect("frame").generator.expect("yield outside generator");
+                    let snapshot = self.stack[base..base + usize::from(max_regs)].to_vec();
+                    let resume_pc = pc + op_width;
+                    self.heap.get_mut(gen_obj).properties[1] = ops::box_number(resume_pc as f64);
+                    // store yield_dst in properties[3] (extend to 4 slots)
+                    if self.heap.get(gen_obj).properties.len() < 4 {
+                        self.heap.get_mut(gen_obj).properties.resize(4, JsValue::undefined());
+                    }
+                    self.heap.get_mut(gen_obj).properties[3] = ops::box_number(f64::from(dst));
+                    self.heap.get_mut(gen_obj).elements = snapshot;
+                    self.heap.get_mut(gen_obj).prototype = self.frames.last().and_then(|f| f.env);
+                    // unwind current frame
+                    let finished_base = self.frames.pop().expect("pop").base;
+                    self.stack.truncate(finished_base);
+                    // Suspend signal: store yielded for generator_next to pick up via heap? We use top_result as suspeded flag
+                    self.top_result = Some(yielded);
+                    // Do not advance caller pc here; generator_next will handle iterator wrapping
+                    // If frames is not empty (main still there), we return from execute to let generator_next handle;
+                    // Signal suspension by returning Ok(()) after setting top_result and a marker.
+                    // To avoid continuing normal dispatch, we keep frames but need to tell outer loop we suspended.
+                    // Use a custom flag: we set a sentinel in heap? Instead we make execute check top_result after SuspendYield
+                    // For now, break out of execute via special error path: we cannot easily break, so we set a flag and return.
+                    // We store suspended gen in a thread-local via heap root? Simpler: we leave top_result and let generator_next's inner loop detect suspension via frame count.
+                    // Here we just continue dispatch which will drive caller; but generator_next's outer caller expects Value return, not dispatch continuation.
+                    // For Task 3, this path is only reached when generator body is running inside generator_next's run loop, not main dispatch.
+                    // So we need to make the inner run loop handle this. For main dispatch (should not happen), just treat as yield value.
+                    // If we're inside generator_next inner loop, the frame was popped and top_result holds yielded; inner loop will detect frames.len decreased and return.
+                    // For now, if we are in main dispatch (frames not empty after pop), store yielded into caller's dst? But we don't know dst.
+                    // Instead, just set top_result and return; outer execute will see suspended state via checking generator object's done flag?
+                    // To make inner loop work, we make SuspendYield set a separate field `suspended_value` and then return.
+                    // Use heap property as signal: store yielded in a temporary global slot (stack base 0 temp) - not needed.
+                    // The inner loop in generator_next will check self.top_result after each step.
+                    // So we leave it and continue; the outer `execute` will now dispatch caller frame.
+                    // To prevent caller from running, we push a marker frame? Simpler to just return now and let generator_next's caller handle.
+                    // We signal by setting pc of caller? No.
+                    // Approach: after suspend, we do not continue 'drive; we return from execute early by setting a flag on Interp.
+                    // Add a flag `suspended` and make execute check it. For now, just store and continue; generator_next's loop will poll heap.
+                    // Minimal: just keep top_result and continue; the main loop will run main frame, which is not desired for resume path.
+                    // But for resume path, frames = [main, gen] ; after suspend, frames = [main]; execute would then continue executing main which would proceed past the `it.next()` call incorrectly without iterator result.
+                    // So we need to prevent that: we make SuspendYield not continue to main but instead make execute return early when it detects suspension via `self.heap.get(gen_obj).properties[2]==0 and top_result set`.
+                    // We achieve this by setting a special `execute_suspended` flag and checking at top of loop.
+                    // For minimal diff, store yielded in heap's roots and make execute check: if top_result is Some and last pop was generator frame, return Ok(()).
+                    // We implement that check via an early return here: we cannot return from inside match without breaking loop, so we use `return Ok(())` to exit execute.
+                    return Ok(());
                 }
                 Opcode::Await => {
                     // TODO: suspend async function similar to SuspendYield; for now pass-through.
@@ -1596,8 +1640,9 @@ impl Interp {
                 self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
             }
             self.top_result = Some(result);
-            // If there is a caller (should not happen for generator_next path with empty stack), just exit as done.
-            return Ok(self.frames.is_empty());
+            // For resumed generator, exit execute to let generator_next wrap as iterator result.
+            // Returning true makes outer execute return to generator_next caller instead of continuing caller dispatch.
+            return Ok(true);
         }
         let Some(caller) = self.frames.last_mut() else {
             self.stack.truncate(finished.base);
@@ -3151,29 +3196,17 @@ impl Interp {
                 window[1 + i] = self.stack[arg_src + i];
             }
         }
-        let yields = {
-            let f = &self.functions[fn_idx as usize];
-            let count = f.instrs.iter().filter(|i| i.op() == Some(v12_bytecode::Opcode::SuspendYield)).count();
-            let mut loads = Vec::new();
-            for instr in &f.instrs {
-                if instr.op() == Some(v12_bytecode::Opcode::LoadInt) {
-                    let v = i8::from_be_bytes([instr.c()]);
-                    loads.push(ops::box_number(f64::from(v)));
-                }
-            }
-            let vals: Vec<JsValue> = if loads.len() >= count { loads.into_iter().take(count).collect() } else { loads };
-            vals
-        };
-        // Debug: if vals len 2, ensure correct
+        // Real suspension: store initial register window snapshot, not eager yields.
         self.gc_protect();
         let r#gen = self.heap.alloc(JsObject {
             kind: KIND_GENERATOR,
             properties: vec![
                 ops::box_number(f64::from(fn_idx)),
-                ops::box_number(0.0), // index
+                ops::box_number(0.0), // resume pc
                 ops::box_number(0.0), // done flag
+                ops::box_number(0.0), // yield_dst
             ],
-            elements: yields,
+            elements: window,
             prototype: captured_env,
             ..JsObject::default()
         });
@@ -3181,31 +3214,106 @@ impl Interp {
         Ok(r#gen)
     }
 
-    fn generator_next(&mut self, this_v: JsValue, _arg: JsValue) -> Result<JsValue, JSException> {
+    fn generator_next(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(self.error_value("TypeError: generator next called on non-object")));
         };
         if self.heap.get(r#gen).kind != KIND_GENERATOR {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
-        let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) == 1.0;
+        let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) == 1.0;
         if done {
-            return Ok(JsValue::undefined());
+            return Ok(self.make_iterator_result(JsValue::undefined(), true));
         }
-        let idx = self.heap.get(r#gen).properties.get(1).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as usize;
-        //eprintln!("next idx {} len {}", idx, self.heap.get(r#gen).elements.len());
-        let yields = self.heap.get(r#gen).elements.clone();
-        if idx < yields.len() {
-            let val = yields[idx];
-            self.heap.get_mut(r#gen).properties[1] = ops::box_number(f64::from((idx + 1) as u32));
-            if idx + 1 >= yields.len() {
-                self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+        let fn_idx = self.heap.get(r#gen).properties.first().and_then(|v| v.as_smi().map(|n| n as u32 as f64).or(v.as_f64())).unwrap_or(0.0) as u32;
+        let resume_pc = self.heap.get(r#gen).properties.get(1).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as usize;
+        let snapshot = self.heap.get(r#gen).elements.clone();
+        let env = self.heap.get(r#gen).prototype;
+        let f_max_regs = self.functions[fn_idx as usize].max_regs;
+        let new_base = self.stack.len();
+        let window_end = new_base + usize::from(f_max_regs);
+        self.stack.resize(window_end, JsValue::undefined());
+        let copy_len = snapshot.len().min(usize::from(f_max_regs));
+        for i in 0..copy_len {
+            self.stack[new_base + i] = snapshot[i];
+        }
+        // If resuming (resume_pc != 0), feed arg into yield_dst register
+        if resume_pc != 0 {
+            let yield_dst = self.heap.get(r#gen).properties.get(3).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as u16;
+            if (yield_dst as usize) < usize::from(f_max_regs) {
+                self.stack[new_base + usize::from(yield_dst)] = arg;
             }
-            return Ok(val);
-        } else {
-            self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
-            return Ok(JsValue::undefined());
         }
+        self.frames.push(Frame {
+            fn_idx,
+            pc: resume_pc,
+            base: new_base,
+            max_regs: f_max_regs,
+            env,
+            generator: Some(r#gen),
+            yield_dst: None,
+        });
+        self.top_result = None;
+        let frames_before = self.frames.len();
+        let exec_res = self.execute();
+        // execute returns Ok(()) on suspension (SuspendYield returned early) with top_result holding yielded
+        // or Ok(()) on completion (complete_frame popped gen frame and set top_result)
+        match exec_res {
+            Ok(()) => {
+                if self.frames.len() < frames_before {
+                    // Suspended: top_result holds yielded value
+                    let yielded = self.top_result.take().unwrap_or(JsValue::undefined());
+                    // Ensure stack truncated already by SuspendYield
+                    return Ok(self.make_iterator_result(yielded, false));
+                } else {
+                    // Completed without suspension? Should have been popped and top_result set
+                    let ret = self.top_result.take().unwrap_or(JsValue::undefined());
+                    // Check if generator marked done
+                    let is_done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) == 1.0;
+                    if is_done {
+                        return Ok(self.make_iterator_result(ret, true));
+                    } else {
+                        // Mark done and return
+                        if self.heap.get(r#gen).properties.len() >= 3 {
+                            self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+                        }
+                        return Ok(self.make_iterator_result(ret, true));
+                    }
+                }
+            }
+            Err(e) => {
+                // Pop the generator frame if still there, mark done
+                if self.frames.len() >= frames_before {
+                    self.frames.pop();
+                    self.stack.truncate(new_base);
+                }
+                if self.heap.get(r#gen).properties.len() >= 3 {
+                    self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    fn make_iterator_result(&mut self, value: JsValue, done: bool) -> JsValue {
+        self.gc_protect();
+        let h = self.heap.alloc(JsObject::default());
+        self.heap.add_root(JsValue::object(h));
+        // Avoid set_property recursion issues for now: store directly via properties vec and shape binding via heap
+        // Use minimal shape: add properties via heap without interpreter's set_property
+        let value_key = self.heap.intern_string(v12_heap::V12Str::latin1(b"value".to_vec()));
+        let done_key = self.heap.intern_string(v12_heap::V12Str::latin1(b"done".to_vec()));
+        let pk_value = PropKey::from_string(value_key);
+        let pk_done = PropKey::from_string(done_key);
+        let shape0 = self.heap.root_shape();
+        let shape1 = self.heap.add_property(shape0, pk_value, v12_heap::Attrs::DEFAULT);
+        let shape2 = self.heap.add_property(shape1, pk_done, v12_heap::Attrs::DEFAULT);
+        // Bind shape to object via interp's shape_of tracking
+        self.bind_shape(h, shape2);
+        let done_val = if done { JsValue::true_() } else { JsValue::false_() };
+        self.heap.get_mut(h).properties = vec![value, done_val];
+        self.heap.get_mut(h).property_keys = vec![Some(pk_value), Some(pk_done)];
+        JsValue::object(h)
     }
 
     /// Republishes every live reference as a GC root — the whole value stack
