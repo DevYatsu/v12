@@ -1354,6 +1354,7 @@ impl Interp {
                     // Suspend generator: save register window and resume pc, then exit inner execute.
                     // yield* delegation is lowered by the compiler to a loop of SuspendYield
                     // (see crates/v12-bccompiler/src/expr.rs YieldExpression delegate path).
+                    // TODO: generic iterator protocol (Symbol.iterator) for non-arrays — v1 supports arrays only
                     self.gc_protect();
                     let dst = instr.a();
                     let yielded = self.stack[base + usize::from(dst)];

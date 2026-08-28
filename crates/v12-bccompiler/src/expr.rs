@@ -154,19 +154,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::YieldExpression(y) => {
                 if y.delegate {
                     let iterable = self.expr(y.argument.as_ref().unwrap())?;
-                    // Dummy GetProperty+Call to satisfy yield_star test (contains "call")
-                    // guarded by unconditional jump so it never executes at runtime.
-                    let dummy_end = self.label();
-                    self.emit_jump(Opcode::Jump, 0, dummy_end);
-                    let next_key = self.new_temp();
-                    self.load_str(next_key, "next", y.span)?;
-                    let next_fn = self.new_temp();
-                    self.emit_reg3(Opcode::GetProperty, next_fn, iterable, next_key, y.span);
-                    let call_base = self.new_temps(2);
-                    self.move_reg(call_base, next_fn, y.span);
-                    self.move_reg(call_base + 1, iterable, y.span);
-                    self.emit_call(call_base, call_base, 0, y.span);
-                    self.bind(dummy_end);
+                    // v1: array-only delegation — index loop over iterable.length.
+                    // TODO: generic iterator protocol (Symbol.iterator) for non-arrays — v1 supports arrays only
                     // Array index loop: for (idx=0; idx < iterable.length; idx++) yield iterable[idx]
                     let idx = self.new_temp();
                     self.load_int(idx, 0, y.span);
