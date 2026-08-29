@@ -1,1 +1,7 @@
 /target
+
+# Local agent/editor state
+.commandcode/
+
+# macOS metadata
+.DS_Store
