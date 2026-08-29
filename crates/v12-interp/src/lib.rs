@@ -287,13 +287,8 @@ struct Frame {
     yield_dst: Option<u16>,
 }
 
-/// Shared suspension helper for `SuspendYield` and `Await` — hides
-/// `properties[1]=resume_pc`, `properties[2]=done`, `properties[3]=yield_dst`,
-/// `elements=snapshot` slot contract. `Interp` is intentionally the owner of
-/// `Frame`/`SuspendYield` snapshot logic; `Engine` must not contain it.
-trait Suspendable {
-    fn suspend(&mut self, r#gen: Handle<JsObject>, resume_pc: usize, dst: u16, snapshot: Vec<JsValue>, env: Option<Handle<JsObject>>) -> Result<(), JSException>;
-}
+pub mod generator;
+use generator::Suspendable;
 
 /// Decodes the instruction at `pc` into
 /// `(op, a, b, c, word_width, narrow_word)`.
@@ -1400,32 +1395,10 @@ impl Interp {
                     self.gc_protect();
                     let dst = instr.a();
                     let yielded = self.stack.get(base + usize::from(dst)).copied().unwrap_or(JsValue::undefined());
-                    let Some(gen_obj) = self.frames.last().and_then(|f| f.generator) else {
+                    if self.frames.last().and_then(|f| f.generator).is_none() {
                         return Err(JSException(self.error_value("SyntaxError: yield outside generator")));
-                    };
-                    let snapshot = {
-                        let end = base + usize::from(max_regs);
-                        if end <= self.stack.len() {
-                            self.stack[base..end].to_vec()
-                        } else if base <= self.stack.len() {
-                            let mut v = self.stack[base..].to_vec();
-                            v.resize(usize::from(max_regs), JsValue::undefined());
-                            v
-                        } else {
-                            vec![JsValue::undefined(); usize::from(max_regs) as usize]
-                        }
-                    };
-                    let resume_pc = pc + op_width;
-                    self.heap.get_mut(gen_obj).properties[1] = ops::box_number(resume_pc as f64);
-                    if self.heap.get(gen_obj).properties.len() < 4 {
-                        self.heap.get_mut(gen_obj).properties.resize(4, JsValue::undefined());
                     }
-                    self.heap.get_mut(gen_obj).properties[3] = ops::box_number(f64::from(dst));
-                    self.heap.get_mut(gen_obj).properties[2] = ops::box_number(2.0); // 2.0 = suspended
-                    self.heap.get_mut(gen_obj).elements = snapshot;
-                    self.heap.get_mut(gen_obj).prototype = self.frames.last().and_then(|f| f.env);
-                    let finished_base = self.frames.pop().expect("pop").base;
-                    self.stack.truncate(finished_base);
+                    self.suspend(u16::from(dst), yielded)?;
                     self.top_result = Some(yielded);
                     return Ok(());
                 }
@@ -1441,41 +1414,16 @@ impl Interp {
                     let Some(r#gen) = frame.generator else {
                         return Err(JSException(self.error_value("SyntaxError: await outside async")));
                     };
-                    let snapshot = {
-                        let end = base + usize::from(max_regs);
-                        if end <= self.stack.len() {
-                            self.stack[base..end].to_vec()
-                        } else if base <= self.stack.len() {
-                            let mut v = self.stack[base..].to_vec();
-                            v.resize(usize::from(max_regs), JsValue::undefined());
-                            v
-                        } else {
-                            vec![JsValue::undefined(); usize::from(max_regs) as usize]
-                        }
-                    };
-                    let resume_pc = pc + op_width;
-                    self.heap.get_mut(r#gen).properties[1] = ops::box_number(resume_pc as f64);
-                    if self.heap.get(r#gen).properties.len() < 4 {
-                        self.heap.get_mut(r#gen).properties.resize(4, JsValue::undefined());
-                    }
-                    self.heap.get_mut(r#gen).properties[3] = ops::box_number(f64::from(dst));
-                    self.heap.get_mut(r#gen).properties[2] = ops::box_number(2.0);
-                    // Ensure async promise slot exists (task 6/7: async returns Promise)
                     let async_promise = if self.heap.get(r#gen).properties.len() > 4 {
                         self.heap.get(r#gen).properties[4]
                     } else {
                         JsValue::undefined()
                     };
                     let has_promise = async_promise.as_object().is_some();
-                    self.heap.get_mut(r#gen).elements = snapshot;
-                    self.heap.get_mut(r#gen).prototype = self.frames.last().and_then(|f| f.env);
-                    let finished_frame = self.frames.pop().expect("pop");
-                    let finished_base = finished_frame.base;
-                    self.stack.truncate(finished_base);
-                    // Promise.resolve(arg) -> enqueue reaction that resumes
                     let (promise, is_rejected, payload) = self.promise_resolve_for_await(arg);
                     self.heap.add_root(payload);
                     if let Some(ph) = promise.as_object() { self.heap.add_root(JsValue::object(ph)); }
+                    let _rgen = self.suspend(u16::from(dst), arg)?;
                     self.pending_awaits.push_back((r#gen, payload, is_rejected));
                     self.top_result = None;
                     // Advance caller past its Call header: async call returns Promise if available else undefined (task 7)
