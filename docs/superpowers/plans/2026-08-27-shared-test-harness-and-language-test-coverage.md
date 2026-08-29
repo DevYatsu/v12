@@ -52,7 +52,7 @@ Identified 2026-08-27 by auditing the test infrastructure. Each issue maps to a 
 - Consumes: `v12_bccompiler::compile_source_with_strings(src) -> Result<(Program, Vec<String>), CompileError>` (bccompiler lib.rs:357), `v12_bytecode::{Opcode, Instr}`.
 - Produces (later tasks rely on these exact names, all `pub`): `Val` (+variants), `Obj`, `ClosureVal`, `Env`, `Env::root()`, `Mini`, `Mini::run_fn(idx, this, args, env) -> Result<Val, Val>`, `eval_src(src) -> Val`, `expect_num(src, f64)`, `expect_bool(src, bool)`, `expect_str(src, &str)`, `expect_undefined(src)`, `value_to_string(&Val) -> String`.
 
-- [ ] **Step 1: Create the crate manifest**
+- [x] **Step 1: Create the crate manifest**
 
 ```toml
 # crates/test-support/Cargo.toml
@@ -68,7 +68,7 @@ v12-bytecode = { workspace = true }
 v12-bccompiler = { workspace = true }
 ```
 
-- [ ] **Step 2: Register in workspace deps**
+- [x] **Step 2: Register in workspace deps**
 
 Add one line to `[workspace.dependencies]` in the root `Cargo.toml` (next to the other crate entries, Cargo.toml:53-62):
 
@@ -76,7 +76,7 @@ Add one line to `[workspace.dependencies]` in the root `Cargo.toml` (next to the
 test-support = { path = "crates/test-support" }
 ```
 
-- [ ] **Step 3: Create the crate root**
+- [x] **Step 3: Create the crate root**
 
 ```rust
 // crates/test-support/src/lib.rs
@@ -90,7 +90,7 @@ pub mod mini;
 pub use mini::*;
 ```
 
-- [ ] **Step 4: Move the mini interpreter verbatim**
+- [x] **Step 4: Move the mini interpreter verbatim**
 
 Move `crates/v12-bccompiler/src/tests.rs` lines 29-672 (the `Val`/`Obj`/`ClosureVal`/`Env` types at :33-73, `Mini` + `BUDGET` at :79-86, `run_fn` at :96, the free helpers `walk_env`/`truthy`/`to_string`/`to_number`/`to_int32`/`type_of`/`strict_eq`/`loose_eq`/`compare`/`binop`/`to_key`/`get_prop`/`set_prop`/`delete_prop` at :447-624, and `eval_src`/`expect_num`/`expect_bool`/`expect_str`/`expect_undefined` at :630-672) into `crates/test-support/src/mini.rs`.
 
@@ -115,12 +115,12 @@ Mechanical adjustments while moving (no logic changes):
    ```
 4. Do **not** move the ~50 bytecode-inspection tests (e.g. tests.rs:2603 asserting on `fb.instrs`/`validate()`) — they stay in `bccompiler` and use `crate::model::{spur_of_str_id, str_id_of}`, which is crate-private and out of reach for `test-support`.
 
-- [ ] **Step 5: Verify the crate builds standalone**
+- [x] **Step 5: Verify the crate builds standalone**
 
 Run: `cargo build -p test-support`
 Expected: success, zero errors.
 
-- [ ] **Step 6: Sanity-check the moved harness with a self-test**
+- [x] **Step 6: Sanity-check the moved harness with a self-test**
 
 Append to `crates/test-support/src/mini.rs`:
 
@@ -147,7 +147,7 @@ mod self_tests {
 Run: `cargo nextest run -p test-support`
 Expected: PASS (2 tests).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/test-support
@@ -167,7 +167,7 @@ git commit -m "test: extract mini reference interpreter into shared test-support
 - Consumes: everything `test-support` exports (Task 1).
 - Produces: `v12-bccompiler` tests compile with the inline copy deleted; no public API change.
 
-- [ ] **Step 1: Add the dev-dependency**
+- [x] **Step 1: Add the dev-dependency**
 
 In `crates/v12-bccompiler/Cargo.toml`, append (create `[dev-dependencies]` if absent):
 
@@ -176,7 +176,7 @@ In `crates/v12-bccompiler/Cargo.toml`, append (create `[dev-dependencies]` if ab
 test-support = { workspace = true }
 ```
 
-- [ ] **Step 2: Delete the inline copy**
+- [x] **Step 2: Delete the inline copy**
 
 In `crates/v12-bccompiler/src/tests.rs`:
 1. Delete lines 29-672 (the moved items — types, `Mini`, helpers, `eval_src`, matchers).
@@ -186,12 +186,12 @@ In `crates/v12-bccompiler/src/tests.rs`:
    ```
 3. Fix any remaining unqualified `compile_source_with_strings` references *inside remaining tests* — those stay valid because they call the crate's own public fn; leave them.
 
-- [ ] **Step 3: Run the full bccompiler suite**
+- [x] **Step 3: Run the full bccompiler suite**
 
 Run: `cargo nextest run -p v12-bccompiler`
 Expected: all 125 tests PASS (the ~186 `expect_*`/`eval_src` call sites now resolve to `test-support`; the ~50 bytecode-inspection tests are untouched).
 
-- [ ] **Step 4: Add a parity guard test**
+- [x] **Step 4: Add a parity guard test**
 
 This pins the contract that the shared copy behaves identically for a few representative programs from the original suite (patterns from tests.rs:682, :2666, :2683):
 
@@ -227,7 +227,7 @@ fn nullish_coalescing_short_circuit() {
 }
 ```
 
-- [ ] **Step 5: Run and commit**
+- [x] **Step 5: Run and commit**
 
 Run: `cargo nextest run -p v12-bccompiler`
 Expected: PASS (125 + 3).
@@ -249,14 +249,14 @@ git commit -m "test: consume shared test-support harness in v12-bccompiler"
 - Consumes: `test-support` (Task 1), `v12_bytecode::{Const, ConstantPool, FunctionBytecode}`.
 - Produces: interp tests import shared helpers; doc comment matches reality.
 
-- [ ] **Step 1: Add the dev-dependency**
+- [x] **Step 1: Add the dev-dependency**
 
 ```toml
 [dev-dependencies]
 test-support = { workspace = true }
 ```
 
-- [ ] **Step 2: Replace local helpers with shared ones**
+- [x] **Step 2: Replace local helpers with shared ones**
 
 In `crates/v12-interp/src/tests.rs`:
 
@@ -308,7 +308,7 @@ In `crates/v12-interp/src/tests.rs`:
    ```
    In interp tests.rs, `s/empty_fn(/fn_with_instrs(/` and add `use test_support::*;` alongside the existing imports.
 
-- [ ] **Step 3: Fix the stale doc pointer**
+- [x] **Step 3: Fix the stale doc pointer**
 
 Replace interp tests.rs lines 1-4 with:
 
@@ -321,7 +321,7 @@ Replace interp tests.rs lines 1-4 with:
 //! task lands — until then this pointer is forward-looking).
 ```
 
-- [ ] **Step 4: Run and commit**
+- [x] **Step 4: Run and commit**
 
 Run: `cargo nextest run -p v12-interp && cargo nextest run -p test-support`
 Expected: PASS.
@@ -342,7 +342,7 @@ git commit -m "test: dedupe interp helpers via test-support, correct differentia
 - Consumes: `test_support::{eval_src, expect_num, expect_bool, expect_str, value_to_string, Val}`, `v12_interp::{Interp, JSException}` (`Interp::from_source` compiles via `compile_source_with_strings` — interp lib.rs:444-447), `Interp::to_display_string(&mut self, v: JsValue) -> String` (interp lib.rs:615).
 - Produces: `run_real(src) -> String` (display string of the completion value thrown by the wrapped IIFE) — the reusable seam for growing the corpus later.
 
-- [ ] **Step 1: Write the suite with a seed corpus of ~25 cases**
+- [x] **Step 1: Write the suite with a seed corpus of ~25 cases**
 
 The ground truth is *declared per case* (not compared between the two implementations) so number-formatting differences between `Mini`'s `to_string` and the engine's `to_display_string` cannot cause false failures. Each case runs through **both** implementations.
 
@@ -470,12 +470,12 @@ fn real_interp_matches_expect_num_helper_semantics() {
 }
 ```
 
-- [ ] **Step 2: Run the suite to verify it fails (or passes) informatively**
+- [x] **Step 2: Run the suite to verify it fails (or passes) informatively**
 
 Run: `cargo nextest run -p v12-interp --test differential`
 Expected: either all PASS (real engine agrees with ground truth — good) or specific cases FAIL with a message naming the disagreeing implementation (`mini disagrees on ...` / `real interp disagrees on ...`). A failure here is a **finding, not a plan failure**: record the case in `conformance/known-failures.md` as a new bullet under a new bucket "in-repo differential" with the exact filter `cargo nextest run -p v12-interp --test differential`, then fix the engine or (only if the declared ground truth was wrong) correct the corpus entry — never delete the case.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/v12-interp/tests/differential.rs
@@ -493,7 +493,7 @@ git commit -m "test: add differential suite (mini reference vs real Tier-1 inter
 - Consumes: `KNOWN_DISCRIMINANTS` from `common/mod.rs:16-28` (already `pub`, already imported by the sweep binaries), `v12_bytecode::Instr` tuple constructor and `Instr::op()` (public — used at common/mod.rs:163 and in bccompiler tests via `i.op()`).
 - Produces: a bidirectional drift guard; no API change.
 
-- [ ] **Step 1: Write the failing-nothing guard test**
+- [x] **Step 1: Write the failing-nothing guard test**
 
 Append to `crates/v12-bytecode/tests/decode_sweep.rs`:
 
@@ -522,12 +522,12 @@ fn known_discriminants_exactly_match_opcode_enum() {
 
 If `Instr::op()` turns out to be non-public at this call site, use the public decode path already exercised by `decode_sweep.rs` (whatever that binary uses to decode one word — check its imports) instead of widening `v12-bytecode`'s API for a test.
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `cargo nextest run -p v12-bytecode --test decode_sweep known_discriminants`
 Expected: PASS on the current tree (list matches enum). To prove the guard works: temporarily change one entry in `KNOWN_DISCRIMINANTS` (e.g. swap `20` for `20`→`21` duplicate), re-run, observe FAIL, revert.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/v12-bytecode/tests/decode_sweep.rs
@@ -551,7 +551,7 @@ Design decisions (fixed by this plan):
 - **No stdout capture.** The existing `println!`-based `console.log` (builtins/mod.rs:238) is left alone; async classification reads the captured array, not process stdout — this stays correct under the rayon-parallel runner (main.rs:121-125).
 - **Honest skips stay.** Tests whose source contains `createRealm(` or `agent.` keep skipping (multi-realm/agent support is a separate, larger effort).
 
-- [ ] **Step 1: Add the shim constant and skip-logic narrowing**
+- [x] **Step 1: Add the shim constant and skip-logic narrowing**
 
 In `conformance/harness/src/runner.rs`, add near the top (beside `MINIMAL_HARNESS_POLYFILL`'s sibling constants):
 
@@ -593,7 +593,7 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
 }
 ```
 
-- [ ] **Step 2: Prepend the shim and add the async verdict**
+- [x] **Step 2: Prepend the shim and add the async verdict**
 
 In `run_single_test`:
 1. At the `combined` assembly (~:224-241), prepend the shim *after* the strict directive and *before* harness includes:
@@ -619,7 +619,7 @@ In `run_single_test`:
    Keep the existing `negative:` handling for the non-async path unchanged. Match the actual `TestOutcome` struct shape in runner.rs (it is defined near :27-35 alongside `Status`) rather than the sketch above — the sketch fixes *semantics*, the struct fields come from the file.
 3. If the async test also threw during eval, prefer the thrown-error verdict (existing `handle_thrown` path) — an eval-time throw means the test body failed before `$DONE` could ever run.
 
-- [ ] **Step 3: Prove the mechanics with a harness self-test**
+- [x] **Step 3: Prove the mechanics with a harness self-test**
 
 Add to the runner's existing self-test module (11 tests already live there — follow their setup pattern):
 
@@ -645,7 +645,7 @@ fn async_doneprint_test_completes_via_captured_print() {
 Run: `cargo nextest run -p test262-runner`
 Expected: PASS. If this fails, Promise reactions are not scheduling into `JobQueue` — stop, file it in `known-failures.md` as a new bucket, and do not narrow the skip until the job queue actually resolves thenables (otherwise ~4.9k tests flip from skip to guaranteed-fail).
 
-- [ ] **Step 4: Measure before/after and update the books**
+- [x] **Step 4: Measure before/after and update the books**
 
 ```sh
 # Before-numbers are already recorded: 4 940 pass / 14 972 fail / 4 961 skip
@@ -657,7 +657,7 @@ Update `conformance/known-failures.md`:
 - Re-score the header totals (new executable denominator — pass% may shift either way; that is expected and must be recorded, not hidden).
 Add the corresponding entry to `conformance/fix-log.md` (command used, commit, deltas).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add conformance/harness/src/runner.rs conformance/known-failures.md conformance/fix-log.md
@@ -675,7 +675,7 @@ git commit -m "conformance: wire async harness + \$262 host shim; ~4.9k language
 - Consumes: `cargo nextest run --workspace` (README:76-79), `./conformance/run.sh` (self-clones test262 per run.sh:18-45).
 - Produces: two jobs — unit gate (all tasks above) and conformance gate (Task 6's numbers).
 
-- [ ] **Step 1: Write the workflow**
+- [x] **Step 1: Write the workflow**
 
 ```yaml
 # .github/workflows/ci.yml
@@ -713,7 +713,7 @@ jobs:
 
 Note: verify the `jit` feature name/shape at `crates/v12-jit-baseline/Cargo.toml:19` (`[features] jit = [...]`) — if the feature must be enabled workspace-wide rather than per-crate, use `cargo nextest run --workspace --all-features` instead.
 
-- [ ] **Step 2: Validate locally, then commit**
+- [x] **Step 2: Validate locally, then commit**
 
 ```sh
 act -j tests 2>/dev/null || echo "act not installed; validate YAML syntax only"

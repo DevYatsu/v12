@@ -100,4 +100,13 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 ---
 
+### 2026-08-29 — Engine/embedding work (ADR-003/005/006, register_fn, call)
+
+- **Filter:** n/a — no conformance-number change intended
+- **Engine change:** `Interp` borrows `&mut Heap` (ADR-003); `v12-api` facade lands `register_fn`/`call` (ADR-005); JIT shared types move to `v12-codegen` (ADR-006).
+- **Known gap (unchanged, pre-existing):** `Promise.resolve().then(cb)` fails with `TypeError: callee is not a function` — the promise `.then` path cannot yet activate bytecode callbacks. Recorded-gate tests `async_promise::promise_resolve_then_runs_callback_via_run_jobs` and `promise_chained_then_drains_fia_run_jobs` (both uncommitted WIP) document this; they fail before and after this work.
+- **Runner:** `cargo nextest run --workspace` — 533 pass / 2 fail (the two gates above) / 1 skip.
+
+---
+
 <!-- Future entries go above this line -->
