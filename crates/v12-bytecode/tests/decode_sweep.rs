@@ -112,19 +112,7 @@ fn sweep_all_256_opcode_bytes_through_every_decode_path() {
             }
 
             // Display path on a single-word function: non-empty, never panics.
-            let fb_one = FunctionBytecode {
-                name_hint: None,
-                max_regs: 1,
-                instrs: vec![instr],
-                consts: ConstantPool::new(),
-                handlers: Vec::new(),
-                spans: vec![(0, 0)],
-                pc_map: Vec::new(),
-                is_strict: false,
-                fixed_params: 0,
-                has_rest: false,
-                rest_reg: 0,
-            };
+            let fb_one = FunctionBytecode::with_instructions(vec![instr], 1);
             let text = render(&fb_one);
             assert!(!text.is_empty());
             if known.is_none() {

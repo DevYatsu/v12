@@ -17,21 +17,9 @@ pub enum UnitNode<'a> {
 }
 
 fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
-    FunctionBytecode {
-        name_hint,
-        max_regs: 1,
-        instrs: Vec::new(),
-        consts: v12_bytecode::ConstantPool::new(),
-        handlers: Vec::new(),
-        spans: Vec::new(),
-        pc_map: Vec::new(),
-        is_strict: false,
-        fixed_params: 0,
-        has_rest: false,
-        rest_reg: 0,
-        is_generator: false,
-        is_async: false,
-    }
+    let mut fb = FunctionBytecode::with_instructions(Vec::new(), 1);
+    fb.name_hint = name_hint;
+    fb
 }
 
 /// Reserved native index for synchronous module loading.

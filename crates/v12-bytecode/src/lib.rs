@@ -1089,6 +1089,27 @@ pub struct FunctionBytecode {
 }
 
 impl FunctionBytecode {
+    /// Minimal constructor for tests and fuzz helpers: fills `spans` with
+    /// `(0, 0)` placeholders and leaves all optional fields at defaults.
+    pub fn with_instructions(instrs: Vec<Instr>, max_regs: u16) -> Self {
+        let n = instrs.len();
+        Self {
+            name_hint: None,
+            max_regs,
+            spans: vec![(0, 0); n],
+            instrs,
+            consts: ConstantPool::new(),
+            handlers: Vec::new(),
+            pc_map: Vec::new(),
+            is_strict: false,
+            fixed_params: 0,
+            has_rest: false,
+            rest_reg: 0,
+            is_generator: false,
+            is_async: false,
+        }
+    }
+
     /// Checks the structural invariants the interpreter relies on:
     ///
     /// - `max_regs > 0` (registers index from 0),
@@ -1326,21 +1347,12 @@ mod data_tests {
     use super::*;
 
     fn nop_fn(handlers: Vec<HandlerRange>) -> FunctionBytecode {
-        FunctionBytecode {
-            name_hint: None,
-            max_regs: 2,
-            instrs: vec![Instr::new(Opcode::Move, 0, 0, 0); 4],
-            consts: ConstantPool::new(),
-            handlers,
-            spans: vec![(0, 0); 4],
-            pc_map: Vec::new(),
-            is_strict: false,
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-            is_generator: false,
-            is_async: false,
-        }
+        let mut fb = FunctionBytecode::with_instructions(
+            vec![Instr::new(Opcode::Move, 0, 0, 0); 4],
+            2,
+        );
+        fb.handlers = handlers;
+        fb
     }
 
     #[test]
@@ -1507,24 +1519,16 @@ mod data_tests {
         );
         instrs.push(Instr::new(Opcode::Return, 2, 0, 0));
 
-        let fb = FunctionBytecode {
-            name_hint: Some("smoke".into()),
-            max_regs: 4,
-            instrs,
-            consts: pool,
-            handlers: vec![HandlerRange {
-                start: 0,
-                end: 4,
-                target: 3,
-                stack_depth: 1,
-            }],
-            spans: vec![(0, 0); 5],
-            pc_map: Vec::new(),
-            is_strict: true,
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-        };
+        let mut fb = FunctionBytecode::with_instructions(instrs, 4);
+        fb.name_hint = Some("smoke".into());
+        fb.consts = pool;
+        fb.handlers = vec![HandlerRange {
+            start: 0,
+            end: 4,
+            target: 3,
+            stack_depth: 1,
+        }];
+        fb.is_strict = true;
         let text = format!("{fb}");
         for needle in [
             "function smoke",

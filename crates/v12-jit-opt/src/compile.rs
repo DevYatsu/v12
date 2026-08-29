@@ -313,27 +313,24 @@ pub fn inline_at(
     spans.extend_from_slice(suffix_spans);
     spans.truncate(new_instrs.len());
 
-    Some(FunctionBytecode {
-        name_hint: caller.name_hint.clone(),
-        max_regs,
-        instrs: new_instrs,
-        consts: {
-            let mut pool = caller.consts.clone();
-            for c in callee.consts.iter() {
-                let _ = pool.insert(c);
-            }
-            pool
-        },
-        handlers: caller.handlers.clone(),
-        spans,
-        pc_map: Vec::new(),
-        is_strict: caller.is_strict,
-        fixed_params: caller.fixed_params,
-        has_rest: caller.has_rest,
-        rest_reg: caller.rest_reg,
-        is_generator: caller.is_generator,
-        is_async: caller.is_async,
-    })
+    let mut fb = FunctionBytecode::with_instructions(new_instrs, max_regs);
+    fb.name_hint = caller.name_hint.clone();
+    {
+        let mut pool = caller.consts.clone();
+        for c in callee.consts.iter() {
+            let _ = pool.insert(c);
+        }
+        fb.consts = pool;
+    }
+    fb.handlers = caller.handlers.clone();
+    fb.spans = spans;
+    fb.is_strict = caller.is_strict;
+    fb.fixed_params = caller.fixed_params;
+    fb.has_rest = caller.has_rest;
+    fb.rest_reg = caller.rest_reg;
+    fb.is_generator = caller.is_generator;
+    fb.is_async = caller.is_async;
+    Some(fb)
 }
 
 // ---------------------------------------------------------------------------
@@ -974,19 +971,7 @@ mod tests {
     use v12_heap::{Heap, JsValue};
 
     fn empty_fn(max_regs: u16, instrs: Vec<Instr>) -> FunctionBytecode {
-        FunctionBytecode {
-            name_hint: None,
-            max_regs,
-            instrs: instrs.clone(),
-            consts: ConstantPool::new(),
-            handlers: Vec::new(),
-            spans: vec![(0, 0); instrs.len()],
-            pc_map: Vec::new(),
-            is_strict: false,
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-        }
+        FunctionBytecode::with_instructions(instrs.clone(), max_regs)
     }
 
     #[test]
@@ -1121,10 +1106,9 @@ mod tests {
             Instr::new(Opcode::Add, 2, 0, 1),
             Instr::new(term, 2, 0, 0),
         ];
-        FunctionBytecode {
-            consts,
-            ..empty_fn(3, instrs)
-        }
+        let mut fb = empty_fn(3, instrs);
+        fb.consts = consts;
+        fb
     }
 
     #[test]

@@ -42,20 +42,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn empty_fn(max_regs: u16, instrs: Vec<Instr>, consts: ConstantPool) -> FunctionBytecode {
-        let spans = vec![(0, 0); instrs.len()];
-        FunctionBytecode {
-            name_hint: None,
-            max_regs,
-            instrs,
-            consts,
-            handlers: Vec::new(),
-            spans,
-            pc_map: Vec::new(),
-            is_strict: false,
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-        }
+        let mut fb = FunctionBytecode::with_instructions(instrs, max_regs);
+        fb.consts = consts;
+        fb
     }
 
     /// Evaluates `bytecode` with the interpreter via the throw-surface trick.
@@ -443,20 +432,9 @@ mod stub_tests {
     use v12_bytecode::{ConstantPool, FunctionBytecode, Instr, Opcode};
 
     fn empty_fn(max_regs: u16, instrs: Vec<Instr>, consts: ConstantPool) -> FunctionBytecode {
-        let spans = vec![(0, 0); instrs.len()];
-        FunctionBytecode {
-            name_hint: None,
-            max_regs,
-            instrs,
-            consts,
-            handlers: Vec::new(),
-            spans,
-            pc_map: Vec::new(),
-            is_strict: false,
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-        }
+        let mut fb = FunctionBytecode::with_instructions(instrs, max_regs);
+        fb.consts = consts;
+        fb
     }
 
     #[test]

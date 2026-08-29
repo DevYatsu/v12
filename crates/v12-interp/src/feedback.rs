@@ -486,21 +486,7 @@ mod tests {
             Instr::new(Opcode::Add, 2, 0, 1),   // pc 2
             Instr::new(Opcode::Throw, 2, 0, 0), // surface result via throw
         ];
-        let fb = FunctionBytecode {
-            name_hint: None,
-            max_regs: 3,
-            instrs,
-            consts: ConstantPool::new(),
-            handlers: Vec::new(),
-            spans: vec![(0, 0); 4],
-            pc_map: Vec::new(),
-            is_strict: false,
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-            is_generator: false,
-            is_async: false,
-        };
+        let fb = FunctionBytecode::with_instructions(instrs, 3);
         let mut interp = Interp::new(vec![fb], 0, Vec::new());
         let _ = interp.run(); // will throw 2
         let lat = interp.type_feedback_at(0, 2);
@@ -518,21 +504,8 @@ mod tests {
             Instr::new(Opcode::Add, 2, 0, 1),
             Instr::new(Opcode::Return, 2, 0, 0),
         ];
-        let fb2 = FunctionBytecode {
-            name_hint: None,
-            max_regs: 3,
-            instrs: instrs2,
-            consts: pool,
-            handlers: Vec::new(),
-            spans: vec![(0, 0); 4],
-            pc_map: Vec::new(),
-            is_strict: false,
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-            is_generator: false,
-            is_async: false,
-        };
+        let mut fb2 = FunctionBytecode::with_instructions(instrs2, 3);
+        fb2.consts = pool;
         let mut interp2 = Interp::new(vec![fb2], 0, Vec::new());
         let _ = interp2.run();
         let lat2 = interp2.type_feedback_at(0, 2);

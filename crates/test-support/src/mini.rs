@@ -672,22 +672,9 @@ pub fn fn_with_instrs(
     instrs: Vec<v12_bytecode::Instr>,
     consts: v12_bytecode::ConstantPool,
 ) -> v12_bytecode::FunctionBytecode {
-    let spans = vec![(0, 0); instrs.len()];
-    v12_bytecode::FunctionBytecode {
-        name_hint: None,
-        max_regs,
-        instrs,
-        consts,
-        handlers: Vec::new(),
-        spans,
-        pc_map: Vec::new(),
-        is_strict: false,
-        fixed_params: 0,
-        has_rest: false,
-        rest_reg: 0,
-        is_generator: false,
-        is_async: false,
-    }
+    let mut fb = v12_bytecode::FunctionBytecode::with_instructions(instrs, max_regs);
+    fb.consts = consts;
+    fb
 }
 
 #[cfg(test)]

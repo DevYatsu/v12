@@ -64,19 +64,9 @@ pub fn fn_with(len: u32, handlers: Vec<HandlerRange>) -> FunctionBytecode {
     let instrs: Vec<Instr> = (0..len)
         .map(|i| Instr::new(Opcode::Move, i as u8, 0, 1))
         .collect();
-    FunctionBytecode {
-        name_hint: None,
-        max_regs: 2,
-        spans: vec![(0, 0); len as usize],
-        instrs,
-        consts: ConstantPool::new(),
-        handlers,
-        pc_map: Vec::new(),
-        is_strict: false,
-        fixed_params: 0,
-        has_rest: false,
-        rest_reg: 0,
-    }
+    let mut fb = FunctionBytecode::with_instructions(instrs, 2);
+    fb.handlers = handlers;
+    fb
 }
 
 /// Wide payload word count per discriminant (header excluded).
@@ -220,23 +210,12 @@ pub fn random_function(rng: &mut Rng, min_words: usize) -> RandomFunction {
         })
         .collect();
 
-    RandomFunction {
-        fb: FunctionBytecode {
-            name_hint: None,
-            // Keep max_regs modest so Display stays readable and arithmetic
-            // cannot overflow u16.
-            max_regs: 1 + rng.below(4096) as u16,
-            spans: vec![(0, 0); instrs.len()],
-            instrs,
-            consts,
-            handlers,
-            pc_map: Vec::new(),
-            is_strict: rng.coin(50),
-            fixed_params: 0,
-            has_rest: false,
-            rest_reg: 0,
-        },
-    }
+    let max_regs = 1 + rng.below(4096) as u16;
+    let mut fb = FunctionBytecode::with_instructions(instrs, max_regs);
+    fb.consts = consts;
+    fb.handlers = handlers;
+    fb.is_strict = rng.coin(50);
+    RandomFunction { fb }
 }
 
 /// Renders through the Display impl, mapping a formatting error to a panic

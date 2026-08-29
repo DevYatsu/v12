@@ -96,19 +96,8 @@ fn display_renders_documented_malformed_wide_shapes() {
         Instr::new_imm24(Opcode::Wide, 1),
         Instr(0x0011_1111),
     ];
-    let fb = FunctionBytecode {
-        name_hint: Some("torture".into()),
-        max_regs: 8,
-        spans: vec![(0, 0); instrs.len()],
-        instrs,
-        consts: Default::default(),
-        handlers: Vec::new(),
-        pc_map: Vec::new(),
-        is_strict: false,
-        fixed_params: 0,
-        has_rest: false,
-        rest_reg: 0,
-    };
+    let mut fb = FunctionBytecode::with_instructions(instrs, 8);
+    fb.name_hint = Some("torture".into());
 
     let text = render(&fb);
     assert!(text.contains("malformed"), "expected diagnostics:\n{text}");

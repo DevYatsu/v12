@@ -135,19 +135,7 @@ fn narrow_load_int_signed_byte_survives_decode_and_display() {
 
 /// Helper building a function around a pre-encoded word sequence.
 fn fb_of(words: Vec<Instr>) -> FunctionBytecode {
-    FunctionBytecode {
-        name_hint: None,
-        max_regs: 6,
-        spans: vec![(0, 0); words.len()],
-        instrs: words,
-        consts: ConstantPool::new(),
-        handlers: Vec::new(),
-        pc_map: Vec::new(),
-        is_strict: false,
-        fixed_params: 0,
-        has_rest: false,
-        rest_reg: 0,
-    }
+    FunctionBytecode::with_instructions(words, 6)
 }
 
 #[test]
