@@ -1398,8 +1398,8 @@ impl Interp {
                     if self.frames.last().and_then(|f| f.generator).is_none() {
                         return Err(JSException(self.error_value("SyntaxError: yield outside generator")));
                     }
-                    self.suspend(u16::from(dst), yielded)?;
-                    self.top_result = Some(yielded);
+                    let resume_pc = pc + op_width;
+                    self.suspend(u16::from(dst), yielded, resume_pc)?;
                     return Ok(());
                 }
                 Opcode::Await => {
@@ -1423,7 +1423,8 @@ impl Interp {
                     let (promise, is_rejected, payload) = self.promise_resolve_for_await(arg);
                     self.heap.add_root(payload);
                     if let Some(ph) = promise.as_object() { self.heap.add_root(JsValue::object(ph)); }
-                    let _rgen = self.suspend(u16::from(dst), arg)?;
+                    let resume_pc = pc + op_width;
+                    let _rgen = self.suspend(u16::from(dst), arg, resume_pc)?;
                     self.pending_awaits.push_back((r#gen, payload, is_rejected));
                     self.top_result = None;
                     // Advance caller past its Call header: async call returns Promise if available else undefined (task 7)
