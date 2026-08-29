@@ -81,21 +81,17 @@ use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, SourceType};
-use v12_bytecode::FunctionBytecode;
 
 pub use model::{
     CompileError, ExportEntry, ImportEntry, Interner, NATIVE_IMPORT_INDEX, NATIVE_IMPORT_INDEX_U32,
 };
 
-/// Compiled program: every function body plus the entry point.
-///
-/// `main` indexes the top-level script body in [`Program::functions`];
-/// `Closure` instructions reference other entries of that same vector.
-#[derive(Debug, Clone)]
-pub struct Program {
-    pub functions: Vec<FunctionBytecode>,
-    pub main: u32,
-}
+/// Re-exported from [`v12_bytecode::Program`]: the canonical home
+/// of `Program` is the bytecode crate so the interpreter and the embedding
+/// facade can run pre-compiled programs without depending on the front-end.
+/// The compiler still owns the act of producing a `Program` from source; the
+/// re-export keeps the public surface of `v12-bccompiler` stable.
+pub use v12_bytecode::Program;
 
 /// Compiled ES module: bytecode plus linkage metadata.
 ///

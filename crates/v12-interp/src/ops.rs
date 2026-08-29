@@ -317,15 +317,15 @@ pub(crate) fn loose_equals(heap: &mut Heap, a: JsValue, b: JsValue) -> bool {
     }
     // ES 7.2.14 step 4: number vs string compares ToNumber(string) with the
     // number (a string that does not parse yields NaN, which equals nothing).
-    if let Some(x) = a_num {
-        if b.is_string() {
-            return x == to_number(heap, b);
-        }
+    if let Some(x) = a_num
+        && b.is_string()
+    {
+        return x == to_number(heap, b);
     }
-    if let Some(y) = b_num {
-        if a.is_string() {
-            return y == to_number(heap, a);
-        }
+    if let Some(y) = b_num
+        && a.is_string()
+    {
+        return y == to_number(heap, a);
     }
     if a.is_string() && b.is_string() {
         // Both strings: textual comparison.

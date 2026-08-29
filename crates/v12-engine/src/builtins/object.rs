@@ -22,10 +22,7 @@ pub fn object_create(
             "TypeError: Object.create prototype must be object or null",
         ));
     };
-    let obj = heap.alloc(JsObject {
-        prototype: proto_handle,
-        ..JsObject::default()
-    });
+    let obj = heap.alloc(JsObject::environment(0, proto_handle));
     Ok(JsValue::object(obj))
 }
 

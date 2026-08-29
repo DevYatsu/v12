@@ -227,7 +227,7 @@ fn structured_wide_op_roundtrip_and_truncation_fuzz() {
 #[test]
 fn known_discriminants_exactly_match_opcode_enum() {
     for d in 0u8..=255 {
-        let assigned = Instr((u32::from(d) << 24)).op().is_some();
+        let assigned = Instr(u32::from(d) << 24).op().is_some();
         let listed = KNOWN_DISCRIMINANTS.contains(&d);
         assert_eq!(
             assigned, listed,

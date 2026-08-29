@@ -14,6 +14,7 @@
 //! interning's job (`Heap::intern_string`), after which reference identity and
 //! textual equality coincide.
 
+use crate::gc::{MarkSink, Trace};
 use crate::handle::Handle;
 use crate::object::V12Symbol;
 use crate::string::V12Str;
@@ -68,7 +69,7 @@ impl PropKey {
         self.0
     }
 
-    /// `(is_symbol, payload)` split, inverse of [`Self::from_parts`].
+    /// `(is_symbol, payload)` split, inverse of [`Self::parts`].
     pub const fn parts(self) -> (bool, u32) {
         (self.0 & SYMBOL_FLAG != 0, self.0 & PAYLOAD_MASK)
     }
@@ -116,6 +117,12 @@ impl PropKey {
         z ^= z >> 15;
         z = z.wrapping_mul(0x846C_A68B);
         z ^ (z >> 16)
+    }
+}
+
+impl Trace for PropKey {
+    fn trace(&self, _sink: &mut MarkSink<'_>) {
+        // PropKey is a plain u32 with no GC handles; nothing to trace.
     }
 }
 

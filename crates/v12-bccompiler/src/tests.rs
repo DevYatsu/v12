@@ -15,7 +15,7 @@ use oxc_allocator::Allocator;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
-use v12_bytecode::{Const, Instr, Opcode, WideOp};
+use v12_bytecode::{Const, Instr, Opcode};
 
 use crate::model::{spur_of_str_id, str_id_of};
 use crate::{

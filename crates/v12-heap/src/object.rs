@@ -111,21 +111,29 @@ impl JsObject {
 
     /// A function object: `elements[0]` holds the function index (Smi),
     /// `prototype` is the closure environment.
+    ///
+    /// The index is stored as a Smi to match the interpreter's dispatch read
+    /// path (`Interp::prepare_call` extracts it via `as_smi()`).
     pub fn function(func_index: u32, env: Option<Handle<JsObject>>) -> Self {
         Self {
             kind: KIND_FUNCTION,
-            elements: vec![crate::JsValue::from_f64(f64::from(func_index))],
+            elements: vec![crate::JsValue::from_i32_smi(func_index as i32)
+                .expect("function index fits Smi")],
             prototype: env,
             ..Self::default()
         }
     }
 
     /// An array object with the given elements and length property.
+    ///
+    /// The length is stored as a Smi to match the interpreter's array
+    /// allocations (`NewArray`/`CopyArrayRest` use `ops::box_number`, which
+    /// boxes small integers as Smi).
     pub fn array(elements: Vec<crate::JsValue>) -> Self {
         let len = elements.len();
         Self {
             kind: KIND_ARRAY,
-            properties: vec![crate::JsValue::from_f64(f64::from(len as u32))],
+            properties: vec![crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi")],
             property_keys: vec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
             elements,
             ..Self::default()
@@ -276,7 +284,7 @@ pub trait PromiseExt {
 
 impl PromiseExt for crate::Handle<JsObject> {
     fn promise_state(&self, heap: &crate::Heap) -> Option<PromiseState> {
-        let v = heap.get(*self).properties.get(0)?;
+        let v = heap.get(*self).properties.first()?;
         if let Some(n) = v.as_smi() {
             match n {
                 0 => return Some(PromiseState::Pending),
@@ -360,26 +368,22 @@ pub trait HeapExt {
 }
 
 impl HeapExt for crate::Heap {
-    #[must_use]
     fn alloc_array(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject> {
         let h = self.alloc(JsObject::array(elements));
         self.add_root(crate::JsValue::object(h));
         h
     }
-    #[must_use]
     fn alloc_function(&mut self, idx: u32, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject> {
         let h = self.alloc(JsObject::function(idx, env));
         self.add_root(crate::JsValue::object(h));
         h
     }
-    #[must_use]
     fn alloc_ordinary(&mut self, props: Vec<crate::JsValue>) -> crate::Handle<JsObject> {
         let n = props.len();
         let h = self.alloc(JsObject::ordinary(props, vec![None; n]));
         self.add_root(crate::JsValue::object(h));
         h
     }
-    #[must_use]
     fn alloc_pending_promise(&mut self) -> crate::Handle<JsObject> {
         let reactions = self.alloc(JsObject::array(Vec::new()));
         self.add_root(crate::JsValue::object(reactions));

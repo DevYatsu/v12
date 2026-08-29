@@ -15,3 +15,10 @@
 - Replaced test in `crates/v12-bccompiler/tests/yield_star.rs` (`contains("call")` gaming) with runtime delegation test `yield_star_delegates_array` using `Interp::from_source` and `to_display_string` asserting `"1,2,true"`.
 - Added dev-dependency `v12-interp` to `crates/v12-bccompiler/Cargo.toml` for runtime test.
 - Tests: `cargo nextest run -p v12-bccompiler --test yield_star -v` PASS (1 passed), `cargo nextest run -p v12-interp -v` PASS (62 passed).
+
+## Fix (circular dev-dependency) — 2026-08-28
+- Removed circular dev-dependency `v12-interp` from `crates/v12-bccompiler/Cargo.toml` (v12-interp already depends on v12-bccompiler).
+- Moved runtime test `yield_star_delegates_array` (`Interp::from_source` asserting `"1,2,true"`) from `crates/v12-bccompiler/tests/yield_star.rs` to `crates/v12-interp/tests/yield_star.rs`.
+- Replaced bccompiler test with pure-compiler check `yield_star_compiles_and_contains_suspend_yield` (compiles `yield* [1,2]` and asserts `suspend_yield` in dump).
+- Commit: 9d49006cdca27c8643f2b373f8826667cc2493a1
+- Tests: `cargo nextest run -p v12-bccompiler --test yield_star -v` PASS (1 passed), `cargo nextest run -p v12-interp --test yield_star -v` PASS (1 passed), `cargo nextest run -p v12-interp -v` PASS (63 passed).
