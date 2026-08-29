@@ -27,9 +27,13 @@ use crate::job_queue::Job;
 /// `Promise#then` on a settled promise, and reaction settling all push jobs
 /// here. The engine shares this `Rc` with its job queue so jobs enqueued
 /// during interpreter execution join the current or next checkpoint.
+///
+/// Host functions registered through the embedding API (`register_fn`) are
+/// capturing Rust closures, stored separately from the fn-pointer handlers.
 #[derive(Default, Clone)]
 pub struct NativeRegistry {
     handlers: std::collections::HashMap<u32, NativeHandler>,
+    closures: std::collections::HashMap<u32, HostClosure>,
     pending: Rc<RefCell<Vec<Job>>>,
 }
 
@@ -37,6 +41,7 @@ impl std::fmt::Debug for NativeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeRegistry")
             .field("handlers", &self.handlers.len())
+            .field("closures", &self.closures.len())
             .field("pending", &self.pending.borrow().len())
             .finish()
     }
@@ -44,6 +49,34 @@ impl std::fmt::Debug for NativeRegistry {
 
 /// A native handler.
 pub type NativeHandler = fn(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue>;
+
+/// A host function implemented as a capturing Rust closure.
+///
+/// The closure receives the heap (for allocating return values), the `this`
+/// value, and the argument slice; an `Err` return is thrown inside JS.
+#[derive(Clone)]
+pub struct HostClosure(Rc<RefCell<dyn FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue>>>);
+
+impl HostClosure {
+    /// Wraps a user closure. `F` must match the host-function signature
+    /// with all lifetimes elided (higher-ranked).
+    pub fn new<F>(f: F) -> Self
+    where
+        F: FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue> + 'static,
+    {
+        Self(Rc::new(RefCell::new(f)))
+    }
+
+    /// Invokes the closure.
+    pub fn call(
+        &self,
+        heap: &mut Heap,
+        this: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JsValue> {
+        (self.0.borrow_mut())(heap, this, args)
+    }
+}
 
 impl NativeRegistry {
     /// Creates an empty registry.
@@ -67,6 +100,21 @@ impl NativeRegistry {
         self.handlers.insert(index, handler);
     }
 
+    /// Registers a capturing closure at `index`.
+    pub fn register_closure(&mut self, index: u32, closure: HostClosure) {
+        self.closures.insert(index, closure);
+    }
+
+    /// Returns an iterator over `(index, handler)` pairs.
+    ///
+    /// Used by [`crate::Engine::eval_indirect`] (ADR-007) to clone the
+    /// engine's installed natives into a fresh realm-local registry
+    /// without touching the engine's `pending` sink. The returned pairs
+    /// are exact copies of the registered handlers.
+    pub fn snapshot_handlers(&self) -> impl Iterator<Item = (u32, NativeHandler)> + '_ {
+        self.handlers.iter().map(|(&i, &h)| (i, h))
+    }
+
     /// Dispatches a native call.
     pub fn dispatch(
         &mut self,
@@ -75,6 +123,9 @@ impl NativeRegistry {
         args: &[JsValue],
         index: u32,
     ) -> Result<JsValue, JsValue> {
+        if let Some(closure) = self.closures.get(&index).cloned() {
+            return closure.call(heap, this, args);
+        }
         if let Some(handler) = self.handlers.get(&index).copied() {
             handler(heap, this, args)
         } else {
@@ -274,11 +325,7 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
     // v1 stub for `new Function`: validate syntax and return a placeholder
     // function object. Full compilation is via `Engine::create_function`.
     if args.is_empty() {
-        let func = heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::KIND_FUNCTION,
-            elements: vec![JsValue::from_i32_smi(0).unwrap()],
-            ..Default::default()
-        });
+        let func = heap.alloc(v12_heap::JsObject::function(0, None));
         heap.add_root(JsValue::object(func));
         return Ok(JsValue::object(func));
     }
@@ -315,11 +362,7 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
         };
         return Err(JsValue::string(handle));
     }
-    let func = heap.alloc(v12_heap::JsObject {
-        kind: v12_heap::KIND_FUNCTION,
-        elements: vec![JsValue::from_i32_smi(1).unwrap()],
-        ..Default::default()
-    });
+    let func = heap.alloc(v12_heap::JsObject::function(1, None));
     heap.add_root(JsValue::object(func));
     Ok(JsValue::object(func))
 }

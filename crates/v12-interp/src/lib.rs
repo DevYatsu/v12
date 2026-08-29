@@ -3273,6 +3273,9 @@ impl<'a> Interp<'a> {
     // ------------------------------------------------------------------
 
     fn is_generator_fn(&self, fn_idx: u32) -> bool {
+        if fn_idx as usize >= self.functions.len() {
+            return false; // native/host function index
+        }
         let f = &self.functions[fn_idx as usize];
         if f.is_generator {
             return true;
@@ -3290,6 +3293,9 @@ impl<'a> Interp<'a> {
     }
 
     fn is_async_fn(&self, fn_idx: u32) -> bool {
+        if fn_idx as usize >= self.functions.len() {
+            return false; // native/host function index
+        }
         self.functions[fn_idx as usize].is_async
     }
 

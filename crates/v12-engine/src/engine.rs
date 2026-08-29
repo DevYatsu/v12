@@ -54,6 +54,9 @@ pub struct Engine {
     /// Tier-up policy (ADR-006). `OnDemand` (the default) means tier-up
     /// only happens when the host asks; `Profile` is the v2 hook.
     tier_policy: v12_codegen::TierPolicy,
+    /// Next index handed out by [`Engine::create_host_function`], offset
+    /// from `HOST_FN_BASE`.
+    host_fn_counter: u32,
 }
 
 impl std::fmt::Debug for Engine {
@@ -84,6 +87,7 @@ impl Engine {
             retained: None,
             completion: None,
             tier_policy: v12_codegen::TierPolicy::default(),
+            host_fn_counter: 0,
         }
     }
 
@@ -520,6 +524,67 @@ impl Engine {
         // heap; they verify the object was created).
         let _ = program;
         Ok(JsValue::object(func))
+    }
+
+    /// Index space reserved for host functions created through the embedding
+    /// API. Well above any realistic program function count; the interpreter
+    /// dispatches any index >= functions.len() to the native registry.
+    const HOST_FN_BASE: u32 = 0x1000_0000;
+
+    /// Registers a capturing Rust closure as a global function named `name`.
+    ///
+    /// The function is installed as a property on the realm's global object
+    /// (shape transition, mirroring the interpreter's `SetGlobal` fast path)
+    /// and dispatches through the engine's native registry. Returns the
+    /// host-function index.
+    pub fn create_host_function(
+        &mut self,
+        name: &str,
+        closure: crate::builtins::HostClosure,
+    ) -> Result<(), JsValue> {
+        let index = Self::HOST_FN_BASE + self.host_fn_counter;
+        self.host_fn_counter += 1;
+        self.registry.register_closure(index, closure);
+        let global = self.realm.global();
+        let func = self.heap.alloc(v12_heap::JsObject::function(index, None));
+        self.heap.add_root(JsValue::object(func));
+        // Install `name` on the global via the public shape API, exactly as
+        // the interpreter's `op_set_global` does (GLOBAL_VAR_OFFSET bias).
+        let h = self
+            .heap
+            .intern_string(V12Str::latin1(name.as_bytes().to_vec()));
+        let key = v12_heap::PropKey::from_string(h);
+        let shape = self.heap.shape_of(global);
+        if let Some(desc) = self.heap.lookup_property(shape, key)
+            && let Some(slot) = desc.slot()
+        {
+            let idx = crate::realm::INTRINSIC_COUNT + slot as usize;
+            let len = self.heap.get(global).properties.len();
+            if idx >= len {
+                self.heap
+                    .get_mut(global)
+                    .properties
+                    .resize(idx + 1, JsValue::undefined());
+            }
+            self.heap.get_mut(global).properties[idx] = JsValue::object(func);
+        } else {
+            let child = self
+                .heap
+                .add_property(shape, key, v12_heap::Attrs::DEFAULT);
+            self.heap.bind_shape(global, child);
+            let new_slot =
+                usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
+            let idx = crate::realm::INTRINSIC_COUNT + new_slot;
+            let len = self.heap.get(global).properties.len();
+            if len <= idx {
+                self.heap
+                    .get_mut(global)
+                    .properties
+                    .resize(idx + 1, JsValue::undefined());
+            }
+            self.heap.get_mut(global).properties[idx] = JsValue::object(func);
+        }
+        Ok(())
     }
 
     /// Drains the microtask queue.

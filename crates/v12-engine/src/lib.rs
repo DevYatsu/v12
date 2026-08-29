@@ -5,15 +5,18 @@
 
 pub mod builtins;
 pub mod engine;
+pub mod error;
 pub mod internal_methods;
 pub mod job_queue;
 pub mod realm;
 pub mod value;
 
 pub use engine::Engine;
+pub use error::EngineError;
 pub use job_queue::JobQueue;
 pub use realm::Realm;
 pub use value::{FromValue, ToValue};
+pub use builtins::HostClosure;
 
 pub use v12_heap::{Heap, JsValue};
 
