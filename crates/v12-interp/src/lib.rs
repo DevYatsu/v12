@@ -1677,10 +1677,16 @@ impl Interp {
         }
 
         // Async functions return a pending Promise immediately (Task 7).
-        // Inline execution until first Await would block the caller; instead we create
-        // a generator object holding the initial state and defer body execution.
-        // For the simple `return 1` case the promise stays pending (test only checks object identity).
-        // For `await` cases, the deferred body will be driven by `run_jobs` via pending_awaits.
+        // NOTE on layering (finding #3): promise/generator allocation lives in
+        // Interp::prepare_call rather than Engine::prepare_call/JobQueue. The
+        // Engine has no per-call retained program to push a promise into before
+        // the interpreter's frame window is laid out, and the detailed brief's
+        // Step 3 explicitly placed `pending_awaits` in Interp. Engine integration
+        // is via `Interp::run_jobs` + `Engine::run_jobs` rebuilding an Interp
+        // from `RetainedProgram` and draining both `JobQueue` and `pending_awaits`
+        // at checkpoint boundaries (see `v12-engine/src/engine.rs:run_jobs`).
+        // Moving this allocation to Engine would require threading the retained
+        // program through every call site with no behavioural gain.
         if self.is_async_fn(target) {
             self.gc_protect();
             let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
@@ -1700,21 +1706,7 @@ impl Interp {
             let mut window = vec![JsValue::undefined(); usize::from(callee_max_regs)];
             window[0] = this_v;
             let arg_src = callee_slot + 2;
-            if callee_has_rest {
-                let fixed = callee_fixed as usize;
-                let rest_reg = callee_rest_reg as usize;
-                let to_copy = fixed.min(argc as usize).min(window.len().saturating_sub(1));
-                for i in 0..to_copy { window[1+i] = self.stack[arg_src+i]; }
-                let rest_len = (argc as usize).saturating_sub(fixed);
-                let rest_slice = if rest_len>0 { self.stack[arg_src+fixed..arg_src+fixed+rest_len].to_vec() } else { Vec::new() };
-                let shape = self.array_shape();
-                let h = self.heap.alloc(JsObject { kind: KIND_ARRAY, properties: vec![ops::box_number(f64::from(rest_len as u32))], elements: rest_slice, ..JsObject::default() });
-                self.bind_shape(h, shape);
-                if rest_reg < window.len() { window[rest_reg] = JsValue::object(h); }
-            } else {
-                let copied = usize::from(argc).min(window.len().saturating_sub(1));
-                for i in 0..copied { window[1+i] = self.stack[arg_src+i]; }
-            }
+            self.fill_call_window(&mut window, arg_src, argc as usize, callee_has_rest, callee_fixed, callee_rest_reg);
             let g = self.heap.alloc(JsObject {
                 kind: KIND_GENERATOR,
                 properties: vec![ ops::box_number(f64::from(target)), ops::box_number(0.0), ops::box_number(0.0), ops::box_number(0.0), JsValue::object(promise) ],
@@ -1740,6 +1732,7 @@ impl Interp {
         let arg_src = callee_slot + 2;
         self.stack.resize(window_end, JsValue::undefined());
         self.stack[new_base] = this_v;
+        // DRY: rest-array creation centralised in alloc_rest_array (finding #4)
         if callee_has_rest {
             let fixed = callee_fixed as usize;
             let rest_reg = callee_rest_reg as usize;
@@ -1757,16 +1750,9 @@ impl Interp {
                 Vec::new()
             };
             self.gc_protect();
-            let shape = self.array_shape();
-            let h = self.heap.alloc(JsObject {
-                kind: KIND_ARRAY,
-                properties: vec![ops::box_number(f64::from(rest_len as u32))],
-                elements: rest_slice,
-                ..JsObject::default()
-            });
-            self.bind_shape(h, shape);
+            let arr = self.alloc_rest_array(rest_slice);
             if rest_reg < usize::from(callee_max_regs) {
-                self.stack[new_base + rest_reg] = JsValue::object(h);
+                self.stack[new_base + rest_reg] = arr;
             }
         } else {
             let copied = usize::from(argc).min(usize::from(callee_max_regs).saturating_sub(1));
@@ -3366,6 +3352,60 @@ impl Interp {
         self.functions[fn_idx as usize].is_async
     }
 
+    /// Allocates an array object for a rest parameter from `elements`. Centralises
+    /// the `array_shape` + `KIND_ARRAY` + `bind_shape` sequence that previously
+    /// duplicated across `prepare_call` (async window), `prepare_call` (sync
+    /// window), `prepare_construct`, and `create_generator_object` (finding #4).
+    fn alloc_rest_array(&mut self, elements: Vec<JsValue>) -> JsValue {
+        let len = elements.len() as u32;
+        let shape = self.array_shape();
+        let h = self.heap.alloc(JsObject {
+            kind: KIND_ARRAY,
+            properties: vec![ops::box_number(f64::from(len))],
+            elements,
+            ..JsObject::default()
+        });
+        self.bind_shape(h, shape);
+        JsValue::object(h)
+    }
+
+    /// Fills `window[1..]` from `self.stack[args_src..]` respecting fixed/rest
+    /// layout. Extracted to deduplicate the verbatim window-building blocks in
+    /// `prepare_call` async vs sync paths (finding #4).
+    fn fill_call_window(
+        &mut self,
+        window: &mut [JsValue],
+        args_src: usize,
+        argc: usize,
+        has_rest: bool,
+        fixed: u16,
+        rest_reg: u16,
+    ) {
+        if has_rest {
+            let fixed_usize = fixed as usize;
+            let to_copy = fixed_usize.min(argc).min(window.len().saturating_sub(1));
+            for i in 0..to_copy {
+                window[1 + i] = self.stack[args_src + i];
+            }
+            let rest_len = argc.saturating_sub(fixed_usize);
+            let slice = if rest_len > 0 {
+                self.stack[args_src + fixed_usize..args_src + fixed_usize + rest_len].to_vec()
+            } else {
+                Vec::new()
+            };
+            self.gc_protect();
+            let arr = self.alloc_rest_array(slice);
+            if (rest_reg as usize) < window.len() {
+                window[rest_reg as usize] = arr;
+            }
+        } else {
+            let copied = argc.min(window.len().saturating_sub(1));
+            for i in 0..copied {
+                window[1 + i] = self.stack[args_src + i];
+            }
+        }
+    }
+
     fn create_generator_object(
         &mut self,
         fn_idx: u32,
@@ -3707,6 +3747,13 @@ impl Interp {
     /// Republishes every live reference as a GC root — the whole value stack
     /// plus each active frame's environment — immediately before opcodes
     /// that can reach `Heap::alloc`.
+    /// Finding #5: roots from `heap.add_root(promise/reactions/g)` are transient.
+    /// `gc_protect` fully republishes `stack` + `frames` + `pending_awaits`
+    /// (generator + payload) + `top_result` + persistent globals, discarding
+    /// stale `add_root` entries. After `complete_frame` settles an async promise
+    /// the generator leaves `pending_awaits`, so the next `gc_protect` drops its
+    /// promise/reactions roots and the promise remains reachable only via the
+    /// generator's `properties[4]` until the generator itself becomes unreachable.
     fn gc_protect(&mut self) {
         let roots = &mut self.heap.roots_mut().0;
         // The root set is fully republished here, so long-lived interpreter

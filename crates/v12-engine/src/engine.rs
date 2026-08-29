@@ -89,27 +89,6 @@ impl Engine {
         &mut self.jobs
     }
 
-    /// Creates a new array object with proper shape setup (length property + elements).
-    /// Mirrors the interpreter's NewArray opcode behavior.
-    pub fn create_array(&mut self, elements: Vec<JsValue>) -> JsValue {
-        use v12_heap::{Attrs, PropKey};
-        let len = elements.len() as f64;
-        let length_key = {
-            let h = self.heap.intern_string(V12Str::latin1(b"length".to_vec()));
-            PropKey::from_string(h)
-        };
-        let shape = self.heap.add_property(self.heap.root_shape(), length_key, Attrs::DEFAULT);
-        let h = self.heap.alloc(JsObject {
-            kind: v12_heap::KIND_ARRAY,
-            properties: vec![JsValue::from_f64(len)],
-            property_keys: vec![Some(length_key)],
-            elements,
-            ..Default::default()
-        });
-        crate::internal_methods::bind_shape_public(&mut self.heap, h, shape);
-        JsValue::object(h)
-    }
-
     /// Evaluates `source` as a script.
     ///
     /// On success returns the completion value (currently `undefined` for
