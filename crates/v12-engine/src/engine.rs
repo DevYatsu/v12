@@ -89,13 +89,7 @@ impl Engine {
 
     /// Alias required by `engine_owns_async_promise` (brief) — pending promise with `properties[0]==0`.
     pub fn new_pending_promise(&mut self) -> v12_heap::Handle<JsObject> {
-        let h = self.new_async_promise();
-        // Ensure properties[0] is f64 0.0 for the brief's `as_f64()==Some(0.0)` check
-        // (HeapExt stores Smi 0 which `as_f64` would miss).
-        if self.heap.get(h).properties[0].as_f64().is_none() {
-            self.heap.get_mut(h).properties[0] = v12_heap::JsValue::from_f64(0.0);
-        }
-        h
+        self.new_async_promise()
     }
 
     /// Engine-owned helper for creating a generator object (delegates to heap).

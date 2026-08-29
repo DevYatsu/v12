@@ -163,7 +163,7 @@ impl JsObject {
         Self {
             kind: KIND_ORDINARY,
             properties: vec![
-                crate::JsValue::from_i32_smi(0).expect("0 fits"),
+                crate::JsValue::from_f64(0.0),
                 crate::JsValue::undefined(),
                 crate::JsValue::object(reactions),
             ],
@@ -277,12 +277,23 @@ pub trait PromiseExt {
 impl PromiseExt for crate::Handle<JsObject> {
     fn promise_state(&self, heap: &crate::Heap) -> Option<PromiseState> {
         let v = heap.get(*self).properties.get(0)?;
-        match v.as_smi() {
-            Some(0) => Some(PromiseState::Pending),
-            Some(1) => Some(PromiseState::Fulfilled),
-            Some(2) => Some(PromiseState::Rejected),
-            _ => None,
+        if let Some(n) = v.as_smi() {
+            match n {
+                0 => return Some(PromiseState::Pending),
+                1 => return Some(PromiseState::Fulfilled),
+                2 => return Some(PromiseState::Rejected),
+                _ => return None,
+            }
         }
+        if let Some(f) = v.as_f64() {
+            match f as i32 {
+                0 => return Some(PromiseState::Pending),
+                1 => return Some(PromiseState::Fulfilled),
+                2 => return Some(PromiseState::Rejected),
+                _ => return None,
+            }
+        }
+        None
     }
     fn promise_value(&self, heap: &crate::Heap) -> Option<crate::JsValue> {
         heap.get(*self).properties.get(1).copied()

@@ -61,18 +61,6 @@ impl JobCtx<'_> {
 /// activate user functions.
 pub type Job = Box<dyn FnOnce(&mut JobCtx<'_>)>;
 
-/// Trait hiding `JobQueue` behind a queue abstraction.
-pub trait MicrotaskQueue {
-    fn enqueue_job(&mut self, job: Job) -> bool;
-    fn is_empty_queue(&self) -> bool;
-    fn drain_queue(&mut self, interp: &mut Interp, pending: Rc<RefCell<Vec<Job>>>) -> usize;
-}
-impl MicrotaskQueue for JobQueue {
-    fn enqueue_job(&mut self, job: Job) -> bool { self.enqueue(job) }
-    fn is_empty_queue(&self) -> bool { self.is_empty() }
-    fn drain_queue(&mut self, interp: &mut Interp, pending: Rc<RefCell<Vec<Job>>>) -> usize { self.drain(interp, pending) }
-}
-
 /// Ordered queue of pending microtasks.
 #[derive(Default)]
 pub struct JobQueue {

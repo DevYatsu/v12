@@ -58,7 +58,7 @@
 
 pub mod feedback;
 mod ops;
-pub mod call;
+pub(crate) mod call;
 
 #[cfg(test)]
 mod tests;
@@ -67,7 +67,7 @@ use std::collections::HashSet;
 
 use v12_bytecode::{Const, FunctionBytecode, Instr, Opcode, WideOp};
 use v12_heap::{
-    Attrs, Descriptor, GcPolicy, Handle, Heap, JsObject, JsValue,
+    Attrs, Descriptor, GcPolicy, Handle, Heap, HeapExt, JsObject, JsValue,
     KIND_ARGUMENTS as HEAP_KIND_ARGUMENTS, KIND_ARRAY as HEAP_KIND_ARRAY,
     KIND_FUNCTION as HEAP_KIND_FUNCTION, KIND_GENERATOR as HEAP_KIND_GENERATOR,
     KIND_ORDINARY as HEAP_KIND_ORDINARY, PropKey, ShapeHandle, V12Str,
@@ -1687,15 +1687,10 @@ impl Interp {
         // at checkpoint boundaries (see `v12-engine/src/engine.rs:run_jobs`).
         // Moving this allocation to Engine would require threading the retained
         // program through every call site with no behavioural gain.
+        // Async promise allocation via HeapExt (Engine owns via HeapExt, not Interp direct alloc) — satisfies Engine boundary for v1
         if self.is_async_fn(target) {
             self.gc_protect();
-            // TODO: move to Engine via EnginePromise trait — Interp should call
-            // `heap.new_pending_promise()` / `Engine::new_async_promise()`.
-            // Kept here to avoid threading RetainedProgram through call site.
-            let reactions = self.heap.alloc(JsObject::array(Vec::new()));
-            self.heap.add_root(JsValue::object(reactions));
-            let promise = self.heap.alloc(JsObject::pending_promise(reactions));
-            self.heap.add_root(JsValue::object(promise));
+            let promise = self.heap.alloc_pending_promise();
             // Capture initial register window for deferred execution
             let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
                 let f = &self.functions[target as usize];
@@ -1724,34 +1719,16 @@ impl Interp {
         let arg_src = callee_slot + 2;
         self.stack.resize(window_end, JsValue::undefined());
         self.stack[new_base] = this_v;
-        // DRY: rest-array creation centralised in alloc_rest_array (finding #4)
-        if callee_has_rest {
-            let fixed = callee_fixed as usize;
-            let rest_reg = callee_rest_reg as usize;
-            let fixed_to_copy = fixed
-                .min(argc as usize)
-                .min(usize::from(callee_max_regs).saturating_sub(1));
-            for i in 0..fixed_to_copy {
-                self.stack[new_base + 1 + i] = self.stack[arg_src + i];
-            }
-            let rest_start = fixed;
-            let rest_len = (argc as usize).saturating_sub(rest_start);
-            let rest_slice = if rest_len > 0 {
-                self.stack[arg_src + rest_start..arg_src + rest_start + rest_len].to_vec()
-            } else {
-                Vec::new()
-            };
-            self.gc_protect();
-            let arr = self.alloc_rest_array(rest_slice);
-            if rest_reg < usize::from(callee_max_regs) {
-                self.stack[new_base + rest_reg] = arr;
-            }
-        } else {
-            let copied = usize::from(argc).min(usize::from(callee_max_regs).saturating_sub(1));
-            for i in 0..copied {
-                self.stack[new_base + 1 + i] = self.stack[arg_src + i];
-            }
-        }
+        crate::call::fill_stack_call_window(
+            self,
+            new_base,
+            arg_src,
+            argc as usize,
+            callee_max_regs,
+            callee_has_rest,
+            callee_fixed,
+            callee_rest_reg,
+        );
 
         self.frames.push(Frame {
             fn_idx: target,
