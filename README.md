@@ -8,10 +8,11 @@ JavaScriptCore, or QuickJS. The goal is an embeddable engine that is fast to
 start, small in memory, and correct enough to run real programs.
 
 > **Status: early development — full pipeline works: compile → run → optimize.**
-> The compiler, heap, interpreter, baseline JIT, embedding engine, the `v12`
+> The compiler, heap, interpreter, baseline JIT, embedding facade, the `v12`
 > CLI, a Test262 harness, and a Tier-2 optimizer scaffold are implemented and
-> tested (484 tests, `cargo nextest run --workspace`). Current Test262
-> `language` pass rate: 4 958/24 873 (24.9%). Expect breaking changes.
+> tested (535 tests, `cargo nextest run --workspace`). Generators, async
+> functions, and Promise microtasks are wired end to end. Expect breaking
+> changes.
 
 ## Why another engine?
 
@@ -37,19 +38,56 @@ ECMA-262 regular expressions, [malachite][malachite] powers `BigInt`,
 [ICU4X][icu] and [temporal_rs][temporal] back internationalization and dates,
 and [lasso][lasso] interns identifier strings.
 
+## Embedding
+
+`v12-api` is the embedder-facing facade — the only crate a host should import.
+It wraps the engine behind a small, stable surface: one `Context` per engine,
+one realm, no `Send`/`Sync`.
+
+```rust
+use v12_api::Context;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut ctx = Context::new();
+
+    // Rust closure exposed to JS as a global function.
+    ctx.register_fn("log", |heap, _this, args| {
+        let msg = args
+            .iter()
+            .filter_map(|v| <String as v12_api::FromValue>::from_value(heap, *v))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("[js] {msg}");
+        Ok(v12_engine::JsValue::undefined())
+    })?;
+
+    ctx.eval::<()>("log('hello from', 1 + 1);")?;
+
+    ctx.eval::<()>("function add(a, b) { return a + b; }")?;
+    let sum: f64 = ctx.call("add", &[1.5, 2.5])?;
+    assert_eq!(sum, 4.0);
+    Ok(())
+}
+```
+
+See `crates/v12-api/README.md` for the full API surface and the runnable
+`calculator` example.
+
 ## Workspace layout
 
 | Crate | Role |
 |---|---|
-| `v12-bytecode` | Register ISA (fixed-width 32-bit words), constant pool, exception handler tables, disassembler |
+| `v12-api` | Embedder facade: `Context` (`eval`/`register_fn`/`call`/`pump`), `Runtime`, `V12Error` |
+| `v12-bytecode` | Register ISA (fixed-width 32-bit words), constant pool, `Program`, exception handler tables, disassembler |
 | `v12-heap` | Values, typed handles, hidden classes, elements storage, strings, mark-sweep garbage collector |
-| `v12-bccompiler` | oxc AST → bytecode compiler (scopes, closures, exceptions, peephole pass) |
-| `v12-interp` | Tier-0 bytecode interpreter (iterative loop, handler tables, tier-up feedback) |
-| `v12-jit-baseline` | Tier-1 template JIT backed by Cranelift (feature-gated, `brif` guards + deopt map) |
+| `v12-bccompiler` | oxc AST → bytecode compiler (scopes, closures, exceptions, generators/async, peephole pass) |
+| `v12-interp` | Tier-0 bytecode interpreter (iterative loop, handler tables, generator suspension, tier-up feedback) |
+| `v12-codegen` | Shared JIT seams: compiled-function cache, deopt maps, tier policy |
+| `v12-jit-baseline` | Tier-1 template JIT backed by Cranelift (feature-gated, deopt map) |
 | `v12-jit-opt` | Tier-2 speculative optimizer — type lattice, guards, SSA, inlining, loop versioning *(driver wiring pending)* |
 | `v12-regex` | ES-semantics wrapper over `regress` |
 | `v12-intl` | `Intl`/Temporal primitives over ICU4X and `temporal_rs` |
-| `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error), single realm, microtask queue, `Engine::eval` API, ESM module compilation |
+| `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error/Promise), single realm, microtask queue, `Engine::eval` API, ESM module compilation |
 | `v12-cli` | The `v12` binary: REPL (rustyline — history + arrows) and script runner |
 
 ## Try the pieces that exist today
@@ -73,7 +111,14 @@ for function in &program.functions {
 }
 ```
 
-Run the test suite (484 tests, `cargo nextest run --workspace`):
+Run a script, including generators, async functions, and promises:
+
+```sh
+echo 'function* g(){ yield 1; yield 2; } console.log([...g()]);' | cargo run --bin v12
+echo 'Promise.resolve(2).then(v => console.log("got " + v));' | cargo run --bin v12
+```
+
+Run the test suite (535 tests, `cargo nextest run --workspace`):
 
 ```sh
 cargo nextest run --workspace
@@ -98,15 +143,17 @@ cargo nextest run --workspace
 - [x] Heap: values, handles, hidden classes, elements kinds, strings, GC
 - [x] Compiler front end: statements, closures, exceptions, peephole pass
 - [x] Tier-0 interpreter — handler-table unwinding, GC-rooted frames, differential vs reference interpreter
-- [x] Built-ins — Object/Array/String/Number/Math/Error + single realm, microtask queue, `Engine::eval` API
+- [x] Built-ins — Object/Array/String/Number/Math/Error/Promise + single realm, microtask queue, `Engine::eval` API
+- [x] Generators & async — `function*`/`yield`, `async`/`await`, `yield*`, Promise reactions through `run_jobs`
 - [x] Tier-1 baseline JIT — Cranelift template (feature-gated, deopt pc_map)
+- [x] Embedding facade — `v12-api`: `Context` (eval/register_fn/call/pump), `Runtime`, `V12Error`
 - [x] `v12` CLI — script runner + REPL (rustyline: history + arrows)
 - [x] Test262 harness — parallel runner, TAP/JSON/human output, per-suite gating (`conformance/run.sh`)
 - [x] Tier-2 speculative optimizer — type lattice, guards, SSA, inlining, loop versioning
 - [x] ESM modules — `compile_source_as_module`, import/export linkage, `Engine` module compilation
-- [ ] Test262 `language` conformance burn-down — 4 958/24 873 (24.9%); queue in `conformance/known-failures.md`
+- [ ] Test262 `language` conformance burn-down — queue in `conformance/known-failures.md`
 - [ ] Tier-2 driver wiring — second tier-up fire → `JitOpt::compile`, deopt backoff
-- [ ] Built-in breadth — `Object.getOwnPropertyNames`, Promise, Map/Set, error objects with proper classes
+- [ ] Built-in breadth — `Object.getOwnPropertyNames`, Map/Set, error objects with proper classes, `for-of`/iterator protocol
 
 Performance targets: match or beat V8 on startup time and memory footprint;
 interpreter performance in the class of modern production interpreters. Beating
