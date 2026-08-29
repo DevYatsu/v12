@@ -2317,6 +2317,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "v12-api"
+version = "0.1.0"
+dependencies = [
+ "v12-engine",
+ "v12-heap",
+]
+
+[[package]]
 name = "v12-bccompiler"
 version = "0.1.0"
 dependencies = [
@@ -2343,9 +2351,19 @@ version = "0.1.0"
 dependencies = [
  "lasso",
  "rustyline",
+ "v12-api",
  "v12-bccompiler",
  "v12-bytecode",
  "v12-engine",
+]
+
+[[package]]
+name = "v12-codegen"
+version = "0.1.0"
+dependencies = [
+ "v12-bytecode",
+ "v12-heap",
+ "v12-interp",
 ]
 
 [[package]]
@@ -2355,6 +2373,7 @@ dependencies = [
  "malachite",
  "v12-bccompiler",
  "v12-bytecode",
+ "v12-codegen",
  "v12-heap",
  "v12-interp",
  "v12-intl",
@@ -2399,6 +2418,7 @@ dependencies = [
  "cranelift-native",
  "target-lexicon",
  "v12-bytecode",
+ "v12-codegen",
  "v12-heap",
  "v12-interp",
 ]
@@ -2414,6 +2434,7 @@ dependencies = [
  "proptest",
  "target-lexicon",
  "v12-bytecode",
+ "v12-codegen",
  "v12-heap",
  "v12-interp",
  "v12-jit-baseline",

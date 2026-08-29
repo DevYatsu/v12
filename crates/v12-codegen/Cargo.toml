@@ -1,0 +1,12 @@
+[package]
+name = "v12-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared types and seams for the v12 JIT tiers (baseline + opt)"
+
+[dependencies]
+v12-bytecode.workspace = true
+v12-heap.workspace = true
+v12-interp.workspace = true

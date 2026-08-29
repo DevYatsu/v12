@@ -55,6 +55,8 @@ v12-bytecode = { path = "crates/v12-bytecode" }
 v12-heap = { path = "crates/v12-heap" }
 v12-bccompiler = { path = "crates/v12-bccompiler" }
 v12-interp = { path = "crates/v12-interp" }
+v12-codegen = { path = "crates/v12-codegen" }
+v12-api = { path = "crates/v12-api" }
 v12-jit-baseline = { path = "crates/v12-jit-baseline" }
 v12-jit-opt = { path = "crates/v12-jit-opt" }
 v12-regex = { path = "crates/v12-regex" }
