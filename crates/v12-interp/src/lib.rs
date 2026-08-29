@@ -287,6 +287,14 @@ struct Frame {
     yield_dst: Option<u16>,
 }
 
+/// Shared suspension helper for `SuspendYield` and `Await` — hides
+/// `properties[1]=resume_pc`, `properties[2]=done`, `properties[3]=yield_dst`,
+/// `elements=snapshot` slot contract. `Interp` is intentionally the owner of
+/// `Frame`/`SuspendYield` snapshot logic; `Engine` must not contain it.
+trait Suspendable {
+    fn suspend(&mut self, r#gen: Handle<JsObject>, resume_pc: usize, dst: u16, snapshot: Vec<JsValue>, env: Option<Handle<JsObject>>) -> Result<(), JSException>;
+}
+
 /// Decodes the instruction at `pc` into
 /// `(op, a, b, c, word_width, narrow_word)`.
 ///
@@ -1675,13 +1683,9 @@ impl Interp {
                     return Ok(CallOutcome::Value(v));
                 }
                 self.gc_protect();
-                let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+                let reactions = self.heap.alloc(JsObject::array(Vec::new()));
                 self.heap.add_root(JsValue::object(reactions));
-                let p = self.heap.alloc(JsObject {
-                    kind: HEAP_KIND_ORDINARY,
-                    properties: vec![JsValue::from_i32_smi(1).expect("fits"), v, JsValue::object(reactions)],
-                    ..JsObject::default()
-                });
+                let p = self.heap.alloc(JsObject::fulfilled_promise(v, reactions));
                 self.heap.add_root(JsValue::object(p));
                 return Ok(CallOutcome::Value(JsValue::object(p)));
             }
@@ -1691,13 +1695,9 @@ impl Interp {
                 let args_slice = self.stack[args_start..args_end].to_vec();
                 let v = args_slice.first().copied().unwrap_or(JsValue::undefined());
                 self.gc_protect();
-                let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+                let reactions = self.heap.alloc(JsObject::array(Vec::new()));
                 self.heap.add_root(JsValue::object(reactions));
-                let p = self.heap.alloc(JsObject {
-                    kind: HEAP_KIND_ORDINARY,
-                    properties: vec![JsValue::from_i32_smi(2).expect("fits"), v, JsValue::object(reactions)],
-                    ..JsObject::default()
-                });
+                let p = self.heap.alloc(JsObject::rejected_promise(v, reactions));
                 self.heap.add_root(JsValue::object(p));
                 return Ok(CallOutcome::Value(JsValue::object(p)));
             }
@@ -1739,14 +1739,12 @@ impl Interp {
         // program through every call site with no behavioural gain.
         if self.is_async_fn(target) {
             self.gc_protect();
-            let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+            // TODO: move to Engine via EnginePromise trait — Interp should call
+            // `heap.new_pending_promise()` / `Engine::new_async_promise()`.
+            // Kept here to avoid threading RetainedProgram through call site.
+            let reactions = self.heap.alloc(JsObject::array(Vec::new()));
             self.heap.add_root(JsValue::object(reactions));
-            let promise = self.heap.alloc(JsObject {
-                kind: HEAP_KIND_ORDINARY,
-                properties: vec![JsValue::from_i32_smi(0).expect("0 fits Smi"), JsValue::undefined(), JsValue::object(reactions)],
-                prototype: None,
-                ..JsObject::default()
-            });
+            let promise = self.heap.alloc(JsObject::pending_promise(reactions));
             self.heap.add_root(JsValue::object(promise));
             // Capture initial register window for deferred execution
             let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
@@ -1757,13 +1755,7 @@ impl Interp {
             window[0] = this_v;
             let arg_src = callee_slot + 2;
             self.fill_call_window(&mut window, arg_src, argc as usize, callee_has_rest, callee_fixed, callee_rest_reg);
-            let g = self.heap.alloc(JsObject {
-                kind: KIND_GENERATOR,
-                properties: vec![ ops::box_number(f64::from(target)), ops::box_number(0.0), ops::box_number(0.0), ops::box_number(0.0), JsValue::object(promise) ],
-                elements: window,
-                prototype: captured_env,
-                ..JsObject::default()
-            });
+            let g = self.heap.alloc(JsObject::generator_with(target, 0, 0.0, 0, window, captured_env, Some(JsValue::object(promise))));
             self.heap.add_root(JsValue::object(g));
             // Defer: enqueue resume at pc 0
             self.pending_awaits.push_back((g, JsValue::undefined(), false));

@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use v12_bytecode::FunctionBytecode;
 use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
+use v12_heap::HeapExt;
 use v12_interp::{Interp, JSException};
 
 use crate::builtins::{NativeRegistry, install_core};
@@ -76,6 +77,14 @@ impl Engine {
     /// Mutable access to the heap.
     pub fn heap_mut(&mut self) -> &mut Heap {
         &mut self.heap
+    }
+
+    /// Engine-owned helper for creating a pending Promise (delegates to `HeapExt`).
+    /// Interp should call this via `EnginePromise` trait rather than allocating
+    /// promise objects directly — hides `properties`/`property_keys` invariants.
+    pub fn new_async_promise(&mut self) -> v12_heap::Handle<JsObject> {
+        use v12_heap::HeapExt;
+        self.heap.alloc_pending_promise()
     }
 
     /// The engine's realm.

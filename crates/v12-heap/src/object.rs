@@ -158,7 +158,237 @@ impl JsObject {
         }
     }
 
+    /// Pending promise with `properties = [state=0, value=undefined, reactions]`.
+    pub fn pending_promise(reactions: crate::Handle<JsObject>) -> Self {
+        Self {
+            kind: KIND_ORDINARY,
+            properties: vec![
+                crate::JsValue::from_i32_smi(0).expect("0 fits"),
+                crate::JsValue::undefined(),
+                crate::JsValue::object(reactions),
+            ],
+            property_keys: vec![None; 3],
+            ..Self::default()
+        }
+    }
 
+    /// Fulfilled promise `properties = [1, value, reactions]`.
+    pub fn fulfilled_promise(value: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
+        Self {
+            kind: KIND_ORDINARY,
+            properties: vec![
+                crate::JsValue::from_i32_smi(1).expect("1 fits"),
+                value,
+                crate::JsValue::object(reactions),
+            ],
+            property_keys: vec![None; 3],
+            ..Self::default()
+        }
+    }
+
+    /// Rejected promise `properties = [2, reason, reactions]`.
+    pub fn rejected_promise(reason: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
+        Self {
+            kind: KIND_ORDINARY,
+            properties: vec![
+                crate::JsValue::from_i32_smi(2).expect("2 fits"),
+                reason,
+                crate::JsValue::object(reactions),
+            ],
+            property_keys: vec![None; 3],
+            ..Self::default()
+        }
+    }
+
+    /// Generator object with full slot contract.
+    /// properties[0]=fn_idx, [1]=resume_pc, [2]=done, [3]=yield_dst, [4]=async_promise?
+    pub fn generator_with(
+        fn_idx: u32,
+        resume_pc: u32,
+        done: f64,
+        yield_dst: u16,
+        window: Vec<crate::JsValue>,
+        env: Option<crate::Handle<JsObject>>,
+        async_promise: Option<crate::JsValue>,
+    ) -> Self {
+        let mut props = vec![
+            crate::JsValue::from_f64(f64::from(fn_idx)),
+            crate::JsValue::from_f64(f64::from(resume_pc)),
+            crate::JsValue::from_f64(done),
+            crate::JsValue::from_f64(f64::from(yield_dst)),
+        ];
+        if let Some(p) = async_promise {
+            props.push(p);
+        }
+        let prop_len = props.len();
+        Self {
+            kind: KIND_GENERATOR,
+            properties: props,
+            property_keys: vec![None; prop_len],
+            elements: window,
+            prototype: env,
+            ..Self::default()
+        }
+    }
+
+    /// Environment object with `slots` undefined slots.
+    pub fn environment(slots: usize, parent: Option<crate::Handle<JsObject>>) -> Self {
+        Self {
+            properties: vec![crate::JsValue::undefined(); slots],
+            property_keys: vec![None; slots],
+            prototype: parent,
+            ..Self::default()
+        }
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// Slot-hiding traits
+// ---------------------------------------------------------------------------
+
+/// Promise state discriminant stored in `properties[0]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+/// Generator suspension state hiding `properties[0..4]` slot contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GeneratorState {
+    pub fn_idx: u32,
+    pub resume_pc: u32,
+    /// 0.0 running, 1.0 done, 2.0 suspended
+    pub done_raw: u32,
+    pub yield_dst: u16,
+    pub done: bool,
+    pub suspended: bool,
+}
+
+/// Extension hiding Promise slot layout.
+pub trait PromiseExt {
+    fn promise_state(&self, heap: &crate::Heap) -> Option<PromiseState>;
+    fn promise_value(&self, heap: &crate::Heap) -> Option<crate::JsValue>;
+    fn settle_promise(&mut self, heap: &mut crate::Heap, state: PromiseState, value: crate::JsValue);
+}
+
+impl PromiseExt for crate::Handle<JsObject> {
+    fn promise_state(&self, heap: &crate::Heap) -> Option<PromiseState> {
+        let v = heap.get(*self).properties.get(0)?;
+        match v.as_smi() {
+            Some(0) => Some(PromiseState::Pending),
+            Some(1) => Some(PromiseState::Fulfilled),
+            Some(2) => Some(PromiseState::Rejected),
+            _ => None,
+        }
+    }
+    fn promise_value(&self, heap: &crate::Heap) -> Option<crate::JsValue> {
+        heap.get(*self).properties.get(1).copied()
+    }
+    fn settle_promise(&mut self, heap: &mut crate::Heap, state: PromiseState, value: crate::JsValue) {
+        let s = match state {
+            PromiseState::Pending => 0,
+            PromiseState::Fulfilled => 1,
+            PromiseState::Rejected => 2,
+        };
+        let o = heap.get_mut(*self);
+        if o.properties.len() >= 2 {
+            o.properties[0] = crate::JsValue::from_i32_smi(s).expect("fits");
+            o.properties[1] = value;
+        }
+    }
+}
+
+/// Extension hiding Generator slot layout.
+pub trait GeneratorExt {
+    fn generator_state(&self, heap: &crate::Heap) -> Option<GeneratorState>;
+    fn set_generator_state(&mut self, heap: &mut crate::Heap, s: GeneratorState);
+}
+
+impl GeneratorExt for crate::Handle<JsObject> {
+    fn generator_state(&self, heap: &crate::Heap) -> Option<GeneratorState> {
+        let o = heap.get(*self);
+        if o.kind != KIND_GENERATOR || o.properties.len() < 4 {
+            return None;
+        }
+        let fn_idx = o.properties[0].as_smi().unwrap_or(0) as u32;
+        let resume_pc = o.properties[1].as_smi().unwrap_or(o.properties[1].as_f64().unwrap_or(0.0) as i32) as u32;
+        // done is stored as f64
+        let done_f = o.properties[2].as_f64().unwrap_or(0.0);
+        let done_raw = done_f as u32;
+        let yield_dst = o.properties[3].as_f64().unwrap_or(0.0) as u16;
+        Some(GeneratorState {
+            fn_idx,
+            resume_pc,
+            done_raw,
+            yield_dst,
+            done: done_raw == 1,
+            suspended: done_raw == 2,
+        })
+    }
+    fn set_generator_state(&mut self, heap: &mut crate::Heap, s: GeneratorState) {
+        let o = heap.get_mut(*self);
+        if o.properties.len() >= 4 {
+            o.properties[0] = crate::JsValue::from_f64(f64::from(s.fn_idx));
+            o.properties[1] = crate::JsValue::from_f64(f64::from(s.resume_pc));
+            o.properties[2] = crate::JsValue::from_f64(f64::from(s.done_raw));
+            o.properties[3] = crate::JsValue::from_f64(f64::from(s.yield_dst));
+        }
+    }
+}
+
+/// Heap allocation helpers that hide `add_root` + `property_keys` invariants.
+pub trait HeapExt {
+    fn alloc_array(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
+    fn alloc_function(&mut self, idx: u32, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject>;
+    fn alloc_ordinary(&mut self, props: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
+    fn alloc_pending_promise(&mut self) -> crate::Handle<JsObject>;
+    fn alloc_array_with_roots(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject> { self.alloc_array(elements) }
+}
+
+impl HeapExt for crate::Heap {
+    #[must_use]
+    fn alloc_array(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject> {
+        let h = self.alloc(JsObject::array(elements));
+        self.add_root(crate::JsValue::object(h));
+        h
+    }
+    #[must_use]
+    fn alloc_function(&mut self, idx: u32, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject> {
+        let h = self.alloc(JsObject::function(idx, env));
+        self.add_root(crate::JsValue::object(h));
+        h
+    }
+    #[must_use]
+    fn alloc_ordinary(&mut self, props: Vec<crate::JsValue>) -> crate::Handle<JsObject> {
+        let n = props.len();
+        let h = self.alloc(JsObject::ordinary(props, vec![None; n]));
+        self.add_root(crate::JsValue::object(h));
+        h
+    }
+    #[must_use]
+    fn alloc_pending_promise(&mut self) -> crate::Handle<JsObject> {
+        let reactions = self.alloc(JsObject::array(Vec::new()));
+        self.add_root(crate::JsValue::object(reactions));
+        let h = self.alloc(JsObject::pending_promise(reactions));
+        self.add_root(crate::JsValue::object(h));
+        h
+    }
+}
+
+/// Engine-side promise allocation seam: Interp should call through this trait
+/// rather than `heap.alloc(JsObject{...})` directly. Provided for layering;
+/// Interp currently documents the TODO and calls `HeapExt::alloc_pending_promise`.
+pub trait EnginePromise {
+    fn new_pending_promise(&mut self) -> crate::Handle<JsObject>;
+}
+
+impl EnginePromise for crate::Heap {
+    fn new_pending_promise(&mut self) -> crate::Handle<JsObject> {
+        self.alloc_pending_promise()
+    }
 }
 /// A heap symbol. Identity *is* the handle for now; descriptions,
 /// well-known singletons, and `#private` names come with interning work.
