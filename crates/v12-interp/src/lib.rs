@@ -1348,7 +1348,8 @@ impl Interp {
                     // Keep stub for manual bytecode: create dormant generator capturing current frame state after this pc.
                     let dst = instr.a();
                     let src = instr.b();
-                    let func_idx = self.stack[base + usize::from(src)].as_smi().map(|v| v as u32).unwrap_or(fn_idx);
+                    // Bounds-checked: OOB stack read yields undefined (JS semantics for array OOB is undefined; for register window treat OOB as undefined rather than panic)
+                    let func_idx = self.stack.get(base + usize::from(src)).and_then(|v| v.as_smi()).map(|v| v as u32).unwrap_or(fn_idx);
                     self.gc_protect();
                     let h = self.heap.alloc(JsObject {
                         kind: KIND_GENERATOR,
@@ -1357,12 +1358,31 @@ impl Interp {
                             ops::box_number(f64::from((pc + op_width) as u32)),
                             ops::box_number(0.0),
                         ],
-                        elements: self.stack[base..base + usize::from(max_regs)].to_vec(),
+                        elements: {
+                            let end = base + usize::from(max_regs);
+                            if end <= self.stack.len() {
+                                self.stack[base..end].to_vec()
+                            } else if base <= self.stack.len() {
+                                // Pad with undefined up to requested window rather than panic (handler/wide op edge)
+                                let mut v = self.stack[base..].to_vec();
+                                v.resize(usize::from(max_regs), JsValue::undefined());
+                                v
+                            } else {
+                                vec![JsValue::undefined(); usize::from(max_regs) as usize]
+                            }
+                        },
                         prototype: self.frames.last().and_then(|f| f.env),
                         ..JsObject::default()
                     });
                     self.heap.add_root(JsValue::object(h));
-                    self.stack[base + usize::from(dst)] = JsValue::object(h);
+                    // Bounds-checked write: extend stack if needed rather than panic
+                    {
+                        let idx = base + usize::from(dst);
+                        if idx >= self.stack.len() {
+                            self.stack.resize(idx + 1, JsValue::undefined());
+                        }
+                        self.stack[idx] = JsValue::object(h);
+                    }
                     self.set_pc(pc + op_width);
                 }
                 Opcode::SuspendYield => {
@@ -1371,9 +1391,22 @@ impl Interp {
                     // (see crates/v12-bccompiler/src/expr.rs YieldExpression delegate path).
                     self.gc_protect();
                     let dst = instr.a();
-                    let yielded = self.stack[base + usize::from(dst)];
-                    let gen_obj = self.frames.last().expect("frame").generator.expect("yield outside generator");
-                    let snapshot = self.stack[base..base + usize::from(max_regs)].to_vec();
+                    let yielded = self.stack.get(base + usize::from(dst)).copied().unwrap_or(JsValue::undefined());
+                    let Some(gen_obj) = self.frames.last().and_then(|f| f.generator) else {
+                        return Err(JSException(self.error_value("SyntaxError: yield outside generator")));
+                    };
+                    let snapshot = {
+                        let end = base + usize::from(max_regs);
+                        if end <= self.stack.len() {
+                            self.stack[base..end].to_vec()
+                        } else if base <= self.stack.len() {
+                            let mut v = self.stack[base..].to_vec();
+                            v.resize(usize::from(max_regs), JsValue::undefined());
+                            v
+                        } else {
+                            vec![JsValue::undefined(); usize::from(max_regs) as usize]
+                        }
+                    };
                     let resume_pc = pc + op_width;
                     self.heap.get_mut(gen_obj).properties[1] = ops::box_number(resume_pc as f64);
                     if self.heap.get(gen_obj).properties.len() < 4 {
@@ -1392,9 +1425,26 @@ impl Interp {
                     self.gc_protect();
                     let src = instr.b();
                     let dst = instr.a();
-                    let arg = self.stack[base + usize::from(src)];
-                    let r#gen = self.frames.last().expect("frame").generator.expect("await outside async");
-                    let snapshot = self.stack[base..base + usize::from(max_regs)].to_vec();
+                    // Bounds-checked stack read: OOB array element is undefined in JS semantics
+                    let arg = self.stack.get(base + usize::from(src)).copied().unwrap_or(JsValue::undefined());
+                    let Some(frame) = self.frames.last() else {
+                        return Err(JSException(self.error_value("SyntaxError: await outside async")));
+                    };
+                    let Some(r#gen) = frame.generator else {
+                        return Err(JSException(self.error_value("SyntaxError: await outside async")));
+                    };
+                    let snapshot = {
+                        let end = base + usize::from(max_regs);
+                        if end <= self.stack.len() {
+                            self.stack[base..end].to_vec()
+                        } else if base <= self.stack.len() {
+                            let mut v = self.stack[base..].to_vec();
+                            v.resize(usize::from(max_regs), JsValue::undefined());
+                            v
+                        } else {
+                            vec![JsValue::undefined(); usize::from(max_regs) as usize]
+                        }
+                    };
                     let resume_pc = pc + op_width;
                     self.heap.get_mut(r#gen).properties[1] = ops::box_number(resume_pc as f64);
                     if self.heap.get(r#gen).properties.len() < 4 {
