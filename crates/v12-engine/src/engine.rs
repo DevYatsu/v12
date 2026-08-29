@@ -89,6 +89,27 @@ impl Engine {
         &mut self.jobs
     }
 
+    /// Creates a new array object with proper shape setup (length property + elements).
+    /// Mirrors the interpreter's NewArray opcode behavior.
+    pub fn create_array(&mut self, elements: Vec<JsValue>) -> JsValue {
+        use v12_heap::{Attrs, PropKey};
+        let len = elements.len() as f64;
+        let length_key = {
+            let h = self.heap.intern_string(V12Str::latin1(b"length".to_vec()));
+            PropKey::from_string(h)
+        };
+        let shape = self.heap.add_property(self.heap.root_shape(), length_key, Attrs::DEFAULT);
+        let h = self.heap.alloc(JsObject {
+            kind: v12_heap::KIND_ARRAY,
+            properties: vec![JsValue::from_f64(len)],
+            property_keys: vec![Some(length_key)],
+            elements,
+            ..Default::default()
+        });
+        crate::internal_methods::bind_shape_public(&mut self.heap, h, shape);
+        JsValue::object(h)
+    }
+
     /// Evaluates `source` as a script.
     ///
     /// On success returns the completion value (currently `undefined` for
@@ -147,6 +168,7 @@ impl Engine {
         // activate user functions; natives' follow-ups join the same drain.
         self.adopt_pending();
         let _ = self.jobs.drain(&mut interp, Rc::clone(&self.pending));
+        let _ = interp.run_jobs();
         self.adopt_pending();
         let heap = interp.into_heap();
         self.heap = heap;
@@ -366,9 +388,7 @@ impl Engine {
     /// Returns the number of jobs executed.
     pub fn run_jobs(&mut self) -> usize {
         self.adopt_pending();
-        if self.jobs.is_empty() {
-            return 0;
-        }
+        let has_jobs = !self.jobs.is_empty();
         let global = self.realm.global();
         let (functions, main, strings) = match &self.retained {
             Some(r) => (r.functions.clone(), r.main, r.strings.clone()),
@@ -377,8 +397,17 @@ impl Engine {
         let heap = std::mem::replace(&mut self.heap, Heap::new(GcPolicy::NoGC));
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(self.registry.clone()));
-        let count = self.jobs.drain(&mut interp, Rc::clone(&self.pending));
+        let mut count = 0;
+        if has_jobs {
+            count += self.jobs.drain(&mut interp, Rc::clone(&self.pending));
+        }
+        count += interp.run_jobs();
         self.adopt_pending();
+        // pending_awaits may have produced new JobQueue entries; drain once more
+        if !self.jobs.is_empty() {
+            count += self.jobs.drain(&mut interp, Rc::clone(&self.pending));
+            count += interp.run_jobs();
+        }
         self.heap = interp.into_heap();
         count
     }
