@@ -67,10 +67,10 @@ use std::collections::HashSet;
 
 use v12_bytecode::{Const, FunctionBytecode, Instr, Opcode, WideOp};
 use v12_heap::{
-    Attrs, Descriptor, GcPolicy, Handle, Heap, HeapExt, JsObject, JsValue,
+    Attrs, Descriptor, Handle, Heap, HeapExt, JsObject, JsValue,
     KIND_ARGUMENTS as HEAP_KIND_ARGUMENTS, KIND_ARRAY as HEAP_KIND_ARRAY,
     KIND_FUNCTION as HEAP_KIND_FUNCTION, KIND_GENERATOR as HEAP_KIND_GENERATOR,
-    KIND_ORDINARY as HEAP_KIND_ORDINARY, PropKey, ShapeHandle, V12Str,
+    PropKey, ShapeHandle, V12Str,
 };
 
 use crate::feedback::{FeedbackVector, Lattice, MonoIc, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
@@ -285,6 +285,11 @@ struct Frame {
     /// Associated generator object when this frame is a generator activation.
     generator: Option<Handle<JsObject>>,
     /// Destination register of the SuspendYield that suspended this frame (for resume value delivery).
+    /// Currently written but not read: the resume path reads the
+    /// destination from the generator object's slot directly, leaving
+    /// this field as a forward-compatibility hook. Suppress the
+    /// `dead_code` warning so the build stays clean.
+    #[allow(dead_code)]
     yield_dst: Option<u16>,
 }
 
@@ -402,12 +407,12 @@ fn decode_parked_call(instrs: &[Instr], pc: usize) -> (bool, u16, usize) {
 /// function table, the entry index, and the string table that
 /// `Const::Str32` ids resolve through (as produced by
 /// `v12_bccompiler::compile_source_with_strings`).
-pub struct Interp {
+pub struct Interp<'a> {
     functions: std::sync::Arc<[FunctionBytecode]>,
     main: u32,
     /// Compiler string table: `Const::Str32` ids resolve through this.
     strings: std::sync::Arc<[String]>,
-    heap: Heap,
+    heap: &'a mut Heap,
 
     /// Interned heap string per `Str32` constant id, filled lazily.
     const_strings: std::collections::HashMap<u32, Handle<V12Str>>,
@@ -422,8 +427,6 @@ pub struct Interp {
     /// Shape indexes already pinned via `add_shape_root` (pinning is
     /// idempotent-averse: repeated pins would grow the root vector forever).
     pinned_shapes: HashSet<u32>,
-    /// Object shape association keyed by validity-cell id; see crate docs.
-    shape_of_cell: std::collections::HashMap<u32, ShapeHandle>,
 
     /// The one contiguous value stack; frames window slices of it.
     stack: Vec<JsValue>,
@@ -467,10 +470,14 @@ pub struct Interp {
     pending_awaits: std::collections::VecDeque<(Handle<JsObject>, JsValue, bool)>,
 }
 
-impl Interp {
+impl<'a> Interp<'a> {
     /// Builds an interpreter over `program`, resolving `Const::Str32` ids
     /// against `strings` (as produced by
     /// `v12_bccompiler::compile_source_with_strings`).
+    ///
+    /// ADR-003: the interpreter borrows `heap` for its whole lifetime — the
+    /// caller (the engine) owns the heap and keeps it valid. `Interp` never
+    /// allocates or reclaims a heap of its own.
     ///
     /// Top-level code addresses globals through `GetGlobal`/`SetGlobal`, so a
     /// global object must exist even when no embedder provides one: without an
@@ -478,8 +485,12 @@ impl Interp {
     /// and rooted here. It carries the `GLOBAL_VAR_OFFSET` leading intrinsic
     /// slots (all `undefined` outside a realm) so shared `GetGlobal` fast
     /// paths stay in bounds.
-    pub fn new(functions: Vec<FunctionBytecode>, main: u32, strings: Vec<String>) -> Self {
-        let mut heap = Heap::new(GcPolicy::default());
+    pub fn new(
+        heap: &'a mut Heap,
+        functions: Vec<FunctionBytecode>,
+        main: u32,
+        strings: Vec<String>,
+    ) -> Self {
         heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
         let mut interp = Self {
             functions: std::sync::Arc::from(functions.into_boxed_slice()),
@@ -492,7 +503,6 @@ impl Interp {
             prototype_key: None,
             length_shape: None,
             pinned_shapes: HashSet::new(),
-            shape_of_cell: std::collections::HashMap::new(),
             stack: Vec::with_capacity(INITIAL_STACK_CAPACITY),
             frames: Vec::new(),
             natives: Box::new(EmptyNativeRegistry),
@@ -519,9 +529,20 @@ impl Interp {
 
     /// Convenience constructor: compiles `source` and resolves its string
     /// table in one step.
-    pub fn from_source(source: &str) -> Result<Self, v12_bccompiler::CompileError> {
+    ///
+    /// ADR-001: this is retained for the test suite and as a thin shim — the
+    /// interpreter itself no longer depends on the front-end, so the shim
+    /// is feature-gated on `compiler` (always on for tests via
+    /// `[dev-dependencies] v12-bccompiler`). Production embedders should
+    /// call [`v12_engine::Engine::eval`] (which builds an `Interp` from a
+    /// compiled `Program`).
+    #[cfg(feature = "compiler")]
+    pub fn from_source(
+        heap: &'a mut Heap,
+        source: &str,
+    ) -> Result<Interp<'a>, v12_bccompiler::CompileError> {
         let (program, strings) = v12_bccompiler::compile_source_with_strings(source)?;
-        Ok(Self::new(program.functions, program.main, strings))
+        Ok(Self::new(heap, program.functions, program.main, strings))
     }
 
     /// Installs a native-function seam, replacing any previous registry.
@@ -544,48 +565,18 @@ impl Interp {
     /// The caller must ensure `global` (if any) is allocated in `heap` and
     /// rooted. When `global` is `None`, a private default global is allocated
     /// and rooted in `heap` (see [`Self::new`]).
+    ///
+    /// ADR-003: takes `&mut Heap` (borrowed, not owned) — the caller keeps
+    /// ownership for the interpreter's whole lifetime.
     pub fn new_with_heap(
-        heap: Heap,
+        heap: &'a mut Heap,
         global: Option<Handle<JsObject>>,
         functions: Vec<FunctionBytecode>,
         main: u32,
         strings: Vec<String>,
     ) -> Self {
-        let mut heap = heap;
-        heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
-        let mut interp = Self {
-            functions: std::sync::Arc::from(functions.into_boxed_slice()),
-            main,
-            strings: std::sync::Arc::from(strings.into_boxed_slice()),
-            heap,
-            const_strings: std::collections::HashMap::new(),
-            typeof_names: [const { None }; TYPE_NAME_COUNT],
-            length_key: None,
-            prototype_key: None,
-            length_shape: None,
-            pinned_shapes: HashSet::new(),
-            shape_of_cell: std::collections::HashMap::new(),
-            stack: Vec::with_capacity(INITIAL_STACK_CAPACITY),
-            frames: Vec::new(),
-            natives: Box::new(EmptyNativeRegistry),
-            hooks: Box::new(()),
-            feedback: std::collections::HashMap::new(),
-            tier_up_pending: Vec::new(),
-            global,
-            console_log: None,
-            promise_resolve_fn: None,
-            promise_reject_fn: None,
-            promise_then_fn: None,
-            array_push_fn: None,
-            array_join_fn: None,
-            enumerable_own_keys_fn: None,
-            generator_next_fn: None,
-            generator_return_fn: None,
-            generator_throw_fn: None,
-            top_result: None,
-            pending_awaits: std::collections::VecDeque::new(),
-        };
-        interp.ensure_default_global();
+        let mut interp = Self::new(heap, functions, main, strings);
+        interp.global = global;
         interp
     }
 
@@ -598,10 +589,7 @@ impl Interp {
         if self.global.is_some() {
             return;
         }
-        let g = self.heap.alloc(JsObject {
-            properties: vec![JsValue::undefined(); GLOBAL_VAR_OFFSET],
-            ..JsObject::default()
-        });
+        let g = self.heap.alloc(JsObject::environment(GLOBAL_VAR_OFFSET, None));
         self.heap.add_root(JsValue::object(g));
         // Minimal Promise wiring for standalone interp tests (mirrors realm.rs)
         let promise_proto = self.heap.alloc(JsObject::default());
@@ -617,19 +605,14 @@ impl Interp {
         self.global = Some(g);
     }
 
-    /// Consumes the interpreter and returns its heap.
-    pub fn into_heap(self) -> Heap {
-        self.heap
-    }
-
     /// Mutable heap access for embedders that share the heap.
     pub fn heap_mut(&mut self) -> &mut Heap {
-        &mut self.heap
+        &mut *self.heap
     }
 
     /// Read-only view of the underlying heap.
     pub fn heap(&self) -> &Heap {
-        &self.heap
+        self.heap
     }
 
     #[cfg(test)]
@@ -691,7 +674,10 @@ impl Interp {
     /// Runs the top-level script to completion.
     ///
     /// `Ok(())` on normal completion; [`Err(JSException)`] when a thrown
-    /// value escaped every handler.
+    /// value escaped every handler. The completion value (last evaluated
+    /// expression statement, or `undefined` for empty scripts) is exposed
+    /// via [`Self::completion_value`] — ADR-004 surface so embedders can
+    /// surface `eval("1+1")` → `2` instead of hard-coding `undefined`.
     pub fn run(&mut self) -> Result<(), JSException> {
         let main_regs =
             self.functions[usize::try_from(self.main).expect("function index fits usize")].max_regs;
@@ -712,6 +698,18 @@ impl Interp {
         self.execute()
     }
 
+    /// The script's actual completion value (ADR-004).
+    ///
+    /// `None` until the interpreter has run a top-level script; `Some(v)` is
+    /// the value the script's main function returned, or `undefined` if it
+    /// never reached an `ExpressionStatement` whose result was captured.
+    /// Cleared by every new `run()` / `run_jobs()` so embedders cannot
+    /// observe stale data.
+    #[must_use]
+    pub fn completion_value(&self) -> Option<JsValue> {
+        self.top_result
+    }
+
     /// Calls a function by bytecode/native index from outside the machine.
     ///
     /// Host-driven activation seam (Promise reaction jobs, embedder calls):
@@ -726,12 +724,7 @@ impl Interp {
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
         self.gc_protect();
-        let callee = self.heap.alloc(JsObject {
-            kind: KIND_FUNCTION,
-            elements: vec![JsValue::from_i32_smi(fn_idx as i32)
-                .expect("function index fits Smi")],
-            ..JsObject::default()
-        });
+        let callee = self.heap.alloc(JsObject::function(fn_idx, None));
         self.call_object(callee, this, args)
     }
 
@@ -909,12 +902,7 @@ impl Interp {
                         } => {
                             self.gc_protect();
                             let env = self.frames.last().expect("frame").env;
-                            let h = self.heap.alloc(JsObject {
-                                kind: KIND_FUNCTION,
-                                elements: vec![ops::box_number(f64::from(function_index))],
-                                prototype: env,
-                                ..JsObject::default()
-                            });
+                            let h = self.heap.alloc(JsObject::function(function_index.into(), env));
                             self.stack[base + usize::from(dst)] = JsValue::object(h);
                         }
                         WideOp::NewEnvironmentW { depth: _, slots } => {
@@ -923,11 +911,7 @@ impl Interp {
                             // slot count matters here, matching the narrow op.
                             self.gc_protect();
                             let parent = self.frames.last().expect("frame").env;
-                            let h = self.heap.alloc(JsObject {
-                                properties: vec![JsValue::undefined(); usize::from(slots)],
-                                prototype: parent,
-                                ..JsObject::default()
-                            });
+                            let h = self.heap.alloc(JsObject::environment(usize::from(slots), parent));
                             self.frames.last_mut().expect("frame").env = Some(h);
                         }
                         WideOp::CopyObjectRestW {
@@ -1222,12 +1206,7 @@ impl Interp {
                     self.gc_protect();
                     let elements = self.stack[first..first + len].to_vec();
                     let shape = self.array_shape();
-                    let h = self.heap.alloc(JsObject {
-                        kind: KIND_ARRAY,
-                        properties: vec![ops::box_number(f64::from(len as u32))],
-                        elements,
-                        ..JsObject::default()
-                    });
+                    let h = self.heap.alloc(JsObject::array(elements));
                     // Publish the shape onto the fresh object before anything
                     // else can allocate (the shape is pinned in
                     // `array_shape`, satisfying the allocation contract).
@@ -1238,12 +1217,7 @@ impl Interp {
                 Opcode::Closure => {
                     self.gc_protect();
                     let env = self.frames.last().expect("frame").env;
-                    let h = self.heap.alloc(JsObject {
-                        kind: KIND_FUNCTION,
-                        elements: vec![ops::box_number(f64::from(rb))],
-                        prototype: env,
-                        ..JsObject::default()
-                    });
+                    let h = self.heap.alloc(JsObject::function(rb.into(), env));
                     self.stack[base + usize::from(ra)] = JsValue::object(h);
                     self.set_pc(pc + op_width);
                 }
@@ -1257,11 +1231,7 @@ impl Interp {
                     // so aliased environments cannot collide with user global
                     // properties that occupy the same physical storage.
                     let parent = self.frames.last().expect("frame").env;
-                    let h = self.heap.alloc(JsObject {
-                        properties: vec![JsValue::undefined(); slots],
-                        prototype: parent,
-                        ..JsObject::default()
-                    });
+                    let h = self.heap.alloc(JsObject::environment(slots, parent));
                     self.frames.last_mut().expect("frame").env = Some(h);
                     self.set_pc(pc + op_width);
                 }
@@ -1374,7 +1344,7 @@ impl Interp {
                                 v.resize(usize::from(max_regs), JsValue::undefined());
                                 v
                             } else {
-                                vec![JsValue::undefined(); usize::from(max_regs) as usize]
+                                vec![JsValue::undefined(); usize::from(max_regs)]
                             }
                         },
                         prototype: self.frames.last().and_then(|f| f.env),
@@ -1784,23 +1754,24 @@ impl Interp {
                 // ensure caller gets the promise
                 if let Some(caller) = self.frames.last_mut() {
                     let pc = caller.pc;
-                    if let Some(&instr) = self.functions[caller.fn_idx as usize].instrs.get(pc) {
-                        if instr.op() == Some(v12_bytecode::Opcode::Call) || instr.op() == Some(v12_bytecode::Opcode::Wide) {
-                            let instrs = &self.functions[caller.fn_idx as usize].instrs;
-                            if let Some(ph) = self.heap.get(r#gen).properties.get(4).copied() {
-                                let try_decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_parked_call(instrs, pc)));
-                                if let Ok((_, dst, width)) = try_decode {
-                                    let caller_base = caller.base;
-                                    let idx = caller_base + usize::from(dst);
-                                    let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
-                                    if is_undef {
-                                        if idx >= self.stack.len() {
-                                            self.stack.resize(idx + 1, JsValue::undefined());
-                                        }
-                                        self.stack[idx] = ph;
-                                        caller.pc += width;
-                                        return Ok(false);
+                    if let Some(&instr) = self.functions[caller.fn_idx as usize].instrs.get(pc)
+                        && (instr.op() == Some(v12_bytecode::Opcode::Call)
+                            || instr.op() == Some(v12_bytecode::Opcode::Wide))
+                    {
+                        let instrs = &self.functions[caller.fn_idx as usize].instrs;
+                        if let Some(ph) = self.heap.get(r#gen).properties.get(4).copied() {
+                            let try_decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_parked_call(instrs, pc)));
+                            if let Ok((_, dst, width)) = try_decode {
+                                let caller_base = caller.base;
+                                let idx = caller_base + usize::from(dst);
+                                let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
+                                if is_undef {
+                                    if idx >= self.stack.len() {
+                                        self.stack.resize(idx + 1, JsValue::undefined());
                                     }
+                                    self.stack[idx] = ph;
+                                    caller.pc += width;
+                                    return Ok(false);
                                 }
                             }
                         }
@@ -1840,12 +1811,12 @@ impl Interp {
             return Err(JSException(self.error_value("TypeError: corrupt call header")));
         };
         let idx = caller_base + usize::from(dst);
-        // Only deliver if destination still holds undefined (caller hasn't been resumed elsewhere)
-        let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
-        if !is_undef {
-            self.stack.truncate(finished.base);
-            return Ok(false);
-        }
+        // The caller was parked on its `Call`/`Construct` and the destination
+        // register still holds the callee the compiler deposited (or, for a
+        // `new`, the freshly allocated instance). The result of the call
+        // arrives here via `complete_frame`; always deliver it and advance
+        // the caller's pc by `width` (the Call/Construct word width, or the
+        // full RegExt-prefixed width for wide calls).
         let result = if is_construct && result.as_object().is_none() && !result.is_hole() {
             // Callee frame still intact at this point (truncation happens
             // below), so its `this` register — the constructed instance.
@@ -1965,22 +1936,16 @@ impl Interp {
     // Property access
     // ------------------------------------------------------------------
 
-    /// The shape describing `obj`: looked up by the object's validity cell,
-    /// defaulting to the pinned empty-object root.
+    /// The shape describing `obj`: looked up via [`Heap::shape_of_mut`],
+    /// defaulting to the pinned empty-object root. ADR-002: the table lives
+    /// inside the heap, so this is a one-line delegation.
     fn shape_of(&mut self, obj: Handle<JsObject>) -> ShapeHandle {
-        let cell = self.heap.validity_cell_of(obj);
-        self.shape_of_cell
-            .get(&cell.0)
-            .copied()
-            .unwrap_or_else(|| self.heap.root_shape())
+        self.heap.shape_of_mut(obj)
     }
 
-    /// Records `obj`'s shape. Pinning happened (or happens) via
-    /// [`Self::pin_shape`]; this only binds the association.
+    /// Records `obj`'s shape. Pinning happens inside [`Heap::bind_shape`].
     pub(crate) fn bind_shape(&mut self, obj: Handle<JsObject>, shape: ShapeHandle) {
-        self.pin_shape(shape);
-        let cell = self.heap.validity_cell_of(obj);
-        self.shape_of_cell.insert(cell.0, shape);
+        self.heap.bind_shape(obj, shape);
     }
 
     /// Anchors `shape` against collection exactly once. Transition edges are
@@ -2088,13 +2053,7 @@ impl Interp {
             return cached;
         }
         self.gc_protect();
-        let func = self.heap.alloc(JsObject {
-            kind: KIND_FUNCTION,
-            elements: vec![
-                JsValue::from_i32_smi(NATIVE_CONSOLE_LOG as i32).expect("native index fits Smi"),
-            ],
-            ..JsObject::default()
-        });
+        let func = self.heap.alloc(JsObject::function(NATIVE_CONSOLE_LOG, None));
         let value = JsValue::object(func);
         self.heap.add_root(value);
         self.console_log = Some(value);
@@ -2136,11 +2095,7 @@ impl Interp {
             return cached;
         }
         self.gc_protect();
-        let func = self.heap.alloc(JsObject {
-            kind: KIND_FUNCTION,
-            elements: vec![JsValue::from_i32_smi(index as i32).expect("native index fits Smi")],
-            ..JsObject::default()
-        });
+        let func = self.heap.alloc(JsObject::function(index, None));
         let value = JsValue::object(func);
         self.heap.add_root(value);
         match which {
@@ -2177,7 +2132,7 @@ impl Interp {
         // property and keeps `Realm` free of interpreter shape bookkeeping.
         let console_obj_opt = if let Some(g) = self.global {
             let val_opt = {
-                let heap = &self.heap;
+                let heap = &*self.heap;
                 heap.get(g).properties.get(12).copied()
             };
             val_opt.and_then(|v| v.as_object())
@@ -2215,7 +2170,7 @@ impl Interp {
         // - `push` / `join` on array-kind objects.
         if let Some(g) = self.global {
             let promise_ctor = {
-                let heap = &self.heap;
+                let heap = &*self.heap;
                 heap.get(g).properties.get(10).and_then(|v| v.as_object())
             };
             if let Some(promise_ctor) = promise_ctor {
@@ -2234,11 +2189,12 @@ impl Interp {
                 }
             }
             // Fast path for Object.enumerableOwnKeys on the Object constructor
-            let object_ctor = self.heap.get(g).properties.get(0).and_then(|v| v.as_object());
-            if let Some(object_ctor) = object_ctor {
-                if obj == object_ctor && self.key_is(key_v, "enumerableOwnKeys") {
-                    return Ok(self.cached_native(NativeFn::EnumerableOwnKeys));
-                }
+            let object_ctor = self.heap.get(g).properties.first().and_then(|v| v.as_object());
+            if let Some(object_ctor) = object_ctor
+                && obj == object_ctor
+                && self.key_is(key_v, "enumerableOwnKeys")
+            {
+                return Ok(self.cached_native(NativeFn::EnumerableOwnKeys));
             }
         }
         if self.heap.get(obj).kind == KIND_GENERATOR {
@@ -2688,15 +2644,9 @@ impl Interp {
         } else {
             self.heap.get(src_obj).elements[start_usize..].to_vec()
         };
-        let new_len = slice.len() as u32;
         self.gc_protect();
         let shape = self.array_shape();
-        let h = self.heap.alloc(JsObject {
-            kind: KIND_ARRAY,
-            properties: vec![ops::box_number(f64::from(new_len))],
-            elements: slice,
-            ..JsObject::default()
-        });
+        let h = self.heap.alloc(JsObject::array(slice));
         self.bind_shape(h, shape);
         // Elements may contain holes; they are preserved as hole values.
         Ok(JsValue::object(h))
@@ -3077,15 +3027,9 @@ impl Interp {
             } else {
                 Vec::new()
             };
-            let rest_len = rest_slice.len() as u32;
             self.gc_protect();
             let shape = self.array_shape();
-            let h = self.heap.alloc(JsObject {
-                kind: KIND_ARRAY,
-                properties: vec![ops::box_number(f64::from(rest_len))],
-                elements: rest_slice,
-                ..JsObject::default()
-            });
+            let h = self.heap.alloc(JsObject::array(rest_slice));
             self.bind_shape(h, shape);
             self.stack[new_base + rest_reg] = JsValue::object(h);
             // Ensure any param registers beyond fixed+rest remain undefined (already).
@@ -3191,10 +3135,7 @@ impl Interp {
                 // (host-created) that lack the spec-mandated property.
                 self.gc_protect();
                 let key_handle = intern_text(&mut self.heap, "prototype");
-                let p = self.heap.alloc(JsObject {
-                    kind: HEAP_KIND_ORDINARY,
-                    ..JsObject::default()
-                });
+                let p = self.heap.alloc(JsObject::default());
                 // Untracked until `set_property` stores it behind the callee;
                 // that path allocates, so root it for the duration.
                 let p_val = JsValue::object(p);
@@ -3219,11 +3160,7 @@ impl Interp {
         // Allocate the instance with [[Prototype]] linking, then push the
         // frame with `this` = instance.
         self.gc_protect();
-        let instance = self.heap.alloc(JsObject {
-            kind: HEAP_KIND_ORDINARY,
-            prototype: Some(proto),
-            ..JsObject::default()
-        });
+        let instance = self.heap.alloc(JsObject::environment(0, Some(proto)));
         let instance_v = JsValue::object(instance);
 
         let target_u32 = u32::try_from(idx).expect("checked non-negative");
@@ -3255,12 +3192,7 @@ impl Interp {
             };
             self.gc_protect();
             let shape = self.array_shape();
-            let h = self.heap.alloc(JsObject {
-                kind: KIND_ARRAY,
-                properties: vec![ops::box_number(f64::from(rest_len as u32))],
-                elements: rest_slice,
-                ..JsObject::default()
-            });
+            let h = self.heap.alloc(JsObject::array(rest_slice));
             self.bind_shape(h, shape);
             if rest_reg < usize::from(callee_max_regs) {
                 self.stack[new_base + rest_reg] = JsValue::object(h);
@@ -3364,6 +3296,7 @@ impl Interp {
     /// Allocates an array object for a rest parameter from `elements`. Centralises
     /// the `array_shape` + `KIND_ARRAY` + `bind_shape` sequence (finding #4).
     /// Delegates to `call::alloc_rest_array` for DRY.
+    #[allow(dead_code)]
     fn alloc_rest_array(&mut self, elements: Vec<JsValue>) -> JsValue {
         crate::call::alloc_rest_array(self, elements)
     }
@@ -3408,18 +3341,7 @@ impl Interp {
         self.fill_call_window(&mut window, arg_src, argc as usize, has_rest, fixed, rest_reg);
         // Real suspension: store initial register window snapshot, not eager yields.
         self.gc_protect();
-        let r#gen = self.heap.alloc(JsObject {
-            kind: KIND_GENERATOR,
-            properties: vec![
-                ops::box_number(f64::from(fn_idx)),
-                ops::box_number(0.0), // resume pc
-                ops::box_number(0.0), // done flag
-                ops::box_number(0.0), // yield_dst
-            ],
-            elements: window,
-            prototype: captured_env,
-            ..JsObject::default()
-        });
+        let r#gen = self.heap.alloc(JsObject::generator_with(fn_idx, 0, 0.0, 0, window, captured_env, None));
         self.heap.add_root(JsValue::object(r#gen));
         Ok(r#gen)
     }
@@ -3444,9 +3366,7 @@ impl Interp {
         let window_end = new_base + usize::from(f_max_regs);
         self.stack.resize(window_end, JsValue::undefined());
         let copy_len = snapshot.len().min(usize::from(f_max_regs));
-        for i in 0..copy_len {
-            self.stack[new_base + i] = snapshot[i];
-        }
+        self.stack[new_base..new_base + copy_len].copy_from_slice(&snapshot[..copy_len]);
         // If resuming (resume_pc != 0), feed arg into yield_dst register
         if resume_pc != 0 {
             let yield_dst = self.heap.get(r#gen).properties.get(3).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as u16;
@@ -3474,13 +3394,13 @@ impl Interp {
                 let done_val = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64))).unwrap_or(0.0);
                 if done_val == 2.0 && self.frames.len() < frames_before {
                     let yielded = self.top_result.take().unwrap_or(JsValue::undefined());
-                    return Ok(self.make_iterator_result(yielded, false));
+                    Ok(self.make_iterator_result(yielded, false))
                 } else {
                     let ret = self.top_result.take().unwrap_or(JsValue::undefined());
                     if done_val != 1.0 && self.heap.get(r#gen).properties.len() >= 3 {
                         self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
                     }
-                    return Ok(self.make_iterator_result(ret, true));
+                    Ok(self.make_iterator_result(ret, true))
                 }
             }
             Err(e) => {
@@ -3492,7 +3412,7 @@ impl Interp {
                 if self.heap.get(r#gen).properties.len() >= 3 {
                     self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
                 }
-                return Err(e);
+                Err(e)
             }
         }
     }
@@ -3587,10 +3507,10 @@ impl Interp {
         // Sync length if shape exists
         let key = self.length_key();
         let shape = self.shape_of(obj);
-        if let Some(desc) = self.heap.lookup_property(shape, key).and_then(|d| d.slot().map(|s| s as usize)) {
-            if desc < self.heap.get(obj).properties.len() {
-                self.heap.get_mut(obj).properties[desc] = ops::box_number(f64::from(new_len));
-            }
+        if let Some(desc) = self.heap.lookup_property(shape, key).and_then(|d| d.slot().map(|s| s as usize))
+            && desc < self.heap.get(obj).properties.len()
+        {
+            self.heap.get_mut(obj).properties[desc] = ops::box_number(f64::from(new_len));
         }
         Ok(ops::box_number(f64::from(new_len)))
     }
@@ -3617,17 +3537,14 @@ impl Interp {
         }
         // Create fulfilled promise for non-promise arg
         self.gc_protect();
-        let reactions = self.heap.alloc(JsObject { kind: v12_heap::KIND_ARRAY, ..JsObject::default() });
+        let reactions = self.heap.alloc(JsObject::array(Vec::new()));
         self.heap.add_root(JsValue::object(reactions));
-        let promise = self.heap.alloc(JsObject {
-            kind: HEAP_KIND_ORDINARY,
-            properties: vec![JsValue::from_i32_smi(1).expect("fits"), v, JsValue::object(reactions)],
-            ..JsObject::default()
-        });
+        let promise = self.heap.alloc(JsObject::fulfilled_promise(v, reactions));
         self.heap.add_root(JsValue::object(promise));
         (JsValue::object(promise), false, v)
     }
 
+    #[allow(dead_code)]
     fn try_unwrap_promise(&self, v: JsValue) -> Option<JsValue> {
         let obj = v.as_object()?;
         let p = self.heap.get(obj);
@@ -3649,9 +3566,7 @@ impl Interp {
         let new_base = self.stack.len();
         self.stack.resize(new_base + usize::from(f_max_regs), JsValue::undefined());
         let copy_len = snapshot.len().min(usize::from(f_max_regs));
-        for i in 0..copy_len {
-            self.stack[new_base + i] = snapshot[i];
-        }
+        self.stack[new_base..new_base + copy_len].copy_from_slice(&snapshot[..copy_len]);
         let yield_dst = self.heap.get(r#gen).properties.get(3).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) as u16;
         if (yield_dst as usize) < usize::from(f_max_regs) {
             self.stack[new_base + usize::from(yield_dst)] = value;
@@ -3671,9 +3586,7 @@ impl Interp {
         let new_base = self.stack.len();
         self.stack.resize(new_base + usize::from(f_max_regs), JsValue::undefined());
         let copy_len = snapshot.len().min(usize::from(f_max_regs));
-        for i in 0..copy_len {
-            self.stack[new_base + i] = snapshot[i];
-        }
+        self.stack[new_base..new_base + copy_len].copy_from_slice(&snapshot[..copy_len]);
         self.frames.push(Frame { fn_idx, pc: resume_pc, base: new_base, max_regs: f_max_regs, env, generator: Some(r#gen), yield_dst: None });
         self.top_result = None;
         // Inject exception via unwind then execute

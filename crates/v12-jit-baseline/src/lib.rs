@@ -55,7 +55,8 @@ mod tests {
         let last = fb.instrs.len() - 1;
         let ret_reg = fb.instrs[last].a();
         fb.instrs[last] = Instr::new(Opcode::Throw, ret_reg, 0, 0);
-        let mut interp = v12_interp::Interp::new(vec![fb], 0, Vec::new());
+        let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+        let mut interp = v12_interp::Interp::new(&mut heap, vec![fb], 0, Vec::new());
         match interp.run() {
             Err(e) => e.0,
             Ok(()) => panic!("interp did not throw"),
@@ -415,7 +416,8 @@ mod tests {
         // Baseline fast path does not yet implement `TypeOf`; this test documents
         // that interp correctly reports "object" for null via the same bytecode
         // that the JIT would later lower.
-        let mut interp = v12_interp::Interp::from_source("throw typeof null;").expect("compiles");
+        let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+        let mut interp = v12_interp::Interp::from_source(&mut heap, "throw typeof null;").expect("compiles");
         let thrown = match interp.run() {
             Err(e) => e.0,
             Ok(()) => panic!("expected throw"),

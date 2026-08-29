@@ -4,7 +4,7 @@
 //! `tests/differential.rs` covers compiled Tier-1 programs end to end.
 
 use v12_bytecode::{Const, ConstantPool, FunctionBytecode, HandlerRange, Instr, Opcode, WideOp};
-use v12_heap::{Heap, JsValue};
+use v12_heap::{GcPolicy, Heap, JsValue};
 
 use test_support::*;
 use crate::{Interp, JSException, NativeRegistry};
@@ -15,15 +15,15 @@ use crate::{Interp, JSException, NativeRegistry};
 // unit. It only crosses the boundary via `v12_heap::JsValue` (unified), which
 // is why `eval_thrown` and `fn_with_instrs` can be shared.
 /// Runs `interp`, expecting an uncaught throw; returns the thrown value.
-fn expect_throw(interp: &mut Interp) -> JsValue {
+fn expect_throw(interp: &mut Interp<'_>) -> JsValue {
     match interp.run() {
         Err(JSException(v)) => v,
         Ok(()) => panic!("expected an uncaught exception"),
     }
 }
 
-fn program_of(main: FunctionBytecode) -> Interp {
-    Interp::new(vec![main], 0, Vec::new())
+fn program_of(heap: &mut Heap, main: FunctionBytecode) -> Interp<'_> {
+    Interp::new(heap, vec![main], 0, Vec::new())
 }
 
 #[test]
@@ -59,7 +59,8 @@ fn wide_operands_execute_with_documented_layouts() {
     instrs.push(Instr::new(Opcode::Add, 4, 1, 3));
     instrs.push(Instr::new(Opcode::Throw, 4, 0, 0));
 
-    let mut interp = program_of(fn_with_instrs(5, instrs, pool));
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = program_of(&mut heap, fn_with_instrs(5, instrs, pool));
     let thrown = expect_throw(&mut interp);
     assert_eq!(thrown.as_smi(), Some(1300));
 }
@@ -79,19 +80,22 @@ fn handler_delivery_lands_in_register_stack_depth() {
         target: 1,
         stack_depth: 0,
     });
-    let mut interp = program_of(fb);
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = program_of(&mut heap, fb);
     interp.run().expect("handler absorbs the throw");
 }
 
 #[test]
 fn falling_off_the_end_completes_normally() {
-    let mut interp = Interp::from_source("let x = 1;").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "let x = 1;").expect("compiles");
     interp.run().expect("implicit undefined completion");
 }
 
 #[test]
 fn runaway_recursion_surfaces_range_error() {
-    let mut interp = Interp::from_source("function f() { return f(); } f();").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "function f() { return f(); } f();").expect("compiles");
     let thrown = expect_throw(&mut interp);
     let msg = interp.to_display_string(thrown);
     assert!(msg.starts_with("RangeError:"), "{msg}");
@@ -99,7 +103,9 @@ fn runaway_recursion_surfaces_range_error() {
 
 #[test]
 fn recursion_below_the_limit_still_works() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "function sumTo(n) { return n === 0 ? 0 : n + sumTo(n - 1); } throw sumTo(500);",
     )
     .expect("compiles");
@@ -127,7 +133,8 @@ impl NativeRegistry for ProbeNatives {
 
 #[test]
 fn calls_beyond_the_program_route_through_the_native_seam() {
-    let mut interp = Interp::from_source("let f = function (a, b) { return a; }; throw f(7, 8);")
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "let f = function (a, b) { return a; }; throw f(7, 8);")
         .expect("compiles");
     // Retarget every closure to function index 255, which lies beyond the
     // compiled program and therefore names a native.
@@ -144,8 +151,9 @@ fn calls_beyond_the_program_route_through_the_native_seam() {
 
 #[test]
 fn unregistered_natives_report_type_error() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp =
-        Interp::from_source("let f = function () { return 1; }; try { f(); } catch (e) {}")
+        Interp::from_source(&mut heap, "let f = function () { return 1; }; try { f(); } catch (e) {}")
             .expect("compiles");
     // Default registry: retargeted calls throw; here the catch swallows it.
     for f in interp.functions_mut_for_test() {
@@ -162,7 +170,9 @@ fn unregistered_natives_report_type_error() {
 fn monomorphic_ic_stays_correct_across_shape_changes() {
     // One hot pair of sites read under two different layouts; results must be
     // exact whether each access hits or misses the cache.
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "
         let total = 0;
         let a = {x: 1};
@@ -189,7 +199,8 @@ fn tier_up_counters_cross_the_threshold_once() {
         for (let i = 0; i < {loops}; i += 1) {{ s += 1; }}
         "
     );
-    let mut interp = Interp::from_source(&src).expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, &src).expect("compiles");
     // Re-run through a hook we can inspect after the fact by installing a
     // shared recorder before execution.
     let recorder = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -206,7 +217,9 @@ fn tier_up_counters_cross_the_threshold_once() {
 
 #[test]
 fn gc_roots_keep_frames_alive_under_collection_stress() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "
         function make(n) {
             let o = {n: n};
@@ -228,7 +241,9 @@ fn gc_roots_keep_frames_alive_under_collection_stress() {
 fn alloc_inside_call_keeps_arguments_rooted() {
     // Allocation-heavy callees must observe intact caller windows even while
     // the collector runs between instructions.
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "
         let junk = {};
         function noise() { junk.a = 1; junk.b = 2; junk.c = junk.a; return 0; }
@@ -249,8 +264,9 @@ fn alloc_inside_call_keeps_arguments_rooted() {
 /// temporaries beyond `stack_depth` remain addressable.
 #[test]
 fn catch_binding_delivers_correct_value() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp =
-        Interp::from_source("let caught=0; try { throw 99; } catch(e){caught=e;} throw caught;")
+        Interp::from_source(&mut heap, "let caught=0; try { throw 99; } catch(e){caught=e;} throw caught;")
             .expect("catch program should compile");
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(99));
 }
@@ -259,7 +275,9 @@ fn catch_binding_delivers_correct_value() {
 /// work through the call frame's window.
 #[test]
 fn catch_binding_inside_function() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "
         function f() {
             let caught = 0;
@@ -279,22 +297,25 @@ fn catch_binding_inside_function() {
 
 #[test]
 fn in_operator_own_property() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp =
-        Interp::from_source("let o = {a: 1, b: 2}; throw ('a' in o);").expect("compiles");
+        Interp::from_source(&mut heap, "let o = {a: 1, b: 2}; throw ('a' in o);").expect("compiles");
     let v = expect_throw(&mut interp);
     assert_eq!(v.as_bool(), Some(true));
 }
 
 #[test]
 fn in_operator_missing_property() {
-    let mut interp = Interp::from_source("let o = {a: 1}; throw ('z' in o);").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "let o = {a: 1}; throw ('z' in o);").expect("compiles");
     let v = expect_throw(&mut interp);
     assert_eq!(v.as_bool(), Some(false));
 }
 
 #[test]
 fn in_operator_non_object_rhs_throws() {
-    let mut interp = Interp::from_source("throw ('a' in 123);").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "throw ('a' in 123);").expect("compiles");
     let thrown = expect_throw(&mut interp);
     let msg = interp.to_display_string(thrown);
     assert!(msg.contains("TypeError"), "expected TypeError, got {msg}");
@@ -303,7 +324,8 @@ fn in_operator_non_object_rhs_throws() {
 #[test]
 fn in_operator_heap_prototype_chain() {
     // Parent has "inheritedKey", child prototypes parent: `inheritedKey in child` true.
-    let mut interp = program_of(fn_with_instrs(
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = program_of(&mut heap, fn_with_instrs(
         2,
         vec![Instr::new(Opcode::Return, 0, 0, 0)],
         ConstantPool::new(),
@@ -316,10 +338,7 @@ fn in_operator_heap_prototype_chain() {
     };
     let child = {
         let heap = interp.heap_mut_for_test();
-        let c = heap.alloc(v12_heap::JsObject {
-            prototype: Some(parent),
-            ..Default::default()
-        });
+        let c = heap.alloc(v12_heap::JsObject::environment(0, Some(parent)));
         heap.add_root(v12_heap::JsValue::object(c));
         c
     };
@@ -376,7 +395,9 @@ fn in_operator_heap_prototype_chain() {
 #[test]
 fn instanceof_plain_objects_false() {
     // obj not linked to Ctor.prototype => false.
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "
         let Ctor = function () {};
         Ctor.prototype = {kind: 'proto'};
@@ -392,7 +413,8 @@ fn instanceof_plain_objects_false() {
 #[test]
 fn instanceof_prototype_chain_via_heap() {
     // Instance's prototype chain contains Ctor.prototype => true.
-    let mut interp = program_of(fn_with_instrs(
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = program_of(&mut heap, fn_with_instrs(
         2,
         vec![Instr::new(Opcode::Return, 0, 0, 0)],
         ConstantPool::new(),
@@ -414,10 +436,7 @@ fn instanceof_prototype_chain_via_heap() {
     };
     let instance = {
         let heap = interp.heap_mut_for_test();
-        let i = heap.alloc(v12_heap::JsObject {
-            prototype: Some(proto),
-            ..Default::default()
-        });
+        let i = heap.alloc(v12_heap::JsObject::environment(0, Some(proto)));
         heap.add_root(v12_heap::JsValue::object(i));
         i
     };
@@ -461,19 +480,13 @@ fn instanceof_prototype_chain_via_heap() {
     // Chain of two hops: instance -> middle -> proto
     let middle = {
         let heap = interp.heap_mut_for_test();
-        let m = heap.alloc(v12_heap::JsObject {
-            prototype: Some(proto),
-            ..Default::default()
-        });
+        let m = heap.alloc(v12_heap::JsObject::environment(0, Some(proto)));
         heap.add_root(v12_heap::JsValue::object(m));
         m
     };
     let instance2 = {
         let heap = interp.heap_mut_for_test();
-        let i2 = heap.alloc(v12_heap::JsObject {
-            prototype: Some(middle),
-            ..Default::default()
-        });
+        let i2 = heap.alloc(v12_heap::JsObject::environment(0, Some(middle)));
         heap.add_root(v12_heap::JsValue::object(i2));
         i2
     };
@@ -486,7 +499,9 @@ fn instanceof_prototype_chain_via_heap() {
 
 #[test]
 fn instanceof_non_object_lhs_false() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "
         let Ctor = function () {};
         Ctor.prototype = {};
@@ -500,13 +515,15 @@ fn instanceof_non_object_lhs_false() {
 
 #[test]
 fn instanceof_non_callable_rhs_throws() {
-    let mut interp = Interp::from_source("let o = {}; throw (o instanceof {});").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "let o = {}; throw (o instanceof {});").expect("compiles");
     let thrown = expect_throw(&mut interp);
     let msg = interp.to_display_string(thrown);
     assert!(msg.contains("TypeError"), "expected TypeError, got {msg}");
 
+    let mut heap2 = Heap::new(GcPolicy::NoGC);
     let mut interp2 =
-        Interp::from_source("let o = {}; throw (o instanceof 123);").expect("compiles");
+        Interp::from_source(&mut heap2, "let o = {}; throw (o instanceof 123);").expect("compiles");
     let thrown2 = expect_throw(&mut interp2);
     let msg2 = interp2.to_display_string(thrown2);
     assert!(msg2.contains("TypeError"), "expected TypeError, got {msg2}");
@@ -515,7 +532,8 @@ fn instanceof_non_callable_rhs_throws() {
 #[test]
 fn accessor_getter_returns_numeric_string() {
     // Bucket 10: accessor with numeric getter string "42" should return 42
-    let mut interp = Interp::from_source("let x = 1;").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "let x = 1;").expect("compiles");
     let obj = {
         let heap = interp.heap_mut_for_test();
         let o = heap.alloc(v12_heap::JsObject::default());
@@ -559,7 +577,8 @@ fn accessor_getter_returns_numeric_string() {
 #[test]
 fn accessor_setter_is_noop_without_data_slot() {
     // Bucket 10: setting an accessor with a setter should not create a data slot
-    let mut interp = Interp::from_source("let x = 1;").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "let x = 1;").expect("compiles");
     let obj = {
         let heap = interp.heap_mut_for_test();
         let o = heap.alloc(v12_heap::JsObject::default());
@@ -620,14 +639,13 @@ fn global_var_alias_for_captured_var() {
     let src = "var x = 123; function f(){ return x; } throw f();";
     let (program, strings) = v12_bccompiler::compile_source_with_strings(src).expect("compile");
     let mut interp2 =
-        Interp::new_with_heap(heap, Some(global), program.functions, program.main, strings);
+        Interp::new_with_heap(&mut heap, Some(global), program.functions, program.main, strings);
     let thrown = expect_throw(&mut interp2);
     assert_eq!(thrown.as_smi(), Some(123));
     // Also verify the global holds the var value. Under shape-descriptor
     // slot numbering every top-level binding gets a descriptor slot in
     // declaration order, physically stored at `GLOBAL_VAR_OFFSET + slot`;
     // the hoisted function declaration takes slot 0, so `x` occupies slot 1.
-    let heap = interp2.heap();
     let val = heap.get(global).properties[15];
     assert_eq!(val.as_smi(), Some(123));
 }
@@ -635,19 +653,19 @@ fn global_var_alias_for_captured_var() {
 #[test]
 fn arguments_exotic_mapped_access_via_elements() {
     // Bucket 8: arguments object with mapped indices stores elements
-    let mut interp = Interp::from_source("let x = 1;").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "let x = 1;").expect("compiles");
     let args_obj = {
         let heap = interp.heap_mut_for_test();
         let mapped: Box<[Option<u32>]> = vec![Some(0), None].into_boxed_slice();
-        let o = heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::KIND_ARGUMENTS,
-            elements: vec![
+        let o = heap.alloc(v12_heap::JsObject::arguments(
+            Vec::new(),
+            vec![
                 v12_heap::JsValue::from_i32_smi(7).unwrap(),
                 v12_heap::JsValue::from_i32_smi(8).unwrap(),
             ],
-            arguments_mapped: Some(mapped),
-            ..Default::default()
-        });
+            Some(mapped),
+        ));
         heap.add_root(v12_heap::JsValue::object(o));
         o
     };
@@ -676,7 +694,8 @@ fn arguments_exotic_mapped_access_via_elements() {
 #[test]
 fn null_literal_evaluates_to_js_null() {
     // `null` must be a distinct value from `undefined`.
-    let mut interp = Interp::from_source("throw null;").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "throw null;").expect("compiles");
     let v = expect_throw(&mut interp);
     assert!(
         v.is_null(),
@@ -689,7 +708,8 @@ fn null_literal_evaluates_to_js_null() {
 #[test]
 fn typeof_null_is_object() {
     // ECMA-262: `typeof null` is `"object"` (legacy).
-    let mut interp = Interp::from_source("throw typeof null;").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "throw typeof null;").expect("compiles");
     let v = expect_throw(&mut interp);
     assert!(v.is_string(), "typeof null must be a string");
     let text = interp.to_display_string(v);
@@ -709,7 +729,8 @@ fn null_via_load_const_wide_evaluates_to_js_null() {
     .encode();
     instrs.push(Instr::new(Opcode::Throw, 0, 0, 0));
     let fb = fn_with_instrs(1, instrs, pool);
-    let mut interp = program_of(fb);
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = program_of(&mut heap, fb);
     let v = expect_throw(&mut interp);
     assert!(v.is_null(), "wide null must still be JsValue::null()");
 }
@@ -717,11 +738,14 @@ fn null_via_load_const_wide_evaluates_to_js_null() {
 #[test]
 fn null_identity_and_strict_equality() {
     // `null === null` is true, `null == undefined` is true (loose), strict false.
-    let mut interp = Interp::from_source("throw (null === null);").expect("compiles");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "throw (null === null);").expect("compiles");
     assert_eq!(expect_throw(&mut interp).as_bool(), Some(true));
-    let mut interp2 = Interp::from_source("throw (null == undefined);").expect("compiles");
+    let mut heap2 = Heap::new(GcPolicy::NoGC);
+    let mut interp2 = Interp::from_source(&mut heap2, "throw (null == undefined);").expect("compiles");
     assert_eq!(expect_throw(&mut interp2).as_bool(), Some(true));
-    let mut interp3 = Interp::from_source("throw (null === undefined);").expect("compiles");
+    let mut heap3 = Heap::new(GcPolicy::NoGC);
+    let mut interp3 = Interp::from_source(&mut heap3, "throw (null === undefined);").expect("compiles");
     assert_eq!(expect_throw(&mut interp3).as_bool(), Some(false));
 }
 
@@ -754,22 +778,26 @@ fn loose_equality_number_string_and_boolean_coercion() {
         ("'a' == 'b'", false),
     ];
     for (src, want) in CASES {
-        let mut interp = Interp::from_source(&format!("throw ({src});")).expect("compiles");
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let mut interp = Interp::from_source(&mut heap, &format!("throw ({src});")).expect("compiles");
         assert_eq!(expect_throw(&mut interp).as_bool(), Some(*want), "{src}");
     }
 }
 
 #[test]
 fn destructuring_object_rest_via_interp() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp =
-        Interp::from_source("let {a, ...rest} = {a:1, b:2, c:3}; throw rest.b + rest.c;")
+        Interp::from_source(&mut heap, "let {a, ...rest} = {a:1, b:2, c:3}; throw rest.b + rest.c;")
             .expect("compiles");
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(5));
 }
 
 #[test]
 fn destructuring_array_rest_and_nested_via_interp() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(
+        &mut heap,
         "let [a, [b, c], ...rest] = [1, [2,3], 4,5]; throw a + b + c + rest[0];",
     )
     .expect("compiles");
@@ -782,18 +810,21 @@ fn destructuring_array_rest_and_nested_via_interp() {
 
 #[test]
 fn rest_params_collect_via_interp() {
-    let mut interp = Interp::from_source("function f(a, ...rest){ throw rest.length; } f(1,2,3);")
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "function f(a, ...rest){ throw rest.length; } f(1,2,3);")
         .expect("compiles");
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(2));
 }
 
 #[test]
 fn spread_array_and_call_via_interp() {
+    let mut heap2 = Heap::new(GcPolicy::NoGC);
     let mut interp2 =
-        Interp::from_source("let arr=[1,2]; let v=[...arr,3]; throw v[2];").expect("compiles");
+        Interp::from_source(&mut heap2, "let arr=[1,2]; let v=[...arr,3]; throw v[2];").expect("compiles");
     assert_eq!(expect_throw(&mut interp2).as_smi(), Some(3));
+    let mut heap3 = Heap::new(GcPolicy::NoGC);
     let mut interp3 =
-        Interp::from_source("function f(...a){ throw a[1]; } f(...[5,6]);").expect("compiles");
+        Interp::from_source(&mut heap3, "function f(...a){ throw a[1]; } f(...[5,6]);").expect("compiles");
     assert_eq!(expect_throw(&mut interp3).as_smi(), Some(6));
 }
 
@@ -803,12 +834,14 @@ fn spread_array_and_call_via_interp() {
 
 #[test]
 fn annex_b_sloppy_block_function_via_interp() {
-    let mut interp = Interp::from_source("if (true) function f(){ return 1; } throw typeof f;")
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, "if (true) function f(){ return 1; } throw typeof f;")
         .expect("compiles");
     let v = expect_throw(&mut interp);
     let text = interp.to_display_string(v);
     assert_eq!(text, "function");
-    let mut interp2 = Interp::from_source("if (false) function f(){ return 1; } throw typeof f;")
+    let mut heap2 = Heap::new(GcPolicy::NoGC);
+    let mut interp2 = Interp::from_source(&mut heap2, "if (false) function f(){ return 1; } throw typeof f;")
         .expect("compiles");
     let v2 = expect_throw(&mut interp2);
     let text2 = interp2.to_display_string(v2);
@@ -821,16 +854,18 @@ fn annex_b_sloppy_block_function_via_interp() {
 
 #[test]
 fn generator_yield_does_not_panic() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp =
-        Interp::from_source("function* gen(){ yield 1; yield 2; } let g=gen(); throw 42;")
+        Interp::from_source(&mut heap, "function* gen(){ yield 1; yield 2; } let g=gen(); throw 42;")
             .expect("compiles");
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(42));
 }
 
 #[test]
 fn async_await_does_not_panic() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp =
-        Interp::from_source("async function af(){ await 1; } af(); throw 100;").expect("compiles");
+        Interp::from_source(&mut heap, "async function af(){ await 1; } af(); throw 100;").expect("compiles");
     // async function is not actually async in stub, but should not panic on await
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(100));
 }
@@ -868,7 +903,7 @@ fn global_get_object_returns_function_kind() {
     let src_obj = "throw Object;";
     let (prog, strings) =
         v12_bccompiler::compile_source_with_strings(src_obj).expect("compile Object");
-    let mut interp = Interp::new_with_heap(heap, Some(global), prog.functions, prog.main, strings);
+    let mut interp = Interp::new_with_heap(&mut heap, Some(global), prog.functions, prog.main, strings);
     let thrown = expect_throw(&mut interp);
     assert!(thrown.is_object(), "Object via GetGlobal should be object");
     let h = thrown.as_object().unwrap();
@@ -894,11 +929,7 @@ fn global_object_get_prototype_property_is_reachable() {
     });
     heap.add_root(v12_heap::JsValue::object(object_ctor));
     // Native function for getPrototypeOf.
-    let native_fn = heap.alloc(v12_heap::JsObject {
-        kind: crate::KIND_FUNCTION,
-        elements: vec![v12_heap::JsValue::from_i32_smi(1001).unwrap()],
-        ..Default::default()
-    });
+    let native_fn = heap.alloc(v12_heap::JsObject::function(1001, None));
     heap.add_root(v12_heap::JsValue::object(native_fn));
     // Give Object a `getPrototypeOf` property via shape.
     let key = {
@@ -916,7 +947,7 @@ fn global_object_get_prototype_property_is_reachable() {
     // Need a separate Interp to hold the shape_of map.
     let src = "throw Object.getPrototypeOf;";
     let (prog, strings) = v12_bccompiler::compile_source_with_strings(src).expect("compile");
-    let mut interp = Interp::new_with_heap(heap, Some(global), prog.functions, prog.main, strings);
+    let mut interp = Interp::new_with_heap(&mut heap, Some(global), prog.functions, prog.main, strings);
     // Manually bind shape and push property after Interp is created (so shape_of is tracked).
     interp.bind_shape_for_test(object_ctor, shape);
     interp
@@ -935,10 +966,7 @@ fn global_object_get_prototype_property_is_reachable() {
     let mut heap2 = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
     let global2 = heap2.alloc(v12_heap::JsObject::default());
     heap2.add_root(v12_heap::JsValue::object(global2));
-    let obj = heap2.alloc(v12_heap::JsObject {
-        prototype: None,
-        ..Default::default()
-    });
+    let obj = heap2.alloc(v12_heap::JsObject::default());
     heap2.add_root(v12_heap::JsValue::object(obj));
     // Directly test the native helper via heap: getPrototypeOf(obj) should be null for ordinary object with no prototype.
     // This exercises the `object::object_get_prototype_of` logic indirectly.
@@ -987,8 +1015,9 @@ fn construct_return_object_overrides_instance() {
 
 #[test]
 fn construct_non_constructor_throws_type_error() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp =
-        Interp::from_source("throw (() => { try { new 5; } catch (e) { return e; } })();").unwrap();
+        Interp::from_source(&mut heap, "throw (() => { try { new 5; } catch (e) { return e; } })();").unwrap();
     let v = expect_throw(&mut interp);
     let msg = interp.to_display_string(v);
     assert!(

@@ -1,6 +1,6 @@
 use v12_heap::{Handle, JsObject, JsValue};
 
-use crate::{Frame, Interp, JSException, KIND_GENERATOR};
+use crate::{Interp, JSException};
 
 const _GEN_FN_SLOT: usize = 0;
 const GEN_PC_SLOT: usize = 1;
@@ -17,7 +17,7 @@ pub trait Suspendable {
     fn resume(&mut self, r#gen: Handle<JsObject>, arg: JsValue) -> Result<JsValue, JSException>;
 }
 
-impl Suspendable for Interp {
+impl Suspendable for Interp<'_> {
     fn suspend(
         &mut self,
         dst: u16,
@@ -40,7 +40,7 @@ impl Suspendable for Interp {
                 v.resize(usize::from(max_regs), JsValue::undefined());
                 v
             } else {
-                vec![JsValue::undefined(); usize::from(max_regs) as usize]
+                vec![JsValue::undefined(); usize::from(max_regs)]
             }
         };
         if self.heap.get(r#gen).properties.len() < 4 {

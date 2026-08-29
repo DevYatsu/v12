@@ -72,10 +72,7 @@ fn create_promise(
     state: i32,
     payload: JsValue,
 ) -> v12_heap::Handle<JsObject> {
-    let reactions = heap.alloc(JsObject {
-        kind: v12_heap::KIND_ARRAY,
-        ..JsObject::default()
-    });
+    let reactions = heap.alloc(JsObject::array(Vec::new()));
     heap.add_root(JsValue::object(reactions));
     let promise = heap.alloc(JsObject {
         kind: KIND_ORDINARY,
@@ -152,11 +149,10 @@ pub fn promise_then(
             let reactions = heap.get(promise).properties[2]
                 .as_object()
                 .expect("promise carries a reactions array");
-            let record = heap.alloc(JsObject {
-                kind: KIND_ORDINARY,
-                properties: vec![handler, on_rejected, JsValue::object(derived)],
-                ..JsObject::default()
-            });
+            let record = heap.alloc(JsObject::ordinary(
+                vec![handler, on_rejected, JsValue::object(derived)],
+                vec![None; 3],
+            ));
             heap.add_root(JsValue::object(record));
             heap.get_mut(reactions).elements.push(JsValue::object(record));
         }
@@ -211,7 +207,7 @@ fn enqueue_reaction(
     derived: v12_heap::Handle<JsObject>,
     rejecting: bool,
 ) {
-    let job: Job = Box::new(move |ctx: &mut JobCtx<'_>| {
+    let job: Job = Box::new(move |ctx: &mut JobCtx<'_, '_>| {
         let callable = handler
             .as_object()
             .is_some_and(|h| ctx.heap_mut().get(h).kind == KIND_FUNCTION);
@@ -236,7 +232,7 @@ fn enqueue_reaction(
 /// Settles `promise` with `state`/`value` and schedules one job per queued
 /// reaction record (microtask checkpoint semantics: the jobs join the
 /// current drain via `ctx.enqueue`).
-fn settle(ctx: &mut JobCtx<'_>, promise: v12_heap::Handle<JsObject>, state: i32, value: JsValue) {
+fn settle(ctx: &mut JobCtx<'_, '_>, promise: v12_heap::Handle<JsObject>, state: i32, value: JsValue) {
     let reactions = {
         let heap = ctx.heap_mut();
         heap.get_mut(promise).properties[0] = smi(state);

@@ -4,6 +4,7 @@
 //! Covers the compiled-program end-to-end path that unit tests over
 //! hand-built bytecode do not reach.
 
+use v12_heap::{GcPolicy, Heap};
 use test_support::{eval_src, expect_bool, expect_num, expect_str, value_to_string, Val};
 use v12_interp::{Interp, JSException};
 
@@ -11,7 +12,8 @@ use v12_interp::{Interp, JSException};
 /// string. `src` is wrapped the same way `test_support::eval_src` wraps it.
 fn run_real(src: &str) -> String {
     let wrapped = format!("throw (function () {{\n{src}\n}})();");
-    let mut interp = Interp::from_source(&wrapped).expect("compile");
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, &wrapped).expect("compile");
     match interp.run() {
         Ok(()) => panic!("expected the completion-value throw"),
         Err(JSException(v)) => interp.to_display_string(v),
@@ -22,6 +24,7 @@ enum Want {
     Num(f64),
     Str(&'static str),
     Bool(bool),
+    #[allow(dead_code)]
     Undefined,
 }
 

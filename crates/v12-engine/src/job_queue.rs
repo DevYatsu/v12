@@ -20,15 +20,15 @@ const MAX_QUEUE_LEN: usize = 10_000;
 /// duration of the checkpoint (from the retained program of the last eval);
 /// jobs may touch the heap directly or activate user function objects via
 /// [`JobCtx::call_object`] — the seam Promise reaction handlers run through.
-pub struct JobCtx<'a> {
-    interp: &'a mut Interp,
+pub struct JobCtx<'a, 'b> {
+    interp: &'a mut Interp<'b>,
     /// Follow-up jobs enqueued while this job ran (by the job itself or by
     /// natives it called); they join the same drain per microtask checkpoint
     /// semantics. Shared with the native registry through the engine.
     pending: Rc<RefCell<Vec<Job>>>,
 }
 
-impl JobCtx<'_> {
+impl<'a, 'b> JobCtx<'a, 'b> {
     /// Mutable heap access for the job.
     pub fn heap_mut(&mut self) -> &mut Heap {
         self.interp.heap_mut()
@@ -59,7 +59,7 @@ impl JobCtx<'_> {
 
 /// A microtask job. Runs with a [`JobCtx`] so it can reach the heap and
 /// activate user functions.
-pub type Job = Box<dyn FnOnce(&mut JobCtx<'_>)>;
+pub type Job = Box<dyn FnOnce(&mut JobCtx<'_, '_>)>;
 
 /// Ordered queue of pending microtasks.
 #[derive(Default)]
@@ -110,7 +110,7 @@ impl JobQueue {
     /// `pending` is the native-shared side channel: follow-up jobs enqueued
     /// during the checkpoint join the same drain (microtask checkpoint
     /// semantics). Returns the number of jobs executed.
-    pub fn drain(&mut self, interp: &mut Interp, pending: Rc<RefCell<Vec<Job>>>) -> usize {
+    pub fn drain(&mut self, interp: &mut Interp<'_>, pending: Rc<RefCell<Vec<Job>>>) -> usize {
         let mut count = 0usize;
         loop {
             // Adopt follow-ups discovered by the previous job/natives before
@@ -125,9 +125,12 @@ impl JobQueue {
                 break;
             };
             // Each job runs to completion; panics from engine bugs propagate,
-            // while jobs themselves should be panic-free.
+            // while jobs themselves should be panic-free. `&mut *interp` is a
+            // fresh reborrow per iteration — the reference lifetime (`'a`)
+            // and the interp's own heap-borrow lifetime are decoupled in
+            // `JobCtx<'a, 'b>`.
             let mut ctx = JobCtx {
-                interp,
+                interp: &mut *interp,
                 pending: Rc::clone(&pending),
             };
             job(&mut ctx);

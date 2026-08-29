@@ -25,8 +25,13 @@ mod job_queue_tests {
     use crate::job_queue::{JobCtx, JobQueue};
     use v12_interp::Interp;
 
-    fn interp() -> Interp {
-        Interp::new(Vec::new(), 0, Vec::new())
+    fn interp() -> Interp<'static> {
+        // Leak a heap so the test helper can return an owned interp; the
+        // leak is bounded (one per test) and the interp borrows it for the
+        // test's lifetime.
+        let heap: &'static mut v12_heap::Heap =
+            Box::leak(Box::new(v12_heap::Heap::new(v12_heap::GcPolicy::NoGC)));
+        Interp::new(heap, Vec::new(), 0, Vec::new())
     }
 
     #[test]
@@ -35,7 +40,7 @@ mod job_queue_tests {
         let mut interp = interp();
         let count = Rc::new(RefCell::new(0));
         let c = Rc::clone(&count);
-        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_>| *c.borrow_mut() += 1));
+        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_, '_>| *c.borrow_mut() += 1));
         assert_eq!(q.len(), 1);
         assert_eq!(q.drain(&mut interp, Rc::new(RefCell::new(Vec::new()))), 1);
         assert_eq!(*count.borrow(), 1);
@@ -46,7 +51,7 @@ mod job_queue_tests {
     fn queue_respects_capacity() {
         let mut q = JobQueue::new();
         for _ in 0..10_001 {
-            let _ = q.enqueue(Box::new(|_ctx: &mut JobCtx<'_>| {}));
+            let _ = q.enqueue(Box::new(|_ctx: &mut JobCtx<'_, '_>| {}));
         }
         // Capacity is 10_000, so some enqueues must have failed
         assert!(q.len() <= 10_000);
@@ -58,7 +63,7 @@ mod job_queue_tests {
         let mut interp = interp();
         let flag = Rc::new(RefCell::new(false));
         let f = Rc::clone(&flag);
-        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_>| {
+        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_, '_>| {
             *f.borrow_mut() = true;
         }));
         q.drain(&mut interp, Rc::new(RefCell::new(Vec::new())));
@@ -150,10 +155,7 @@ mod builtin_tests {
     #[test]
     fn array_push_and_pop_length() {
         let mut heap = Heap::new(GcPolicy::NoGC);
-        let arr = heap.alloc(JsObject {
-            kind: v12_interp::KIND_ARRAY,
-            ..JsObject::default()
-        });
+        let arr = heap.alloc(JsObject::array(Vec::new()));
         heap.add_root(JsValue::object(arr));
         let one = JsValue::from_i32_smi(1).unwrap();
         let two = JsValue::from_i32_smi(2).unwrap();
@@ -234,7 +236,7 @@ mod promise_job_tests {
         let flag = std::rc::Rc::new(std::cell::RefCell::new(false));
         let f = std::rc::Rc::clone(&flag);
         // Simulate Promise.resolve enqueuing a microtask
-        engine.enqueue_job(move |_ctx: &mut crate::job_queue::JobCtx<'_>| {
+        engine.enqueue_job(move |_ctx: &mut crate::job_queue::JobCtx<'_, '_>| {
             *f.borrow_mut() = true;
         });
         let count = engine.run_jobs();
@@ -250,7 +252,7 @@ mod promise_job_tests {
         let mut engine = Engine::new();
         let flag = std::rc::Rc::new(std::cell::RefCell::new(0i32));
         let c = std::rc::Rc::clone(&flag);
-        engine.enqueue_job(move |_ctx: &mut crate::job_queue::JobCtx<'_>| *c.borrow_mut() += 1);
+        engine.enqueue_job(move |_ctx: &mut crate::job_queue::JobCtx<'_, '_>| *c.borrow_mut() += 1);
         let _ = engine.eval("throw 1;");
         assert_eq!(*flag.borrow(), 1);
     }

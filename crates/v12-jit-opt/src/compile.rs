@@ -1134,7 +1134,9 @@ mod tests {
             };
 
             // 1. Interpreter ground truth + feedback collection.
+            let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
             let mut interp = v12_interp::Interp::new(
+                &mut heap,
                 vec![add_program(second_const, Opcode::Throw)],
                 0,
                 Vec::new(),
@@ -1346,7 +1348,8 @@ mod tests {
         let mut twin = fb.clone();
         let last = twin.instrs.len() - 1;
         twin.instrs[last] = Instr::new(Opcode::Throw, 0, 0, 0);
-        let mut interp = v12_interp::Interp::new(vec![twin], 0, Vec::new());
+        let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+        let mut interp = v12_interp::Interp::new(&mut heap, vec![twin], 0, Vec::new());
         let thrown = match interp.run() {
             Ok(()) => panic!("expected Throw"),
             Err(e) => e.0,

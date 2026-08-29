@@ -487,7 +487,8 @@ mod tests {
             Instr::new(Opcode::Throw, 2, 0, 0), // surface result via throw
         ];
         let fb = FunctionBytecode::with_instructions(instrs, 3);
-        let mut interp = Interp::new(vec![fb], 0, Vec::new());
+        let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+        let mut interp = Interp::new(&mut heap, vec![fb], 0, Vec::new());
         let _ = interp.run(); // will throw 2
         let lat = interp.type_feedback_at(0, 2);
         assert_eq!(
@@ -506,7 +507,8 @@ mod tests {
         ];
         let mut fb2 = FunctionBytecode::with_instructions(instrs2, 3);
         fb2.consts = pool;
-        let mut interp2 = Interp::new(vec![fb2], 0, Vec::new());
+        let mut heap2 = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+        let mut interp2 = Interp::new(&mut heap2, vec![fb2], 0, Vec::new());
         let _ = interp2.run();
         let lat2 = interp2.type_feedback_at(0, 2);
         assert_eq!(
@@ -522,7 +524,8 @@ mod tests {
         // constant-folding so the `Add` bytecode actually executes and records
         // Smi feedback.
         use crate::Interp;
-        let mut interp = Interp::from_source("let x = 1; throw x + 1;").expect("compile");
+        let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+        let mut interp = Interp::from_source(&mut heap, "let x = 1; throw x + 1;").expect("compile");
         let _ = interp.run();
         let fv = interp.feedback_vector(0).expect("feedback exists");
         // At least one pc should have Smi feedback (the Add).

@@ -1,11 +1,10 @@
 use v12_heap::{JsObject, JsValue};
 
 use crate::Interp;
-use crate::ops;
 
 /// Build a callee register window from a caller arg slice, handling rest.
 pub(crate) fn fill_call_window(
-    interp: &mut Interp,
+    interp: &mut Interp<'_>,
     window: &mut [JsValue],
     args_src: &[JsValue],
     has_rest: bool,
@@ -15,9 +14,7 @@ pub(crate) fn fill_call_window(
     if has_rest {
         let fixed_usize = fixed as usize;
         let to_copy = fixed_usize.min(args_src.len()).min(window.len().saturating_sub(1));
-        for i in 0..to_copy {
-            window[1 + i] = args_src[i];
-        }
+        window[1..1 + to_copy].copy_from_slice(&args_src[..to_copy]);
         let rest_len = args_src.len().saturating_sub(fixed_usize);
         let slice = if rest_len > 0 {
             args_src[fixed_usize..].to_vec()
@@ -31,17 +28,16 @@ pub(crate) fn fill_call_window(
         }
     } else {
         let copied = args_src.len().min(window.len().saturating_sub(1));
-        for i in 0..copied {
-            window[1 + i] = args_src[i];
-        }
+        window[1..1 + copied].copy_from_slice(&args_src[..copied]);
     }
 }
 
 /// Fill the callee stack window at `new_base` from caller args at `arg_src`.
 /// DRY helper for the sync `prepare_call` path — both async and sync paths
 /// use `fill_call_window` via this wrapper.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_stack_call_window(
-    interp: &mut Interp,
+    interp: &mut Interp<'_>,
     new_base: usize,
     arg_src: usize,
     argc: usize,
@@ -56,8 +52,17 @@ pub(crate) fn fill_stack_call_window(
         let to_copy = fixed_usize
             .min(argc)
             .min(window_len.saturating_sub(1));
-        for i in 0..to_copy {
-            interp.stack[new_base + 1 + i] = interp.stack[arg_src + i];
+        let dst_start = new_base + 1;
+        // Source and destination may overlap when caller/callee windows
+        // share the same stack. Use `split_at_mut` for non-overlapping
+        // mutable slices.
+        if arg_src < dst_start {
+            let (left, right) = interp.stack.split_at_mut(dst_start);
+            right[..to_copy].copy_from_slice(&left[arg_src..arg_src + to_copy]);
+        } else {
+            let (left, right) = interp.stack.split_at_mut(arg_src);
+            left[dst_start..dst_start + to_copy]
+                .copy_from_slice(&right[..to_copy]);
         }
         let rest_len = argc.saturating_sub(fixed_usize);
         let slice = if rest_len > 0 {
@@ -72,21 +77,20 @@ pub(crate) fn fill_stack_call_window(
         }
     } else {
         let copied = argc.min(window_len.saturating_sub(1));
-        for i in 0..copied {
-            interp.stack[new_base + 1 + i] = interp.stack[arg_src + i];
+        let dst_start = new_base + 1;
+        if arg_src < dst_start {
+            let (left, right) = interp.stack.split_at_mut(dst_start);
+            right[..copied].copy_from_slice(&left[arg_src..arg_src + copied]);
+        } else {
+            let (left, right) = interp.stack.split_at_mut(arg_src);
+            left[dst_start..dst_start + copied].copy_from_slice(&right[..copied]);
         }
     }
 }
 
-pub(crate) fn alloc_rest_array(interp: &mut Interp, elements: Vec<JsValue>) -> JsValue {
-    let len = elements.len() as u32;
+pub(crate) fn alloc_rest_array(interp: &mut Interp<'_>, elements: Vec<JsValue>) -> JsValue {
     let shape = interp.array_shape();
-    let h = interp.heap_mut().alloc(JsObject {
-        kind: crate::KIND_ARRAY,
-        properties: vec![ops::box_number(f64::from(len))],
-        elements,
-        ..JsObject::default()
-    });
+    let h = interp.heap_mut().alloc(JsObject::array(elements));
     interp.bind_shape(h, shape);
     JsValue::object(h)
 }
