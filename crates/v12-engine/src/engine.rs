@@ -587,6 +587,76 @@ impl Engine {
         Ok(())
     }
 
+    /// Calls the global function `name` with `args`.
+    ///
+    /// Resolves `name` on the realm's global object (shape lookup, the same
+    /// mechanism `GetGlobal` uses) and invokes it through a fresh interpreter
+    /// borrowing the engine's heap. Requires a prior `eval` (or
+    /// `eval_module`) so the retained program provides the bytecode for
+    /// `name` and any functions it calls. Returns the callee's result.
+    pub fn call_global(&mut self, name: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
+        let global = self.realm.global();
+        let func = {
+            let h = self
+                .heap
+                .intern_string(V12Str::latin1(name.as_bytes().to_vec()));
+            let key = v12_heap::PropKey::from_string(h);
+            let shape = self.heap.shape_of(global);
+            let desc = self.heap.lookup_property(shape, key);
+            let slot = desc.and_then(|d| d.slot()).ok_or_else(|| {
+                let h = self.heap.intern_string(V12Str::latin1(
+                    format!("ReferenceError: {name} is not defined").into_bytes(),
+                ));
+                JsValue::string(h)
+            })?;
+            let idx = crate::realm::INTRINSIC_COUNT + slot as usize;
+            self.heap
+                .get(global)
+                .properties
+                .get(idx)
+                .copied()
+                .ok_or_else(|| {
+                    let h = self.heap.intern_string(V12Str::latin1(
+                        format!("ReferenceError: {name} is not defined").into_bytes(),
+                    ));
+                    JsValue::string(h)
+                })?
+        };
+        let callee = func.as_object().ok_or_else(|| {
+            let h = self.heap.intern_string(V12Str::latin1(
+                format!("TypeError: {name} is not a function").into_bytes(),
+            ));
+            JsValue::string(h)
+        })?;
+        self.heap.add_root(JsValue::object(callee));
+
+        let (functions, main, strings) = match &self.retained {
+            Some(r) => (
+                r.functions.to_vec(),
+                r.main,
+                r.strings.iter().map(|s| s.to_string()).collect(),
+            ),
+            None => (Vec::new(), 0, Vec::new()),
+        };
+        let Engine { heap, jobs, registry, pending, .. } = self;
+        let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
+        interp.set_natives(Box::new(registry.clone()));
+        let outcome = interp.call_object(callee, JsValue::undefined(), args);
+        for job in registry.take_pending() {
+            jobs.enqueue(job);
+        }
+        let _ = jobs.drain(&mut interp, Rc::clone(pending));
+        let _ = interp.run_jobs();
+        for job in registry.take_pending() {
+            jobs.enqueue(job);
+        }
+        drop(interp);
+        match outcome {
+            Ok(v) => Ok(v),
+            Err(JSException(thrown)) => Err(thrown),
+        }
+    }
+
     /// Drains the microtask queue.
     ///
     /// Rebuilds an interpreter from the retained program of the last eval so

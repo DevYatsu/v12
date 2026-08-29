@@ -85,6 +85,34 @@ impl Context {
             .map_err(|thrown| V12Error::Thrown(self.engine.to_display_string(thrown)))
     }
 
+    /// Calls the global function `name` with `args` and converts the result
+    /// to `T`.
+    ///
+    /// Requires a prior [`Context::eval`] (or `eval_module`) in this context
+    /// so the function's bytecode is retained. `A` values are marshalled via
+    /// `ToValue`, the result via `FromValue`.
+    pub fn call<T, A>(&mut self, name: &str, args: &[A]) -> Result<T, V12Error>
+    where
+        T: v12_engine::FromValue,
+        A: v12_engine::ToValue,
+    {
+        let js_args: Vec<v12_engine::JsValue> = args
+            .iter()
+            .map(|a| a.to_value(self.engine.heap_mut()))
+            .collect();
+        self.engine
+            .call_global(name, &js_args)
+            .map_err(|thrown| V12Error::Thrown(self.engine.to_display_string(thrown)))
+            .and_then(|value| {
+                T::from_value(self.engine.heap(), value).ok_or_else(|| {
+                    V12Error::Thrown(format!(
+                        "could not decode result into {}",
+                        std::any::type_name::<T>()
+                    ))
+                })
+            })
+    }
+
     /// Enqueues a host-driven microtask.
     pub fn enqueue_job<F>(&mut self, job: F) -> bool
     where
@@ -158,5 +186,39 @@ mod tests {
         .unwrap();
         let err: Result<(), _> = ctx.eval::<()>("boom()");
         assert!(err.unwrap_err().to_string().contains("kaput"));
+    }
+
+    #[test]
+    fn call_invokes_global_function_with_args() {
+        let mut ctx = Context::new();
+        ctx.eval::<()>("function greet(who) { return 'hi ' + who; }").unwrap();
+        let s: String = ctx.call("greet", &["bob".to_string()]).unwrap();
+        assert_eq!(s, "hi bob");
+    }
+
+    #[test]
+    fn call_returns_typed_result() {
+        let mut ctx = Context::new();
+        ctx.eval::<()>("function sum(a, b) { return a + b; }").unwrap();
+        let n: f64 = ctx.call("sum", &[2.0, 3.0]).unwrap();
+        assert_eq!(n, 5.0);
+    }
+
+    #[test]
+    fn call_unknown_function_is_error() {
+        let mut ctx = Context::new();
+        ctx.eval::<()>("function ok() {}").unwrap();
+        let err: Result<f64, _> = ctx.call::<f64, f64>("missing", &[]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn call_throws_surface_as_v12_error() {
+        let mut ctx = Context::new();
+        // Throwing a string surfaces its text directly; error-object
+        // constructors are not fully wired in the engine's builtins yet.
+        ctx.eval::<()>("function bad() { throw 'out of bounds'; }").unwrap();
+        let err: Result<f64, _> = ctx.call::<f64, f64>("bad", &[]);
+        assert!(err.unwrap_err().to_string().contains("out"));
     }
 }
