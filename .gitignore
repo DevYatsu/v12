@@ -2,6 +2,8 @@
 
 # Local agent/editor state
 .commandcode/
+.slim/
+.superpowers/
 
 # macOS metadata
 .DS_Store
