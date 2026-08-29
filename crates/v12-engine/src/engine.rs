@@ -24,7 +24,7 @@ const MAX_SOURCE_LEN: usize = 1_000_000;
 /// a time; a queued job belonging to an older program would mis-index — in
 /// practice each eval drains its own checkpoint before the next compiles.
 ///
-/// ADR-003: the program lives in an `Arc` so the engine no longer deep-clones
+/// The program lives in an `Arc` so the engine no longer deep-clones
 /// `functions` and `strings` on every `eval` / `run_jobs`. `run_jobs` just
 /// clones the `Arc` (a refcount bump) to hand the program to the
 /// `Interp::new` call. Old behavior: `Vec<FunctionBytecode>` (deep clone per
@@ -46,12 +46,12 @@ pub struct Engine {
     /// during interpreter execution; the engine adopts them at checkpoints.
     pending: Rc<RefCell<Vec<Job>>>,
     retained: Option<RetainedProgram>,
-    /// Last script completion value (ADR-004). Populated by every
+    /// Last script completion value. Populated by every
     /// successful `eval*` call. `None` until the first script runs; older
     /// completion values are *not* cleared between calls — the most recent
     /// one is what the host sees via [`Engine::last_completion`].
     completion: Option<JsValue>,
-    /// Tier-up policy (ADR-006). `OnDemand` (the default) means tier-up
+    /// Tier-up policy. `OnDemand` (the default) means tier-up
     /// only happens when the host asks; `Profile` is the v2 hook.
     tier_policy: v12_codegen::TierPolicy,
     /// Next index handed out by [`Engine::create_host_function`], offset
@@ -144,7 +144,7 @@ impl Engine {
         &mut self.jobs
     }
 
-    /// Sets the tier-up policy (ADR-006).
+    /// Sets the tier-up policy.
     ///
     /// `OnDemand` (default): tier-up only on host request. `Profile`: the
     /// engine's profiler decides when to tier-up. v1 ships the policy field
@@ -153,7 +153,7 @@ impl Engine {
         self.tier_policy = policy;
     }
 
-    /// Current tier-up policy (ADR-006).
+    /// Current tier-up policy.
     #[must_use]
     pub fn tier_policy(&self) -> v12_codegen::TierPolicy {
         self.tier_policy
@@ -172,8 +172,7 @@ impl Engine {
         self.eval_direct(source)
     }
 
-    /// Evaluates `source` and returns the spec-compliant completion value
-    /// (ADR-004).
+    /// Evaluates `source` and returns the spec-compliant completion value.
     ///
     /// Unlike [`Self::eval`], this entry point returns the *real* script
     /// completion value when the script body explicitly returned one (e.g.
@@ -203,7 +202,7 @@ impl Engine {
         self.eval_direct(source)
     }
 
-    /// The last script's actual completion value (ADR-004), or
+    /// The last script's actual completion value, or
     /// `undefined` if no script has run yet.
     ///
     /// Updated by every successful [`Self::eval`] / [`Self::eval_with_completion`].
@@ -251,7 +250,7 @@ impl Engine {
 
     /// Private inner: compiles + runs + captures completion, returning a
     /// structured [`EngineError`]. Both [`Self::eval_direct`] (legacy) and
-    /// [`Self::eval_with_completion`] (ADR-004) are thin adapters over this.
+    /// [`Self::eval_with_completion`] are thin adapters over this.
     fn eval_inner(&mut self, source: &str) -> Result<JsValue, EngineError> {
         if source.len() > MAX_SOURCE_LEN {
             return Err(EngineError::Host("source too large".into()));
@@ -261,8 +260,8 @@ impl Engine {
         let (program, strings) = v12_bccompiler::compile_source_with_strings(source)
             .map_err(EngineError::Compile)?;
         // Retain the program so queued jobs can rebuild an interpreter and
-        // activate the script's functions later (Promise reactions). ADR-003:
-        // wrap the `Vec`s in `Arc` once; subsequent `eval`/`run_jobs` clone
+        // activate the script's functions later (Promise reactions).
+        // Wrap the `Vec`s in `Arc` once; subsequent `eval`/`run_jobs` clone
         // the `Arc` instead of deep-cloning the function/string tables.
         let functions: Arc<[FunctionBytecode]> = Arc::from(program.functions.into_boxed_slice());
         let strings_arc: Arc<[String]> = Arc::from(strings.into_boxed_slice());
@@ -271,7 +270,7 @@ impl Engine {
             main: program.main,
             strings: Arc::clone(&strings_arc),
         });
-        // ADR-003: borrow the engine's heap for the interpreter's lifetime —
+        // Borrow the engine's heap for the interpreter's lifetime —
         // no `mem::replace` swap, no sentinel heap, `Engine::heap()` stays
         // valid the whole time the interpreter runs. Destructure `self` so
         // the heap borrow and the job-queue/registry accesses are disjoint
@@ -298,13 +297,14 @@ impl Engine {
         for job in registry.take_pending() {
             jobs.enqueue(job);
         }
-        // ADR-004: capture the actual completion value (e.g. `1+1` → 2) so
-        // `eval_with_completion` can return it; `eval` continues to return
-        // `undefined` for normal completion to preserve its existing shape.
+        // Capture the actual completion value (e.g. `1+1` → 2);
+        // `eval` and `eval_with_completion` both return it.
         *completion = interp.completion_value();
         drop(interp); // releases the `&mut heap` borrow
         match outcome {
-            Ok(()) => Ok(JsValue::undefined()),
+            // Return the real script completion value (e.g.
+            // `1+1` → 2) instead of hard-coded `undefined`.
+            Ok(()) => Ok(completion.unwrap_or_else(JsValue::undefined)),
             Err(JSException(thrown)) => Err(EngineError::Thrown(thrown)),
         }
     }
@@ -334,7 +334,7 @@ impl Engine {
                 };
                 JsValue::string(handle)
             })?;
-        // ADR-007: the indirect-eval gets its OWN `NativeRegistry` with its
+        // The indirect-eval gets its OWN `NativeRegistry` with its
         // OWN pending sink, so jobs enqueued in this realm never reach the
         // engine's queue and no `set_pending` save/restore is needed. The
         // engine's `self.registry` is left untouched for the whole call.
@@ -359,8 +359,10 @@ impl Engine {
             local_queue.enqueue(job);
         }
         let _ = local_queue.drain(&mut interp, Rc::new(RefCell::new(Vec::new())));
+        // Indirect eval also returns its completion value.
+        let completion = interp.completion_value().unwrap_or_else(JsValue::undefined);
         match outcome {
-            Ok(()) => Ok(JsValue::undefined()),
+            Ok(()) => Ok(completion),
             Err(JSException(thrown)) => {
                 // Translate thrown string into the caller's heap.
                 if let Some(h) = thrown.as_string() {
@@ -421,7 +423,7 @@ impl Engine {
             .map(|(_, s)| s.to_string())
             .collect();
         let program = module.program;
-        // ADR-003: wrap in `Arc` once so `run_jobs` can clone the handle.
+        // Wrap in `Arc` once so `run_jobs` can clone the handle.
         let functions: Arc<[FunctionBytecode]> = Arc::from(program.functions.into_boxed_slice());
         let strings_arc: Arc<[String]> = Arc::from(strings.into_boxed_slice());
         self.retained = Some(RetainedProgram {
@@ -429,7 +431,7 @@ impl Engine {
             main: program.main,
             strings: Arc::clone(&strings_arc),
         });
-        // ADR-003: borrow the engine's heap; no swap. Destructure `self` so
+        // Borrow the engine's heap; no swap. Destructure `self` so
         // the heap borrow and job-queue/registry accesses are disjoint locals.
         let Engine { heap, jobs, registry, pending, completion, .. } = self;
         let mut interp = Interp::new_with_heap(
@@ -472,11 +474,11 @@ impl Engine {
         for job in registry.take_pending() {
             jobs.enqueue(job);
         }
-        // ADR-004: capture the module's completion value too.
+        // Capture the module's completion value too.
         *completion = interp.completion_value();
         drop(interp); // releases the `&mut heap` borrow
         match outcome {
-            Ok(()) => Ok(JsValue::undefined()),
+            Ok(()) => Ok(completion.unwrap_or_else(JsValue::undefined)),
             Err(JSException(thrown)) => Err(thrown),
         }
     }
@@ -668,7 +670,7 @@ impl Engine {
         self.adopt_pending();
         let has_jobs = !self.jobs.is_empty();
         let global = self.realm.global();
-        // ADR-003: borrow the retained program via `Arc::clone` — a refcount
+        // Borrow the retained program via `Arc::clone` — a refcount
         // bump, not a deep copy. The interpreter consumes `Vec`s, so we
         // materialize once here, but the strings are now deduplicated across
         // calls (the same `Arc<[String]>` is shared with the original
@@ -681,7 +683,7 @@ impl Engine {
             ),
             None => (Vec::new(), 0, Vec::new()),
         };
-        // ADR-003: borrow the engine's heap; no swap. The interpreter is
+        // Borrow the engine's heap; no swap. The interpreter is
         // scoped to this method, so the borrow ends when it drops. Destructure
         // `self` so heap and jobs/registry accesses are disjoint locals.
         let Engine { heap, jobs, registry, pending, .. } = self;
@@ -829,12 +831,10 @@ mod tests {
 
     #[test]
     fn eval_with_completion_returns_real_value() {
-        // ADR-004: the engine surfaces the spec completion value via
-        // `eval_with_completion` and `last_completion`. The existing
-        // interpreter sets `top_result` only on the `Return` opcode; for
-        // expression-statement scripts the completion is therefore
-        // `undefined` (documented on `eval_with_completion`). What this
-        // test verifies is the API wiring: a successful call populates
+        // The engine surfaces the spec completion value via
+        // `eval_with_completion` and `last_completion`: expression-statement
+        // scripts now complete with the last expression's value, so
+        // `eval("1+1")` returns 2.
         // `last_completion`, and the structured `EngineError` path for
         // throws and compile errors is well-formed.
         let mut engine = Engine::new();

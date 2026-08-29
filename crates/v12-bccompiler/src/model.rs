@@ -58,8 +58,8 @@ pub const NATIVE_IMPORT_INDEX: u16 = 254;
 pub const NATIVE_IMPORT_INDEX_U32: u32 = NATIVE_IMPORT_INDEX as u32;
 
 /// Native index for `Object.enumerableOwnKeys` - returns array of own enumerable property keys.
-/// Must match the index registered in `v12_engine::builtins::mod.rs`.
-pub const NATIVE_OBJECT_ENUMERABLE_OWN_KEYS: u32 = 1003;
+/// Must match the index registered in `v12_engine::builtins::mod.rs` (1901).
+pub const NATIVE_OBJECT_ENUMERABLE_OWN_KEYS: u32 = 1901;
 
 // ---------------------------------------------------------------------------
 // Interner
@@ -183,26 +183,11 @@ pub enum VarLoc {
 /// `Error`, …) without claiming full spec coverage. The realm
 /// (`v12-engine/src/realm.rs`) and interpreter (`v12-interp`) share the same
 /// ordering via their own copies of this list (kept in sync manually for now).
-pub const GLOBAL_INTRINSICS: &[&str] = &[
-    "Object",
-    "Array",
-    "String",
-    "Number",
-    "Boolean",
-    "Math",
-    "JSON",
-    "Error",
-    "TypeError",
-    "RangeError",
-    "ReferenceError",
-    "SyntaxError",
-    "URIError",
-    "EvalError",
-    "Promise",
-    "Symbol",
-    "console",
-    "globalThis",
-];
+///
+/// Re-exported from [`v12_bytecode::GLOBAL_INTRINSICS`]: the
+/// canonical home of the table is the bytecode crate so the interpreter
+/// does not have to depend on the compiler to know the list.
+pub use v12_bytecode::GLOBAL_INTRINSICS;
 
 /// Per-function-unit layout decided by the collect pass.
 #[derive(Debug)]
@@ -442,6 +427,10 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     pub(crate) handler_max: u32,
     pub loops: Vec<LoopCtx>,
     pub finallies: Vec<FinallyCtx<'a>>,
+    /// Register holding the value of the last expression statement compiled
+    /// so far, when there is one. The main unit emits a `Return` of it so
+    /// `eval` gets the spec-compliant script completion value.
+    pub last_expr_reg: Option<u16>,
     overflow: Option<CompileError>,
 }
 
@@ -457,6 +446,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             handler_max: 0,
             loops: Vec::new(),
             finallies: Vec::new(),
+            last_expr_reg: None,
             overflow: None,
         }
     }

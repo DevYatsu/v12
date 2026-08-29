@@ -125,7 +125,10 @@ impl ToValue for () {
 }
 
 impl FromValue for () {
-    fn from_value(_heap: &Heap, value: JsValue) -> Option<Self> {
-        if value.is_undefined() { Some(()) } else { None }
+    fn from_value(_heap: &Heap, _value: JsValue) -> Option<Self> {
+        // `()` means "discard the result": with ADR-004 completion values
+        // wired, scripts now complete with real values, so every value
+        // decodes to unit.
+        Some(())
     }
 }

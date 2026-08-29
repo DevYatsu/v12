@@ -100,7 +100,23 @@ pub fn compile_unit(
         emit_import_calls(&mut cx)?;
     }
     match node {
-        UnitNode::Main(p) => cx.stmt_list(&p.body)?,
+        UnitNode::Main(p) => {
+            cx.stmt_list(&p.body)?;
+            // Spec-compliant script completion: the value of the
+            // last expression statement is the script's completion. Emit it
+            // as an explicit `Return` so the interpreter's bottom-frame
+            // completion captures it (`eval("1+1")` → 2).
+            if let Some(reg) = cx.last_expr_reg {
+                cx.emit_reg1(
+                    Opcode::Return,
+                    reg,
+                    p.body
+                        .last()
+                        .map(|s| s.span())
+                        .unwrap_or_default(),
+                );
+            }
+        }
         UnitNode::Fn(f) => {
             let Some(body) = f.body.as_deref() else {
                 return Err(cx.err(

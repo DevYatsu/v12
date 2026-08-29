@@ -1604,33 +1604,11 @@ impl<'a> Interp<'a> {
                 let res = self.array_push_fallback(this_v, &args_slice)?;
                 return Ok(CallOutcome::Value(res));
             }
-            if target == NATIVE_PROMISE_RESOLVE {
-                let args_start = callee_slot + 2;
-                let args_end = args_start + usize::from(argc);
-                let args_slice = self.stack[args_start..args_end].to_vec();
-                let v = args_slice.first().copied().unwrap_or(JsValue::undefined());
-                if self.is_promise(v) {
-                    return Ok(CallOutcome::Value(v));
-                }
-                self.gc_protect();
-                let reactions = self.heap.alloc(JsObject::array(Vec::new()));
-                self.heap.add_root(JsValue::object(reactions));
-                let p = self.heap.alloc(JsObject::fulfilled_promise(v, reactions));
-                self.heap.add_root(JsValue::object(p));
-                return Ok(CallOutcome::Value(JsValue::object(p)));
-            }
-            if target == NATIVE_PROMISE_REJECT {
-                let args_start = callee_slot + 2;
-                let args_end = args_start + usize::from(argc);
-                let args_slice = self.stack[args_start..args_end].to_vec();
-                let v = args_slice.first().copied().unwrap_or(JsValue::undefined());
-                self.gc_protect();
-                let reactions = self.heap.alloc(JsObject::array(Vec::new()));
-                self.heap.add_root(JsValue::object(reactions));
-                let p = self.heap.alloc(JsObject::rejected_promise(v, reactions));
-                self.heap.add_root(JsValue::object(p));
-                return Ok(CallOutcome::Value(JsValue::object(p)));
-            }
+            // `NATIVE_PROMISE_RESOLVE` / `NATIVE_PROMISE_REJECT` are NOT
+            // handled inline: they route through the native seam so the
+            // engine's promise builtins (which wire the ctor-derived
+            // prototype and enqueue real reactions) run. Interp-alone tests
+            // that need a promise use `promise_resolve_for_await`.
             let args_start = callee_slot + 2;
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
