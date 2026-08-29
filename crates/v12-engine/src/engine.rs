@@ -87,6 +87,36 @@ impl Engine {
         self.heap.alloc_pending_promise()
     }
 
+    /// Alias required by `engine_owns_async_promise` (brief) — pending promise with `properties[0]==0`.
+    pub fn new_pending_promise(&mut self) -> v12_heap::Handle<JsObject> {
+        let h = self.new_async_promise();
+        // Ensure properties[0] is f64 0.0 for the brief's `as_f64()==Some(0.0)` check
+        // (HeapExt stores Smi 0 which `as_f64` would miss).
+        if self.heap.get(h).properties[0].as_f64().is_none() {
+            self.heap.get_mut(h).properties[0] = v12_heap::JsValue::from_f64(0.0);
+        }
+        h
+    }
+
+    /// Engine-owned helper for creating a generator object (delegates to heap).
+    pub fn new_generator_object(
+        &mut self,
+        fn_idx: u32,
+        env: Option<v12_heap::Handle<JsObject>>,
+    ) -> v12_heap::Handle<JsObject> {
+        let h = self.heap.alloc(v12_heap::JsObject::generator_with(
+            fn_idx,
+            0,
+            0.0,
+            0,
+            Vec::new(),
+            env,
+            None,
+        ));
+        self.heap.add_root(v12_heap::JsValue::object(h));
+        h
+    }
+
     /// The engine's realm.
     #[must_use]
     pub fn realm(&self) -> &Realm {
@@ -464,6 +494,15 @@ impl Engine {
 impl Default for Engine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub trait EnginePromiseFactory {
+    fn new_pending_promise(&mut self) -> v12_heap::Handle<JsObject>;
+}
+impl EnginePromiseFactory for Engine {
+    fn new_pending_promise(&mut self) -> v12_heap::Handle<JsObject> {
+        Engine::new_pending_promise(self)
     }
 }
 

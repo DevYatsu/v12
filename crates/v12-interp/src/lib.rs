@@ -58,6 +58,7 @@
 
 pub mod feedback;
 mod ops;
+pub mod call;
 
 #[cfg(test)]
 mod tests;
@@ -1959,7 +1960,7 @@ impl Interp {
 
     /// Records `obj`'s shape. Pinning happened (or happens) via
     /// [`Self::pin_shape`]; this only binds the association.
-    fn bind_shape(&mut self, obj: Handle<JsObject>, shape: ShapeHandle) {
+    pub(crate) fn bind_shape(&mut self, obj: Handle<JsObject>, shape: ShapeHandle) {
         self.pin_shape(shape);
         let cell = self.heap.validity_cell_of(obj);
         self.shape_of_cell.insert(cell.0, shape);
@@ -3344,25 +3345,14 @@ impl Interp {
     }
 
     /// Allocates an array object for a rest parameter from `elements`. Centralises
-    /// the `array_shape` + `KIND_ARRAY` + `bind_shape` sequence that previously
-    /// duplicated across `prepare_call` (async window), `prepare_call` (sync
-    /// window), `prepare_construct`, and `create_generator_object` (finding #4).
+    /// the `array_shape` + `KIND_ARRAY` + `bind_shape` sequence (finding #4).
+    /// Delegates to `call::alloc_rest_array` for DRY.
     fn alloc_rest_array(&mut self, elements: Vec<JsValue>) -> JsValue {
-        let len = elements.len() as u32;
-        let shape = self.array_shape();
-        let h = self.heap.alloc(JsObject {
-            kind: KIND_ARRAY,
-            properties: vec![ops::box_number(f64::from(len))],
-            elements,
-            ..JsObject::default()
-        });
-        self.bind_shape(h, shape);
-        JsValue::object(h)
+        crate::call::alloc_rest_array(self, elements)
     }
 
     /// Fills `window[1..]` from `self.stack[args_src..]` respecting fixed/rest
-    /// layout. Extracted to deduplicate the verbatim window-building blocks in
-    /// `prepare_call` async vs sync paths (finding #4).
+    /// layout. Delegates to `call::fill_call_window` for DRY (finding #4).
     fn fill_call_window(
         &mut self,
         window: &mut [JsValue],
@@ -3372,29 +3362,14 @@ impl Interp {
         fixed: u16,
         rest_reg: u16,
     ) {
-        if has_rest {
-            let fixed_usize = fixed as usize;
-            let to_copy = fixed_usize.min(argc).min(window.len().saturating_sub(1));
-            for i in 0..to_copy {
-                window[1 + i] = self.stack[args_src + i];
-            }
-            let rest_len = argc.saturating_sub(fixed_usize);
-            let slice = if rest_len > 0 {
-                self.stack[args_src + fixed_usize..args_src + fixed_usize + rest_len].to_vec()
-            } else {
-                Vec::new()
-            };
-            self.gc_protect();
-            let arr = self.alloc_rest_array(slice);
-            if (rest_reg as usize) < window.len() {
-                window[rest_reg as usize] = arr;
-            }
+        let args_slice = if args_src + argc <= self.stack.len() {
+            self.stack[args_src..args_src + argc].to_vec()
+        } else if args_src < self.stack.len() {
+            self.stack[args_src..].to_vec()
         } else {
-            let copied = argc.min(window.len().saturating_sub(1));
-            for i in 0..copied {
-                window[1 + i] = self.stack[args_src + i];
-            }
-        }
+            Vec::new()
+        };
+        crate::call::fill_call_window(self, window, &args_slice, has_rest, fixed, rest_reg)
     }
 
     fn create_generator_object(
@@ -3409,41 +3384,11 @@ impl Interp {
             let f = &self.functions[fn_idx as usize];
             (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
         };
-        // Build initial register window snapshot.
+        // Build initial register window snapshot via shared helper (DRY #4).
         let mut window = vec![JsValue::undefined(); usize::from(max_regs)];
         window[0] = this_v;
         let arg_src = callee_slot + 2;
-        if has_rest {
-            let fixed_usize = fixed as usize;
-            let to_copy = (fixed_usize).min(argc as usize).min(window.len().saturating_sub(1));
-            for i in 0..to_copy {
-                window[1 + i] = self.stack[arg_src + i];
-            }
-            let rest_start = fixed_usize;
-            let rest_len = (argc as usize).saturating_sub(rest_start);
-            let slice = if rest_len > 0 {
-                self.stack[arg_src + rest_start..arg_src + rest_start + rest_len].to_vec()
-            } else {
-                Vec::new()
-            };
-            self.gc_protect();
-            let shape = self.array_shape();
-            let h = self.heap.alloc(JsObject {
-                kind: KIND_ARRAY,
-                properties: vec![ops::box_number(f64::from(rest_len as u32))],
-                elements: slice,
-                ..JsObject::default()
-            });
-            self.bind_shape(h, shape);
-            if (rest_reg as usize) < window.len() {
-                window[rest_reg as usize] = JsValue::object(h);
-            }
-        } else {
-            let copied = (argc as usize).min(window.len().saturating_sub(1));
-            for i in 0..copied {
-                window[1 + i] = self.stack[arg_src + i];
-            }
-        }
+        self.fill_call_window(&mut window, arg_src, argc as usize, has_rest, fixed, rest_reg);
         // Real suspension: store initial register window snapshot, not eager yields.
         self.gc_protect();
         let r#gen = self.heap.alloc(JsObject {
@@ -3745,7 +3690,7 @@ impl Interp {
     /// the generator leaves `pending_awaits`, so the next `gc_protect` drops its
     /// promise/reactions roots and the promise remains reachable only via the
     /// generator's `properties[4]` until the generator itself becomes unreachable.
-    fn gc_protect(&mut self) {
+    pub(crate) fn gc_protect(&mut self) {
         let roots = &mut self.heap.roots_mut().0;
         // The root set is fully republished here, so long-lived interpreter
         // state kept outside the stack/frames — the global object and the
