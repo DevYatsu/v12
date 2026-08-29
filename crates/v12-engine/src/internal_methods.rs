@@ -5,9 +5,6 @@
 //! reports a `TypeError`. The engine never assumes an object's kind without
 //! checking it, so proxy-blind fast paths remain correct.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-
 use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey, ShapeHandle};
 
 /// Object kinds understood by the engine.
@@ -620,53 +617,29 @@ pub fn dispatch_has(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey) -> Int
 
 // ---------------------------------------------------------------------------
 // Shape association for ordinary objects
+//
+// Object → shape binding now lives in `Heap::shape_of` / `Heap::bind_shape`.
+// The old `thread_local SHAPE_TABLE` keyed by raw `Heap` pointer (the source
+// of the address-reuse correctness bug P1.2) is gone: a fresh heap cannot
+// observe another engine's bindings, and the table's lifetime tracks the
+// heap's automatically.
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    static SHAPE_TABLE: RefCell<HashMap<(usize, u32), ShapeHandle>> = RefCell::new(HashMap::new());
-}
-
-fn heap_id(heap: &Heap) -> usize {
-    heap as *const Heap as usize
-}
-
 fn shape_of(heap: &Heap, obj: Handle<JsObject>) -> ShapeHandle {
-    let cell = heap.get(obj).validity_cell;
-    if cell == v12_heap::ValidityCellId::NONE {
-        return heap.root_shape();
-    }
-    let key = (heap_id(heap), cell.0);
-    SHAPE_TABLE.with(|table| {
-        table
-            .borrow()
-            .get(&key)
-            .copied()
-            .unwrap_or_else(|| heap.root_shape())
-    })
+    heap.shape_of(obj)
 }
 
 fn shape_of_mut(heap: &mut Heap, obj: Handle<JsObject>) -> ShapeHandle {
-    let cell = heap.validity_cell_of(obj);
-    if cell == v12_heap::ValidityCellId::NONE {
-        return heap.root_shape();
-    }
-    let key = (heap_id(heap), cell.0);
-    SHAPE_TABLE.with(|table| {
-        table
-            .borrow()
-            .get(&key)
-            .copied()
-            .unwrap_or_else(|| heap.root_shape())
-    })
+    heap.shape_of_mut(obj)
 }
 
 fn bind_shape(heap: &mut Heap, obj: Handle<JsObject>, shape: ShapeHandle) {
-    let cell = heap.validity_cell_of(obj);
-    let key = (heap_id(heap), cell.0);
-    SHAPE_TABLE.with(|table| {
-        table.borrow_mut().insert(key, shape);
-    });
-    heap.add_shape_root(shape);
+    heap.bind_shape(obj, shape);
+}
+
+/// Public wrapper for `bind_shape` so native handlers can bind shapes.
+pub fn bind_shape_public(heap: &mut Heap, obj: Handle<JsObject>, shape: ShapeHandle) {
+    bind_shape(heap, obj, shape);
 }
 
 fn inherited_descriptor(

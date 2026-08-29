@@ -18,7 +18,7 @@ mod runtime;
 #[cfg(not(feature = "jit"))]
 mod stub;
 
-// ADR-006: the shared cache/error types now live in `v12-codegen`; this
+// The shared cache/error types now live in `v12-codegen`; this
 // crate re-exports them for back-compat (both JIT tiers depend on the
 // shared core, not on each other).
 pub use v12_codegen::{CompiledFn, FunctionId, JitCache, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};

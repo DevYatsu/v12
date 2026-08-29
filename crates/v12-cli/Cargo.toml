@@ -10,6 +10,11 @@ name = "v12"
 path = "src/main.rs"
 
 [dependencies]
+# The CLI is the reference consumer of the `v12-api` facade. It
+# still pulls `v12-bccompiler` and `v12-bytecode` for `--disasm` output
+# (a power-user feature outside the facade's scope), but the runtime eval
+# path goes through the facade.
+v12-api.workspace = true
 v12-engine.workspace = true
 v12-bccompiler.workspace = true
 v12-bytecode.workspace = true

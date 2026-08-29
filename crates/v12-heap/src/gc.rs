@@ -266,6 +266,16 @@ pub struct Heap {
     /// heap handles inside, so collections ignore it entirely.
     validity_cells: Vec<u32>,
 
+    /// Object → shape binding.
+    ///
+    /// Keyed by `ValidityCellId::0` (id 0 is the shared null cell and never
+    /// appears here, so the cell `1` lives at index 0). Lives inside the
+    /// heap so a fresh `Heap` cannot read another engine's shapes through
+    /// address reuse, and so the GC owns the table's lifetime. Replaces
+    /// the old global `SHAPE_TABLE: thread_local<RefCell<HashMap<…>>>` in
+    /// the engine and the parallel side table the interpreter used to keep.
+    shape_of_cell: Vec<ShapeHandle>,
+
     /// Canonical string instances by content hash. Every handle in the
     /// table is a GC root (marked at each collection start), so interned
     /// strings outlive the transient duplicates they deduplicate. Buckets
@@ -313,6 +323,7 @@ impl Heap {
             root_shape: Handle::new(0),
             validity_cells: Vec::new(),
             interned_strings: hashbrown::HashMap::new(),
+            shape_of_cell: Vec::new(),
             policy,
             allocated_since_gc: 0,
             live_after_gc: 0,
@@ -599,6 +610,55 @@ impl Heap {
         self.get_mut(obj).flags |= bits;
         let cell = self.validity_cell_of(obj);
         self.bump_validity(cell);
+    }
+
+    // ------------------------------------------------------------------
+    // Object → shape binding
+    // ------------------------------------------------------------------
+
+    /// The shape currently describing `obj`, defaulting to the pinned
+    /// empty-object root when no explicit binding has been recorded.
+    ///
+    /// Replaces the old `thread_local SHAPE_TABLE` keyed by raw heap
+    /// address (the source of the address-reuse correctness bug P1.2).
+    /// `obj` is reached only through its validity cell, so a reused
+    /// handle cannot alias a stale entry from another engine.
+    pub fn shape_of(&self, obj: Handle<JsObject>) -> ShapeHandle {
+        let cell = self.get(obj).validity_cell;
+        if cell == ValidityCellId::NONE {
+            return self.root_shape;
+        }
+        self.shape_of_cell
+            .get(cell.cell_index() - 1)
+            .copied()
+            .unwrap_or(self.root_shape)
+    }
+
+    /// The shape currently describing `obj`, creating its validity cell on
+    /// first use. Equivalent to [`Self::shape_of`] plus the lazy cell
+    /// allocation; exposed for mutators that already hold `&mut Heap` and
+    /// are about to write the binding.
+    pub fn shape_of_mut(&mut self, obj: Handle<JsObject>) -> ShapeHandle {
+        let cell = self.validity_cell_of(obj);
+        self.shape_of_cell
+            .get(cell.cell_index() - 1)
+            .copied()
+            .unwrap_or(self.root_shape)
+    }
+
+    /// Records `shape` as the shape of `obj` and pins it against collection.
+    ///
+    /// Transition edges are untraced, so an unpinned shape dies even while
+    /// objects descended from it live; pinning trades that hazard for
+    /// bounded metadata growth. Old binding is overwritten silently.
+    pub fn bind_shape(&mut self, obj: Handle<JsObject>, shape: ShapeHandle) {
+        let cell = self.validity_cell_of(obj);
+        let idx = cell.cell_index() - 1;
+        if idx >= self.shape_of_cell.len() {
+            self.shape_of_cell.resize(idx + 1, self.root_shape);
+        }
+        self.shape_of_cell[idx] = shape;
+        self.add_shape_root(shape);
     }
 
     // ------------------------------------------------------------------

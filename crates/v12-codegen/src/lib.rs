@@ -1,4 +1,4 @@
-//! Shared types and seams for the v12 JIT tiers (ADR-006).
+//! Shared types and seams for the v12 JIT tiers.
 //!
 //! The two JIT crates (`v12-jit-baseline` and `v12-jit-opt`) used to depend
 //! on each other (`v12-jit-opt` imported baseline types directly), which
@@ -27,7 +27,7 @@
 //! This is the v1 extraction: the shared types and module shells exist; the
 //! actual `DeoptMap`, `GuardKind`, and `TierPolicy` types still live in
 //! `v12-jit-opt`/`v12-jit-baseline` and will be moved here incrementally.
-//! The dependency direction is what ADR-006 needs, and the migration
+//! The dependency direction is what the JIT layering needs, and the migration
 //! pathway is one mechanical move at a time.
 
 #![forbid(unsafe_code)]

@@ -5,13 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Enables `Interp::from_source`, the source-text convenience
+# constructor that pulls in `v12-bccompiler` for tests / power users.
+# Off by default so production embedders can build a small binary.
+default = ["compiler"]
+compiler = ["dep:v12-bccompiler"]
+
 [dependencies]
 v12-bytecode.workspace = true
 v12-heap.workspace = true
-# The interpreter executes `bccompiler::Program`s, so the compiler is a runtime
-# dependency (not merely a dev dependency): `Interp::new` consumes a `Program`.
-# No cycle: the compiler never depends on the interpreter.
-v12-bccompiler.workspace = true
+# The interpreter runs `v12_bytecode::Program`s, not compiler
+# products. The front-end (`v12-bccompiler` / `oxc_*` / `lasso`) is no
+# longer a runtime dependency of the interpreter; embedders that want
+# source-text eval go through `v12-engine` (or `v12-api`).
+v12-bccompiler = { workspace = true, optional = true }
 
 [dev-dependencies]
 test-support.workspace = true

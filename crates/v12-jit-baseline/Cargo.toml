@@ -9,8 +9,8 @@ license.workspace = true
 v12-bytecode.workspace = true
 v12-heap.workspace = true
 v12-interp.workspace = true
-# ADR-006: shared types now live in `v12-codegen`. The baseline tier
-# depends on the shared core, *not* on the opt tier.
+# Shared types live in `v12-codegen`. The baseline tier depends on the
+# shared core, *not* on the opt tier.
 v12-codegen.workspace = true
 cranelift-frontend = { workspace = true, optional = true }
 cranelift-codegen = { workspace = true, optional = true }

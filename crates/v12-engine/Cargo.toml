@@ -13,6 +13,9 @@ v12-bccompiler.workspace = true
 v12-regex.workspace = true
 v12-intl.workspace = true
 malachite.workspace = true
+# The engine depends on the shared codegen core so it can wire
+# tier-up against any tier (`v12-codegen::TierCompiler`).
+v12-codegen.workspace = true
 v12-jit-baseline = { workspace = true, optional = true }
 
 [features]

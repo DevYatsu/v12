@@ -1169,6 +1169,58 @@ impl FunctionBytecode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 4: program-level structure
+// ---------------------------------------------------------------------------
+
+/// Compiled program: every function body plus the entry point.
+///
+/// `main` indexes the top-level script body in [`Program::functions`];
+/// `Closure` instructions reference other entries of that same vector.
+///
+/// Lives in `v12-bytecode` so the interpreter and the embedding
+/// facade can run pre-compiled programs without depending on the
+/// front-end (`v12-bccompiler` / `oxc_*` / `lasso`). The compiler
+/// re-exports this type for back-compat.
+#[derive(Debug, Clone, Default)]
+pub struct Program {
+    pub functions: Vec<FunctionBytecode>,
+    pub main: u32,
+}
+
+/// Names of standard intrinsics that are always present on the global object.
+///
+/// An unresolved `IdentifierReference` whose text is in this table is treated
+/// as a global access (`GetGlobal`/`SetGlobal`) rather than a compile error.
+/// The list is intentionally small for v1 — enough to cover `known-failures.md`
+/// bucket 3 (`Object`, `Array`, `String`, `Number`, `Boolean`, `Math`, `JSON`,
+/// `Error`, …) without claiming full spec coverage.
+///
+/// Lives in `v12-bytecode` so the compiler, the interpreter, and
+/// the realm can all reference the same list without depending on
+/// `v12-bccompiler`. The compiler's `model::GLOBAL_INTRINSICS` re-exports
+/// this constant for back-compat.
+pub const GLOBAL_INTRINSICS: &[&str] = &[
+    "Object",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Math",
+    "JSON",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "URIError",
+    "EvalError",
+    "Promise",
+    "Symbol",
+    "console",
+    "globalThis",
+];
+
 /// Human-readable opcode name; exhaustive so a new variant fails to compile
 /// until it gets a mnemonic.
 pub fn mnemonic(op: Opcode) -> &'static str {
