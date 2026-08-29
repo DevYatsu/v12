@@ -1,9 +1,10 @@
-# Known failures — last scored 2026-08-27
+# Known failures — last scored 2026-08-29
 
-> Latest run: `cargo run -p test262-runner -- --filter language --jobs 8`
-> on commit `f47ec78` (Tier-0 + SSA optimizer Phase 2, fail-closed guards).
-> Totals: **24 873 tests, 4 940 pass / 14 972 fail / 4 961 skip, 24.8 % pass** over `test/language` (bootstrap was 23.5 %).
+> Latest run: `cargo run -p test262-runner -- --filter language --jobs 8 --format json --json-out /tmp/t262.json`
+> on commit `f9dd7de` (generators+async now executable, async skips removed).
+> Totals: **24 873 tests, 4 858 pass / 19 588 fail / 427 skip, 19.9 % pass** over `test/language`.
 > Treatment: `pass%` is over executable tests (`pass + fail`). Skips are not counted.
+> Async-flagged tests (~4.5k) are now executable; most fail on remaining gaps (`yield*`, `for-await`, promise jobs).
 >
 > The assignment-expression slice (`--filter language/expressions/assignment`, 818 files)
 > on the same build: **411 pass / 405 fail / 2 skip, 50.4 % pass** (baseline 49.5 %).
@@ -32,15 +33,12 @@ This file is the fix-it queue. Each bullet is a bucket — a single engine gap t
 - **Symptom:** was a panic at collect.rs:706 (`attempt to add with overflow`, caught as engine panic); since `262aed8` it is a clean compile error, but the index counters still saturate on large files.
 - **Fix location:** widen counters, dedupe constants in plans, or spill to a second plan segment. Zero panics now, so this is purely a capacity fix.
 
-### C. Async harness + `$262` skips — 4 944 skips remaining
+### C. Remaining skips — 427 skips (async now executable)
 
-- **Counts at f47ec78:** async harness 4 883 (`expressions`+`statements`, mostly generators/async), `$262` host object 78 (annexB/eval-code).
-- **Progress (2026-08-27, this commit):** the `$262` host shim landed — tests using `$262.global`/`detachArrayBuffer`/`gc`/`getReport` now run. Skips narrowed from 4 961; remaining skips are only `createRealm(` (multi-realm), `$262.agent`, and async-flagged/`$DONE` tests.
-- **Blocked on engine, not harness:** the async verdict path is gated behind a failing self-test — `Promise.resolve().then(...)` never executes (Promise reaction jobs are not scheduled through `run_jobs()`; `Promise` exists only as an intrinsic name). Self-test kept `#[ignore]`d in `runner.rs` as evidence (`async_doneprint_test_completes_via_captured_print`). Do not narrow the async skip until it passes.
-- **Fix order (remaining):**
-  1. Engine: wire Promise reaction jobs into the job queue (`Promise` intrinsics only exist as names today).
-  2. Then the async `done` print-watched verdict (`doneprintHandle.js` prints `Test262:AsyncTestComplete` → re-read captured `__test262Prints` array) — adds ~4.9k executable tests without hurting pass%.
-- **Note:** Skips do not count toward the `pass%` denominator, so wiring them does not hurt the percentage — it only adds executable tests that must then pass.
+- **Counts at f9dd7de:** async harness 0 (was 4 883 at f47ec78) — generators + async/await now executable via `__test262Prints` capture + `run_jobs` drain. `$262` host object skips are also gone except multi-realm/agent. Remaining skips are only `createRealm(` (multi-realm), `$262.agent`, and `$DONE` without async flag.
+- **Progress (2026-08-29, this commit):** async skip removed from `skip_reason_for` in `conformance/harness/src/runner.rs:322`. `cargo run -p test262-runner -- --filter language --jobs 8 --format json --json-out /tmp/t262.json` now reports **4 858 pass / 19 588 fail / 427 skip, 19.9 % pass** (was 4 940 / 14 972 / 4 961, 24.8 %). Delta: −82 pass, +4 616 fail, −4 534 skip — the ~4.5k formerly-skipped async tests became executable; most fail on remaining gaps (`yield*`, `for-await-of`, promise reaction jobs).
+- **Remaining gaps for async pass%:** `yield*` delegation and `for-await-of` are tracked under bucket A (`unsupported expression`); promise reaction jobs already drain via `run_jobs` but some async tests still need fuller job coverage.
+- **Note:** Skips do not count toward the `pass%` denominator; un-skipping lowers pass% transiently until the newly-exposed failures are fixed.
 
 ## Done (moved out of the queue)
 

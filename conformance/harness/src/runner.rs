@@ -342,9 +342,6 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     // keep the skip only for non-language suites if needed. For the language
     // gate we want them executable, so do not skip here — `run_single_test`
     // will dispatch to `eval_module` when the flag is present.
-    if fm.has_flag("async") {
-        return Some("async harness not yet implemented".to_string());
-    }
     // Multi-realm and agent API remain unsupported: tests that actually call
     // them would fail, so keep an honest skip instead of a guaranteed red.
     if source.contains("createRealm(") {
@@ -694,7 +691,10 @@ mod tests {
             flags: vec!["async".to_string()],
             ..Default::default()
         };
-        assert!(skip_reason_for(&fm, "").is_some());
+        assert!(
+            skip_reason_for(&fm, "").is_none(),
+            "async should no longer be skipped (generators+async wired)"
+        );
     }
 
     #[test]

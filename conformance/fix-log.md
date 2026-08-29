@@ -24,6 +24,18 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-08-29 — Un-ignore async tests (generators+async now executable)
+
+- **Filter:** `language` (24 873 files, 8 jobs)
+- **Before:** 4 940 pass / 14 972 fail / 4 961 skip, 24.8 % pass (f47ec78; async skips 4 883 + $262 78)
+- **After:**  4 858 pass / 19 588 fail / 427 skip, 19.9 % pass (f9dd7de; async skips 0)
+- **Delta:** −82 pass, +4 616 fail, −4 534 skip, −4.9 pts — async slice became executable (expected transient dip; newly exposed failures on `yield*`/`for-await`/promise jobs)
+- **Engine change:** none — harness-only. Removed `if fm.has_flag("async")` skip in `conformance/harness/src/runner.rs:322`; kept `createRealm(`/`$262.agent`/`$DONE` skips. Async completion already covered by `__test262Prints` capture + `engine.run_jobs()` drain.
+- **Files:** `conformance/harness/src/runner.rs`, `conformance/known-failures.md`, `conformance/fix-log.md`
+- **Bucket:** `known-failures.md` C (async harness) — closed; remaining skips 427 are multi-realm/agent + `$DONE`
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8 --format json --json-out /tmp/t262.json && cat /tmp/t262.json | python3 -c "import json; print(json.load(open('/tmp/t262.json'))['summary'])"`
+- **Notes:** `cargo nextest run -p test262-runner` 38/38 pass (skip_async_flag now expects no skip). Language suites remain green on non-async paths; async tests are now scored.
+
 ### 2026-08-27 — `$262` host shim wired; async skip kept (gate failed)
 
 - **Filter:** `language/expressions` (11 190 files, 8 jobs)
