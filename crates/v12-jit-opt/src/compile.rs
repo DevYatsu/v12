@@ -50,8 +50,8 @@
 //!```
 
 use v12_bytecode::{FunctionBytecode, Opcode};
+use v12_codegen::{CompiledFn, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 use v12_heap::JsValue;
-use v12_jit_baseline::{CompiledFn, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 
 use crate::deopt::DeoptMap;
 use crate::guard::{Assumption, GuardKind, LOOP_HOT_THRESHOLD, Lattice};

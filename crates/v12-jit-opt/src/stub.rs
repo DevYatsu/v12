@@ -3,7 +3,7 @@
 //! Stub when `jit` feature disabled. Mirrors baseline stub.
 
 use v12_bytecode::FunctionBytecode;
-use v12_jit_baseline::{CompiledFn, FunctionId, JitError};
+use v12_codegen::{CompiledFn, FunctionId, JitError};
 
 use crate::OptCompiler;
 

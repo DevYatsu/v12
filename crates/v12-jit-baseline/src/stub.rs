@@ -4,9 +4,7 @@
 //! Cranelift.
 
 use v12_bytecode::FunctionBytecode;
-
-use crate::cache::{CompiledFn, JitCache};
-use crate::error::JitError;
+use v12_codegen::{CompiledFn, JitCache, JitError};
 
 /// Baseline JIT stub — no code generation when the feature is off.
 pub struct JitBaseline {

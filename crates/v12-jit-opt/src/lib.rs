@@ -7,7 +7,9 @@
 // ponytail: mono shape/type guard + deopt to interp/baseline. Upgrade when profile >5% in GetProperty/Add -> poly IC, loop versioning, OSR, inlining.
 
 pub use v12_bytecode::{FunctionBytecode, PcMapEntry};
-pub use v12_jit_baseline::{
+// ADR-006: shared types come from the shared core, not from the baseline
+// tier (which is a peer, not a parent).
+pub use v12_codegen::{
     CompiledFn, FunctionId, JitCache, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS,
 };
 

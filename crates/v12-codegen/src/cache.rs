@@ -1,4 +1,4 @@
-//! Registry of baseline-compiled functions.
+//! Registry of compiled functions (shared by the baseline and opt tiers).
 
 use std::collections::HashMap;
 
@@ -8,10 +8,10 @@ use v12_heap::JsValue;
 /// Identifier for a function in the program table.
 pub type FunctionId = u32;
 
-/// Executable closure for a baseline-compiled function.
+/// Executable closure for a compiled function.
 pub type JitExecFn = Box<dyn Fn(&mut [JsValue]) -> JsValue + Send + Sync>;
 
-/// A baseline-compiled function.
+/// A compiled function.
 ///
 /// The struct owns the deoptimization map and the executable closure. The
 /// closure captures the logic for the function and can be invoked via
@@ -27,7 +27,7 @@ pub struct CompiledFn {
 impl CompiledFn {
     /// Creates a new compiled function.
     #[allow(dead_code)]
-    pub(crate) fn new(pc_map: Vec<PcMapEntry>, max_regs: u16, exec: JitExecFn) -> Self {
+    pub fn new(pc_map: Vec<PcMapEntry>, max_regs: u16, exec: JitExecFn) -> Self {
         Self {
             pc_map,
             max_regs,
@@ -67,7 +67,7 @@ impl std::fmt::Debug for CompiledFn {
     }
 }
 
-/// Cache of baseline-compiled entry points keyed by function id.
+/// Cache of compiled entry points keyed by function id.
 ///
 /// The cache is separate from the interpreter's `FeedbackVector`, which
 /// remains owned by `Interp`.

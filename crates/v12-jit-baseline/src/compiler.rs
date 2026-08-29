@@ -14,10 +14,9 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 use v12_bytecode::{FunctionBytecode, Opcode, PcMapEntry, WideOp};
+use v12_codegen::{CompiledFn, JitCache, JitError, JitExecFn, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 use v12_heap::JsValue;
 
-use crate::cache::{CompiledFn, JitExecFn};
-use crate::error::{JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 use crate::runtime;
 
 // ---------------------------------------------------------------------------
@@ -28,14 +27,14 @@ use crate::runtime;
 ///
 /// Owns the compilation cache and emits Cranelift IR for each function.
 pub struct JitBaseline {
-    cache: crate::cache::JitCache,
+    cache: JitCache,
 }
 
 impl JitBaseline {
     /// Creates a new baseline JIT.
     pub fn new() -> Result<Self, JitError> {
         Ok(Self {
-            cache: crate::cache::JitCache::new(),
+            cache: JitCache::new(),
         })
     }
 
@@ -74,12 +73,11 @@ impl JitBaseline {
     }
 
     /// Borrows the compilation cache.
-    pub fn cache(&self) -> &crate::cache::JitCache {
+    pub fn cache(&self) -> &JitCache {
         &self.cache
     }
 
-    /// Mutably borrows the compilation cache.
-    pub fn cache_mut(&mut self) -> &mut crate::cache::JitCache {
+    pub fn cache_mut(&mut self) -> &mut JitCache {
         &mut self.cache
     }
 }

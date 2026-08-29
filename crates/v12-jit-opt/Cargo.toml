@@ -9,6 +9,11 @@ license.workspace = true
 v12-bytecode.workspace = true
 v12-heap.workspace = true
 v12-interp.workspace = true
+# ADR-006: shared types live in `v12-codegen`; the opt tier depends on the
+# shared core for types. `v12-jit-baseline` remains a normal dependency as
+# the fallback tier — the optimizer delegates non-speculative functions to
+# the template JIT — but it no longer supplies opt's public types.
+v12-codegen.workspace = true
 v12-jit-baseline.workspace = true
 cranelift-frontend = { workspace = true, optional = true }
 cranelift-codegen = { workspace = true, optional = true }

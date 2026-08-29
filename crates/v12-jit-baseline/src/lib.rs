@@ -11,19 +11,19 @@
 
 pub mod mmap;
 
-mod cache;
 #[cfg(feature = "jit")]
 mod compiler;
-mod error;
 #[cfg(feature = "jit")]
 mod runtime;
 #[cfg(not(feature = "jit"))]
 mod stub;
 
-pub use cache::{CompiledFn, FunctionId, JitCache};
+// ADR-006: the shared cache/error types now live in `v12-codegen`; this
+// crate re-exports them for back-compat (both JIT tiers depend on the
+// shared core, not on each other).
+pub use v12_codegen::{CompiledFn, FunctionId, JitCache, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 #[cfg(feature = "jit")]
 pub use compiler::JitBaseline;
-pub use error::{JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 #[cfg(not(feature = "jit"))]
 pub use stub::JitBaseline;
 
