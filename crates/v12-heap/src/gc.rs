@@ -424,6 +424,13 @@ impl Heap {
         self.roots.0.push(value);
     }
 
+    /// Removes all occurrences of `value` from the root set.
+    pub fn remove_root(&mut self, value: JsValue) {
+        while let Some(pos) = self.roots.0.iter().position(|v| *v == value) {
+            self.roots.0.remove(pos);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Shapes
     // ------------------------------------------------------------------
@@ -1002,6 +1009,7 @@ mod tests {
             kind: KIND_ORDINARY,
             flags: 0,
             properties: props,
+            property_keys: Vec::new(),
             elements: Vec::new(),
             prototype: proto,
             validity_cell: ValidityCellId::NONE,

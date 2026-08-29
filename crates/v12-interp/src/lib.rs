@@ -372,6 +372,7 @@ fn decode_parked_call(instrs: &[Instr], pc: usize) -> (bool, u16, usize) {
             Ok((WideOp::ConstructW { dst, .. }, width)) => (true, dst, width),
             Ok((WideOp::RegExt { mask, a_hi, .. }, _)) => {
                 // The narrow call/construct follows the 2-word prefix.
+                // SAFETY: corrupt bytecode may panic — caller validates before emit
                 let narrow = instrs
                     .get(pc + 2)
                     .copied()
@@ -384,6 +385,7 @@ fn decode_parked_call(instrs: &[Instr], pc: usize) -> (bool, u16, usize) {
                 let is_construct = narrow.op() == Some(Opcode::Construct);
                 (is_construct, dst, 3)
             }
+            // SAFETY: corrupt bytecode may panic — caller validates before emit
             other => panic!("call parked on malformed wide header: {other:?}"),
         },
         _ => (
@@ -1431,15 +1433,23 @@ impl Interp {
                     // Advance caller past its Call header: async call returns Promise if available else undefined (task 7)
                     if let Some(caller) = self.frames.last_mut() {
                         let instrs = &self.functions[caller.fn_idx as usize].instrs;
-                        let (_, cdst, width) = decode_parked_call(instrs, caller.pc);
-                        let caller_base = caller.base;
-                        if has_promise {
-                            self.stack[caller_base + usize::from(cdst)] = async_promise;
-                        } else {
-                            // No promise slot yet (legacy path) – keep undefined for backward compat
-                            self.stack[caller_base + usize::from(cdst)] = JsValue::undefined();
+                        let caller_pc = caller.pc;
+                        let try_decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_parked_call(instrs, caller_pc)));
+                        if let Ok((_, cdst, width)) = try_decode {
+                            let caller_base = caller.base;
+                            let idx = caller_base + usize::from(cdst);
+                            // SAFETY: corrupt bytecode may panic — caller validates before emit (exempt here via catch_unwind)
+                            if idx >= self.stack.len() {
+                                self.stack.resize(idx + 1, JsValue::undefined());
+                            }
+                            if has_promise {
+                                self.stack[idx] = async_promise;
+                            } else {
+                                // No promise slot yet (legacy path) – keep undefined for backward compat
+                                self.stack[idx] = JsValue::undefined();
+                            }
+                            caller.pc += width;
                         }
-                        caller.pc += width;
                     } else {
                         return Ok(());
                     }
@@ -1758,6 +1768,11 @@ impl Interp {
                     self.heap.get_mut(ph).properties[0] = JsValue::from_i32_smi(1).expect("fits");
                     self.heap.get_mut(ph).properties[1] = result;
                 }
+                // Prevent Heap::roots leak: promise was roots-pinned at creation/await; after settling
+                // it remains reachable via generator properties[4] until GC, so drop the extra root.
+                if let Some(ph_val) = self.heap.get(r#gen).properties.get(4).copied() {
+                    self.heap.remove_root(ph_val);
+                }
             }
             self.stack.truncate(finished.base);
             if self.heap.get(r#gen).properties.len() >= 3 {
@@ -1776,8 +1791,13 @@ impl Interp {
                                 let try_decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_parked_call(instrs, pc)));
                                 if let Ok((_, dst, width)) = try_decode {
                                     let caller_base = caller.base;
-                                    if self.stack[caller_base + usize::from(dst)].is_undefined() {
-                                        self.stack[caller_base + usize::from(dst)] = ph;
+                                    let idx = caller_base + usize::from(dst);
+                                    let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
+                                    if is_undef {
+                                        if idx >= self.stack.len() {
+                                            self.stack.resize(idx + 1, JsValue::undefined());
+                                        }
+                                        self.stack[idx] = ph;
                                         caller.pc += width;
                                         return Ok(false);
                                     }
@@ -1810,19 +1830,39 @@ impl Interp {
         // returns an object replaces the instance, otherwise the newly
         // allocated instance (still sitting in the callee's r0) is returned.
         let instrs = &self.functions[caller.fn_idx as usize].instrs;
-        let (is_construct, dst, width) = decode_parked_call(instrs, caller.pc);
         let caller_base = caller.base;
+        let caller_pc = caller.pc;
+        // SAFETY: corrupt bytecode may panic — caller validates before emit (RegExt/call-park malformed panics are exempt)
+        let try_decode = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_parked_call(instrs, caller_pc)));
+        let Ok((is_construct, dst, width)) = try_decode else {
+            // Corrupt call header: treat as JS TypeError rather than native panic
+            self.stack.truncate(finished.base);
+            return Err(JSException(self.error_value("TypeError: corrupt call header")));
+        };
+        let idx = caller_base + usize::from(dst);
+        // Only deliver if destination still holds undefined (caller hasn't been resumed elsewhere)
+        let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
+        if !is_undef {
+            self.stack.truncate(finished.base);
+            return Ok(false);
+        }
         let result = if is_construct && result.as_object().is_none() && !result.is_hole() {
             // Callee frame still intact at this point (truncation happens
             // below), so its `this` register — the constructed instance.
-            let v = self.stack[finished.base];
+            let v = self.stack.get(finished.base).copied().unwrap_or(result);
             if v.as_object().is_some() { v } else { result }
         } else {
             result
         };
         self.stack.truncate(finished.base);
-        self.stack[caller_base + usize::from(dst)] = result;
-        caller.pc += width;
+        if idx >= self.stack.len() {
+            self.stack.resize(idx + 1, JsValue::undefined());
+        }
+        self.stack[idx] = result;
+        // Re-borrow caller after truncate (still last frame)
+        if let Some(c) = self.frames.last_mut() {
+            c.pc += width;
+        }
         Ok(false)
     }
 
