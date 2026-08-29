@@ -765,9 +765,9 @@ impl<'a> Interp<'a> {
     /// Applies ES `ToString` from outside the machine — diagnostics and test
     /// harnesses, not executable semantics.
     pub fn to_display_string(&mut self, v: JsValue) -> String {
-        match ops::to_js_string(&mut self.heap, v) {
+        match ops::to_js_string(self.heap, v) {
             Ok(h) => {
-                let units = ops::string_units(&mut self.heap, h);
+                let units = ops::string_units(self.heap, h);
                 String::from_utf16_lossy(&units)
             }
             Err(_) => "<unprintable>".into(),
@@ -953,7 +953,7 @@ impl<'a> Interp<'a> {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
                     self.gc_protect();
-                    let v = attempt!(ops::add(&mut self.heap, l, r));
+                    let v = attempt!(ops::add(self.heap, l, r));
                     self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
@@ -965,7 +965,7 @@ impl<'a> Interp<'a> {
                 Opcode::Sub => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
-                    let v = ops::sub(&mut self.heap, l, r);
+                    let v = ops::sub(self.heap, l, r);
                     self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
@@ -977,7 +977,7 @@ impl<'a> Interp<'a> {
                 Opcode::Mul => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
-                    let v = ops::mul(&mut self.heap, l, r);
+                    let v = ops::mul(self.heap, l, r);
                     self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
@@ -990,9 +990,9 @@ impl<'a> Interp<'a> {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
                     let n = match op {
-                        Opcode::Div => ops::div(&mut self.heap, l, r),
-                        Opcode::Mod => ops::modulo(&mut self.heap, l, r),
-                        _ => ops::js_pow(&mut self.heap, l, r),
+                        Opcode::Div => ops::div(self.heap, l, r),
+                        Opcode::Mod => ops::modulo(self.heap, l, r),
+                        _ => ops::js_pow(self.heap, l, r),
                     };
                     self.stack[base + usize::from(ra)] = n;
                     let lat = Lattice::from_value(n, None);
@@ -1007,8 +1007,8 @@ impl<'a> Interp<'a> {
                 // Bitwise operations and shifts (ES ToInt32/ToUint32)
                 // ------------------------------------------------------
                 Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
-                    let ln = ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
-                    let rn = ops::to_number(&mut self.heap, self.stack[base + usize::from(rc)]);
+                    let ln = ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
+                    let rn = ops::to_number(self.heap, self.stack[base + usize::from(rc)]);
                     let (a, b) = (ops::to_int32(ln), ops::to_int32(rn));
                     let n = match op {
                         Opcode::BitAnd => a & b,
@@ -1019,8 +1019,8 @@ impl<'a> Interp<'a> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Shl | Opcode::Shr | Opcode::UShr => {
-                    let ln = ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
-                    let rn = ops::to_number(&mut self.heap, self.stack[base + usize::from(rc)]);
+                    let ln = ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
+                    let rn = ops::to_number(self.heap, self.stack[base + usize::from(rc)]);
                     let shift = ops::to_uint32(rn) & 31;
                     let n = match op {
                         Opcode::Shl => ops::to_int32(ln) << shift,
@@ -1038,37 +1038,37 @@ impl<'a> Interp<'a> {
                 Opcode::Eq | Opcode::Ne => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
-                    let eq = ops::loose_equals(&mut self.heap, l, r);
+                    let eq = ops::loose_equals(self.heap, l, r);
                     self.write_bool(base, ra, eq ^ (op == Opcode::Ne));
                     self.set_pc(pc + op_width);
                 }
                 Opcode::StrictEq | Opcode::StrictNe => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
-                    let eq = ops::strict_equals(&self.heap, l, r);
+                    let eq = ops::strict_equals(self.heap, l, r);
                     self.write_bool(base, ra, eq ^ (op == Opcode::StrictNe));
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
-                    let ord = ops::compare(op, &mut self.heap, l, r);
+                    let ord = ops::compare(op, self.heap, l, r);
                     self.write_bool(base, ra, ord);
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Neg => {
-                    let n = -ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
+                    let n = -ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
                     self.stack[base + usize::from(ra)] = ops::box_number(n);
                     self.set_pc(pc + op_width);
                 }
                 Opcode::BitNot => {
-                    let n = ops::to_number(&mut self.heap, self.stack[base + usize::from(rb)]);
+                    let n = ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
                     self.stack[base + usize::from(ra)] =
                         ops::box_number(f64::from(!ops::to_int32(n)));
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Not => {
-                    let truthy = ops::to_boolean(&self.heap, self.stack[base + usize::from(rb)]);
+                    let truthy = ops::to_boolean(self.heap, self.stack[base + usize::from(rb)]);
                     self.write_bool(base, ra, !truthy);
                     self.set_pc(pc + op_width);
                 }
@@ -1104,7 +1104,7 @@ impl<'a> Interp<'a> {
                     self.set_pc(narrow.imm24() as usize);
                 }
                 Opcode::JumpIfFalse | Opcode::JumpIfTrue => {
-                    let truthy = ops::to_boolean(&self.heap, self.stack[base + usize::from(ra)]);
+                    let truthy = ops::to_boolean(self.heap, self.stack[base + usize::from(ra)]);
                     let taken = truthy ^ (op == Opcode::JumpIfFalse);
                     self.set_pc(if taken {
                         usize::from(narrow.imm16())
@@ -1470,7 +1470,7 @@ impl<'a> Interp<'a> {
                     .get(str_id as usize)
                     .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"))
                     .clone();
-                let h = intern_text(&mut self.heap, &text);
+                let h = intern_text(self.heap, &text);
                 self.const_strings.insert(str_id, h);
                 Ok(JsValue::string(h))
             }
@@ -1480,7 +1480,7 @@ impl<'a> Interp<'a> {
             // these variants implies hand-built bytecode.
             Const::BigIntId(_) | Const::BigU64(_) => {
                 Err(JSException(JsValue::string(intern_text(
-                    &mut self.heap,
+                    self.heap,
                     "InternalError: BigInt constants are not supported yet",
                 ))))
             }
@@ -1491,7 +1491,7 @@ impl<'a> Interp<'a> {
         if let Some(h) = self.typeof_names[tag] {
             return Ok(h);
         }
-        let h = intern_text(&mut self.heap, TYPE_NAMES[tag]);
+        let h = intern_text(self.heap, TYPE_NAMES[tag]);
         self.typeof_names[tag] = Some(h);
         Ok(h)
     }
@@ -1639,7 +1639,7 @@ impl<'a> Interp<'a> {
                 // Disjoint field borrows: heap + natives mut, stack immut.
                 // Borrow checker allows distinct fields in 2024 edition.
                 self.natives
-                    .call_native(&mut self.heap, this_v, args, target)
+                    .call_native(self.heap, this_v, args, target)
             };
             return result.map(CallOutcome::Value).map_err(JSException);
         }
@@ -1881,7 +1881,7 @@ impl<'a> Interp<'a> {
 
     /// Materializes an interned error string as a throwable value.
     fn error_value(&mut self, text: &str) -> JsValue {
-        JsValue::string(intern_text(&mut self.heap, text))
+        JsValue::string(intern_text(self.heap, text))
     }
 
     // ------------------------------------------------------------------
@@ -1970,7 +1970,7 @@ impl<'a> Interp<'a> {
         if let Some(k) = self.length_key {
             return k;
         }
-        let h = intern_text(&mut self.heap, "length");
+        let h = intern_text(self.heap, "length");
         let k = PropKey::from_string(h);
         self.length_key = Some(k);
         k
@@ -1980,7 +1980,7 @@ impl<'a> Interp<'a> {
         if let Some(k) = self.prototype_key {
             return k;
         }
-        let h = intern_text(&mut self.heap, "prototype");
+        let h = intern_text(self.heap, "prototype");
         let k = PropKey::from_string(h);
         self.prototype_key = Some(k);
         k
@@ -2016,7 +2016,7 @@ impl<'a> Interp<'a> {
 
     /// Decodes a heap string to Rust text (key handling and diagnostics).
     fn string_text(&mut self, h: Handle<V12Str>) -> String {
-        let units = ops::string_units(&mut self.heap, h);
+        let units = ops::string_units(self.heap, h);
         String::from_utf16_lossy(&units)
     }
 
@@ -2030,7 +2030,7 @@ impl<'a> Interp<'a> {
         if let Some(y) = key_v.as_symbol() {
             return Ok(PropKey::from_symbol(y));
         }
-        let h = ops::to_js_string(&mut self.heap, key_v)?;
+        let h = ops::to_js_string(self.heap, key_v)?;
         Ok(PropKey::from_string(h))
     }
 
@@ -2686,13 +2686,13 @@ impl<'a> Interp<'a> {
             if let Some(n) = v.as_smi().map(f64::from).or(v.as_f64()) {
                 // Numeric key → decimal string.
                 let text = ops::number_to_string(n);
-                let h = intern_text(&mut self.heap, &text);
+                let h = intern_text(self.heap, &text);
                 excl_keys.push(PropKey::from_string(h));
                 continue;
             }
             if let Some(b) = v.as_bool() {
                 let text = if b { "true" } else { "false" };
-                let h = intern_text(&mut self.heap, text);
+                let h = intern_text(self.heap, text);
                 excl_keys.push(PropKey::from_string(h));
                 continue;
             }
@@ -2703,7 +2703,7 @@ impl<'a> Interp<'a> {
                 continue;
             }
             // Fallback: ToString then intern.
-            let h = ops::to_js_string(&mut self.heap, v)?;
+            let h = ops::to_js_string(self.heap, v)?;
             excl_keys.push(PropKey::from_string(h));
         }
 
@@ -2852,7 +2852,7 @@ impl<'a> Interp<'a> {
                 return Ok(v);
             }
         }
-        let h = intern_text(&mut self.heap, text);
+        let h = intern_text(self.heap, text);
         let key = PropKey::from_string(h);
         let shape = self.shape_of(global);
         if let Some(desc) = self.heap.lookup_property(shape, key)
@@ -2888,7 +2888,7 @@ impl<'a> Interp<'a> {
                 return Ok(());
             }
         }
-        let h = intern_text(&mut self.heap, &text);
+        let h = intern_text(self.heap, &text);
         let key = PropKey::from_string(h);
         let shape = self.shape_of(global);
         // If already a property, update.
@@ -2978,7 +2978,7 @@ impl<'a> Interp<'a> {
             self.gc_protect();
             let result = self
                 .natives
-                .call_native(&mut self.heap, this_v, &args_vec, target);
+                .call_native(self.heap, this_v, &args_vec, target);
             return result.map(CallOutcome::Value).map_err(JSException);
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
@@ -3112,7 +3112,7 @@ impl<'a> Interp<'a> {
             let result = {
                 let args = &self.stack[args_start..args_end];
                 self.natives
-                    .call_native(&mut self.heap, JsValue::undefined(), args, target)
+                    .call_native(self.heap, JsValue::undefined(), args, target)
             };
             return result.map(CallOutcome::Value).map_err(JSException);
         }
@@ -3134,7 +3134,7 @@ impl<'a> Interp<'a> {
                 // Fallback for function objects created outside `Closure`
                 // (host-created) that lack the spec-mandated property.
                 self.gc_protect();
-                let key_handle = intern_text(&mut self.heap, "prototype");
+                let key_handle = intern_text(self.heap, "prototype");
                 let p = self.heap.alloc(JsObject::default());
                 // Untracked until `set_property` stores it behind the callee;
                 // that path allocates, so root it for the duration.
@@ -3499,7 +3499,7 @@ impl<'a> Interp<'a> {
             }
         }
         self.gc_protect();
-        Ok(JsValue::string(intern_text(&mut self.heap, &parts.join(&sep))))
+        Ok(JsValue::string(intern_text(self.heap, &parts.join(&sep))))
     }
 
     fn array_push_fallback(&mut self, this_v: JsValue, args: &[JsValue]) -> Result<JsValue, JSException> {
