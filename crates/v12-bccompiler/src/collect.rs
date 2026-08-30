@@ -399,6 +399,7 @@ impl<'s> Collector<'s> {
                         .any(|d| d.expression.value == "use strict")
                 });
                 mplan.is_strict = parent_strict || own_strict;
+                mplan.static_method = m.r#static;
                 let m_strict = mplan.is_strict;
                 self.plans.units.push(mplan);
                 self.plans.fn_index.insert(m.value.span, midx);
@@ -759,6 +760,17 @@ impl<'s> Collector<'s> {
                         .expect("arrow below main unit");
                 }
                 self.plans.units[owner].needs_this = true;
+            }
+            Expression::Super(_) => {
+                // `super` resolves through the class env captured by the
+                // nearest enclosing method/constructor unit.
+                let mut owner = self.cur_unit();
+                while self.plans.units[owner].is_arrow {
+                    owner = self.plans.units[owner]
+                        .parent
+                        .expect("arrow below main unit");
+                }
+                self.plans.units[owner].uses_super = true;
             }
             Expression::FunctionExpression(f) => {
                 self.fn_unit(f, false, "<fnexpr>");

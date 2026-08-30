@@ -274,7 +274,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::ImportExpression(i) => {
                 Err(self.err(i.span, "dynamic import() is not supported"))
             }
-            Expression::Super(x) => Err(self.err(x.span, "`super` references are not supported")),
+            Expression::Super(x) => self.super_expr(x.span),
             Expression::ImportMeta(x) => Err(self.err(x.span, "`import.meta` is not supported")),
             Expression::NewTarget(x) => Err(self.err(x.span, "`new.target` is not supported")),
             Expression::PrivateInExpression(x) => Err(self.err(
@@ -1093,7 +1093,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             MemberExpression::StaticMemberExpression(s) => {
                 // `console.log`: `console` → `GetGlobal` (PropKey), `log` →
                 // `LoadConst` (Str32). Keep the ids distinct.
-                let obj = self.expr(&s.object)?;
+                let obj = if s.object.is_super() {
+                    self.super_expr(s.object.span())?
+                } else {
+                    self.expr(&s.object)?
+                };
                 let key = self.new_temp();
                 self.load_str(key, s.property.name.as_str(), s.property.span)?;
                 Ok((obj, key))
@@ -1101,7 +1105,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             MemberExpression::ComputedMemberExpression(c) => {
                 // Key first, then base — single temp for key, no extra alloc.
                 let key = self.expr(&c.expression)?;
-                let obj = self.expr(&c.object)?;
+                let obj = if c.object.is_super() {
+                    self.super_expr(c.object.span())?
+                } else {
+                    self.expr(&c.object)?
+                };
                 Ok((obj, key))
             }
             MemberExpression::PrivateFieldExpression(p) => {
@@ -1568,11 +1576,22 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             // Layout: [callee][this][arg…]; see `CALL_HEADER_REGS`.
             let block = self.new_temps(argc + CALL_HEADER_REGS);
 
-            if let Some(m) = c.callee.as_member_expression() {
+            if c.callee.is_super() {
+                // `super(...)`: call the parent constructor with `this`.
+                let super_ctor = self.super_ctor(c.span)?;
+                self.move_reg(block, super_ctor, c.span);
+                self.move_reg(block + 1, REG_THIS, c.span);
+            } else if let Some(m) = c.callee.as_member_expression() {
                 // Method call: obj + key evaluate first, `this` = object.
+                // `super.x(...)` uses `this` as the receiver (the home object
+                // supplies the method, the current `this` the receiver).
                 let (obj, key) = self.member_parts(m)?;
                 self.emit_reg3(Opcode::GetProperty, block, obj, key, c.span);
-                self.move_reg(block + 1, obj, c.span);
+                if m.object().is_super() {
+                    self.move_reg(block + 1, REG_THIS, c.span);
+                } else {
+                    self.move_reg(block + 1, obj, c.span);
+                }
             } else {
                 let v = self.expr(&c.callee)?;
                 self.move_reg(block, v, c.span);
@@ -1632,6 +1651,55 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             .get(&span)
             .copied()
             .ok_or_else(|| self.err(span, "internal: nested function missing from plans"))
+    }
+
+    /// Env depth from the current frame to the class scope env captured by the
+    /// nearest method/constructor unit. Each env-bearing unit on the path
+    /// (including the method's own prologue env) contributes one parent link;
+    /// the class env itself is that link's target (depth 0 when the frame env
+    /// is the class env directly).
+    fn super_env_depth(&self) -> u8 {
+        let units = &self.comp.plans.units;
+        let mut depth = 0u8;
+        let mut cur = Some(self.unit);
+        while let Some(u) = cur {
+            if units[u].has_env {
+                depth += 1;
+            }
+            if !units[u].is_arrow && units[u].uses_super {
+                break;
+            }
+            cur = units[u].parent;
+        }
+        depth
+    }
+
+    /// `super` in expression position: resolves the parent constructor from
+    /// the class env. For member access the caller additionally dereferences
+    /// `.prototype` for instance methods.
+    fn super_ctor(&mut self, span: Span) -> Res<u16> {
+        if !self.comp.plans.units[self.unit].uses_super {
+            return Err(self.err(span, "`super` outside a class method is not supported"));
+        }
+        let depth = self.super_env_depth();
+        let d = self.new_temp();
+        self.emit_get_env(d, depth, crate::class::SLOT_SUPER_CTOR, span);
+        Ok(d)
+    }
+
+    /// Lowers `super` used as a member object: `superCtor.prototype` for
+    /// instance methods, `superCtor` for static methods and constructors.
+    fn super_expr(&mut self, span: Span) -> Res<u16> {
+        let ctor = self.super_ctor(span)?;
+        let is_static = self.comp.plans.units[self.unit].static_method;
+        if is_static {
+            return Ok(ctor);
+        }
+        let proto = self.new_temp();
+        let key = self.new_temp();
+        self.load_str(key, "prototype", span)?;
+        self.emit_reg3(Opcode::GetProperty, proto, ctor, key, span);
+        Ok(proto)
     }
 
     fn emit_closure_instr(&mut self, dst: u16, idx: usize, span: Span) -> Res<()> {

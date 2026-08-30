@@ -77,6 +77,11 @@ pub struct JsObject {
     /// higher ids. Lets a closure created in one program (e.g. `eval`) be
     /// invoked from another by resolving through the program registry.
     pub program_id: u32,
+    /// For `KIND_FUNCTION` objects: the captured lexical environment the
+    /// closure closes over. Distinct from `prototype` (the [[Prototype]]
+    /// link, which classes' `extends` rewires). Kept separate so a function
+    /// can have both a real prototype chain and a captured env.
+    pub captured_env: Option<Handle<JsObject>>,
     /// The shape describing this object's property layout. Stored directly
     /// on the object (one word) so `Heap::shape_of` is a single field read
     /// — no side-table indirection on the property-access hot path. Defaults
@@ -135,6 +140,7 @@ impl Default for JsObject {
             flags: 0,
             callable: crate::function::FunctionTarget::Bytecode(0),
             program_id: 0,
+            captured_env: None,
             shape: crate::shape::ShapeHandle::new(0),
             inline_props: [crate::JsValue::undefined(); Self::IN_OBJECT_PROP_CAP],
             overflow: None,
@@ -225,13 +231,13 @@ impl JsObject {
         }
     }
 
-    /// A function object: `callable` is what invoking it runs, `prototype`
+    /// A function object: `callable` is what invoking it runs, `captured_env`
     /// is the closure environment.
     pub fn function(target: crate::function::FunctionTarget, env: Option<Handle<JsObject>>) -> Self {
         Self {
             kind: KIND_FUNCTION,
             callable: target,
-            prototype: env,
+            captured_env: env,
             ..Self::default()
         }
     }
@@ -612,6 +618,7 @@ impl Trace for JsObject {
         self.elements.trace(sink);
         self.elements_array.trace(sink);
         self.prototype.trace(sink);
+        self.captured_env.trace(sink);
     }
 }
 

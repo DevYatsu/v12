@@ -22,6 +22,11 @@ use v12_bytecode::Opcode;
 use crate::expr::static_key_text;
 use crate::model::{CompileError, FnCtx};
 
+/// Fixed environment slots for the class scope captured by the constructor
+/// and method closures. Only allocated when the class has a heritage.
+pub(crate) const SLOT_SUPER_CTOR: u16 = 0;
+pub(crate) const SUPER_ENV_SLOTS: u16 = 1;
+
 /// Lowers a class expression, returning the register holding the constructor.
 pub(crate) fn class_expression(
     cx: &mut FnCtx<'_, '_, '_, '_>,
@@ -30,6 +35,15 @@ pub(crate) fn class_expression(
 ) -> Result<u16, CompileError> {
     let span = c.span;
     let has_super = c.heritage.is_some();
+
+    // 0. The class scope environment: holds the parent constructor for
+    //    `super`. Created *before* any closure so the constructor and every
+    //    method capture it; populated once `extends` has been evaluated.
+    //    `NewEnvironment` installs it as the current frame's innermost env
+    //    (no destination register).
+    if has_super {
+        cx.emit_new_env(0, SUPER_ENV_SLOTS, span);
+    }
 
     // 1. Compile the constructor unit (registered during collect) and create
     //    its closure — the class function itself.
@@ -48,8 +62,11 @@ pub(crate) fn class_expression(
         cx.load_undefined(p, span);
         p
     };
+    if has_super {
+        cx.emit_set_env(0, SLOT_SUPER_CTOR, parent, span);
+    }
 
-    // 3. Create the prototype object and link it to the constructor.
+    // 4. Create the prototype object and link it to the constructor.
     let proto = cx.new_temp();
     cx.emit_reg3(Opcode::NewObject, proto, 0, 0, span);
     let proto_key = cx.load_str_key("prototype", span)?;
@@ -59,7 +76,7 @@ pub(crate) fn class_expression(
     // proto.constructor = constructor
     cx.emit_reg3(Opcode::SetProperty, proto, ctor_key, ctor, span);
 
-    // 4. Wire `extends` prototype chains.
+    // 5. Wire `extends` prototype chains.
     if has_super {
         // Constructor [[Prototype]] = parent constructor (static inheritance).
         cx.emit_reg3(Opcode::SetPrototype, 0, ctor, parent, span);
@@ -70,7 +87,7 @@ pub(crate) fn class_expression(
         cx.emit_reg3(Opcode::SetPrototype, 0, proto, pp, span);
     }
 
-    // 5. Define the class elements (methods, getters/setters, statics).
+    // 6. Define the class elements (methods, getters/setters, statics).
     define_elements(cx, &c.body, ctor, proto)?;
 
     // Class declarations bind the constructor to the class name.

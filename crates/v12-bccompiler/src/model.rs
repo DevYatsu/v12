@@ -216,6 +216,13 @@ pub struct UnitPlan {
     pub has_rest: bool,
     /// Strict mode for this unit (inherited + directive).
     pub is_strict: bool,
+    /// The method/constructor body references `super`; its unit must resolve
+    /// the class env captured by its closure.
+    pub uses_super: bool,
+    /// The unit is a class method with the `static` modifier: `super.x`
+    /// resolves against the parent constructor directly instead of its
+    /// `prototype`.
+    pub static_method: bool,
     /// First free register above params + non-captured locals.
     pub locals_end: u16,
 }
@@ -236,6 +243,8 @@ impl UnitPlan {
             param_count: 0,
             has_rest: false,
             is_strict: false,
+            uses_super: false,
+            static_method: false,
             locals_end: 1, // r0 = this
         }
     }

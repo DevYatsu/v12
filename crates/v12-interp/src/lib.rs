@@ -1910,7 +1910,7 @@ impl<'a> Interp<'a> {
         // program (eval) resolve its bytecode against the right table.
         let (target, captured_env, callee_program) = {
             let c = self.heap.get(callee_obj);
-            (c.callable, c.prototype, c.program_id)
+            (c.callable, c.captured_env, c.program_id)
         };
 
         // Dispatch on the callable. Bytecode targets below the program length
@@ -2151,7 +2151,7 @@ impl<'a> Interp<'a> {
     ) -> Result<JsValue, JSException> {
         let (target, captured_env, func_program) = {
             let o = self.heap.get(func);
-            (o.callable, o.prototype, o.program_id)
+            (o.callable, o.captured_env, o.program_id)
         };
         match target {
             v12_heap::FunctionTarget::Native(f) => {
@@ -2541,13 +2541,21 @@ impl<'a> Interp<'a> {
     /// ES `ToString`.
     fn property_key(&mut self, key_v: JsValue) -> Result<PropKey, JSException> {
         if let Some(h) = key_v.as_string() {
-            return Ok(PropKey::from_string(h));
+            // Canonicalize through the intern table: PropKey identity is
+            // reference identity, and dynamically-built strings (concat,
+            // computed keys) must alias the canonical instance for the
+            // property to be found.
+            let units = ops::string_units(self.heap, h);
+            let canonical = self.heap.intern_string(v12_heap::V12Str::utf16(units));
+            return Ok(PropKey::from_string(canonical));
         }
         if let Some(y) = key_v.as_symbol() {
             return Ok(PropKey::from_symbol(y));
         }
         let h = ops::to_js_string(self.heap, key_v)?;
-        Ok(PropKey::from_string(h))
+        let units = ops::string_units(self.heap, h);
+        let canonical = self.heap.intern_string(v12_heap::V12Str::utf16(units));
+        Ok(PropKey::from_string(canonical))
     }
 
     /// `GetProperty` with monomorphic inline-cache probing and accessor support.
@@ -3675,7 +3683,7 @@ impl<'a> Interp<'a> {
         // program (eval) resolve its bytecode against the right table.
         let (target, captured_env, callee_program) = {
             let c = self.heap.get(callee_obj);
-            (c.callable, c.prototype, c.program_id)
+            (c.callable, c.captured_env, c.program_id)
         };
 
         // Materialize the spread args from the args array (shared by both the
@@ -3954,7 +3962,7 @@ impl<'a> Interp<'a> {
             pc: 0,
             base: new_base,
             max_regs: callee_max_regs,
-            env: self.heap.get(callee_obj).prototype,
+            env: self.heap.get(callee_obj).captured_env,
             generator: None,
             yield_dst: None,
         });
