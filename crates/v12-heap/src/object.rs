@@ -46,6 +46,12 @@ pub const KIND_MAP: u8 = 7;
 /// `v12-engine/src/builtins/map.rs`).
 pub const KIND_SET: u8 = 8;
 
+/// Iterator object (Array/Map/Set iterators backing `Symbol.iterator`).
+/// Internal state lives in `elements` as `[kind, source, index]` — see
+/// `v12-engine/src/builtins/iterator.rs`. The `next` method is a native
+/// routed through the registry.
+pub const KIND_ITERATOR: u8 = 9;
+
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
 /// down. Transitions are monotone — sealing then freezing is legal, nothing
 /// un-seals — so [`Heap::set_integrity_level`] only ever raises flags.

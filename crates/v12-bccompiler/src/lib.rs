@@ -39,8 +39,7 @@
 //! - Unary `+` (no ToNumber opcode), spread arguments in `new`
 //!   expressions, getters/setters in object literals, BigInt/RegExp literals,
 //!   classes, generators/async beyond stubs, `for-in` (needs a key-listing
-//!   builtin), `for-of` (needs `Symbol.iterator`), `with`, tagged templates,
-//!   dynamic `import()`.
+//!   builtin), `with`, tagged templates, dynamic `import()`.
 //! - Optional chains guard per link into one shared chain-exit; the spec's
 //!   full "delete this chain part" reference semantics are not modeled.
 //! - Logical assignment to member targets keeps the resolved `(obj, key)`

@@ -293,6 +293,59 @@ impl<'s> Collector<'s> {
                 }
                 self.stmt(&f.body);
             }
+            Statement::ForInStatement(f) => {
+                // `for (const k in obj)`: declare the left binding pattern
+                // (the loop variable), then walk the right and body.
+                match &f.left {
+                    oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
+                        let is_const =
+                            matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+                        for d in &v.declarations {
+                            if is_const
+                                && let Some(sym) = binding_symbol(&d.id)
+                            {
+                                self.plans.const_bindings.insert(sym);
+                            }
+                            self.binding_pattern(&d.id);
+                        }
+                    }
+                    oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
+                        if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
+                            self.note_ref(sym);
+                        }
+                    }
+                    _ => {}
+                }
+                self.expr(&f.right);
+                self.stmt(&f.body);
+            }
+            Statement::ForOfStatement(f) => {
+                // `for (const x of iterable)`: the left binding pattern is a
+                // fresh per-iteration binding — declare it in the current
+                // unit so `access()` resolves a real register, not r0.
+                match &f.left {
+                    oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
+                        let is_const =
+                            matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+                        for d in &v.declarations {
+                            if is_const
+                                && let Some(sym) = binding_symbol(&d.id)
+                            {
+                                self.plans.const_bindings.insert(sym);
+                            }
+                            self.binding_pattern(&d.id);
+                        }
+                    }
+                    oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
+                        if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
+                            self.note_ref(sym);
+                        }
+                    }
+                    _ => {}
+                }
+                self.expr(&f.right);
+                self.stmt(&f.body);
+            }
             Statement::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
                     self.expr(arg);

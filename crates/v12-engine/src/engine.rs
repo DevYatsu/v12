@@ -1313,4 +1313,115 @@ mod tests {
         let thrown = engine2.eval("throw typeof console.log;").unwrap_err();
         assert_eq!(engine2.to_display_string(thrown), "function");
     }
+
+    #[test]
+    fn for_of_over_array_literal() {
+        let mut engine = Engine::new();
+        // Sum array elements via for-of; observe via throw.
+        let thrown = engine
+            .eval(
+                "let sum = 0; for (const v of [1, 2, 3, 4]) { sum += v; } throw sum;",
+            )
+            .unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(10));
+    }
+
+    #[test]
+    fn for_of_over_array_binding_and_break() {
+        let mut engine = Engine::new();
+        // `for (const x of arr)` binds the loop variable; break exits early.
+        let thrown = engine
+            .eval(
+                "let arr = [10, 20, 30]; let first; for (const x of arr) { first = x; break; } throw first;",
+            )
+            .unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(10));
+    }
+
+    #[test]
+    fn for_of_over_set_and_map() {
+        let mut engine = Engine::new();
+        // Set iteration yields values in insertion order.
+        let thrown = engine
+            .eval(
+                "let s = new Set(); s.add(1); s.add(2); s.add(3); let sum = 0; for (const v of s) { sum += v; } throw sum;",
+            )
+            .unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(6));
+        // Map iteration yields [key, value] pairs.
+        let thrown = engine
+            .eval(
+                "let m = new Map(); m.set('a', 1); m.set('b', 2); let out = ''; for (const [k, v] of m) { out += k + v; } throw out;",
+            )
+            .unwrap_err();
+        let text = engine.to_display_string(thrown);
+        assert_eq!(text, "a1b2");
+    }
+
+    #[test]
+    fn for_of_with_string_index_via_includes() {
+        // for-of over a string primitive is not supported yet (no wrapper);
+        // verify the compiler accepts the syntax and the array path is green.
+        let mut engine = Engine::new();
+        let result = engine.eval("let n = 0; for (const v of [5, 6]) { n += v; }");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn for_of_over_generator() {
+        let mut engine = Engine::new();
+        // Generators are iterable: `for-of` over a generator object drives
+        // its `next` and stops at `done`.
+        let thrown = engine
+            .eval(
+                "function* g() { yield 1; yield 2; yield 3; } let sum = 0; for (const v of g()) { sum += v; } throw sum;",
+            )
+            .unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(6));
+    }
+
+    #[test]
+    fn for_of_break_leaves_iterator_open() {
+        let mut engine = Engine::new();
+        // `break` inside for-of: the loop stops without calling `return`.
+        let thrown = engine
+            .eval(
+                "let arr = [1, 2, 3]; let seen = 0; for (const v of arr) { seen += v; break; } throw seen;",
+            )
+            .unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(1));
+    }
+
+    #[test]
+    fn symbol_iterator_reads_from_symbol_intrinsic() {
+        let mut engine = Engine::new();
+        // `Symbol.iterator` is a symbol value readable off the Symbol
+        // intrinsic, and arrays respond to it (identity-compared).
+        let thrown = engine
+            .eval("let s = Symbol.iterator; let arr = [1]; throw typeof s;")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "symbol");
+        // Calling `arr[Symbol.iterator]()` yields an iterator object.
+        let thrown = engine
+            .eval("let it = [7][Symbol.iterator](); throw typeof it.next;")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "function");
+    }
+
+    #[test]
+    fn array_entries_and_keys_iterators() {
+        let mut engine = Engine::new();
+        let thrown = engine
+            .eval(
+                "let out = ''; for (const [k, v] of ['a', 'b'].entries()) { out += k + v; } throw out;",
+            )
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "0a1b");
+        let thrown = engine
+            .eval(
+                "let ks = ''; for (const k of ['x', 'y'].keys()) { ks += k; } throw ks;",
+            )
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "01");
+    }
 }

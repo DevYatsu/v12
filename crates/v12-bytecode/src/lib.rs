@@ -124,6 +124,21 @@ pub enum Opcode {
     /// also used by `Object.setPrototypeOf`). `r{a}` is unused. Rejects
     /// primitive targets with a TypeError.
     SetPrototype = 67,
+    /// ES GetIterator: `r{a} = GetIterator(r{b})`. Reads the `@@iterator`
+    /// method off `r{b}` (the realm's `Symbol.iterator` well-known symbol),
+    /// calls it with `r{b}` as receiver, and validates that the result is an
+    /// object. Throws TypeError when the method is missing or the result is
+    /// not an object. Supports the `for-of` statement, spread, and `yield*`.
+    GetIterator = 68,
+    /// ES IteratorNext: `r{a} = IteratorNext(r{b})` — calls the iterator
+    /// object's `next` method (property `"next"`) with the iterator as
+    /// receiver and stores the result. `r{c}` is unused (kept for a future
+    /// `IteratorNextValue` fused op).
+    IteratorNext = 69,
+    /// ES IteratorClose: `IteratorClose(r{a})`. Calls the iterator's
+    /// `"return"` method (if any) when the loop exits abruptly (break /
+    /// throw). `r{b}` and `r{c}` are unused.
+    IteratorClose = 70,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -194,6 +209,9 @@ impl TryFrom<u8> for Opcode {
             65 => Ok(Self::DefineAccessor),
             66 => Ok(Self::JumpIfNullish),
             67 => Ok(Self::SetPrototype),
+            68 => Ok(Self::GetIterator),
+            69 => Ok(Self::IteratorNext),
+            70 => Ok(Self::IteratorClose),
             other => Err(other),
         }
     }
@@ -365,6 +383,9 @@ mod encoding_tests {
         Opcode::DefineAccessor,
         Opcode::JumpIfNullish,
         Opcode::SetPrototype,
+        Opcode::GetIterator,
+        Opcode::IteratorNext,
+        Opcode::IteratorClose,
     ];
 
     #[test]
@@ -1321,6 +1342,9 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::DefineAccessor => "define_accessor",
         Opcode::JumpIfNullish => "jump_if_nullish",
         Opcode::SetPrototype => "set_prototype",
+        Opcode::GetIterator => "get_iterator",
+        Opcode::IteratorNext => "iterator_next",
+        Opcode::IteratorClose => "iterator_close",
     }
 }
 
@@ -1359,6 +1383,9 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::MergeObject => write!(f, " r{b}, r{c}"),
         Opcode::DefineAccessor => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::SetPrototype => write!(f, " r{b}, r{c}"),
+        Opcode::GetIterator => write!(f, " r{a}, r{b}"),
+        Opcode::IteratorNext => write!(f, " r{a}, r{b}"),
+        Opcode::IteratorClose => write!(f, " r{a}"),
         Opcode::JumpIfNullish => write!(f, " r{a}, -> {}", i.imm16()),
         Opcode::Jump => write!(f, " -> {}", i.imm24()),
         Opcode::JumpIfFalse | Opcode::JumpIfTrue => write!(f, " r{a}, -> {}", i.imm16()),

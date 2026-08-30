@@ -71,8 +71,9 @@ use v12_heap::{
     Attrs, Descriptor, Handle, Heap, HeapExt, JsObject, JsValue,
     KIND_ARGUMENTS as HEAP_KIND_ARGUMENTS, KIND_ARRAY as HEAP_KIND_ARRAY,
     KIND_ERROR as HEAP_KIND_ERROR, KIND_FUNCTION as HEAP_KIND_FUNCTION,
-    KIND_GENERATOR as HEAP_KIND_GENERATOR, KIND_MAP as HEAP_KIND_MAP,
-    KIND_PROMISE as HEAP_KIND_PROMISE, KIND_SET as HEAP_KIND_SET, PropKey, ShapeHandle, V12Str,
+    KIND_GENERATOR as HEAP_KIND_GENERATOR, KIND_ITERATOR as HEAP_KIND_ITERATOR,
+    KIND_MAP as HEAP_KIND_MAP, KIND_PROMISE as HEAP_KIND_PROMISE, KIND_SET as HEAP_KIND_SET,
+    PropKey, ShapeHandle, V12Str,
 };
 
 use crate::feedback::{FeedbackVector, Lattice, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
@@ -106,6 +107,10 @@ pub const KIND_MAP: u8 = HEAP_KIND_MAP;
 /// Object kind for Set objects (values in `elements`).
 pub const KIND_SET: u8 = HEAP_KIND_SET;
 
+/// Object kind for iterator objects (Array/Map/Set iterators backing
+/// `Symbol.iterator`; state in `elements` as `[kind, source, index]`).
+pub const KIND_ITERATOR: u8 = HEAP_KIND_ITERATOR;
+
 /// Native index for `console.log` — a console method that prints its
 /// arguments and returns `undefined`. Chosen beyond any plausible program
 /// function count, matching `v12_engine::builtins::NATIVE_CONSOLE_LOG`.
@@ -119,6 +124,10 @@ pub const NATIVE_ARRAY_PUSH: u32 = 1100;
 /// Native index for `Array.prototype.join`, mirroring
 /// `v12_engine::builtins::NATIVE_ARRAY_JOIN`.
 pub const NATIVE_ARRAY_JOIN: u32 = 1102;
+
+/// Native index for `Array.prototype.pop`, mirroring
+/// `v12_engine::builtins::NATIVE_ARRAY_POP`.
+pub const NATIVE_ARRAY_POP: u32 = 1101;
 
 /// Native index for `Object.enumerableOwnKeys` (internal), mirroring
 /// `v12_engine::builtins::NATIVE_ENUMERABLE_OWN_KEYS`.
@@ -135,6 +144,18 @@ pub const NATIVE_PROMISE_THEN: u32 = 1712;
 pub const NATIVE_GENERATOR_NEXT: u32 = 1910;
 pub const NATIVE_GENERATOR_RETURN: u32 = 1911;
 pub const NATIVE_GENERATOR_THROW: u32 = 1912;
+
+/// Native indices of the iterator surface, mirroring
+/// `v12_engine::builtins` constants: `next` on iterator objects, the
+/// `Symbol.iterator` creators on Array/Map/Set, and `%IteratorPrototype%`
+/// self-return.
+pub const NATIVE_ITERATOR_NEXT: u32 = 2200;
+pub const NATIVE_ARRAY_ITERATOR: u32 = 2201;
+pub const NATIVE_MAP_ITERATOR: u32 = 2202;
+pub const NATIVE_SET_ITERATOR: u32 = 2203;
+pub const NATIVE_ITERATOR_SELF: u32 = 2204;
+pub const NATIVE_ARRAY_ITERATOR_ENTRIES: u32 = 2205;
+pub const NATIVE_ARRAY_ITERATOR_KEYS: u32 = 2206;
 
 /// Native indices of the Map/Set surface, mirroring `v12_engine::builtins`
 /// constants (same duplication pattern as the promise/array constants; the
@@ -586,6 +607,9 @@ pub struct Interp<'a> {
     generator_next_fn: Option<JsValue>,
     generator_return_fn: Option<JsValue>,
     generator_throw_fn: Option<JsValue>,
+    /// The realm's `Symbol.iterator` well-known symbol, allocated lazily on
+    /// first `for-of`/spread use and rooted so it survives collection.
+    symbol_iterator: Option<Handle<v12_heap::V12Symbol>>,
     /// Completion value of the bottom frame when the dispatch loop ends.
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
@@ -651,6 +675,7 @@ impl<'a> Interp<'a> {
             generator_next_fn: None,
             generator_return_fn: None,
             generator_throw_fn: None,
+            symbol_iterator: None,
             top_result: None,
             pending_awaits: std::collections::VecDeque::new(),
         };
@@ -1570,6 +1595,28 @@ impl<'a> Interp<'a> {
                     attempt!(self.op_set_prototype(obj_v, proto_v));
                     self.set_pc(pc + op_width);
                 }
+                Opcode::GetIterator => {
+                    // ES GetIterator: `iter = @@iterator(rhs)`.
+                    let src_v = self.stack[base + usize::from(rb)];
+                    self.gc_protect();
+                    let iter = attempt!(self.op_get_iterator(src_v));
+                    self.stack[base + usize::from(ra)] = iter;
+                    self.set_pc(pc + op_width);
+                }
+                Opcode::IteratorNext => {
+                    // ES IteratorNext: `result = iter.next()`.
+                    let iter_v = self.stack[base + usize::from(rb)];
+                    self.gc_protect();
+                    let result = attempt!(self.op_iterator_next(iter_v));
+                    self.stack[base + usize::from(ra)] = result;
+                    self.set_pc(pc + op_width);
+                }
+                Opcode::IteratorClose => {
+                    let iter_v = self.stack[base + usize::from(ra)];
+                    self.gc_protect();
+                    attempt!(self.op_iterator_close(iter_v));
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::CopyArrayRest => {
                     let src_v = self.stack[base + usize::from(rb)];
                     let start = rc;
@@ -2207,6 +2254,126 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Calls a function object from *inside* the dispatch loop (an arm that
+    /// needs to invoke user code: iterator methods, `Symbol.iterator`
+    /// creators). Unlike [`Self::call_object`] — which asserts an empty frame
+    /// stack — this pushes a nested frame, runs a nested `execute` stopped
+    /// after the callee's frame, and returns the callee's result without
+    /// disturbing the caller's frames.
+    fn call_inline(
+        &mut self,
+        func: Handle<JsObject>,
+        this: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let (target, captured_env, func_program) = {
+            let o = self.heap.get(func);
+            (o.callable, o.captured_env, o.program_id)
+        };
+        match target {
+            v12_heap::FunctionTarget::Native(f) => {
+                self.gc_protect();
+                f(self.heap, this, args).map_err(JSException)
+            }
+            v12_heap::FunctionTarget::Host(closure) => {
+                self.gc_protect();
+                closure.call(self.heap, this, args).map_err(JSException)
+            }
+            v12_heap::FunctionTarget::Bytecode(fn_idx) => {
+                // Interpreter-internal natives (generator next/return/throw,
+                // console.log, promise fallbacks) dispatch through the
+                // `NativeFn` seam before any registry lookup.
+                if let Some(native_fn) = NativeFn::from_index(fn_idx) {
+                    return match native_fn {
+                        NativeFn::GeneratorNext => {
+                            self.generator_next(this, args.first().copied().unwrap_or(JsValue::undefined()))
+                        }
+                        NativeFn::GeneratorReturn => {
+                            self.generator_return(this, args.first().copied().unwrap_or(JsValue::undefined()))
+                        }
+                        NativeFn::GeneratorThrow => {
+                            self.generator_throw(this, args.first().copied().unwrap_or(JsValue::undefined()))
+                        }
+                        NativeFn::ConsoleLog => {
+                            let mut parts = Vec::with_capacity(args.len());
+                            for &v in args {
+                                parts.push(self.to_display_string(v));
+                            }
+                            println!("{}", parts.join(" "));
+                            Ok(JsValue::undefined())
+                        }
+                        NativeFn::ArrayJoin => self.array_join_fallback(this, args),
+                        NativeFn::ArrayPush => self.array_push_fallback(this, args),
+                        // Promise/keys natives translate to the engine's
+                        // native indices before the registry lookup.
+                        NativeFn::PromiseResolve => {
+                            self.gc_protect();
+                            let result = self
+                                .natives
+                                .call_native(self.heap, this, args, NATIVE_PROMISE_RESOLVE);
+                            result.map_err(JSException)
+                        }
+                        NativeFn::PromiseReject => {
+                            self.gc_protect();
+                            let result = self
+                                .natives
+                                .call_native(self.heap, this, args, NATIVE_PROMISE_REJECT);
+                            result.map_err(JSException)
+                        }
+                        NativeFn::PromiseThen => {
+                            self.gc_protect();
+                            let result = self
+                                .natives
+                                .call_native(self.heap, this, args, NATIVE_PROMISE_THEN);
+                            result.map_err(JSException)
+                        }
+                        NativeFn::EnumerableOwnKeys => {
+                            self.gc_protect();
+                            let result = self
+                                .natives
+                                .call_native(self.heap, this, args, NATIVE_ENUMERABLE_OWN_KEYS);
+                            result.map_err(JSException)
+                        }
+                    };
+                }
+                let funcs = self.functions_for_program(func_program);
+                if (fn_idx as usize) >= funcs.len() {
+                    // Out-of-range bytecode index: the native seam (engine
+                    // iterator creators, Map/Set methods, console, …).
+                    self.gc_protect();
+                    return self
+                        .natives
+                        .call_native(self.heap, this, args, fn_idx)
+                        .map_err(JSException);
+                }
+                let callee_max_regs = funcs[fn_idx as usize].max_regs;
+                let new_base = self.stack.len();
+                let window_end = new_base + usize::from(callee_max_regs);
+                self.stack.resize(window_end, JsValue::undefined());
+                self.stack[new_base] = this;
+                let copied = args.len().min(usize::from(callee_max_regs).saturating_sub(1));
+                self.stack[new_base + 1..new_base + 1 + copied]
+                    .copy_from_slice(&args[..copied]);
+                self.frames.push(Frame {
+                    fn_idx,
+                    program: func_program,
+                    pc: 0,
+                    base: new_base,
+                    max_regs: callee_max_regs,
+                    env: captured_env,
+                    generator: None,
+                    yield_dst: None,
+                });
+                self.top_result = None;
+                self.stop_at_frames = Some(self.frames.len() - 1);
+                let exec_result = self.execute();
+                self.stop_at_frames = None;
+                exec_result?;
+                Ok(self.top_result.take().unwrap_or(JsValue::undefined()))
+            }
+        }
+    }
+
     /// Completes the top frame with `result`: deposits it into the caller's
     /// destination register and resumes there. Returns `true` when the
     /// completed frame was the top-level script — the run is done.
@@ -2602,6 +2769,17 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// True when `key_v` is the realm's `Symbol.iterator` well-known symbol
+    /// (identity-compared against the lazily-allocated handle). Symbols have
+    /// no text, so this is the symbol analog of `key_is`.
+    fn key_is_symbol_iterator(&mut self, key_v: JsValue) -> bool {
+        let Some(key_sym) = key_v.as_symbol() else {
+            return false;
+        };
+        let wk = self.symbol_iterator_key();
+        key_sym == wk
+    }
+
     /// Which lazily-synthesized native function object to produce.
     ///
     /// Grouped so the synthesis body is written once; `console_log_fn`
@@ -2691,6 +2869,21 @@ impl<'a> Interp<'a> {
             }
         }
 
+        // `Symbol.iterator` — reading the well-known symbol off the `Symbol`
+        // intrinsic (found by name in the global's property prefix) yields
+        // the realm's singleton symbol value.
+        let symbol_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "Symbol");
+        if let (Some(g), Some(symbol_idx)) = (self.global, symbol_idx)
+            && let Some(symbol_ctor) = {
+                let heap = &*self.heap;
+                heap.get(g).properties.get(symbol_idx).and_then(|v| v.as_object())
+            }
+            && obj == symbol_ctor
+            && self.key_is(key_v, "iterator")
+        {
+            return Ok(JsValue::symbol(self.symbol_iterator_key()));
+        }
+
         // Fast paths for the Promise surface and the array `push`/`join`
         // methods, mirroring the `console.log` synthesis above. Natives cannot
         // attach shape-bound properties (shape binding is interpreter state),
@@ -2742,12 +2935,47 @@ impl<'a> Interp<'a> {
                 return Ok(self.cached_native(NativeFn::GeneratorThrow));
             }
         }
+        // `obj[Symbol.iterator]` — the well-known symbol key is a symbol
+        // value, not a string; recognize it by comparing against the cached
+        // realm symbol handle. Returns a synthesized native function that
+        // creates an iterator over `obj`.
+        if self.key_is_symbol_iterator(key_v) {
+            let kind = self.heap.get(obj).kind;
+            let constant = match kind {
+                KIND_ARRAY | KIND_ARGUMENTS => crate::NATIVE_ARRAY_ITERATOR,
+                KIND_MAP => crate::NATIVE_MAP_ITERATOR,
+                KIND_SET => crate::NATIVE_SET_ITERATOR,
+                KIND_ITERATOR | KIND_GENERATOR => crate::NATIVE_ITERATOR_SELF,
+                _ => 0,
+            };
+            if constant != 0 {
+                return Ok(self.map_set_method(constant));
+            }
+        }
+        if self.heap.get(obj).kind == KIND_ITERATOR {
+            if self.key_is(key_v, "next") {
+                return Ok(self.map_set_method(crate::NATIVE_ITERATOR_NEXT));
+            }
+        }
         if self.heap.get(obj).kind == KIND_ARRAY {
             if self.key_is(key_v, "push") {
                 return Ok(self.cached_native(NativeFn::ArrayPush));
             }
+            if self.key_is(key_v, "pop") {
+                return Ok(self.map_set_method(crate::NATIVE_ARRAY_POP));
+            }
             if self.key_is(key_v, "join") {
                 return Ok(self.cached_native(NativeFn::ArrayJoin));
+            }
+            // `Array.prototype.entries` / `keys` / `values` — iterator creators.
+            if self.key_is(key_v, "entries") {
+                return Ok(self.map_set_method(crate::NATIVE_ARRAY_ITERATOR_ENTRIES));
+            }
+            if self.key_is(key_v, "keys") {
+                return Ok(self.map_set_method(crate::NATIVE_ARRAY_ITERATOR_KEYS));
+            }
+            if self.key_is(key_v, "values") {
+                return Ok(self.map_set_method(crate::NATIVE_ARRAY_ITERATOR));
             }
             if self.key_is(key_v, "length") {
                 // Length is properties[0] for arrays regardless of shape state
@@ -2766,7 +2994,8 @@ impl<'a> Interp<'a> {
             // For arguments exotic, a mapped index mirrors the parameter slot;
             // v1 simply returns the element (the param alias is exercised via
             // the mapped array in heap tests).
-            return Ok(self.array_element(obj, idx));
+            let v = self.array_element(obj, idx);
+            return Ok(v);
         }
 
         // Map/Set method fast paths, recognized by object kind. Each
@@ -3476,6 +3705,123 @@ impl<'a> Interp<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// ES GetIterator (7.4.1): `iter = iterable[Symbol.iterator]()`, then
+    /// require the result to be an object.
+    ///
+    /// The realm's `Symbol.iterator` well-known symbol lives on the global
+    /// object at the fixed `Symbol` intrinsic's `iterator` property; reading
+    /// it goes through the ordinary `get_property` path so user code can
+    /// observe and override it.
+    fn op_get_iterator(&mut self, src_v: JsValue) -> Result<JsValue, JSException> {
+        // 1. `method = GetV(iterable, @@iterator)` — resolve the well-known
+        //    symbol first so the lookup uses the real symbol key.
+        let method = self.iterator_symbol_method(src_v)?;
+        if method.as_object().is_none() {
+            return Err(JSException(self.error_value(
+                "TypeError: value is not iterable (its Symbol.iterator property is not a function)",
+            )));
+        }
+        // 2. `iterator = Call(method, iterable)` — reuse the call machinery
+        //    (handles bytecode natives and engine natives uniformly). The
+        //    method object is freshly synthesized by `get_property`; park it
+        //    on the stack so the safepoint inside `call_inline` keeps it
+        //    alive (only `add_root`-ed otherwise, which the next protect
+        //    discards).
+        let method_obj = method.as_object().expect("checked above");
+        self.stack.push(JsValue::object(method_obj));
+        self.gc_protect();
+        let result = self.call_inline(method_obj, src_v, &[]);
+        self.stack.pop();
+        match result {
+            Ok(v) if v.as_object().is_some() => Ok(v),
+            Ok(_) => Err(JSException(self.error_value(
+                "TypeError: result of Symbol.iterator call is not an object",
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolves the `@@iterator` method value off `obj` (a symbol-keyed
+    /// `get_property`), without treating a missing method as an error — the
+    /// caller decides the failure mode.
+    fn iterator_symbol_method(&mut self, obj_v: JsValue) -> Result<JsValue, JSException> {
+        let sym = self.symbol_iterator_key();
+        let sym_v = JsValue::symbol(sym);
+        self.gc_protect();
+        self.get_property(0, 0, obj_v, sym_v)
+    }
+
+    /// The realm's `Symbol.iterator` well-known symbol handle, allocated once.
+    fn symbol_iterator_key(&mut self) -> Handle<v12_heap::V12Symbol> {
+        if let Some(h) = self.symbol_iterator {
+            return h;
+        }
+        // Symbol("Symbol.iterator") — the well-known symbol's [[Description]].
+        // The heap's V12Symbol is currently a unit struct; the description is
+        // recorded on the Symbol intrinsic's `description` property instead
+        // (deferred until the Symbol built-in lands).
+        self.gc_protect();
+        let h = self.heap.alloc(v12_heap::V12Symbol);
+        self.heap.add_root(JsValue::symbol(h));
+        self.symbol_iterator = Some(h);
+        h
+    }
+
+    /// ES IteratorNext (7.4.2): `result = iterator.next()`.
+    fn op_iterator_next(&mut self, iter_v: JsValue) -> Result<JsValue, JSException> {
+        let Some(_iter_obj) = iter_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: IteratorNext called on non-object",
+            )));
+        };
+        let next_key = self.new_temp_key("next");
+        let next_v = self.get_property(0, 0, iter_v, next_key)?;
+        if next_v.as_object().is_none() {
+            return Err(JSException(self.error_value(
+                "TypeError: iterator.next is not a function",
+            )));
+        }
+        let next_obj = next_v.as_object().expect("checked above");
+        // Park the resolved function on the value stack: `gc_protect`
+        // republishes the stack as roots, so the function object survives the
+        // safepoint inside `call_inline` (it is freshly synthesized by
+        // `get_property` and only `add_root`-ed, which the next protect
+        // discards).
+        self.stack.push(JsValue::object(next_obj));
+        self.gc_protect();
+        let result = self.call_inline(next_obj, iter_v, &[]);
+        self.stack.pop();
+        result
+    }
+
+    /// ES IteratorClose (7.4.6): call `iterator.return()` when present.
+    /// Non-object `return` methods are ignored (spec: return is not a
+    /// function → continue unwinding). The close is best-effort — the
+    /// original completion always wins.
+    fn op_iterator_close(&mut self, iter_v: JsValue) -> Result<(), JSException> {
+        let Some(_iter_obj) = iter_v.as_object() else {
+            return Ok(());
+        };
+        let return_key = self.new_temp_key("return");
+        let return_v = self.get_property(0, 0, iter_v, return_key)?;
+        let Some(return_obj) = return_v.as_object() else {
+            return Ok(());
+        };
+        self.stack.push(JsValue::object(return_obj));
+        self.gc_protect();
+        let result = self.call_inline(return_obj, iter_v, &[]);
+        self.stack.pop();
+        let _ = result;
+        Ok(())
+    }
+
+    /// Interns `text` into a fresh register (compiler-style temp) for use as
+    /// a property key operand. Mirrors the compiler's `load_str_key`; kept
+    /// here so iterator runtime paths don't hand-build key values.
+    fn new_temp_key(&mut self, text: &str) -> JsValue {
+        JsValue::string(intern_text(self.heap, text))
     }
 
     fn op_check_is_array(&mut self, v: JsValue) -> Result<(), JSException> {
@@ -4486,6 +4832,9 @@ impl<'a> Interp<'a> {
             roots.push(*v);
         }
         if let Some(v) = self.top_result { roots.push(v); }
+        if let Some(sym) = self.symbol_iterator {
+            roots.push(JsValue::symbol(sym));
+        }
         roots.extend(persistent.into_iter().flatten());
         // Collection runs here, at the safepoint, with the freshly
         // republished roots visible — never inside `Heap::alloc`.

@@ -24,6 +24,19 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-08-30 — Iterator protocol + `for-of` (Priority 2)
+
+- **Filter:** `language/statements/for-of` (752 files, 8 jobs)
+- **Before:** 0 pass / 0 fail / 752 skip, 0.0 % pass (all rejected: `for-of requires the iterator protocol — Symbol.iterator is not available yet`)
+- **After:**  244 pass / 508 fail / 0 skip, 32.4 % pass
+- **Delta:** +244 pass, −752 skip, +32.4 pts
+- **Engine change:** added `GetIterator`/`IteratorNext`/`IteratorClose` opcodes (68–70); `KIND_ITERATOR` heap kind; engine `iterator.rs` builtins (Array/Map/Set iterators, `next`, `%IteratorPrototype%` self-return); interpreter `op_get_iterator`/`op_iterator_next`/`op_iterator_close` + `call_inline` (nested-frame call usable inside dispatch); `Symbol.iterator` well-known symbol on the `Symbol` intrinsic; `Array.prototype.entries/keys/values/pop` fast paths; compiler `for_of_loop` lowering + collect-pass declaration of for-of/in bindings (fixes the pre-existing "both destructured bindings land in r0" bug).
+- **Files:** `crates/v12-bytecode/src/lib.rs`, `crates/v12-heap/src/object.rs`, `crates/v12-engine/src/builtins/iterator.rs` (new), `crates/v12-engine/src/builtins/mod.rs`, `crates/v12-interp/src/lib.rs`, `crates/v12-bccompiler/src/stmt.rs`, `crates/v12-bccompiler/src/collect.rs`, `crates/v12-bccompiler/src/tests.rs`, `crates/v12-bytecode/tests/common/mod.rs`, `crates/v12-engine/src/engine.rs` (tests)
+- **Bucket:** `known-failures.md` A (`unsupported expression`) — shrank (for-of no longer rejected); P2 `for-of` slice opened at 32.4 %
+- **Runner:** `cargo run -p test262-runner -- --filter language/statements/for-of --jobs 8`
+- **Notes:** Remaining for-of failures: completion-value semantics (`cptn-*`), complex assignment targets, `arguments` exotic objects, accessor/defineProperty paths, `IteratorClose` on throw. `cargo nextest run` 553/553 pass (8 new engine tests).
+
+
 ### 2026-08-29 — Un-ignore async tests (generators+async now executable)
 
 - **Filter:** `language` (24 873 files, 8 jobs)

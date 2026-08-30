@@ -10,9 +10,9 @@
 //! ranges may share one.
 
 use oxc_ast::ast::{
-    ArrayPattern, BindingPattern, Declaration, Expression, ForInStatement, ForStatementInit, Function,
-    LabeledStatement, ModuleDeclaration, ObjectPattern, Statement, TryStatement,
-    VariableDeclarationKind,
+    ArrayPattern, BindingPattern, Declaration, Expression, ForInStatement, ForOfStatement,
+    ForStatementInit, Function, LabeledStatement, ModuleDeclaration, ObjectPattern, Statement,
+    TryStatement, VariableDeclarationKind,
 };
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{HandlerRange, Instr, Label, Opcode, WideOp};
@@ -157,10 +157,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(())
             }
             Statement::ForInStatement(f) => self.for_in_loop(f, None),
-            Statement::ForOfStatement(f) => Err(self.err(
-                f.span,
-                "for-of requires the iterator protocol — Symbol.iterator is not available yet",
-            )),
+            Statement::ForOfStatement(f) => self.for_of_loop(f, None),
             Statement::WithStatement(w) => {
                 Err(self.err(w.span, "with statements are not supported"))
             }
@@ -475,12 +472,77 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(())
     }
 
+    fn for_of_loop(&mut self, f: &'a ForOfStatement<'a>, name: Option<String>) -> Res<()> {
+        let span = f.span;
+        // 1. GetIterator(rhs) — one runtime opcode: reads the realm's
+        //    `Symbol.iterator` well-known symbol, calls it, validates the
+        //    result object. Registers `iter` and `result` are loop-invariant.
+        let rhs = self.expr(&f.right)?;
+        let iter = self.new_temp();
+        self.emit_reg3(Opcode::GetIterator, iter, rhs, 0, span);
+        let result = self.new_temp();
+        let top = self.label();
+        let cont = self.label();
+        let end = self.label();
+        self.bind(top);
+        self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), span);
+        // 2. IteratorNext(iter) → result object.
+        self.emit_reg3(Opcode::IteratorNext, result, iter, 0, span);
+        // 3. `result.done` → exit (leaving the iterator open, per spec: a
+        //    normal completion of a for-of body does NOT IteratorClose).
+        let done_key = self.new_temp();
+        self.load_str(done_key, "done", span)?;
+        let done = self.new_temp();
+        self.emit_reg3(Opcode::GetProperty, done, result, done_key, span);
+        self.emit_jump(Opcode::JumpIfTrue, done, end);
+        // 4. Bind `result.value` to the loop target.
+        let value_key = self.new_temp();
+        self.load_str(value_key, "value", span)?;
+        let value = self.new_temp();
+        self.emit_reg3(Opcode::GetProperty, value, result, value_key, span);
+        match &f.left {
+            oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
+                if v.declarations.len() != 1 {
+                    return Err(self.err(span, "for-of requires exactly one binding"));
+                }
+                self.lower_binding_pattern(&v.declarations[0].id, value)?;
+            }
+            oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
+                let src = value;
+                if let Some(sym) = self.comp.symbol_of(id.reference_id.get()) {
+                    let access = self.access(sym);
+                    self.store_access(access, src, span);
+                } else {
+                    let gid =
+                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+                    self.emit_set_global(gid, src, span);
+                }
+            }
+            _ => {
+                return Err(self.err(
+                    span,
+                    "for-of with complex assignment targets is not supported",
+                ));
+            }
+        }
+        // 5. Body with break → IteratorClose. `continue` skips the close.
+        self.loops.push(LoopCtx {
+            break_label: end,
+            continue_label: Some(cont),
+            name,
+            finally_base: self.finallies.len(),
+        });
+        self.stmt(&f.body)?;
+        self.loops.pop();
+        self.bind(cont);
+        self.emit_jump(Opcode::Jump, 0, top);
+        self.bind(end);
+        Ok(())
+    }
+
     fn for_in_loop(&mut self, f: &'a ForInStatement<'a>, name: Option<String>) -> Res<()> {
         // Compile the right-hand side (the object to iterate over)
         let obj_reg = self.expr(&f.right)?;
-        
-        // For-in iteration: we need to enumerate all enumerable string keys from the object
-        // and its prototype chain. We'll call the native function to get all keys.
         
         // Get registers for iteration
         let keys_reg = self.new_temp();  // Will hold the array of keys

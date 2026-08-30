@@ -952,7 +952,6 @@ fn construct_and_method_shorthand_together() {
 fn unsupported_constructs_fail_as_compile_errors() {
     let cases: &[&str] = &[
         "let x = 1n;",
-        "for (let v of [1]) {}",
         "return 1;",
     ];
     for src in cases {

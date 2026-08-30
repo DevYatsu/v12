@@ -7,6 +7,7 @@
 pub mod array;
 pub mod boolean;
 pub mod error;
+pub mod iterator;
 pub mod map;
 pub mod math;
 pub mod number;
@@ -248,6 +249,19 @@ pub const NATIVE_SET_ADD: u32 = 2101;
 pub const NATIVE_SET_HAS: u32 = 2102;
 pub const NATIVE_SET_DELETE: u32 = 2103;
 pub const NATIVE_SET_SIZE: u32 = 2104;
+pub const NATIVE_ITERATOR_NEXT: u32 = 2200;
+/// `Array.prototype[Symbol.iterator]` — creates an array-values iterator.
+pub const NATIVE_ARRAY_ITERATOR: u32 = 2201;
+/// `Map.prototype[Symbol.iterator]` — creates a map-entries iterator.
+pub const NATIVE_MAP_ITERATOR: u32 = 2202;
+/// `Set.prototype[Symbol.iterator]` — creates a set-values iterator.
+pub const NATIVE_SET_ITERATOR: u32 = 2203;
+/// `%IteratorPrototype%[Symbol.iterator]` — returns `this`.
+pub const NATIVE_ITERATOR_SELF: u32 = 2204;
+/// `Array.prototype.entries` — array-entries iterator.
+pub const NATIVE_ARRAY_ITERATOR_ENTRIES: u32 = 2205;
+/// `Array.prototype.keys` — array-keys iterator.
+pub const NATIVE_ARRAY_ITERATOR_KEYS: u32 = 2206;
 
 /// Installs the core built-ins into `registry`.
 pub fn install_core(registry: &mut NativeRegistry) {
@@ -284,6 +298,7 @@ pub fn install_core(registry: &mut NativeRegistry) {
     registry.register(NATIVE_SET_HAS, map::set_has);
     registry.register(NATIVE_SET_DELETE, map::set_delete);
     registry.register(NATIVE_SET_SIZE, map::set_size);
+    iterator::install(registry);
 }
 
 /// Renders a value the way `console.log` observes it (Tier-0 display subset).

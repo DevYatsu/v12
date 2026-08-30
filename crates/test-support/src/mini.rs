@@ -389,7 +389,10 @@ impl<'p> Mini<'p> {
                 | Opcode::CopyObjectRest
                 | Opcode::ArrayAppend
                 | Opcode::MergeObject
-                | Opcode::DefineAccessor => {
+                | Opcode::DefineAccessor
+                | Opcode::GetIterator
+                | Opcode::IteratorNext
+                | Opcode::IteratorClose => {
                     panic!("generator/async/copy opcodes not expected in tier-1 mini programs")
                 }
                 Opcode::Construct => {
