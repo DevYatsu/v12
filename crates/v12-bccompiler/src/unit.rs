@@ -80,14 +80,17 @@ pub fn compile_unit(
         UnitNode::Fn(f) => {
             cx.b.is_generator = f.generator;
             cx.b.is_async = f.r#async;
+            cx.b.is_arrow = false;
         }
         UnitNode::Arrow(a) => {
             cx.b.is_generator = false;
             cx.b.is_async = a.r#async;
+            cx.b.is_arrow = true;
         }
         UnitNode::Main(_) => {
             cx.b.is_generator = false;
             cx.b.is_async = false;
+            cx.b.is_arrow = false;
         }
     }
     emit_prologue(&mut cx, idx, self_symbol)?;

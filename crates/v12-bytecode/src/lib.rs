@@ -1107,6 +1107,9 @@ pub struct FunctionBytecode {
     pub rest_reg: u16,
     pub is_generator: bool,
     pub is_async: bool,
+    /// Arrow functions lack a `prototype` property (they are not
+    /// constructible). Set from the compiler's unit plan.
+    pub is_arrow: bool,
 }
 
 impl FunctionBytecode {
@@ -1128,6 +1131,7 @@ impl FunctionBytecode {
             rest_reg: 0,
             is_generator: false,
             is_async: false,
+            is_arrow: false,
         }
     }
 
@@ -1672,6 +1676,7 @@ pub struct FunctionBuilder {
     fixups: Vec<Fixup>,
     pub is_generator: bool,
     pub is_async: bool,
+    pub is_arrow: bool,
 }
 
 impl FunctionBuilder {
@@ -1796,6 +1801,7 @@ impl FunctionBuilder {
             rest_reg: 0,
             is_generator: self.is_generator,
             is_async: self.is_async,
+            is_arrow: self.is_arrow,
         }
     }
 }

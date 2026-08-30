@@ -158,13 +158,23 @@ impl v12_interp::NativeRegistry for NativeRegistry {
     }
 
     /// Direct `eval`: compile and run `source` against the shared heap and
-    /// global, returning the script's completion value.
+    /// global, returning the script's completion value. The eval program is
+    /// registered into the caller's cross-program registry so eval-created
+    /// closures resolve from the caller's interpreter.
     fn eval(
         &mut self,
         heap: &mut Heap,
         source: &str,
         _this: JsValue,
         global: Option<v12_heap::Handle<v12_heap::JsObject>>,
+        programs: std::rc::Rc<
+            std::cell::RefCell<
+                std::vec::Vec<(
+                    std::rc::Rc<[v12_bytecode::FunctionBytecode]>,
+                    std::rc::Rc<[String]>,
+                )>,
+            >,
+        >,
     ) -> Result<JsValue, JsValue> {
         let (program, strings) = v12_bccompiler::compile_source_with_strings(source).map_err(
             |err| {
@@ -177,13 +187,26 @@ impl v12_interp::NativeRegistry for NativeRegistry {
                 JsValue::string(h)
             },
         )?;
+        // Register the eval program so its closures can be invoked from the
+        // caller's program afterwards.
+        let program_id = {
+            let mut table = programs.borrow_mut();
+            let id = table.len() as u32;
+            table.push((
+                std::rc::Rc::from(program.functions.into_boxed_slice()),
+                std::rc::Rc::from(strings.clone().into_boxed_slice()),
+            ));
+            id
+        };
         let mut interp = v12_interp::Interp::new_with_heap(
             heap,
             global,
-            program.functions,
+            Vec::new(),
             program.main,
             strings,
         );
+        interp.set_program_id(program_id);
+        interp.set_programs(programs);
         interp.set_natives(Box::new(self.clone()));
         match interp.run() {
             Ok(()) => Ok(interp.completion_value().unwrap_or_else(JsValue::undefined)),

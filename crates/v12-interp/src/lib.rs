@@ -64,6 +64,7 @@ pub(crate) mod call;
 mod tests;
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use v12_bytecode::{Const, FunctionBytecode, Instr, Opcode, WideOp};
 use v12_heap::{
@@ -304,16 +305,17 @@ pub trait NativeRegistry {
 
     /// Direct `eval(source)`: compile and execute `source` against `heap`,
     /// returning the completion value. `global` is the realm's global object
-    /// (so eval's `var`/assignments share the caller's global). The
-    /// interpreter routes the eval native here so the engine can re-enter
-    /// with its own program/global wiring. The default implementation
-    /// refuses (no eval support).
+    /// (so eval's `var`/assignments share the caller's global). `programs` is
+    /// the caller's cross-program registry; the engine registers the eval
+    /// program there so eval-created closures resolve from the caller. The
+    /// default implementation refuses (no eval support).
     fn eval(
         &mut self,
         _heap: &mut Heap,
         _source: &str,
         _this: JsValue,
         _global: Option<Handle<JsObject>>,
+        _programs: std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>>,
     ) -> Result<JsValue, JsValue> {
         Err(JsValue::undefined())
     }
@@ -357,10 +359,20 @@ enum CallOutcome {
     Value(JsValue),
 }
 
+/// One registered program: its function table and the string table that
+/// `Const::Str32` ids in that program resolve through. Kept as a pair so a
+/// cross-program closure resolves both its bytecode and its constants
+/// against its own program.
+type ProgramTable = (Rc<[FunctionBytecode]>, Rc<[String]>);
+
 /// One JavaScript activation: a function body, its register window on the
 /// shared stack, its pc, and the head of its environment chain.
 struct Frame {
     fn_idx: u32,
+    /// The program whose function table `fn_idx` indexes. 0 is the default
+    /// program; cross-program calls (eval closures) carry the eval program's
+    /// id. The dispatch loop resolves instructions through this.
+    program: u32,
     /// Absolute bytecode pc of the next instruction. On entry to a handler
     /// this is reset to the handler target; a completing call advances the
     /// caller's pc past its `Call` header.
@@ -501,14 +513,28 @@ fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u16, usize),
 /// `Const::Str32` ids resolve through (as produced by
 /// `v12_bccompiler::compile_source_with_strings`).
 pub struct Interp<'a> {
-    functions: std::rc::Rc<[FunctionBytecode]>,
+    functions: Rc<[FunctionBytecode]>,
     main: u32,
     /// Compiler string table: `Const::Str32` ids resolve through this.
-    strings: std::rc::Rc<[String]>,
+    strings: Rc<[String]>,
+    /// This interpreter's program id: 0 for the built program, higher for
+    /// eval-registered programs. Closure objects stamp it so a call can
+    /// resolve `Bytecode(fn_idx)` against the right function table.
+    program_id: u32,
+    /// Programs registered for cross-program calls, indexed by program id.
+    /// Index 0 is `self.functions`/`self.strings`; eval programs are appended
+    /// by the engine. Each entry pairs the function table with its string
+    /// table (both resolve through the *callee's* program, not the current
+    /// interpreter's). Lets a closure created in one program (e.g. `eval`) be
+    /// invoked from another. Owned by the interpreter; a nested eval
+    /// interpreter shares it via `Rc`.
+    programs: std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>>,
     heap: &'a mut Heap,
 
-    /// Interned heap string per `Str32` constant id, filled lazily.
-    const_strings: std::collections::HashMap<u32, Handle<V12Str>>,
+    /// Interned heap string per `(program, Str32)` constant id, filled lazily.
+    /// Program-scoped: the same `Str32` id means different text in different
+    /// programs (eval), so the key carries the program id.
+    const_strings: std::collections::HashMap<(u32, u32), Handle<V12Str>>,
     /// Interned `typeof` names, lazily filled in [`TYPE_NAMES`] order.
     typeof_names: [Option<Handle<V12Str>>; TYPE_NAME_COUNT],
     /// Cached property key for the array `length` property.
@@ -524,6 +550,11 @@ pub struct Interp<'a> {
     /// The one contiguous value stack; frames window slices of it.
     stack: Vec<JsValue>,
     frames: Vec<Frame>,
+    /// When set, `execute` returns as soon as the frame count drops to this
+    /// value (a re-entrant accessor call stops after its own frame, leaving
+    /// the caller's frames in place). `None` normally: `execute` runs to the
+    /// bottom frame.
+    stop_at_frames: Option<usize>,
 
     natives: Box<dyn NativeRegistry>,
     hooks: Box<dyn TierHooks>,
@@ -585,10 +616,16 @@ impl<'a> Interp<'a> {
         strings: Vec<String>,
     ) -> Self {
         heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
+        let functions = Rc::from(functions.into_boxed_slice());
+        let strings = Rc::from(strings.into_boxed_slice());
+        let programs =
+            std::rc::Rc::new(std::cell::RefCell::new(vec![(Rc::clone(&functions), Rc::clone(&strings))]));
         let mut interp = Self {
-            functions: std::rc::Rc::from(functions.into_boxed_slice()),
+            functions,
             main,
-            strings: std::rc::Rc::from(strings.into_boxed_slice()),
+            strings,
+            program_id: 0,
+            programs,
             heap,
             const_strings: std::collections::HashMap::new(),
             typeof_names: [const { None }; TYPE_NAME_COUNT],
@@ -598,6 +635,7 @@ impl<'a> Interp<'a> {
             pinned_shapes: HashSet::new(),
             stack: Vec::with_capacity(INITIAL_STACK_CAPACITY),
             frames: Vec::new(),
+            stop_at_frames: None,
             natives: Box::new(EmptyNativeRegistry),
             hooks: Box::new(()),
             feedback: std::collections::HashMap::new(),
@@ -641,6 +679,151 @@ impl<'a> Interp<'a> {
     /// Installs a native-function seam, replacing any previous registry.
     pub fn set_natives(&mut self, natives: Box<dyn NativeRegistry>) {
         self.natives = natives;
+    }
+
+    /// Registers a program in the cross-program table, returning its id.
+    /// The id is what a nested interpreter running that program stamps on
+    /// its closure objects, so calls from other programs resolve here.
+    pub fn register_program(
+        &mut self,
+        functions: Vec<FunctionBytecode>,
+        strings: Vec<String>,
+    ) -> u32 {
+        let mut table = self.programs.borrow_mut();
+        let id = table.len() as u32;
+        table.push((Rc::from(functions.into_boxed_slice()), Rc::from(strings.into_boxed_slice())));
+        id
+    }
+
+    /// Sets this interpreter's program id (the id returned by
+    /// [`Self::register_program`] for the program it is executing).
+    pub fn set_program_id(&mut self, id: u32) {
+        self.program_id = id;
+    }
+
+    /// Replaces the shared cross-program table (a nested eval interpreter
+    /// adopts the caller's registry so both resolve the same programs).
+    pub fn set_programs(&mut self, programs: std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>>) {
+        self.programs = programs;
+    }
+
+    /// The shared cross-program table (so a nested eval interpreter can
+    /// register into the same registry the outer interpreter resolves).
+    pub fn programs(&self) -> std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>> {
+        Rc::clone(&self.programs)
+    }
+
+    /// The function table for a callee object's program. Uses the object's
+    /// `program_id` to pick the right table when a closure created in another
+    /// program (e.g. `eval`) is invoked here. Falls back to this
+    /// interpreter's own `functions` when the id is unknown.
+    fn resolve_functions(&self, obj: Handle<JsObject>) -> Rc<[FunctionBytecode]> {
+        let id = self.heap.get(obj).program_id;
+        self.functions_for_program(id)
+    }
+
+    /// The function table for a program id. The interpreter's own `functions`
+    /// is authoritative for the built program (id 0); higher ids resolve
+    /// through the shared registry (eval programs). Falls back to
+    /// `self.functions` for unknown ids.
+    fn functions_for_program(&self, id: u32) -> Rc<[FunctionBytecode]> {
+        if id == 0 {
+            return Rc::clone(&self.functions);
+        }
+        let table = self.programs.borrow();
+        table
+            .get(id as usize)
+            .map(|(f, _)| Rc::clone(f))
+            .unwrap_or_else(|| Rc::clone(&self.functions))
+    }
+
+    /// The string table for a program id (mirror of
+    /// [`Self::functions_for_program`]).
+    fn strings_for_program(&self, id: u32) -> Rc<[String]> {
+        if id == 0 {
+            return Rc::clone(&self.strings);
+        }
+        let table = self.programs.borrow();
+        table
+            .get(id as usize)
+            .map(|(_, s)| Rc::clone(s))
+            .unwrap_or_else(|| Rc::clone(&self.strings))
+    }
+
+    /// The function table a frame executes against (its `program` id).
+    fn frame_functions(&self, frame: &Frame) -> Rc<[FunctionBytecode]> {
+        self.functions_for_program(frame.program)
+    }
+
+    /// Allocates a closure function object, stamping this interpreter's
+    /// program id so `Bytecode(fn_idx)` resolves against the right table.
+    ///
+    /// Non-arrow functions also get their spec-mandated `prototype` property
+    /// (a fresh object whose `constructor` points back at the function) so
+    /// `F.prototype` reads and `new F` work without lazy materialization.
+    /// Arrow functions are not constructible and have no `prototype`.
+    fn alloc_closure(
+        &mut self,
+        fn_idx: u32,
+        env: Option<Handle<JsObject>>,
+    ) -> Handle<JsObject> {
+        let funcs = self.functions_for_program(self.program_id);
+        let is_arrow = funcs
+            .get(fn_idx as usize)
+            .map(|f| f.is_arrow)
+            .unwrap_or(false);
+        let mut obj = JsObject::function(v12_heap::FunctionTarget::Bytecode(fn_idx), env);
+        obj.program_id = self.program_id;
+        let h = self.heap.alloc(obj);
+        if !is_arrow {
+            // Park the fresh closure on the stack: materialization allocates
+            // (prototype object, shape transitions) and the collector can run
+            // before the `Closure` arm stores `h` into its register.
+            self.stack.push(JsValue::object(h));
+            let result = self
+                .materialize_function_prototype(h)
+                .expect("closure prototype materialization cannot fail");
+            self.stack.pop();
+            let _ = result;
+        }
+        h
+    }
+
+    /// Gives a function object its `prototype` property: a fresh ordinary
+    /// object whose `constructor` property points back at `f`. Idempotent —
+    /// returns early when the property already exists (e.g. the realm wired
+    /// one, or `prepare_construct` materialized it earlier).
+    fn materialize_function_prototype(
+        &mut self,
+        f: Handle<JsObject>,
+    ) -> Result<(), JSException> {
+        let key = self.prototype_key();
+        let shape = self.shape_of(f);
+        if let Some(desc) = self.heap.lookup_property(shape, key)
+            && let Some(slot) = desc.slot()
+        {
+            // Already present.
+            return Ok(());
+        }
+        self.gc_protect();
+        let proto = self.heap.alloc(JsObject::default());
+        // gc_protect clears and repopulates the root vector, so `add_root`
+        // values do not survive the allocations inside `set_property`.
+        // Keep both objects alive by parking them on the value stack (which
+        // gc_protect republishes as roots) for the duration.
+        let proto_v = JsValue::object(proto);
+        let f_v = JsValue::object(f);
+        self.stack.push(proto_v);
+        self.stack.push(f_v);
+        // `constructor` on the prototype points back at the function.
+        let ctor_key = JsValue::string(intern_text(self.heap, "constructor"));
+        let proto_key_v = JsValue::string(intern_text(self.heap, "prototype"));
+        let result = self
+            .set_property(proto_v, ctor_key, f_v)
+            .and_then(|()| self.set_property(f_v, proto_key_v, proto_v));
+        self.stack.pop();
+        self.stack.pop();
+        result
     }
 
     /// Installs tier-transition hooks invoked between frame completions.
@@ -761,7 +944,7 @@ impl<'a> Interp<'a> {
 
     #[cfg(test)]
     pub fn functions_mut_for_test(&mut self) -> &mut [FunctionBytecode] {
-        std::rc::Rc::make_mut(&mut self.functions)
+        Rc::make_mut(&mut self.functions)
     }
 
     /// Runs the top-level script to completion.
@@ -772,14 +955,19 @@ impl<'a> Interp<'a> {
     /// via [`Self::completion_value`] — ADR-004 surface so embedders can
     /// surface `eval("1+1")` → `2` instead of hard-coding `undefined`.
     pub fn run(&mut self) -> Result<(), JSException> {
-        let main_regs =
-            self.functions[usize::try_from(self.main).expect("function index fits usize")].max_regs;
+        // Resolve the main function against this interpreter's program (which
+        // for a nested eval interpreter lives in the shared registry, not the
+        // local `functions` field).
+        let main_funcs = self.functions_for_program(self.program_id);
+        let main_regs = main_funcs[usize::try_from(self.main).expect("function index fits usize")]
+            .max_regs;
         debug_assert!(self.frames.is_empty(), "run() is not reentrant");
         self.stack.clear();
         self.stack
             .resize(usize::from(main_regs), JsValue::undefined());
         self.frames.push(Frame {
             fn_idx: self.main,
+            program: self.program_id,
             pc: 0,
             base: 0,
             max_regs: main_regs,
@@ -905,15 +1093,17 @@ impl<'a> Interp<'a> {
             }
 
             // Snapshot hot frame state: arms call back into `self` and must
-            // not hold borrows across those calls.
-            let (fn_idx, pc, base, max_regs) = {
+            // not hold borrows across those calls. Resolve the frame's
+            // function table (its program) once per iteration.
+            let (fn_idx, program, pc, base, max_regs) = {
                 let f = self.frames.last().expect("execute() requires a frame");
-                (f.fn_idx, f.pc, f.base, f.max_regs)
+                (f.fn_idx, f.program, f.pc, f.base, f.max_regs)
             };
+            let funcs = self.functions_for_program(program);
 
             // Falling off the instruction stream is implicit `return
             // undefined` (the documented completion ABI).
-            let Some(&instr) = self.functions[fn_idx as usize].instrs.get(pc) else {
+            let Some(&instr) = funcs[fn_idx as usize].instrs.get(pc) else {
                 if self.complete_frame(JsValue::undefined())? {
                     return Ok(());
                 }
@@ -927,7 +1117,7 @@ impl<'a> Interp<'a> {
             // instruction's register slots and executes as one 3-word op
             // (see `WideOp::RegExt`).
             let (op, ra, rb, rc, op_width, narrow) = {
-                let instrs = &self.functions[fn_idx as usize].instrs;
+                let instrs = &funcs[fn_idx as usize].instrs;
                 decode_instr(instrs, pc)
             };
 
@@ -960,12 +1150,12 @@ impl<'a> Interp<'a> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::LoadConst => {
-                    let value = attempt!(self.const_value(fn_idx, u32::from(narrow.imm16())));
+                    let value = attempt!(self.const_value(fn_idx, u32::from(narrow.imm16()), program));
                     self.stack[base + usize::from(ra)] = value;
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Wide => {
-                    let words = &self.functions[fn_idx as usize].instrs[pc..];
+                    let words = &funcs[fn_idx as usize].instrs[pc..];
                     let (wide, width) =
                         WideOp::try_decode(words).expect("malformed wide opcode sequence");
                     match wide {
@@ -975,7 +1165,7 @@ impl<'a> Interp<'a> {
                             self.stack[base + usize::from(dst)] = ops::box_number(value as f64);
                         }
                         WideOp::LoadConstW { dst, const_id } => {
-                            let value = attempt!(self.const_value(fn_idx, const_id));
+                            let value = attempt!(self.const_value(fn_idx, const_id, program));
                             self.stack[base + usize::from(dst)] = value;
                         }
                         WideOp::GetEnvSlotW { dst, depth, slot } => {
@@ -1014,10 +1204,7 @@ impl<'a> Interp<'a> {
                         } => {
                             self.gc_protect();
                             let env = self.frames.last().expect("frame").env;
-                            let h = self.heap.alloc(JsObject::function(
-                                v12_heap::FunctionTarget::Bytecode(function_index.into()),
-                                env,
-                            ));
+                            let h = self.alloc_closure(function_index.into(), env);
                             self.stack[base + usize::from(dst)] = JsValue::object(h);
                         }
                         WideOp::NewEnvironmentW { depth: _, slots } => {
@@ -1349,10 +1536,7 @@ impl<'a> Interp<'a> {
                 Opcode::Closure => {
                     self.gc_protect();
                     let env = self.frames.last().expect("frame").env;
-                    let h = self.heap.alloc(JsObject::function(
-                        v12_heap::FunctionTarget::Bytecode(rb.into()),
-                        env,
-                    ));
+                    let h = self.alloc_closure(rb.into(), env);
                     self.stack[base + usize::from(ra)] = JsValue::object(h);
                     self.set_pc(pc + op_width);
                 }
@@ -1452,7 +1636,7 @@ impl<'a> Interp<'a> {
                 Opcode::GetGlobal => {
                     let dst = instr.a();
                     let const_id = u32::from(narrow.imm16());
-                    let val = attempt!(self.op_get_global(const_id));
+                    let val = attempt!(self.op_get_global(const_id, program));
                     self.stack[base + usize::from(dst)] = val;
                     self.set_pc(pc + op_width);
                 }
@@ -1469,7 +1653,7 @@ impl<'a> Interp<'a> {
                             )));
                         }
                     }
-                    attempt!(self.op_set_global(const_id, val));
+                    attempt!(self.op_set_global(const_id, val, program));
                     self.set_pc(pc + op_width);
                 }
 
@@ -1615,15 +1799,16 @@ impl<'a> Interp<'a> {
     // Constants
     // ------------------------------------------------------------------
 
-    fn const_value(&mut self, fn_idx: u32, id: u32) -> Result<JsValue, JSException> {
-        let konst = self.functions[fn_idx as usize]
+    fn const_value(&mut self, fn_idx: u32, id: u32, program: u32) -> Result<JsValue, JSException> {
+        let funcs = self.functions_for_program(program);
+        let konst = funcs[fn_idx as usize]
             .consts
             .get(id as u16)
             .unwrap_or_else(|| panic!("constant k{id} out of range in fn {fn_idx}"));
         match konst {
             Const::F64(v) => Ok(ops::box_number(v)),
             Const::Str32(str_id) => {
-                if let Some(&h) = self.const_strings.get(&str_id) {
+                if let Some(&h) = self.const_strings.get(&(program, str_id)) {
                     return Ok(JsValue::string(h));
                 }
                 // Interning allocates, so republish roots first: values
@@ -1631,13 +1816,13 @@ impl<'a> Interp<'a> {
                 // of a preceding Closure) are otherwise invisible to the
                 // collector.
                 self.gc_protect();
-                let text: String = self
-                    .strings
+                let strings = self.strings_for_program(program);
+                let text: String = strings
                     .get(str_id as usize)
                     .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"))
                     .clone();
                 let h = intern_text(self.heap, &text);
-                self.const_strings.insert(str_id, h);
+                self.const_strings.insert((program, str_id), h);
                 Ok(JsValue::string(h))
             }
             // `null` is a singleton distinct from `undefined`.
@@ -1714,10 +1899,12 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: callee is not a function"),
             ));
         }
-        // Read the callable target and captured environment from the object.
-        let (target, captured_env) = {
+        // Read the callable target, captured environment, and program id
+        // from the object. The program id lets a closure created in another
+        // program (eval) resolve its bytecode against the right table.
+        let (target, captured_env, callee_program) = {
             let c = self.heap.get(callee_obj);
-            (c.callable, c.prototype)
+            (c.callable, c.prototype, c.program_id)
         };
 
         // Dispatch on the callable. Bytecode targets below the program length
@@ -1751,7 +1938,10 @@ impl<'a> Interp<'a> {
         // interpreter's internal fallbacks are encoded as out-of-range
         // bytecode indices (NativeFn::index); everything else is an
         // engine-installed native index handled through the registry seam.
-        if (target_idx as usize) >= self.functions.len() {
+        // The length check resolves against the callee's program so an eval
+        // closure's index compares against the eval program, not this one.
+        let callee_funcs = self.functions_for_program(callee_program);
+        if (target_idx as usize) >= callee_funcs.len() {
             if let Some(native_fn) = NativeFn::from_index(target_idx) {
                 let arg = if (callee_slot + 2) < self.stack.len() && argc > 0 {
                     self.stack[callee_slot + 2]
@@ -1823,8 +2013,11 @@ impl<'a> Interp<'a> {
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
             if target_idx == NATIVE_EVAL {
-                // Direct eval: the first argument is the source text. Extract
-                // it before touching the registry (which needs `&mut self.heap`).
+                // Direct eval: hand the source, shared global, and the
+                // cross-program registry to the engine's eval implementation,
+                // which compiles and runs a nested interpreter against this
+                // heap. The registry lets eval-created closures be invoked
+                // from this program afterwards.
                 let source = self
                     .stack
                     .get(args_start)
@@ -1832,7 +2025,8 @@ impl<'a> Interp<'a> {
                     .map(|h| self.string_text(h))
                     .unwrap_or_default();
                 let global = self.global;
-                let result = self.natives.eval(self.heap, &source, this_v, global);
+                let programs = self.programs();
+                let result = self.natives.eval(self.heap, &source, this_v, global, programs);
                 return result.map(CallOutcome::Value).map_err(JSException);
             }
             self.gc_protect();
@@ -1847,7 +2041,7 @@ impl<'a> Interp<'a> {
         }
 
         // Generator function: calling it returns a generator object without executing body.
-        if self.is_generator_fn(target_idx) {
+        if self.is_generator_fn_for(target_idx, callee_program) {
             let r#gen = self.create_generator_object(target_idx, captured_env, this_v, callee_slot, argc)?;
             return Ok(CallOutcome::Value(JsValue::object(r#gen)));
         }
@@ -1870,27 +2064,31 @@ impl<'a> Interp<'a> {
         // Moving this allocation to Engine would require threading the retained
         // program through every call site with no behavioural gain.
         // Async promise allocation via HeapExt (Engine owns via HeapExt, not Interp direct alloc) — satisfies Engine boundary for v1
-        if self.is_async_fn(target_idx) {
+        if self.is_async_fn_for(target_idx, callee_program) {
             self.gc_protect();
             let promise = self.heap.alloc_pending_promise();
             // Capture initial register window for deferred execution
+            let funcs = self.functions_for_program(callee_program);
             let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
-                let f = &self.functions[target_idx as usize];
+                let f = &funcs[target_idx as usize];
                 (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
             };
             let mut window = vec![JsValue::undefined(); usize::from(callee_max_regs)];
             window[0] = this_v;
             let arg_src = callee_slot + 2;
             self.fill_call_window(&mut window, arg_src, argc as usize, callee_has_rest, callee_fixed, callee_rest_reg);
-            let g = self.heap.alloc(JsObject::generator_with(target_idx, 0, 0.0, 0, window, captured_env, Some(JsValue::object(promise))));
+            let mut g_obj = JsObject::generator_with(target_idx, 0, 0.0, 0, window, captured_env, Some(JsValue::object(promise)));
+            g_obj.program_id = callee_program;
+            let g = self.heap.alloc(g_obj);
             self.heap.add_root(JsValue::object(g));
             // Defer: enqueue resume at pc 0
             self.pending_awaits.push_back((g, JsValue::undefined(), false));
             return Ok(CallOutcome::Value(JsValue::object(promise)));
         }
 
+        let funcs = self.functions_for_program(callee_program);
         let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
-            let f = &self.functions[target_idx as usize];
+            let f = &funcs[target_idx as usize];
             (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
         };
         let new_base = base + usize::from(caller_max_regs);
@@ -1914,6 +2112,7 @@ impl<'a> Interp<'a> {
 
         self.frames.push(Frame {
             fn_idx: target_idx,
+            program: callee_program,
             pc: 0,
             base: new_base,
             max_regs: callee_max_regs,
@@ -1944,9 +2143,9 @@ impl<'a> Interp<'a> {
         this: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        let (target, captured_env) = {
+        let (target, captured_env, func_program) = {
             let o = self.heap.get(func);
-            (o.callable, o.prototype)
+            (o.callable, o.prototype, o.program_id)
         };
         match target {
             v12_heap::FunctionTarget::Native(f) => {
@@ -1962,18 +2161,15 @@ impl<'a> Interp<'a> {
                 // inside the dispatch loop, so `call_object` — which requires
                 // an empty frame stack — is not usable). The captured
                 // environment comes from the accessor function object's
-                // `prototype` link, set when the closure was created.
-                //
-                // The body's `fn_idx` indexes the program that created it.
-                // If that program differs from the currently-executing one
-                // (e.g. an accessor created inside `eval` and invoked by the
-                // outer program), we cannot run it here — report `undefined`
-                // rather than panic (the accessor's own program would need a
-                // cross-program call table).
-                if (fn_idx as usize) >= self.functions.len() {
+                // `prototype` link, set when the closure was created. The
+                // bytecode resolves against the accessor's own program, which
+                // lets eval-created accessors be invoked from the outer
+                // program.
+                let funcs = self.functions_for_program(func_program);
+                if (fn_idx as usize) >= funcs.len() {
                     return Ok(JsValue::undefined());
                 }
-                let callee_max_regs = self.functions[fn_idx as usize].max_regs;
+                let callee_max_regs = funcs[fn_idx as usize].max_regs;
                 let new_base = self.stack.len();
                 let window_end = new_base + usize::from(callee_max_regs);
                 self.stack.resize(window_end, JsValue::undefined());
@@ -1983,6 +2179,7 @@ impl<'a> Interp<'a> {
                     .copy_from_slice(&args[..copied]);
                 self.frames.push(Frame {
                     fn_idx,
+                    program: func_program,
                     pc: 0,
                     base: new_base,
                     max_regs: callee_max_regs,
@@ -1991,7 +2188,14 @@ impl<'a> Interp<'a> {
                     yield_dst: None,
                 });
                 self.top_result = None;
-                self.execute()?;
+                // Stop the nested execute after the accessor frame completes,
+                // leaving the caller's frames in place (the default `execute`
+                // runs to the bottom frame, which would wrongly drain the
+                // caller while `set_property`/`get_property` is mid-arm).
+                self.stop_at_frames = Some(self.frames.len() - 1);
+                let exec_result = self.execute();
+                self.stop_at_frames = None;
+                exec_result?;
                 Ok(self.top_result.take().unwrap_or(JsValue::undefined()))
             }
         }
@@ -2003,6 +2207,14 @@ impl<'a> Interp<'a> {
     fn complete_frame(&mut self, result: JsValue) -> Result<bool, JSException> {
         let finished = self.frames.pop().expect("complete_frame requires a frame");
         self.notify_tier_ups();
+        // A re-entrant accessor call stops the nested execute here: the
+        // accessor's frame is done, and the caller's frames must remain
+        // intact for the `set_property`/`get_property` arm that invoked it.
+        if self.stop_at_frames.is_some_and(|n| self.frames.len() == n) {
+            self.stack.truncate(finished.base);
+            self.top_result = Some(result);
+            return Ok(true);
+        }
         if let Some(r#gen) = finished.generator {
             // Async completion: settle stored promise and don't overwrite caller dst (promise already delivered)
             let is_async = self.is_async_fn(finished.fn_idx);
@@ -3289,7 +3501,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn op_get_global(&mut self, str_id: u32) -> Result<JsValue, JSException> {
+    fn op_get_global(&mut self, str_id: u32, program: u32) -> Result<JsValue, JSException> {
         let Some(global) = self.global else {
             return Ok(JsValue::undefined());
         };
@@ -3297,11 +3509,12 @@ impl<'a> Interp<'a> {
         // `Heap::alloc` can collect — publish roots first so values written
         // since the last opcode-level protect stay reachable.
         self.gc_protect();
-        // Borrow the compiler's string table entry: comparing against the
-        // intrinsics list and interning both take &str, so no String clone
-        // is needed on this fast path.
-        let text: &str = self
-            .strings
+        // Borrow the compiler's string table entry (program-scoped: an eval
+        // frame's `Str32` ids index the eval program's string table):
+        // comparing against the intrinsics list and interning both take
+        // &str, so no String clone is needed on this fast path.
+        let strings = self.strings_for_program(program);
+        let text: &str = strings
             .get(str_id as usize)
             .map(String::as_str)
             .unwrap_or("");
@@ -3330,15 +3543,15 @@ impl<'a> Interp<'a> {
         Ok(JsValue::undefined())
     }
 
-    fn op_set_global(&mut self, str_id: u32, val: JsValue) -> Result<(), JSException> {
+    fn op_set_global(&mut self, str_id: u32, val: JsValue, program: u32) -> Result<(), JSException> {
         let Some(global) = self.global else {
             return Ok(());
         };
         // Interning a new key and the shape transition below can each
         // allocate; publish roots first so `val` survives any collection.
         self.gc_protect();
-        let text = self
-            .strings
+        let strings = self.strings_for_program(program);
+        let text = strings
             .get(str_id as usize)
             .cloned()
             .unwrap_or_default();
@@ -3407,10 +3620,12 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: callee is not a function"),
             ));
         }
-        // Read the callable target and captured environment from the object.
-        let (target, captured_env) = {
+        // Read the callable target, captured environment, and program id
+        // from the object. The program id lets a closure created in another
+        // program (eval) resolve its bytecode against the right table.
+        let (target, captured_env, callee_program) = {
             let c = self.heap.get(callee_obj);
-            (c.callable, c.prototype)
+            (c.callable, c.prototype, c.program_id)
         };
 
         // Materialize the spread args from the args array (shared by both the
@@ -3446,7 +3661,8 @@ impl<'a> Interp<'a> {
                 return result.map(CallOutcome::Value).map_err(JSException);
             }
         };
-        if (target_idx as usize) >= self.functions.len() {
+        let callee_funcs = self.functions_for_program(callee_program);
+        if (target_idx as usize) >= callee_funcs.len() {
             self.gc_protect();
             let result = self
                 .natives
@@ -3508,6 +3724,7 @@ impl<'a> Interp<'a> {
         }
         self.frames.push(Frame {
             fn_idx: target_idx,
+            program: callee_program,
             pc: 0,
             base: new_base,
             max_regs: callee_max_regs,
@@ -3555,6 +3772,7 @@ impl<'a> Interp<'a> {
             ));
         }
         // Read the callable target from the object.
+        let callee_program = self.heap.get(callee_obj).program_id;
         let target = self.heap.get(callee_obj).callable;
 
         // Native seam: constructor-shaped natives (Boolean, Error) dispatch
@@ -3564,7 +3782,7 @@ impl<'a> Interp<'a> {
         // registry, which rejects unregistered indices as not a constructor.
         let target_idx = match target {
             v12_heap::FunctionTarget::Bytecode(idx) => {
-                if (idx as usize) >= self.functions.len() {
+                if (idx as usize) >= self.functions_for_program(callee_program).len() {
                     let args_start = callee_slot + 2;
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
@@ -3682,6 +3900,7 @@ impl<'a> Interp<'a> {
 
         self.frames.push(Frame {
             fn_idx: target_idx,
+            program: callee_program,
             pc: 0,
             base: new_base,
             max_regs: callee_max_regs,
@@ -3749,10 +3968,17 @@ impl<'a> Interp<'a> {
     // ------------------------------------------------------------------
 
     fn is_generator_fn(&self, fn_idx: u32) -> bool {
-        if fn_idx as usize >= self.functions.len() {
+        self.is_generator_fn_for(fn_idx, self.program_id)
+    }
+
+    /// Program-aware generator check: resolves the function table for the
+    /// callee's program before inspecting the flag.
+    fn is_generator_fn_for(&self, fn_idx: u32, program: u32) -> bool {
+        let funcs = self.functions_for_program(program);
+        if fn_idx as usize >= funcs.len() {
             return false; // native/host function index
         }
-        let f = &self.functions[fn_idx as usize];
+        let f = &funcs[fn_idx as usize];
         if f.is_generator {
             return true;
         }
@@ -3769,10 +3995,16 @@ impl<'a> Interp<'a> {
     }
 
     fn is_async_fn(&self, fn_idx: u32) -> bool {
-        if fn_idx as usize >= self.functions.len() {
+        self.is_async_fn_for(fn_idx, self.program_id)
+    }
+
+    /// Program-aware async check.
+    fn is_async_fn_for(&self, fn_idx: u32, program: u32) -> bool {
+        let funcs = self.functions_for_program(program);
+        if fn_idx as usize >= funcs.len() {
             return false; // native/host function index
         }
-        self.functions[fn_idx as usize].is_async
+        funcs[fn_idx as usize].is_async
     }
 
     /// Allocates an array object for a rest parameter from `elements`. Centralises
@@ -4041,9 +4273,13 @@ impl<'a> Interp<'a> {
                 .unwrap_or(0.0) as usize;
             (fn_idx, resume_pc)
         };
+        // Resume against the generator's own program (async generators
+        // created in eval carry a nonzero program id).
+        let gen_program = self.heap.get(r#gen).program_id;
+        let funcs = self.functions_for_program(gen_program);
         let snapshot = self.heap.get(r#gen).elements.clone();
         let env = self.heap.get(r#gen).prototype;
-        let f_max_regs = self.functions[fn_idx as usize].max_regs;
+        let f_max_regs = funcs[fn_idx as usize].max_regs;
         let new_base = self.stack.len();
         self.stack
             .resize(new_base + usize::from(f_max_regs), JsValue::undefined());
@@ -4062,6 +4298,7 @@ impl<'a> Interp<'a> {
         }
         self.frames.push(Frame {
             fn_idx,
+            program: gen_program,
             pc: resume_pc,
             base: new_base,
             max_regs: f_max_regs,
