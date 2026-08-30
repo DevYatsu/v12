@@ -3,7 +3,6 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use v12_bytecode::FunctionBytecode;
 use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
@@ -24,16 +23,17 @@ const MAX_SOURCE_LEN: usize = 1_000_000;
 /// a time; a queued job belonging to an older program would mis-index — in
 /// practice each eval drains its own checkpoint before the next compiles.
 ///
-/// The program lives in an `Arc` so the engine no longer deep-clones
+/// The program lives in an `Rc` so the engine no longer deep-clones
 /// `functions` and `strings` on every `eval` / `run_jobs`. `run_jobs` just
-/// clones the `Arc` (a refcount bump) to hand the program to the
+/// clones the `Rc` (a refcount bump) to hand the program to the
 /// `Interp::new` call. Old behavior: `Vec<FunctionBytecode>` (deep clone per
 /// call) + `Vec<String>` (deep clone per call) → thousands of bytes copied
-/// for every microtask drain. New behavior: one refcount bump.
+/// for every microtask drain. New behavior: one refcount bump. `Rc`, not
+/// `Rc`: the engine is single-threaded, so atomics buy nothing.
 struct RetainedProgram {
-    functions: Arc<[FunctionBytecode]>,
+    functions: Rc<[FunctionBytecode]>,
     main: u32,
-    strings: Arc<[String]>,
+    strings: Rc<[String]>,
 }
 
 /// The JavaScript engine.
@@ -261,14 +261,14 @@ impl Engine {
             .map_err(EngineError::Compile)?;
         // Retain the program so queued jobs can rebuild an interpreter and
         // activate the script's functions later (Promise reactions).
-        // Wrap the `Vec`s in `Arc` once; subsequent `eval`/`run_jobs` clone
-        // the `Arc` instead of deep-cloning the function/string tables.
-        let functions: Arc<[FunctionBytecode]> = Arc::from(program.functions.into_boxed_slice());
-        let strings_arc: Arc<[String]> = Arc::from(strings.into_boxed_slice());
+        // Wrap the `Vec`s in `Rc` once; subsequent `eval`/`run_jobs` clone
+        // the `Rc` instead of deep-cloning the function/string tables.
+        let functions: Rc<[FunctionBytecode]> = Rc::from(program.functions.into_boxed_slice());
+        let strings_arc: Rc<[String]> = Rc::from(strings.into_boxed_slice());
         self.retained = Some(RetainedProgram {
-            functions: Arc::clone(&functions),
+            functions: Rc::clone(&functions),
             main: program.main,
-            strings: Arc::clone(&strings_arc),
+            strings: Rc::clone(&strings_arc),
         });
         // Borrow the engine's heap for the interpreter's lifetime —
         // no `mem::replace` swap, no sentinel heap, `Engine::heap()` stays
@@ -416,13 +416,13 @@ impl Engine {
             .map(|(_, s)| s.to_string())
             .collect();
         let program = module.program;
-        // Wrap in `Arc` once so `run_jobs` can clone the handle.
-        let functions: Arc<[FunctionBytecode]> = Arc::from(program.functions.into_boxed_slice());
-        let strings_arc: Arc<[String]> = Arc::from(strings.into_boxed_slice());
+        // Wrap in `Rc` once so `run_jobs` can clone the handle.
+        let functions: Rc<[FunctionBytecode]> = Rc::from(program.functions.into_boxed_slice());
+        let strings_arc: Rc<[String]> = Rc::from(strings.into_boxed_slice());
         self.retained = Some(RetainedProgram {
-            functions: Arc::clone(&functions),
+            functions: Rc::clone(&functions),
             main: program.main,
-            strings: Arc::clone(&strings_arc),
+            strings: Rc::clone(&strings_arc),
         });
         // Borrow the engine's heap; no swap. Destructure `self` so
         // the heap borrow and job-queue/registry accesses are disjoint locals.
@@ -512,7 +512,7 @@ impl Engine {
             None,
         ));
         self.heap.add_root(JsValue::object(func));
-        // Keep the program alive for the test duration by leaking its Arc
+        // Keep the program alive for the test duration by leaking its Rc
         // (v1: tests do not actually call the function through the engine's
         // heap; they verify the object was created).
         let _ = program;
@@ -707,10 +707,10 @@ impl Engine {
     pub fn run_jobs(&mut self) -> usize {
         self.adopt_pending();
         let global = self.realm.global();
-        // Borrow the retained program via `Arc::clone` — a refcount
+        // Borrow the retained program via `Rc::clone` — a refcount
         // bump, not a deep copy. The interpreter consumes `Vec`s, so we
         // materialize once here, but the strings are now deduplicated across
-        // calls (the same `Arc<[String]>` is shared with the original
+        // calls (the same `Rc<[String]>` is shared with the original
         // eval that produced it).
         let (functions, main, strings) = match &self.retained {
             Some(r) => (

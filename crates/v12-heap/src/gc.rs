@@ -1132,6 +1132,7 @@ mod tests {
             kind: KIND_ORDINARY,
             flags: 0,
             callable: crate::function::FunctionTarget::Bytecode(0),
+            program_id: 0,
             shape: crate::shape::ShapeHandle::new(0),
             inline_props: [crate::JsValue::undefined(); JsObject::IN_OBJECT_PROP_CAP],
             overflow: None,

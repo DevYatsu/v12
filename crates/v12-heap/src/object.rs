@@ -72,6 +72,11 @@ pub struct JsObject {
     /// bytecode index, a native handler, or a host closure). One word.
     /// Meaningless for other kinds (defaults to the root bytecode index 0).
     pub callable: crate::function::FunctionTarget,
+    /// The program whose function table a `Bytecode` callable indexes.
+    /// 0 is the interpreter's own program; eval-registered programs get
+    /// higher ids. Lets a closure created in one program (e.g. `eval`) be
+    /// invoked from another by resolving through the program registry.
+    pub program_id: u32,
     /// The shape describing this object's property layout. Stored directly
     /// on the object (one word) so `Heap::shape_of` is a single field read
     /// — no side-table indirection on the property-access hot path. Defaults
@@ -129,6 +134,7 @@ impl Default for JsObject {
             kind: KIND_ORDINARY,
             flags: 0,
             callable: crate::function::FunctionTarget::Bytecode(0),
+            program_id: 0,
             shape: crate::shape::ShapeHandle::new(0),
             inline_props: [crate::JsValue::undefined(); Self::IN_OBJECT_PROP_CAP],
             overflow: None,

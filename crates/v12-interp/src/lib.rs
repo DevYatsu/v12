@@ -501,10 +501,10 @@ fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u16, usize),
 /// `Const::Str32` ids resolve through (as produced by
 /// `v12_bccompiler::compile_source_with_strings`).
 pub struct Interp<'a> {
-    functions: std::sync::Arc<[FunctionBytecode]>,
+    functions: std::rc::Rc<[FunctionBytecode]>,
     main: u32,
     /// Compiler string table: `Const::Str32` ids resolve through this.
-    strings: std::sync::Arc<[String]>,
+    strings: std::rc::Rc<[String]>,
     heap: &'a mut Heap,
 
     /// Interned heap string per `Str32` constant id, filled lazily.
@@ -586,9 +586,9 @@ impl<'a> Interp<'a> {
     ) -> Self {
         heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
         let mut interp = Self {
-            functions: std::sync::Arc::from(functions.into_boxed_slice()),
+            functions: std::rc::Rc::from(functions.into_boxed_slice()),
             main,
-            strings: std::sync::Arc::from(strings.into_boxed_slice()),
+            strings: std::rc::Rc::from(strings.into_boxed_slice()),
             heap,
             const_strings: std::collections::HashMap::new(),
             typeof_names: [const { None }; TYPE_NAME_COUNT],
@@ -761,7 +761,7 @@ impl<'a> Interp<'a> {
 
     #[cfg(test)]
     pub fn functions_mut_for_test(&mut self) -> &mut [FunctionBytecode] {
-        std::sync::Arc::make_mut(&mut self.functions)
+        std::rc::Rc::make_mut(&mut self.functions)
     }
 
     /// Runs the top-level script to completion.
