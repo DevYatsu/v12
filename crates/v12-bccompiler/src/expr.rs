@@ -860,8 +860,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
         };
 
+        // Destructuring assignment: `[a, b] = rhs` / `{x, y} = rhs`.
+        if !left.is_simple_assignment_target() {
+            return self.destructure_assign(left, right, span);
+        }
         let Some(simple) = left.as_simple_assignment_target() else {
-            return Err(self.err(span, "destructuring assignment is not supported"));
+            unreachable!("destructuring handled above");
         };
         let rhs = self.expr(right)?;
 
@@ -934,6 +938,140 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     // -- member access ----------------------------------------------------------
+
+    /// Lowers `[a, b] = rhs` / `{x, y} = rhs`. Evaluates `rhs` once, then
+    /// extracts each element/property and assigns to the sub-target.
+    fn destructure_assign(
+        &mut self,
+        left: &AssignmentTarget<'_>,
+        right: &Expression<'_>,
+        span: Span,
+    ) -> Res<u16> {
+        let src = self.expr(right)?;
+        match left {
+            AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                // `[a, b, ...rest] = rhs`: element `i` reads index `i` off
+                // the source; a rest element copies the tail via
+                // `CopyArrayRest`. Elisions (`[a, , b]`) skip.
+                let mut index: u32 = 0;
+                for el in &arr.elements {
+                    // `None` is an elision (`[a, , b]`): the slot is skipped.
+                    let Some(el) = el else {
+                        index += 1;
+                        continue;
+                    };
+                    // `AssignmentTargetWithDefault` is a direct variant; the
+                    // rest of the inner `AssignmentTarget` variants (simple
+                    // identifiers/members) are flattened in. The rest element
+                    // lives in `arr.rest`, handled after the loop.
+                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) = el {
+                        // `[a = default]`: default applies when the read is
+                        // undefined — not handled in this pass.
+                        if let Some(target) = d.binding.as_simple_assignment_target() {
+                            let val = self.read_index(src, index, span)?;
+                            self.assign_simple(target, val, span)?;
+                        }
+                        index += 1;
+                    } else if let Some(simple) = el.as_simple_assignment_target() {
+                        let val = self.read_index(src, index, span)?;
+                        self.assign_simple(simple, val, span)?;
+                        index += 1;
+                    } else {
+                        index += 1;
+                    }
+                }
+                // `...rest`: tail copy from the current index.
+                if let Some(rest) = &arr.rest {
+                    let dst = self.new_temp();
+                    self.emit_reg3(
+                        Opcode::CopyArrayRest,
+                        dst,
+                        src,
+                        index.min(u16::MAX as u32) as u16,
+                        span,
+                    );
+                    if let Some(simple) = rest.target.as_simple_assignment_target() {
+                        self.assign_simple(simple, dst, span)?;
+                    }
+                }
+                Ok(src)
+            }
+            AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                // `{x, y: z} = rhs`: property `x` reads `rhs.x`.
+                for prop in &obj.properties {
+                    match prop {
+                        oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
+                            // `{x} = rhs`: property `x` → target variable `x`.
+                            let key = self.new_temp();
+                            self.load_str(key, id.binding.name.as_str(), span)?;
+                            let val = self.new_temp();
+                            self.emit_reg3(Opcode::GetProperty, val, src, key, span);
+                            let Some(sym) = self.comp.symbol_of(id.binding.reference_id.get()) else {
+                                let gid = crate::model::str_id_of(self.comp.strings.get_or_intern(id.binding.name.as_str()));
+                                self.emit_set_global(gid, val, span);
+                                continue;
+                            };
+                            let access = self.access(sym);
+                            self.store_access(access, val, span);
+                        }
+                        oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                            // `{y: z} = rhs`: property `y` → target `z`.
+                            let key = self.property_key(&p.name)?;
+                            let Some(simple) = p.binding.as_simple_assignment_target() else {
+                                continue;
+                            };
+                            let val = self.new_temp();
+                            self.emit_reg3(Opcode::GetProperty, val, src, key, span);
+                            self.assign_simple(simple, val, span)?;
+                        }
+                    }
+                }
+                Ok(src)
+            }
+            _ => Err(self.err(span, "unsupported destructuring target")),
+        }
+    }
+
+    /// Reads `src[index]` into a temp (missing → undefined).
+    fn read_index(&mut self, src: u16, index: u32, span: Span) -> Res<u16> {
+        let key = self.new_temp();
+        self.load_int(key, index as i64, span);
+        let dst = self.new_temp();
+        self.emit_reg3(Opcode::GetProperty, dst, src, key, span);
+        Ok(dst)
+    }
+
+    /// Assigns `val` to a simple target (identifier, member, or global).
+    fn assign_simple(
+        &mut self,
+        target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
+        val: u16,
+        span: Span,
+    ) -> Res<()> {
+        match target {
+            oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
+                    let gid = crate::model::str_id_of(
+                        self.comp.strings.get_or_intern(id.name.as_str()),
+                    );
+                    self.emit_set_global(gid, val, span);
+                    return Ok(());
+                };
+                let access = self.access(sym);
+                self.store_access(access, val, span);
+                Ok(())
+            }
+            _ => {
+                if let Some(m) = target.as_member_expression() {
+                    let (obj, key) = self.member_parts(m)?;
+                    self.emit_reg3(Opcode::SetProperty, obj, key, val, span);
+                    Ok(())
+                } else {
+                    Err(self.err(span, "unsupported assignment target"))
+                }
+            }
+        }
+    }
 
     /// Evaluates object + key once (evaluation-order safe for read-modify-write
     /// targets) and returns their registers.

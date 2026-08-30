@@ -954,7 +954,6 @@ fn unsupported_constructs_fail_as_compile_errors() {
         "let x = 1n;",
         "for (let v of [1]) {}",
         "class C {}",
-        "[a, b] = [1, 2]",
         "return 1;",
     ];
     for src in cases {
