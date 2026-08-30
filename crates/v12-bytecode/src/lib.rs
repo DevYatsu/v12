@@ -107,6 +107,16 @@ pub enum Opcode {
     /// returned object when the body returns one, otherwise the instance
     /// itself. Anything else throws TypeError "not a constructor".
     Construct = 62,
+    /// ES ToNumber: `r{a} = ToNumber(r{b})`. Supports the unary `+`
+    /// operator; boxes the numeric result (Smi or double).
+    ToNumber = 63,
+    /// Copies every enumerable own property of `r{c}` onto the object `r{b}`
+    /// (object spread merge; later writes win). `r{a}` is unused.
+    MergeObject = 64,
+    /// Defines an accessor property: `r{a}` = object, `r{b}` = key,
+    /// `r{c}` = packed `(getter_fn, setter_fn)` pair register base. The
+    /// getter/setter are function objects (or `undefined` for absent).
+    DefineAccessor = 65,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -172,6 +182,9 @@ impl TryFrom<u8> for Opcode {
             60 => Ok(Self::GetGlobal),
             61 => Ok(Self::SetGlobal),
             62 => Ok(Self::Construct),
+            63 => Ok(Self::ToNumber),
+            64 => Ok(Self::MergeObject),
+            65 => Ok(Self::DefineAccessor),
             other => Err(other),
         }
     }
@@ -338,6 +351,9 @@ mod encoding_tests {
         Opcode::GetGlobal,
         Opcode::SetGlobal,
         Opcode::Construct,
+        Opcode::ToNumber,
+        Opcode::MergeObject,
+        Opcode::DefineAccessor,
     ];
 
     #[test]
@@ -1217,6 +1233,8 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
     "EvalError",
     "Promise",
     "Symbol",
+    "Map",
+    "Set",
     "console",
     "globalThis",
 ];
@@ -1282,6 +1300,9 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::GetGlobal => "get_global",
         Opcode::SetGlobal => "set_global",
         Opcode::Construct => "construct",
+        Opcode::ToNumber => "to_number",
+        Opcode::MergeObject => "merge_object",
+        Opcode::DefineAccessor => "define_accessor",
     }
 }
 
@@ -1314,7 +1335,11 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         | Opcode::Ge
         | Opcode::StrictEq
         | Opcode::StrictNe => write!(f, " r{a}, r{b}, r{c}"),
-        Opcode::Neg | Opcode::BitNot | Opcode::Not | Opcode::TypeOf => write!(f, " r{a}, r{b}"),
+        Opcode::Neg | Opcode::BitNot | Opcode::Not | Opcode::TypeOf | Opcode::ToNumber => {
+            write!(f, " r{a}, r{b}")
+        }
+        Opcode::MergeObject => write!(f, " r{b}, r{c}"),
+        Opcode::DefineAccessor => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::Jump => write!(f, " -> {}", i.imm24()),
         Opcode::JumpIfFalse | Opcode::JumpIfTrue => write!(f, " r{a}, -> {}", i.imm16()),
         Opcode::LoopHeader => Ok(()),

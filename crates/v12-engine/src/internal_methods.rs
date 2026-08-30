@@ -286,38 +286,23 @@ fn ordinary_get(
                     }
                 }
                 v12_heap::Descriptor::Accessor { getter, .. } => {
-                    if let Some(g) = getter {
-                        // v1: interpret getter handle's string text as a numeric
-                        // literal; the full `Engine::eval` path is wired via
-                        // `v12-interp::get_property` for the interpreter.
-                        heap.flatten(g);
-                        let units = match &heap.get(g).storage {
-                            v12_heap::StrStorage::Latin1(b) => {
-                                b.iter().map(|&x| u16::from(x)).collect::<Vec<_>>()
+                    if let Some(getter) = getter {
+                        // The getter is a function object. Native/host handlers
+                        // can be invoked directly with only the heap; a
+                        // bytecode getter needs the interpreter, which the
+                        // engine's `get_property` path provides — this
+                        // internal-method fallback reports `undefined` for it.
+                        match heap.get(getter).callable {
+                            v12_heap::FunctionTarget::Native(f) => {
+                                return f(heap, JsValue::object(o), &[]);
                             }
-                            v12_heap::StrStorage::Utf16(u) => u.clone(),
-                            _ => Vec::new(),
-                        };
-                        let text = String::from_utf16_lossy(&units);
-                        let trimmed = text.trim();
-                        if let Ok(n) = trimmed.parse::<f64>() {
-                            let v = if n.is_finite()
-                                && n.fract() == 0.0
-                                && !(n == 0.0 && n.is_sign_negative())
-                                && (f64::from(JsValue::SMI_MIN)..=f64::from(JsValue::SMI_MAX))
-                                    .contains(&n)
-                                && let Some(smi) = JsValue::from_i32_smi(n as i32)
-                            {
-                                smi
-                            } else {
-                                JsValue::from_f64(n)
-                            };
-                            return Ok(v);
+                            v12_heap::FunctionTarget::Host(c) => {
+                                return c.call(heap, JsValue::object(o), &[]);
+                            }
+                            v12_heap::FunctionTarget::Bytecode(_) => {
+                                return Ok(JsValue::undefined());
+                            }
                         }
-                        if trimmed.is_empty() {
-                            return Ok(JsValue::undefined());
-                        }
-                        return Ok(JsValue::string(g));
                     }
                     return Ok(JsValue::undefined());
                 }

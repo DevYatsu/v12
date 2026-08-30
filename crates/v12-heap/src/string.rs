@@ -63,6 +63,14 @@ use std::vec::Vec;
 /// appends stay O(1) and the rope flattens once, on demand.
 pub const CONCAT_EAGER_FLATTEN_MAX_UNITS: usize = 128;
 
+/// Maximum rope (Cons/Sliced chain) depth before a composite is flattened
+/// eagerly on the next concatenation/slice. Guards against pathological
+/// `s += c` loops building unbounded trees: every walk (flatten, hash,
+/// compare) is iterative, so the cost is bounded, but the *node* count and
+/// per-node overhead grow linearly with appends — flattening past the cap
+/// keeps the tree shallow and the memory proportional to the text.
+pub const ROPE_MAX_DEPTH: usize = 64;
+
 /// FNV-1a 32-bit offset basis: standard Fowler–Noll–Vo parameter, giving
 /// good dispersion on the short ASCII-heavy texts that dominate property
 /// names and source snippets. Pure arithmetic — no addresses, no seeds —
@@ -851,5 +859,54 @@ mod tests {
         heap.roots_mut().0.clear();
         heap.force_collect();
         assert_eq!(heap.live_count::<V12Str>(), 0);
+    }
+
+    #[test]
+    fn deep_rope_stays_bounded_by_the_depth_cap() {
+        // Repeated appends to one string must not build an unbounded Cons
+        // tree: past ROPE_MAX_DEPTH the concatenation flattens eagerly, so
+        // the tree depth stays bounded even after many appends.
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        // Each chunk is large enough to stay lazy (> CONCAT_EAGER_FLATTEN_MAX_UNITS).
+        let chunk = latin(&mut heap, &"x".repeat(200));
+        root(&mut heap, chunk);
+        let mut s = chunk;
+        let appends = super::ROPE_MAX_DEPTH * 4;
+        for _ in 0..appends {
+            let next = heap.concat(s, chunk);
+            root(&mut heap, next);
+            s = next;
+        }
+        // The depth cap keeps the chain bounded: even if the final node is a
+        // Cons, its depth cannot exceed ROPE_MAX_DEPTH + 1 (the cap check
+        // flattens the moment the chain would grow past it).
+        let mut depth = 1usize;
+        let mut cur = s;
+        loop {
+            match &heap.get(cur).storage {
+                StrStorage::Cons { left, right, .. } => {
+                    depth += 1;
+                    // Follow the deeper side for the worst case.
+                    let dl = heap.get(*left).len();
+                    let dr = heap.get(*right).len();
+                    cur = if dl >= dr { *left } else { *right };
+                }
+                StrStorage::Sliced { parent, .. } => {
+                    depth += 1;
+                    cur = *parent;
+                }
+                StrStorage::Latin1(_) | StrStorage::Utf16(_) => break,
+            }
+        }
+        assert!(
+            depth <= super::ROPE_MAX_DEPTH + 1,
+            "rope depth {depth} exceeds the cap {}",
+            super::ROPE_MAX_DEPTH
+        );
+        // Text is intact after all the churn (chunk + one per append).
+        let expected = 200 * (appends + 1);
+        assert_eq!(heap.get(s).len(), expected);
+        heap.flatten(s);
+        assert_eq!(heap.get(s).len(), expected);
     }
 }

@@ -259,15 +259,10 @@ impl Default for ElementsArray {
     }
 }
 
-impl ElementsArray {
-    /// A fresh packed-Smi store.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Current representation.
-    pub fn kind(&self) -> ElementsKind {
-        match self.storage {
+impl ElementsStorage {
+    /// Current representation of this storage variant.
+    fn kind(&self) -> ElementsKind {
+        match self {
             ElementsStorage::PackedSmi(_) => ElementsKind::PackedSmi,
             ElementsStorage::HoleySmi(_) => ElementsKind::HoleySmi,
             ElementsStorage::PackedDouble(_) => ElementsKind::PackedDouble,
@@ -277,17 +272,31 @@ impl ElementsArray {
             ElementsStorage::Dictionary(_) => ElementsKind::Dictionary,
         }
     }
+}
+
+impl ElementsArray {
+    /// A fresh packed-Smi store.
+    pub const fn new() -> Self {
+        Self {
+            storage: ElementsStorage::PackedSmi(Vec::new()),
+        }
+    }
+
+    /// Current representation.
+    pub fn kind(&self) -> ElementsKind {
+        self.storage.kind()
+    }
 
     /// Length view: element count for fast kinds, highest-index-plus-one for
     /// dictionaries.
     pub fn len(&self) -> usize {
         match &self.storage {
-            ElementsStorage::PackedSmi(v)
-            | ElementsStorage::HoleySmi(v)
-            | ElementsStorage::PackedDouble(v)
+            ElementsStorage::PackedSmi(v) => v.len(),
+            ElementsStorage::HoleySmi(v)
             | ElementsStorage::HoleyDouble(v)
             | ElementsStorage::PackedObject(v)
             | ElementsStorage::HoleyObject(v) => v.len(),
+            ElementsStorage::PackedDouble(v) => v.len(),
             ElementsStorage::Dictionary(dict) => dict.length() as usize,
         }
     }
@@ -297,12 +306,18 @@ impl ElementsArray {
     /// dictionaries key on `u32`, so their length view fits by construction.
     fn len_u32(&self) -> u32 {
         match &self.storage {
-            ElementsStorage::PackedSmi(v)
-            | ElementsStorage::HoleySmi(v)
-            | ElementsStorage::PackedDouble(v)
+            ElementsStorage::PackedSmi(v) => {
+                debug_assert!(v.len() < ELEMENTS_TO_DICTIONARY_INDEX as usize);
+                v.len() as u32
+            }
+            ElementsStorage::HoleySmi(v)
             | ElementsStorage::HoleyDouble(v)
             | ElementsStorage::PackedObject(v)
             | ElementsStorage::HoleyObject(v) => {
+                debug_assert!(v.len() < ELEMENTS_TO_DICTIONARY_INDEX as usize);
+                v.len() as u32
+            }
+            ElementsStorage::PackedDouble(v) => {
                 debug_assert!(v.len() < ELEMENTS_TO_DICTIONARY_INDEX as usize);
                 v.len() as u32
             }
@@ -334,6 +349,51 @@ impl ElementsArray {
         self.set(self.len() as u32, value);
     }
 
+    /// Removes and returns the last element (`None` when empty). Shrinks the
+    /// flat backing vectors; dictionary storage removes the highest index.
+    pub fn pop(&mut self) -> Option<JsValue> {
+        match &mut self.storage {
+            ElementsStorage::PackedSmi(v) => v.pop().map(smi_value),
+            ElementsStorage::HoleySmi(v)
+            | ElementsStorage::HoleyDouble(v)
+            | ElementsStorage::PackedObject(v)
+            | ElementsStorage::HoleyObject(v) => v.pop(),
+            ElementsStorage::PackedDouble(v) => v.pop().map(JsValue::from_f64),
+            ElementsStorage::Dictionary(dict) => {
+                if dict.length() == 0 {
+                    return None;
+                }
+                let last = dict.length() - 1;
+                let v = dict.entries.remove(&last).map(|e| e.value);
+                // Recompute the length view: highest remaining index + 1.
+                dict.length = dict
+                    .entries
+                    .keys()
+                    .max()
+                    .map_or(0, |&k| k + 1);
+                v
+            }
+        }
+    }
+
+    /// Iterates present elements in index order (`None` for holes, which the
+    /// caller treats as absent). Dictionary storage iterates its entries.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = JsValue> + '_> {
+        match &self.storage {
+            ElementsStorage::PackedSmi(v) => Box::new(v.iter().map(|&n| smi_value(n))),
+            ElementsStorage::HoleySmi(v)
+            | ElementsStorage::HoleyDouble(v)
+            | ElementsStorage::PackedObject(v)
+            | ElementsStorage::HoleyObject(v) => Box::new(v.iter().copied()),
+            ElementsStorage::PackedDouble(v) => {
+                Box::new(v.iter().map(|&d| JsValue::from_f64(d)))
+            }
+            ElementsStorage::Dictionary(dict) => {
+                Box::new(dict.iter().map(|(_, e)| e.value))
+            }
+        }
+    }
+
     /// Writes `index`, generalizing along the lattice whenever the current
     /// rung cannot hold the value (module docs cover the policy). Data below
     /// `index` is preserved through every conversion.
@@ -354,11 +414,19 @@ impl ElementsArray {
         }
 
         // Gap-filling above the current end needs hole-capable storage,
-        // which `plan` already guaranteed by promoting the kind.
-        self.fill_gaps(index as usize);
+        // which `plan` already guaranteed by promoting the kind. Only fill
+        // when a gap actually exists — a dense write (`index == fast_len`)
+        // on a packed kind must not demand holey storage.
+        if index as usize > self.fast_len() {
+            self.fill_gaps(index as usize);
+        }
 
+        // Snapshot the post-write kind: the dictionary arm below needs it in
+        // a guard, but borrowing `self` immutably inside the `&mut self.storage`
+        // match is not allowed.
+        let is_dict = self.kind() == ElementsKind::Dictionary;
         match (&mut self.storage, class) {
-            (_, class) if self.kind() == ElementsKind::Dictionary => {
+            (_, class) if is_dict => {
                 if let ElementsStorage::Dictionary(dict) = &mut self.storage {
                     dict.insert(index, class.to_value());
                 }
@@ -384,7 +452,7 @@ impl ElementsArray {
             // Any remaining combination is a plan/store disagreement; the
             // dictionary absorbs it rather than corrupting a fast rung.
             (_, class) => {
-                self.convert_to(ElementsStorage::Dictionary);
+                self.convert_to(ElementsKind::Dictionary);
                 if let ElementsStorage::Dictionary(dict) = &mut self.storage {
                     dict.insert(index, class.to_value());
                 }
@@ -396,12 +464,12 @@ impl ElementsArray {
     /// as zero-length here; its inserts go through the map).
     fn fast_len(&self) -> usize {
         match &self.storage {
-            ElementsStorage::PackedSmi(v)
-            | ElementsStorage::HoleySmi(v)
-            | ElementsStorage::PackedDouble(v)
+            ElementsStorage::PackedSmi(v) => v.len(),
+            ElementsStorage::HoleySmi(v)
             | ElementsStorage::HoleyDouble(v)
             | ElementsStorage::PackedObject(v)
             | ElementsStorage::HoleyObject(v) => v.len(),
+            ElementsStorage::PackedDouble(v) => v.len(),
             ElementsStorage::Dictionary(_) => 0,
         }
     }
@@ -643,5 +711,32 @@ impl Trace for ElementsArray {
 impl crate::object::SizeEstimate for ElementsArray {
     fn approx_size(&self) -> usize {
         core::mem::size_of::<Self>() + self.retained_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_smi_writes_fill_lattice() {
+        let mut arr = ElementsArray::new();
+        arr.set(0, JsValue::from_i32_smi(5).unwrap());
+        arr.set(1, JsValue::from_i32_smi(6).unwrap());
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.get(0).and_then(|v| v.as_smi()), Some(5));
+        assert_eq!(arr.get(1).and_then(|v| v.as_smi()), Some(6));
+    }
+
+    #[test]
+    fn pop_removes_last_and_shrinks() {
+        let mut arr = ElementsArray::new();
+        arr.set(0, JsValue::from_i32_smi(5).unwrap());
+        arr.set(1, JsValue::from_i32_smi(6).unwrap());
+        assert_eq!(arr.pop().and_then(|v| v.as_smi()), Some(6));
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.pop().and_then(|v| v.as_smi()), Some(5));
+        assert_eq!(arr.len(), 0);
+        assert_eq!(arr.pop(), None);
     }
 }

@@ -32,6 +32,8 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "RangeError",
     "Promise",
     "Symbol",
+    "Map",
+    "Set",
     "console",
     "globalThis",
 ];
@@ -76,6 +78,11 @@ impl Realm {
             };
             let ctor = heap.alloc(JsObject {
                 kind,
+                // Placeholder: no real callable yet. `u32::MAX` is beyond any
+                // program function count, so calling/constructing it routes to
+                // the native seam, which reports "not registered" — the same
+                // rejection a pre-FunctionTarget empty `elements[0]` gave.
+                callable: v12_heap::FunctionTarget::Bytecode(u32::MAX),
                 ..JsObject::default()
             });
             // Publish the placeholder immediately to honor the allocation contract.
@@ -117,13 +124,36 @@ impl Realm {
             heap.get_mut(promise_ctor).prototype = Some(promise_proto);
         }
         // `String(x)` must be callable (ES ToString): point the placeholder's
-        // target at the native constructor index.
+        // callable at the native constructor index (out-of-range bytecode →
+        // native seam → engine registry dispatches `string_construct`).
         let string_ctor = intrinsics.get("String").and_then(|v| v.as_object());
         if let Some(string_ctor) = string_ctor {
-            heap.get_mut(string_ctor).elements = vec![JsValue::from_i32_smi(
-                NATIVE_STRING_CONSTRUCT as i32,
-            )
-            .expect("native index fits Smi")];
+            heap.get_mut(string_ctor).callable =
+                v12_heap::FunctionTarget::Bytecode(NATIVE_STRING_CONSTRUCT);
+        }
+        // `Error(x)` / `new Error(x)` are constructible: point the placeholder
+        // at the native error creator.
+        let error_ctor = intrinsics.get("Error").and_then(|v| v.as_object());
+        if let Some(error_ctor) = error_ctor {
+            heap.get_mut(error_ctor).callable =
+                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_ERROR_CREATE);
+        }
+        // `Boolean(x)` / `new Boolean(x)` are constructible.
+        let boolean_ctor = intrinsics.get("Boolean").and_then(|v| v.as_object());
+        if let Some(boolean_ctor) = boolean_ctor {
+            heap.get_mut(boolean_ctor).callable =
+                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_BOOLEAN_CONSTRUCT);
+        }
+        // `Map` / `Set` are constructible.
+        let map_ctor = intrinsics.get("Map").and_then(|v| v.as_object());
+        if let Some(map_ctor) = map_ctor {
+            heap.get_mut(map_ctor).callable =
+                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_MAP_CONSTRUCT);
+        }
+        let set_ctor = intrinsics.get("Set").and_then(|v| v.as_object());
+        if let Some(set_ctor) = set_ctor {
+            heap.get_mut(set_ctor).callable =
+                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_SET_CONSTRUCT);
         }
 
         Self { global, intrinsics }

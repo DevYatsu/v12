@@ -208,6 +208,10 @@ impl<'p> Mini<'p> {
                     regs[instr.a() as usize] = Val::F64(-to_number(&regs[instr.b() as usize]));
                     pc += 1;
                 }
+                Opcode::ToNumber => {
+                    regs[instr.a() as usize] = Val::F64(to_number(&regs[instr.b() as usize]));
+                    pc += 1;
+                }
                 Opcode::BitNot => {
                     regs[instr.a() as usize] =
                         Val::F64(!to_int32(&to_number(&regs[instr.b() as usize])) as f64);
@@ -370,7 +374,9 @@ impl<'p> Mini<'p> {
                 | Opcode::CheckIsArray
                 | Opcode::CallApply
                 | Opcode::CopyObjectRest
-                | Opcode::ArrayAppend => {
+                | Opcode::ArrayAppend
+                | Opcode::MergeObject
+                | Opcode::DefineAccessor => {
                     panic!("generator/async/copy opcodes not expected in tier-1 mini programs")
                 }
                 Opcode::Construct => {

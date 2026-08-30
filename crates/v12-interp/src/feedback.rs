@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! Per-function execution feedback: saturating heat counters, the
-//! monomorphic property-access inline cache, and per-opcode type feedback
+//! polymorphic property-access inline cache, and per-opcode type feedback
 //! used by the tier-2 optimizer for speculative specialization.
 //!
 //! The interpreter records observations, it does not act on them beyond
@@ -23,13 +23,75 @@ use v12_heap::{JsValue, ShapeHandle};
 /// driver, low enough to fire within milliseconds of sustained heat.
 pub(crate) const FEEDBACK_TIER_UP_THRESHOLD: u16 = 1024;
 
-/// One inline-cache site: the last shape seen at the access and the slot its
-/// descriptor names. Monomorphic by design — a new shape simply replaces the
-/// old entry, and every hit re-validates before trusting `slot`.
-#[derive(Clone, Copy, Debug)]
-pub struct MonoIc {
+/// One inline-cache entry: the shape seen at the access and the slot its
+/// descriptor names. Every hit re-validates before trusting `slot`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IcEntry {
     pub shape: ShapeHandle,
     pub slot: u32,
+}
+
+/// Maximum entries in a polymorphic inline cache. Small fixed array: real
+/// call sites see one or two shapes; beyond this the cache resets (the slow
+/// path stays correct).
+pub const IC_MAX_ENTRIES: usize = 3;
+
+/// A small polymorphic inline cache for one property-access site.
+///
+/// Monomorphic sites (the common case) use entry 0; a second shape appends.
+/// On a third distinct shape the whole cache resets to the newest entry,
+/// keeping the array bounded and the probe a linear scan of ≤3 entries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PolyIc {
+    entries: [Option<IcEntry>; IC_MAX_ENTRIES],
+}
+
+impl PolyIc {
+    /// Looks up `shape`; returns the cached slot on a hit.
+    #[inline]
+    pub fn get(&self, shape: ShapeHandle) -> Option<u32> {
+        for e in self.entries.iter().flatten() {
+            if e.shape == shape {
+                return Some(e.slot);
+            }
+        }
+        None
+    }
+
+    /// Records a `(shape, slot)` observation. Monomorphic first entry, append
+    /// up to the cap, reset past it.
+    pub fn record(&mut self, shape: ShapeHandle, slot: u32) {
+        // Refresh an existing entry (keeps the most recent slot for a shape).
+        for e in self.entries.iter_mut().flatten() {
+            if e.shape == shape {
+                e.slot = slot;
+                return;
+            }
+        }
+        for slot_opt in self.entries.iter_mut() {
+            if slot_opt.is_none() {
+                *slot_opt = Some(IcEntry { shape, slot });
+                return;
+            }
+        }
+        // Full: reset to the newest observation only.
+        self.entries = [Some(IcEntry { shape, slot }), None, None];
+    }
+
+    /// Number of populated entries.
+    pub fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    /// True when no entries are populated.
+    pub fn is_empty(&self) -> bool {
+        self.entries.iter().all(Option::is_none)
+    }
+
+    /// The first (most recent) entry, for feedback/tiering.
+    pub fn first(&self) -> Option<&IcEntry> {
+        self.entries[0].as_ref()
+    }
 }
 
 /// Type lattice for speculative specialization.
@@ -176,7 +238,7 @@ impl Lattice {
 #[derive(Default)]
 pub struct FeedbackVector {
     /// Inline caches keyed by the pc of their `GetProperty` instruction.
-    pub ics: HashMap<u32, MonoIc>,
+    pub ics: HashMap<u32, PolyIc>,
     /// Per-opcode type feedback keyed by bytecode pc.
     pub type_feedback: HashMap<u32, Lattice>,
     /// Saturating count of loop-header crossings.
@@ -222,14 +284,11 @@ impl FeedbackVector {
 
     /// Whether the inline caches are monomorphic (at most one shape per site).
     ///
-    /// The current representation is already monomorphic per site, so this
-    /// returns `true` when no site has conflicting shapes. It is retained as
-    /// an explicit predicate for the optimizer gate.
+    /// Retained as an explicit predicate for the optimizer gate (a
+    /// polymorphic site is still optimizable, but the guard set is larger).
     #[must_use]
     pub fn is_mono(&self) -> bool {
-        // With MonoIc we store only the last shape, so mono is trivially true.
-        // A future polymorphic IC would change this predicate.
-        true
+        self.ics.values().all(|ic| ic.len() <= 1)
     }
 
     /// Accessor for tests: number of type-feedback entries.
@@ -535,5 +594,57 @@ mod tests {
             "expected Smi in feedback, got {:?}",
             fv.type_feedback
         );
+    }
+
+    #[test]
+    fn poly_ic_records_and_resets() {
+        let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
+        let s0 = heap.root_shape();
+        let s1 = heap.add_property(
+            s0,
+            v12_heap::PropKey::from_parts(false, 1),
+            v12_heap::Attrs::DEFAULT,
+        );
+        let s2 = heap.add_property(
+            s1,
+            v12_heap::PropKey::from_parts(false, 2),
+            v12_heap::Attrs::DEFAULT,
+        );
+
+        let mut ic = PolyIc::default();
+        assert!(ic.is_empty());
+        assert_eq!(ic.get(s0), None);
+
+        // Monomorphic first entry.
+        ic.record(s0, 7);
+        assert_eq!(ic.get(s0), Some(7));
+        assert_eq!(ic.len(), 1);
+
+        // Second distinct shape appends.
+        ic.record(s1, 9);
+        assert_eq!(ic.get(s0), Some(7));
+        assert_eq!(ic.get(s1), Some(9));
+        assert_eq!(ic.len(), 2);
+
+        // Third distinct shape appends.
+        ic.record(s2, 11);
+        assert_eq!(ic.get(s2), Some(11));
+        assert_eq!(ic.len(), 3);
+
+        // A fourth distinct shape resets to the newest entry only.
+        let s3 = heap.add_property(
+            s2,
+            v12_heap::PropKey::from_parts(false, 3),
+            v12_heap::Attrs::DEFAULT,
+        );
+        ic.record(s3, 13);
+        assert_eq!(ic.len(), 1);
+        assert_eq!(ic.get(s3), Some(13));
+        assert_eq!(ic.get(s0), None);
+
+        // Refreshing an existing shape keeps the entry count.
+        ic.record(s3, 14);
+        assert_eq!(ic.len(), 1);
+        assert_eq!(ic.get(s3), Some(14));
     }
 }

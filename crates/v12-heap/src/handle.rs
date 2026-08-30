@@ -57,7 +57,7 @@ pub struct Handle<T> {
 }
 
 impl<T> Handle<T> {
-    pub(crate) fn new(index: u32) -> Self {
+    pub(crate) const fn new(index: u32) -> Self {
         Self {
             index,
             _space: PhantomData,

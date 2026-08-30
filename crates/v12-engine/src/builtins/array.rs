@@ -26,9 +26,18 @@ pub fn array_push(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<Js
         return Err(intern_type_error(heap, "RangeError: invalid array length"));
     }
     for &item in args {
-        heap.get_mut(obj).elements.push(item);
+        let obj_mut = heap.get_mut(obj);
+        if obj_mut.kind == v12_heap::KIND_ARRAY {
+            obj_mut.elements_array.push(item);
+        } else {
+            obj_mut.elements.push(item);
+        }
     }
-    let new_len = heap.get(obj).elements.len() as u32;
+    let new_len = if heap.get(obj).kind == v12_heap::KIND_ARRAY {
+        heap.get(obj).elements_array.len() as u32
+    } else {
+        heap.get(obj).elements.len() as u32
+    };
     sync_length(heap, obj, new_len);
     let len_value =
         JsValue::from_i32_smi(new_len as i32).unwrap_or(JsValue::from_f64(f64::from(new_len)));
@@ -43,17 +52,27 @@ pub fn array_pop(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<Js
             "TypeError: Array.prototype.pop called on non-object",
         ));
     };
-    let popped = heap
-        .get_mut(obj)
-        .elements
-        .pop()
-        .unwrap_or(JsValue::undefined());
+    let popped = if heap.get(obj).kind == v12_heap::KIND_ARRAY {
+        heap.get_mut(obj)
+            .elements_array
+            .pop()
+            .unwrap_or(JsValue::undefined())
+    } else {
+        heap.get_mut(obj)
+            .elements
+            .pop()
+            .unwrap_or(JsValue::undefined())
+    };
     let value = if popped.is_hole() {
         JsValue::undefined()
     } else {
         popped
     };
-    let new_len = heap.get(obj).elements.len() as u32;
+    let new_len = if heap.get(obj).kind == v12_heap::KIND_ARRAY {
+        heap.get(obj).elements_array.len() as u32
+    } else {
+        heap.get(obj).elements.len() as u32
+    };
     sync_length(heap, obj, new_len);
     Ok(value)
 }

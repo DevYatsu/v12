@@ -28,6 +28,24 @@ pub const KIND_ARGUMENTS: u8 = 3;
 /// elements=saved register window snapshot; prototype=captured Env. DO NOT reorder without updating interp.
 pub const KIND_GENERATOR: u8 = 4;
 
+/// Promise object. Internal slots live in `properties[0..3]` =
+/// `[state, value, reactions]` (see [`PromiseExt`]). A dedicated kind makes
+/// `is_promise` a single field test instead of a structural check.
+pub const KIND_PROMISE: u8 = 5;
+
+/// Error object. Internal slots: `properties[0]` = name, `properties[1]` =
+/// message. A dedicated kind lets `is_error` be a field test and keeps error
+/// display (`message` extraction) off the shape path.
+pub const KIND_ERROR: u8 = 6;
+
+/// Map object. Entries live in `elements` as `[k1, v1, k2, v2, …]` pairs
+/// (see `v12-engine/src/builtins/map.rs`).
+pub const KIND_MAP: u8 = 7;
+
+/// Set object. Values live in `elements` (see
+/// `v12-engine/src/builtins/map.rs`).
+pub const KIND_SET: u8 = 8;
+
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
 /// down. Transitions are monotone — sealing then freezing is legal, nothing
 /// un-seals — so [`Heap::set_integrity_level`] only ever raises flags.
@@ -44,12 +62,31 @@ pub enum IntegrityLevel {
 /// A heap object: a kind/flags header plus dense property and element
 /// vectors and a prototype link. Shapes describe the layout; this carries
 /// the storage.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JsObject {
     /// Object kind; [`KIND_ORDINARY`] by default.
     pub kind: u8,
     /// Kind-specific flag bits (see the `FLAG_*` constants).
     pub flags: u8,
+    /// For `KIND_FUNCTION` objects: what calling this object invokes (a
+    /// bytecode index, a native handler, or a host closure). One word.
+    /// Meaningless for other kinds (defaults to the root bytecode index 0).
+    pub callable: crate::function::FunctionTarget,
+    /// The shape describing this object's property layout. Stored directly
+    /// on the object (one word) so `Heap::shape_of` is a single field read
+    /// — no side-table indirection on the property-access hot path. Defaults
+    /// to the pinned empty-object root shape; `Heap::bind_shape` transitions
+    /// it as properties are added.
+    pub shape: crate::shape::ShapeHandle,
+    /// In-object property slots (V8-style): shape descriptor slots below
+    /// [`Self::IN_OBJECT_PROP_CAP`] live here, avoiding a separate backing
+    /// allocation for the common few-property case. Access through
+    /// [`Self::prop_slot`].
+    pub inline_props: [crate::JsValue; Self::IN_OBJECT_PROP_CAP],
+    /// Out-of-line property backing store for slots at or beyond
+    /// [`Self::IN_OBJECT_PROP_CAP`]. `None` until a shape grows past the
+    /// inline cap. Access through [`Self::prop_slot`].
+    pub overflow: Option<Box<[crate::JsValue]>>,
     /// Named-property slots (shape-backed layout arrives with the object
     /// model work).
     pub properties: Vec<crate::JsValue>,
@@ -58,14 +95,21 @@ pub struct JsObject {
     /// handlers that need to enumerate property names without interpreter's
     /// shape cache.
     pub property_keys: Vec<Option<crate::PropKey>>,
-    /// Integer-indexed element slots.
+    /// Integer-indexed element slots (legacy `Vec` used for the overloaded
+    /// slots: function index, generator register window, promise reactions).
     pub elements: Vec<crate::JsValue>,
+    /// Integer-indexed element storage for *arrays*, backed by the
+    /// [`ElementsArray`] kind lattice (PackedSmi → … → Dictionary). Array
+    /// element reads/writes route through here; `elements` remains for the
+    /// non-array overloaded uses above.
+    pub elements_array: crate::elements::ElementsArray,
     /// Prototype link; traced as a strong reference. Guards over this chain
     /// watch a validity-cell serial, not this field alone.
     pub prototype: Option<Handle<JsObject>>,
     /// The validity cell watching assumptions about this object (prototype
     /// identity, attribute stability), assigned lazily on first use. The
-    /// registry holding serials lives on the heap.
+    /// registry holding serials lives on the heap. Not on the shape-lookup
+    /// hot path — `shape` is the shape binding.
     pub validity_cell: ValidityCellId,
     /// Arguments exotic mapping: `Some(map)` where `map[i]` is `Some(slot)`
     /// when indexed property `i` is aliased to the `slot`-th parameter slot,
@@ -75,12 +119,35 @@ pub struct JsObject {
     pub arguments_mapped: Option<Box<[Option<u32>]>>,
 }
 
+impl Default for JsObject {
+    /// Defaults to the pinned empty-object root shape (shape-slot 0), which
+    /// every heap pins at construction — so a fresh object is born with the
+    /// canonical shape and `Heap::shape_of` returns the root until the first
+    /// `bind_shape`.
+    fn default() -> Self {
+        Self {
+            kind: KIND_ORDINARY,
+            flags: 0,
+            callable: crate::function::FunctionTarget::Bytecode(0),
+            shape: crate::shape::ShapeHandle::new(0),
+            inline_props: [crate::JsValue::undefined(); Self::IN_OBJECT_PROP_CAP],
+            overflow: None,
+            properties: Vec::new(),
+            property_keys: Vec::new(),
+            elements: Vec::new(),
+            elements_array: crate::elements::ElementsArray::new(),
+            prototype: None,
+            validity_cell: ValidityCellId::NONE,
+            arguments_mapped: None,
+        }
+    }
+}
+
 impl JsObject {
     /// An ordinary object with empty storage.
     pub fn new() -> Self {
         Self::default()
     }
-
     /// `[[Extensible]] == false`. Implied by both integrity transitions.
     pub const FLAG_NOT_EXTENSIBLE: u8 = 0b0000_0001;
     /// Every own property non-configurable: sealed or stricter.
@@ -99,6 +166,49 @@ impl JsObject {
         self.flags & Self::FLAG_FROZEN != 0
     }
 
+    /// Number of property slots stored inline in the object header.
+    ///
+    /// This is the V8-style in-object/overflow split: shape descriptor slots
+    /// below this cap live in `inline_props`, slots at or above it live in
+    /// `overflow`. Kept small (V8 uses 3–4); benchmark and tune.
+    pub const IN_OBJECT_PROP_CAP: usize = 4;
+
+    /// Reads the property value at shape-slot `slot`.
+    ///
+    /// Slots below [`Self::IN_OBJECT_PROP_CAP`] come from the inline array,
+    /// slots at or above it from the overflow backing store. This is the
+    /// single accessor for shape-derived slots — the interpreter's
+    /// `GetProperty`/`SetProperty` fast paths index through it.
+    ///
+    /// # Panics
+    /// Panics when `slot` is out of range of both stores (corrupt shape).
+    #[inline]
+    pub fn prop_slot(&self, slot: usize) -> crate::JsValue {
+        if slot < Self::IN_OBJECT_PROP_CAP {
+            self.inline_props[slot]
+        } else {
+            self.overflow
+                .as_deref()
+                .and_then(|o| o.get(slot - Self::IN_OBJECT_PROP_CAP))
+                .copied()
+                .unwrap_or(crate::JsValue::undefined())
+        }
+    }
+
+    /// Writes the property value at shape-slot `slot`. See
+    /// [`Self::prop_slot`] for the store layout.
+    #[inline]
+    pub fn set_prop_slot(&mut self, slot: usize, value: crate::JsValue) {
+        if slot < Self::IN_OBJECT_PROP_CAP {
+            self.inline_props[slot] = value;
+        } else {
+            let idx = slot - Self::IN_OBJECT_PROP_CAP;
+            if let Some(overflow) = self.overflow.as_deref_mut() {
+                overflow[idx] = value;
+            }
+        }
+    }
+
     /// An ordinary object with the given properties and their keys.
     pub fn ordinary(properties: Vec<crate::JsValue>, property_keys: Vec<Option<crate::PropKey>>) -> Self {
         Self {
@@ -109,16 +219,12 @@ impl JsObject {
         }
     }
 
-    /// A function object: `elements[0]` holds the function index (Smi),
-    /// `prototype` is the closure environment.
-    ///
-    /// The index is stored as a Smi to match the interpreter's dispatch read
-    /// path (`Interp::prepare_call` extracts it via `as_smi()`).
-    pub fn function(func_index: u32, env: Option<Handle<JsObject>>) -> Self {
+    /// A function object: `callable` is what invoking it runs, `prototype`
+    /// is the closure environment.
+    pub fn function(target: crate::function::FunctionTarget, env: Option<Handle<JsObject>>) -> Self {
         Self {
             kind: KIND_FUNCTION,
-            elements: vec![crate::JsValue::from_i32_smi(func_index as i32)
-                .expect("function index fits Smi")],
+            callable: target,
             prototype: env,
             ..Self::default()
         }
@@ -128,14 +234,21 @@ impl JsObject {
     ///
     /// The length is stored as a Smi to match the interpreter's array
     /// allocations (`NewArray`/`CopyArrayRest` use `ops::box_number`, which
-    /// boxes small integers as Smi).
+    /// boxes small integers as Smi). The elements are mirrored into both the
+    /// legacy `elements` vec (overloaded uses read it) and the live
+    /// `elements_array` lattice that array element accesses route through.
     pub fn array(elements: Vec<crate::JsValue>) -> Self {
         let len = elements.len();
+        let mut elements_array = crate::elements::ElementsArray::new();
+        for (i, &v) in elements.iter().enumerate() {
+            elements_array.set(i as u32, v);
+        }
         Self {
             kind: KIND_ARRAY,
             properties: vec![crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi")],
             property_keys: vec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
             elements,
+            elements_array,
             ..Self::default()
         }
     }
@@ -169,7 +282,7 @@ impl JsObject {
     /// Pending promise with `properties = [state=0, value=undefined, reactions]`.
     pub fn pending_promise(reactions: crate::Handle<JsObject>) -> Self {
         Self {
-            kind: KIND_ORDINARY,
+            kind: KIND_PROMISE,
             properties: vec![
                 crate::JsValue::from_f64(0.0),
                 crate::JsValue::undefined(),
@@ -183,7 +296,7 @@ impl JsObject {
     /// Fulfilled promise `properties = [1, value, reactions]`.
     pub fn fulfilled_promise(value: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
-            kind: KIND_ORDINARY,
+            kind: KIND_PROMISE,
             properties: vec![
                 crate::JsValue::from_i32_smi(1).expect("1 fits"),
                 value,
@@ -197,13 +310,28 @@ impl JsObject {
     /// Rejected promise `properties = [2, reason, reactions]`.
     pub fn rejected_promise(reason: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
-            kind: KIND_ORDINARY,
+            kind: KIND_PROMISE,
             properties: vec![
                 crate::JsValue::from_i32_smi(2).expect("2 fits"),
                 reason,
                 crate::JsValue::object(reactions),
             ],
             property_keys: vec![None; 3],
+            ..Self::default()
+        }
+    }
+
+    /// An error object with `properties = [name, message]`. `name` is the
+    /// error class (e.g. `"TypeError"`); `message` is the human-readable
+    /// text. Both are heap strings.
+    pub fn error(name: crate::Handle<crate::V12Str>, message: crate::Handle<crate::V12Str>) -> Self {
+        Self {
+            kind: KIND_ERROR,
+            properties: vec![
+                crate::JsValue::string(name),
+                crate::JsValue::string(message),
+            ],
+            property_keys: vec![None; 2],
             ..Self::default()
         }
     }
@@ -361,7 +489,7 @@ impl GeneratorExt for crate::Handle<JsObject> {
 /// Heap allocation helpers that hide `add_root` + `property_keys` invariants.
 pub trait HeapExt {
     fn alloc_array(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
-    fn alloc_function(&mut self, idx: u32, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject>;
+    fn alloc_function(&mut self, target: crate::function::FunctionTarget, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject>;
     fn alloc_ordinary(&mut self, props: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
     fn alloc_pending_promise(&mut self) -> crate::Handle<JsObject>;
     fn alloc_array_with_roots(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject> { self.alloc_array(elements) }
@@ -373,8 +501,8 @@ impl HeapExt for crate::Heap {
         self.add_root(crate::JsValue::object(h));
         h
     }
-    fn alloc_function(&mut self, idx: u32, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject> {
-        let h = self.alloc(JsObject::function(idx, env));
+    fn alloc_function(&mut self, target: crate::function::FunctionTarget, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject> {
+        let h = self.alloc(JsObject::function(target, env));
         self.add_root(crate::JsValue::object(h));
         h
     }
@@ -451,6 +579,7 @@ impl SizeEstimate for JsObject {
         16 + self.properties.capacity() * VALUE_BYTES
             + self.elements.capacity() * VALUE_BYTES
             + self.property_keys.capacity() * core::mem::size_of::<Option<crate::PropKey>>()
+            + self.elements_array.retained_bytes()
             + mapped
     }
 }
@@ -475,6 +604,7 @@ impl Trace for JsObject {
         self.properties.trace(sink);
         self.property_keys.trace(sink);
         self.elements.trace(sink);
+        self.elements_array.trace(sink);
         self.prototype.trace(sink);
     }
 }

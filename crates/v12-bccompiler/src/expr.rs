@@ -470,23 +470,76 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     fn object_literal(&mut self, o: &oxc_ast::ast::ObjectExpression<'_>) -> Res<u16> {
         let dst = self.new_temp();
         self.emit_reg3(Opcode::NewObject, dst, 0, 0, o.span);
+        // Collect accessor halves by key so `{ get x(){}, set x(){} }` emits
+        // ONE `DefineAccessor` carrying both closures (the descriptor needs
+        // both halves on the same shape transition).
+        let mut accessors: Vec<(String, u16, Option<u16>, Option<u16>, Span)> = Vec::new();
         for prop_kind in &o.properties {
             match prop_kind {
                 ObjectPropertyKind::SpreadProperty(s) => {
-                    return Err(self.err(s.span, "object spread is not supported"));
+                    // `{...src}`: evaluate src, merge its enumerable own
+                    // properties onto the literal's object (later writes win).
+                    let src = self.expr(&s.argument)?;
+                    self.emit_reg3(Opcode::MergeObject, 0, dst, src, s.span);
                 }
-                ObjectPropertyKind::ObjectProperty(p) => self.object_prop(dst, p)?,
+                ObjectPropertyKind::ObjectProperty(p) => {
+                    if p.kind == oxc_ast::ast::PropertyKind::Get
+                        || p.kind == oxc_ast::ast::PropertyKind::Set
+                    {
+                        let (text, key, body) = self.accessor_parts(p)?;
+                        let is_get = p.kind == oxc_ast::ast::PropertyKind::Get;
+                        let entry = accessors.iter_mut().find(|(t, _, _, _, _)| *t == text);
+                        if let Some((_, _, g, s, _)) = entry {
+                            if is_get {
+                                *g = Some(body);
+                            } else {
+                                *s = Some(body);
+                            }
+                        } else {
+                            accessors.push((
+                                text,
+                                key,
+                                if is_get { Some(body) } else { None },
+                                if is_get { None } else { Some(body) },
+                                p.span,
+                            ));
+                        }
+                    } else {
+                        self.object_prop(dst, p)?;
+                    }
+                }
             }
+        }
+        for (_text, key, getter, setter, span) in accessors {
+            // Pair registers: r[pair] = getter (or undefined), r[pair+1] = setter.
+            let pair = self.new_temp();
+            match (getter, setter) {
+                (Some(g), Some(s)) => {
+                    self.emit_reg2(Opcode::Move, pair, g, span);
+                    self.emit_reg2(Opcode::Move, pair + 1, s, span);
+                }
+                (Some(g), None) => {
+                    self.emit_reg2(Opcode::Move, pair, g, span);
+                    self.load_undefined(pair + 1, span);
+                }
+                (None, Some(s)) => {
+                    self.load_undefined(pair, span);
+                    self.emit_reg2(Opcode::Move, pair + 1, s, span);
+                }
+                (None, None) => unreachable!("accessor with neither half"),
+            }
+            self.emit_reg3(Opcode::DefineAccessor, dst, key, pair, span);
         }
         Ok(dst)
     }
 
     fn object_prop(&mut self, obj: u16, p: &ObjectProperty<'_>) -> Res<()> {
-        // Getters/setters need accessor descriptors; shorthand methods are
-        // just function-valued properties and lower like any other value.
-        if p.kind != oxc_ast::ast::PropertyKind::Init {
-            return Err(self.err(p.span, "object accessors (get/set) are not supported"));
-        }
+        // Accessors are batched in `object_literal`; reaching this path with
+        // a get/set kind is a compiler bug.
+        debug_assert!(
+            p.kind == oxc_ast::ast::PropertyKind::Init,
+            "accessor property reached object_prop"
+        );
         // Computed property keys (`{[expr]: value}`) evaluate the key
         // expression into a temp (ToPropertyKey via runtime `to_key`) and
         // use dynamic `SetProperty`. Static keys remain interned strings via
@@ -515,6 +568,35 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         };
         self.emit_reg3(Opcode::SetProperty, obj, key, val, p.span);
         Ok(())
+    }
+
+    /// Object literal accessor: compile the body closure, returning the static
+    /// key text (for get/set pair dedup), the key register, and the body
+    /// register. Both halves of a get/set pair are batched in
+    /// [`Self::object_literal`] so they share one shape transition.
+    fn accessor_parts(&mut self, p: &ObjectProperty<'_>) -> Res<(String, u16, u16)> {
+        let key = if p.computed {
+            let Some(expr) = p.key.as_expression() else {
+                return Err(self.err(p.key.span(), "computed property key must be an expression"));
+            };
+            self.expr(expr)?
+        } else {
+            self.property_key(&p.key)?
+        };
+        let text = static_key_text(&p.key)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let body = match &p.value {
+            Expression::FunctionExpression(f) => {
+                let r = self.new_temp();
+                self.closure_fn(r, f)?;
+                r
+            }
+            _ => {
+                return Err(self.err(p.span, "accessor value must be a function expression"));
+            }
+        };
+        Ok((text, key, body))
     }
 
     /// Materializes a property key string; `{x}` shorthand keys come straight
@@ -546,7 +628,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 return Ok(dst);
             }
             UnaryOperator::UnaryPlus => {
-                return Err(self.err(span, "unary `+` is not supported (no ToNumber opcode yet)"));
+                // ES ToNumber; the interpreter's `ToNumber` opcode boxes the result.
+                let v = self.expr(arg)?;
+                let dst = self.new_temp();
+                self.emit_reg2(Opcode::ToNumber, dst, v, span);
+                return Ok(dst);
             }
             UnaryOperator::Delete => return self.delete(arg, span),
         };
@@ -583,6 +669,20 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn delete(&mut self, arg: &Expression<'_>, span: Span) -> Res<u16> {
+        // `delete unqualifiedIdentifier`: a SyntaxError early error in strict
+        // mode; in sloppy mode Annex B says it evaluates to `true` (and does
+        // nothing — the binding is not deleted).
+        if !arg.is_member_expression() {
+            if self.comp.plans.units[self.unit].is_strict {
+                return Err(self.err(
+                    span,
+                    "SyntaxError: Delete of an unqualified identifier in strict mode",
+                ));
+            }
+            let dst = self.new_temp();
+            self.load_bool(dst, true, span);
+            return Ok(dst);
+        }
         let Some(m) = arg.as_member_expression() else {
             return Err(self.err(span, "`delete` is only supported on properties"));
         };

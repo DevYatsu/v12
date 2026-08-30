@@ -117,11 +117,11 @@ impl Attrs {
 /// `Descriptor` has two forms:
 ///
 /// * `Data` — an ordinary data property with a value slot and attributes.
-/// * `Accessor` — a getter/setter pair, each an optional heap-string handle
-///   whose text is the JS source of the accessor function body for `v1`.
-///   Accessor descriptors occupy a slot index in `num_own` for layout stability
-///   but hold `hole` in the object's `properties` storage; the getter/setter
-///   handles are traced via the shape.
+/// * `Accessor` — a getter/setter pair, each an optional function *object*
+///   handle (whose `callable` is the accessor body and whose `prototype` is
+///   the captured environment). The accessor body is a real callable, not
+///   source text. Accessor descriptors occupy a slot index in `num_own` for
+///   layout stability but hold `hole` in the object's `properties` storage.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Descriptor {
     Data {
@@ -131,8 +131,8 @@ pub enum Descriptor {
     },
     Accessor {
         key: PropKey,
-        getter: Option<Handle<V12Str>>,
-        setter: Option<Handle<V12Str>>,
+        getter: Option<Handle<crate::object::JsObject>>,
+        setter: Option<Handle<crate::object::JsObject>>,
         attrs: Attrs,
     },
 }
@@ -175,18 +175,18 @@ impl Descriptor {
         matches!(self, Self::Accessor { .. })
     }
 
-    /// Getter handle for accessors.
+    /// Getter function object for accessors.
     #[must_use]
-    pub fn getter(self) -> Option<Handle<V12Str>> {
+    pub fn getter(self) -> Option<Handle<crate::object::JsObject>> {
         match self {
             Self::Accessor { getter, .. } => getter,
             Self::Data { .. } => None,
         }
     }
 
-    /// Setter handle for accessors.
+    /// Setter function object for accessors.
     #[must_use]
-    pub fn setter(self) -> Option<Handle<V12Str>> {
+    pub fn setter(self) -> Option<Handle<crate::object::JsObject>> {
         match self {
             Self::Accessor { setter, .. } => setter,
             Self::Data { .. } => None,
@@ -530,12 +530,14 @@ impl Trace for Shape {
                 (false, index) => sink.mark_string(Handle::new(index)),
                 (true, index) => sink.mark_symbol(Handle::new(index)),
             }
+            // Accessor getter/setter are function-object handles; keep them
+            // (and their captured environments) alive.
             if let Descriptor::Accessor { getter, setter, .. } = descriptor {
                 if let Some(g) = getter {
-                    sink.mark_string(*g);
+                    sink.mark_object(*g);
                 }
                 if let Some(s) = setter {
-                    sink.mark_string(*s);
+                    sink.mark_object(*s);
                 }
             }
         }
@@ -790,8 +792,11 @@ mod tests {
     fn accessor_descriptor_is_distinct_from_data() {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let k = keyed(&mut heap, b"acc");
-        let getter = heap.intern_string(V12Str::latin1(b"42".to_vec()));
-        heap.add_root(crate::JsValue::string(getter));
+        let getter = heap.alloc(crate::JsObject::function(
+            crate::function::FunctionTarget::Bytecode(7),
+            None,
+        ));
+        heap.add_root(crate::JsValue::object(getter));
         let base = heap.root_shape();
         let s_acc = heap.define_accessor(base, k, Some(getter), None, Attrs::DEFAULT);
         heap.add_shape_root(s_acc);
@@ -814,18 +819,26 @@ mod tests {
     fn accessor_getter_and_setter_roundtrip() {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let k = keyed(&mut heap, b"x");
-        let getter = heap.intern_string(V12Str::latin1(b"123".to_vec()));
-        let setter = heap.intern_string(V12Str::latin1(b"setter_body".to_vec()));
-        heap.add_root(crate::JsValue::string(getter));
-        heap.add_root(crate::JsValue::string(setter));
+        let getter = heap.alloc(crate::JsObject::function(
+            crate::function::FunctionTarget::Bytecode(3),
+            None,
+        ));
+        let setter = heap.alloc(crate::JsObject::function(
+            crate::function::FunctionTarget::Bytecode(4),
+            None,
+        ));
+        heap.add_root(crate::JsValue::object(getter));
+        heap.add_root(crate::JsValue::object(setter));
         let base = heap.root_shape();
         let s = heap.define_accessor(base, k, Some(getter), Some(setter), Attrs::DEFAULT);
         heap.add_shape_root(s);
         let d = heap.lookup_property(s, k).unwrap();
         assert_eq!(d.getter(), Some(getter));
         assert_eq!(d.setter(), Some(setter));
-        // Ensure GC keeps getter/setter strings alive via shape trace
+        // The descriptor traces the getter/setter function objects, so a
+        // collection keeps them (and their envs) alive.
         heap.force_collect();
         assert_eq!(heap.lookup_property(s, k).unwrap().getter(), Some(getter));
+        assert_eq!(heap.lookup_property(s, k).unwrap().setter(), Some(setter));
     }
 }

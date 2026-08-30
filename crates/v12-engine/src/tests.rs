@@ -142,6 +142,7 @@ mod builtin_tests {
     use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
 
     use crate::builtins::{array, object, string};
+    use crate::engine::Engine;
 
     #[test]
     fn object_create_with_null_prototype() {
@@ -153,6 +154,21 @@ mod builtin_tests {
     }
 
     #[test]
+    fn map_set_builtins_via_engine() {
+        let mut engine = Engine::new();
+        // Map: set/get/has/delete/size end to end.
+        let src = "let m = new Map(); m.set('a', 1); m.set('b', 2); \
+                   throw [m.get('b'), m.has('a'), m.size, m.delete('a'), m.has('a')].join(',');";
+        let thrown = engine.eval(src).unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "2,true,2,true,false");
+        // Set: add dedups, has/delete/size work.
+        let src2 = "let s = new Set(); s.add(1); s.add(2); s.add(1); \
+                    throw [s.size, s.has(2), s.delete(1), s.has(1)].join(',');";
+        let thrown2 = engine.eval(src2).unwrap_err();
+        assert_eq!(engine.to_display_string(thrown2), "2,true,true,false");
+    }
+
+    #[test]
     fn array_push_and_pop_length() {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let arr = heap.alloc(JsObject::array(Vec::new()));
@@ -161,10 +177,10 @@ mod builtin_tests {
         let two = JsValue::from_i32_smi(2).unwrap();
         let len = array::array_push(&mut heap, JsValue::object(arr), &[one, two]).expect("push");
         assert_eq!(len.as_smi(), Some(2));
-        assert_eq!(heap.get(arr).elements.len(), 2);
+        assert_eq!(heap.get(arr).elements_array.len(), 2);
         let popped = array::array_pop(&mut heap, JsValue::object(arr), &[]).expect("pop");
         assert_eq!(popped.as_smi(), Some(2));
-        assert_eq!(heap.get(arr).elements.len(), 1);
+        assert_eq!(heap.get(arr).elements_array.len(), 1);
     }
 
     #[test]

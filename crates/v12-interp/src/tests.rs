@@ -530,8 +530,8 @@ fn instanceof_non_callable_rhs_throws() {
 }
 
 #[test]
-fn accessor_getter_returns_numeric_string() {
-    // Bucket 10: accessor with numeric getter string "42" should return 42
+fn accessor_getter_invokes_callable() {
+    // Bucket 10: accessor with a real getter callable returns its result.
     let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(&mut heap, "let x = 1;").expect("compiles");
     let obj = {
@@ -540,15 +540,26 @@ fn accessor_getter_returns_numeric_string() {
         heap.add_root(v12_heap::JsValue::object(o));
         o
     };
-    let (key, key_v, getter) = {
+    let (key, key_v) = {
         let heap = interp.heap_mut_for_test();
         let s = heap.intern_string(v12_heap::V12Str::latin1(b"val".to_vec()));
         heap.add_root(v12_heap::JsValue::string(s));
         let key = v12_heap::PropKey::from_string(s);
         let key_v = v12_heap::JsValue::string(s);
-        let g = heap.intern_string(v12_heap::V12Str::latin1(b"42".to_vec()));
-        heap.add_root(v12_heap::JsValue::string(g));
-        (key, key_v, g)
+        (key, key_v)
+    };
+    // Getter is a native callable that returns the Smi 42.
+    fn getter_42(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+        Ok(JsValue::from_i32_smi(42).unwrap())
+    }
+    let getter = {
+        let heap = interp.heap_mut_for_test();
+        let g = heap.alloc(v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Native(getter_42),
+            None,
+        ));
+        heap.add_root(v12_heap::JsValue::object(g));
+        g
     };
     let shape = {
         let heap = interp.heap_mut_for_test();
@@ -575,7 +586,7 @@ fn accessor_getter_returns_numeric_string() {
 }
 
 #[test]
-fn accessor_setter_is_noop_without_data_slot() {
+fn accessor_setter_invokes_callable_without_data_slot() {
     // Bucket 10: setting an accessor with a setter should not create a data slot
     let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(&mut heap, "let x = 1;").expect("compiles");
@@ -585,17 +596,34 @@ fn accessor_setter_is_noop_without_data_slot() {
         heap.add_root(v12_heap::JsValue::object(o));
         o
     };
-    let (key, key_v, getter, setter) = {
+    let (key, key_v) = {
         let heap = interp.heap_mut_for_test();
         let s = heap.intern_string(v12_heap::V12Str::latin1(b"prop".to_vec()));
         heap.add_root(v12_heap::JsValue::string(s));
         let key = v12_heap::PropKey::from_string(s);
         let key_v = v12_heap::JsValue::string(s);
-        let g = heap.intern_string(v12_heap::V12Str::latin1(b"10".to_vec()));
-        let st = heap.intern_string(v12_heap::V12Str::latin1(b"setter_body".to_vec()));
-        heap.add_root(v12_heap::JsValue::string(g));
-        heap.add_root(v12_heap::JsValue::string(st));
-        (key, key_v, g, st)
+        (key, key_v)
+    };
+    // Getter returns 10; setter is a no-op that swallows the assigned value.
+    fn getter_10(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+        Ok(JsValue::from_i32_smi(10).unwrap())
+    }
+    fn setter_noop(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+        Ok(JsValue::undefined())
+    }
+    let (getter, setter) = {
+        let heap = interp.heap_mut_for_test();
+        let g = heap.alloc(v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Native(getter_10),
+            None,
+        ));
+        heap.add_root(v12_heap::JsValue::object(g));
+        let s = heap.alloc(v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Native(setter_noop),
+            None,
+        ));
+        heap.add_root(v12_heap::JsValue::object(s));
+        (g, s)
     };
     let shape = {
         let heap = interp.heap_mut_for_test();
@@ -631,10 +659,10 @@ fn global_var_alias_for_captured_var() {
     let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
     let global = heap.alloc(v12_heap::JsObject::default());
     heap.add_root(v12_heap::JsValue::object(global));
-    // Simulate global with intrinsic slots already (must match `GLOBAL_VAR_OFFSET` = 14).
+    // Simulate global with intrinsic slots already (must match `GLOBAL_VAR_OFFSET` = 16).
     heap.get_mut(global)
         .properties
-        .resize(14, v12_heap::JsValue::undefined());
+        .resize(16, v12_heap::JsValue::undefined());
     heap.add_root(v12_heap::JsValue::object(global));
     let src = "var x = 123; function f(){ return x; } throw f();";
     let (program, strings) = v12_bccompiler::compile_source_with_strings(src).expect("compile");
@@ -646,7 +674,7 @@ fn global_var_alias_for_captured_var() {
     // slot numbering every top-level binding gets a descriptor slot in
     // declaration order, physically stored at `GLOBAL_VAR_OFFSET + slot`;
     // the hoisted function declaration takes slot 0, so `x` occupies slot 1.
-    let val = heap.get(global).properties[15];
+    let val = heap.get(global).properties[17];
     assert_eq!(val.as_smi(), Some(123));
 }
 
@@ -929,7 +957,10 @@ fn global_object_get_prototype_property_is_reachable() {
     });
     heap.add_root(v12_heap::JsValue::object(object_ctor));
     // Native function for getPrototypeOf.
-    let native_fn = heap.alloc(v12_heap::JsObject::function(1001, None));
+    let native_fn = heap.alloc(v12_heap::JsObject::function(
+        v12_heap::FunctionTarget::Bytecode(1001),
+        None,
+    ));
     heap.add_root(v12_heap::JsValue::object(native_fn));
     // Give Object a `getPrototypeOf` property via shape.
     let key = {

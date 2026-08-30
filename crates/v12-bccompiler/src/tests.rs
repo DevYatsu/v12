@@ -263,6 +263,17 @@ fn typeof_forms() {
 }
 
 #[test]
+fn unary_plus_applies_tonumber() {
+    expect_num("return +'42';", 42.0);
+    expect_num("return +true;", 1.0);
+    expect_num("return +null;", 0.0);
+    expect_num("return +'3.5';", 3.5);
+    expect_num("let x = '7'; return +x;", 7.0);
+    // Unary minus still negates.
+    expect_num("return -'42';", -42.0);
+}
+
+#[test]
 fn string_concat_via_plus() {
     expect_str("return 'hello' + ' ' + 'world';", "hello world");
     expect_str("return 'n=' + 42;", "n=42");
@@ -940,12 +951,8 @@ fn construct_and_method_shorthand_together() {
 #[test]
 fn unsupported_constructs_fail_as_compile_errors() {
     let cases: &[&str] = &[
-        "+x",
         "let x = 1n;",
         "for (let v of [1]) {}",
-        // `new Object()` and `` `tpl ${1}` `` are now lowered (Construct /
-        // template fold); method shorthand lowers as a closure property.
-        "({ get x() { return 1; } })",
         "class C {}",
         "[a, b] = [1, 2]",
         "return 1;",

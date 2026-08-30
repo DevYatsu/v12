@@ -287,16 +287,9 @@ impl Engine {
         let natives = registry.clone();
         interp.set_natives(Box::new(natives));
         let outcome = interp.run();
-        // Drain the checkpoint against the still-live interpreter so jobs can
-        // activate user functions; natives' follow-ups join the same drain.
-        for job in registry.take_pending() {
-            jobs.enqueue(job);
-        }
-        let _ = jobs.drain(&mut interp, Rc::clone(pending));
-        let _ = interp.run_jobs();
-        for job in registry.take_pending() {
-            jobs.enqueue(job);
-        }
+        // Drain the single microtask checkpoint against the still-live
+        // interpreter: host jobs and async resumes alternate until empty.
+        let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         // Capture the actual completion value (e.g. `1+1` → 2);
         // `eval` and `eval_with_completion` both return it.
         *completion = interp.completion_value();
@@ -467,13 +460,8 @@ impl Engine {
         };
         interp.set_natives(Box::new(natives));
         let outcome = interp.run();
-        for job in registry.take_pending() {
-            jobs.enqueue(job);
-        }
-        let _ = jobs.drain(&mut interp, Rc::clone(pending));
-        for job in registry.take_pending() {
-            jobs.enqueue(job);
-        }
+        // Single checkpoint: host jobs + async resumes alternate until empty.
+        let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         // Capture the module's completion value too.
         *completion = interp.completion_value();
         drop(interp); // releases the `&mut heap` borrow
@@ -519,7 +507,10 @@ impl Engine {
             .iter()
             .position(|f| f.name_hint.as_deref() == Some("__f"))
             .unwrap_or(1) as u32;
-        let func = self.heap.alloc(v12_heap::JsObject::function(idx, None));
+        let func = self.heap.alloc(v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(idx),
+            None,
+        ));
         self.heap.add_root(JsValue::object(func));
         // Keep the program alive for the test duration by leaking its Arc
         // (v1: tests do not actually call the function through the engine's
@@ -546,9 +537,19 @@ impl Engine {
     ) -> Result<(), JsValue> {
         let index = Self::HOST_FN_BASE + self.host_fn_counter;
         self.host_fn_counter += 1;
-        self.registry.register_closure(index, closure);
+        self.registry.register_closure(index, closure.clone());
         let global = self.realm.global();
-        let func = self.heap.alloc(v12_heap::JsObject::function(index, None));
+        // The function object carries the host closure directly (one word),
+        // so `prepare_call` invokes it without a registry lookup. The engine
+        // closure wraps an `Rc<RefCell<dyn FnMut>>`; the heap `HostClosure`
+        // adapts it to the one-word handle. Ownership: the engine registry
+        // keeps the closure alive for the engine's lifetime, outliving every
+        // function object that references it.
+        let heap_closure = v12_heap::HostClosure::new(move |heap, this, args| closure.call(heap, this, args));
+        let func = self.heap.alloc(v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Host(heap_closure),
+            None,
+        ));
         self.heap.add_root(JsValue::object(func));
         // Install `name` on the global via the public shape API, exactly as
         // the interpreter's `op_set_global` does (GLOBAL_VAR_OFFSET bias).
@@ -644,19 +645,56 @@ impl Engine {
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
         let outcome = interp.call_object(callee, JsValue::undefined(), args);
-        for job in registry.take_pending() {
-            jobs.enqueue(job);
-        }
-        let _ = jobs.drain(&mut interp, Rc::clone(pending));
-        let _ = interp.run_jobs();
-        for job in registry.take_pending() {
-            jobs.enqueue(job);
-        }
+        let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         drop(interp);
         match outcome {
             Ok(v) => Ok(v),
             Err(JSException(thrown)) => Err(thrown),
         }
+    }
+
+    /// Drains the microtask checkpoint: host jobs and interpreter async
+    /// resumes, alternating until both are empty.
+    ///
+    /// This is the engine's *single* scheduler. A host job may (through a
+    /// native or a promise reaction) enqueue an async resume, and an async
+    /// resume may settle a promise that enqueues a host job — so the loop
+    /// alternates: drain host jobs, then one pass of interpreter awaits, then
+    /// adopt native follow-ups, until nothing is pending. Returns the number
+    /// of jobs executed (host jobs + async resumes).
+    ///
+    /// Takes the registry explicitly (not `&mut self`) so callers that have
+    /// already destructured the engine into disjoint locals can use it.
+    fn drain_checkpoint(
+        registry: &mut NativeRegistry,
+        interp: &mut Interp<'_>,
+        jobs: &mut JobQueue,
+        pending: &Rc<RefCell<Vec<Job>>>,
+    ) -> usize {
+        let mut count = 0usize;
+        loop {
+            // Adopt follow-ups enqueued by natives/promises during the last
+            // iteration, then run host jobs until the queue is empty.
+            for job in registry.take_pending() {
+                jobs.enqueue(job);
+            }
+            count += jobs.drain(interp, Rc::clone(pending));
+
+            // One pass of async resumes: each may enqueue more host jobs
+            // (promise settlements), which the loop picks up next.
+            let mut resumed = 0usize;
+            while interp.resume_next_await() {
+                resumed += 1;
+            }
+            count += resumed;
+
+            // Loop ends when neither host jobs nor awaits nor native
+            // follow-ups remain.
+            if jobs.is_empty() && !interp.has_pending_awaits() {
+                break;
+            }
+        }
+        count
     }
 
     /// Drains the microtask queue.
@@ -668,7 +706,6 @@ impl Engine {
     /// Returns the number of jobs executed.
     pub fn run_jobs(&mut self) -> usize {
         self.adopt_pending();
-        let has_jobs = !self.jobs.is_empty();
         let global = self.realm.global();
         // Borrow the retained program via `Arc::clone` — a refcount
         // bump, not a deep copy. The interpreter consumes `Vec`s, so we
@@ -689,19 +726,7 @@ impl Engine {
         let Engine { heap, jobs, registry, pending, .. } = self;
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
-        let mut count = 0;
-        if has_jobs {
-            count += jobs.drain(&mut interp, Rc::clone(pending));
-        }
-        count += interp.run_jobs();
-        for job in registry.take_pending() {
-            jobs.enqueue(job);
-        }
-        // pending_awaits may have produced new JobQueue entries; drain once more
-        if !jobs.is_empty() {
-            count += jobs.drain(&mut interp, Rc::clone(pending));
-            count += interp.run_jobs();
-        }
+        let count = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         drop(interp); // releases the `&mut heap` borrow
         count
     }
@@ -723,6 +748,16 @@ impl Engine {
         self.jobs.enqueue(Box::new(job))
     }
 
+    /// Decodes a heap string handle to Rust text (flattening first).
+    fn heap_string_text(&mut self, handle: v12_heap::Handle<V12Str>) -> String {
+        self.heap.flatten(handle);
+        match &self.heap.get(handle).storage {
+            v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
+            _ => String::new(),
+        }
+    }
+
     /// Returns a display string for a value, using the engine heap.
     pub fn to_display_string(&mut self, value: JsValue) -> String {
         // For engine-heap values, intern and flatten via heap string ops.
@@ -735,6 +770,24 @@ impl Engine {
                 v12_heap::StrStorage::Utf16(units) => return String::from_utf16_lossy(units),
                 _ => return String::new(),
             }
+        }
+        // Real error objects render as "Name: message".
+        if value.is_object()
+            && let Some(obj) = value.as_object()
+            && self.heap.get(obj).kind == v12_heap::KIND_ERROR
+        {
+            // Snapshot the handles first so the text decode (which needs
+            // `&mut self`) doesn't fight the borrow.
+            let name_h = self.heap.get(obj).properties.first().and_then(|v| v.as_string());
+            let msg_h = self.heap.get(obj).properties.get(1).and_then(|v| v.as_string());
+            let name = name_h
+                .map(|h| self.heap_string_text(h))
+                .unwrap_or_else(|| "Error".to_string());
+            let msg = msg_h.map(|h| self.heap_string_text(h)).unwrap_or_default();
+            if msg.is_empty() {
+                return name;
+            }
+            return format!("{name}: {msg}");
         }
         if let Some(n) = value.as_smi().map(f64::from).or(value.as_f64()) {
             if n.is_nan() {
@@ -1047,8 +1100,11 @@ mod tests {
             heap.add_root(JsValue::string(h));
             v12_heap::PropKey::from_string(h)
         };
-        let getter = heap.intern_string(V12Str::latin1(b"77".to_vec()));
-        heap.add_root(JsValue::string(getter));
+        let getter = heap.alloc(v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(9),
+            None,
+        ));
+        heap.add_root(JsValue::object(getter));
         let shape = heap.define_accessor(
             heap.root_shape(),
             key,

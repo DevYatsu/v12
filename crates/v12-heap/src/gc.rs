@@ -266,16 +266,6 @@ pub struct Heap {
     /// heap handles inside, so collections ignore it entirely.
     validity_cells: Vec<u32>,
 
-    /// Object → shape binding.
-    ///
-    /// Keyed by `ValidityCellId::0` (id 0 is the shared null cell and never
-    /// appears here, so the cell `1` lives at index 0). Lives inside the
-    /// heap so a fresh `Heap` cannot read another engine's shapes through
-    /// address reuse, and so the GC owns the table's lifetime. Replaces
-    /// the old global `SHAPE_TABLE: thread_local<RefCell<HashMap<…>>>` in
-    /// the engine and the parallel side table the interpreter used to keep.
-    shape_of_cell: Vec<ShapeHandle>,
-
     /// Canonical string instances by content hash. Every handle in the
     /// table is a GC root (marked at each collection start), so interned
     /// strings outlive the transient duplicates they deduplicate. Buckets
@@ -323,7 +313,6 @@ impl Heap {
             root_shape: Handle::new(0),
             validity_cells: Vec::new(),
             interned_strings: hashbrown::HashMap::new(),
-            shape_of_cell: Vec::new(),
             policy,
             allocated_since_gc: 0,
             live_after_gc: 0,
@@ -347,18 +336,21 @@ impl Heap {
 
     /// Moves `value` into the space of its type and returns its handle.
     ///
-    /// May collect first (policy trigger and/or stress cadence), so obey the
-    /// crate-level contract: root the returned handle before the next `alloc`
-    /// call. Freed indices return through the space's free list; when that is
-    /// empty, the allocator sweeps the space forward in budgeted steps
-    /// ([`SWEEP_BUDGET_SLOTS`]) until a dead slot surfaces or the space is
-    /// fully swept, re-checking the free list after each step, and only then
-    /// extends the slot vector. A slot freed by the last collection is
-    /// therefore reused lowest-index-first relative to the sweep cursor.
+    /// **Never collects.** Collection runs only at explicit safepoints
+    /// ([`Heap::safepoint`]) or [`Heap::force_collect`], never inside `alloc`
+    /// — this is what makes allocation cheap (a free-list pop or a bump) and
+    /// removes the "root before the next alloc" caller discipline from the
+    /// allocation path itself. Freed indices return through the space's free
+    /// list; when that is empty, the allocator sweeps the space forward in
+    /// budgeted steps ([`SWEEP_BUDGET_SLOTS`]) until a dead slot surfaces or
+    /// the space is fully swept, re-checking the free list after each step,
+    /// and only then extends the slot vector. A slot freed by the last
+    /// collection is therefore reused lowest-index-first relative to the
+    /// sweep cursor.
+    ///
+    /// Callers that hold handles across code which may reach a safepoint must
+    /// keep those handles reachable from the GC roots (see [`GcRoots`]).
     pub fn alloc<T: SpaceOps>(&mut self, value: T) -> Handle<T> {
-        self.collect_if_needed();
-        self.stress_collect_if_due();
-
         let size = value.approx_size();
         let s = T::SPACE.as_index();
         // Free lists and slot vectors index by usize; the u32 narrowing to
@@ -502,12 +494,56 @@ impl Heap {
         &mut self,
         parent: ShapeHandle,
         key: PropKey,
-        getter: Option<crate::Handle<crate::V12Str>>,
-        setter: Option<crate::Handle<crate::V12Str>>,
+        getter: Option<crate::Handle<crate::object::JsObject>>,
+        setter: Option<crate::Handle<crate::object::JsObject>>,
         attrs: Attrs,
     ) -> ShapeHandle {
+        // An object literal `{ get x() {}, set x() {} }` defines both halves
+        // of one accessor: the second call must merge into the existing
+        // descriptor, not create a sibling or discard the new half.
         if let Some(existing) = self.get(parent).transitions.get(key) {
-            return existing;
+            let merged = match self.get(existing).descriptors.find(key) {
+                Some(Descriptor::Accessor {
+                    getter: g, setter: s, ..
+                }) => {
+                    let merged_getter = getter.or(*g);
+                    let merged_setter = setter.or(*s);
+                    if merged_getter == *g && merged_setter == *s {
+                        return existing; // nothing new to add
+                    }
+                    Some(Descriptor::Accessor {
+                        key,
+                        getter: merged_getter,
+                        setter: merged_setter,
+                        attrs,
+                    })
+                }
+                // A data property with the same key: accessor definition is a
+                // reconfiguration; treat as a fresh transition below.
+                _ => None,
+            };
+            if let Some(descriptor) = merged {
+                // The transition child is not yet bound to any object (both
+                // accessor halves arrive during one object literal), so
+                // completing its descriptor in place is safe.
+                let list = {
+                    let existing_shape = self.get_mut(existing);
+                    let mut list = existing_shape.descriptors.as_slice().to_vec();
+                    for d in list.iter_mut() {
+                        if d.key() == key {
+                            *d = descriptor;
+                            break;
+                        }
+                    }
+                    list
+                };
+                let mut out = crate::shape::Descriptors::default();
+                for d in list {
+                    out.push(d);
+                }
+                self.get_mut(existing).descriptors = out;
+                return existing;
+            }
         }
         let (slot, proto_cell, mut descriptors) = {
             let parent_shape = self.get(parent);
@@ -616,34 +652,25 @@ impl Heap {
     // Object → shape binding
     // ------------------------------------------------------------------
 
-    /// The shape currently describing `obj`, defaulting to the pinned
-    /// empty-object root when no explicit binding has been recorded.
+    /// The shape currently describing `obj`.
     ///
-    /// Replaces the old `thread_local SHAPE_TABLE` keyed by raw heap
-    /// address (the source of the address-reuse correctness bug P1.2).
-    /// `obj` is reached only through its validity cell, so a reused
-    /// handle cannot alias a stale entry from another engine.
+    /// The binding lives directly on the object ([`JsObject::shape`]) — one
+    /// field read, no side table. Fresh objects default to the pinned
+    /// empty-object root (shape-slot 0), so this returns the root until the
+    /// first [`Heap::bind_shape`].
+    ///
+    /// Replaces the old `thread_local SHAPE_TABLE` keyed by raw heap address
+    /// (the source of the address-reuse correctness bug P1.2) and the
+    /// validity-cell-keyed side table that followed it.
     pub fn shape_of(&self, obj: Handle<JsObject>) -> ShapeHandle {
-        let cell = self.get(obj).validity_cell;
-        if cell == ValidityCellId::NONE {
-            return self.root_shape;
-        }
-        self.shape_of_cell
-            .get(cell.cell_index() - 1)
-            .copied()
-            .unwrap_or(self.root_shape)
+        self.get(obj).shape
     }
 
-    /// The shape currently describing `obj`, creating its validity cell on
-    /// first use. Equivalent to [`Self::shape_of`] plus the lazy cell
-    /// allocation; exposed for mutators that already hold `&mut Heap` and
-    /// are about to write the binding.
+    /// The shape currently describing `obj`. Identical to [`Self::shape_of`]
+    /// now that the binding is on the object; kept for callers that hold
+    /// `&mut Heap` and are about to write the binding.
     pub fn shape_of_mut(&mut self, obj: Handle<JsObject>) -> ShapeHandle {
-        let cell = self.validity_cell_of(obj);
-        self.shape_of_cell
-            .get(cell.cell_index() - 1)
-            .copied()
-            .unwrap_or(self.root_shape)
+        self.get(obj).shape
     }
 
     /// Records `shape` as the shape of `obj` and pins it against collection.
@@ -652,12 +679,7 @@ impl Heap {
     /// objects descended from it live; pinning trades that hazard for
     /// bounded metadata growth. Old binding is overwritten silently.
     pub fn bind_shape(&mut self, obj: Handle<JsObject>, shape: ShapeHandle) {
-        let cell = self.validity_cell_of(obj);
-        let idx = cell.cell_index() - 1;
-        if idx >= self.shape_of_cell.len() {
-            self.shape_of_cell.resize(idx + 1, self.root_shape);
-        }
-        self.shape_of_cell[idx] = shape;
+        self.get_mut(obj).shape = shape;
         self.add_shape_root(shape);
     }
 
@@ -714,11 +736,39 @@ impl Heap {
             })
         });
         // The threshold is a tiny usize constant; widen it to the string
-        // domain (u32) rather than narrowing the computed length.
-        if total <= CONCAT_EAGER_FLATTEN_MAX_UNITS as u32 {
+        // domain (u32) rather than narrowing the computed length. Flatten
+        // eagerly if the rope chain is already deep: repeated appends to one
+        // string would otherwise grow an unbounded Cons tree.
+        if total <= CONCAT_EAGER_FLATTEN_MAX_UNITS as u32
+            || self.rope_depth(handle) > string::ROPE_MAX_DEPTH
+        {
             self.flatten(handle);
         }
         handle
+    }
+
+    /// Depth of the composite chain rooted at `handle` (1 for a flat leaf,
+    /// else the longest Cons/Sliced path). Iterative walk; the depth is
+    /// bounded in practice by [`string::ROPE_MAX_DEPTH`] because `concat`
+    /// flattens past it, so the walk stays cheap even for adversarial trees.
+    fn rope_depth(&self, handle: Handle<V12Str>) -> usize {
+        use string::StrStorage as S;
+        let mut max_depth = 0usize;
+        let mut stack: Vec<(Handle<V12Str>, usize)> = vec![(handle, 1)];
+        while let Some((h, depth)) = stack.pop() {
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            match &self.get(h).storage {
+                S::Cons { left, right, .. } => {
+                    stack.push((*left, depth + 1));
+                    stack.push((*right, depth + 1));
+                }
+                S::Sliced { parent, .. } => stack.push((*parent, depth + 1)),
+                S::Latin1(_) | S::Utf16(_) => {}
+            }
+        }
+        max_depth
     }
 
     /// Views `[start_utf16, start_utf16 + len)` of `parent` without copying.
@@ -826,6 +876,19 @@ impl Heap {
     // ------------------------------------------------------------------
     // Collection
     // ------------------------------------------------------------------
+
+    /// The single explicit safepoint: the only place (besides
+    /// [`Heap::force_collect`]) where a collection may run.
+    ///
+    /// Collection never happens inside [`Heap::alloc`] — allocation is a
+    /// free-list pop or a bump — so mutators control exactly when the GC
+    /// observes their roots. Call this at points where the caller's live
+    /// values are all reachable from the registered roots ([`Heap::roots`]
+    /// plus any [`GcRoots`] the collector is configured with).
+    pub fn safepoint(&mut self) {
+        self.collect_if_needed();
+        self.stress_collect_if_due();
+    }
 
     /// Collects when the policy says so. No-op under [`GcPolicy::NoGC`] and
     /// whenever the allocated-since-last-mark estimate is below the threshold
@@ -1068,9 +1131,14 @@ mod tests {
         JsObject {
             kind: KIND_ORDINARY,
             flags: 0,
+            callable: crate::function::FunctionTarget::Bytecode(0),
+            shape: crate::shape::ShapeHandle::new(0),
+            inline_props: [crate::JsValue::undefined(); JsObject::IN_OBJECT_PROP_CAP],
+            overflow: None,
             properties: props,
             property_keys: Vec::new(),
             elements: Vec::new(),
+            elements_array: crate::elements::ElementsArray::new(),
             prototype: proto,
             validity_cell: ValidityCellId::NONE,
             arguments_mapped: None,
@@ -1159,9 +1227,27 @@ mod tests {
         let survivor = heap.alloc(ordinary_with(vec![JsValue::from_i32_smi(1).unwrap()], None));
         heap.add_root(JsValue::object(survivor));
 
-        let mut allocs = 0;
-        while heap.collections() == 0 {
+        // Allocation itself never collects (safepoint model): a burst of
+        // allocs with no safepoint must leave `collections()` at zero.
+        for _ in 0..10_000 {
             heap.alloc(JsObject::default());
+        }
+        assert_eq!(heap.collections(), 0, "alloc must not collect");
+
+        // The growth trigger fires at the next safepoint after the threshold
+        // was crossed, not inside the allocating call. The burst above
+        // crossed the floor, so this first safepoint collects; afterwards the
+        // counter resets and we verify the trigger fires again on a fresh
+        // accumulation.
+        heap.safepoint();
+        assert_eq!(heap.collections(), 1, "safepoint must fire the growth trigger");
+
+        // Everything allocated since the reset accumulates until the next
+        // crossing; the trigger fires at a safepoint, never inside alloc.
+        let mut allocs = 0;
+        while heap.collections() == 1 {
+            heap.alloc(JsObject::default());
+            heap.safepoint();
             allocs += 1;
             assert!(allocs < 100_000, "growth trigger never fired");
         }
@@ -1171,14 +1257,17 @@ mod tests {
         assert!(heap.allocated_since_last_gc() <= heap.growth_threshold());
         // …and the rooted survivor kept its data.
         assert_eq!(heap.get(survivor).properties[0].as_smi(), Some(1));
-        assert_eq!(heap.collections(), 1);
+        assert_eq!(heap.collections(), 2);
 
-        // Collection ran *before* the allocation that crossed the threshold
-        // committed, so that newest unrooted object is still present…
-        assert_eq!(heap.live_count::<JsObject>(), 2);
+        // Collection ran *after* the allocation that crossed the threshold
+        // committed, so that newest unrooted object is present at the moment
+        // of collection; the post-safepoint sweep has since released it (the
+        // lazy sweep has drained, since `force_collect` completes it), leaving
+        // only the rooted survivor live.
+        assert_eq!(heap.live_count::<JsObject>(), 1);
         // …and one more cycle reduces the heap to the survivor alone.
         heap.force_collect();
-        assert_eq!(heap.collections(), 2);
+        assert_eq!(heap.collections(), 3);
         assert_eq!(heap.live_count::<JsObject>(), 1);
     }
 
@@ -1211,12 +1300,14 @@ mod tests {
 
         for i in 0..500u32 {
             // Contract: link each new handle into rooted storage BEFORE the
-            // next allocation, or stress(1) will have collected it.
+            // next safepoint, or stress(1) will have collected it.
             let o = heap.alloc(JsObject::default());
             heap.get_mut(parent).elements.push(JsValue::object(o));
             let s = heap.alloc(V12Str::latin1(vec![b'a' + (i % 26) as u8]));
             heap.get_mut(o).properties.push(JsValue::string(s));
             assert_eq!(heap.get(parent).elements.len(), (i + 1) as usize);
+            // Stress cadence fires at safepoints, not inside alloc.
+            heap.safepoint();
         }
 
         // Two allocations per iteration ⇒ ~two collections per iteration.

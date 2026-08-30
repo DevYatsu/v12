@@ -171,72 +171,104 @@ impl JsValue {
     /// so every type predicate below doubles as a well-formedness proof.
     /// The box check stays explicit — [`Self::is_canonical`] alone is also
     /// `true` for raw doubles.
+    ///
+    /// In release builds the canonical-form validation is compiled out (the
+    /// interpreter's values are canonical by construction); the predicate
+    /// becomes the single tag check. Debug builds keep the full validation.
+    #[inline]
     const fn has_tag(self, tag: u64) -> bool {
-        self.is_boxed() && self.is_canonical() && self.tag() == tag
+        let tag_matches = self.tag() == tag;
+        if cfg!(debug_assertions) {
+            self.is_boxed() && self.is_canonical() && tag_matches
+        } else {
+            self.is_boxed() && tag_matches
+        }
     }
 
     /// Raw (unboxed) double.
+    #[inline]
     pub const fn is_f64(self) -> bool {
         !self.is_boxed()
     }
 
     /// Smi.
+    #[inline]
     pub const fn is_smi(self) -> bool {
         self.has_tag(TAG_SMI)
     }
 
     /// Heap reference of any space.
+    #[inline]
     pub const fn is_ref(self) -> bool {
-        self.is_boxed()
-            && self.is_canonical()
-            && matches!(
-                self.tag(),
-                TAG_OBJECT | TAG_STRING | TAG_SYMBOL | TAG_BIGINT
-            )
+        let tag_matches = matches!(
+            self.tag(),
+            TAG_OBJECT | TAG_STRING | TAG_SYMBOL | TAG_BIGINT
+        );
+        if cfg!(debug_assertions) {
+            self.is_boxed() && self.is_canonical() && tag_matches
+        } else {
+            self.is_boxed() && tag_matches
+        }
     }
 
+    #[inline]
     pub const fn is_object(self) -> bool {
         self.has_tag(TAG_OBJECT)
     }
 
+    #[inline]
     pub const fn is_string(self) -> bool {
         self.has_tag(TAG_STRING)
     }
 
+    #[inline]
     pub const fn is_symbol(self) -> bool {
         self.has_tag(TAG_SYMBOL)
     }
 
+    #[inline]
     pub const fn is_bigint(self) -> bool {
         self.has_tag(TAG_BIGINT)
     }
 
+    #[inline]
     pub const fn is_undefined(self) -> bool {
         self.has_tag(TAG_UNDEFINED)
     }
 
+    #[inline]
     pub const fn is_null(self) -> bool {
         self.has_tag(TAG_NULL)
     }
 
+    #[inline]
     pub const fn is_boolean(self) -> bool {
-        self.is_boxed() && self.is_canonical() && matches!(self.tag(), TAG_TRUE | TAG_FALSE)
+        let tag_matches = matches!(self.tag(), TAG_TRUE | TAG_FALSE);
+        if cfg!(debug_assertions) {
+            self.is_boxed() && self.is_canonical() && tag_matches
+        } else {
+            self.is_boxed() && tag_matches
+        }
     }
 
+    #[inline]
     pub const fn is_true(self) -> bool {
         self.has_tag(TAG_TRUE)
     }
 
+    #[inline]
     pub const fn is_false(self) -> bool {
         self.has_tag(TAG_FALSE)
     }
 
     /// Internal absent-element marker.
+    #[inline]
     pub const fn is_hole(self) -> bool {
         self.has_tag(TAG_HOLE)
     }
 
     /// Internal empty-slot marker.
+    #[inline]
     pub const fn is_empty(self) -> bool {
         self.has_tag(TAG_EMPTY)
     }
@@ -266,6 +298,7 @@ impl JsValue {
 
     /// Raw double, bit-exact (`Some(-0.0)` stays `-0.0`; NaN payloads are
     /// whatever was stored, already canonicalized at construction).
+    #[inline]
     pub fn as_f64(self) -> Option<f64> {
         if self.is_boxed() {
             None
@@ -275,6 +308,7 @@ impl JsValue {
     }
 
     /// Smi payload with sign extension from bit 30.
+    #[inline]
     pub fn as_smi(self) -> Option<i32> {
         if !self.is_smi() {
             return None;
@@ -284,22 +318,27 @@ impl JsValue {
         Some(((p << 1) as i32) >> 1)
     }
 
+    #[inline]
     pub fn as_object(self) -> Option<Handle<JsObject>> {
         self.ref_handle(TAG_OBJECT).map(Handle::new)
     }
 
+    #[inline]
     pub fn as_string(self) -> Option<Handle<V12Str>> {
         self.ref_handle(TAG_STRING).map(Handle::new)
     }
 
+    #[inline]
     pub fn as_symbol(self) -> Option<Handle<V12Symbol>> {
         self.ref_handle(TAG_SYMBOL).map(Handle::new)
     }
 
+    #[inline]
     pub fn as_bigint(self) -> Option<Handle<V12BigInt>> {
         self.ref_handle(TAG_BIGINT).map(Handle::new)
     }
 
+    #[inline]
     pub fn as_bool(self) -> Option<bool> {
         if self.is_true() {
             Some(true)
@@ -515,7 +554,11 @@ mod tests {
         let wide_smi = JsValue(BOX_MASK | (1u64 << 31) | 5);
         assert!(wide_smi.tag() == TAG_SMI);
         assert!(!wide_smi.is_canonical());
-        // Predicates never fire on reserved/dirty tags.
+        // Predicates never fire on reserved/dirty tags. The forge-detection
+        // gate in `has_tag`/`is_ref` is compiled out in release builds (the
+        // interpreter's values are canonical by construction), so this
+        // assertion is debug-only.
+        #[cfg(debug_assertions)]
         assert!(!stray.is_object() && !stray.is_smi() && !stray.is_ref());
     }
 

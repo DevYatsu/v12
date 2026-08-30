@@ -92,9 +92,9 @@
 //!
 //! Allocation contract: a freshly returned handle must be registered in
 //! [`Heap::roots`] (or made reachable from an existing root) **before the next
-//! `Heap::alloc` call**. Collection runs only inside `alloc` and inside the
-//! explicit `force_collect`/`collect_if_needed` entry points, so the window
-//! between `alloc` and rooting is safe.
+//! safepoint** ([`Heap::safepoint`]). Collection never runs inside
+//! [`Heap::alloc`] — allocation is a free-list pop or a bump — so the window
+//! between `alloc` and the next safepoint is safe.
 //!
 //! ## Garbage collection
 //!
@@ -103,17 +103,21 @@
 //! prototype chains and nested structures get deep. Sweeping is **lazy**:
 //! the mark phase only publishes liveness, and dead slots return to their
 //! space's free list in budgeted steps charged against later allocations.
-//! The trigger is the heap-growth policy: collect when bytes allocated
-//! since the last mark reach the live-bytes estimate at the last mark (2×
-//! growth), with a floor of 1 MiB by default ([`GcPolicy::Growth`]);
-//! [`GcPolicy::NoGC`] disables automatic collection for bring-up. A
-//! `--gc-stress`-style cadence ([`Heap::gc_stress`]) forces collection every
-//! *n* allocations (`n = 1` valid).
+//! Collection runs only at explicit safepoints ([`Heap::safepoint`]) or via
+//! [`Heap::force_collect`], never inside `alloc`. The trigger is the
+//! heap-growth policy: collect when bytes allocated since the last mark reach
+//! the live-bytes estimate at the last mark (2× growth), with a floor of
+//! 1 MiB by default ([`GcPolicy::Growth`]); [`GcPolicy::NoGC`] disables
+//! automatic collection for bring-up. A `--gc-stress`-style cadence
+//! ([`Heap::gc_stress`]) forces collection every *n* safepoints (`n = 1`
+//! valid).
 //!
 //! Single-mutator design: [`Heap`] is intentionally `!Send + !Sync`.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+mod elements;
+mod function;
 mod gc;
 mod handle;
 mod object;
@@ -123,18 +127,23 @@ mod string;
 mod stub_cache;
 mod value;
 
+pub use elements::{
+    ElementsArray, ElementsDictionary, ElementsKind, ELEMENTS_TO_DICTIONARY_INDEX,
+    MAX_FAST_ELEMENT_GAP,
+};
+pub use function::{FunctionTarget, HostClosure, Native};
 pub use gc::{GcPolicy, Heap, MarkSink, RootSet, Trace};
 pub use handle::{Handle, HeapSpace, Space};
 pub use object::{
     EnginePromise, GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject,
-    KIND_ARGUMENTS, KIND_ARRAY, KIND_FUNCTION, KIND_GENERATOR, KIND_ORDINARY, PromiseExt,
-    PromiseState, V12BigInt, V12Symbol,
+    KIND_ARGUMENTS, KIND_ARRAY, KIND_ERROR, KIND_FUNCTION, KIND_GENERATOR, KIND_MAP, KIND_ORDINARY,
+    KIND_PROMISE, KIND_SET, PromiseExt, PromiseState, V12BigInt, V12Symbol,
 };
 pub use prop_key::PropKey;
 pub use shape::{
     Attrs, DESCRIPTORS_INLINE_CAP, Descriptor, Descriptors, Shape, ShapeHandle,
     TRANSITIONS_INLINE_CAP, Transitions, ValidityCellId,
 };
-pub use string::{CONCAT_EAGER_FLATTEN_MAX_UNITS, StrStorage, V12Str};
+pub use string::{CONCAT_EAGER_FLATTEN_MAX_UNITS, ROPE_MAX_DEPTH, StrStorage, V12Str};
 pub use stub_cache::{STUB_CACHE_CAPACITY, StubCache};
 pub use value::{BOX_MASK, JsValue, QUIET_NAN_BITS};

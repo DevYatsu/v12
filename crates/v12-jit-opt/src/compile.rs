@@ -889,10 +889,12 @@ impl Pipeline {
                 }
                 if matches!(instr.op(), Some(Opcode::GetProperty)) {
                     let lat = fv.type_at(pc);
-                    if let Some(ic) = fv.ics.get(&pc) {
+                    if let Some(ic) = fv.ics.get(&pc)
+                        && let Some(entry) = ic.first()
+                    {
                         let assumption = Assumption {
                             bc_pc: pc,
-                            guard: GuardKind::ShapeEq { expected: ic.shape },
+                            guard: GuardKind::ShapeEq { expected: entry.shape },
                         };
                         if !lat.is_any() {
                             let _ = emit_guard(&mut deopt, assumption);
@@ -923,8 +925,10 @@ impl Pipeline {
                         {
                             continue;
                         }
-                        if let Some(ic) = fv.ics.get(&pc) {
-                            let _ = peel_first_iteration(&mut deopt, hdr, ic.shape);
+                        if let Some(ic) = fv.ics.get(&pc)
+                            && let Some(entry) = ic.first()
+                        {
+                            let _ = peel_first_iteration(&mut deopt, hdr, entry.shape);
                             break;
                         }
                     }
@@ -1330,8 +1334,9 @@ mod tests {
         };
         let heap = Heap::new(v12_heap::GcPolicy::NoGC);
         let shape = heap.root_shape();
-        fv.ics
-            .insert(hdr + 2, v12_interp::feedback::MonoIc { shape, slot: 0 });
+        let mut ic = v12_interp::feedback::PolyIc::default();
+        ic.record(shape, 0);
+        fv.ics.insert(hdr + 2, ic);
         let mut p = Pipeline::new().unwrap();
         let (_c, deopt) = p.compile_with_feedback(&fb, Some(&fv)).unwrap();
         assert!(deopt.guard_count() >= 1);

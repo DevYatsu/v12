@@ -7,6 +7,7 @@
 pub mod array;
 pub mod boolean;
 pub mod error;
+pub mod map;
 pub mod math;
 pub mod number;
 pub mod object;
@@ -179,6 +180,17 @@ pub const NATIVE_ARRAY_JOIN: u32 = 1102;
 pub const NATIVE_EVAL: u32 = 1800;
 pub const NATIVE_FUNCTION: u32 = 1801;
 pub const NATIVE_CONSOLE_LOG: u32 = 1900;
+pub const NATIVE_MAP_CONSTRUCT: u32 = 2000;
+pub const NATIVE_MAP_GET: u32 = 2001;
+pub const NATIVE_MAP_SET: u32 = 2002;
+pub const NATIVE_MAP_HAS: u32 = 2003;
+pub const NATIVE_MAP_DELETE: u32 = 2004;
+pub const NATIVE_MAP_SIZE: u32 = 2005;
+pub const NATIVE_SET_CONSTRUCT: u32 = 2100;
+pub const NATIVE_SET_ADD: u32 = 2101;
+pub const NATIVE_SET_HAS: u32 = 2102;
+pub const NATIVE_SET_DELETE: u32 = 2103;
+pub const NATIVE_SET_SIZE: u32 = 2104;
 
 /// Installs the core built-ins into `registry`.
 pub fn install_core(registry: &mut NativeRegistry) {
@@ -204,6 +216,17 @@ pub fn install_core(registry: &mut NativeRegistry) {
     registry.register(NATIVE_EVAL, eval_stub);
     registry.register(NATIVE_FUNCTION, function_stub);
     registry.register(NATIVE_CONSOLE_LOG, console_log);
+    registry.register(NATIVE_MAP_CONSTRUCT, map::map_construct);
+    registry.register(NATIVE_MAP_GET, map::map_get);
+    registry.register(NATIVE_MAP_SET, map::map_set);
+    registry.register(NATIVE_MAP_HAS, map::map_has);
+    registry.register(NATIVE_MAP_DELETE, map::map_delete);
+    registry.register(NATIVE_MAP_SIZE, map::map_size);
+    registry.register(NATIVE_SET_CONSTRUCT, map::set_construct);
+    registry.register(NATIVE_SET_ADD, map::set_add);
+    registry.register(NATIVE_SET_HAS, map::set_has);
+    registry.register(NATIVE_SET_DELETE, map::set_delete);
+    registry.register(NATIVE_SET_SIZE, map::set_size);
 }
 
 /// Renders a value the way `console.log` observes it (Tier-0 display subset).
@@ -269,7 +292,11 @@ fn array_join(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValu
     };
     // Snapshot before formatting: the display helpers may allocate (and thus
     // collect), invalidating a live borrow of the element store.
-    let elements = heap.get(arr).elements.clone();
+    let elements: Vec<JsValue> = if heap.get(arr).kind == v12_heap::KIND_ARRAY {
+        heap.get(arr).elements_array.iter().collect()
+    } else {
+        heap.get(arr).elements.clone()
+    };
     let mut parts = Vec::with_capacity(elements.len());
     for &v in &elements {
         if v.is_undefined() || v.is_null() {
@@ -325,7 +352,10 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
     // v1 stub for `new Function`: validate syntax and return a placeholder
     // function object. Full compilation is via `Engine::create_function`.
     if args.is_empty() {
-        let func = heap.alloc(v12_heap::JsObject::function(0, None));
+        let func = heap.alloc(v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(0),
+            None,
+        ));
         heap.add_root(JsValue::object(func));
         return Ok(JsValue::object(func));
     }
@@ -362,7 +392,10 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
         };
         return Err(JsValue::string(handle));
     }
-    let func = heap.alloc(v12_heap::JsObject::function(1, None));
+    let func = heap.alloc(v12_heap::JsObject::function(
+        v12_heap::FunctionTarget::Bytecode(1),
+        None,
+    ));
     heap.add_root(JsValue::object(func));
     Ok(JsValue::object(func))
 }

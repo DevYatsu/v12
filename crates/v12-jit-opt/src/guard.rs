@@ -175,11 +175,11 @@ impl core::fmt::Display for Assumption {
 
 /// Tracks shape clashes per inline-cache site.
 ///
-/// `FeedbackVector::is_mono` is currently vacuous: `MonoIc` stores only the
-/// last shape per pc, so `is_mono() == true` even after a polymorphic access
-/// merely clobbers the old shape. `TODO(poly IC)` — a future poly-IC will
-/// remember up to N shapes per site and cause `is_mono` to return `false`
-/// once `clashes > 0`.
+/// `FeedbackVector::is_mono` reports whether every site has ≤1 recorded shape.
+/// The `PolyIc` remembers up to [`v12_interp::feedback::IC_MAX_ENTRIES`]
+/// shapes per site, so a polymorphic access now makes `is_mono()` return
+/// `false`, and the optimizer's guard selection uses the first (most recent)
+/// shape.
 ///
 /// This counter provides the missing signal today without mutating the
 /// interpreter's `FeedbackVector`. The optimizer calls `observe` on every IC

@@ -26,7 +26,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use v12_heap::{Heap, JsObject, JsValue, KIND_FUNCTION, KIND_ORDINARY};
+use v12_heap::{Heap, JsObject, JsValue, KIND_FUNCTION};
 
 use crate::job_queue::{Job, JobCtx};
 use v12_interp::JSException;
@@ -50,15 +50,15 @@ fn type_error(heap: &mut Heap, msg: &str) -> JsValue {
     JsValue::string(h)
 }
 
-/// Structural promise check: ordinary object carrying the three internal
-/// slots with a plausible `[[State]]`. Promise objects are engine-created
-/// only, so no user object collides in practice.
+/// Structural promise check: a `KIND_PROMISE` object carrying the three
+/// internal slots with a plausible `[[State]]`. Promise objects are
+/// engine-created only, so no user object collides in practice.
 fn is_promise(heap: &Heap, v: JsValue) -> bool {
     let Some(obj) = v.as_object() else {
         return false;
     };
     let o = heap.get(obj);
-    o.kind == KIND_ORDINARY
+    o.kind == v12_heap::KIND_PROMISE
         && o.properties.len() == PROMISE_SLOTS
         && o.properties[0]
             .as_smi()
@@ -75,7 +75,7 @@ fn create_promise(
     let reactions = heap.alloc(JsObject::array(Vec::new()));
     heap.add_root(JsValue::object(reactions));
     let promise = heap.alloc(JsObject {
-        kind: KIND_ORDINARY,
+        kind: v12_heap::KIND_PROMISE,
         properties: vec![smi(state), payload, JsValue::object(reactions)],
         prototype,
         ..JsObject::default()
