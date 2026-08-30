@@ -34,6 +34,7 @@ pub const INTRINSIC_NAMES: &[&str] = &[
     "Symbol",
     "Map",
     "Set",
+    "eval",
     "console",
     "globalThis",
 ];
@@ -154,6 +155,13 @@ impl Realm {
         if let Some(set_ctor) = set_ctor {
             heap.get_mut(set_ctor).callable =
                 v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_SET_CONSTRUCT);
+        }
+        // `eval` is callable: route through the native registry (the
+        // interpreter special-cases NATIVE_EVAL to run the source re-entrantly).
+        let eval_global = intrinsics.get("eval").and_then(|v| v.as_object());
+        if let Some(eval_global) = eval_global {
+            heap.get_mut(eval_global).callable =
+                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_EVAL);
         }
 
         Self { global, intrinsics }

@@ -512,7 +512,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         for (_text, key, getter, setter, span) in accessors {
             // Pair registers: r[pair] = getter (or undefined), r[pair+1] = setter.
-            let pair = self.new_temp();
+            // Allocate both as a contiguous block so `pair + 1` is in-range.
+            let pair = self.new_temps(2);
             match (getter, setter) {
                 (Some(g), Some(s)) => {
                     self.emit_reg2(Opcode::Move, pair, g, span);

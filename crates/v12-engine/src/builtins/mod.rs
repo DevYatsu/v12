@@ -156,6 +156,40 @@ impl v12_interp::NativeRegistry for NativeRegistry {
             _ => self.dispatch(heap, this, args, index),
         }
     }
+
+    /// Direct `eval`: compile and run `source` against the shared heap and
+    /// global, returning the script's completion value.
+    fn eval(
+        &mut self,
+        heap: &mut Heap,
+        source: &str,
+        _this: JsValue,
+        global: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    ) -> Result<JsValue, JsValue> {
+        let (program, strings) = v12_bccompiler::compile_source_with_strings(source).map_err(
+            |err| {
+                let msg = err.message;
+                let h = if msg.is_ascii() {
+                    heap.intern_string(v12_heap::V12Str::latin1(msg.into_bytes()))
+                } else {
+                    heap.intern_string(v12_heap::V12Str::utf16(msg.encode_utf16().collect()))
+                };
+                JsValue::string(h)
+            },
+        )?;
+        let mut interp = v12_interp::Interp::new_with_heap(
+            heap,
+            global,
+            program.functions,
+            program.main,
+            strings,
+        );
+        interp.set_natives(Box::new(self.clone()));
+        match interp.run() {
+            Ok(()) => Ok(interp.completion_value().unwrap_or_else(JsValue::undefined)),
+            Err(v12_interp::JSException(thrown)) => Err(thrown),
+        }
+    }
 }
 
 /// Indices for built-ins. Chosen beyond any plausible program function count.

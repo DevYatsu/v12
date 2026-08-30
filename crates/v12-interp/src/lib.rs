@@ -148,6 +148,9 @@ pub const NATIVE_SET_HAS: u32 = 2102;
 pub const NATIVE_SET_DELETE: u32 = 2103;
 pub const NATIVE_SET_SIZE: u32 = 2104;
 
+/// Native index for direct `eval`, mirroring `v12_engine::builtins::NATIVE_EVAL`.
+pub const NATIVE_EVAL: u32 = 1800;
+
 /// Selector for [`Interp::cached_native`] — the interpreter's *internal*
 /// native fallbacks (synthesized only when the engine has not installed a
 /// real native on the realm). These are encoded as out-of-range bytecode
@@ -214,8 +217,8 @@ pub const NATIVE_ERROR_CREATE: u32 = 1600;
 /// shape descriptor reports for the global must be biased by this constant
 /// before indexing storage (see [`Interp::global_slot_index`]). Must stay in
 /// sync with `v12-engine/src/realm.rs` `INTRINSIC_NAMES.len()` and
-/// `v12-bccompiler/src/model.rs` `GLOBAL_INTRINSICS.len()` (v1: 16).
-const GLOBAL_VAR_OFFSET: usize = 16;
+/// `v12-bccompiler/src/model.rs` `GLOBAL_INTRINSICS.len()` (v1: 17).
+const GLOBAL_VAR_OFFSET: usize = 17;
 
 /// Names of the intrinsic slots installed by the realm at fixed positions
 /// in the global object's `properties` vector.
@@ -240,6 +243,7 @@ const GLOBAL_INTRINSIC_NAMES: &[&str] = &[
     "Symbol",
     "Map",
     "Set",
+    "eval",
     "console",
     "globalThis",
 ];
@@ -297,6 +301,22 @@ pub trait NativeRegistry {
         args: &[JsValue],
         index: u32,
     ) -> Result<JsValue, JsValue>;
+
+    /// Direct `eval(source)`: compile and execute `source` against `heap`,
+    /// returning the completion value. `global` is the realm's global object
+    /// (so eval's `var`/assignments share the caller's global). The
+    /// interpreter routes the eval native here so the engine can re-enter
+    /// with its own program/global wiring. The default implementation
+    /// refuses (no eval support).
+    fn eval(
+        &mut self,
+        _heap: &mut Heap,
+        _source: &str,
+        _this: JsValue,
+        _global: Option<Handle<JsObject>>,
+    ) -> Result<JsValue, JsValue> {
+        Err(JsValue::undefined())
+    }
 }
 
 /// The default [`NativeRegistry`]: no natives exist.
@@ -1791,6 +1811,20 @@ impl<'a> Interp<'a> {
             let args_start = callee_slot + 2;
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
+            if target_idx == NATIVE_EVAL {
+                // Direct eval: the first argument is the source text. Extract
+                // it before touching the registry (which needs `&mut self.heap`).
+                let source = self
+                    .stack
+                    .get(args_start)
+                    .and_then(|v| v.as_string())
+                    .map(|h| self.string_text(h))
+                    .unwrap_or_default();
+                let global = self.global;
+                let result = self.natives.eval(self.heap, &source, this_v, global);
+                return result.map(CallOutcome::Value).map_err(JSException);
+            }
+            self.gc_protect();
             let result = {
                 let args = &self.stack[args_start..args_end];
                 // Disjoint field borrows: heap + natives mut, stack immut.
@@ -1918,6 +1952,16 @@ impl<'a> Interp<'a> {
                 // an empty frame stack — is not usable). The captured
                 // environment comes from the accessor function object's
                 // `prototype` link, set when the closure was created.
+                //
+                // The body's `fn_idx` indexes the program that created it.
+                // If that program differs from the currently-executing one
+                // (e.g. an accessor created inside `eval` and invoked by the
+                // outer program), we cannot run it here — report `undefined`
+                // rather than panic (the accessor's own program would need a
+                // cross-program call table).
+                if (fn_idx as usize) >= self.functions.len() {
+                    return Ok(JsValue::undefined());
+                }
                 let callee_max_regs = self.functions[fn_idx as usize].max_regs;
                 let new_base = self.stack.len();
                 let window_end = new_base + usize::from(callee_max_regs);
