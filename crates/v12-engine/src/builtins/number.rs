@@ -4,11 +4,7 @@ use v12_heap::{Heap, JsValue};
 use v12_native::Throw;
 
 /// `Number.isNaN(value)` – true only for NaN.
-pub fn number_is_nan(
-    _heap: &mut Heap,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn number_is_nan(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let is_nan = if let Some(n) = v.as_f64() {
         n.is_nan()

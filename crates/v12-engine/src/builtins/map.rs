@@ -13,7 +13,7 @@ use v12_native::Throw;
 use super::helpers;
 
 /// A Map object: `kind == Kind::Map`, entries in `elements` as key/value pairs.
-fn map_entries<'a>(heap: &'a Heap, obj: v12_heap::Handle<JsObject>) -> Option<&'a [JsValue]> {
+fn map_entries(heap: &Heap, obj: v12_heap::Handle<JsObject>) -> Option<&[JsValue]> {
     if heap.get(obj).kind != v12_heap::Kind::Map {
         return None;
     }
@@ -21,7 +21,7 @@ fn map_entries<'a>(heap: &'a Heap, obj: v12_heap::Handle<JsObject>) -> Option<&'
 }
 
 /// A Set object: `kind == Kind::Set`, entries in `elements` as values.
-fn set_entries<'a>(heap: &'a Heap, obj: v12_heap::Handle<JsObject>) -> Option<&'a [JsValue]> {
+fn set_entries(heap: &Heap, obj: v12_heap::Handle<JsObject>) -> Option<&[JsValue]> {
     if heap.get(obj).kind != v12_heap::Kind::Set {
         return None;
     }
@@ -39,19 +39,25 @@ fn same_value_zero(a: JsValue, b: JsValue) -> bool {
 /// `Map(iterable?)` — creates a Map. The iterable is ignored for v1
 /// (constructor from entries is a later conformance item).
 pub fn map_construct(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::alloc_obj(heap, JsObject {
-        kind: v12_heap::Kind::Map,
-        ..JsObject::default()
-    });
+    let obj = helpers::alloc_obj(
+        heap,
+        JsObject {
+            kind: v12_heap::Kind::Map,
+            ..JsObject::default()
+        },
+    );
     Ok(JsValue::object(obj))
 }
 
 /// `Set(iterable?)` — creates a Set.
 pub fn set_construct(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::alloc_obj(heap, JsObject {
-        kind: v12_heap::Kind::Set,
-        ..JsObject::default()
-    });
+    let obj = helpers::alloc_obj(
+        heap,
+        JsObject {
+            kind: v12_heap::Kind::Set,
+            ..JsObject::default()
+        },
+    );
     Ok(JsValue::object(obj))
 }
 
@@ -92,12 +98,21 @@ pub fn map_has(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsVal
         .unwrap_or_default()
         .chunks_exact(2)
         .any(|pair| same_value_zero(pair[0], key));
-    Ok(if found { JsValue::true_() } else { JsValue::false_() })
+    Ok(if found {
+        JsValue::true_()
+    } else {
+        JsValue::false_()
+    })
 }
 
 /// `Map.prototype.delete(key)` — removes and returns `true` if present.
 pub fn map_delete(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Map.prototype.delete", Some(v12_heap::Kind::Map))?;
+    let obj = helpers::as_object(
+        heap,
+        this,
+        "Map.prototype.delete",
+        Some(v12_heap::Kind::Map),
+    )?;
     let key = args.first().copied().unwrap_or_else(JsValue::undefined);
     let entries = &mut heap.get_mut(obj).elements;
     if let Some(pos) = (0..entries.len() / 2).find(|&i| same_value_zero(entries[2 * i], key)) {
@@ -134,12 +149,21 @@ pub fn set_has(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsVal
         .unwrap_or_default()
         .iter()
         .any(|&v| same_value_zero(v, value));
-    Ok(if found { JsValue::true_() } else { JsValue::false_() })
+    Ok(if found {
+        JsValue::true_()
+    } else {
+        JsValue::false_()
+    })
 }
 
 /// `Set.prototype.delete(value)` — removes and returns `true` if present.
 pub fn set_delete(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Set.prototype.delete", Some(v12_heap::Kind::Set))?;
+    let obj = helpers::as_object(
+        heap,
+        this,
+        "Set.prototype.delete",
+        Some(v12_heap::Kind::Set),
+    )?;
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
     let entries = &mut heap.get_mut(obj).elements;
     if let Some(pos) = entries.iter().position(|&v| same_value_zero(v, value)) {

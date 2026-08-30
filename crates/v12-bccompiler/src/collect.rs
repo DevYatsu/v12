@@ -111,6 +111,9 @@ struct Collector<'s> {
 }
 
 impl<'s> Collector<'s> {
+    // `cur_unit` runs with a non-empty `unit_stack` (pushed at every unit
+    // entry, popped at exit); audited invariant.
+    #[allow(clippy::expect_used)]
     fn cur_unit(&self) -> usize {
         *self.unit_stack.last().expect("unit stack underflow")
     }
@@ -301,9 +304,7 @@ impl<'s> Collector<'s> {
                         let is_const =
                             matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
                         for d in &v.declarations {
-                            if is_const
-                                && let Some(sym) = binding_symbol(&d.id)
-                            {
+                            if is_const && let Some(sym) = binding_symbol(&d.id) {
                                 self.plans.const_bindings.insert(sym);
                             }
                             self.binding_pattern(&d.id);
@@ -328,9 +329,7 @@ impl<'s> Collector<'s> {
                         let is_const =
                             matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
                         for d in &v.declarations {
-                            if is_const
-                                && let Some(sym) = binding_symbol(&d.id)
-                            {
+                            if is_const && let Some(sym) = binding_symbol(&d.id) {
                                 self.plans.const_bindings.insert(sym);
                             }
                             self.binding_pattern(&d.id);
@@ -403,7 +402,14 @@ impl<'s> Collector<'s> {
         // The constructor unit.
         let parent = self.cur_unit();
         let idx = self.plans.units.len();
-        let mut plan = UnitPlan::new(Some(parent), false, format!("<class>{}", c.id.as_ref().map(|i| i.name.as_str()).unwrap_or("")));
+        let plan = UnitPlan::new(
+            Some(parent),
+            false,
+            format!(
+                "<class>{}",
+                c.id.as_ref().map(|i| i.name.as_str()).unwrap_or("")
+            ),
+        );
         self.plans.units.push(plan);
         self.plans.fn_index.insert(c.span, idx);
         // The constructor's params/body come from the explicit `constructor`
@@ -796,6 +802,9 @@ impl<'s> Collector<'s> {
         }
     }
 
+    // Arrow units always have a parent (the compiler guarantees a non-arrow
+    // main unit exists); audited invariant.
+    #[allow(clippy::expect_used)]
     fn expr(&mut self, e: &Expression<'_>) {
         match e {
             Expression::Identifier(id) => {

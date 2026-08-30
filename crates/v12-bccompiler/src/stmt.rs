@@ -543,66 +543,73 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     fn for_in_loop(&mut self, f: &'a ForInStatement<'a>, name: Option<String>) -> Res<()> {
         // Compile the right-hand side (the object to iterate over)
         let obj_reg = self.expr(&f.right)?;
-        
+
         // Get registers for iteration
-        let keys_reg = self.new_temp();  // Will hold the array of keys
-        let iter_idx = self.new_temp();  // Current index in the keys array
-        let key_reg = self.new_temp();   // Current key being iterated
-        
+        let keys_reg = self.new_temp(); // Will hold the array of keys
+        let iter_idx = self.new_temp(); // Current index in the keys array
+        let key_reg = self.new_temp(); // Current key being iterated
+
         // Create a closure for the native function
         let callee = self.new_temp();
-        self.emit_closure(callee, crate::model::NATIVE_OBJECT_ENUMERABLE_OWN_KEYS as u16, f.span);
-        
+        self.emit_closure(
+            callee,
+            crate::model::NATIVE_OBJECT_ENUMERABLE_OWN_KEYS as u16,
+            f.span,
+        );
+
         // Call the native: [callee][this][arg] -> Call rC, rC, argc=1
         let this_reg = self.new_temp();
         self.load_undefined(this_reg, f.span);
-        
+
         let call_block = self.new_temps(3);
         self.move_reg(call_block, callee, f.span);
         self.move_reg(call_block + 1, this_reg, f.span);
         self.move_reg(call_block + 2, obj_reg, f.span);
         self.emit_call(keys_reg, call_block, 1, f.span);
-        
+
         // Initialize index to 0
         let zero = self.new_temp();
         self.load_int(zero, 0, f.span);
         self.move_reg(iter_idx, zero, f.span);
-        
+
         let top = self.label();
         let cont = self.label();
         let end = self.label();
-        
+
         self.bind(top);
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), f.span);
-        
+
         // Get keys array length
         let len_reg = self.new_temp();
         let length_key = self.new_temp();
         self.load_str(length_key, "length", f.span)?;
         self.emit_reg3(Opcode::GetProperty, len_reg, keys_reg, length_key, f.span);
-        
+
         // Compare iter_idx < len_reg
         let cmp = self.new_temp();
         self.emit_reg3(Opcode::Lt, cmp, iter_idx, len_reg, f.span);
         self.emit_jump(Opcode::JumpIfFalse, cmp, end);
-        
+
         // Get key at current index
         self.emit_reg3(Opcode::GetProperty, key_reg, keys_reg, iter_idx, f.span);
-        
+
         // Increment index
         let one = self.new_temp();
         self.load_int(one, 1, f.span);
         let next_idx = self.new_temp();
         self.emit_reg3(Opcode::Add, next_idx, iter_idx, one, f.span);
         self.move_reg(iter_idx, next_idx, f.span);
-        
+
         // Store key to lhs binding - convert ForStatementLeft to AssignmentTargetPattern
         let pattern: &oxc_ast::ast::BindingPattern<'_> = match &f.left {
             oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(_id) => {
                 // This is a simple identifier like `for (let x in obj)`
                 // We need to convert to BindingPattern
                 // Since we can't easily do this, let's just handle the case where left is a variable declaration
-                return Err(self.err(f.span, "for-in with complex binding patterns not yet supported"));
+                return Err(self.err(
+                    f.span,
+                    "for-in with complex binding patterns not yet supported",
+                ));
             }
             oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
                 // For `for (let x in obj)`, the binding pattern is the identifier in the declaration
@@ -611,11 +618,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 }
                 &v.declarations[0].id
             }
-            _ => return Err(self.err(f.span, "for-in only supports variable declarations and simple identifiers")),
+            _ => {
+                return Err(self.err(
+                    f.span,
+                    "for-in only supports variable declarations and simple identifiers",
+                ));
+            }
         };
-        
+
         self.lower_binding_pattern(pattern, key_reg)?;
-        
+
         self.loops.push(LoopCtx {
             break_label: end,
             continue_label: Some(cont),
@@ -624,7 +636,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         });
         self.stmt(&f.body)?;
         self.loops.pop();
-        
+
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
         self.bind(end);
@@ -829,6 +841,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// (innermost first). Regions are popped first so statements inside a
     /// copy resolve against outer regions only — a `return` inside a copied
     /// finalizer cannot re-trigger its own copy.
+    // The loop guard guarantees the stack is non-empty at pop; audited
+    // invariant.
+    #[allow(clippy::expect_used)]
     pub fn run_finally_copies(&mut self, until_len: usize) -> Res<()> {
         while self.finallies.len() > until_len {
             let ctx = self.finallies.pop().expect("finally stack underflow");

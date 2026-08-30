@@ -40,10 +40,9 @@ pub use error::{JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 
 pub use v12_bytecode::{Const, FunctionBytecode, Instr, Opcode, WideOp};
 pub use v12_heap::{
-    Attrs, Descriptor, GcPolicy, Handle, Heap, JsObject, JsValue, PropKey, ShapeHandle,
-    V12Str,
+    Attrs, Descriptor, GcPolicy, Handle, Heap, JsObject, JsValue, PropKey, ShapeHandle, V12Str,
 };
-pub use v12_interp::{Interp, JSException, NativeRegistry, EmptyNativeRegistry};
+pub use v12_interp::{EmptyNativeRegistry, Interp, JSException, NativeRegistry};
 
 /// Tier-up policy: when a function crosses the threshold, the engine asks
 /// the configured tier (baseline → opt) to recompile it. v1 ships a stub
@@ -67,10 +66,8 @@ pub enum TierPolicy {
 pub trait TierCompiler {
     /// Recompile `fb` into native code. The result is opaque; the engine
     /// hands it back to the next tier or to the runtime for patching.
-    fn compile(
-        &mut self,
-        fb: &FunctionBytecode,
-    ) -> Result<Box<dyn std::fmt::Debug + Send>, String>;
+    fn compile(&mut self, fb: &FunctionBytecode)
+    -> Result<Box<dyn std::fmt::Debug + Send>, String>;
 }
 
 #[cfg(test)]

@@ -170,7 +170,10 @@ fn fuzz_100k_random_words_through_every_decode_path() {
                 assert!(width <= words.len());
             }
             Err(reason) => {
-                assert!(!reason.to_string().is_empty(), "errors must explain themselves")
+                assert!(
+                    !reason.to_string().is_empty(),
+                    "errors must explain themselves"
+                )
             }
         }
 

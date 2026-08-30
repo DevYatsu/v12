@@ -10,7 +10,11 @@ fn await_resumes_after_promise_resolves() {
     if let Err(e) = res {
         panic!("run failed: {}", interp.to_display_string(e.0));
     }
-    assert!(interp.pending_jobs() > 0, "expected await to enqueue job FIFO pending={}", interp.pending_jobs());
+    assert!(
+        interp.pending_jobs() > 0,
+        "expected await to enqueue job FIFO pending={}",
+        interp.pending_jobs()
+    );
     let n = interp.run_jobs();
     assert!(n > 0);
     let src3 = "async function f(){ let a = await 1; let b = await 2; return a + b; } f();";
@@ -31,7 +35,11 @@ fn await_with_promise_value() {
     if let Err(e) = res {
         panic!("run failed: {}", interp.to_display_string(e.0));
     }
-    assert!(interp.pending_jobs() > 0, "await Promise.resolve should enqueue job pending={}", interp.pending_jobs());
+    assert!(
+        interp.pending_jobs() > 0,
+        "await Promise.resolve should enqueue job pending={}",
+        interp.pending_jobs()
+    );
     let n = interp.run_jobs();
     assert!(n > 0);
 }

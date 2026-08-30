@@ -125,7 +125,10 @@ pub fn promise_then(
     sink: &Rc<RefCell<Vec<Job>>>,
 ) -> Result<JsValue, Throw> {
     if !is_promise(heap, this) {
-        return Err(Throw::type_error(heap, "Promise.prototype.then requires a promise"));
+        return Err(Throw::type_error(
+            heap,
+            "Promise.prototype.then requires a promise",
+        ));
     }
     let promise = this.as_object().expect("checked above");
     let handler = args.first().copied().unwrap_or_else(JsValue::undefined);
@@ -150,7 +153,9 @@ pub fn promise_then(
                 vec![None; 3],
             ));
             heap.add_root(JsValue::object(record));
-            heap.get_mut(reactions).elements.push(JsValue::object(record));
+            heap.get_mut(reactions)
+                .elements
+                .push(JsValue::object(record));
         }
         STATE_FULFILLED => enqueue_reaction(
             &mut |job| sink.borrow_mut().push(job),
@@ -180,7 +185,10 @@ pub fn queue_microtask(
 ) -> Result<JsValue, Throw> {
     let cb = args.first().copied().unwrap_or_else(JsValue::undefined);
     if cb.as_object().is_none() {
-        return Err(Throw::type_error(heap, "queueMicrotask requires a function"));
+        return Err(Throw::type_error(
+            heap,
+            "queueMicrotask requires a function",
+        ));
     }
     // Root the callback: the job outlives the program stack that referenced it.
     heap.add_root(cb);
@@ -228,7 +236,12 @@ fn enqueue_reaction(
 /// Settles `promise` with `state`/`value` and schedules one job per queued
 /// reaction record (microtask checkpoint semantics: the jobs join the
 /// current drain via `ctx.enqueue`).
-fn settle(ctx: &mut JobCtx<'_, '_>, promise: v12_heap::Handle<JsObject>, state: i32, value: JsValue) {
+fn settle(
+    ctx: &mut JobCtx<'_, '_>,
+    promise: v12_heap::Handle<JsObject>,
+    state: i32,
+    value: JsValue,
+) {
     let reactions = {
         let heap = ctx.heap_mut();
         heap.get_mut(promise).properties[0] = smi(state);

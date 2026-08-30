@@ -13,7 +13,9 @@ pub(crate) fn fill_call_window(
 ) {
     if has_rest {
         let fixed_usize = fixed as usize;
-        let to_copy = fixed_usize.min(args_src.len()).min(window.len().saturating_sub(1));
+        let to_copy = fixed_usize
+            .min(args_src.len())
+            .min(window.len().saturating_sub(1));
         window[1..1 + to_copy].copy_from_slice(&args_src[..to_copy]);
         let rest_len = args_src.len().saturating_sub(fixed_usize);
         let slice = if rest_len > 0 {
@@ -49,9 +51,7 @@ pub(crate) fn fill_stack_call_window(
     let window_len = callee_max_regs as usize;
     if has_rest {
         let fixed_usize = fixed as usize;
-        let to_copy = fixed_usize
-            .min(argc)
-            .min(window_len.saturating_sub(1));
+        let to_copy = fixed_usize.min(argc).min(window_len.saturating_sub(1));
         let dst_start = new_base + 1;
         // Source and destination may overlap when caller/callee windows
         // share the same stack. Use `split_at_mut` for non-overlapping
@@ -61,8 +61,7 @@ pub(crate) fn fill_stack_call_window(
             right[..to_copy].copy_from_slice(&left[arg_src..arg_src + to_copy]);
         } else {
             let (left, right) = interp.stack.split_at_mut(arg_src);
-            left[dst_start..dst_start + to_copy]
-                .copy_from_slice(&right[..to_copy]);
+            left[dst_start..dst_start + to_copy].copy_from_slice(&right[..to_copy]);
         }
         let rest_len = argc.saturating_sub(fixed_usize);
         let slice = if rest_len > 0 {

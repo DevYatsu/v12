@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod realm_tests {
-    use v12_heap::{GcPolicy, Heap, Kind};
+    use v12_heap::{GcPolicy, Heap};
 
     use crate::realm::Realm;
 
@@ -40,7 +40,9 @@ mod job_queue_tests {
         let mut interp = interp();
         let count = Rc::new(RefCell::new(0));
         let c = Rc::clone(&count);
-        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_, '_>| *c.borrow_mut() += 1));
+        q.enqueue(Box::new(move |_ctx: &mut JobCtx<'_, '_>| {
+            *c.borrow_mut() += 1
+        }));
         assert_eq!(q.len(), 1);
         assert_eq!(q.drain(&mut interp, Rc::new(RefCell::new(Vec::new()))), 1);
         assert_eq!(*count.borrow(), 1);

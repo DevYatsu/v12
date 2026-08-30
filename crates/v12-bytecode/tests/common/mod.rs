@@ -22,7 +22,8 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     41, 42, 43, 44, 45, 46, 47, 48, 49, // GetProperty .. SetEnvSlot
     50, 51, 52, // CreateGenerator, SuspendYield, Await
     53, 54, // In, InstanceOf
-    55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, // CopyArrayRest .. Construct, ToNumber, MergeObject, DefineAccessor, JumpIfNullish, SetPrototype
+    55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
+    67, // CopyArrayRest .. Construct, ToNumber, MergeObject, DefineAccessor, JumpIfNullish, SetPrototype
     68, 69, 70, // GetIterator, IteratorNext, IteratorClose
 ];
 

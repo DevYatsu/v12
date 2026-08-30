@@ -584,7 +584,8 @@ mod tests {
         // Smi feedback.
         use crate::Interp;
         let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
-        let mut interp = Interp::from_source(&mut heap, "let x = 1; throw x + 1;").expect("compile");
+        let mut interp =
+            Interp::from_source(&mut heap, "let x = 1; throw x + 1;").expect("compile");
         let _ = interp.run();
         let fv = interp.feedback_vector(0).expect("feedback exists");
         // At least one pc should have Smi feedback (the Add).

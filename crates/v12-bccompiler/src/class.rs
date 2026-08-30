@@ -13,9 +13,7 @@
 //!    parent constructor (static inheritance), and the prototype object's
 //!    prototype becomes `Parent.prototype` (instance inheritance).
 
-use oxc_ast::ast::{
-    Class, ClassBody, ClassElement, MethodDefinitionKind, PropertyKey,
-};
+use oxc_ast::ast::{Class, ClassBody, ClassElement, MethodDefinitionKind, PropertyKey};
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::Opcode;
 
@@ -197,8 +195,8 @@ fn property_key_reg(
     span: Span,
 ) -> Result<u16, CompileError> {
     if !computed {
-        let text = static_key_text(key)
-            .ok_or_else(|| cx.err(span, "unsupported class property key"))?;
+        let text =
+            static_key_text(key).ok_or_else(|| cx.err(span, "unsupported class property key"))?;
         let d = cx.new_temp();
         cx.load_str(d, &text, span)?;
         Ok(d)

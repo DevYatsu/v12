@@ -7,11 +7,7 @@ use super::{helpers, intern_type_error};
 
 /// `Object.create(proto)` – creates a new ordinary object with `proto` as
 /// its prototype. `proto` may be an object or `null`.
-pub fn object_create(
-    heap: &mut Heap,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn object_create(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let proto = args.first().copied().unwrap_or(JsValue::null());
     let proto_handle = if proto.is_null() {
         None
@@ -21,7 +17,8 @@ pub fn object_create(
         return Err((intern_type_error(
             heap,
             "TypeError: Object.create prototype must be object or null",
-        )).into());
+        ))
+        .into());
     };
     let obj = heap.alloc(JsObject::environment(0, proto_handle));
     Ok(JsValue::object(obj))
@@ -55,7 +52,8 @@ pub fn object_define_property(
         return Err((intern_type_error(
             heap,
             "TypeError: Object.defineProperty requires 2 arguments",
-        )).into());
+        ))
+        .into());
     }
     let obj = args[0]
         .as_object()

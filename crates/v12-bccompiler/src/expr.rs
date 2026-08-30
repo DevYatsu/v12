@@ -16,6 +16,22 @@ use crate::model::{CALL_HEADER_REGS, CompileError, FnCtx, REG_THIS, VarAccess};
 
 type Res<T> = Result<T, CompileError>;
 
+/// One object-literal accessor key: both closures plus the key register,
+/// batched until all properties are seen so a `get`/`set` pair shares one
+/// `DefineAccessor` (they must land on the same shape transition).
+struct AccessorPair {
+    /// Static key text, for pairing getter/setter halves.
+    text: String,
+    /// Register holding the property key.
+    key: u16,
+    /// Getter body register, when a getter was present.
+    getter: Option<u16>,
+    /// Setter body register, when a setter was present.
+    setter: Option<u16>,
+    /// Span of the first (getter or setter) property seen.
+    span: Span,
+}
+
 impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Compiles `e`, returning the register that holds its value.
     pub fn expr(&mut self, e: &Expression<'_>) -> Res<u16> {
@@ -305,9 +321,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_reg3(Opcode::Await, dst, arg, 0, a.span);
                 Ok(dst)
             }
-            Expression::ClassExpression(c) => {
-                crate::class::class_expression(self, c, false)
-            }
+            Expression::ClassExpression(c) => crate::class::class_expression(self, c, false),
             Expression::TaggedTemplateExpression(t) => {
                 Err(self.err(t.span, "tagged template literals are not supported"))
             }
@@ -512,7 +526,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // Collect accessor halves by key so `{ get x(){}, set x(){} }` emits
         // ONE `DefineAccessor` carrying both closures (the descriptor needs
         // both halves on the same shape transition).
-        let mut accessors: Vec<(String, u16, Option<u16>, Option<u16>, Span)> = Vec::new();
+        let mut accessors: Vec<AccessorPair> = Vec::new();
         for prop_kind in &o.properties {
             match prop_kind {
                 ObjectPropertyKind::SpreadProperty(s) => {
@@ -527,21 +541,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     {
                         let (text, key, body) = self.accessor_parts(p)?;
                         let is_get = p.kind == oxc_ast::ast::PropertyKind::Get;
-                        let entry = accessors.iter_mut().find(|(t, _, _, _, _)| *t == text);
-                        if let Some((_, _, g, s, _)) = entry {
+                        let entry = accessors.iter_mut().find(|e| e.text == text);
+                        if let Some(entry) = entry {
                             if is_get {
-                                *g = Some(body);
+                                entry.getter = Some(body);
                             } else {
-                                *s = Some(body);
+                                entry.setter = Some(body);
                             }
                         } else {
-                            accessors.push((
+                            accessors.push(AccessorPair {
                                 text,
                                 key,
-                                if is_get { Some(body) } else { None },
-                                if is_get { None } else { Some(body) },
-                                p.span,
-                            ));
+                                getter: is_get.then_some(body),
+                                setter: (!is_get).then_some(body),
+                                span: p.span,
+                            });
                         }
                     } else {
                         self.object_prop(dst, p)?;
@@ -549,7 +563,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 }
             }
         }
-        for (_text, key, getter, setter, span) in accessors {
+        for AccessorPair {
+            text: _,
+            key,
+            getter,
+            setter,
+            span,
+        } in accessors
+        {
             // Pair registers: r[pair] = getter (or undefined), r[pair+1] = setter.
             // Allocate both as a contiguous block so `pair + 1` is in-range.
             let pair = self.new_temps(2);
@@ -1003,7 +1024,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     // rest of the inner `AssignmentTarget` variants (simple
                     // identifiers/members) are flattened in. The rest element
                     // lives in `arr.rest`, handled after the loop.
-                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) = el {
+                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(
+                        d,
+                    ) = el
+                    {
                         // `[a = default]`: default applies when the read is
                         // undefined — not handled in this pass.
                         if let Some(target) = d.binding.as_simple_assignment_target() {
@@ -1090,9 +1114,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         match target {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
-                    let gid = crate::model::str_id_of(
-                        self.comp.strings.get_or_intern(id.name.as_str()),
-                    );
+                    let gid =
+                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
                     self.emit_set_global(gid, val, span);
                     return Ok(());
                 };
@@ -1267,6 +1290,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
         // Walk from the chain root down to the base value, flattening as we
         // go. Private fields remain rejected with a named construct error.
+        // Each match arm guarantees the `as_member_expression` conversion.
+        #[allow(clippy::expect_used)]
         fn collect<'x>(
             links: &mut Vec<SpineLink<'x>>,
             mut cur: &'x Expression<'x>,

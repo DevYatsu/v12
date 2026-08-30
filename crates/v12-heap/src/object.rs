@@ -252,7 +252,10 @@ impl JsObject {
     }
 
     /// An ordinary object with the given properties and their keys.
-    pub fn ordinary(properties: Vec<crate::JsValue>, property_keys: Vec<Option<crate::PropKey>>) -> Self {
+    pub fn ordinary(
+        properties: Vec<crate::JsValue>,
+        property_keys: Vec<Option<crate::PropKey>>,
+    ) -> Self {
         Self {
             kind: Kind::Ordinary,
             properties,
@@ -263,7 +266,10 @@ impl JsObject {
 
     /// A function object: `callable` is what invoking it runs, `captured_env`
     /// is the closure environment.
-    pub fn function(target: crate::function::FunctionTarget, env: Option<Handle<JsObject>>) -> Self {
+    pub fn function(
+        target: crate::function::FunctionTarget,
+        env: Option<Handle<JsObject>>,
+    ) -> Self {
         Self {
             kind: Kind::Function,
             callable: target,
@@ -279,6 +285,8 @@ impl JsObject {
     /// boxes small integers as Smi). The elements are mirrored into both the
     /// legacy `elements` vec (overloaded uses read it) and the live
     /// `elements_array` lattice that array element accesses route through.
+    // Element count fits the i31 Smi bound; audited invariant.
+    #[allow(clippy::expect_used)]
     pub fn array(elements: Vec<crate::JsValue>) -> Self {
         let len = elements.len();
         let mut elements_array = crate::elements::ElementsArray::new();
@@ -287,7 +295,9 @@ impl JsObject {
         }
         Self {
             kind: Kind::Array,
-            properties: vec![crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi")],
+            properties: vec![
+                crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi"),
+            ],
             property_keys: vec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
             elements,
             elements_array,
@@ -296,7 +306,11 @@ impl JsObject {
     }
 
     /// An arguments exotic object with the given properties and elements.
-    pub fn arguments(properties: Vec<crate::JsValue>, elements: Vec<crate::JsValue>, mapped: Option<Box<[Option<u32>]>>) -> Self {
+    pub fn arguments(
+        properties: Vec<crate::JsValue>,
+        elements: Vec<crate::JsValue>,
+        mapped: Option<Box<[Option<u32>]>>,
+    ) -> Self {
         let prop_len = properties.len();
         Self {
             kind: Kind::Arguments,
@@ -312,7 +326,12 @@ impl JsObject {
     /// `source` and `flags` are heap strings; `lastIndex` starts at 0.
     /// The compiled pattern lives in the engine's regexp side table, keyed by
     /// the object handle — this object carries only the source text.
-    pub fn regexp(source: crate::Handle<crate::V12Str>, flags: crate::Handle<crate::V12Str>) -> Self {
+    // lastIndex starts at 0; always within the i31 Smi bound.
+    #[allow(clippy::expect_used)]
+    pub fn regexp(
+        source: crate::Handle<crate::V12Str>,
+        flags: crate::Handle<crate::V12Str>,
+    ) -> Self {
         Self {
             kind: Kind::RegExp,
             properties: vec![
@@ -327,7 +346,10 @@ impl JsObject {
 
     /// A generator object (suspended frame).
     pub fn generator() -> Self {
-        Self { kind: Kind::Generator, ..Default::default() }
+        Self {
+            kind: Kind::Generator,
+            ..Default::default()
+        }
     }
 
     /// A Promise object (ordinary kind with Promise-specific fields set later).
@@ -353,6 +375,8 @@ impl JsObject {
     }
 
     /// Fulfilled promise `properties = [1, value, reactions]`.
+    // Promise state constants 1 and 2 fit the i31 Smi bound.
+    #[allow(clippy::expect_used)]
     pub fn fulfilled_promise(value: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
             kind: Kind::Promise,
@@ -367,6 +391,8 @@ impl JsObject {
     }
 
     /// Rejected promise `properties = [2, reason, reactions]`.
+    // Promise state constants 1 and 2 fit the i31 Smi bound.
+    #[allow(clippy::expect_used)]
     pub fn rejected_promise(reason: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
             kind: Kind::Promise,
@@ -383,7 +409,10 @@ impl JsObject {
     /// An error object with `properties = [name, message]`. `name` is the
     /// error class (e.g. `"TypeError"`); `message` is the human-readable
     /// text. Both are heap strings.
-    pub fn error(name: crate::Handle<crate::V12Str>, message: crate::Handle<crate::V12Str>) -> Self {
+    pub fn error(
+        name: crate::Handle<crate::V12Str>,
+        message: crate::Handle<crate::V12Str>,
+    ) -> Self {
         Self {
             kind: Kind::Error,
             properties: vec![
@@ -435,7 +464,6 @@ impl JsObject {
             ..Self::default()
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +494,12 @@ pub struct GeneratorState {
 pub trait PromiseExt {
     fn promise_state(&self, heap: &crate::Heap) -> Option<PromiseState>;
     fn promise_value(&self, heap: &crate::Heap) -> Option<crate::JsValue>;
-    fn settle_promise(&mut self, heap: &mut crate::Heap, state: PromiseState, value: crate::JsValue);
+    fn settle_promise(
+        &mut self,
+        heap: &mut crate::Heap,
+        state: PromiseState,
+        value: crate::JsValue,
+    );
 }
 
 impl PromiseExt for crate::Handle<JsObject> {
@@ -493,7 +526,14 @@ impl PromiseExt for crate::Handle<JsObject> {
     fn promise_value(&self, heap: &crate::Heap) -> Option<crate::JsValue> {
         heap.get(*self).properties.get(1).copied()
     }
-    fn settle_promise(&mut self, heap: &mut crate::Heap, state: PromiseState, value: crate::JsValue) {
+    // State constants 0–2 fit the i31 Smi bound.
+    #[allow(clippy::expect_used)]
+    fn settle_promise(
+        &mut self,
+        heap: &mut crate::Heap,
+        state: PromiseState,
+        value: crate::JsValue,
+    ) {
         let s = match state {
             PromiseState::Pending => 0,
             PromiseState::Fulfilled => 1,
@@ -520,7 +560,10 @@ impl GeneratorExt for crate::Handle<JsObject> {
             return None;
         }
         let fn_idx = o.properties[0].as_smi().unwrap_or(0) as u32;
-        let resume_pc = o.properties[1].as_smi().unwrap_or(o.properties[1].as_f64().unwrap_or(0.0) as i32) as u32;
+        let resume_pc = o.properties[1]
+            .as_smi()
+            .unwrap_or(o.properties[1].as_f64().unwrap_or(0.0) as i32)
+            as u32;
         // done is stored as f64
         let done_f = o.properties[2].as_f64().unwrap_or(0.0);
         let done_raw = done_f as u32;
@@ -548,10 +591,16 @@ impl GeneratorExt for crate::Handle<JsObject> {
 /// Heap allocation helpers that hide `add_root` + `property_keys` invariants.
 pub trait HeapExt {
     fn alloc_array(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
-    fn alloc_function(&mut self, target: crate::function::FunctionTarget, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject>;
+    fn alloc_function(
+        &mut self,
+        target: crate::function::FunctionTarget,
+        env: Option<crate::Handle<JsObject>>,
+    ) -> crate::Handle<JsObject>;
     fn alloc_ordinary(&mut self, props: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
     fn alloc_pending_promise(&mut self) -> crate::Handle<JsObject>;
-    fn alloc_array_with_roots(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject> { self.alloc_array(elements) }
+    fn alloc_array_with_roots(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject> {
+        self.alloc_array(elements)
+    }
 }
 
 impl HeapExt for crate::Heap {
@@ -560,7 +609,11 @@ impl HeapExt for crate::Heap {
         self.add_root(crate::JsValue::object(h));
         h
     }
-    fn alloc_function(&mut self, target: crate::function::FunctionTarget, env: Option<crate::Handle<JsObject>>) -> crate::Handle<JsObject> {
+    fn alloc_function(
+        &mut self,
+        target: crate::function::FunctionTarget,
+        env: Option<crate::Handle<JsObject>>,
+    ) -> crate::Handle<JsObject> {
         let h = self.alloc(JsObject::function(target, env));
         self.add_root(crate::JsValue::object(h));
         h
@@ -675,10 +728,10 @@ impl Trace for V12Symbol {
 
 impl Trace for V12BigInt {
     fn trace(&self, _sink: &mut MarkSink<'_>) {}
-
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::JsValue;
@@ -753,7 +806,11 @@ mod tests {
     fn generator_object_slots() {
         let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
         let h = heap.alloc(JsObject::generator());
-        heap.get_mut(h).properties = vec![JsValue::from_f64(2.0), JsValue::from_f64(0.0), JsValue::from_f64(0.0)];
+        heap.get_mut(h).properties = vec![
+            JsValue::from_f64(2.0),
+            JsValue::from_f64(0.0),
+            JsValue::from_f64(0.0),
+        ];
         assert_eq!(heap.get(h).kind, Kind::Generator);
         assert_eq!(heap.get(h).properties.len(), 3);
     }

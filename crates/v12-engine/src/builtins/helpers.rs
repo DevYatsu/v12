@@ -15,14 +15,17 @@ use v12_native::Throw;
 /// of `kind` (when given). This is the one-line replacement for the old
 /// `let Some(obj) = this.as_object() else { return Err(…non-object…) }` plus
 /// the separate `kind` re-check.
-pub fn as_object<'a>(
-    heap: &'a mut Heap,
+pub fn as_object(
+    heap: &mut Heap,
     this: JsValue,
     method: &str,
     kind: Option<v12_heap::Kind>,
 ) -> Result<Handle<JsObject>, Throw> {
     let Some(obj) = this.as_object() else {
-        return Err(Throw::type_error(heap, format!("TypeError: {method} called on non-object")));
+        return Err(Throw::type_error(
+            heap,
+            format!("TypeError: {method} called on non-object"),
+        ));
     };
     if let Some(kind) = kind
         && heap.get(obj).kind != kind

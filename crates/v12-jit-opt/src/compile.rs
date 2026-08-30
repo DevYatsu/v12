@@ -824,9 +824,7 @@ fn resolve_const_bits(fb: &FunctionBytecode, id: u32) -> Result<u64, JitError> {
         Some(v12_bytecode::Const::Str32(_)) => Ok(JsValue::undefined().bits()),
         Some(v12_bytecode::Const::Null) => Ok(JsValue::null().bits()),
         Some(other) => Err(JitError::UnsupportedWideOp(format!("const kind {other:?}"))),
-        None => Err(invalid_bytecode(format!(
-            "const id {id} out of range"
-        ))),
+        None => Err(invalid_bytecode(format!("const id {id} out of range"))),
     }
 }
 
@@ -901,7 +899,9 @@ impl Pipeline {
                     {
                         let assumption = Assumption {
                             bc_pc: pc,
-                            guard: GuardKind::ShapeEq { expected: entry.shape },
+                            guard: GuardKind::ShapeEq {
+                                expected: entry.shape,
+                            },
                         };
                         if !lat.is_any() {
                             let _ = emit_guard(&mut deopt, assumption);

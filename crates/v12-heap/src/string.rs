@@ -209,6 +209,9 @@ impl V12Str {
     /// uses — for offset arithmetic without a usize round-trip. A flat leaf
     /// longer than `u32::MAX` units cannot exist: composite lengths are
     /// `u32`, so the heap could not reference it.
+    // Flat leaves longer than u32::MAX cannot exist (composite lengths are
+    // u32, so the heap could not reference them); audited invariant.
+    #[allow(clippy::expect_used)]
     pub fn len_u32(&self) -> u32 {
         u32::try_from(self.len()).expect("string exceeds u32::MAX code units")
     }
@@ -474,6 +477,9 @@ pub(crate) fn content_hash(heap: &Heap, seed: Seed<'_>) -> u32 {
 
 /// Hash of an already-flat store; interning compares canonical instances,
 /// which are flat by construction.
+// Interning only ever canonicalizes flat instances; composites reach this
+// only via a programming error, so fail loud.
+#[allow(clippy::panic)]
 pub(crate) fn hash_flat(storage: &StrStorage) -> u32 {
     let mut state = FNV_OFFSET_BASIS_32;
     match storage {
@@ -509,6 +515,7 @@ pub(crate) fn flat_units_equal(a: &StrStorage, b: &StrStorage) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::{GcPolicy, Heap, JsValue};

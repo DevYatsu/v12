@@ -29,7 +29,7 @@ mod throw;
 
 pub use convert::DecodeError;
 pub use id::{NativeId, UnknownNativeId};
-pub use methods::{lookup_method, KindMethods, Method, BUILTIN_METHODS};
+pub use methods::{BUILTIN_METHODS, KindMethods, Method, lookup_method};
 pub use registry::{EmptyNativeRegistry, Handler, NativeRegistry, ProgramTable, RuntimeRegistry};
 pub use sig::NativeSig;
 pub use throw::Throw;

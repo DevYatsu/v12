@@ -369,6 +369,8 @@ impl Heap {
     ///
     /// Callers that hold handles across code which may reach a safepoint must
     /// keep those handles reachable from the GC roots (see [`GcRoots`]).
+    // Slot indices are Vec lengths, far below u32::MAX; audited invariant.
+    #[allow(clippy::expect_used)]
     pub fn alloc<T: SpaceOps>(&mut self, value: T) -> Handle<T> {
         let size = value.approx_size();
         let s = T::SPACE.as_index();
@@ -410,26 +412,24 @@ impl Heap {
     /// behavior and the reuse caveat.
     pub fn get<T: SpaceOps>(&self, h: Handle<T>) -> &T {
         let i = h.slot();
-        if cfg!(debug_assertions) && !self.alive[T::SPACE.as_index()][i] {
-            panic!(
-                "stale {} handle: index {} refers to a dead slot",
-                T::SPACE.name(),
-                i
-            );
-        }
+        debug_assert!(
+            self.alive[T::SPACE.as_index()][i],
+            "stale {} handle: index {} refers to a dead slot",
+            T::SPACE.name(),
+            i
+        );
         &T::slots(self)[i]
     }
 
     /// Mutable object content by handle; same liveness rules as [`Heap::get`].
     pub fn get_mut<T: SpaceOps>(&mut self, h: Handle<T>) -> &mut T {
         let i = h.slot();
-        if cfg!(debug_assertions) && !self.alive[T::SPACE.as_index()][i] {
-            panic!(
-                "stale {} handle: index {} refers to a dead slot",
-                T::SPACE.name(),
-                i
-            );
-        }
+        debug_assert!(
+            self.alive[T::SPACE.as_index()][i],
+            "stale {} handle: index {} refers to a dead slot",
+            T::SPACE.name(),
+            i
+        );
         &mut T::slots_mut(self)[i]
     }
 
@@ -532,7 +532,9 @@ impl Heap {
         if let Some(existing) = self.get(parent).transitions.get(key) {
             let merged = match self.get(existing).descriptors.find(key) {
                 Some(Descriptor::Accessor {
-                    getter: g, setter: s, ..
+                    getter: g,
+                    setter: s,
+                    ..
                 }) => {
                     let merged_getter = getter.or(*g);
                     let merged_setter = setter.or(*s);
@@ -573,7 +575,9 @@ impl Heap {
                 return existing;
             }
         } else if let Some(Descriptor::Accessor {
-            getter: g, setter: s, ..
+            getter: g,
+            setter: s,
+            ..
         }) = self.get(parent).descriptors.find(key)
         {
             // `parent` already carries the accessor (the object was bound to
@@ -647,10 +651,13 @@ impl Heap {
     /// changes only through [`Heap::bump_validity`]; a guard is the pair
     /// (cell, serial seen when the assumption was recorded) and holds exactly
     /// while [`Heap::guard_holds`] says the recorded serial still matches.
+    // Cell count is a Vec length, far below u32::MAX; audited invariant.
+    #[allow(clippy::expect_used)]
     pub fn new_validity_cell(&mut self) -> ValidityCellId {
         let id = self.validity_cells.len() + 1;
         self.validity_cells.push(0);
         // Ids are 1-based (zero is `NONE`), so cell `id` lives at `id - 1`.
+        // Cell count is a Vec length, far below u32::MAX; audited invariant.
         ValidityCellId(u32::try_from(id).expect("validity cell count exceeds u32::MAX"))
     }
 
@@ -781,6 +788,9 @@ impl Heap {
     /// [`CONCAT_EAGER_FLATTEN_MAX_UNITS`], where node overhead rivals the
     /// payload and the text is materialized immediately (see the string
     /// module docs for the economics).
+    // Operand lengths fit u32 by construction; the sum overflows only past
+    // u32::MAX, which composite storage cannot represent anyway.
+    #[allow(clippy::expect_used)]
     pub fn concat(&mut self, left: Handle<V12Str>, right: Handle<V12Str>) -> Handle<V12Str> {
         // u32 arithmetic throughout: composite lengths are stored as u32, so
         // an overflow here is a genuine "too large for the heap" condition.
@@ -1200,6 +1210,7 @@ impl Heap {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::{Kind, StrStorage};
@@ -1319,7 +1330,11 @@ mod tests {
         // counter resets and we verify the trigger fires again on a fresh
         // accumulation.
         heap.safepoint();
-        assert_eq!(heap.collections(), 1, "safepoint must fire the growth trigger");
+        assert_eq!(
+            heap.collections(),
+            1,
+            "safepoint must fire the growth trigger"
+        );
 
         // Everything allocated since the reset accumulates until the next
         // crossing; the trigger fires at a safepoint, never inside alloc.

@@ -6,11 +6,7 @@ use v12_native::Throw;
 use super::{helpers, regexp};
 
 /// `String.prototype.charAt(index)` – returns a single-character string.
-pub fn string_char_at(
-    heap: &mut Heap,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn string_char_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let handle = this
         .as_string()
         .ok_or_else(|| Throw::type_error(heap, "String.prototype.charAt called on non-string"))?;
@@ -98,12 +94,23 @@ pub fn string_match(
     let text = helpers::string_text(heap, handle);
     let Some(re) = args.first().and_then(|v| v.as_object()) else {
         // Non-regexp argument: ToString and return a single-match array.
-        let arg = args.first().map(|v| helpers::value_text(heap, *v)).unwrap_or_default();
-        return Ok(match_text_to_array(heap, &text, text.find(&arg).map(|i| (i, i + arg.len()))));
+        let arg = args
+            .first()
+            .map(|v| helpers::value_text(heap, *v))
+            .unwrap_or_default();
+        return Ok(match_text_to_array(
+            heap,
+            &text,
+            text.find(&arg).map(|i| (i, i + arg.len())),
+        ));
     };
     if heap.get(re).kind != v12_heap::Kind::RegExp {
         let arg = helpers::value_text(heap, *args.first().unwrap());
-        return Ok(match_text_to_array(heap, &text, text.find(&arg).map(|i| (i, i + arg.len()))));
+        return Ok(match_text_to_array(
+            heap,
+            &text,
+            text.find(&arg).map(|i| (i, i + arg.len())),
+        ));
     }
     let (_, flags) = regexp::regexp_source_flags(heap, re);
     let text_h = heap.intern_text(&text);
@@ -112,16 +119,16 @@ pub fn string_match(
         let mut matches = Vec::new();
         let mut start = 0.0;
         loop {
-            let m = regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])?;
+            let m =
+                regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])?;
             if m.is_null() {
                 break;
             }
             // Extract `m[0]`.
-            if let Some(arr) = m.as_object() {
-                if let Some(v) = heap.get(arr).elements_array.get(0) {
+            if let Some(arr) = m.as_object()
+                && let Some(v) = heap.get(arr).elements_array.get(0) {
                     matches.push(v);
                 }
-            }
             // Guard against infinite loop on zero-width matches.
             let li = regexp::last_index(heap, re);
             if li <= start {
@@ -211,11 +218,28 @@ pub fn string_replace(
             break;
         }
         let Some(arr) = m.as_object() else { break };
-        let match_start = heap.get(arr).properties.get(1).and_then(|v| v.as_smi()).map(i64::from).unwrap_or(0) as usize;
-        let m0_len = heap.get(arr).elements_array.get(0).and_then(|v| v.as_string()).map(|h| helpers::string_text(heap, h).len()).unwrap_or(0);
+        let match_start = heap
+            .get(arr)
+            .properties
+            .get(1)
+            .and_then(|v| v.as_smi())
+            .map(i64::from)
+            .unwrap_or(0) as usize;
+        let m0_len = heap
+            .get(arr)
+            .elements_array
+            .get(0)
+            .and_then(|v| v.as_string())
+            .map(|h| helpers::string_text(heap, h).len())
+            .unwrap_or(0);
         let mut groups = Vec::new();
         for i in 1..=9 {
-            let g = heap.get(arr).elements_array.get(i).and_then(|v| v.as_string()).map(|h| helpers::string_text(heap, h));
+            let g = heap
+                .get(arr)
+                .elements_array
+                .get(i)
+                .and_then(|v| v.as_string())
+                .map(|h| helpers::string_text(heap, h));
             groups.push(g);
         }
         spans.push((match_start, match_start + m0_len, groups));
@@ -240,7 +264,14 @@ pub fn string_replace(
     for (s, e, groups) in spans {
         out.push_str(&text[cursor..s]);
         let whole = &text[s..e];
-        out.push_str(&expand_replacement(&replacement, whole, &groups.iter().map(|g| g.as_deref().unwrap_or("")).collect::<Vec<_>>()));
+        out.push_str(&expand_replacement(
+            &replacement,
+            whole,
+            &groups
+                .iter()
+                .map(|g| g.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>(),
+        ));
         cursor = e;
     }
     out.push_str(&text[cursor..]);
@@ -263,11 +294,15 @@ pub fn string_search(
     };
     let Some(re) = search.as_object() else {
         let needle = helpers::value_text(heap, search);
-        return Ok(helpers::smi_or_f64(text.find(&needle).map(|i| i as i64).unwrap_or(-1)));
+        return Ok(helpers::smi_or_f64(
+            text.find(&needle).map(|i| i as i64).unwrap_or(-1),
+        ));
     };
     if heap.get(re).kind != v12_heap::Kind::RegExp {
         let needle = helpers::value_text(heap, search);
-        return Ok(helpers::smi_or_f64(text.find(&needle).map(|i| i as i64).unwrap_or(-1)));
+        return Ok(helpers::smi_or_f64(
+            text.find(&needle).map(|i| i as i64).unwrap_or(-1),
+        ));
     }
     let text_h = heap.intern_text(&text);
     let m = regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])?;
@@ -339,13 +374,30 @@ pub fn string_split(
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut start = 0.0;
     loop {
-        let m = regexp::regexp_exec(heap, cache, JsValue::object(splitter), &[JsValue::string(text_h)])?;
+        let m = regexp::regexp_exec(
+            heap,
+            cache,
+            JsValue::object(splitter),
+            &[JsValue::string(text_h)],
+        )?;
         if m.is_null() {
             break;
         }
         let Some(arr) = m.as_object() else { break };
-        let s = heap.get(arr).properties.get(1).and_then(|v| v.as_smi()).map(i64::from).unwrap_or(0) as usize;
-        let len = heap.get(arr).elements_array.get(0).and_then(|v| v.as_string()).map(|h| helpers::string_text(heap, h).len()).unwrap_or(0);
+        let s = heap
+            .get(arr)
+            .properties
+            .get(1)
+            .and_then(|v| v.as_smi())
+            .map(i64::from)
+            .unwrap_or(0) as usize;
+        let len = heap
+            .get(arr)
+            .elements_array
+            .get(0)
+            .and_then(|v| v.as_string())
+            .map(|h| helpers::string_text(heap, h).len())
+            .unwrap_or(0);
         spans.push((s, s + len));
         let li = regexp::last_index(heap, splitter);
         if li <= start {
@@ -365,7 +417,7 @@ pub fn string_split(
     Ok(array_of_strings(heap, pieces, limit))
 }
 
-fn array_of_strings<'a>(heap: &mut Heap, strs: Vec<&'a str>, limit: i64) -> JsValue {
+fn array_of_strings(heap: &mut Heap, strs: Vec<&str>, limit: i64) -> JsValue {
     let mut out = Vec::new();
     for (i, s) in strs.into_iter().enumerate() {
         if (i as i64) >= limit {
@@ -381,7 +433,10 @@ fn match_text_to_array(heap: &mut Heap, text: &str, found: Option<(usize, usize)
     match found {
         Some((s, e)) => {
             let matched_h = heap.intern_text(&text[s..e]);
-            let arr = helpers::alloc_obj(heap, v12_heap::JsObject::array(vec![JsValue::string(matched_h)]));
+            let arr = helpers::alloc_obj(
+                heap,
+                v12_heap::JsObject::array(vec![JsValue::string(matched_h)]),
+            );
             JsValue::object(arr)
         }
         None => JsValue::null(),
@@ -419,4 +474,3 @@ fn expand_replacement(template: &str, whole: &str, groups: &[&str]) -> String {
     }
     out
 }
-

@@ -94,7 +94,10 @@ impl ElementsKind {
 
     /// True for the three hole-bearing rungs.
     pub fn is_holey(self) -> bool {
-        matches!(self, ElementsKind::HoleySmi | ElementsKind::HoleyDouble | ElementsKind::HoleyObject)
+        matches!(
+            self,
+            ElementsKind::HoleySmi | ElementsKind::HoleyDouble | ElementsKind::HoleyObject
+        )
     }
 
     /// True for the terminal hash-backed rung.
@@ -130,12 +133,12 @@ enum ValueClass<'a> {
 
 impl ValueClass<'_> {
     /// The canonical `JsValue` this class stores back as.
-    fn to_value(&self) -> JsValue {
+    fn to_value(self) -> JsValue {
         match self {
             ValueClass::Hole => JsValue::hole(),
-            ValueClass::Smi(n) => smi_value(*n),
-            ValueClass::Double(d) => JsValue::from_f64(*d),
-            ValueClass::Other(v) => **v,
+            ValueClass::Smi(n) => smi_value(n),
+            ValueClass::Double(d) => JsValue::from_f64(d),
+            ValueClass::Other(v) => *v,
         }
     }
 }
@@ -186,12 +189,21 @@ fn element_key_hash(index: u32) -> u64 {
 impl ElementsDictionary {
     /// Empty dictionary.
     pub fn new() -> Self {
-        Self { entries: rustc_hash::FxHashMap::default(), length: 0 }
+        Self {
+            entries: rustc_hash::FxHashMap::default(),
+            length: 0,
+        }
     }
 
     /// Inserts or overwrites `index`, refreshing the cached hash.
     pub fn insert(&mut self, index: u32, value: JsValue) {
-        self.entries.insert(index, DictEntry { hash: element_key_hash(index), value });
+        self.entries.insert(
+            index,
+            DictEntry {
+                hash: element_key_hash(index),
+                value,
+            },
+        );
         self.length = self.length.max(index + 1);
     }
 
@@ -229,9 +241,7 @@ impl ElementsDictionary {
     /// Rough retained bytes for GC accounting.
     fn retained_bytes(&self) -> usize {
         self.entries.capacity()
-            * (core::mem::size_of::<u32>()
-                + core::mem::size_of::<DictEntry>()
-                + 1)
+            * (core::mem::size_of::<u32>() + core::mem::size_of::<DictEntry>() + 1)
     }
 }
 
@@ -261,7 +271,9 @@ enum ElementsStorage {
 
 impl Default for ElementsArray {
     fn default() -> Self {
-        Self { storage: ElementsStorage::PackedSmi(Vec::new()) }
+        Self {
+            storage: ElementsStorage::PackedSmi(Vec::new()),
+        }
     }
 }
 
@@ -307,30 +319,6 @@ impl ElementsArray {
         }
     }
 
-    /// Element count in the JS array-index domain (`u32`). Flat kinds are
-    /// capped far below `u32::MAX` by [`ELEMENTS_TO_DICTIONARY_INDEX`];
-    /// dictionaries key on `u32`, so their length view fits by construction.
-    fn len_u32(&self) -> u32 {
-        match &self.storage {
-            ElementsStorage::PackedSmi(v) => {
-                debug_assert!(v.len() < ELEMENTS_TO_DICTIONARY_INDEX as usize);
-                v.len() as u32
-            }
-            ElementsStorage::HoleySmi(v)
-            | ElementsStorage::HoleyDouble(v)
-            | ElementsStorage::PackedObject(v)
-            | ElementsStorage::HoleyObject(v) => {
-                debug_assert!(v.len() < ELEMENTS_TO_DICTIONARY_INDEX as usize);
-                v.len() as u32
-            }
-            ElementsStorage::PackedDouble(v) => {
-                debug_assert!(v.len() < ELEMENTS_TO_DICTIONARY_INDEX as usize);
-                v.len() as u32
-            }
-            ElementsStorage::Dictionary(dict) => dict.length(),
-        }
-    }
-
     /// True when no elements are stored (or the length view is zero).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -372,11 +360,7 @@ impl ElementsArray {
                 let last = dict.length() - 1;
                 let v = dict.entries.remove(&last).map(|e| e.value);
                 // Recompute the length view: highest remaining index + 1.
-                dict.length = dict
-                    .entries
-                    .keys()
-                    .max()
-                    .map_or(0, |&k| k + 1);
+                dict.length = dict.entries.keys().max().map_or(0, |&k| k + 1);
                 v
             }
         }
@@ -391,12 +375,8 @@ impl ElementsArray {
             | ElementsStorage::HoleyDouble(v)
             | ElementsStorage::PackedObject(v)
             | ElementsStorage::HoleyObject(v) => Box::new(v.iter().copied()),
-            ElementsStorage::PackedDouble(v) => {
-                Box::new(v.iter().map(|&d| JsValue::from_f64(d)))
-            }
-            ElementsStorage::Dictionary(dict) => {
-                Box::new(dict.iter().map(|(_, e)| e.value))
-            }
+            ElementsStorage::PackedDouble(v) => Box::new(v.iter().map(|&d| JsValue::from_f64(d))),
+            ElementsStorage::Dictionary(dict) => Box::new(dict.iter().map(|(_, e)| e.value)),
         }
     }
 
@@ -442,7 +422,9 @@ impl ElementsArray {
             (ElementsStorage::HoleySmi(v), ValueClass::Hole) => put_at(v, index, JsValue::hole()),
             (ElementsStorage::PackedDouble(v), ValueClass::Double(d)) => put_at(v, index, d),
             // Small integers ride in double rungs losslessly.
-            (ElementsStorage::PackedDouble(v), ValueClass::Smi(n)) => put_at(v, index, f64::from(n)),
+            (ElementsStorage::PackedDouble(v), ValueClass::Smi(n)) => {
+                put_at(v, index, f64::from(n))
+            }
             (ElementsStorage::HoleyDouble(v), ValueClass::Double(d)) => {
                 put_at(v, index, JsValue::from_f64(d))
             }
@@ -519,7 +501,11 @@ impl ElementsArray {
                 }
             }
         };
-        Some(if minimum.rank() > current.rank() { minimum } else { current })
+        Some(if minimum.rank() > current.rank() {
+            minimum
+        } else {
+            current
+        })
     }
 
     fn convert_to(&mut self, target: ElementsKind) {
@@ -573,15 +559,6 @@ fn flat_index(index: u32) -> usize {
     index as usize
 }
 
-/// Dense flat-storage position → JS element index. Flat vectors never grow
-/// beyond [`ELEMENTS_TO_DICTIONARY_INDEX`] entries, so the narrowing is
-/// safe; debug builds assert it.
-#[inline]
-fn dense_index(i: usize) -> u32 {
-    debug_assert!(i < ELEMENTS_TO_DICTIONARY_INDEX as usize);
-    i as u32
-}
-
 fn put_at<T: Clone>(v: &mut Vec<T>, index: u32, item: T) {
     let i = flat_index(index);
     if i < v.len() {
@@ -615,32 +592,38 @@ fn convert_storage(source: ElementsStorage, target: ElementsKind) -> ElementsSto
     }
 
     // Shared builders over flat vectors.
-    let smis_as_values =
-        |v: &[i32]| v.iter().map(|&n| smi_value(n)).collect::<Vec<JsValue>>();
-    let doubles_as_values =
-        |v: &[f64]| v.iter().map(|&d| JsValue::from_f64(d)).collect::<Vec<JsValue>>();
+    let smis_as_values = |v: &[i32]| v.iter().map(|&n| smi_value(n)).collect::<Vec<JsValue>>();
+    let doubles_as_values = |v: &[f64]| {
+        v.iter()
+            .map(|&d| JsValue::from_f64(d))
+            .collect::<Vec<JsValue>>()
+    };
 
     match source {
         ElementsStorage::PackedSmi(v) => match target {
-            ElementsKind::HoleySmi => {
-                ElementsStorage::HoleySmi(smis_as_values(&v))
-            }
+            ElementsKind::HoleySmi => ElementsStorage::HoleySmi(smis_as_values(&v)),
             ElementsKind::PackedDouble => {
                 ElementsStorage::PackedDouble(v.iter().map(|&n| f64::from(n)).collect())
             }
-            ElementsKind::HoleyDouble => {
-                ElementsStorage::HoleyDouble(doubles_as_values(
-                    &v.iter().map(|&n| f64::from(n)).collect::<Vec<f64>>(),
-                ))
-            }
+            ElementsKind::HoleyDouble => ElementsStorage::HoleyDouble(doubles_as_values(
+                &v.iter().map(|&n| f64::from(n)).collect::<Vec<f64>>(),
+            )),
             ElementsKind::PackedObject => ElementsStorage::PackedObject(smis_as_values(&v)),
             ElementsKind::HoleyObject => ElementsStorage::HoleyObject(smis_as_values(&v)),
-            _ => dictionary_from_pairs(v.iter().enumerate().map(|(i, &n)| (i as u32, smi_value(n)))),
+            _ => {
+                dictionary_from_pairs(v.iter().enumerate().map(|(i, &n)| (i as u32, smi_value(n))))
+            }
         },
         ElementsStorage::HoleySmi(v) => match target {
             ElementsKind::HoleyDouble => ElementsStorage::HoleyDouble(
                 v.into_iter()
-                    .map(|u| if u.is_hole() { u } else { JsValue::from_f64(as_double(u)) })
+                    .map(|u| {
+                        if u.is_hole() {
+                            u
+                        } else {
+                            JsValue::from_f64(as_double(u))
+                        }
+                    })
                     .collect(),
             ),
             ElementsKind::HoleyObject => ElementsStorage::HoleyObject(v),
@@ -652,17 +635,13 @@ fn convert_storage(source: ElementsStorage, target: ElementsKind) -> ElementsSto
             ),
         },
         ElementsStorage::PackedDouble(v) => match target {
-            ElementsKind::HoleyDouble => {
-                ElementsStorage::HoleyDouble(doubles_as_values(&v))
-            }
-            ElementsKind::PackedObject => {
-                ElementsStorage::PackedObject(doubles_as_values(&v))
-            }
-            ElementsKind::HoleyObject => {
-                ElementsStorage::HoleyObject(doubles_as_values(&v))
-            }
+            ElementsKind::HoleyDouble => ElementsStorage::HoleyDouble(doubles_as_values(&v)),
+            ElementsKind::PackedObject => ElementsStorage::PackedObject(doubles_as_values(&v)),
+            ElementsKind::HoleyObject => ElementsStorage::HoleyObject(doubles_as_values(&v)),
             _ => dictionary_from_pairs(
-                v.into_iter().enumerate().map(|(i, d)| (i as u32, JsValue::from_f64(d))),
+                v.into_iter()
+                    .enumerate()
+                    .map(|(i, d)| (i as u32, JsValue::from_f64(d))),
             ),
         },
         ElementsStorage::HoleyDouble(v) => match target {
@@ -721,6 +700,7 @@ impl crate::object::SizeEstimate for ElementsArray {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

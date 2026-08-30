@@ -5,8 +5,8 @@ use std::path::Path;
 use std::rc::Rc;
 
 use v12_bytecode::FunctionBytecode;
-use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
 use v12_heap::HeapExt;
+use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
 use v12_interp::{Interp, JSException};
 use v12_native::{NativeId, Throw};
 
@@ -206,8 +206,7 @@ impl Engine {
     /// Cheap; doesn't allocate.
     #[must_use]
     pub fn last_completion(&self) -> JsValue {
-        self.completion
-            .unwrap_or_else(JsValue::undefined)
+        self.completion.unwrap_or_else(JsValue::undefined)
     }
 
     /// Direct `eval`: shares the caller's heap and global.
@@ -223,8 +222,7 @@ impl Engine {
             Err(EngineError::Thrown(t)) => Err(t),
             Err(EngineError::Host(msg)) => {
                 let h = if msg.is_ascii() {
-                    self.heap
-                        .intern_string(V12Str::latin1(msg.into_bytes()))
+                    self.heap.intern_string(V12Str::latin1(msg.into_bytes()))
                 } else {
                     self.heap
                         .intern_string(V12Str::utf16(msg.encode_utf16().collect()))
@@ -234,8 +232,7 @@ impl Engine {
             Err(EngineError::Compile(err)) => {
                 let msg = err.message;
                 let handle = if msg.is_ascii() {
-                    self.heap
-                        .intern_string(V12Str::latin1(msg.into_bytes()))
+                    self.heap.intern_string(V12Str::latin1(msg.into_bytes()))
                 } else {
                     self.heap
                         .intern_string(V12Str::utf16(msg.encode_utf16().collect()))
@@ -254,8 +251,8 @@ impl Engine {
         }
         let global = self.realm.global();
         self.heap.add_root(JsValue::object(global));
-        let (program, strings) = v12_bccompiler::compile_source_with_strings(source)
-            .map_err(EngineError::Compile)?;
+        let (program, strings) =
+            v12_bccompiler::compile_source_with_strings(source).map_err(EngineError::Compile)?;
         // Retain the program so queued jobs can rebuild an interpreter and
         // activate the script's functions later (Promise reactions).
         // Wrap the `Vec`s in `Rc` once; subsequent `eval`/`run_jobs` clone
@@ -273,7 +270,14 @@ impl Engine {
         // the heap borrow and the job-queue/registry accesses are disjoint
         // locals (the borrow checker cannot see field disjointness through
         // `&mut self`).
-        let Engine { heap, jobs, registry, pending, completion, .. } = self;
+        let Engine {
+            heap,
+            jobs,
+            registry,
+            pending,
+            completion,
+            ..
+        } = self;
         let mut interp = Interp::new_with_heap(
             heap,
             Some(global),
@@ -333,8 +337,13 @@ impl Engine {
         // `snapshot_handlers` + `install_core` dance is obsolete.
         let mut local_registry = self.registry.clone();
         local_registry.set_pending(Rc::new(RefCell::new(Vec::new())));
-        let mut interp =
-            Interp::new_with_heap(&mut heap, Some(global), program.functions, program.main, strings);
+        let mut interp = Interp::new_with_heap(
+            &mut heap,
+            Some(global),
+            program.functions,
+            program.main,
+            strings,
+        );
         interp.set_natives(Box::new(local_registry.clone()));
         let outcome = interp.run();
         // Drain this realm's checkpoint against its own interpreter; the
@@ -420,7 +429,14 @@ impl Engine {
         });
         // Borrow the engine's heap; no swap. Destructure `self` so
         // the heap borrow and job-queue/registry accesses are disjoint locals.
-        let Engine { heap, jobs, registry, pending, completion, .. } = self;
+        let Engine {
+            heap,
+            jobs,
+            registry,
+            pending,
+            completion,
+            ..
+        } = self;
         let mut interp = Interp::new_with_heap(
             heap,
             Some(global),
@@ -560,9 +576,7 @@ impl Engine {
             }
             self.heap.get_mut(global).properties[idx] = JsValue::object(func);
         } else {
-            let child = self
-                .heap
-                .add_property(shape, key, v12_heap::Attrs::DEFAULT);
+            let child = self.heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
             self.heap.bind_shape(global, child);
             let new_slot =
                 usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
@@ -630,7 +644,13 @@ impl Engine {
             ),
             None => (Vec::new(), 0, Vec::new()),
         };
-        let Engine { heap, jobs, registry, pending, .. } = self;
+        let Engine {
+            heap,
+            jobs,
+            registry,
+            pending,
+            ..
+        } = self;
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
         let outcome = interp.call_object(callee, JsValue::undefined(), args);
@@ -712,7 +732,13 @@ impl Engine {
         // Borrow the engine's heap; no swap. The interpreter is
         // scoped to this method, so the borrow ends when it drops. Destructure
         // `self` so heap and jobs/registry accesses are disjoint locals.
-        let Engine { heap, jobs, registry, pending, .. } = self;
+        let Engine {
+            heap,
+            jobs,
+            registry,
+            pending,
+            ..
+        } = self;
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
         let count = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
@@ -767,8 +793,18 @@ impl Engine {
         {
             // Snapshot the handles first so the text decode (which needs
             // `&mut self`) doesn't fight the borrow.
-            let name_h = self.heap.get(obj).properties.first().and_then(|v| v.as_string());
-            let msg_h = self.heap.get(obj).properties.get(1).and_then(|v| v.as_string());
+            let name_h = self
+                .heap
+                .get(obj)
+                .properties
+                .first()
+                .and_then(|v| v.as_string());
+            let msg_h = self
+                .heap
+                .get(obj)
+                .properties
+                .get(1)
+                .and_then(|v| v.as_string());
             let name = name_h
                 .map(|h| self.heap_string_text(h))
                 .unwrap_or_else(|| "Error".to_string());
@@ -880,9 +916,7 @@ mod tests {
         // `last_completion`, and the structured `EngineError` path for
         // throws and compile errors is well-formed.
         let mut engine = Engine::new();
-        let v = engine
-            .eval_with_completion("let x = 1;")
-            .expect("ok");
+        let v = engine.eval_with_completion("let x = 1;").expect("ok");
         assert!(v.is_undefined(), "empty/decl-only script returns undefined");
         // `last_completion` returns the most recent completion, or
         // `undefined` if nothing has run.
@@ -1309,9 +1343,17 @@ mod tests {
         // `/ab+c/` literal compiles to a RegExp constructor call; `.test`
         // drives exec.
         let thrown = engine.eval("throw /ab+c/.test('xabbbc');").unwrap_err();
-        assert!(thrown.is_true(), "test should match: {}", engine.to_display_string(thrown));
+        assert!(
+            thrown.is_true(),
+            "test should match: {}",
+            engine.to_display_string(thrown)
+        );
         let thrown = engine.eval("throw /ab+c/.test('xac');").unwrap_err();
-        assert!(thrown.is_false(), "test should not match: {}", engine.to_display_string(thrown));
+        assert!(
+            thrown.is_false(),
+            "test should not match: {}",
+            engine.to_display_string(thrown)
+        );
         // exec returns a match array with index/input.
         let thrown = engine
             .eval("let m = /(a)(b)/.exec('zab'); throw m[0] + ' ' + m[1] + ' ' + m[2] + ' ' + m.index + ' ' + m.input;")
@@ -1341,9 +1383,7 @@ mod tests {
         let mut engine = Engine::new();
         // Global exec advances lastIndex across calls.
         let thrown = engine
-            .eval(
-                "let re = /a/g; let s = 'a a a'; let n = 0; while (re.exec(s)) { n++; } throw n;",
-            )
+            .eval("let re = /a/g; let s = 'a a a'; let n = 0; while (re.exec(s)) { n++; } throw n;")
             .unwrap_err();
         assert_eq!(thrown.as_smi(), Some(3));
         // lastIndex resets to 0 after exhaustion.
@@ -1415,9 +1455,7 @@ mod tests {
     fn string_replace_string_separator() {
         let mut engine = Engine::new();
         // Non-regexp replace only replaces first occurrence.
-        let thrown = engine
-            .eval("throw 'aaa'.replace('a', 'b');")
-            .unwrap_err();
+        let thrown = engine.eval("throw 'aaa'.replace('a', 'b');").unwrap_err();
         assert_eq!(engine.to_display_string(thrown), "baa");
     }
 
@@ -1513,9 +1551,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(engine.to_display_string(thrown), "0a1b");
         let thrown = engine
-            .eval(
-                "let ks = ''; for (const k of ['x', 'y'].keys()) { ks += k; } throw ks;",
-            )
+            .eval("let ks = ''; for (const k of ['x', 'y'].keys()) { ks += k; } throw ks;")
             .unwrap_err();
         assert_eq!(engine.to_display_string(thrown), "01");
     }

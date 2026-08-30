@@ -52,7 +52,6 @@
 use crate::gc::{MarkSink, Trace};
 use crate::handle::{Handle, HeapSpace, Space};
 use crate::prop_key::PropKey;
-use crate::string::V12Str;
 
 use std::boxed::Box;
 use std::vec::Vec;
@@ -592,6 +591,7 @@ impl crate::object::SizeEstimate for Shape {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::{GcPolicy, Heap, V12Str};

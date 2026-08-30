@@ -11,9 +11,9 @@
 //! spare bits (size 1); `Host(HostClosure)` carries the one-word closure
 //! handle inline.
 
-use crate::gc::{MarkSink, Trace};
 use crate::Heap;
 use crate::JsValue;
+use crate::gc::{MarkSink, Trace};
 
 /// Discriminants of the built-in native functions.
 ///
@@ -61,6 +61,12 @@ pub enum Native {
     SetSize,
 }
 
+/// Signature of a native built-in handler: heap + receiver + args → result.
+pub type NativeFn = fn(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue>;
+
+/// Signature of an embedder host closure (boxed, `FnMut`).
+type HostFn = dyn FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue>;
+
 /// One-word handle to an embedder closure.
 ///
 /// Sized to a single machine word (a raw pointer to the `Box<dyn FnMut>`
@@ -69,7 +75,9 @@ pub enum Native {
 /// function object that references it (the JIT's executable-memory layer is
 /// the only other audited `unsafe` in the codebase).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HostClosure(pub(crate) *mut dyn FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue>);
+pub struct HostClosure(
+    pub(crate) *mut HostFn,
+);
 
 // Safety: HostClosure is a pointer handle, never dereferenced here; the
 // engine's registry owns the box and drops it after all referencing function
@@ -85,8 +93,7 @@ impl HostClosure {
     where
         F: FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue> + 'static,
     {
-        let boxed: Box<dyn FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue>> =
-            Box::new(f);
+        let boxed: Box<HostFn> = Box::new(f);
         Self(Box::into_raw(boxed))
     }
 
@@ -111,12 +118,18 @@ impl HostClosure {
 }
 
 /// What a `KIND_FUNCTION` object invokes when called.
+///
+/// `Native` carries a raw fn pointer; equality on that variant compares
+/// addresses, which the lint flags as non-unique. Identity semantics are
+/// intentional here — the variant is a discriminant carrier, and `Hash` is
+/// only used for container bookkeeping, never for fn-pointer uniqueness.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(unpredictable_function_pointer_comparisons)]
 pub enum FunctionTarget {
     /// A bytecode function: index into the program's function table.
     Bytecode(u32),
     /// A built-in native: the handler fn pointer.
-    Native(fn(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue>),
+    Native(NativeFn),
     /// An embedder-registered host closure.
     Host(HostClosure),
 }

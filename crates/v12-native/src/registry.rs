@@ -135,7 +135,11 @@ macro_rules! typed_wrapper {
                 heap: &mut $crate::Heap,
                 this: $crate::JsValue,
                 args: &[$crate::JsValue],
-                f: fn(&mut $crate::Heap, $crate::JsValue, S) -> Result<$crate::JsValue, $crate::Throw>,
+                f: fn(
+                    &mut $crate::Heap,
+                    $crate::JsValue,
+                    S,
+                ) -> Result<$crate::JsValue, $crate::Throw>,
             ) -> Result<$crate::JsValue, $crate::Throw> {
                 let decoded = S::from_js(heap, args)?;
                 f(heap, this, decoded)

@@ -105,10 +105,7 @@ mod tests {
 
     #[test]
     fn kind_label_is_stable() {
-        assert_eq!(
-            EngineError::Host(String::new()).kind_label(),
-            "host"
-        );
+        assert_eq!(EngineError::Host(String::new()).kind_label(), "host");
         assert_eq!(
             EngineError::Thrown(JsValue::undefined()).kind_label(),
             "thrown"

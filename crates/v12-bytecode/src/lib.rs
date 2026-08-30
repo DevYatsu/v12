@@ -1479,10 +1479,8 @@ mod data_tests {
     use super::*;
 
     fn nop_fn(handlers: Vec<HandlerRange>) -> FunctionBytecode {
-        let mut fb = FunctionBytecode::with_instructions(
-            vec![Instr::new(Opcode::Move, 0, 0, 0); 4],
-            2,
-        );
+        let mut fb =
+            FunctionBytecode::with_instructions(vec![Instr::new(Opcode::Move, 0, 0, 0); 4], 2);
         fb.handlers = handlers;
         fb
     }
@@ -1621,17 +1619,17 @@ mod data_tests {
             },
         ];
         let err = nop_fn(flat).validate().unwrap_err();
-        assert!(err.to_string().contains("non-increasing stack depth"), "{err}");
+        assert!(
+            err.to_string().contains("non-increasing stack depth"),
+            "{err}"
+        );
     }
 
     #[test]
     fn validate_rejects_zero_max_regs() {
         let mut fb = nop_fn(Vec::new());
         fb.max_regs = 0;
-        assert_eq!(
-            fb.validate().unwrap_err(),
-            BytecodeError::ZeroMaxRegs
-        );
+        assert_eq!(fb.validate().unwrap_err(), BytecodeError::ZeroMaxRegs);
     }
 
     #[test]

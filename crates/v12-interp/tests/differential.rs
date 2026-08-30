@@ -4,8 +4,8 @@
 //! Covers the compiled-program end-to-end path that unit tests over
 //! hand-built bytecode do not reach.
 
+use test_support::{Val, eval_src, expect_bool, expect_num, expect_str, value_to_string};
 use v12_heap::{GcPolicy, Heap};
-use test_support::{eval_src, expect_bool, expect_num, expect_str, value_to_string, Val};
 use v12_interp::{Interp, JSException};
 
 /// Runs `src` on the real engine and returns the completion value's display
@@ -34,16 +34,43 @@ const CASES: &[(&str, Want)] = &[
     ("return 10 % 3;", Want::Num(1.0)),
     ("return 2 ** 10;", Want::Num(1024.0)),
     ("let a = 1; a += 41; return a;", Want::Num(42.0)),
-    ("let i = 0; let s = 0; while (i < 5) { s += i; i += 1; } return s;", Want::Num(10.0)),
-    ("let s = 0; for (let i = 1; i <= 4; i += 1) { s += i; } return s;", Want::Num(10.0)),
-    ("let f = function (x) { return x * 2; }; return f(21);", Want::Num(42.0)),
-    ("function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); } return fact(6);", Want::Num(720.0)),
-    ("let mk = function () { let c = 0; return function () { c += 1; return c; }; }; let g = mk(); g(); g(); return g();", Want::Num(3.0)),
+    (
+        "let i = 0; let s = 0; while (i < 5) { s += i; i += 1; } return s;",
+        Want::Num(10.0),
+    ),
+    (
+        "let s = 0; for (let i = 1; i <= 4; i += 1) { s += i; } return s;",
+        Want::Num(10.0),
+    ),
+    (
+        "let f = function (x) { return x * 2; }; return f(21);",
+        Want::Num(42.0),
+    ),
+    (
+        "function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); } return fact(6);",
+        Want::Num(720.0),
+    ),
+    (
+        "let mk = function () { let c = 0; return function () { c += 1; return c; }; }; let g = mk(); g(); g(); return g();",
+        Want::Num(3.0),
+    ),
     ("return 'a' + 'b' + 1;", Want::Str("ab1")),
-    ("let o = { x: 10, y: 2 }; return o.x + o.y;", Want::Num(12.0)),
-    ("let o = { x: 1 }; o.y = 5; return o.x + o.y;", Want::Num(6.0)),
-    ("let o = { a: { b: { c: 7 } } }; return o.a.b.c;", Want::Num(7.0)),
-    ("return 1 < 2 && 2 <= 2 && 3 > 2 && 3 >= 3;", Want::Bool(true)),
+    (
+        "let o = { x: 10, y: 2 }; return o.x + o.y;",
+        Want::Num(12.0),
+    ),
+    (
+        "let o = { x: 1 }; o.y = 5; return o.x + o.y;",
+        Want::Num(6.0),
+    ),
+    (
+        "let o = { a: { b: { c: 7 } } }; return o.a.b.c;",
+        Want::Num(7.0),
+    ),
+    (
+        "return 1 < 2 && 2 <= 2 && 3 > 2 && 3 >= 3;",
+        Want::Bool(true),
+    ),
     ("return 1 === 1 && 1 !== '1';", Want::Bool(true)),
     ("return !false && (!!true);", Want::Bool(true)),
     ("return typeof 1;", Want::Str("number")),
@@ -52,9 +79,15 @@ const CASES: &[(&str, Want)] = &[
     ("return typeof null;", Want::Str("object")),
     ("return null ?? 7;", Want::Num(7.0)),
     ("return undefined ?? 7;", Want::Num(7.0)),
-    ("let s = ''; switch (2) { case 2: s += 'B'; case 3: s += 'C'; break; } return s;", Want::Str("BC")),
+    (
+        "let s = ''; switch (2) { case 2: s += 'B'; case 3: s += 'C'; break; } return s;",
+        Want::Str("BC"),
+    ),
     ("return [1, 2, 3].length;", Want::Num(3.0)),
-    ("let x = 5; let y = x > 3 ? 'big' : 'small'; return y;", Want::Str("big")),
+    (
+        "let x = 5; let y = x > 3 ? 'big' : 'small'; return y;",
+        Want::Str("big"),
+    ),
 ];
 
 fn eval_val(src: &str) -> Val {
@@ -81,7 +114,11 @@ fn assert_want(src: &str, want: &Want) {
             };
             assert_eq!(got_mini, *n, "mini disagrees on {src:?}");
             let got_real = run_real(src);
-            assert_eq!(got_real, crate_display_of(*n), "real interp disagrees on {src:?}");
+            assert_eq!(
+                got_real,
+                crate_display_of(*n),
+                "real interp disagrees on {src:?}"
+            );
         }
         Want::Str(s) => {
             let got_mini = value_to_string(&eval_val(src));
@@ -103,7 +140,11 @@ fn assert_want(src: &str, want: &Want) {
         Want::Undefined => {
             let got_mini = value_to_string(&eval_val(src));
             assert_eq!(got_mini, "undefined", "mini disagrees on {src:?}");
-            assert_eq!(run_real(src), "undefined", "real interp disagrees on {src:?}");
+            assert_eq!(
+                run_real(src),
+                "undefined",
+                "real interp disagrees on {src:?}"
+            );
         }
     }
 }
@@ -118,7 +159,12 @@ fn mini_and_real_agree_on_corpus() {
             failures.push(msg.downcast_ref::<String>().cloned().unwrap_or_default());
         }
     }
-    assert!(failures.is_empty(), "{} disagreement(s):\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} disagreement(s):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// Gap, fixed: `loose_equals` (v12-interp/src/ops.rs) lacked the number↔string
@@ -129,7 +175,10 @@ fn mini_and_real_agree_on_corpus() {
 fn known_gap_loose_equals_number_string_coercion() {
     assert_want("return 1 == '1';", &Want::Bool(true));
     assert_want("return '1' == 1;", &Want::Bool(true));
-    assert_want("return 1 == '1' && 1 === 1 && 1 !== '1';", &Want::Bool(true));
+    assert_want(
+        "return 1 == '1' && 1 === 1 && 1 !== '1';",
+        &Want::Bool(true),
+    );
 }
 
 #[test]

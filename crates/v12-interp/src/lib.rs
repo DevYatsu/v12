@@ -56,9 +56,9 @@
 //! unique to a living object, and reset when a slot is freed — a reused
 //! object handle therefore cannot alias a stale entry.
 
+pub(crate) mod call;
 pub mod feedback;
 mod ops;
-pub(crate) mod call;
 
 #[cfg(test)]
 mod tests;
@@ -68,8 +68,7 @@ use std::rc::Rc;
 
 use v12_bytecode::{BytecodeError, Const, FunctionBytecode, Instr, Opcode, WideOp};
 use v12_heap::{
-    Attrs, Descriptor, Handle, Heap, HeapExt, JsObject, JsValue, Kind, PropKey, ShapeHandle,
-    V12Str,
+    Attrs, Descriptor, Handle, Heap, HeapExt, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
 };
 
 use crate::feedback::{FeedbackVector, Lattice, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
@@ -83,7 +82,7 @@ use crate::feedback::{FeedbackVector, Lattice, TYPE_NAME_COUNT, TYPE_NAMES, Tier
 // spelling working and are typed as `NativeId`.
 // ---------------------------------------------------------------------------
 
-pub use v12_native::NativeId as NativeId; // the shared enum itself
+pub use v12_native::NativeId; // the shared enum itself
 
 /// `console.log` — prints its arguments and returns `undefined`.
 pub const NATIVE_CONSOLE_LOG: NativeId = NativeId::ConsoleLog;
@@ -365,11 +364,12 @@ fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u16, usize),
             Ok((WideOp::ConstructW { dst, .. }, width)) => Ok((true, dst, width)),
             Ok((WideOp::RegExt { mask, a_hi, .. }, _)) => {
                 // The narrow call/construct follows the 2-word prefix.
-                let narrow = instrs.get(pc + 2).copied().ok_or(
-                    BytecodeError::InvalidFunction {
+                let narrow = instrs
+                    .get(pc + 2)
+                    .copied()
+                    .ok_or(BytecodeError::InvalidFunction {
                         reason: "RegExt prefix without its narrow instruction".to_string(),
-                    },
-                )?;
+                    })?;
                 let dst = if mask & 1 != 0 {
                     (u16::from(a_hi) << 8) | u16::from(narrow.a())
                 } else {
@@ -505,8 +505,10 @@ impl<'a> Interp<'a> {
         heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
         let functions = Rc::from(functions.into_boxed_slice());
         let strings = Rc::from(strings.into_boxed_slice());
-        let programs =
-            std::rc::Rc::new(std::cell::RefCell::new(vec![(Rc::clone(&functions), Rc::clone(&strings))]));
+        let programs = std::rc::Rc::new(std::cell::RefCell::new(vec![(
+            Rc::clone(&functions),
+            Rc::clone(&strings),
+        )]));
         let mut interp = Self {
             functions,
             main,
@@ -579,7 +581,10 @@ impl<'a> Interp<'a> {
     ) -> u32 {
         let mut table = self.programs.borrow_mut();
         let id = table.len() as u32;
-        table.push((Rc::from(functions.into_boxed_slice()), Rc::from(strings.into_boxed_slice())));
+        table.push((
+            Rc::from(functions.into_boxed_slice()),
+            Rc::from(strings.into_boxed_slice()),
+        ));
         id
     }
 
@@ -591,7 +596,10 @@ impl<'a> Interp<'a> {
 
     /// Replaces the shared cross-program table (a nested eval interpreter
     /// adopts the caller's registry so both resolve the same programs).
-    pub fn set_programs(&mut self, programs: std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>>) {
+    pub fn set_programs(
+        &mut self,
+        programs: std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>>,
+    ) {
         self.programs = programs;
     }
 
@@ -599,15 +607,6 @@ impl<'a> Interp<'a> {
     /// register into the same registry the outer interpreter resolves).
     pub fn programs(&self) -> std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>> {
         Rc::clone(&self.programs)
-    }
-
-    /// The function table for a callee object's program. Uses the object's
-    /// `program_id` to pick the right table when a closure created in another
-    /// program (e.g. `eval`) is invoked here. Falls back to this
-    /// interpreter's own `functions` when the id is unknown.
-    fn resolve_functions(&self, obj: Handle<JsObject>) -> Rc<[FunctionBytecode]> {
-        let id = self.heap.get(obj).program_id;
-        self.functions_for_program(id)
     }
 
     /// The function table for a program id. The interpreter's own `functions`
@@ -638,11 +637,6 @@ impl<'a> Interp<'a> {
             .unwrap_or_else(|| Rc::clone(&self.strings))
     }
 
-    /// The function table a frame executes against (its `program` id).
-    fn frame_functions(&self, frame: &Frame) -> Rc<[FunctionBytecode]> {
-        self.functions_for_program(frame.program)
-    }
-
     /// Allocates a closure function object, stamping this interpreter's
     /// program id so `Bytecode(fn_idx)` resolves against the right table.
     ///
@@ -650,11 +644,7 @@ impl<'a> Interp<'a> {
     /// (a fresh object whose `constructor` points back at the function) so
     /// `F.prototype` reads and `new F` work without lazy materialization.
     /// Arrow functions are not constructible and have no `prototype`.
-    fn alloc_closure(
-        &mut self,
-        fn_idx: u32,
-        env: Option<Handle<JsObject>>,
-    ) -> Handle<JsObject> {
+    fn alloc_closure(&mut self, fn_idx: u32, env: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let funcs = self.functions_for_program(self.program_id);
         let is_arrow = funcs
             .get(fn_idx as usize)
@@ -668,11 +658,10 @@ impl<'a> Interp<'a> {
             // (prototype object, shape transitions) and the collector can run
             // before the `Closure` arm stores `h` into its register.
             self.stack.push(JsValue::object(h));
-            let result = self
+            self
                 .materialize_function_prototype(h)
                 .expect("closure prototype materialization cannot fail");
             self.stack.pop();
-            let _ = result;
         }
         h
     }
@@ -681,14 +670,11 @@ impl<'a> Interp<'a> {
     /// object whose `constructor` property points back at `f`. Idempotent —
     /// returns early when the property already exists (e.g. the realm wired
     /// one, or `prepare_construct` materialized it earlier).
-    fn materialize_function_prototype(
-        &mut self,
-        f: Handle<JsObject>,
-    ) -> Result<(), JSException> {
+    fn materialize_function_prototype(&mut self, f: Handle<JsObject>) -> Result<(), JSException> {
         let key = self.prototype_key();
         let shape = self.shape_of(f);
         if let Some(desc) = self.heap.lookup_property(shape, key)
-            && let Some(slot) = desc.slot()
+            && let Some(_slot) = desc.slot()
         {
             // Already present.
             return Ok(());
@@ -753,12 +739,18 @@ impl<'a> Interp<'a> {
         if self.global.is_some() {
             return;
         }
-        let g = self.heap.alloc(JsObject::environment(GLOBAL_VAR_OFFSET, None));
+        let g = self
+            .heap
+            .alloc(JsObject::environment(GLOBAL_VAR_OFFSET, None));
         self.heap.add_root(JsValue::object(g));
         // Minimal Promise wiring for standalone interp tests (mirrors realm.rs)
         let promise_proto = self.heap.alloc(JsObject::default());
         self.heap.add_root(JsValue::object(promise_proto));
-        let promise_ctor = self.heap.alloc(JsObject { kind: Kind::Function, prototype: Some(promise_proto), ..JsObject::default() });
+        let promise_ctor = self.heap.alloc(JsObject {
+            kind: Kind::Function,
+            prototype: Some(promise_proto),
+            ..JsObject::default()
+        });
         self.heap.add_root(JsValue::object(promise_ctor));
         {
             let props = &mut self.heap.get_mut(g).properties;
@@ -781,7 +773,7 @@ impl<'a> Interp<'a> {
 
     #[cfg(test)]
     pub(crate) fn heap_mut_for_test(&mut self) -> &mut Heap {
-        &mut self.heap
+        self.heap
     }
 
     #[cfg(test)]
@@ -847,8 +839,8 @@ impl<'a> Interp<'a> {
         // for a nested eval interpreter lives in the shared registry, not the
         // local `functions` field).
         let main_funcs = self.functions_for_program(self.program_id);
-        let main_regs = main_funcs[usize::try_from(self.main).expect("function index fits usize")]
-            .max_regs;
+        let main_regs =
+            main_funcs[usize::try_from(self.main).expect("function index fits usize")].max_regs;
         debug_assert!(self.frames.is_empty(), "run() is not reentrant");
         self.stack.clear();
         self.stack
@@ -913,7 +905,10 @@ impl<'a> Interp<'a> {
         this: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        debug_assert!(self.frames.is_empty(), "call_object must run outside of run()");
+        debug_assert!(
+            self.frames.is_empty(),
+            "call_object must run outside of run()"
+        );
         // Lay out `[callee][this][args…]` exactly as a parked `Call` would.
         self.stack.clear();
         self.stack.push(JsValue::object(callee));
@@ -944,9 +939,21 @@ impl<'a> Interp<'a> {
         {
             // Snapshot the name/message handles first so the text decode
             // below (which needs `&mut self`) doesn't fight the borrow.
-            let name_h = self.heap.get(obj).properties.first().and_then(|v| v.as_string());
-            let msg_h = self.heap.get(obj).properties.get(1).and_then(|v| v.as_string());
-            let name = name_h.map(|h| self.string_text(h)).unwrap_or_else(|| "Error".to_string());
+            let name_h = self
+                .heap
+                .get(obj)
+                .properties
+                .first()
+                .and_then(|v| v.as_string());
+            let msg_h = self
+                .heap
+                .get(obj)
+                .properties
+                .get(1)
+                .and_then(|v| v.as_string());
+            let name = name_h
+                .map(|h| self.string_text(h))
+                .unwrap_or_else(|| "Error".to_string());
             let msg = msg_h.map(|h| self.string_text(h)).unwrap_or_default();
             if msg.is_empty() {
                 return name;
@@ -1046,7 +1053,8 @@ impl<'a> Interp<'a> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::LoadConst => {
-                    let value = attempt!(self.const_value(fn_idx, u32::from(narrow.imm16()), program));
+                    let value =
+                        attempt!(self.const_value(fn_idx, u32::from(narrow.imm16()), program));
                     self.stack[base + usize::from(ra)] = value;
                     self.set_pc(pc + op_width);
                 }
@@ -1109,7 +1117,9 @@ impl<'a> Interp<'a> {
                             // slot count matters here, matching the narrow op.
                             self.gc_protect();
                             let parent = self.frames.last().expect("frame").env;
-                            let h = self.heap.alloc(JsObject::environment(usize::from(slots), parent));
+                            let h = self
+                                .heap
+                                .alloc(JsObject::environment(usize::from(slots), parent));
                             self.frames.last_mut().expect("frame").env = Some(h);
                         }
                         WideOp::CopyObjectRestW {
@@ -1548,7 +1558,11 @@ impl<'a> Interp<'a> {
                     let obj_v = self.stack[base + usize::from(ra)];
                     let key_v = self.stack[base + usize::from(rb)];
                     let pair_base = base + usize::from(rc);
-                    let getter_v = self.stack.get(pair_base).copied().unwrap_or(JsValue::undefined());
+                    let getter_v = self
+                        .stack
+                        .get(pair_base)
+                        .copied()
+                        .unwrap_or(JsValue::undefined());
                     let setter_v = self
                         .stack
                         .get(pair_base + 1)
@@ -1587,7 +1601,12 @@ impl<'a> Interp<'a> {
                     let dst = instr.a();
                     let src = instr.b();
                     // Bounds-checked: OOB stack read yields undefined (JS semantics for array OOB is undefined; for register window treat OOB as undefined rather than panic)
-                    let func_idx = self.stack.get(base + usize::from(src)).and_then(|v| v.as_smi()).map(|v| v as u32).unwrap_or(fn_idx);
+                    let func_idx = self
+                        .stack
+                        .get(base + usize::from(src))
+                        .and_then(|v| v.as_smi())
+                        .map(|v| v as u32)
+                        .unwrap_or(fn_idx);
                     self.gc_protect();
                     let h = self.heap.alloc(JsObject {
                         kind: Kind::Generator,
@@ -1629,9 +1648,15 @@ impl<'a> Interp<'a> {
                     // (see crates/v12-bccompiler/src/expr.rs YieldExpression delegate path).
                     self.gc_protect();
                     let dst = instr.a();
-                    let yielded = self.stack.get(base + usize::from(dst)).copied().unwrap_or(JsValue::undefined());
+                    let yielded = self
+                        .stack
+                        .get(base + usize::from(dst))
+                        .copied()
+                        .unwrap_or(JsValue::undefined());
                     if self.frames.last().and_then(|f| f.generator).is_none() {
-                        return Err(JSException(self.error_value("SyntaxError: yield outside generator")));
+                        return Err(JSException(
+                            self.error_value("SyntaxError: yield outside generator"),
+                        ));
                     }
                     let resume_pc = pc + op_width;
                     self.suspend(u16::from(dst), yielded, resume_pc)?;
@@ -1642,12 +1667,20 @@ impl<'a> Interp<'a> {
                     let src = instr.b();
                     let dst = instr.a();
                     // Bounds-checked stack read: OOB array element is undefined in JS semantics
-                    let arg = self.stack.get(base + usize::from(src)).copied().unwrap_or(JsValue::undefined());
+                    let arg = self
+                        .stack
+                        .get(base + usize::from(src))
+                        .copied()
+                        .unwrap_or(JsValue::undefined());
                     let Some(frame) = self.frames.last() else {
-                        return Err(JSException(self.error_value("SyntaxError: await outside async")));
+                        return Err(JSException(
+                            self.error_value("SyntaxError: await outside async"),
+                        ));
                     };
                     let Some(r#gen) = frame.generator else {
-                        return Err(JSException(self.error_value("SyntaxError: await outside async")));
+                        return Err(JSException(
+                            self.error_value("SyntaxError: await outside async"),
+                        ));
                     };
                     let async_promise = if self.heap.get(r#gen).properties.len() > 4 {
                         self.heap.get(r#gen).properties[4]
@@ -1657,7 +1690,9 @@ impl<'a> Interp<'a> {
                     let has_promise = async_promise.as_object().is_some();
                     let (promise, is_rejected, payload) = self.promise_resolve_for_await(arg);
                     self.heap.add_root(payload);
-                    if let Some(ph) = promise.as_object() { self.heap.add_root(JsValue::object(ph)); }
+                    if let Some(ph) = promise.as_object() {
+                        self.heap.add_root(JsValue::object(ph));
+                    }
                     let resume_pc = pc + op_width;
                     let _rgen = self.suspend(u16::from(dst), arg, resume_pc)?;
                     self.pending_awaits.push_back((r#gen, payload, is_rejected));
@@ -1753,11 +1788,10 @@ impl<'a> Interp<'a> {
             Const::Null => Ok(JsValue::null()),
             // BigInt literals are rejected at compile time today; reaching
             // these variants implies hand-built bytecode.
-            Const::BigIntId(_) | Const::BigU64(_) => {
-                Err(JSException(JsValue::string(self.heap.intern_text(
-                    "InternalError: BigInt constants are not supported yet",
-                ))))
-            }
+            Const::BigIntId(_) | Const::BigU64(_) => Err(JSException(JsValue::string(
+                self.heap
+                    .intern_text("InternalError: BigInt constants are not supported yet"),
+            ))),
         }
     }
 
@@ -1865,7 +1899,7 @@ impl<'a> Interp<'a> {
         // closure's index compares against the eval program, not this one.
         let callee_funcs = self.functions_for_program(callee_program);
         if (target_idx as usize) >= callee_funcs.len() {
-            if let Some(native_fn) = NativeId::try_from(target_idx).ok() {
+            if let Ok(native_fn) = NativeId::try_from(target_idx) {
                 let arg = if (callee_slot + 2) < self.stack.len() && argc > 0 {
                     self.stack[callee_slot + 2]
                 } else {
@@ -1884,12 +1918,12 @@ impl<'a> Interp<'a> {
                     NativeId::GeneratorThrow => {
                         Ok(CallOutcome::Value(self.generator_throw(this_v, arg)?))
                     }
-                    NativeId::ArrayJoin => {
-                        Ok(CallOutcome::Value(self.array_join_fallback(this_v, &args_slice)?))
-                    }
-                    NativeId::ArrayPush => {
-                        Ok(CallOutcome::Value(self.array_push_fallback(this_v, &args_slice)?))
-                    }
+                    NativeId::ArrayJoin => Ok(CallOutcome::Value(
+                        self.array_join_fallback(this_v, &args_slice)?,
+                    )),
+                    NativeId::ArrayPush => Ok(CallOutcome::Value(
+                        self.array_push_fallback(this_v, &args_slice)?,
+                    )),
                     NativeId::ConsoleLog => {
                         let mut parts = Vec::with_capacity(args_slice.len());
                         for &v in &args_slice {
@@ -1904,39 +1938,61 @@ impl<'a> Interp<'a> {
                     // engine's native constants, so translate the selector.
                     NativeId::PromiseResolve => {
                         self.gc_protect();
-                        let result = self
-                            .natives
-                            .call_native(self.heap, this_v, &args_slice, NATIVE_PROMISE_RESOLVE);
-                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
+                        let result = self.natives.call_native(
+                            self.heap,
+                            this_v,
+                            &args_slice,
+                            NATIVE_PROMISE_RESOLVE,
+                        );
+                        result
+                            .map(CallOutcome::Value)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
                     }
                     NativeId::PromiseReject => {
                         self.gc_protect();
-                        let result = self
-                            .natives
-                            .call_native(self.heap, this_v, &args_slice, NATIVE_PROMISE_REJECT);
-                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
+                        let result = self.natives.call_native(
+                            self.heap,
+                            this_v,
+                            &args_slice,
+                            NATIVE_PROMISE_REJECT,
+                        );
+                        result
+                            .map(CallOutcome::Value)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
                     }
                     NativeId::PromiseThen => {
                         self.gc_protect();
-                        let result = self
-                            .natives
-                            .call_native(self.heap, this_v, &args_slice, NATIVE_PROMISE_THEN);
-                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
+                        let result = self.natives.call_native(
+                            self.heap,
+                            this_v,
+                            &args_slice,
+                            NATIVE_PROMISE_THEN,
+                        );
+                        result
+                            .map(CallOutcome::Value)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
                     }
                     NativeId::ObjectEnumerableOwnKeys => {
                         self.gc_protect();
-                        let result = self
-                            .natives
-                            .call_native(self.heap, this_v, &args_slice, NATIVE_ENUMERABLE_OWN_KEYS);
-                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
+                        let result = self.natives.call_native(
+                            self.heap,
+                            this_v,
+                            &args_slice,
+                            NATIVE_ENUMERABLE_OWN_KEYS,
+                        );
+                        result
+                            .map(CallOutcome::Value)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
                     }
                     // Any other native id: route through the registry seam.
                     _ => {
                         self.gc_protect();
-                        let result = self
-                            .natives
-                            .call_native(self.heap, this_v, &args_slice, native_fn);
-                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
+                        let result =
+                            self.natives
+                                .call_native(self.heap, this_v, &args_slice, native_fn);
+                        result
+                            .map(CallOutcome::Value)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
                     }
                 };
             }
@@ -1957,8 +2013,12 @@ impl<'a> Interp<'a> {
                     .unwrap_or_default();
                 let global = self.global;
                 let programs = self.programs();
-                let result = self.natives.eval(self.heap, &source, this_v, global, programs);
-                return result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t));
+                let result = self
+                    .natives
+                    .eval(self.heap, &source, this_v, global, programs);
+                return result
+                    .map(CallOutcome::Value)
+                    .map_err(|t| JSException::from_throw(self.heap, t));
             }
             self.gc_protect();
             let id = self.native_id_for(target_idx)?;
@@ -1975,7 +2035,8 @@ impl<'a> Interp<'a> {
 
         // Generator function: calling it returns a generator object without executing body.
         if self.is_generator_fn_for(target_idx, callee_program) {
-            let r#gen = self.create_generator_object(target_idx, captured_env, this_v, callee_slot, argc)?;
+            let r#gen =
+                self.create_generator_object(target_idx, captured_env, this_v, callee_slot, argc)?;
             return Ok(CallOutcome::Value(JsValue::object(r#gen)));
         }
 
@@ -2009,13 +2070,29 @@ impl<'a> Interp<'a> {
             let mut window = vec![JsValue::undefined(); usize::from(callee_max_regs)];
             window[0] = this_v;
             let arg_src = callee_slot + 2;
-            self.fill_call_window(&mut window, arg_src, argc as usize, callee_has_rest, callee_fixed, callee_rest_reg);
-            let mut g_obj = JsObject::generator_with(target_idx, 0, 0.0, 0, window, captured_env, Some(JsValue::object(promise)));
+            self.fill_call_window(
+                &mut window,
+                arg_src,
+                argc as usize,
+                callee_has_rest,
+                callee_fixed,
+                callee_rest_reg,
+            );
+            let mut g_obj = JsObject::generator_with(
+                target_idx,
+                0,
+                0.0,
+                0,
+                window,
+                captured_env,
+                Some(JsValue::object(promise)),
+            );
             g_obj.program_id = callee_program;
             let g = self.heap.alloc(g_obj);
             self.heap.add_root(JsValue::object(g));
             // Defer: enqueue resume at pc 0
-            self.pending_awaits.push_back((g, JsValue::undefined(), false));
+            self.pending_awaits
+                .push_back((g, JsValue::undefined(), false));
             return Ok(CallOutcome::Value(JsValue::object(promise)));
         }
 
@@ -2107,9 +2184,10 @@ impl<'a> Interp<'a> {
                 let window_end = new_base + usize::from(callee_max_regs);
                 self.stack.resize(window_end, JsValue::undefined());
                 self.stack[new_base] = this;
-                let copied = args.len().min(usize::from(callee_max_regs).saturating_sub(1));
-                self.stack[new_base + 1..new_base + 1 + copied]
-                    .copy_from_slice(&args[..copied]);
+                let copied = args
+                    .len()
+                    .min(usize::from(callee_max_regs).saturating_sub(1));
+                self.stack[new_base + 1..new_base + 1 + copied].copy_from_slice(&args[..copied]);
                 self.frames.push(Frame {
                     fn_idx,
                     program: func_program,
@@ -2163,17 +2241,20 @@ impl<'a> Interp<'a> {
                 // Interpreter-internal natives (generator next/return/throw,
                 // console.log, promise fallbacks) dispatch through the
                 // `NativeFn` seam before any registry lookup.
-                if let Some(native_fn) = NativeId::try_from(fn_idx).ok() {
+                if let Ok(native_fn) = NativeId::try_from(fn_idx) {
                     return match native_fn {
-                        NativeId::GeneratorNext => {
-                            self.generator_next(this, args.first().copied().unwrap_or(JsValue::undefined()))
-                        }
-                        NativeId::GeneratorReturn => {
-                            self.generator_return(this, args.first().copied().unwrap_or(JsValue::undefined()))
-                        }
-                        NativeId::GeneratorThrow => {
-                            self.generator_throw(this, args.first().copied().unwrap_or(JsValue::undefined()))
-                        }
+                        NativeId::GeneratorNext => self.generator_next(
+                            this,
+                            args.first().copied().unwrap_or(JsValue::undefined()),
+                        ),
+                        NativeId::GeneratorReturn => self.generator_return(
+                            this,
+                            args.first().copied().unwrap_or(JsValue::undefined()),
+                        ),
+                        NativeId::GeneratorThrow => self.generator_throw(
+                            this,
+                            args.first().copied().unwrap_or(JsValue::undefined()),
+                        ),
                         NativeId::ConsoleLog => {
                             let mut parts = Vec::with_capacity(args.len());
                             for &v in args {
@@ -2188,39 +2269,49 @@ impl<'a> Interp<'a> {
                         // native indices before the registry lookup.
                         NativeId::PromiseResolve => {
                             self.gc_protect();
-                            let result = self
-                                .natives
-                                .call_native(self.heap, this, args, NATIVE_PROMISE_RESOLVE);
+                            let result = self.natives.call_native(
+                                self.heap,
+                                this,
+                                args,
+                                NATIVE_PROMISE_RESOLVE,
+                            );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
                         NativeId::PromiseReject => {
                             self.gc_protect();
-                            let result = self
-                                .natives
-                                .call_native(self.heap, this, args, NATIVE_PROMISE_REJECT);
+                            let result = self.natives.call_native(
+                                self.heap,
+                                this,
+                                args,
+                                NATIVE_PROMISE_REJECT,
+                            );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
                         NativeId::PromiseThen => {
                             self.gc_protect();
-                            let result = self
-                                .natives
-                                .call_native(self.heap, this, args, NATIVE_PROMISE_THEN);
+                            let result = self.natives.call_native(
+                                self.heap,
+                                this,
+                                args,
+                                NATIVE_PROMISE_THEN,
+                            );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
                         NativeId::ObjectEnumerableOwnKeys => {
                             self.gc_protect();
-                            let result = self
-                                .natives
-                                .call_native(self.heap, this, args, NATIVE_ENUMERABLE_OWN_KEYS);
+                            let result = self.natives.call_native(
+                                self.heap,
+                                this,
+                                args,
+                                NATIVE_ENUMERABLE_OWN_KEYS,
+                            );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
                         // Any other native id: the interpreter has no internal
                         // fallback for it — route through the registry seam.
                         _ => {
                             self.gc_protect();
-                            let result = self
-                                .natives
-                                .call_native(self.heap, this, args, native_fn);
+                            let result = self.natives.call_native(self.heap, this, args, native_fn);
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
                     };
@@ -2241,9 +2332,10 @@ impl<'a> Interp<'a> {
                 let window_end = new_base + usize::from(callee_max_regs);
                 self.stack.resize(window_end, JsValue::undefined());
                 self.stack[new_base] = this;
-                let copied = args.len().min(usize::from(callee_max_regs).saturating_sub(1));
-                self.stack[new_base + 1..new_base + 1 + copied]
-                    .copy_from_slice(&args[..copied]);
+                let copied = args
+                    .len()
+                    .min(usize::from(callee_max_regs).saturating_sub(1));
+                self.stack[new_base + 1..new_base + 1 + copied].copy_from_slice(&args[..copied]);
                 self.frames.push(Frame {
                     fn_idx,
                     program: func_program,
@@ -2308,11 +2400,12 @@ impl<'a> Interp<'a> {
                             || instr.op() == Some(v12_bytecode::Opcode::Wide))
                     {
                         let instrs = &self.functions[caller.fn_idx as usize].instrs;
-                        if let Some(ph) = self.heap.get(r#gen).properties.get(4).copied() {
-                            if let Ok((_, dst, width)) = decode_parked_call(instrs, pc) {
+                        if let Some(ph) = self.heap.get(r#gen).properties.get(4).copied()
+                            && let Ok((_, dst, width)) = decode_parked_call(instrs, pc) {
                                 let caller_base = caller.base;
                                 let idx = caller_base + usize::from(dst);
-                                let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
+                                let is_undef =
+                                    self.stack.get(idx).is_some_and(|v| v.is_undefined());
                                 if is_undef {
                                     if idx >= self.stack.len() {
                                         self.stack.resize(idx + 1, JsValue::undefined());
@@ -2322,7 +2415,6 @@ impl<'a> Interp<'a> {
                                     return Ok(false);
                                 }
                             }
-                        }
                     }
                     // Caller already advanced (prepare_call returned Value); just resume it
                     return Ok(false);
@@ -2354,7 +2446,9 @@ impl<'a> Interp<'a> {
         let Ok((is_construct, dst, width)) = decode_parked_call(instrs, caller_pc) else {
             // Corrupt call header: treat as JS TypeError rather than native panic
             self.stack.truncate(finished.base);
-            return Err(JSException(self.error_value("TypeError: corrupt call header")));
+            return Err(JSException(
+                self.error_value("TypeError: corrupt call header"),
+            ));
         };
         let idx = caller_base + usize::from(dst);
         // The caller was parked on its `Call`/`Construct` and the destination
@@ -2691,9 +2785,7 @@ impl<'a> Interp<'a> {
         self.heap.flatten(handle);
         match &self.heap.get(handle).storage {
             v12_heap::StrStorage::Latin1(bytes) => bytes == text.as_bytes(),
-            v12_heap::StrStorage::Utf16(units) => {
-                units.iter().copied().eq(text.encode_utf16())
-            }
+            v12_heap::StrStorage::Utf16(units) => units.iter().copied().eq(text.encode_utf16()),
             _ => false,
         }
     }
@@ -2715,15 +2807,25 @@ impl<'a> Interp<'a> {
     /// predates it and keeps its own copy.
     fn cached_native(&mut self, which: NativeId) -> JsValue {
         let (index, cached) = match which {
-            NativeId::PromiseResolve => (u32::from(NativeId::PromiseResolve), self.promise_resolve_fn),
+            NativeId::PromiseResolve => {
+                (u32::from(NativeId::PromiseResolve), self.promise_resolve_fn)
+            }
             NativeId::PromiseReject => (u32::from(NativeId::PromiseReject), self.promise_reject_fn),
             NativeId::PromiseThen => (u32::from(NativeId::PromiseThen), self.promise_then_fn),
             NativeId::ArrayPush => (u32::from(NativeId::ArrayPush), self.array_push_fn),
             NativeId::ArrayJoin => (u32::from(NativeId::ArrayJoin), self.array_join_fn),
-            NativeId::ObjectEnumerableOwnKeys => (u32::from(NativeId::ObjectEnumerableOwnKeys), self.enumerable_own_keys_fn),
+            NativeId::ObjectEnumerableOwnKeys => (
+                u32::from(NativeId::ObjectEnumerableOwnKeys),
+                self.enumerable_own_keys_fn,
+            ),
             NativeId::GeneratorNext => (u32::from(NativeId::GeneratorNext), self.generator_next_fn),
-            NativeId::GeneratorReturn => (u32::from(NativeId::GeneratorReturn), self.generator_return_fn),
-            NativeId::GeneratorThrow => (u32::from(NativeId::GeneratorThrow), self.generator_throw_fn),
+            NativeId::GeneratorReturn => (
+                u32::from(NativeId::GeneratorReturn),
+                self.generator_return_fn,
+            ),
+            NativeId::GeneratorThrow => {
+                (u32::from(NativeId::GeneratorThrow), self.generator_throw_fn)
+            }
             // console.log is synthesized via `console_log_fn`, not here.
             NativeId::ConsoleLog => (u32::from(NativeId::ConsoleLog), self.console_log),
             // Only the ids below are ever synthesized through `cached_native`
@@ -2819,7 +2921,10 @@ impl<'a> Interp<'a> {
         if let (Some(g), Some(symbol_idx)) = (self.global, symbol_idx)
             && let Some(symbol_ctor) = {
                 let heap = &*self.heap;
-                heap.get(g).properties.get(symbol_idx).and_then(|v| v.as_object())
+                heap.get(g)
+                    .properties
+                    .get(symbol_idx)
+                    .and_then(|v| v.as_object())
             }
             && obj == symbol_ctor
             && self.key_is(key_v, "iterator")
@@ -2841,7 +2946,10 @@ impl<'a> Interp<'a> {
         if let (Some(g), Some(promise_idx)) = (self.global, promise_idx) {
             let promise_ctor = {
                 let heap = &*self.heap;
-                heap.get(g).properties.get(promise_idx).and_then(|v| v.as_object())
+                heap.get(g)
+                    .properties
+                    .get(promise_idx)
+                    .and_then(|v| v.as_object())
             };
             if let Some(promise_ctor) = promise_ctor {
                 if obj == promise_ctor {
@@ -2859,7 +2967,12 @@ impl<'a> Interp<'a> {
                 }
             }
             // Fast path for Object.enumerableOwnKeys on the Object constructor
-            let object_ctor = self.heap.get(g).properties.first().and_then(|v| v.as_object());
+            let object_ctor = self
+                .heap
+                .get(g)
+                .properties
+                .first()
+                .and_then(|v| v.as_object());
             if let Some(object_ctor) = object_ctor
                 && obj == object_ctor
                 && self.key_is(key_v, "enumerableOwnKeys")
@@ -2918,11 +3031,10 @@ impl<'a> Interp<'a> {
             } else {
                 None
             };
-            if let Some(slot) = slot {
-                if let Some(v) = self.heap.get(obj).properties.get(slot).copied() {
+            if let Some(slot) = slot
+                && let Some(v) = self.heap.get(obj).properties.get(slot).copied() {
                     return Ok(v);
                 }
-            }
         }
         // `RegExp.prototype` — the constructor's prototype property (needed
         // for `new RegExp(...)` instanceof wiring and `RegExp.prototype.exec`
@@ -2932,7 +3044,10 @@ impl<'a> Interp<'a> {
         if let (Some(g), Some(regexp_idx)) = (self.global, regexp_idx)
             && let Some(regexp_ctor) = {
                 let heap = &*self.heap;
-                heap.get(g).properties.get(regexp_idx).and_then(|v| v.as_object())
+                heap.get(g)
+                    .properties
+                    .get(regexp_idx)
+                    .and_then(|v| v.as_object())
             }
             && obj == regexp_ctor
             && self.key_is(key_v, "prototype")
@@ -2982,8 +3097,8 @@ impl<'a> Interp<'a> {
         // synthesizes a function whose callable routes through the engine's
         // native registry (the `NATIVE_*` constants are out-of-range bytecode
         // indices the registry dispatches).
-        if kind == Kind::Map || kind == Kind::Set {
-            if let Some(handle) = key_v.as_string() {
+        if (kind == Kind::Map || kind == Kind::Set)
+            && let Some(handle) = key_v.as_string() {
                 let mut name_is = |text: &str| -> bool {
                     self.heap.flatten(handle);
                     match &self.heap.get(handle).storage {
@@ -3033,7 +3148,6 @@ impl<'a> Interp<'a> {
                     return Ok(self.map_set_method(constant));
                 }
             }
-        }
 
         let key = self.property_key(key_v)?;
         let shape = self.shape_of(obj);
@@ -3131,12 +3245,11 @@ impl<'a> Interp<'a> {
         // the value is coerced via ToNumber.
         if kind == Kind::RegExp && self.key_is(key_v, "lastIndex") {
             let n = ops::to_number(self.heap, value);
-            if n.fract() == 0.0 && n >= -1e15 && n <= 1e15 {
-                if let Some(smi) = JsValue::from_i32_smi(n as i32) {
+            if n.fract() == 0.0 && (-1e15..=1e15).contains(&n)
+                && let Some(smi) = JsValue::from_i32_smi(n as i32) {
                     self.heap.get_mut(obj).properties[2] = smi;
                     return Ok(());
                 }
-            }
             self.heap.get_mut(obj).properties[2] = JsValue::from_f64(n);
             return Ok(());
         }
@@ -3173,7 +3286,10 @@ impl<'a> Interp<'a> {
             match d {
                 Descriptor::Data { attrs, .. } if !attrs.writable() => return Ok(()),
                 Descriptor::Accessor { setter, .. } if setter.is_none() => return Ok(()),
-                Descriptor::Accessor { setter: Some(setter), .. } => {
+                Descriptor::Accessor {
+                    setter: Some(setter),
+                    ..
+                } => {
                     // Inherited accessor with setter: invoke it with the
                     // receiver and the assigned value.
                     self.call_accessor_with(setter, JsValue::object(obj), &[value])?;
@@ -3206,10 +3322,7 @@ impl<'a> Interp<'a> {
                     .get_mut(obj)
                     .properties
                     .resize(idx + 1, JsValue::undefined());
-                self.heap
-                    .get_mut(obj)
-                    .property_keys
-                    .resize(idx + 1, None);
+                self.heap.get_mut(obj).property_keys.resize(idx + 1, None);
             }
             self.heap.get_mut(obj).properties[idx] = value;
             self.heap.get_mut(obj).property_keys[idx] = Some(key);
@@ -3421,8 +3534,7 @@ impl<'a> Interp<'a> {
                     .and_then(|d| d.slot())
                     .map(|s| s as usize);
                 if let Some(slot) = slot {
-                    self.heap.get_mut(obj).properties[slot] =
-                        ops::box_number(f64::from(len_after));
+                    self.heap.get_mut(obj).properties[slot] = ops::box_number(f64::from(len_after));
                 }
             }
             return;
@@ -3466,7 +3578,12 @@ impl<'a> Interp<'a> {
         let slice: Vec<JsValue> = if start_usize >= src_len {
             Vec::new()
         } else {
-            self.heap.get(src_obj).elements_array.iter().skip(start_usize).collect()
+            self.heap
+                .get(src_obj)
+                .elements_array
+                .iter()
+                .skip(start_usize)
+                .collect()
         };
         self.gc_protect();
         let shape = self.array_shape();
@@ -3636,9 +3753,9 @@ impl<'a> Interp<'a> {
         setter_v: JsValue,
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: cannot define accessor on non-object",
-            )));
+            return Err(JSException(
+                self.error_value("TypeError: cannot define accessor on non-object"),
+            ));
         };
         let key = self.property_key(key_v)?;
         let getter = accessor_target(self.heap, getter_v);
@@ -3650,7 +3767,7 @@ impl<'a> Interp<'a> {
             .define_accessor(shape, key, getter, setter, Attrs::DEFAULT);
         self.bind_shape(obj, child);
         // Accessor slots hold a hole in `properties`; ensure one exists.
-        let slot = child_slot(&self.heap, child);
+        let slot = child_slot(self.heap, child);
         let props = &mut self.heap.get_mut(obj).properties;
         if props.len() <= slot {
             props.resize(slot + 1, JsValue::hole());
@@ -3663,9 +3780,9 @@ impl<'a> Interp<'a> {
     /// prototypes are rejected per ES `OrdinarySetPrototypeOf`.
     fn op_set_prototype(&mut self, obj_v: JsValue, proto_v: JsValue) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: cannot set prototype of a primitive",
-            )));
+            return Err(JSException(
+                self.error_value("TypeError: cannot set prototype of a primitive"),
+            ));
         };
         match proto_v {
             v if v.is_null() => {
@@ -3677,9 +3794,9 @@ impl<'a> Interp<'a> {
             }
             v => {
                 let Some(proto) = v.as_object() else {
-                    return Err(JSException(self.error_value(
-                        "TypeError: prototype must be an object or null",
-                    )));
+                    return Err(JSException(
+                        self.error_value("TypeError: prototype must be an object or null"),
+                    ));
                 };
                 if self.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
                     return Ok(());
@@ -3688,9 +3805,9 @@ impl<'a> Interp<'a> {
                 let mut cur = Some(proto);
                 while let Some(c) = cur {
                     if c == obj {
-                        return Err(JSException(self.error_value(
-                            "TypeError: cyclic [[Prototype]] value",
-                        )));
+                        return Err(JSException(
+                            self.error_value("TypeError: cyclic [[Prototype]] value"),
+                        ));
                     }
                     cur = self.heap.get(c).prototype;
                 }
@@ -3765,16 +3882,16 @@ impl<'a> Interp<'a> {
     /// ES IteratorNext (7.4.2): `result = iterator.next()`.
     fn op_iterator_next(&mut self, iter_v: JsValue) -> Result<JsValue, JSException> {
         let Some(_iter_obj) = iter_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: IteratorNext called on non-object",
-            )));
+            return Err(JSException(
+                self.error_value("TypeError: IteratorNext called on non-object"),
+            ));
         };
         let next_key = self.new_temp_key("next");
         let next_v = self.get_property(0, 0, iter_v, next_key)?;
         if next_v.as_object().is_none() {
-            return Err(JSException(self.error_value(
-                "TypeError: iterator.next is not a function",
-            )));
+            return Err(JSException(
+                self.error_value("TypeError: iterator.next is not a function"),
+            ));
         }
         let next_obj = next_v.as_object().expect("checked above");
         // Park the resolved function on the value stack: `gc_protect`
@@ -3940,7 +4057,12 @@ impl<'a> Interp<'a> {
         Ok(JsValue::undefined())
     }
 
-    fn op_set_global(&mut self, str_id: u32, val: JsValue, program: u32) -> Result<(), JSException> {
+    fn op_set_global(
+        &mut self,
+        str_id: u32,
+        val: JsValue,
+        program: u32,
+    ) -> Result<(), JSException> {
         let Some(global) = self.global else {
             return Ok(());
         };
@@ -3948,10 +4070,7 @@ impl<'a> Interp<'a> {
         // allocate; publish roots first so `val` survives any collection.
         self.gc_protect();
         let strings = self.strings_for_program(program);
-        let text = strings
-            .get(str_id as usize)
-            .cloned()
-            .unwrap_or_default();
+        let text = strings.get(str_id as usize).cloned().unwrap_or_default();
         if let Some(idx) = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == text) {
             // Intrinsics are at fixed indices; allow overwriting.
             if idx < self.heap.get(global).properties.len() {
@@ -4062,10 +4181,10 @@ impl<'a> Interp<'a> {
         if (target_idx as usize) >= callee_funcs.len() {
             self.gc_protect();
             let id = self.native_id_for(target_idx)?;
-            let result = self
-                .natives
-                .call_native(self.heap, this_v, &args_vec, id);
-            return result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t));
+            let result = self.natives.call_native(self.heap, this_v, &args_vec, id);
+            return result
+                .map(CallOutcome::Value)
+                .map_err(|t| JSException::from_throw(self.heap, t));
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(JSException(
@@ -4367,12 +4486,6 @@ impl<'a> Interp<'a> {
     // Generators
     // ------------------------------------------------------------------
 
-    fn is_generator_fn(&self, fn_idx: u32) -> bool {
-        self.is_generator_fn_for(fn_idx, self.program_id)
-    }
-
-    /// Program-aware generator check: resolves the function table for the
-    /// callee's program before inspecting the flag.
     fn is_generator_fn_for(&self, fn_idx: u32, program: u32) -> bool {
         let funcs = self.functions_for_program(program);
         if fn_idx as usize >= funcs.len() {
@@ -4452,22 +4565,46 @@ impl<'a> Interp<'a> {
         let mut window = vec![JsValue::undefined(); usize::from(max_regs)];
         window[0] = this_v;
         let arg_src = callee_slot + 2;
-        self.fill_call_window(&mut window, arg_src, argc as usize, has_rest, fixed, rest_reg);
+        self.fill_call_window(
+            &mut window,
+            arg_src,
+            argc as usize,
+            has_rest,
+            fixed,
+            rest_reg,
+        );
         // Real suspension: store initial register window snapshot, not eager yields.
         self.gc_protect();
-        let r#gen = self.heap.alloc(JsObject::generator_with(fn_idx, 0, 0.0, 0, window, captured_env, None));
+        let r#gen = self.heap.alloc(JsObject::generator_with(
+            fn_idx,
+            0,
+            0.0,
+            0,
+            window,
+            captured_env,
+            None,
+        ));
         self.heap.add_root(JsValue::object(r#gen));
         Ok(r#gen)
     }
 
     fn generator_next(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
-            return Err(JSException(self.error_value("TypeError: generator next called on non-object")));
+            return Err(JSException(
+                self.error_value("TypeError: generator next called on non-object"),
+            ));
         };
         if self.heap.get(r#gen).kind != Kind::Generator {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
-        let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) == 1.0;
+        let done = self
+            .heap
+            .get(r#gen)
+            .properties
+            .get(2)
+            .and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64()))
+            .unwrap_or(0.0)
+            == 1.0;
         if done {
             return Ok(self.make_iterator_result(JsValue::undefined(), true));
         }
@@ -4486,16 +4623,28 @@ impl<'a> Interp<'a> {
         self.heap.add_root(JsValue::object(h));
         // Avoid set_property recursion issues for now: store directly via properties vec and shape binding via heap
         // Use minimal shape: add properties via heap without interpreter's set_property
-        let value_key = self.heap.intern_string(v12_heap::V12Str::latin1(b"value".to_vec()));
-        let done_key = self.heap.intern_string(v12_heap::V12Str::latin1(b"done".to_vec()));
+        let value_key = self
+            .heap
+            .intern_string(v12_heap::V12Str::latin1(b"value".to_vec()));
+        let done_key = self
+            .heap
+            .intern_string(v12_heap::V12Str::latin1(b"done".to_vec()));
         let pk_value = PropKey::from_string(value_key);
         let pk_done = PropKey::from_string(done_key);
         let shape0 = self.heap.root_shape();
-        let shape1 = self.heap.add_property(shape0, pk_value, v12_heap::Attrs::DEFAULT);
-        let shape2 = self.heap.add_property(shape1, pk_done, v12_heap::Attrs::DEFAULT);
+        let shape1 = self
+            .heap
+            .add_property(shape0, pk_value, v12_heap::Attrs::DEFAULT);
+        let shape2 = self
+            .heap
+            .add_property(shape1, pk_done, v12_heap::Attrs::DEFAULT);
         // Bind shape to object via interp's shape_of tracking
         self.bind_shape(h, shape2);
-        let done_val = if done { JsValue::true_() } else { JsValue::false_() };
+        let done_val = if done {
+            JsValue::true_()
+        } else {
+            JsValue::false_()
+        };
         self.heap.get_mut(h).properties = vec![value, done_val];
         self.heap.get_mut(h).property_keys = vec![Some(pk_value), Some(pk_done)];
         JsValue::object(h)
@@ -4503,12 +4652,21 @@ impl<'a> Interp<'a> {
 
     fn generator_return(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
-            return Err(JSException(self.error_value("TypeError: generator return called on non-object")));
+            return Err(JSException(
+                self.error_value("TypeError: generator return called on non-object"),
+            ));
         };
         if self.heap.get(r#gen).kind != Kind::Generator {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
-        let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64))).unwrap_or(0.0) == 1.0;
+        let done = self
+            .heap
+            .get(r#gen)
+            .properties
+            .get(2)
+            .and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64)))
+            .unwrap_or(0.0)
+            == 1.0;
         if done {
             return Ok(self.make_iterator_result(arg, true));
         }
@@ -4523,12 +4681,21 @@ impl<'a> Interp<'a> {
 
     fn generator_throw(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
-            return Err(JSException(self.error_value("TypeError: generator throw called on non-object")));
+            return Err(JSException(
+                self.error_value("TypeError: generator throw called on non-object"),
+            ));
         };
         if self.heap.get(r#gen).kind != Kind::Generator {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
-        let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64))).unwrap_or(0.0) == 1.0;
+        let done = self
+            .heap
+            .get(r#gen)
+            .properties
+            .get(2)
+            .and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64)))
+            .unwrap_or(0.0)
+            == 1.0;
         if done {
             return Err(JSException(arg));
         }
@@ -4539,13 +4706,25 @@ impl<'a> Interp<'a> {
         Err(JSException(arg))
     }
 
-    fn array_join_fallback(&mut self, this_v: JsValue, args: &[JsValue]) -> Result<JsValue, JSException> {
+    fn array_join_fallback(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
         let Some(arr) = this_v.as_object() else {
-            return Err(JSException(self.error_value("TypeError: Array.prototype.join requires an array")));
+            return Err(JSException(
+                self.error_value("TypeError: Array.prototype.join requires an array"),
+            ));
         };
         let sep = if let Some(&v) = args.first() {
-            if v.is_undefined() { ",".to_string() } else { self.to_display_string(v) }
-        } else { ",".to_string() };
+            if v.is_undefined() {
+                ",".to_string()
+            } else {
+                self.to_display_string(v)
+            }
+        } else {
+            ",".to_string()
+        };
         let elements: Vec<JsValue> = if self.heap.get(arr).kind == Kind::Array {
             self.heap.get(arr).elements_array.iter().collect()
         } else {
@@ -4563,9 +4742,15 @@ impl<'a> Interp<'a> {
         Ok(JsValue::string(self.heap.intern_text(&parts.join(&sep))))
     }
 
-    fn array_push_fallback(&mut self, this_v: JsValue, args: &[JsValue]) -> Result<JsValue, JSException> {
+    fn array_push_fallback(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
         let Some(obj) = this_v.as_object() else {
-            return Err(JSException(self.error_value("TypeError: Array.prototype.push called on non-object")));
+            return Err(JSException(self.error_value(
+                "TypeError: Array.prototype.push called on non-object",
+            )));
         };
         if self.heap.get(obj).kind == Kind::Array {
             for &item in args {
@@ -4584,7 +4769,10 @@ impl<'a> Interp<'a> {
         // Sync length if shape exists
         let key = self.length_key();
         let shape = self.shape_of(obj);
-        if let Some(desc) = self.heap.lookup_property(shape, key).and_then(|d| d.slot().map(|s| s as usize))
+        if let Some(desc) = self
+            .heap
+            .lookup_property(shape, key)
+            .and_then(|d| d.slot().map(|s| s as usize))
             && desc < self.heap.get(obj).properties.len()
         {
             self.heap.get_mut(obj).properties[desc] = ops::box_number(f64::from(new_len));
@@ -4593,9 +4781,14 @@ impl<'a> Interp<'a> {
     }
 
     fn is_promise(&self, v: JsValue) -> bool {
-        let Some(obj) = v.as_object() else { return false; };
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
         let o = self.heap.get(obj);
-        o.kind == Kind::Promise && o.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s))
+        o.kind == Kind::Promise
+            && o.properties[0]
+                .as_smi()
+                .is_some_and(|s| (0..=2).contains(&s))
     }
 
     fn promise_resolve_for_await(&mut self, v: JsValue) -> (JsValue, bool, JsValue) {
@@ -4625,7 +4818,11 @@ impl<'a> Interp<'a> {
     fn try_unwrap_promise(&self, v: JsValue) -> Option<JsValue> {
         let obj = v.as_object()?;
         let p = self.heap.get(obj);
-        if p.properties.len() >= 3 && p.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s)) {
+        if p.properties.len() >= 3
+            && p.properties[0]
+                .as_smi()
+                .is_some_and(|s| (0..=2).contains(&s))
+        {
             let state = p.properties[0].as_smi().unwrap();
             if state == 1 {
                 return Some(p.properties[1]);
@@ -4639,7 +4836,11 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    fn resume_async_throw(&mut self, r#gen: Handle<JsObject>, exc: JsValue) -> Result<(), JSException> {
+    fn resume_async_throw(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        exc: JsValue,
+    ) -> Result<(), JSException> {
         self.resume_generator(r#gen, exc, true)?;
         Ok(())
     }
@@ -4757,10 +4958,16 @@ impl<'a> Interp<'a> {
     pub fn run_jobs(&mut self) -> usize {
         let mut count = 0;
         while let Some((r#gen, val, is_reject)) = self.pending_awaits.pop_front() {
-            let res = if is_reject { self.resume_async_throw(r#gen, val) } else { self.resume_async(r#gen, val) };
+            let res = if is_reject {
+                self.resume_async_throw(r#gen, val)
+            } else {
+                self.resume_async(r#gen, val)
+            };
             let _ = res;
             count += 1;
-            if count > 10000 { break; }
+            if count > 10000 {
+                break;
+            }
         }
         count
     }
@@ -4788,7 +4995,9 @@ impl<'a> Interp<'a> {
     }
 
     /// Number of pending async jobs.
-    pub fn pending_jobs(&self) -> usize { self.pending_awaits.len() }
+    pub fn pending_jobs(&self) -> usize {
+        self.pending_awaits.len()
+    }
 
     /// Republishes every live reference as a GC root — the whole value stack
     /// plus each active frame's environment — at a safepoint.
@@ -4802,6 +5011,7 @@ impl<'a> Interp<'a> {
     /// Finding #5: roots from `heap.add_root(promise/reactions/g)` are transient.
     /// Republishing `stack` + `frames` + `pending_awaits` (generator + payload)
     /// + `top_result` + persistent globals discards stale `add_root` entries.
+    ///
     /// After `complete_frame` settles an async promise the generator leaves
     /// `pending_awaits`, so the next pass drops its promise/reactions roots and
     /// the promise remains reachable only via the generator's `properties[4]`
@@ -4812,7 +5022,13 @@ impl<'a> Interp<'a> {
         // state kept outside the stack/frames — the global object and the
         // cached `console.log` native — must be re-rooted on every pass or
         // a collection between allocations drops their referents.
-        let persistent: [Option<JsValue>; 5] = [self.global.map(JsValue::object), self.console_log, self.generator_next_fn, self.generator_return_fn, self.generator_throw_fn];
+        let persistent: [Option<JsValue>; 5] = [
+            self.global.map(JsValue::object),
+            self.console_log,
+            self.generator_next_fn,
+            self.generator_return_fn,
+            self.generator_throw_fn,
+        ];
         roots.clear();
         roots.extend_from_slice(&self.stack);
         for frame in &self.frames {
@@ -4827,7 +5043,9 @@ impl<'a> Interp<'a> {
             roots.push(JsValue::object(*g));
             roots.push(*v);
         }
-        if let Some(v) = self.top_result { roots.push(v); }
+        if let Some(v) = self.top_result {
+            roots.push(v);
+        }
         if let Some(sym) = self.symbol_iterator {
             roots.push(JsValue::symbol(sym));
         }

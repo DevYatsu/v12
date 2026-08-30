@@ -143,25 +143,29 @@ impl Realm {
         // `Boolean(x)` / `new Boolean(x)` are constructible.
         let boolean_ctor = intrinsics.get("Boolean").and_then(|v| v.as_object());
         if let Some(boolean_ctor) = boolean_ctor {
-            heap.get_mut(boolean_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_BOOLEAN_CONSTRUCT));
+            heap.get_mut(boolean_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
+                crate::builtins::NATIVE_BOOLEAN_CONSTRUCT,
+            ));
         }
         // `Map` / `Set` are constructible.
         let map_ctor = intrinsics.get("Map").and_then(|v| v.as_object());
         if let Some(map_ctor) = map_ctor {
-            heap.get_mut(map_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_MAP_CONSTRUCT));
+            heap.get_mut(map_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
+                crate::builtins::NATIVE_MAP_CONSTRUCT,
+            ));
         }
         let set_ctor = intrinsics.get("Set").and_then(|v| v.as_object());
         if let Some(set_ctor) = set_ctor {
-            heap.get_mut(set_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_SET_CONSTRUCT));
+            heap.get_mut(set_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
+                crate::builtins::NATIVE_SET_CONSTRUCT,
+            ));
         }
         // `RegExp` is constructible.
         let regexp_ctor = intrinsics.get("RegExp").and_then(|v| v.as_object());
         if let Some(regexp_ctor) = regexp_ctor {
-            heap.get_mut(regexp_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_REGEXP_CONSTRUCT));
+            heap.get_mut(regexp_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
+                crate::builtins::NATIVE_REGEXP_CONSTRUCT,
+            ));
         }
         // `eval` is callable: route through the native registry (the
         // interpreter special-cases NATIVE_EVAL to run the source re-entrantly).

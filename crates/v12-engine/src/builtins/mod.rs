@@ -77,12 +77,7 @@ impl HostClosure {
     }
 
     /// Invokes the closure.
-    pub fn call(
-        &self,
-        heap: &mut Heap,
-        this: JsValue,
-        args: &[JsValue],
-    ) -> Result<JsValue, Throw> {
+    pub fn call(&self, heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
         (self.0.borrow_mut())(heap, this, args)
     }
 }
@@ -349,10 +344,9 @@ fn string_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result
 /// matching ES `Array.prototype.join`.
 fn array_join(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let Some(arr) = this.as_object() else {
-        return Err((intern_type_error(
-            heap,
-            "TypeError: Array.prototype.join requires an array",
-        )).into());
+        return Err(
+            (intern_type_error(heap, "TypeError: Array.prototype.join requires an array")).into(),
+        );
     };
     let sep = match args.first() {
         Some(&v) if !v.is_undefined() => helpers::value_text(heap, v),
@@ -402,10 +396,10 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
     // v1 stub for `new Function`: validate syntax and return a placeholder
     // function object. Full compilation is via `Engine::create_function`.
     if args.is_empty() {
-        let func = helpers::alloc_obj(heap, v12_heap::JsObject::function(
-            v12_heap::FunctionTarget::Bytecode(0),
-            None,
-        ));
+        let func = helpers::alloc_obj(
+            heap,
+            v12_heap::JsObject::function(v12_heap::FunctionTarget::Bytecode(0), None),
+        );
         return Ok(JsValue::object(func));
     }
     let mut param_parts = Vec::new();
@@ -426,10 +420,10 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
         let handle = helpers::intern_text(heap, &msg);
         return Err((JsValue::string(handle)).into());
     }
-    let func = helpers::alloc_obj(heap, v12_heap::JsObject::function(
-        v12_heap::FunctionTarget::Bytecode(1),
-        None,
-    ));
+    let func = helpers::alloc_obj(
+        heap,
+        v12_heap::JsObject::function(v12_heap::FunctionTarget::Bytecode(1), None),
+    );
     Ok(JsValue::object(func))
 }
 

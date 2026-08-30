@@ -14,8 +14,11 @@ use crate::error::V12Error;
 /// [`v12_engine::Throw`].
 fn wrap_host_closure<F>(mut f: F) -> v12_engine::HostClosure
 where
-    F: FnMut(&mut v12_heap::Heap, v12_engine::JsValue, &[v12_engine::JsValue])
-        -> Result<v12_engine::JsValue, v12_engine::JsValue>
+    F: FnMut(
+            &mut v12_heap::Heap,
+            v12_engine::JsValue,
+            &[v12_engine::JsValue],
+        ) -> Result<v12_engine::JsValue, v12_engine::JsValue>
         + 'static,
 {
     v12_engine::HostClosure::new(move |heap, this, args| {
@@ -47,8 +50,12 @@ impl Context {
         T: v12_engine::FromValue,
     {
         match self.engine.eval_with_completion(source) {
-            Ok(v) => T::from_value(self.engine.heap(), v)
-                .ok_or_else(|| V12Error::Thrown(format!("could not decode completion into {}", std::any::type_name::<T>()))),
+            Ok(v) => T::from_value(self.engine.heap(), v).ok_or_else(|| {
+                V12Error::Thrown(format!(
+                    "could not decode completion into {}",
+                    std::any::type_name::<T>()
+                ))
+            }),
             Err(e) => {
                 // Convert the structured engine error to a facade error.
                 // Throws carry a `JsValue`; for primitives we flatten
@@ -80,8 +87,11 @@ impl Context {
     /// inside JS. Registering over an existing name replaces it.
     pub fn register_fn<F>(&mut self, name: &str, f: F) -> Result<(), V12Error>
     where
-        F: FnMut(&mut v12_heap::Heap, v12_engine::JsValue, &[v12_engine::JsValue])
-            -> Result<v12_engine::JsValue, v12_engine::JsValue>
+        F: FnMut(
+                &mut v12_heap::Heap,
+                v12_engine::JsValue,
+                &[v12_engine::JsValue],
+            ) -> Result<v12_engine::JsValue, v12_engine::JsValue>
             + 'static,
     {
         self.engine
@@ -148,7 +158,9 @@ mod tests {
         ctx.register_fn("add", |_heap, _this, args| {
             // Literal args arrive as Smis; decode both Smi and double forms.
             let num = |v: v12_engine::JsValue| {
-                v.as_f64().or_else(|| v.as_smi().map(f64::from)).unwrap_or(0.0)
+                v.as_f64()
+                    .or_else(|| v.as_smi().map(f64::from))
+                    .unwrap_or(0.0)
             };
             let a = args.first().copied().map(num).unwrap_or(0.0);
             let b = args.get(1).copied().map(num).unwrap_or(0.0);
@@ -195,7 +207,8 @@ mod tests {
     #[test]
     fn call_invokes_global_function_with_args() {
         let mut ctx = Context::new();
-        ctx.eval::<()>("function greet(who) { return 'hi ' + who; }").unwrap();
+        ctx.eval::<()>("function greet(who) { return 'hi ' + who; }")
+            .unwrap();
         let s: String = ctx.call("greet", &["bob".to_string()]).unwrap();
         assert_eq!(s, "hi bob");
     }
@@ -203,7 +216,8 @@ mod tests {
     #[test]
     fn call_returns_typed_result() {
         let mut ctx = Context::new();
-        ctx.eval::<()>("function sum(a, b) { return a + b; }").unwrap();
+        ctx.eval::<()>("function sum(a, b) { return a + b; }")
+            .unwrap();
         let n: f64 = ctx.call("sum", &[2.0, 3.0]).unwrap();
         assert_eq!(n, 5.0);
     }
@@ -221,7 +235,8 @@ mod tests {
         let mut ctx = Context::new();
         // Throwing a string surfaces its text directly; error-object
         // constructors are not fully wired in the engine's builtins yet.
-        ctx.eval::<()>("function bad() { throw 'out of bounds'; }").unwrap();
+        ctx.eval::<()>("function bad() { throw 'out of bounds'; }")
+            .unwrap();
         let err: Result<f64, _> = ctx.call::<f64, f64>("bad", &[]);
         assert!(err.unwrap_err().to_string().contains("out"));
     }

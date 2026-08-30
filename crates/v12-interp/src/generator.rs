@@ -44,7 +44,10 @@ impl Suspendable for Interp<'_> {
             }
         };
         if self.heap.get(r#gen).properties.len() < 4 {
-            self.heap.get_mut(r#gen).properties.resize(4, JsValue::undefined());
+            self.heap
+                .get_mut(r#gen)
+                .properties
+                .resize(4, JsValue::undefined());
         }
         self.heap.get_mut(r#gen).properties[GEN_PC_SLOT] = JsValue::from_f64(resume_pc as f64);
         self.heap.get_mut(r#gen).properties[GEN_DST_SLOT] = JsValue::from_f64(f64::from(dst));

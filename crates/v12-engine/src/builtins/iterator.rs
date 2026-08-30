@@ -41,12 +41,19 @@ const SLOT_INDEX: usize = 2;
 
 /// Builds an iterator object over `source` with the given kind.
 fn create_iterator(heap: &mut Heap, source: Handle<JsObject>, kind: i32) -> Handle<JsObject> {
-    let iter = helpers::alloc_obj(heap, JsObject {
-        kind: v12_heap::Kind::Iterator,
-        elements: vec![helpers::smi_or_f64(i64::from(kind)), JsValue::object(source), helpers::smi_or_f64(0)],
-        ..JsObject::default()
-    });
-    iter
+    
+    helpers::alloc_obj(
+        heap,
+        JsObject {
+            kind: v12_heap::Kind::Iterator,
+            elements: vec![
+                helpers::smi_or_f64(i64::from(kind)),
+                JsValue::object(source),
+                helpers::smi_or_f64(0),
+            ],
+            ..JsObject::default()
+        },
+    )
 }
 
 /// Allocates an ES iterator result `{value, done}`.
@@ -64,7 +71,11 @@ fn iterator_result(heap: &mut Heap, value: JsValue, done: bool) -> JsValue {
     // through its shape walk (unbound objects stay on the root shape, which
     // has no descriptors).
     heap.bind_shape(h, shape2);
-    let done_val = if done { JsValue::true_() } else { JsValue::false_() };
+    let done_val = if done {
+        JsValue::true_()
+    } else {
+        JsValue::false_()
+    };
     heap.get_mut(h).properties = vec![value, done_val];
     heap.get_mut(h).property_keys = vec![Some(pk_value), Some(pk_done)];
     JsValue::object(h)
@@ -118,9 +129,9 @@ fn source_len(heap: &Heap, source: Handle<JsObject>) -> usize {
 /// `Set.prototype[Symbol.iterator]` shared implementation: returns a fresh
 /// iterator over `this`.
 pub fn iterator_for(heap: &mut Heap, this: JsValue, kind: i32) -> Result<JsValue, Throw> {
-    let obj = this.as_object().ok_or_else(|| {
-        Throw::type_error(heap, "TypeError: value is not iterable")
-    })?;
+    let obj = this
+        .as_object()
+        .ok_or_else(|| Throw::type_error(heap, "TypeError: value is not iterable"))?;
     Ok(JsValue::object(create_iterator(heap, obj, kind)))
 }
 
@@ -129,7 +140,10 @@ pub fn iterator_for(heap: &mut Heap, this: JsValue, kind: i32) -> Result<JsValue
 pub fn iterator_next(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let iter = helpers::as_object(heap, this, "iterator.next", Some(v12_heap::Kind::Iterator))?;
     let Some((source, index)) = state(heap, iter) else {
-        return Err(Throw::type_error(heap, "iterator.next called on non-iterator"));
+        return Err(Throw::type_error(
+            heap,
+            "iterator.next called on non-iterator",
+        ));
     };
     let kind = heap.get(iter).elements[SLOT_KIND]
         .as_smi()
@@ -137,7 +151,8 @@ pub fn iterator_next(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Resul
     let len = source_len(heap, source);
     if index >= len {
         // Done: mark the iterator exhausted and return {undefined, true}.
-        heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(i64::from(v12_heap::JsValue::SMI_MAX));
+        heap.get_mut(iter).elements[SLOT_INDEX] =
+            helpers::smi_or_f64(i64::from(v12_heap::JsValue::SMI_MAX));
         return Ok(iterator_result(heap, JsValue::undefined(), true));
     }
     // Advance the index before producing the value: iterator state updates
@@ -195,11 +210,19 @@ pub fn set_iterator(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result
 }
 
 /// `Array.prototype.entries` — entries iterator over `this`.
-pub fn array_iterator_entries(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn array_iterator_entries(
+    heap: &mut Heap,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_ARRAY_ENTRIES)
 }
 
 /// `Array.prototype.keys` — keys iterator over `this`.
-pub fn array_iterator_keys(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn array_iterator_keys(
+    heap: &mut Heap,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_ARRAY_KEYS)
 }

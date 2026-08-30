@@ -21,11 +21,13 @@ mod stub;
 // The shared cache/error types now live in `v12-codegen`; this
 // crate re-exports them for back-compat (both JIT tiers depend on the
 // shared core, not on each other).
-pub use v12_codegen::{CompiledFn, FunctionId, JitCache, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 #[cfg(feature = "jit")]
 pub use compiler::JitBaseline;
 #[cfg(not(feature = "jit"))]
 pub use stub::JitBaseline;
+pub use v12_codegen::{
+    CompiledFn, FunctionId, JitCache, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS,
+};
 
 // Re-export bytecode types for convenience.
 pub use v12_bytecode::{FunctionBytecode, PcMapEntry};
@@ -417,7 +419,8 @@ mod tests {
         // that interp correctly reports "object" for null via the same bytecode
         // that the JIT would later lower.
         let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
-        let mut interp = v12_interp::Interp::from_source(&mut heap, "throw typeof null;").expect("compiles");
+        let mut interp =
+            v12_interp::Interp::from_source(&mut heap, "throw typeof null;").expect("compiles");
         let thrown = match interp.run() {
             Err(e) => e.0,
             Ok(()) => panic!("expected throw"),

@@ -305,11 +305,7 @@ impl JsValue {
     #[inline]
     pub const fn from_bits(bits: u64) -> Option<JsValue> {
         let v = JsValue(bits);
-        if v.is_canonical() {
-            Some(v)
-        } else {
-            None
-        }
+        if v.is_canonical() { Some(v) } else { None }
     }
 
     // ------------------------------------------------------------------
@@ -389,7 +385,6 @@ impl JsValue {
         }
     }
 }
-
 
 /// A value could not be decoded into the requested Rust type.
 ///
@@ -580,6 +575,7 @@ impl Trace for JsValue {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -779,13 +775,22 @@ mod tests {
     #[test]
     fn from_bits_guards_the_canonical_form() {
         // Canonical words pass through unchanged.
-        assert_eq!(JsValue::from_bits(JsValue::undefined().bits()), Some(JsValue::undefined()));
-        assert_eq!(JsValue::from_bits(JsValue::from_f64(1.5).bits()), Some(JsValue::from_f64(1.5)));
+        assert_eq!(
+            JsValue::from_bits(JsValue::undefined().bits()),
+            Some(JsValue::undefined())
+        );
+        assert_eq!(
+            JsValue::from_bits(JsValue::from_f64(1.5).bits()),
+            Some(JsValue::from_f64(1.5))
+        );
         let smi = JsValue::from_i32_smi(42).unwrap();
         assert_eq!(JsValue::from_bits(smi.bits()), Some(smi));
         // The same forged words the predicate rejects are refused here.
         assert_eq!(JsValue::from_bits(BOX_MASK | (15 << TAG_SHIFT)), None); // reserved tag
-        assert_eq!(JsValue::from_bits(BOX_MASK | (1 << TAG_SHIFT) | (1u64 << 40) | 3), None); // stray mid-bit
+        assert_eq!(
+            JsValue::from_bits(BOX_MASK | (1 << TAG_SHIFT) | (1u64 << 40) | 3),
+            None
+        ); // stray mid-bit
         assert_eq!(JsValue::from_bits(BOX_MASK | (5 << TAG_SHIFT) | 1), None); // dirty special
         // Raw doubles (unboxed) are always canonical.
         assert!(JsValue::from_bits(f64::NAN.to_bits()).is_some());

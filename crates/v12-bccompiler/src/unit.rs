@@ -119,7 +119,13 @@ pub fn compile_unit(
     if cx.b.is_generator {
         let dst = cx.new_temp();
         let func_idx = u16::try_from(idx).unwrap_or(0);
-        cx.emit_reg3(Opcode::CreateGenerator, dst, func_idx, 0, oxc_span::Span::default());
+        cx.emit_reg3(
+            Opcode::CreateGenerator,
+            dst,
+            func_idx,
+            0,
+            oxc_span::Span::default(),
+        );
     }
     if idx == 0 {
         emit_import_calls(&mut cx)?;
@@ -135,10 +141,7 @@ pub fn compile_unit(
                 cx.emit_reg1(
                     Opcode::Return,
                     reg,
-                    p.body
-                        .last()
-                        .map(|s| s.span())
-                        .unwrap_or_default(),
+                    p.body.last().map(|s| s.span()).unwrap_or_default(),
                 );
             }
         }
@@ -174,10 +177,7 @@ pub fn compile_unit(
             });
             if let Some(m) = ctor {
                 let Some(body) = m.value.body.as_deref() else {
-                    return Err(cx.err(
-                        m.span,
-                        "constructor without a body is not supported",
-                    ));
+                    return Err(cx.err(m.span, "constructor without a body is not supported"));
                 };
                 cx.stmt_list(&body.statements)?;
             }
@@ -185,10 +185,7 @@ pub fn compile_unit(
         }
         UnitNode::Method(f) => {
             let Some(body) = f.body.as_deref() else {
-                return Err(cx.err(
-                    f.span(),
-                    "class method without a body is not supported",
-                ));
+                return Err(cx.err(f.span(), "class method without a body is not supported"));
             };
             cx.stmt_list(&body.statements)?;
         }

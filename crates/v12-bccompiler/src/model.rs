@@ -100,6 +100,9 @@ pub type Interner = lasso::Rodeo<lasso::Spur>;
 /// See the `Interner` docs for why `Spur` (used for `GetGlobal`'s `PropKey`)
 /// and `Str32` (used for `LoadConst`'s pooled string) share the `Rodeo` but
 /// occupy distinct immediate namespaces.
+// A `Spur` always names a 32-bit table index by construction; audited
+// invariant of the lasso codec.
+#[allow(clippy::expect_used)]
 pub(crate) fn str_id_of(key: lasso::Spur) -> u32 {
     u32::try_from(key.into_usize()).expect("a Spur always names a 32-bit table index")
 }
@@ -327,6 +330,9 @@ impl Plans {
 
     /// The nearest non-arrow ancestor unit (inclusive) — the unit whose `this`
     /// an arrow observes.
+    // Arrow units always have a parent (a non-arrow main unit exists);
+    // audited invariant.
+    #[allow(clippy::expect_used)]
     pub fn this_home(&self, unit: usize) -> usize {
         let mut cur = unit;
         while self.units[cur].is_arrow {
@@ -789,6 +795,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// `str_id_of` (string table index) for the global name. The immediate
     /// is a direct string table id, not a pool index — distinct from
     /// `LoadConst`'s `Str32` pool immediate. See `Interner` docs.
+    // Global-name table ids fit u16 in this subset; audited invariant.
+    #[allow(clippy::expect_used)]
     pub fn emit_get_global(&mut self, dst: u16, name_id: u32, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
         self.emit_regs(Opcode::GetGlobal, dst, k >> 8, k & 0xFF, 0b0001, span);
@@ -796,6 +804,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// `SetGlobal name_id, src` — same `Spur`-derived string table id as
     /// `GetGlobal`.
+    // Global-name table ids fit u16 in this subset; audited invariant.
+    #[allow(clippy::expect_used)]
     pub fn emit_set_global(&mut self, name_id: u32, src: u16, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
         self.emit_regs(Opcode::SetGlobal, src, k >> 8, k & 0xFF, 0b0001, span);

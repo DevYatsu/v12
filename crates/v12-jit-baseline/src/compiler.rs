@@ -14,7 +14,9 @@ use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 use v12_bytecode::{BytecodeError, FunctionBytecode, Opcode, PcMapEntry, WideOp};
-use v12_codegen::{CompiledFn, JitCache, JitError, JitExecFn, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
+use v12_codegen::{
+    CompiledFn, JitCache, JitError, JitExecFn, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS,
+};
 use v12_heap::JsValue;
 
 use crate::runtime;
@@ -654,9 +656,7 @@ fn resolve_const_bits(bytecode: &FunctionBytecode, id: u32) -> Result<u64, JitEr
         }
         Some(v12_bytecode::Const::Null) => Ok(JsValue::null().bits()),
         Some(other) => Err(JitError::UnsupportedWideOp(format!("const kind {other:?}"))),
-        None => Err(invalid_bytecode(format!(
-            "const id {id} out of range"
-        ))),
+        None => Err(invalid_bytecode(format!("const id {id} out of range"))),
     }
 }
 

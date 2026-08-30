@@ -48,6 +48,8 @@ macro_rules! impl_native_sig_tuples {
                     )));
                 }
                 // Positional conversion, std TryFrom under the hood.
+                // The 0-arity expansion never advances the iterator.
+                #[allow(unused_mut)]
                 let mut it = js.iter();
                 Ok(($(($name::try_from(*it.next().expect("length checked above"))
                     .map_err(|e| decode_error_to_throw(heap, e))?),)*))
