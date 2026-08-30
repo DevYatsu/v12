@@ -137,7 +137,8 @@ pub use handle::{Handle, HeapSpace, Space};
 pub use object::{
     EnginePromise, GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject,
     KIND_ARGUMENTS, KIND_ARRAY, KIND_ERROR, KIND_FUNCTION, KIND_GENERATOR, KIND_MAP, KIND_ORDINARY,
-    KIND_PROMISE, KIND_SET, KIND_ITERATOR, PromiseExt, PromiseState, V12BigInt, V12Symbol,
+    KIND_PROMISE, KIND_SET, KIND_ITERATOR, KIND_REGEXP, PromiseExt, PromiseState, V12BigInt,
+    V12Symbol,
 };
 pub use prop_key::PropKey;
 pub use shape::{

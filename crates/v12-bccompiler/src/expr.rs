@@ -45,7 +45,47 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Err(self.err(b.span, "BigInt literals are not supported"))
             }
             Expression::RegExpLiteral(r) => {
-                Err(self.err(r.span, "RegExp literals are not supported"))
+                // `/pattern/flags` → `RegExp("pattern", "flags")`: read the
+                // `RegExp` global (a native constructor in the realm) and
+                // call it with the pattern text and canonical flag string.
+                use oxc_ast::ast::RegExpFlags;
+                let pattern = r.regex.pattern.text.as_str();
+                let mut flags = String::with_capacity(8);
+                let f = r.regex.flags;
+                if f.contains(RegExpFlags::D) {
+                    flags.push('d');
+                }
+                if f.contains(RegExpFlags::G) {
+                    flags.push('g');
+                }
+                if f.contains(RegExpFlags::I) {
+                    flags.push('i');
+                }
+                if f.contains(RegExpFlags::M) {
+                    flags.push('m');
+                }
+                if f.contains(RegExpFlags::S) {
+                    flags.push('s');
+                }
+                if f.contains(RegExpFlags::U) {
+                    flags.push('u');
+                }
+                if f.contains(RegExpFlags::V) {
+                    flags.push('v');
+                }
+                if f.contains(RegExpFlags::Y) {
+                    flags.push('y');
+                }
+                let dst = self.new_temp();
+                let gid = crate::model::str_id_of(self.comp.strings.get_or_intern("RegExp"));
+                self.emit_get_global(dst, gid, r.span);
+                let block = self.new_temps(CALL_HEADER_REGS + 2);
+                self.move_reg(block, dst, r.span);
+                self.load_undefined(block + 1, r.span);
+                self.load_str(block + 2, pattern, r.span)?;
+                self.load_str(block + 3, &flags, r.span)?;
+                self.emit_call(block, block, 2, r.span);
+                Ok(block)
             }
             Expression::Identifier(id) => {
                 self.read_identifier(id.name.as_str(), id.reference_id.get(), id.span)

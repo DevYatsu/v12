@@ -1271,6 +1271,7 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
     "Symbol",
     "Map",
     "Set",
+    "RegExp",
     "eval",
     "console",
     "globalThis",

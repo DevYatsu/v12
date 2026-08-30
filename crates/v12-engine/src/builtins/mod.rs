@@ -13,6 +13,7 @@ pub mod math;
 pub mod number;
 pub mod object;
 pub mod promise;
+pub mod regexp;
 pub mod string;
 
 use std::cell::RefCell;
@@ -37,6 +38,9 @@ pub struct NativeRegistry {
     handlers: std::collections::HashMap<u32, NativeHandler>,
     closures: std::collections::HashMap<u32, HostClosure>,
     pending: Rc<RefCell<Vec<Job>>>,
+    /// Compiled-regexp cache for RegExp natives. Per-registry (per-engine) so
+    /// object-handle indexes never collide across engines.
+    regex_cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<u32, v12_regex::CompiledRegex>>>,
 }
 
 impl std::fmt::Debug for NativeRegistry {
@@ -149,11 +153,15 @@ impl v12_interp::NativeRegistry for NativeRegistry {
         // Job-enqueuing natives need the side channel, which the bare
         // `NativeHandler` signature (`fn(&mut Heap, …)`) cannot carry; they
         // are intercepted here instead of registered as plain handlers.
+        // RegExp natives need the per-registry compiled-pattern cache.
         match index {
             NATIVE_PROMISE_RESOLVE => promise::promise_resolve(heap, this, args),
             NATIVE_PROMISE_REJECT => promise::promise_reject(heap, this, args),
             NATIVE_PROMISE_THEN => promise::promise_then(heap, this, args, &self.pending),
             NATIVE_QUEUE_MICROTASK => promise::queue_microtask(heap, args, &self.pending),
+            NATIVE_REGEXP_EXEC => regexp::regexp_exec(heap, &self.regex_cache, this, args),
+            NATIVE_REGEXP_TEST => regexp::regexp_test(heap, &self.regex_cache, this, args),
+            NATIVE_REGEXP_COMPILE => regexp::regexp_compile(heap, &self.regex_cache, this, args),
             _ => self.dispatch(heap, this, args, index),
         }
     }
@@ -249,6 +257,11 @@ pub const NATIVE_SET_ADD: u32 = 2101;
 pub const NATIVE_SET_HAS: u32 = 2102;
 pub const NATIVE_SET_DELETE: u32 = 2103;
 pub const NATIVE_SET_SIZE: u32 = 2104;
+pub const NATIVE_REGEXP_CONSTRUCT: u32 = 2300;
+pub const NATIVE_REGEXP_EXEC: u32 = 2301;
+pub const NATIVE_REGEXP_TEST: u32 = 2302;
+pub const NATIVE_REGEXP_TO_STRING: u32 = 2303;
+pub const NATIVE_REGEXP_COMPILE: u32 = 2304;
 pub const NATIVE_ITERATOR_NEXT: u32 = 2200;
 /// `Array.prototype[Symbol.iterator]` — creates an array-values iterator.
 pub const NATIVE_ARRAY_ITERATOR: u32 = 2201;
@@ -299,6 +312,7 @@ pub fn install_core(registry: &mut NativeRegistry) {
     registry.register(NATIVE_SET_DELETE, map::set_delete);
     registry.register(NATIVE_SET_SIZE, map::set_size);
     iterator::install(registry);
+    regexp::install(registry);
 }
 
 /// Renders a value the way `console.log` observes it (Tier-0 display subset).

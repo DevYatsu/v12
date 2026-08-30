@@ -72,8 +72,8 @@ use v12_heap::{
     KIND_ARGUMENTS as HEAP_KIND_ARGUMENTS, KIND_ARRAY as HEAP_KIND_ARRAY,
     KIND_ERROR as HEAP_KIND_ERROR, KIND_FUNCTION as HEAP_KIND_FUNCTION,
     KIND_GENERATOR as HEAP_KIND_GENERATOR, KIND_ITERATOR as HEAP_KIND_ITERATOR,
-    KIND_MAP as HEAP_KIND_MAP, KIND_PROMISE as HEAP_KIND_PROMISE, KIND_SET as HEAP_KIND_SET,
-    PropKey, ShapeHandle, V12Str,
+    KIND_MAP as HEAP_KIND_MAP, KIND_PROMISE as HEAP_KIND_PROMISE, KIND_REGEXP as HEAP_KIND_REGEXP,
+    KIND_SET as HEAP_KIND_SET, PropKey, ShapeHandle, V12Str,
 };
 
 use crate::feedback::{FeedbackVector, Lattice, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
@@ -110,6 +110,9 @@ pub const KIND_SET: u8 = HEAP_KIND_SET;
 /// Object kind for iterator objects (Array/Map/Set iterators backing
 /// `Symbol.iterator`; state in `elements` as `[kind, source, index]`).
 pub const KIND_ITERATOR: u8 = HEAP_KIND_ITERATOR;
+
+/// Object kind for RegExp objects (`properties = [source, flags, lastIndex]`).
+pub const KIND_REGEXP: u8 = HEAP_KIND_REGEXP;
 
 /// Native index for `console.log` — a console method that prints its
 /// arguments and returns `undefined`. Chosen beyond any plausible program
@@ -156,6 +159,14 @@ pub const NATIVE_SET_ITERATOR: u32 = 2203;
 pub const NATIVE_ITERATOR_SELF: u32 = 2204;
 pub const NATIVE_ARRAY_ITERATOR_ENTRIES: u32 = 2205;
 pub const NATIVE_ARRAY_ITERATOR_KEYS: u32 = 2206;
+
+/// Native indices of the RegExp surface, mirroring
+/// `v12_engine::builtins` constants.
+pub const NATIVE_REGEXP_CONSTRUCT: u32 = 2300;
+pub const NATIVE_REGEXP_EXEC: u32 = 2301;
+pub const NATIVE_REGEXP_TEST: u32 = 2302;
+pub const NATIVE_REGEXP_TO_STRING: u32 = 2303;
+pub const NATIVE_REGEXP_COMPILE: u32 = 2304;
 
 /// Native indices of the Map/Set surface, mirroring `v12_engine::builtins`
 /// constants (same duplication pattern as the promise/array constants; the
@@ -239,8 +250,8 @@ pub const NATIVE_ERROR_CREATE: u32 = 1600;
 /// shape descriptor reports for the global must be biased by this constant
 /// before indexing storage (see [`Interp::global_slot_index`]). Must stay in
 /// sync with `v12-engine/src/realm.rs` `INTRINSIC_NAMES.len()` and
-/// `v12-bccompiler/src/model.rs` `GLOBAL_INTRINSICS.len()` (v1: 17).
-const GLOBAL_VAR_OFFSET: usize = 17;
+/// `v12-bccompiler/src/model.rs` `GLOBAL_INTRINSICS.len()` (v1: 18).
+const GLOBAL_VAR_OFFSET: usize = 18;
 
 /// Names of the intrinsic slots installed by the realm at fixed positions
 /// in the global object's `properties` vector.
@@ -265,6 +276,7 @@ const GLOBAL_INTRINSIC_NAMES: &[&str] = &[
     "Symbol",
     "Map",
     "Set",
+    "RegExp",
     "eval",
     "console",
     "globalThis",
@@ -2957,6 +2969,59 @@ impl<'a> Interp<'a> {
                 return Ok(self.map_set_method(crate::NATIVE_ITERATOR_NEXT));
             }
         }
+        // RegExp object surface: methods `exec`/`test`/`toString`/`compile`
+        // and the `source`/`flags`/`lastIndex` properties (internal slots).
+        if self.heap.get(obj).kind == KIND_REGEXP {
+            if self.key_is(key_v, "exec") {
+                return Ok(self.map_set_method(crate::NATIVE_REGEXP_EXEC));
+            }
+            if self.key_is(key_v, "test") {
+                return Ok(self.map_set_method(crate::NATIVE_REGEXP_TEST));
+            }
+            if self.key_is(key_v, "toString") {
+                return Ok(self.map_set_method(crate::NATIVE_REGEXP_TO_STRING));
+            }
+            if self.key_is(key_v, "compile") {
+                return Ok(self.map_set_method(crate::NATIVE_REGEXP_COMPILE));
+            }
+            // Property reads off the internal slots.
+            let slot = if self.key_is(key_v, "source") {
+                Some(0)
+            } else if self.key_is(key_v, "flags") {
+                Some(1)
+            } else if self.key_is(key_v, "lastIndex") {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(slot) = slot {
+                if let Some(v) = self.heap.get(obj).properties.get(slot).copied() {
+                    return Ok(v);
+                }
+            }
+        }
+        // `RegExp.prototype` — the constructor's prototype property (needed
+        // for `new RegExp(...)` instanceof wiring and `RegExp.prototype.exec`
+        // style reads). The realm's RegExp placeholder has no real prototype
+        // object; synthesize a minimal one on first read.
+        let regexp_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "RegExp");
+        if let (Some(g), Some(regexp_idx)) = (self.global, regexp_idx)
+            && let Some(regexp_ctor) = {
+                let heap = &*self.heap;
+                heap.get(g).properties.get(regexp_idx).and_then(|v| v.as_object())
+            }
+            && obj == regexp_ctor
+            && self.key_is(key_v, "prototype")
+        {
+            if let Some(p) = self.heap.get(obj).prototype {
+                return Ok(JsValue::object(p));
+            }
+            self.gc_protect();
+            let proto = self.heap.alloc(JsObject::default());
+            self.heap.add_root(JsValue::object(proto));
+            self.heap.get_mut(obj).prototype = Some(proto);
+            return Ok(JsValue::object(proto));
+        }
         if self.heap.get(obj).kind == KIND_ARRAY {
             if self.key_is(key_v, "push") {
                 return Ok(self.cached_native(NativeFn::ArrayPush));
@@ -3145,6 +3210,19 @@ impl<'a> Interp<'a> {
             // slot (v1 keeps the element store authoritative; callers inspect
             // `heap.get(obj).arguments_mapped` directly).
             self.array_set_element(obj, idx, value);
+            return Ok(());
+        }
+        // RegExp `lastIndex` write: stores into the internal slot. Per spec
+        // the value is coerced via ToNumber.
+        if kind == KIND_REGEXP && self.key_is(key_v, "lastIndex") {
+            let n = ops::to_number(self.heap, value);
+            if n.fract() == 0.0 && n >= -1e15 && n <= 1e15 {
+                if let Some(smi) = JsValue::from_i32_smi(n as i32) {
+                    self.heap.get_mut(obj).properties[2] = smi;
+                    return Ok(());
+                }
+            }
+            self.heap.get_mut(obj).properties[2] = JsValue::from_f64(n);
             return Ok(());
         }
 

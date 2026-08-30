@@ -52,6 +52,13 @@ pub const KIND_SET: u8 = 8;
 /// routed through the registry.
 pub const KIND_ITERATOR: u8 = 9;
 
+/// RegExp object. Internal slots live in `properties` as
+/// `[source, flags, lastIndex]` — see `v12-engine/src/builtins/regexp.rs`.
+/// The compiled pattern is cached inside the object's `elements[0]` via the
+/// native registry's side table; the object itself only carries the source
+/// text and flag string.
+pub const KIND_REGEXP: u8 = 10;
+
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
 /// down. Transitions are monotone — sealing then freezing is legal, nothing
 /// un-seals — so [`Heap::set_integrity_level`] only ever raises flags.
@@ -280,6 +287,23 @@ impl JsObject {
             property_keys: vec![None; prop_len],
             elements,
             arguments_mapped: mapped,
+            ..Self::default()
+        }
+    }
+
+    /// A RegExp object with `properties = [source, flags, lastIndex]`.
+    /// `source` and `flags` are heap strings; `lastIndex` starts at 0.
+    /// The compiled pattern lives in the engine's regexp side table, keyed by
+    /// the object handle — this object carries only the source text.
+    pub fn regexp(source: crate::Handle<crate::V12Str>, flags: crate::Handle<crate::V12Str>) -> Self {
+        Self {
+            kind: KIND_REGEXP,
+            properties: vec![
+                crate::JsValue::string(source),
+                crate::JsValue::string(flags),
+                crate::JsValue::from_i32_smi(0).expect("0 fits Smi"),
+            ],
+            property_keys: vec![None; 3],
             ..Self::default()
         }
     }

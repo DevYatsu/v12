@@ -1315,15 +1315,53 @@ mod tests {
     }
 
     #[test]
-    fn for_of_over_array_literal() {
+    fn regexp_literal_test_and_exec() {
         let mut engine = Engine::new();
-        // Sum array elements via for-of; observe via throw.
+        // `/ab+c/` literal compiles to a RegExp constructor call; `.test`
+        // drives exec.
+        let thrown = engine.eval("throw /ab+c/.test('xabbbc');").unwrap_err();
+        assert!(thrown.is_true(), "test should match: {}", engine.to_display_string(thrown));
+        let thrown = engine.eval("throw /ab+c/.test('xac');").unwrap_err();
+        assert!(thrown.is_false(), "test should not match: {}", engine.to_display_string(thrown));
+        // exec returns a match array with index/input.
+        let thrown = engine
+            .eval("let m = /(a)(b)/.exec('zab'); throw m[0] + ' ' + m[1] + ' ' + m[2] + ' ' + m.index + ' ' + m.input;")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "ab a b 1 zab");
+    }
+
+    #[test]
+    fn regexp_constructor_and_source_flags() {
+        let mut engine = Engine::new();
+        let thrown = engine
+            .eval("let re = new RegExp('a+b', 'gi'); throw re.source + '|' + re.flags;")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "a+b|gi");
+        // Copy-from-regexp: `new RegExp(re)` preserves source/flags.
+        let thrown = engine
+            .eval("let re = /x/y; let re2 = new RegExp(re); throw re2.source + '|' + re2.flags;")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "x|y");
+        // toString.
+        let thrown = engine.eval("throw /ab+/gi.toString();").unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "/ab+/gi");
+    }
+
+    #[test]
+    fn regexp_last_index_global() {
+        let mut engine = Engine::new();
+        // Global exec advances lastIndex across calls.
         let thrown = engine
             .eval(
-                "let sum = 0; for (const v of [1, 2, 3, 4]) { sum += v; } throw sum;",
+                "let re = /a/g; let s = 'a a a'; let n = 0; while (re.exec(s)) { n++; } throw n;",
             )
             .unwrap_err();
-        assert_eq!(thrown.as_smi(), Some(10));
+        assert_eq!(thrown.as_smi(), Some(3));
+        // lastIndex resets to 0 after exhaustion.
+        let thrown = engine
+            .eval("let re = /a/g; re.exec('a'); re.exec('a'); throw re.lastIndex;")
+            .unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(0));
     }
 
     #[test]

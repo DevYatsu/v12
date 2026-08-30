@@ -659,10 +659,10 @@ fn global_var_alias_for_captured_var() {
     let mut heap = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
     let global = heap.alloc(v12_heap::JsObject::default());
     heap.add_root(v12_heap::JsValue::object(global));
-    // Simulate global with intrinsic slots already (must match `GLOBAL_VAR_OFFSET` = 17).
+    // Simulate global with intrinsic slots already (must match `GLOBAL_VAR_OFFSET` = 18).
     heap.get_mut(global)
         .properties
-        .resize(17, v12_heap::JsValue::undefined());
+        .resize(18, v12_heap::JsValue::undefined());
     heap.add_root(v12_heap::JsValue::object(global));
     let src = "var x = 123; function f(){ return x; } throw f();";
     let (program, strings) = v12_bccompiler::compile_source_with_strings(src).expect("compile");
@@ -674,7 +674,7 @@ fn global_var_alias_for_captured_var() {
     // slot numbering every top-level binding gets a descriptor slot in
     // declaration order, physically stored at `GLOBAL_VAR_OFFSET + slot`;
     // the hoisted function declaration takes slot 0, so `x` occupies slot 1.
-    let val = heap.get(global).properties[18];
+    let val = heap.get(global).properties[19];
     assert_eq!(val.as_smi(), Some(123));
 }
 
