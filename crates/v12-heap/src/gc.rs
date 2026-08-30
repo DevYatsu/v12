@@ -910,6 +910,18 @@ impl Heap {
         handle
     }
 
+    /// Interns `text` as a canonical heap string, choosing the storage by
+    /// ASCII-ness (latin1 for ASCII, utf16 otherwise). Deduplicated by
+    /// content via [`Heap::intern_string`] — equal texts share one handle,
+    /// which property-key identity relies on.
+    pub fn intern_text(&mut self, text: &str) -> Handle<V12Str> {
+        if text.is_ascii() {
+            self.intern_string(V12Str::latin1(text.as_bytes().to_vec()))
+        } else {
+            self.intern_string(V12Str::utf16(text.encode_utf16().collect()))
+        }
+    }
+
     // ------------------------------------------------------------------
     // Collection
     // ------------------------------------------------------------------

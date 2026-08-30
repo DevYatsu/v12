@@ -162,6 +162,10 @@ impl v12_interp::NativeRegistry for NativeRegistry {
             NATIVE_REGEXP_EXEC => regexp::regexp_exec(heap, &self.regex_cache, this, args),
             NATIVE_REGEXP_TEST => regexp::regexp_test(heap, &self.regex_cache, this, args),
             NATIVE_REGEXP_COMPILE => regexp::regexp_compile(heap, &self.regex_cache, this, args),
+            NATIVE_STRING_MATCH => string::string_match(heap, &self.regex_cache, this, args),
+            NATIVE_STRING_REPLACE => string::string_replace(heap, &self.regex_cache, this, args),
+            NATIVE_STRING_SEARCH => string::string_search(heap, &self.regex_cache, this, args),
+            NATIVE_STRING_SPLIT => string::string_split(heap, &self.regex_cache, this, args),
             _ => self.dispatch(heap, this, args, index),
         }
     }
@@ -234,6 +238,14 @@ pub const NATIVE_STRING_CHAR_AT: u32 = 1200;
 pub const NATIVE_STRING_SLICE: u32 = 1201;
 /// `String(x)` — callable `String` intrinsic (ToString subset).
 pub const NATIVE_STRING_CONSTRUCT: u32 = 1202;
+/// `String.prototype.match(regexp)` — regexp match over a string.
+pub const NATIVE_STRING_MATCH: u32 = 1203;
+/// `String.prototype.replace(regexp, replacement)` — regexp replace.
+pub const NATIVE_STRING_REPLACE: u32 = 1204;
+/// `String.prototype.search(regexp)` — first match index.
+pub const NATIVE_STRING_SEARCH: u32 = 1205;
+/// `String.prototype.split(regexp, limit)` — split on regexp separators.
+pub const NATIVE_STRING_SPLIT: u32 = 1206;
 pub const NATIVE_NUMBER_IS_NAN: u32 = 1300;
 pub const NATIVE_MATH_ABS: u32 = 1400;
 pub const NATIVE_BOOLEAN_CONSTRUCT: u32 = 1500;
@@ -362,7 +374,7 @@ fn string_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result
     let text = args
         .first()
         .map_or_else(|| "undefined".to_string(), |&v| value_display_text(heap, v));
-    Ok(JsValue::string(intern_text(heap, &text)))
+    Ok(JsValue::string(heap.intern_text(&text)))
 }
 
 /// `Array.prototype.join(separator?)`: element display strings joined by
@@ -392,16 +404,7 @@ fn array_join(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValu
         }
     }
     let text = parts.join(&sep);
-    Ok(JsValue::string(intern_text(heap, &text)))
-}
-
-/// Interns `text` as a heap string, choosing the storage by ASCII-ness.
-fn intern_text(heap: &mut Heap, text: &str) -> v12_heap::Handle<v12_heap::V12Str> {
-    if text.is_ascii() {
-        heap.intern_string(v12_heap::V12Str::latin1(text.as_bytes().to_vec()))
-    } else {
-        heap.intern_string(v12_heap::V12Str::utf16(text.encode_utf16().collect()))
-    }
+    Ok(JsValue::string(heap.intern_text(&text)))
 }
 
 fn eval_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {

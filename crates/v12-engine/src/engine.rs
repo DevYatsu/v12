@@ -1365,6 +1365,74 @@ mod tests {
     }
 
     #[test]
+    fn string_match_global_and_single() {
+        let mut engine = Engine::new();
+        // Global match returns all whole matches.
+        let thrown = engine
+            .eval("let m = 'a1b2c3'.match(/\\d/g); throw m.length + ' ' + m[0] + m[1] + m[2];")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "3 123");
+        // Non-global match returns exec result.
+        let thrown = engine
+            .eval("let m = 'abc123'.match(/(\\d+)/); throw m[0] + ' ' + m[1];")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "123 123");
+        // No match -> null.
+        let thrown = engine.eval("throw 'abc'.match(/z/);").unwrap_err();
+        assert!(thrown.is_null());
+    }
+
+    #[test]
+    fn string_replace_with_groups() {
+        let mut engine = Engine::new();
+        // Global replace.
+        let thrown = engine
+            .eval("throw 'a1b2'.replace(/\\d/g, 'x');")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "axbx");
+        // Group + $& expansion.
+        let thrown = engine
+            .eval("throw 'hello world'.replace(/(\\w+) (\\w+)/, '$2 $1');")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "world hello");
+        // $& is the whole match.
+        let thrown = engine
+            .eval("throw 'abc'.replace(/b/, '<$&>');")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "a<b>c");
+    }
+
+    #[test]
+    fn string_search_and_split() {
+        let mut engine = Engine::new();
+        // search returns first match index.
+        let thrown = engine.eval("throw 'abc123'.search(/\\d/);").unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(3));
+        let thrown = engine.eval("throw 'abc'.search(/z/);").unwrap_err();
+        assert_eq!(thrown.as_smi(), Some(-1));
+        // split on global regexp.
+        let thrown = engine
+            .eval("let p = 'a,b,c'.split(/,/); throw p.length + ' ' + p[0] + p[1] + p[2];")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "3 abc");
+        // split on string separator.
+        let thrown = engine
+            .eval("let p = '1-2-3'.split('-'); throw p[0] + p[1] + p[2];")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "123");
+    }
+
+    #[test]
+    fn string_replace_string_separator() {
+        let mut engine = Engine::new();
+        // Non-regexp replace only replaces first occurrence.
+        let thrown = engine
+            .eval("throw 'aaa'.replace('a', 'b');")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "baa");
+    }
+
+    #[test]
     fn for_of_over_array_binding_and_break() {
         let mut engine = Engine::new();
         // `for (const x of arr)` binds the loop variable; break exits early.

@@ -168,6 +168,13 @@ pub const NATIVE_REGEXP_TEST: u32 = 2302;
 pub const NATIVE_REGEXP_TO_STRING: u32 = 2303;
 pub const NATIVE_REGEXP_COMPILE: u32 = 2304;
 
+/// Native indices of the String regexp methods, mirroring
+/// `v12_engine::builtins` constants.
+pub const NATIVE_STRING_MATCH: u32 = 1203;
+pub const NATIVE_STRING_REPLACE: u32 = 1204;
+pub const NATIVE_STRING_SEARCH: u32 = 1205;
+pub const NATIVE_STRING_SPLIT: u32 = 1206;
+
 /// Native indices of the Map/Set surface, mirroring `v12_engine::builtins`
 /// constants (same duplication pattern as the promise/array constants; the
 /// interpreter sits below the engine crate).
@@ -366,22 +373,10 @@ impl NativeRegistry for EmptyNativeRegistry {
         _args: &[JsValue],
         index: u32,
     ) -> Result<JsValue, JsValue> {
-        Err(JsValue::string(intern_text(
-            heap,
+        Err(JsValue::string(heap.intern_text(
             &format!("TypeError: native function #{index} is not registered"),
         )))
     }
-}
-
-/// Interns `text` as a canonical heap string (deduplicated by content, so
-/// equal texts share one handle — property-key identity relies on this).
-pub(crate) fn intern_text(heap: &mut Heap, text: &str) -> Handle<V12Str> {
-    let s = if text.is_ascii() {
-        V12Str::latin1(text.as_bytes().to_vec())
-    } else {
-        V12Str::utf16(text.encode_utf16().collect())
-    };
-    heap.intern_string(s)
 }
 
 /// Outcome of preparing a call.
@@ -853,8 +848,8 @@ impl<'a> Interp<'a> {
         self.stack.push(proto_v);
         self.stack.push(f_v);
         // `constructor` on the prototype points back at the function.
-        let ctor_key = JsValue::string(intern_text(self.heap, "constructor"));
-        let proto_key_v = JsValue::string(intern_text(self.heap, "prototype"));
+        let ctor_key = JsValue::string(self.heap.intern_text("constructor"));
+        let proto_key_v = JsValue::string(self.heap.intern_text("prototype"));
         let result = self
             .set_property(proto_v, ctor_key, f_v)
             .and_then(|()| self.set_property(f_v, proto_key_v, proto_v));
@@ -1886,7 +1881,7 @@ impl<'a> Interp<'a> {
                     .get(str_id as usize)
                     .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"))
                     .clone();
-                let h = intern_text(self.heap, &text);
+                let h = self.heap.intern_text(&text);
                 self.const_strings.insert((program, str_id), h);
                 Ok(JsValue::string(h))
             }
@@ -1895,8 +1890,7 @@ impl<'a> Interp<'a> {
             // BigInt literals are rejected at compile time today; reaching
             // these variants implies hand-built bytecode.
             Const::BigIntId(_) | Const::BigU64(_) => {
-                Err(JSException(JsValue::string(intern_text(
-                    self.heap,
+                Err(JSException(JsValue::string(self.heap.intern_text(
                     "InternalError: BigInt constants are not supported yet",
                 ))))
             }
@@ -1907,7 +1901,7 @@ impl<'a> Interp<'a> {
         if let Some(h) = self.typeof_names[tag] {
             return Ok(h);
         }
-        let h = intern_text(self.heap, TYPE_NAMES[tag]);
+        let h = self.heap.intern_text(TYPE_NAMES[tag]);
         self.typeof_names[tag] = Some(h);
         Ok(h)
     }
@@ -2558,8 +2552,8 @@ impl<'a> Interp<'a> {
             None => ("Error", text),
         };
         self.gc_protect();
-        let name_h = intern_text(self.heap, name);
-        let msg_h = intern_text(self.heap, message);
+        let name_h = self.heap.intern_text(name);
+        let msg_h = self.heap.intern_text(message);
         let obj = self.heap.alloc(JsObject::error(name_h, msg_h));
         self.heap.add_root(JsValue::object(obj));
         JsValue::object(obj)
@@ -2651,7 +2645,7 @@ impl<'a> Interp<'a> {
         if let Some(k) = self.length_key {
             return k;
         }
-        let h = intern_text(self.heap, "length");
+        let h = self.heap.intern_text("length");
         let k = PropKey::from_string(h);
         self.length_key = Some(k);
         k
@@ -2661,7 +2655,7 @@ impl<'a> Interp<'a> {
         if let Some(k) = self.prototype_key {
             return k;
         }
-        let h = intern_text(self.heap, "prototype");
+        let h = self.heap.intern_text("prototype");
         let k = PropKey::from_string(h);
         self.prototype_key = Some(k);
         k
@@ -2844,7 +2838,23 @@ impl<'a> Interp<'a> {
     ) -> Result<JsValue, JSException> {
         // Primitives have no wrappers yet: reads yield undefined, matching
         // real JS minus the built-ins that would populate the wrappers.
+        // String primitives get the regexp method surface (`match`/`replace`/
+        // `search`/`split`) synthesized structurally.
         let Some(obj) = obj_v.as_object() else {
+            if obj_v.is_string() {
+                if self.key_is(key_v, "match") {
+                    return Ok(self.map_set_method(crate::NATIVE_STRING_MATCH));
+                }
+                if self.key_is(key_v, "replace") {
+                    return Ok(self.map_set_method(crate::NATIVE_STRING_REPLACE));
+                }
+                if self.key_is(key_v, "search") {
+                    return Ok(self.map_set_method(crate::NATIVE_STRING_SEARCH));
+                }
+                if self.key_is(key_v, "split") {
+                    return Ok(self.map_set_method(crate::NATIVE_STRING_SPLIT));
+                }
+            }
             return Ok(JsValue::undefined());
         };
 
@@ -3595,13 +3605,13 @@ impl<'a> Interp<'a> {
             if let Some(n) = v.as_smi().map(f64::from).or(v.as_f64()) {
                 // Numeric key → decimal string.
                 let text = ops::number_to_string(n);
-                let h = intern_text(self.heap, &text);
+                let h = self.heap.intern_text(&text);
                 excl_keys.push(PropKey::from_string(h));
                 continue;
             }
             if let Some(b) = v.as_bool() {
                 let text = if b { "true" } else { "false" };
-                let h = intern_text(self.heap, text);
+                let h = self.heap.intern_text(text);
                 excl_keys.push(PropKey::from_string(h));
                 continue;
             }
@@ -3899,7 +3909,7 @@ impl<'a> Interp<'a> {
     /// a property key operand. Mirrors the compiler's `load_str_key`; kept
     /// here so iterator runtime paths don't hand-build key values.
     fn new_temp_key(&mut self, text: &str) -> JsValue {
-        JsValue::string(intern_text(self.heap, text))
+        JsValue::string(self.heap.intern_text(text))
     }
 
     fn op_check_is_array(&mut self, v: JsValue) -> Result<(), JSException> {
@@ -4008,7 +4018,7 @@ impl<'a> Interp<'a> {
                 return Ok(v);
             }
         }
-        let h = intern_text(self.heap, text);
+        let h = self.heap.intern_text(text);
         let key = PropKey::from_string(h);
         let shape = self.shape_of(global);
         if let Some(desc) = self.heap.lookup_property(shape, key)
@@ -4044,7 +4054,7 @@ impl<'a> Interp<'a> {
                 return Ok(());
             }
         }
-        let h = intern_text(self.heap, &text);
+        let h = self.heap.intern_text(&text);
         let key = PropKey::from_string(h);
         let shape = self.shape_of(global);
         // If already a property, update.
@@ -4311,7 +4321,7 @@ impl<'a> Interp<'a> {
                 // Fallback for function objects created outside `Closure`
                 // (host-created) that lack the spec-mandated property.
                 self.gc_protect();
-                let key_handle = intern_text(self.heap, "prototype");
+                let key_handle = self.heap.intern_text("prototype");
                 let p = self.heap.alloc(JsObject::default());
                 // Untracked until `set_property` stores it behind the callee;
                 // that path allocates, so root it for the duration.
@@ -4642,7 +4652,7 @@ impl<'a> Interp<'a> {
             }
         }
         self.gc_protect();
-        Ok(JsValue::string(intern_text(self.heap, &parts.join(&sep))))
+        Ok(JsValue::string(self.heap.intern_text(&parts.join(&sep))))
     }
 
     fn array_push_fallback(&mut self, this_v: JsValue, args: &[JsValue]) -> Result<JsValue, JSException> {

@@ -9,7 +9,7 @@
 
 use v12_heap::{Handle, Heap, JsValue, V12Str};
 
-use crate::{JSException, KIND_FUNCTION, intern_text};
+use crate::{JSException, KIND_FUNCTION};
 
 /// UTF-16 code units of a heap string, materializing composites first.
 pub(crate) fn string_units(heap: &mut Heap, h: Handle<V12Str>) -> Vec<u16> {
@@ -209,16 +209,16 @@ pub(crate) fn to_js_string(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>
         return Ok(h);
     }
     if let Some(n) = num_of(v) {
-        return Ok(intern_text(heap, &number_to_string(n)));
+        return Ok(heap.intern_text(&number_to_string(n)));
     }
     if let Some(b) = v.as_bool() {
-        return Ok(intern_text(heap, if b { "true" } else { "false" }));
+        return Ok(heap.intern_text(if b { "true" } else { "false" }));
     }
     if v.is_undefined() {
-        return Ok(intern_text(heap, "undefined"));
+        return Ok(heap.intern_text("undefined"));
     }
     if v.is_null() {
-        return Ok(intern_text(heap, "null"));
+        return Ok(heap.intern_text("null"));
     }
     if v.is_object() {
         let o = v.as_object().expect("object tag");
@@ -227,16 +227,14 @@ pub(crate) fn to_js_string(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>
         } else {
             "[object Object]"
         };
-        return Ok(intern_text(heap, text));
+        return Ok(heap.intern_text(text));
     }
     if v.is_symbol() {
-        return Err(JSException(JsValue::string(intern_text(
-            heap,
+        return Err(JSException(JsValue::string(heap.intern_text(
             "TypeError: Cannot convert a Symbol value to a string",
         ))));
     }
-    Err(JSException(JsValue::string(intern_text(
-        heap,
+    Err(JSException(JsValue::string(heap.intern_text(
         "InternalError: BigInt ToString is not supported yet",
     ))))
 }

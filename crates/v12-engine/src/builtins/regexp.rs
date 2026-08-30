@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, V12Str};
 
-use super::{NativeRegistry, intern_text, intern_type_error};
+use super::{NativeRegistry, intern_type_error};
 
 /// Compiled-regexp cache: object handle → compiled pattern. Owned by the
 /// registry so it survives GC (objects are traced strongly via the cache's
@@ -62,8 +62,8 @@ pub fn regexp_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Re
     let flags_text = canonicalize_flags(&flags_text).map_err(|e| {
         intern_type_error(heap, &format!("SyntaxError: {e}"))
     })?;
-    let source_h = intern_text(heap, &source_text);
-    let flags_h = intern_text(heap, &flags_text);
+    let source_h = heap.intern_text(&source_text);
+    let flags_h = heap.intern_text(&flags_text);
     Ok(JsValue::object(alloc_regexp(heap, JsValue::string(source_h), JsValue::string(flags_h))))
 }
 
@@ -273,7 +273,7 @@ fn match_result(
                     .iter()
                     .map(|&u| char::from_u32(u32::from(u)).unwrap_or('\u{FFFD}'))
                     .collect();
-                elements.push(JsValue::string(intern_text(heap, &text)));
+                elements.push(JsValue::string(heap.intern_text(&text)));
             }
             None => elements.push(JsValue::undefined()),
         }
@@ -284,9 +284,9 @@ fn match_result(
     // shape as root → length → index → input so the array's `length` stays at
     // physical slot 0 (the interpreter's array fast path reads
     // `properties[0]` for length) and the named props land at slots 1/2.
-    let length_key = intern_text(heap, "length");
-    let index_key = intern_text(heap, "index");
-    let input_key = intern_text(heap, "input");
+    let length_key = heap.intern_text("length");
+    let index_key = heap.intern_text("index");
+    let input_key = heap.intern_text("input");
     let shape0 = heap.root_shape();
     let shape_len = heap.add_property(shape0, v12_heap::PropKey::from_string(length_key), v12_heap::Attrs::DEFAULT);
     let shape_idx = heap.add_property(shape_len, v12_heap::PropKey::from_string(index_key), v12_heap::Attrs::DEFAULT);
@@ -300,7 +300,7 @@ fn match_result(
     }
     heap.get_mut(arr).properties[1] = JsValue::from_i32_smi(m.start() as i32)
         .unwrap_or_else(|| JsValue::from_f64(m.start() as f64));
-    heap.get_mut(arr).properties[2] = JsValue::string(intern_text(heap, input_text));
+    heap.get_mut(arr).properties[2] = JsValue::string(heap.intern_text(input_text));
     JsValue::object(arr)
 }
 
@@ -322,7 +322,7 @@ pub fn regexp_to_string(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Re
     }
     let (source, flags) = regexp_source_flags(heap, obj);
     let text = format!("/{source}/{flags}");
-    Ok(JsValue::string(intern_text(heap, &text)))
+    Ok(JsValue::string(heap.intern_text(&text)))
 }
 
 /// `RegExp.prototype.compile` — legacy recompile-in-place (Annex B).
@@ -351,8 +351,8 @@ pub fn regexp_compile(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: 
     let flags_text = canonicalize_flags(&flags_text).map_err(|e| {
         intern_type_error(heap, &format!("SyntaxError: {e}"))
     })?;
-    let source_h = intern_text(heap, &source_text);
-    let flags_h = intern_text(heap, &flags_text);
+    let source_h = heap.intern_text(&source_text);
+    let flags_h = heap.intern_text(&flags_text);
     heap.get_mut(obj).properties[SLOT_SOURCE] = JsValue::string(source_h);
     heap.get_mut(obj).properties[SLOT_FLAGS] = JsValue::string(flags_h);
     heap.get_mut(obj).properties[SLOT_LAST_INDEX] = JsValue::from_i32_smi(0).expect("0 fits Smi");
