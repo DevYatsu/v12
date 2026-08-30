@@ -1233,6 +1233,17 @@ impl<'a> Interp<'a> {
                         pc + op_width
                     });
                 }
+                Opcode::JumpIfNullish => {
+                    // Optional-chaining short-circuit: jump when the value is
+                    // null or undefined.
+                    let v = self.stack[base + usize::from(ra)];
+                    let nullish = v.is_null() || v.is_undefined();
+                    self.set_pc(if nullish {
+                        usize::from(narrow.imm16())
+                    } else {
+                        pc + op_width
+                    });
+                }
                 Opcode::LoopHeader => {
                     self.note_loop(fn_idx);
                     self.set_pc(pc + op_width);

@@ -10,7 +10,7 @@ use std::fmt;
 
 use v12_bytecode::{Const, ConstantPool, FunctionBytecode, HandlerRange, Instr, Opcode, WideOp};
 
-/// The 60 assigned opcode discriminants. Hardcoded on purpose: if someone
+/// The 61 assigned opcode discriminants. Hardcoded on purpose: if someone
 /// adds or renumbers an opcode, the exhaustive sweep fails until this list
 /// is updated alongside [`Opcode`].
 pub const KNOWN_DISCRIMINANTS: &[u8] = &[
@@ -22,10 +22,10 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     41, 42, 43, 44, 45, 46, 47, 48, 49, // GetProperty .. SetEnvSlot
     50, 51, 52, // CreateGenerator, SuspendYield, Await
     53, 54, // In, InstanceOf
-    55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, // CopyArrayRest .. Construct, ToNumber, MergeObject, DefineAccessor
+    55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, // CopyArrayRest .. Construct, ToNumber, MergeObject, DefineAccessor, JumpIfNullish
 ];
 
-pub const EXPECTED_OPCODE_COUNT: usize = 60;
+pub const EXPECTED_OPCODE_COUNT: usize = 61;
 
 /// Seeded splitmix64. Deterministic across platforms and runs.
 pub struct Rng(u64);

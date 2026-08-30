@@ -242,6 +242,13 @@ impl<'p> Mini<'p> {
                         pc + 1
                     };
                 }
+                Opcode::JumpIfNullish => {
+                    pc = if matches!(regs[instr.a() as usize], Val::Null | Val::Undefined) {
+                        instr.imm16() as usize
+                    } else {
+                        pc + 1
+                    };
+                }
                 Opcode::LoopHeader => pc += 1,
                 Opcode::Call => {
                     let dst = instr.a();

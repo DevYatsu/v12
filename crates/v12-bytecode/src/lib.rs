@@ -117,6 +117,9 @@ pub enum Opcode {
     /// `r{c}` = packed `(getter_fn, setter_fn)` pair register base. The
     /// getter/setter are function objects (or `undefined` for absent).
     DefineAccessor = 65,
+    /// Jumps to `target` (imm16) when `r{a}` is `null` or `undefined`.
+    /// Supports optional chaining (`a?.b`) short-circuiting.
+    JumpIfNullish = 66,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -185,6 +188,7 @@ impl TryFrom<u8> for Opcode {
             63 => Ok(Self::ToNumber),
             64 => Ok(Self::MergeObject),
             65 => Ok(Self::DefineAccessor),
+            66 => Ok(Self::JumpIfNullish),
             other => Err(other),
         }
     }
@@ -354,6 +358,7 @@ mod encoding_tests {
         Opcode::ToNumber,
         Opcode::MergeObject,
         Opcode::DefineAccessor,
+        Opcode::JumpIfNullish,
     ];
 
     #[test]
@@ -1304,6 +1309,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::ToNumber => "to_number",
         Opcode::MergeObject => "merge_object",
         Opcode::DefineAccessor => "define_accessor",
+        Opcode::JumpIfNullish => "jump_if_nullish",
     }
 }
 
@@ -1341,6 +1347,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         }
         Opcode::MergeObject => write!(f, " r{b}, r{c}"),
         Opcode::DefineAccessor => write!(f, " r{a}, r{b}, r{c}"),
+        Opcode::JumpIfNullish => write!(f, " r{a}, -> {}", i.imm16()),
         Opcode::Jump => write!(f, " -> {}", i.imm24()),
         Opcode::JumpIfFalse | Opcode::JumpIfTrue => write!(f, " r{a}, -> {}", i.imm16()),
         Opcode::LoopHeader => Ok(()),
