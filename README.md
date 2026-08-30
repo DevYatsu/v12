@@ -10,9 +10,10 @@ start, small in memory, and correct enough to run real programs.
 > **Status: early development — full pipeline works: compile → run → optimize.**
 > The compiler, heap, interpreter, baseline JIT, embedding facade, the `v12`
 > CLI, a Test262 harness, and a Tier-2 optimizer scaffold are implemented and
-> tested (535 tests, `cargo nextest run --workspace`). Generators, async
-> functions, and Promise microtasks are wired end to end. Expect breaking
-> changes.
+> tested (563 tests, `cargo nextest run --workspace`). Generators, async
+> functions, and Promise microtasks are wired end to end. Test262 `language`
+> conformance is at **32.1 % pass** (7 561 / 23 580 executable tests, 427
+> skipped) — the Phase 1 target is ≥60 %. Expect breaking changes.
 
 ## Why another engine?
 
@@ -80,6 +81,7 @@ See `crates/v12-api/README.md` for the full API surface and the runnable
 | `v12-api` | Embedder facade: `Context` (`eval`/`register_fn`/`call`/`pump`), `Runtime`, `V12Error` |
 | `v12-bytecode` | Register ISA (fixed-width 32-bit words), constant pool, `Program`, exception handler tables, disassembler |
 | `v12-heap` | Values, typed handles, hidden classes, elements storage, strings, mark-sweep garbage collector |
+| `v12-native` | Unified native dispatch: the `NativeId` enum, typed `NativeSig` signatures, and std `From`/`TryFrom` conversions shared by the interpreter and engine |
 | `v12-bccompiler` | oxc AST → bytecode compiler (scopes, closures, exceptions, generators/async, peephole pass) |
 | `v12-interp` | Tier-0 bytecode interpreter (iterative loop, handler tables, generator suspension, tier-up feedback) |
 | `v12-codegen` | Shared JIT seams: compiled-function cache, deopt maps, tier policy |
@@ -87,7 +89,7 @@ See `crates/v12-api/README.md` for the full API surface and the runnable
 | `v12-jit-opt` | Tier-2 speculative optimizer — type lattice, guards, SSA, inlining, loop versioning *(driver wiring pending)* |
 | `v12-regex` | ES-semantics wrapper over `regress` |
 | `v12-intl` | `Intl`/Temporal primitives over ICU4X and `temporal_rs` |
-| `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error/Promise), single realm, microtask queue, `Engine::eval` API, ESM module compilation |
+| `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error/Promise/Map/Set/RegExp), single realm, microtask queue, `Engine::eval` API, ESM module compilation |
 | `v12-cli` | The `v12` binary: REPL (rustyline — history + arrows) and script runner |
 
 ## Try the pieces that exist today
@@ -118,7 +120,7 @@ echo 'function* g(){ yield 1; yield 2; } console.log([...g()]);' | cargo run --b
 echo 'Promise.resolve(2).then(v => console.log("got " + v));' | cargo run --bin v12
 ```
 
-Run the test suite (535 tests, `cargo nextest run --workspace`):
+Run the test suite (563 tests, `cargo nextest run --workspace`):
 
 ```sh
 cargo nextest run --workspace
@@ -134,8 +136,10 @@ cargo nextest run --workspace
    that fails closed.
 3. **Narrow interfaces, frozen early.** The bytecode ISA and the value/heap
    layout were specified bit-exactly before dependent work started.
-4. **Safe Rust by default.** Every crate carries `#![forbid(unsafe_code)]`;
-   the JIT's executable-memory layer will be the single audited exception.
+4. **Safe Rust by default.** Engine-core crates opt into `[workspace.lints]`
+   with `unsafe_code` denied and `unwrap`/`expect`/`panic` warned; the two
+   audited exceptions (the `HostClosure` raw-pointer handle and the JIT's
+   executable-memory layer) carry scoped `#[allow]`s.
 
 ## Roadmap
 
@@ -151,9 +155,11 @@ cargo nextest run --workspace
 - [x] Test262 harness — parallel runner, TAP/JSON/human output, per-suite gating (`conformance/run.sh`)
 - [x] Tier-2 speculative optimizer — type lattice, guards, SSA, inlining, loop versioning
 - [x] ESM modules — `compile_source_as_module`, import/export linkage, `Engine` module compilation
-- [ ] Test262 `language` conformance burn-down — queue in `conformance/known-failures.md`
+- [x] Unified native dispatch — `NativeId` enum, typed `NativeSig`, structural built-in method lookup (O(1))
+- [x] Built-in breadth — Map/Set, RegExp runtime, `for-of`/iterator protocol, error objects
+- [ ] Test262 `language` conformance burn-down — 32.1 % → ≥60 % (queue in `conformance/known-failures.md`)
 - [ ] Tier-2 driver wiring — second tier-up fire → `JitOpt::compile`, deopt backoff
-- [ ] Built-in breadth — `Object.getOwnPropertyNames`, Map/Set, error objects with proper classes, `for-of`/iterator protocol
+- [ ] Built-in breadth — `Object.getOwnPropertyNames`, proper error classes/`Error.prototype`, remaining string methods
 
 Performance targets: match or beat V8 on startup time and memory footprint;
 interpreter performance in the class of modern production interpreters. Beating

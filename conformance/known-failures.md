@@ -1,10 +1,10 @@
-# Known failures — last scored 2026-08-29
+# Known failures — last scored 2026-08-30
 
 > Latest run: `cargo run -p test262-runner -- --filter language --jobs 8 --format json --json-out /tmp/t262.json`
-> on commit `f9dd7de` (generators+async now executable, async skips removed).
-> Totals: **24 873 tests, 4 858 pass / 19 588 fail / 427 skip, 19.9 % pass** over `test/language`.
+> Totals: **24 007 tests, 7 561 pass / 16 019 fail / 427 skip, 32.1 % pass** over `test/language`.
 > Treatment: `pass%` is over executable tests (`pass + fail`). Skips are not counted.
-> Async-flagged tests (~4.5k) are now executable; most fail on remaining gaps (`yield*`, `for-await`, promise jobs).
+> Since the 2026-08-29 score (19.9 %): the iterator protocol + `for-of`, the
+> RegExp runtime, and the unified native dispatch landed (+12.2 pts).
 >
 > The assignment-expression slice (`--filter language/expressions/assignment`, 818 files)
 > on the same build: **411 pass / 405 fail / 2 skip, 50.4 % pass** (baseline 49.5 %).
