@@ -693,6 +693,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.load_const(dst, Const::Str32(id), span)
     }
 
+    /// Loads the interned text `s` into a fresh register, returning it.
+    pub fn load_str_key(&mut self, s: &str, span: oxc_span::Span) -> Result<u16, CompileError> {
+        let d = self.new_temp();
+        self.load_str(d, s, span)?;
+        Ok(d)
+    }
+
     /// Loads an i64 as narrowly as the encoding allows.
     pub fn load_int(&mut self, dst: u16, v: i64, span: oxc_span::Span) {
         if (-128..=127).contains(&v) && dst <= u16::from(u8::MAX) {

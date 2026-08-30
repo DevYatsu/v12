@@ -249,6 +249,12 @@ impl<'p> Mini<'p> {
                         pc + 1
                     };
                 }
+                Opcode::SetPrototype => {
+                    // Reference interpreter: objects carry an optional proto
+                    // in the value; approximate by tracking on the object's
+                    // property store is out of scope — treat as no-op.
+                    pc += 1;
+                }
                 Opcode::LoopHeader => pc += 1,
                 Opcode::Call => {
                     let dst = instr.a();

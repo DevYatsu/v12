@@ -266,8 +266,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(dst)
             }
             Expression::ClassExpression(c) => {
-                let _ = c;
-                Err(self.err(e.span(), "class expressions are not supported"))
+                crate::class::class_expression(self, c, false)
             }
             Expression::TaggedTemplateExpression(t) => {
                 Err(self.err(t.span, "tagged template literals are not supported"))
@@ -1626,7 +1625,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_closure_instr(dst, idx, a.span)
     }
 
-    fn planned_index(&self, span: Span) -> Res<usize> {
+    pub(crate) fn planned_index(&self, span: Span) -> Res<usize> {
         self.comp
             .plans
             .fn_index

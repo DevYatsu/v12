@@ -1564,6 +1564,12 @@ impl<'a> Interp<'a> {
                     attempt!(self.env_write(ra, rb, v));
                     self.set_pc(pc + op_width);
                 }
+                Opcode::SetPrototype => {
+                    let obj_v = self.stack[base + usize::from(rb)];
+                    let proto_v = self.stack[base + usize::from(rc)];
+                    attempt!(self.op_set_prototype(obj_v, proto_v));
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::CopyArrayRest => {
                     let src_v = self.stack[base + usize::from(rb)];
                     let start = rc;
@@ -2937,8 +2943,10 @@ impl<'a> Interp<'a> {
             match d {
                 Descriptor::Data { attrs, .. } if !attrs.writable() => return Ok(()),
                 Descriptor::Accessor { setter, .. } if setter.is_none() => return Ok(()),
-                Descriptor::Accessor { .. } => {
-                    // Inherited accessor with setter: invoke (v1 no-op).
+                Descriptor::Accessor { setter: Some(setter), .. } => {
+                    // Inherited accessor with setter: invoke it with the
+                    // receiver and the assigned value.
+                    self.call_accessor_with(setter, JsValue::object(obj), &[value])?;
                     return Ok(());
                 }
                 _ => {}
@@ -3418,6 +3426,48 @@ impl<'a> Interp<'a> {
             props.resize(slot + 1, JsValue::hole());
         }
         Ok(())
+    }
+
+    /// `SetPrototype`: sets `obj`'s `[[Prototype]]` to `proto` (the class
+    /// `extends` wiring). `proto` may be an object or `null`; primitive
+    /// prototypes are rejected per ES `OrdinarySetPrototypeOf`.
+    fn op_set_prototype(&mut self, obj_v: JsValue, proto_v: JsValue) -> Result<(), JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: cannot set prototype of a primitive",
+            )));
+        };
+        match proto_v {
+            v if v.is_null() => {
+                if self.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
+                    return Ok(());
+                }
+                self.heap.get_mut(obj).prototype = None;
+                Ok(())
+            }
+            v => {
+                let Some(proto) = v.as_object() else {
+                    return Err(JSException(self.error_value(
+                        "TypeError: prototype must be an object or null",
+                    )));
+                };
+                if self.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
+                    return Ok(());
+                }
+                // ES: setting a prototype that creates a cycle is rejected.
+                let mut cur = Some(proto);
+                while let Some(c) = cur {
+                    if c == obj {
+                        return Err(JSException(self.error_value(
+                            "TypeError: cyclic [[Prototype]] value",
+                        )));
+                    }
+                    cur = self.heap.get(c).prototype;
+                }
+                self.heap.get_mut(obj).prototype = Some(proto);
+                Ok(())
+            }
+        }
     }
 
     fn op_check_is_array(&mut self, v: JsValue) -> Result<(), JSException> {

@@ -500,7 +500,10 @@ impl Heap {
     ) -> ShapeHandle {
         // An object literal `{ get x() {}, set x() {} }` defines both halves
         // of one accessor: the second call must merge into the existing
-        // descriptor, not create a sibling or discard the new half.
+        // descriptor, not create a sibling or discard the new half. The
+        // object is already bound to `parent` (the first call's child), so
+        // the merge target is `parent`'s own descriptor for `key`, not a
+        // transition of it.
         if let Some(existing) = self.get(parent).transitions.get(key) {
             let merged = match self.get(existing).descriptors.find(key) {
                 Some(Descriptor::Accessor {
@@ -544,6 +547,40 @@ impl Heap {
                 self.get_mut(existing).descriptors = out;
                 return existing;
             }
+        } else if let Some(Descriptor::Accessor {
+            getter: g, setter: s, ..
+        }) = self.get(parent).descriptors.find(key)
+        {
+            // `parent` already carries the accessor (the object was bound to
+            // the first half's child shape): merge the second half into that
+            // shape directly.
+            let merged_getter = getter.or(*g);
+            let merged_setter = setter.or(*s);
+            if merged_getter == *g && merged_setter == *s {
+                return parent;
+            }
+            let list = {
+                let parent_shape = self.get_mut(parent);
+                let mut list = parent_shape.descriptors.as_slice().to_vec();
+                for d in list.iter_mut() {
+                    if d.key() == key {
+                        *d = Descriptor::Accessor {
+                            key,
+                            getter: merged_getter,
+                            setter: merged_setter,
+                            attrs,
+                        };
+                        break;
+                    }
+                }
+                list
+            };
+            let mut out = crate::shape::Descriptors::default();
+            for d in list {
+                out.push(d);
+            }
+            self.get_mut(parent).descriptors = out;
+            return parent;
         }
         let (slot, proto_cell, mut descriptors) = {
             let parent_shape = self.get(parent);

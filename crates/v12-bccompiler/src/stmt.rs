@@ -151,8 +151,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Statement::VariableDeclaration(v) => self.var_decl(v),
             Statement::SwitchStatement(s) => self.switch_stmt(s, None),
             Statement::ClassDeclaration(c) => {
-                let _ = c;
-                Err(self.err(s.span(), "class declarations are not supported"))
+                // Class declarations bind the constructor to the class name;
+                // `class_expression` performs that store when `is_statement`.
+                let _ = crate::class::class_expression(self, c, true)?;
+                Ok(())
             }
             Statement::ForInStatement(f) => self.for_in_loop(f, None),
             Statement::ForOfStatement(f) => Err(self.err(

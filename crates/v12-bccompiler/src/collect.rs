@@ -315,9 +315,110 @@ impl<'s> Collector<'s> {
             Statement::FunctionDeclaration(f) => {
                 self.fn_unit(f, true, "<fn>");
             }
+            Statement::ClassDeclaration(c) => {
+                self.class_unit(c);
+            }
             Statement::VariableDeclaration(v) => self.var_decl(v),
             // break / continue / empty / debugger carry no references.
             _ => {}
+        }
+    }
+
+    /// Best-effort key text for a class element's static key (diagnostics only).
+    fn static_key_or_default(key: &oxc_ast::ast::PropertyKey<'_>) -> String {
+        crate::expr::static_key_text(key).unwrap_or_else(|| "<computed>".to_string())
+    }
+
+    /// Registers a class's constructor and every method as function units,
+    /// walking their bodies for nested functions/arrows/references. The
+    /// constructor unit's span is the *class* span so the lowering can find
+    /// it; each method unit's span is the method function's span.
+    fn class_unit(&mut self, c: &oxc_ast::ast::Class<'_>) {
+        // The class name binds in the enclosing unit.
+        if let Some(id) = &c.id
+            && let Some(sym) = id.symbol_id.get()
+        {
+            self.declare(sym);
+            if self.cur_unit() == 0 && !self.plans.is_module {
+                self.plans.global_vars.insert(sym);
+            }
+        }
+        // Walk the heritage expression for references.
+        if let Some(h) = &c.heritage {
+            self.expr(&h.expression);
+        }
+        // The constructor unit.
+        let parent = self.cur_unit();
+        let idx = self.plans.units.len();
+        let mut plan = UnitPlan::new(Some(parent), false, format!("<class>{}", c.id.as_ref().map(|i| i.name.as_str()).unwrap_or("")));
+        self.plans.units.push(plan);
+        self.plans.fn_index.insert(c.span, idx);
+        // The constructor's params/body come from the explicit `constructor`
+        // element; register them in the constructor unit.
+        self.unit_stack.push(idx);
+        let ctor_el = c.body.body.iter().find_map(|el| match el {
+            oxc_ast::ast::ClassElement::MethodDefinition(m)
+                if m.kind == oxc_ast::ast::MethodDefinitionKind::Constructor =>
+            {
+                Some(m)
+            }
+            _ => None,
+        });
+        if let Some(m) = ctor_el {
+            // The explicit constructor is a Function; register its params and
+            // walk its body, and note references inside it.
+            for p in &m.value.params.items {
+                self.binding_pattern(&p.pattern);
+            }
+            if let Some(rest) = &m.value.params.rest {
+                self.binding_pattern(&rest.rest.argument);
+            }
+            let param_count = self.plans.units[idx].decl_order.len();
+            self.plans.units[idx].param_count = param_count;
+            self.plans.units[idx].has_rest = m.value.params.rest.is_some();
+            if let Some(body) = m.value.body.as_deref() {
+                self.stmt_list(&body.statements);
+            }
+        }
+        self.unit_stack.pop();
+        // Each non-constructor method is its own unit.
+        for el in &c.body.body {
+            if let oxc_ast::ast::ClassElement::MethodDefinition(m) = el
+                && m.kind != oxc_ast::ast::MethodDefinitionKind::Constructor
+            {
+                let midx = self.plans.units.len();
+                let mut mplan = UnitPlan::new(
+                    Some(parent),
+                    false,
+                    format!("<method>{}", Self::static_key_or_default(&m.key)),
+                );
+                let parent_strict = *self.strict_stack.last().unwrap_or(&false);
+                let own_strict = m.value.body.as_deref().is_some_and(|b| {
+                    b.directives
+                        .iter()
+                        .any(|d| d.expression.value == "use strict")
+                });
+                mplan.is_strict = parent_strict || own_strict;
+                let m_strict = mplan.is_strict;
+                self.plans.units.push(mplan);
+                self.plans.fn_index.insert(m.value.span, midx);
+                self.unit_stack.push(midx);
+                self.strict_stack.push(m_strict);
+                for p in &m.value.params.items {
+                    self.binding_pattern(&p.pattern);
+                }
+                if let Some(rest) = &m.value.params.rest {
+                    self.binding_pattern(&rest.rest.argument);
+                }
+                let param_count = self.plans.units[midx].decl_order.len();
+                self.plans.units[midx].param_count = param_count;
+                self.plans.units[midx].has_rest = m.value.params.rest.is_some();
+                if let Some(body) = m.value.body.as_deref() {
+                    self.stmt_list(&body.statements);
+                }
+                self.unit_stack.pop();
+                self.strict_stack.pop();
+            }
         }
     }
 
@@ -664,6 +765,9 @@ impl<'s> Collector<'s> {
             }
             Expression::ArrowFunctionExpression(a) => {
                 self.arrow_unit(a);
+            }
+            Expression::ClassExpression(c) => {
+                self.class_unit(c);
             }
             Expression::BinaryExpression(b) => {
                 self.expr(&b.left);

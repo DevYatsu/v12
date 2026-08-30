@@ -953,7 +953,6 @@ fn unsupported_constructs_fail_as_compile_errors() {
     let cases: &[&str] = &[
         "let x = 1n;",
         "for (let v of [1]) {}",
-        "class C {}",
         "return 1;",
     ];
     for src in cases {

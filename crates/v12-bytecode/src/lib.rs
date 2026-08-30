@@ -120,6 +120,10 @@ pub enum Opcode {
     /// Jumps to `target` (imm16) when `r{a}` is `null` or `undefined`.
     /// Supports optional chaining (`a?.b`) short-circuiting.
     JumpIfNullish = 66,
+    /// Sets `r{b}`'s `[[Prototype]]` to `r{c}` (the class `extends` wiring;
+    /// also used by `Object.setPrototypeOf`). `r{a}` is unused. Rejects
+    /// primitive targets with a TypeError.
+    SetPrototype = 67,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -189,6 +193,7 @@ impl TryFrom<u8> for Opcode {
             64 => Ok(Self::MergeObject),
             65 => Ok(Self::DefineAccessor),
             66 => Ok(Self::JumpIfNullish),
+            67 => Ok(Self::SetPrototype),
             other => Err(other),
         }
     }
@@ -359,6 +364,7 @@ mod encoding_tests {
         Opcode::MergeObject,
         Opcode::DefineAccessor,
         Opcode::JumpIfNullish,
+        Opcode::SetPrototype,
     ];
 
     #[test]
@@ -1314,6 +1320,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::MergeObject => "merge_object",
         Opcode::DefineAccessor => "define_accessor",
         Opcode::JumpIfNullish => "jump_if_nullish",
+        Opcode::SetPrototype => "set_prototype",
     }
 }
 
@@ -1351,6 +1358,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         }
         Opcode::MergeObject => write!(f, " r{b}, r{c}"),
         Opcode::DefineAccessor => write!(f, " r{a}, r{b}, r{c}"),
+        Opcode::SetPrototype => write!(f, " r{b}, r{c}"),
         Opcode::JumpIfNullish => write!(f, " r{a}, -> {}", i.imm16()),
         Opcode::Jump => write!(f, " -> {}", i.imm24()),
         Opcode::JumpIfFalse | Opcode::JumpIfTrue => write!(f, " r{a}, -> {}", i.imm16()),

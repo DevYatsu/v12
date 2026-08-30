@@ -2,7 +2,9 @@
 //! copies, `this` threading, self-reference binding), body dispatch, and
 //! assembly into [`Compiler::functions`].
 
-use oxc_ast::ast::{ArrowFunctionExpression, Function, FunctionType, Program};
+use oxc_ast::ast::{
+    ArrowFunctionExpression, Class, Function, FunctionType, MethodDefinitionKind, Program,
+};
 use oxc_semantic::SymbolId;
 use oxc_span::GetSpan;
 use v12_bytecode::{FunctionBytecode, Opcode};
@@ -14,6 +16,11 @@ pub enum UnitNode<'a> {
     Main(&'a Program<'a>),
     Fn(&'a Function<'a>),
     Arrow(&'a ArrowFunctionExpression<'a>),
+    /// The constructor unit of a class: the explicit `constructor` body, or a
+    /// default body when the class has none.
+    Class(&'a Class<'a>),
+    /// A non-constructor class method.
+    Method(&'a Function<'a>),
 }
 
 fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
@@ -92,6 +99,21 @@ pub fn compile_unit(
             cx.b.is_async = false;
             cx.b.is_arrow = false;
         }
+        UnitNode::Class(c) => {
+            // The class constructor unit. If an explicit `constructor` exists,
+            // its function is the unit's body source; the collect pass stored
+            // its span as the unit's span. The unit itself is a plain
+            // constructible function (never generator/async/arrow).
+            cx.b.is_generator = false;
+            cx.b.is_async = false;
+            cx.b.is_arrow = false;
+            let _ = c;
+        }
+        UnitNode::Method(f) => {
+            cx.b.is_generator = f.generator;
+            cx.b.is_async = f.r#async;
+            cx.b.is_arrow = false;
+        }
     }
     emit_prologue(&mut cx, idx, self_symbol)?;
     if cx.b.is_generator {
@@ -139,6 +161,37 @@ pub fn compile_unit(
                 cx.emit_reg1(Opcode::Return, v, expr.span());
             }
         },
+        UnitNode::Class(c) => {
+            // Find the explicit `constructor` element; compile its body, or
+            // emit a default empty constructor when absent.
+            let ctor = c.body.body.iter().find_map(|el| match el {
+                oxc_ast::ast::ClassElement::MethodDefinition(m)
+                    if m.kind == MethodDefinitionKind::Constructor =>
+                {
+                    Some(m)
+                }
+                _ => None,
+            });
+            if let Some(m) = ctor {
+                let Some(body) = m.value.body.as_deref() else {
+                    return Err(cx.err(
+                        m.span,
+                        "constructor without a body is not supported",
+                    ));
+                };
+                cx.stmt_list(&body.statements)?;
+            }
+            // Default constructor: empty body; `return undefined`.
+        }
+        UnitNode::Method(f) => {
+            let Some(body) = f.body.as_deref() else {
+                return Err(cx.err(
+                    f.span(),
+                    "class method without a body is not supported",
+                ));
+            };
+            cx.stmt_list(&body.statements)?;
+        }
     }
     let mut fb = cx.finish()?;
     fb.name_hint = Some(comp.plans.units[idx].name_hint.clone());

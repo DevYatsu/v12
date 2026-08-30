@@ -68,6 +68,7 @@
 
 #![forbid(unsafe_code)]
 
+mod class;
 mod collect;
 mod expr;
 mod model;
