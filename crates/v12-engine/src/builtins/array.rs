@@ -1,8 +1,9 @@
 //! Array built-ins: push, pop, and length handling.
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, V12Str};
+use v12_native::Throw;
 
-use super::intern_type_error;
+use super::{helpers, intern_type_error};
 
 /// Maximum array length (2^32 - 1).
 const MAX_ARRAY_LENGTH: u32 = u32::MAX;
@@ -14,45 +15,33 @@ fn length_prop(heap: &mut Heap) -> v12_heap::PropKey {
 }
 
 /// `Array.prototype.push(...items)` – appends elements and updates `length`.
-pub fn array_push(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
-    let Some(obj) = this.as_object() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: Array.prototype.push called on non-object",
-        ));
-    };
+pub fn array_push(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "Array.prototype.push", None)?;
     let len = array_length(heap, obj);
     if len as usize + args.len() > MAX_ARRAY_LENGTH as usize {
-        return Err(intern_type_error(heap, "RangeError: invalid array length"));
+        return Err((intern_type_error(heap, "RangeError: invalid array length")).into());
     }
     for &item in args {
         let obj_mut = heap.get_mut(obj);
-        if obj_mut.kind == v12_heap::KIND_ARRAY {
+        if obj_mut.kind == v12_heap::Kind::Array {
             obj_mut.elements_array.push(item);
         } else {
             obj_mut.elements.push(item);
         }
     }
-    let new_len = if heap.get(obj).kind == v12_heap::KIND_ARRAY {
+    let new_len = if heap.get(obj).kind == v12_heap::Kind::Array {
         heap.get(obj).elements_array.len() as u32
     } else {
         heap.get(obj).elements.len() as u32
     };
     sync_length(heap, obj, new_len);
-    let len_value =
-        JsValue::from_i32_smi(new_len as i32).unwrap_or(JsValue::from_f64(f64::from(new_len)));
-    Ok(len_value)
+    Ok(helpers::smi_or_f64(i64::from(new_len)))
 }
 
 /// `Array.prototype.pop()` – removes the last element.
-pub fn array_pop(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
-    let Some(obj) = this.as_object() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: Array.prototype.pop called on non-object",
-        ));
-    };
-    let popped = if heap.get(obj).kind == v12_heap::KIND_ARRAY {
+pub fn array_pop(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "Array.prototype.pop", None)?;
+    let popped = if heap.get(obj).kind == v12_heap::Kind::Array {
         heap.get_mut(obj)
             .elements_array
             .pop()
@@ -68,7 +57,7 @@ pub fn array_pop(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<Js
     } else {
         popped
     };
-    let new_len = if heap.get(obj).kind == v12_heap::KIND_ARRAY {
+    let new_len = if heap.get(obj).kind == v12_heap::Kind::Array {
         heap.get(obj).elements_array.len() as u32
     } else {
         heap.get(obj).elements.len() as u32

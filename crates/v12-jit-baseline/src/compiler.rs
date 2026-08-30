@@ -13,11 +13,18 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
-use v12_bytecode::{FunctionBytecode, Opcode, PcMapEntry, WideOp};
+use v12_bytecode::{BytecodeError, FunctionBytecode, Opcode, PcMapEntry, WideOp};
 use v12_codegen::{CompiledFn, JitCache, JitError, JitExecFn, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 use v12_heap::JsValue;
 
 use crate::runtime;
+
+/// Converts a structured message into the JIT's invalid-bytecode error.
+fn invalid_bytecode(reason: impl Into<String>) -> JitError {
+    JitError::InvalidBytecode(BytecodeError::InvalidFunction {
+        reason: reason.into(),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Baseline compiler
@@ -55,7 +62,7 @@ impl JitBaseline {
             });
         }
         if usize::from(bytecode.max_regs) > MAX_JIT_REGISTERS {
-            return Err(JitError::InvalidBytecode(format!(
+            return Err(invalid_bytecode(format!(
                 "max_regs {} exceeds JIT limit {}",
                 bytecode.max_regs, MAX_JIT_REGISTERS
             )));
@@ -206,7 +213,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
 
         let instr = bytecode.instrs[pc];
         let Some(op) = instr.op() else {
-            return Err(JitError::InvalidBytecode(format!(
+            return Err(invalid_bytecode(format!(
                 "unassigned opcode byte at pc {pc}"
             )));
         };
@@ -215,7 +222,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
         if op == Opcode::Wide {
             let words = &bytecode.instrs[pc..];
             let (wide, width) = WideOp::try_decode(words)
-                .map_err(|e| JitError::InvalidBytecode(format!("wide decode at {pc}: {e}")))?;
+                .map_err(|e| invalid_bytecode(format!("wide decode at {pc}: {e}")))?;
             match wide {
                 WideOp::LoadConstW { dst, const_id } => {
                     let bits = resolve_const_bits(bytecode, const_id)?;
@@ -534,7 +541,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
             Opcode::Jump => {
                 let target = instr.imm24() as usize;
                 if target >= blocks.len() {
-                    return Err(JitError::InvalidBytecode(format!(
+                    return Err(invalid_bytecode(format!(
                         "Jump target {target} out of bounds at pc {pc}"
                     )));
                 }
@@ -545,7 +552,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let target = usize::from(instr.imm16());
                 ensure_reg(cond, bytecode.max_regs)?;
                 if target >= blocks.len() {
-                    return Err(JitError::InvalidBytecode(format!(
+                    return Err(invalid_bytecode(format!(
                         "JumpIfFalse target {target} out of bounds at pc {pc}"
                     )));
                 }
@@ -565,7 +572,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let target = usize::from(instr.imm16());
                 ensure_reg(cond, bytecode.max_regs)?;
                 if target >= blocks.len() {
-                    return Err(JitError::InvalidBytecode(format!(
+                    return Err(invalid_bytecode(format!(
                         "JumpIfTrue target {target} out of bounds at pc {pc}"
                     )));
                 }
@@ -647,7 +654,7 @@ fn resolve_const_bits(bytecode: &FunctionBytecode, id: u32) -> Result<u64, JitEr
         }
         Some(v12_bytecode::Const::Null) => Ok(JsValue::null().bits()),
         Some(other) => Err(JitError::UnsupportedWideOp(format!("const kind {other:?}"))),
-        None => Err(JitError::InvalidBytecode(format!(
+        None => Err(invalid_bytecode(format!(
             "const id {id} out of range"
         ))),
     }
@@ -657,7 +664,7 @@ fn ensure_reg(idx: usize, max: u16) -> Result<(), JitError> {
     if idx < usize::from(max) {
         Ok(())
     } else {
-        Err(JitError::InvalidBytecode(format!(
+        Err(invalid_bytecode(format!(
             "register r{idx} out of bounds (max_regs={max})"
         )))
     }

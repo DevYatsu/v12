@@ -205,7 +205,7 @@ pub enum Transitions {
         entries: [Option<(PropKey, ShapeHandle)>; TRANSITIONS_INLINE_CAP],
         len: u8,
     },
-    Map(Box<hashbrown::HashMap<PropKey, ShapeHandle>>),
+    Map(Box<rustc_hash::FxHashMap<PropKey, ShapeHandle>>),
 }
 
 impl Default for Transitions {
@@ -248,6 +248,16 @@ impl Transitions {
     /// is one-way (shapes are immutable once published, so nothing ever
     /// shrinks back).
     pub fn insert(&mut self, key: PropKey, child: ShapeHandle) {
+        // Invariant: the inline tier never holds more than
+        // TRANSITIONS_INLINE_CAP live edges (the append path below upgrades
+        // to the map tier at the cap instead of overflowing).
+        crate::assert_engine!(
+            !matches!(
+                self,
+                Transitions::Inline { len, .. } if *len as usize > TRANSITIONS_INLINE_CAP
+            ),
+            "inline transition count exceeds the inline cap"
+        );
         if self.get(key).is_some() {
             // Replacement never changes the count, so neither tier needs its
             // append path.
@@ -271,7 +281,10 @@ impl Transitions {
                     *len += 1;
                     return;
                 }
-                let mut map = hashbrown::HashMap::with_capacity(TRANSITIONS_INLINE_CAP + 1);
+                let mut map = rustc_hash::FxHashMap::with_capacity_and_hasher(
+                    TRANSITIONS_INLINE_CAP + 1,
+                    rustc_hash::FxBuildHasher,
+                );
                 for (k, h) in entries.iter_mut().flatten() {
                     map.insert(*k, *h);
                 }
@@ -444,6 +457,32 @@ impl ValidityCellId {
 impl Default for ValidityCellId {
     fn default() -> Self {
         Self::NONE
+    }
+}
+
+/// One version stamp of a validity cell.
+///
+/// A guard records the [`Serial`] it observed and holds exactly while the
+/// cell's current serial still equals it. Wrapping the `u32` in a nominal
+/// type keeps a raw serial from being confused with a cell id or a handle
+/// index when guards cross the heap boundary.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Serial(pub u32);
+
+impl Serial {
+    /// The raw serial value.
+    #[inline]
+    pub fn value(self) -> u32 {
+        self.0
+    }
+}
+
+impl Serial {
+    /// The next serial after `self`, wrapping so a cell bumped 2³² times
+    /// starts a fresh era instead of aborting (mirrors `bump_validity`).
+    #[inline]
+    pub fn wrapping_next(self) -> Serial {
+        Serial(self.0.wrapping_add(1))
     }
 }
 

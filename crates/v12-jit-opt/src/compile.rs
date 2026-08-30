@@ -49,12 +49,19 @@
 //!     phi = phi(v8, v9)
 //!```
 
-use v12_bytecode::{FunctionBytecode, Opcode};
+use v12_bytecode::{BytecodeError, FunctionBytecode, Opcode};
 use v12_codegen::{CompiledFn, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
 use v12_heap::JsValue;
 
 use crate::deopt::DeoptMap;
 use crate::guard::{Assumption, GuardKind, LOOP_HOT_THRESHOLD, Lattice};
+
+/// Converts a structured message into the JIT's invalid-bytecode error.
+fn invalid_bytecode(reason: impl Into<String>) -> JitError {
+    JitError::InvalidBytecode(BytecodeError::InvalidFunction {
+        reason: reason.into(),
+    })
+}
 
 #[cfg(feature = "jit")]
 use cranelift_codegen::ir::InstBuilder;
@@ -509,7 +516,7 @@ fn build_ssa_ir(
 
         let instr = fb.instrs[pc as usize];
         let Some(op) = instr.op() else {
-            return Err(JitError::InvalidBytecode(format!(
+            return Err(invalid_bytecode(format!(
                 "unassigned opcode byte at pc {pc}"
             )));
         };
@@ -517,7 +524,7 @@ fn build_ssa_ir(
         if op == Opcode::Wide {
             let words = &fb.instrs[pc as usize..];
             let Ok((wide, _width)) = v12_bytecode::WideOp::try_decode(words) else {
-                return Err(JitError::InvalidBytecode(format!("wide decode at {pc}")));
+                return Err(invalid_bytecode(format!("wide decode at {pc}")));
             };
             match wide {
                 v12_bytecode::WideOp::LoadConstW { dst, const_id } => {
@@ -817,7 +824,7 @@ fn resolve_const_bits(fb: &FunctionBytecode, id: u32) -> Result<u64, JitError> {
         Some(v12_bytecode::Const::Str32(_)) => Ok(JsValue::undefined().bits()),
         Some(v12_bytecode::Const::Null) => Ok(JsValue::null().bits()),
         Some(other) => Err(JitError::UnsupportedWideOp(format!("const kind {other:?}"))),
-        None => Err(JitError::InvalidBytecode(format!(
+        None => Err(invalid_bytecode(format!(
             "const id {id} out of range"
         ))),
     }
@@ -862,7 +869,7 @@ impl Pipeline {
             });
         }
         if usize::from(fb.max_regs) > MAX_JIT_REGISTERS {
-            return Err(JitError::InvalidBytecode(format!(
+            return Err(invalid_bytecode(format!(
                 "max_regs {} exceeds JIT limit {}",
                 fb.max_regs, MAX_JIT_REGISTERS
             )));
@@ -954,7 +961,7 @@ impl Pipeline {
             });
         }
         if usize::from(fb.max_regs) > MAX_JIT_REGISTERS {
-            return Err(JitError::InvalidBytecode(format!(
+            return Err(invalid_bytecode(format!(
                 "max_regs {} exceeds JIT limit {}",
                 fb.max_regs, MAX_JIT_REGISTERS
             )));

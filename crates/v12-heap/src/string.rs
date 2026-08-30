@@ -61,6 +61,10 @@ use std::vec::Vec;
 /// dominate real workloads — paying one copy at build time beats charging
 /// every later reader a tree walk. Above it, deferral wins: repeated
 /// appends stay O(1) and the rope flattens once, on demand.
+///
+/// Same shape as V8's `ConsString` flatten-on-threshold and JSC's rope
+/// policy: the exact threshold is a tuning constant, but the *existence* of
+/// an eager-flatten bound for short concats is the shared precedent.
 pub const CONCAT_EAGER_FLATTEN_MAX_UNITS: usize = 128;
 
 /// Maximum rope (Cons/Sliced chain) depth before a composite is flattened
@@ -69,6 +73,10 @@ pub const CONCAT_EAGER_FLATTEN_MAX_UNITS: usize = 128;
 /// compare) is iterative, so the cost is bounded, but the *node* count and
 /// per-node overhead grow linearly with appends — flattening past the cap
 /// keeps the tree shallow and the memory proportional to the text.
+///
+/// V8 flattens ropes at a fixed depth (currently 30) for the same reason:
+/// an unbounded Cons chain would make every later walk linear in the number
+/// of appends, not the text length.
 pub const ROPE_MAX_DEPTH: usize = 64;
 
 /// FNV-1a 32-bit offset basis: standard Fowler–Noll–Vo parameter, giving

@@ -4,6 +4,16 @@
 //! objects use shape-guarded fast paths. Proxy objects trap via a stub that
 //! reports a `TypeError`. The engine never assumes an object's kind without
 //! checking it, so proxy-blind fast paths remain correct.
+//!
+//! **Dispatch-table convention:** this module is the engine's internal-method
+//! vtable — a flat function-pointer table indexed by [`ObjectKind`], resolved
+//! by a `match`, never `dyn`/reflection. New object kinds add a row to the
+//! table (and to the `match` in the dispatch helpers); the table stays
+//! predictable and trace-friendly, which is what lets the JIT tiers emit
+//! shape-guarded direct calls instead of runtime lookups. The `dyn` sites in
+//! the codebase are confined to the control-path seams (`TierCompiler`,
+//! `JitExecFn` in `v12-codegen`); the engine's hot dispatch is always flat
+//! `match` over a concrete enum.
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey, ShapeHandle};
 
@@ -118,7 +128,7 @@ fn ordinary_get_own_property(
         return Ok(None);
     }
     let kind = heap.get(obj).kind;
-    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+    if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
     {
         if let Some(slot) = heap.get(obj).elements.get(idx as usize) {
@@ -169,7 +179,7 @@ fn ordinary_define_own_property(
         return Err(type_error(heap, "Too many properties"));
     }
     let kind = heap.get(obj).kind;
-    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+    if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
     {
         let len = heap.get(obj).elements.len();
@@ -241,7 +251,7 @@ fn ordinary_has_property(
     key: PropKey,
 ) -> InternalResult<bool> {
     let kind = heap.get(obj).kind;
-    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+    if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
         && let Some(slot) = heap.get(obj).elements.get(idx as usize)
         && !slot.is_hole()
@@ -266,7 +276,7 @@ fn ordinary_get(
     _receiver: JsValue,
 ) -> InternalResult<JsValue> {
     let kind = heap.get(obj).kind;
-    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+    if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
         && let Some(slot) = heap.get(obj).elements.get(idx as usize)
     {
@@ -321,7 +331,7 @@ fn ordinary_set(
     _receiver: JsValue,
 ) -> InternalResult<bool> {
     let kind = heap.get(obj).kind;
-    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+    if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
     {
         let len = heap.get(obj).elements.len();
@@ -376,7 +386,7 @@ fn ordinary_set(
 
 fn ordinary_delete(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey) -> InternalResult<bool> {
     let kind = heap.get(obj).kind;
-    if (kind == v12_heap::KIND_ARGUMENTS || kind == v12_heap::KIND_ARRAY)
+    if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
     {
         if let Some(slot) = heap.get_mut(obj).elements.get_mut(idx as usize) {
@@ -560,8 +570,7 @@ pub fn methods_for(kind: ObjectKind) -> &'static InternalMethods {
 /// Resolves an object's kind from its header.
 #[must_use]
 pub fn kind_of(heap: &Heap, obj: Handle<JsObject>) -> ObjectKind {
-    const KIND_PROXY: u8 = 99;
-    if heap.get(obj).kind == KIND_PROXY {
+    if heap.get(obj).kind == v12_heap::Kind::Proxy {
         ObjectKind::Proxy
     } else {
         ObjectKind::Ordinary

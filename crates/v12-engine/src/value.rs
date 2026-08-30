@@ -20,61 +20,37 @@ pub trait FromValue: Sized {
 
 impl ToValue for bool {
     fn to_value(&self, _heap: &mut Heap) -> JsValue {
-        if *self {
-            JsValue::true_()
-        } else {
-            JsValue::false_()
-        }
+        JsValue::from(*self)
     }
 }
 
 impl FromValue for bool {
     fn from_value(_heap: &Heap, value: JsValue) -> Option<Self> {
-        value.as_bool()
+        value.try_into().ok()
     }
 }
 
 impl ToValue for i32 {
     fn to_value(&self, _heap: &mut Heap) -> JsValue {
-        if let Some(smi) = JsValue::from_i32_smi(*self) {
-            smi
-        } else {
-            JsValue::from_f64(f64::from(*self))
-        }
+        JsValue::from(*self)
     }
 }
 
 impl FromValue for i32 {
     fn from_value(_heap: &Heap, value: JsValue) -> Option<Self> {
-        if let Some(n) = value.as_smi() {
-            return Some(n);
-        }
-        if let Some(n) = value.as_f64()
-            && n.fract() == 0.0
-            && n >= f64::from(i32::MIN)
-            && n <= f64::from(i32::MAX)
-        {
-            return Some(n as i32);
-        }
-        None
+        value.try_into().ok()
     }
 }
 
 impl ToValue for f64 {
     fn to_value(&self, _heap: &mut Heap) -> JsValue {
-        JsValue::from_f64(*self)
+        JsValue::from(*self)
     }
 }
 
 impl FromValue for f64 {
     fn from_value(_heap: &Heap, value: JsValue) -> Option<Self> {
-        if let Some(n) = value.as_f64() {
-            return Some(n);
-        }
-        if let Some(n) = value.as_smi().map(f64::from) {
-            return Some(n);
-        }
-        None
+        value.try_into().ok()
     }
 }
 

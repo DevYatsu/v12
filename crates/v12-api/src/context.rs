@@ -9,14 +9,18 @@ use crate::error::V12Error;
 /// Wraps a user closure into a `HostClosure` (Rc<RefCell<dyn FnMut>>).
 ///
 /// The double indirection lets the registry hold a cloneable handle while
-/// the closure stays callable across interpreter re-entrancy.
-fn wrap_host_closure<F>(f: F) -> v12_engine::HostClosure
+/// the closure stays callable across interpreter re-entrancy. The user
+/// closure's `Err(JsValue)` (a value to throw) is adapted to the engine's
+/// [`v12_engine::Throw`].
+fn wrap_host_closure<F>(mut f: F) -> v12_engine::HostClosure
 where
     F: FnMut(&mut v12_heap::Heap, v12_engine::JsValue, &[v12_engine::JsValue])
         -> Result<v12_engine::JsValue, v12_engine::JsValue>
         + 'static,
 {
-    v12_engine::HostClosure::new(f)
+    v12_engine::HostClosure::new(move |heap, this, args| {
+        f(heap, this, args).map_err(v12_engine::Throw::Value)
+    })
 }
 
 /// One isolated JavaScript execution context.

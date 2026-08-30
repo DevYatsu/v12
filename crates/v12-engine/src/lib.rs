@@ -17,6 +17,7 @@ pub use job_queue::JobQueue;
 pub use realm::Realm;
 pub use value::{FromValue, ToValue};
 pub use builtins::HostClosure;
+pub use v12_native::{NativeId, Throw};
 
 pub use v12_heap::{Heap, JsValue};
 

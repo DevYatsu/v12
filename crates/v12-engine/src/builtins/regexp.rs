@@ -1,6 +1,6 @@
 //! RegExp built-ins over the [`v12_regex`] wrapper (which wraps `regress`).
 //!
-//! A RegExp object is a `KIND_REGEXP` with `properties =
+//! A RegExp object is a `Kind::RegExp` with `properties =
 //! [source, flags, lastIndex]`:
 //!
 //! - `properties[0]`: the source text (heap string; may be the canonical
@@ -14,18 +14,20 @@
 //! only happens when the source or flags change. The table is owned by the
 //! registry, which outlives every function object referencing it.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::rc::Rc;
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, V12Str};
+use v12_native::Throw;
 
-use super::{NativeRegistry, intern_type_error};
+use super::{helpers, intern_type_error};
 
 /// Compiled-regexp cache: object handle → compiled pattern. Owned by the
 /// registry so it survives GC (objects are traced strongly via the cache's
 /// `u32` keys only as opaque ids — the cache holds no `Handle`s, so entries
 /// for collected objects are simply stale and get overwritten on reuse).
-pub type RegexCache = Arc<RwLock<HashMap<u32, v12_regex::CompiledRegex>>>;
+pub type RegexCache = Rc<RefCell<HashMap<u32, v12_regex::CompiledRegex>>>;
 
 /// The `lastIndex` slot index in a RegExp object's `properties`.
 const SLOT_SOURCE: usize = 0;
@@ -38,12 +40,12 @@ const SLOT_LAST_INDEX: usize = 2;
 /// undefined, the new object copies `pattern.source` and `pattern.flags`.
 /// Otherwise `pattern` is coerced to a string (with `undefined` → `""` and
 /// `null` → `"null"` per ToString). Invalid flags are a SyntaxError.
-pub fn regexp_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn regexp_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let (source_text, flags_text) = match (args.first(), args.get(1)) {
         (Some(first), None) => {
             // Copy-from-regexp fast path.
             if let Some(obj) = first.as_object()
-                && heap.get(obj).kind == v12_heap::KIND_REGEXP
+                && heap.get(obj).kind == v12_heap::Kind::RegExp
             {
                 let source = heap.get(obj).properties[SLOT_SOURCE];
                 let flags = heap.get(obj).properties[SLOT_FLAGS];
@@ -68,11 +70,10 @@ pub fn regexp_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Re
 }
 
 fn alloc_regexp(heap: &mut Heap, source: JsValue, flags: JsValue) -> Handle<JsObject> {
-    let obj = heap.alloc(JsObject::regexp(
+    let obj = helpers::alloc_obj(heap, JsObject::regexp(
         source.as_string().expect("source is a string"),
         flags.as_string().expect("flags is a string"),
     ));
-    heap.add_root(JsValue::object(obj));
     obj
 }
 
@@ -85,7 +86,7 @@ fn stringify_arg(heap: &mut Heap, v: JsValue) -> String {
     if v.is_null() {
         return "null".to_string();
     }
-    super::value_display_text(heap, v)
+    helpers::value_text(heap, v)
 }
 
 /// Validates and canonicalizes a flag string into `"dgimsuvy"` order.
@@ -95,10 +96,10 @@ fn canonicalize_flags(flags: &str) -> Result<String, String> {
     let order = ['d', 'g', 'i', 'm', 's', 'u', 'v', 'y'];
     for c in flags.chars() {
         let Some(idx) = order.iter().position(|&o| o == c) else {
-            return Err(format!("invalid regular expression flag {c:?}"));
+            return Err((format!("invalid regular expression flag {c:?}")).into());
         };
         if seen[idx] {
-            return Err(format!("duplicate regular expression flag {c:?}"));
+            return Err((format!("duplicate regular expression flag {c:?}")).into());
         }
         seen[idx] = true;
     }
@@ -119,15 +120,12 @@ pub fn compile_for(
     obj: Handle<JsObject>,
 ) -> Result<v12_regex::CompiledRegex, String> {
     let idx = obj.index();
-    if let Some(compiled) = cache.read().expect("regexp cache poisoned").get(&idx) {
+    if let Some(compiled) = cache.borrow().get(&idx) {
         return Ok(compiled.clone());
     }
     let (source, flags) = regexp_source_flags(heap, obj);
     let compiled = compile_pattern(&source, &flags)?;
-    cache
-        .write()
-        .expect("regexp cache poisoned")
-        .insert(idx, compiled.clone());
+    cache.borrow_mut().insert(idx, compiled.clone());
     Ok(compiled)
 }
 
@@ -163,7 +161,7 @@ fn compile_pattern(source: &str, flags: &str) -> Result<v12_regex::CompiledRegex
             'u' => f.unicode = true,
             'v' => f.unicode_sets = true,
             'y' => f.sticky = true,
-            _ => return Err(format!("invalid regular expression flag {c:?}")),
+            _ => return Err((format!("invalid regular expression flag {c:?}")).into()),
         }
     }
     v12_regex::compile(source, f).map_err(|e| e.message)
@@ -196,16 +194,11 @@ pub fn set_last_index(heap: &mut Heap, obj: Handle<JsObject>, v: f64) {
 /// `v12_regex`, and returns either `null` or an array-like match object
 /// (`[0]` = whole match, `[1..n]` = capture groups, plus `index`, `input`,
 /// and `groups` properties).
-pub fn regexp_exec(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
-    let Some(obj) = this.as_object() else {
-        return Err(intern_type_error(heap, "TypeError: RegExp.prototype.exec called on non-object"));
-    };
-    if heap.get(obj).kind != v12_heap::KIND_REGEXP {
-        return Err(intern_type_error(heap, "TypeError: RegExp.prototype.exec called on non-RegExp"));
-    }
+pub fn regexp_exec(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "RegExp.prototype.exec", Some(v12_heap::Kind::RegExp))?;
     let input_text = args
         .first()
-        .map(|v| super::value_display_text(heap, *v))
+        .map(|v| helpers::value_text(heap, *v))
         .unwrap_or_default();
     let input_units: Vec<u16> = input_text.encode_utf16().collect();
 
@@ -278,8 +271,7 @@ fn match_result(
             None => elements.push(JsValue::undefined()),
         }
     }
-    let arr = heap.alloc(JsObject::array(elements));
-    heap.add_root(JsValue::object(arr));
+    let arr = helpers::alloc_obj(heap, JsObject::array(elements));
     // `index`, `input` named properties via shape transitions. Build the
     // shape as root → length → index → input so the array's `length` stays at
     // physical slot 0 (the interpreter's array fast path reads
@@ -298,14 +290,13 @@ fn match_result(
         heap.get_mut(arr).properties.resize(3, JsValue::undefined());
         heap.get_mut(arr).property_keys.resize(3, None);
     }
-    heap.get_mut(arr).properties[1] = JsValue::from_i32_smi(m.start() as i32)
-        .unwrap_or_else(|| JsValue::from_f64(m.start() as f64));
+    heap.get_mut(arr).properties[1] = helpers::smi_or_f64(m.start() as i64);
     heap.get_mut(arr).properties[2] = JsValue::string(heap.intern_text(input_text));
     JsValue::object(arr)
 }
 
 /// `RegExp.prototype.test(string)` — `Boolean(exec(string))`.
-pub fn regexp_test(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn regexp_test(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     match regexp_exec(heap, cache, this, args)? {
         v if v.is_null() => Ok(JsValue::false_()),
         _ => Ok(JsValue::true_()),
@@ -313,30 +304,20 @@ pub fn regexp_test(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: &[J
 }
 
 /// `RegExp.prototype.toString()` — `"/" + source + "/" + flags`.
-pub fn regexp_to_string(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
-    let Some(obj) = this.as_object() else {
-        return Err(intern_type_error(heap, "TypeError: RegExp.prototype.toString called on non-object"));
-    };
-    if heap.get(obj).kind != v12_heap::KIND_REGEXP {
-        return Err(intern_type_error(heap, "TypeError: RegExp.prototype.toString called on non-RegExp"));
-    }
+pub fn regexp_to_string(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "RegExp.prototype.toString", Some(v12_heap::Kind::RegExp))?;
     let (source, flags) = regexp_source_flags(heap, obj);
     let text = format!("/{source}/{flags}");
     Ok(JsValue::string(heap.intern_text(&text)))
 }
 
 /// `RegExp.prototype.compile` — legacy recompile-in-place (Annex B).
-pub fn regexp_compile(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
-    let Some(obj) = this.as_object() else {
-        return Err(intern_type_error(heap, "TypeError: RegExp.prototype.compile called on non-object"));
-    };
-    if heap.get(obj).kind != v12_heap::KIND_REGEXP {
-        return Err(intern_type_error(heap, "TypeError: RegExp.prototype.compile called on non-RegExp"));
-    }
+pub fn regexp_compile(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "RegExp.prototype.compile", Some(v12_heap::Kind::RegExp))?;
     let (source_text, flags_text) = match (args.first(), args.get(1)) {
         (Some(first), None) => {
             if let Some(src_obj) = first.as_object()
-                && heap.get(src_obj).kind == v12_heap::KIND_REGEXP
+                && heap.get(src_obj).kind == v12_heap::Kind::RegExp
             {
                 let (s, f) = regexp_source_flags(heap, src_obj);
                 (s, f)
@@ -357,15 +338,6 @@ pub fn regexp_compile(heap: &mut Heap, cache: &RegexCache, this: JsValue, args: 
     heap.get_mut(obj).properties[SLOT_FLAGS] = JsValue::string(flags_h);
     heap.get_mut(obj).properties[SLOT_LAST_INDEX] = JsValue::from_i32_smi(0).expect("0 fits Smi");
     // Drop any cached compilation for this object.
-    cache.write().expect("regexp cache poisoned").remove(&obj.index());
+    cache.borrow_mut().remove(&obj.index());
     Ok(this)
-}
-
-/// Installs the RegExp natives into `registry`. `exec`/`test`/`compile`
-/// carry the compiled-pattern cache and are intercepted in
-/// `NativeRegistry::call_native`; only the plain-handler natives are
-/// registered here.
-pub fn install(registry: &mut NativeRegistry) {
-    registry.register(super::NATIVE_REGEXP_CONSTRUCT, regexp_construct);
-    registry.register(super::NATIVE_REGEXP_TO_STRING, regexp_to_string);
 }

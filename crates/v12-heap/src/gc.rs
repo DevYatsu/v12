@@ -9,11 +9,21 @@
 //! charged against later allocations. Debug builds panic on dead-slot access
 //! regardless of sweep progress — liveness is published eagerly at mark end
 //! (see crate docs).
+//!
+//! ## Pooling contract
+//!
+//! The slot spaces *are* the engine's object pool, with an explicit
+//! checkout/release discipline: [`Heap::alloc`] checks a slot out (free-list
+//! pop or bump), the sweeper releases it back (per-space free list), and
+//! lifetime is governed by `Trace` + mark-sweep — the RAII equivalent for a
+//! GC heap. Any future pooled resource (e.g. JIT `CompiledFn` buffers) must
+//! follow the same shape: an explicit checkout/release guard pair, never an
+//! implicit global pool.
 
 use crate::handle::{Handle, HeapSpace, Space};
 use crate::object::{IntegrityLevel, JsObject, SizeEstimate, V12BigInt, V12Symbol};
 use crate::prop_key::PropKey;
-use crate::shape::{Attrs, Descriptor, Shape, ShapeHandle, Transitions, ValidityCellId};
+use crate::shape::{Attrs, Descriptor, Serial, Shape, ShapeHandle, Transitions, ValidityCellId};
 use crate::string::{self, CONCAT_EAGER_FLATTEN_MAX_UNITS, Seed, StrStorage, V12Str};
 use crate::value::JsValue;
 
@@ -270,7 +280,7 @@ pub struct Heap {
     /// table is a GC root (marked at each collection start), so interned
     /// strings outlive the transient duplicates they deduplicate. Buckets
     /// hold hash-colliding candidates; textual equality decides hits.
-    interned_strings: hashbrown::HashMap<u32, Vec<Handle<V12Str>>>,
+    interned_strings: rustc_hash::FxHashMap<u32, Vec<Handle<V12Str>>>,
 
     policy: GcPolicy,
     allocated_since_gc: usize,
@@ -312,7 +322,7 @@ impl Heap {
             shape_roots: vec![Handle::new(0)],
             root_shape: Handle::new(0),
             validity_cells: Vec::new(),
-            interned_strings: hashbrown::HashMap::new(),
+            interned_strings: rustc_hash::FxHashMap::default(),
             policy,
             allocated_since_gc: 0,
             live_after_gc: 0,
@@ -348,11 +358,26 @@ impl Heap {
     /// collection is therefore reused lowest-index-first relative to the
     /// sweep cursor.
     ///
+    /// **Allocation contract:** heap allocation is reachable *only* through
+    /// `&mut Heap` — there is no ambient allocator on the engine's hot paths.
+    /// A function that allocates takes `&mut Heap` (or an interpreter that
+    /// borrows one); `Box`/`Vec`/`String` outside the explicitly-owned
+    /// execution memory (the value stack, the frame vector) is a violation.
+    /// This makes every allocation visible at the call site and keeps the
+    /// collector's root discipline local: a value produced by `alloc` must be
+    /// rooted before the next safepoint (see [`GcRoots`]).
+    ///
     /// Callers that hold handles across code which may reach a safepoint must
     /// keep those handles reachable from the GC roots (see [`GcRoots`]).
     pub fn alloc<T: SpaceOps>(&mut self, value: T) -> Handle<T> {
         let size = value.approx_size();
         let s = T::SPACE.as_index();
+        // Entry contract: the space's bookkeeping arrays are index-aligned
+        // (free-list slots are dead, alive/released have matching lengths).
+        crate::assert_engine!(
+            self.alive[s].len() == self.released[s].len(),
+            "alive/released arrays must stay index-aligned"
+        );
         // Free lists and slot vectors index by usize; the u32 narrowing to
         // `Handle` happens exactly once, at the handle boundary below.
         let index: usize = loop {
@@ -644,17 +669,20 @@ impl Heap {
 
     /// Current serial of `cell`; `None` for the null cell — a guard over
     /// [`ValidityCellId::NONE`] can never hold.
-    pub fn validity_serial(&self, cell: ValidityCellId) -> Option<u32> {
+    pub fn validity_serial(&self, cell: ValidityCellId) -> Option<Serial> {
         if cell == ValidityCellId::NONE {
             return None;
         }
         // Ids are 1-based (zero is `NONE`), so the stored serial sits at
         // `index - 1`.
-        self.validity_cells.get(cell.cell_index() - 1).copied()
+        self.validity_cells
+            .get(cell.cell_index() - 1)
+            .copied()
+            .map(Serial)
     }
 
     /// True when a guard that recorded `seen` against `cell` still holds.
-    pub fn guard_holds(&self, cell: ValidityCellId, seen: u32) -> bool {
+    pub fn guard_holds(&self, cell: ValidityCellId, seen: Serial) -> bool {
         self.validity_serial(cell) == Some(seen)
     }
 
@@ -665,7 +693,7 @@ impl Heap {
     /// 2³² times simply starts a fresh era instead of aborting.
     pub fn bump_validity(&mut self, cell: ValidityCellId) {
         if let Some(serial) = self.validity_serial(cell) {
-            self.validity_cells[cell.cell_index() - 1] = serial.wrapping_add(1);
+            self.validity_cells[cell.cell_index() - 1] = serial.wrapping_next().0;
         }
     }
 
@@ -1174,11 +1202,11 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KIND_ORDINARY, StrStorage};
+    use crate::{Kind, StrStorage};
 
     const fn ordinary_with(props: Vec<JsValue>, proto: Option<Handle<JsObject>>) -> JsObject {
         JsObject {
-            kind: KIND_ORDINARY,
+            kind: Kind::Ordinary,
             flags: 0,
             callable: crate::function::FunctionTarget::Bytecode(0),
             program_id: 0,
@@ -1521,7 +1549,7 @@ mod tests {
         for _ in 0..10 {
             heap.force_collect();
         }
-        assert_eq!(heap.get(h).kind, KIND_ORDINARY); // still alive, no panic
+        assert_eq!(heap.get(h).kind, Kind::Ordinary); // still alive, no panic
     }
 
     #[test]
@@ -1530,18 +1558,18 @@ mod tests {
         let a = heap.new_validity_cell();
         let b = heap.new_validity_cell();
         assert_ne!(a, b, "cells must be distinct ids");
-        assert_eq!(heap.validity_serial(a), Some(0));
-        assert_eq!(heap.validity_serial(b), Some(0));
+        assert_eq!(heap.validity_serial(a), Some(Serial(0)));
+        assert_eq!(heap.validity_serial(b), Some(Serial(0)));
 
         // A guard recorded now fails exactly when a bump lands.
         let seen = heap.validity_serial(a).expect("real cell has a serial");
         assert!(heap.guard_holds(a, seen));
         heap.bump_validity(a);
         assert!(!heap.guard_holds(a, seen));
-        assert_eq!(heap.validity_serial(a), Some(1));
+        assert_eq!(heap.validity_serial(a), Some(Serial(1)));
 
         // Sibling cells are untouched by a's bump.
-        assert_eq!(heap.validity_serial(b), Some(0));
+        assert_eq!(heap.validity_serial(b), Some(Serial(0)));
     }
 
     #[test]
@@ -1549,7 +1577,7 @@ mod tests {
         let heap = Heap::new(GcPolicy::NoGC);
         assert_eq!(heap.validity_serial(ValidityCellId::NONE), None);
         // Guards over the null cell can never hold: no cell, no assumption.
-        assert!(!heap.guard_holds(ValidityCellId::NONE, 0));
+        assert!(!heap.guard_holds(ValidityCellId::NONE, Serial(0)));
     }
 
     #[test]
@@ -1567,7 +1595,7 @@ mod tests {
         let other = heap.validity_cell_of(p);
         assert_ne!(other, first);
         heap.bump_validity(first);
-        assert_eq!(heap.validity_serial(other), Some(0));
+        assert_eq!(heap.validity_serial(other), Some(Serial(0)));
     }
 
     #[test]

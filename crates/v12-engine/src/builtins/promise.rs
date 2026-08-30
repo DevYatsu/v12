@@ -26,7 +26,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use v12_heap::{Heap, JsObject, JsValue, KIND_FUNCTION};
+use v12_heap::{Heap, JsObject, JsValue, Kind};
+use v12_native::Throw;
 
 use crate::job_queue::{Job, JobCtx};
 use v12_interp::JSException;
@@ -45,12 +46,7 @@ fn smi(v: i32) -> JsValue {
     JsValue::from_i32_smi(v).expect("state fits Smi")
 }
 
-fn type_error(heap: &mut Heap, msg: &str) -> JsValue {
-    let h = heap.intern_string(v12_heap::V12Str::latin1(msg.as_bytes().to_vec()));
-    JsValue::string(h)
-}
-
-/// Structural promise check: a `KIND_PROMISE` object carrying the three
+/// Structural promise check: a `Kind::Promise` object carrying the three
 /// internal slots with a plausible `[[State]]`. Promise objects are
 /// engine-created only, so no user object collides in practice.
 fn is_promise(heap: &Heap, v: JsValue) -> bool {
@@ -58,7 +54,7 @@ fn is_promise(heap: &Heap, v: JsValue) -> bool {
         return false;
     };
     let o = heap.get(obj);
-    o.kind == v12_heap::KIND_PROMISE
+    o.kind == v12_heap::Kind::Promise
         && o.properties.len() == PROMISE_SLOTS
         && o.properties[0]
             .as_smi()
@@ -75,7 +71,7 @@ fn create_promise(
     let reactions = heap.alloc(JsObject::array(Vec::new()));
     heap.add_root(JsValue::object(reactions));
     let promise = heap.alloc(JsObject {
-        kind: v12_heap::KIND_PROMISE,
+        kind: v12_heap::Kind::Promise,
         properties: vec![smi(state), payload, JsValue::object(reactions)],
         prototype,
         ..JsObject::default()
@@ -86,7 +82,7 @@ fn create_promise(
 
 /// `Promise.resolve(x)`: identity for promises; otherwise a fulfilled promise
 /// carrying `x` (`undefined` when the argument is missing).
-pub fn promise_resolve(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn promise_resolve(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
     if is_promise(heap, value) {
         return Ok(value);
@@ -106,7 +102,7 @@ pub fn promise_resolve(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Resu
 }
 
 /// `Promise.reject(x)`: a rejected promise carrying `x`.
-pub fn promise_reject(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn promise_reject(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
     let prototype = this.as_object().and_then(|ctor| heap.get(ctor).prototype);
     Ok(JsValue::object(create_promise(
@@ -127,9 +123,9 @@ pub fn promise_then(
     this: JsValue,
     args: &[JsValue],
     sink: &Rc<RefCell<Vec<Job>>>,
-) -> Result<JsValue, JsValue> {
+) -> Result<JsValue, Throw> {
     if !is_promise(heap, this) {
-        return Err(type_error(heap, "TypeError: Promise.prototype.then requires a promise"));
+        return Err(Throw::type_error(heap, "Promise.prototype.then requires a promise"));
     }
     let promise = this.as_object().expect("checked above");
     let handler = args.first().copied().unwrap_or_else(JsValue::undefined);
@@ -181,10 +177,10 @@ pub fn queue_microtask(
     heap: &mut Heap,
     args: &[JsValue],
     sink: &Rc<RefCell<Vec<Job>>>,
-) -> Result<JsValue, JsValue> {
+) -> Result<JsValue, Throw> {
     let cb = args.first().copied().unwrap_or_else(JsValue::undefined);
     if cb.as_object().is_none() {
-        return Err(type_error(heap, "TypeError: queueMicrotask requires a function"));
+        return Err(Throw::type_error(heap, "queueMicrotask requires a function"));
     }
     // Root the callback: the job outlives the program stack that referenced it.
     heap.add_root(cb);
@@ -210,7 +206,7 @@ fn enqueue_reaction(
     let job: Job = Box::new(move |ctx: &mut JobCtx<'_, '_>| {
         let callable = handler
             .as_object()
-            .is_some_and(|h| ctx.heap_mut().get(h).kind == KIND_FUNCTION);
+            .is_some_and(|h| ctx.heap_mut().get(h).kind == Kind::Function);
         let outcome = if callable {
             let h = handler.as_object().expect("checked above");
             ctx.call_object(h, JsValue::undefined(), &[payload])

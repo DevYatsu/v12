@@ -50,6 +50,9 @@ pub(crate) const TAG_EMPTY: u64 = 10;
 /// The field is public so embedders can forge values; doing so forfeits the
 /// canonical-form guarantee: [`JsValue::is_canonical`] answers `false` and
 /// every type predicate ([`Self::is_object`] and friends) refuses the word.
+/// Code receiving raw bits from outside the crate should go through
+/// [`JsValue::from_bits`], which rejects non-canonical patterns at the
+/// boundary.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct JsValue(pub u64);
 
@@ -81,7 +84,6 @@ impl JsValue {
         Self(Self::boxed(tag, 0))
     }
 
-    // ------------------------------------------------------------------
     // Constructors
     // ------------------------------------------------------------------
 
@@ -292,6 +294,24 @@ impl JsValue {
         self.0 & LOWER_BITS_MASK & !payload_mask == 0
     }
 
+    /// The guarded way to turn an arbitrary `u64` into a value.
+    ///
+    /// This is the boundary constructors should use when the bits came from
+    /// outside the crate (embedder handles, JIT `extern "C"` helpers, tests):
+    /// it returns `None` for non-canonical bit patterns instead of letting a
+    /// forged value through. Prefer the typed constructors ([`Self::from_f64`],
+    /// [`Self::from_i32_smi`], …) whenever the semantic kind is known; this
+    /// exists for the raw-bit boundaries.
+    #[inline]
+    pub const fn from_bits(bits: u64) -> Option<JsValue> {
+        let v = JsValue(bits);
+        if v.is_canonical() {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
     // ------------------------------------------------------------------
     // Extractors
     // ------------------------------------------------------------------
@@ -369,6 +389,187 @@ impl JsValue {
         }
     }
 }
+
+
+/// A value could not be decoded into the requested Rust type.
+///
+/// Carries the `typeof`-style name of the offending value and what was
+/// expected, so the throw boundary can build a precise `TypeError`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DecodeError {
+    /// The `typeof`-style name of the value that failed to decode.
+    pub got: &'static str,
+    /// What was expected (e.g. `"number"`, `"string"`, `"object"`).
+    pub expected: &'static str,
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "expected {}, got {}", self.expected, self.got)
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl JsValue {
+    /// The `typeof`-style name of this value's tag (heap-free).
+    pub const fn type_name(self) -> &'static str {
+        match () {
+            _ if self.is_f64() || self.is_smi() => "number",
+            _ if self.is_string() => "string",
+            _ if self.is_boolean() => "boolean",
+            _ if self.is_object() => "object",
+            _ if self.is_undefined() => "undefined",
+            _ if self.is_null() => "null",
+            _ if self.is_symbol() => "symbol",
+            _ if self.is_bigint() => "bigint",
+            _ => "value",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// std TryFrom<JsValue> — JS → Rust (zero-alloc)
+// ---------------------------------------------------------------------------
+//
+// These live here, next to `JsValue`, so they satisfy the orphan rule (the
+// impl is for a local type). `From`/`TryFrom` have no heap parameter, so only
+// zero-alloc conversions fit; heap-dependent ones (owned `String` content,
+// interning) are explicit `Heap` methods.
+
+impl TryFrom<JsValue> for f64 {
+    type Error = DecodeError;
+
+    #[inline]
+    fn try_from(v: JsValue) -> Result<Self, Self::Error> {
+        if let Some(n) = v.as_f64() {
+            Ok(n)
+        } else if let Some(n) = v.as_smi() {
+            Ok(f64::from(n))
+        } else {
+            Err(DecodeError {
+                got: v.type_name(),
+                expected: "number",
+            })
+        }
+    }
+}
+
+impl TryFrom<JsValue> for i32 {
+    type Error = DecodeError;
+
+    #[inline]
+    fn try_from(v: JsValue) -> Result<Self, Self::Error> {
+        if let Some(n) = v.as_smi() {
+            return Ok(n);
+        }
+        if let Some(n) = v.as_f64()
+            && n.fract() == 0.0
+            && n >= f64::from(i32::MIN)
+            && n <= f64::from(i32::MAX)
+        {
+            return Ok(n as i32);
+        }
+        Err(DecodeError {
+            got: v.type_name(),
+            expected: "integer",
+        })
+    }
+}
+
+impl TryFrom<JsValue> for bool {
+    type Error = DecodeError;
+
+    #[inline]
+    fn try_from(v: JsValue) -> Result<Self, Self::Error> {
+        if let Some(b) = v.as_bool() {
+            Ok(b)
+        } else {
+            Err(DecodeError {
+                got: v.type_name(),
+                expected: "boolean",
+            })
+        }
+    }
+}
+
+impl TryFrom<JsValue> for crate::Handle<crate::V12Str> {
+    type Error = DecodeError;
+
+    #[inline]
+    fn try_from(v: JsValue) -> Result<Self, Self::Error> {
+        v.as_string().ok_or(DecodeError {
+            got: v.type_name(),
+            expected: "string",
+        })
+    }
+}
+
+impl TryFrom<JsValue> for crate::Handle<JsObject> {
+    type Error = DecodeError;
+
+    #[inline]
+    fn try_from(v: JsValue) -> Result<Self, Self::Error> {
+        v.as_object().ok_or(DecodeError {
+            got: v.type_name(),
+            expected: "object",
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// std From<T> for JsValue — Rust → JS (zero-alloc)
+// ---------------------------------------------------------------------------
+
+impl From<f64> for JsValue {
+    #[inline]
+    fn from(n: f64) -> Self {
+        JsValue::from_f64(n)
+    }
+}
+
+impl From<i32> for JsValue {
+    #[inline]
+    fn from(n: i32) -> Self {
+        // Smi-canonicalizing: integral values inside the Smi range become
+        // Smis, everything else stays a raw double.
+        JsValue::from_i32_smi(n).unwrap_or_else(|| JsValue::from_f64(f64::from(n)))
+    }
+}
+
+impl From<bool> for JsValue {
+    #[inline]
+    fn from(b: bool) -> Self {
+        if b {
+            JsValue::true_()
+        } else {
+            JsValue::false_()
+        }
+    }
+}
+
+impl From<crate::Handle<crate::V12Str>> for JsValue {
+    #[inline]
+    fn from(h: crate::Handle<crate::V12Str>) -> Self {
+        JsValue::string(h)
+    }
+}
+
+impl From<crate::Handle<JsObject>> for JsValue {
+    #[inline]
+    fn from(h: crate::Handle<JsObject>) -> Self {
+        JsValue::object(h)
+    }
+}
+
+impl From<()> for JsValue {
+    #[inline]
+    fn from((): ()) -> Self {
+        JsValue::undefined()
+    }
+}
+
+// ------------------------------------------------------------------
 
 impl Trace for JsValue {
     fn trace(&self, sink: &mut MarkSink<'_>) {
@@ -573,5 +774,21 @@ mod tests {
         let d = JsValue::from_f64(1.0);
         assert_eq!(d.as_smi(), None);
         assert_eq!(d.as_object(), None);
+    }
+
+    #[test]
+    fn from_bits_guards_the_canonical_form() {
+        // Canonical words pass through unchanged.
+        assert_eq!(JsValue::from_bits(JsValue::undefined().bits()), Some(JsValue::undefined()));
+        assert_eq!(JsValue::from_bits(JsValue::from_f64(1.5).bits()), Some(JsValue::from_f64(1.5)));
+        let smi = JsValue::from_i32_smi(42).unwrap();
+        assert_eq!(JsValue::from_bits(smi.bits()), Some(smi));
+        // The same forged words the predicate rejects are refused here.
+        assert_eq!(JsValue::from_bits(BOX_MASK | (15 << TAG_SHIFT)), None); // reserved tag
+        assert_eq!(JsValue::from_bits(BOX_MASK | (1 << TAG_SHIFT) | (1u64 << 40) | 3), None); // stray mid-bit
+        assert_eq!(JsValue::from_bits(BOX_MASK | (5 << TAG_SHIFT) | 1), None); // dirty special
+        // Raw doubles (unboxed) are always canonical.
+        assert!(JsValue::from_bits(f64::NAN.to_bits()).is_some());
+        assert!(JsValue::from_bits((-0.0f64).to_bits()).is_some());
     }
 }

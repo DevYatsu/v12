@@ -8,6 +8,7 @@ use v12_bytecode::FunctionBytecode;
 use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
 use v12_heap::HeapExt;
 use v12_interp::{Interp, JSException};
+use v12_native::{NativeId, Throw};
 
 use crate::builtins::{NativeRegistry, install_core};
 use crate::error::EngineError;
@@ -54,9 +55,6 @@ pub struct Engine {
     /// Tier-up policy. `OnDemand` (the default) means tier-up
     /// only happens when the host asks; `Profile` is the v2 hook.
     tier_policy: v12_codegen::TierPolicy,
-    /// Next index handed out by [`Engine::create_host_function`], offset
-    /// from `HOST_FN_BASE`.
-    host_fn_counter: u32,
 }
 
 impl std::fmt::Debug for Engine {
@@ -87,7 +85,6 @@ impl Engine {
             retained: None,
             completion: None,
             tier_policy: v12_codegen::TierPolicy::default(),
-            host_fn_counter: 0,
         }
     }
 
@@ -331,14 +328,11 @@ impl Engine {
         // OWN pending sink, so jobs enqueued in this realm never reach the
         // engine's queue and no `set_pending` save/restore is needed. The
         // engine's `self.registry` is left untouched for the whole call.
-        let mut local_registry = NativeRegistry::new();
-        crate::builtins::install_core(&mut local_registry);
-        // Copy the engine's native handlers so the indirect realm can use
-        // them. `set_pending` is intentionally not called — the local
-        // registry's `pending` is its own.
-        for (idx, handler) in self.registry.snapshot_handlers() {
-            local_registry.register(idx, handler);
-        }
+        // `NativeRegistry` is `Clone`, so the local registry starts as a full
+        // copy of the engine's (builtins + host functions) — the old
+        // `snapshot_handlers` + `install_core` dance is obsolete.
+        let mut local_registry = self.registry.clone();
+        local_registry.set_pending(Rc::new(RefCell::new(Vec::new())));
         let mut interp =
             Interp::new_with_heap(&mut heap, Some(global), program.functions, program.main, strings);
         interp.set_natives(Box::new(local_registry.clone()));
@@ -444,15 +438,17 @@ impl Engine {
                 heap: &mut Heap,
                 this: JsValue,
                 args: &[JsValue],
-                index: u32,
-            ) -> Result<JsValue, JsValue> {
-                if index == 254 {
+                id: NativeId,
+            ) -> Result<JsValue, Throw> {
+                // The module-import seam is the shared `ModuleImport` native
+                // (discriminant 254): the engine builds an empty namespace.
+                if id == NativeId::ModuleImport {
                     let h = heap.alloc(JsObject::default());
                     // Empty namespace object (no properties).
                     heap.add_root(JsValue::object(h));
                     return Ok(JsValue::object(h));
                 }
-                self.inner.call_native(heap, this, args, index)
+                self.inner.call_native(heap, this, args, id)
             }
         }
         let natives = ModuleImportNatives {
@@ -485,7 +481,7 @@ impl Engine {
     ///
     /// `params` is a comma-separated parameter list (e.g. `"a, b"`), `body`
     /// is the function body source. Compiles `function __f(params){body}` and
-    /// returns a `KIND_FUNCTION` object whose `elements[0]` is the function
+    /// returns a `Kind::Function` object whose `elements[0]` is the function
     /// index. The caller can invoke it by constructing an `Interp` with the
     /// same program (for `v1` the program is not retained; tests verify
     /// compilation and allocation only).
@@ -519,33 +515,26 @@ impl Engine {
         Ok(JsValue::object(func))
     }
 
-    /// Index space reserved for host functions created through the embedding
-    /// API. Well above any realistic program function count; the interpreter
-    /// dispatches any index >= functions.len() to the native registry.
-    const HOST_FN_BASE: u32 = 0x1000_0000;
-
     /// Registers a capturing Rust closure as a global function named `name`.
     ///
     /// The function is installed as a property on the realm's global object
-    /// (shape transition, mirroring the interpreter's `SetGlobal` fast path)
-    /// and dispatches through the engine's native registry. Returns the
-    /// host-function index.
+    /// (shape transition, mirroring the interpreter's `SetGlobal` fast path).
+    /// It dispatches through `FunctionTarget::Host` (one word on the function
+    /// object), so no registry entry is needed.
     pub fn create_host_function(
         &mut self,
         name: &str,
         closure: crate::builtins::HostClosure,
     ) -> Result<(), JsValue> {
-        let index = Self::HOST_FN_BASE + self.host_fn_counter;
-        self.host_fn_counter += 1;
-        self.registry.register_closure(index, closure.clone());
         let global = self.realm.global();
         // The function object carries the host closure directly (one word),
         // so `prepare_call` invokes it without a registry lookup. The engine
         // closure wraps an `Rc<RefCell<dyn FnMut>>`; the heap `HostClosure`
-        // adapts it to the one-word handle. Ownership: the engine registry
-        // keeps the closure alive for the engine's lifetime, outliving every
-        // function object that references it.
-        let heap_closure = v12_heap::HostClosure::new(move |heap, this, args| closure.call(heap, this, args));
+        // adapts it to the one-word handle. Ownership: the returned function
+        // object and its closure live on the heap for the engine's lifetime.
+        let heap_closure = v12_heap::HostClosure::new(move |heap, this, args| {
+            closure.call(heap, this, args).map_err(|t| t.into_js(heap))
+        });
         let func = self.heap.alloc(v12_heap::JsObject::function(
             v12_heap::FunctionTarget::Host(heap_closure),
             None,
@@ -774,7 +763,7 @@ impl Engine {
         // Real error objects render as "Name: message".
         if value.is_object()
             && let Some(obj) = value.as_object()
-            && self.heap.get(obj).kind == v12_heap::KIND_ERROR
+            && self.heap.get(obj).kind == v12_heap::Kind::Error
         {
             // Snapshot the handles first so the text decode (which needs
             // `&mut self`) doesn't fight the borrow.
@@ -1063,7 +1052,7 @@ mod tests {
         let func = engine.create_function("a", "return a+1;").expect("create");
         assert!(func.is_object());
         let handle = func.as_object().unwrap();
-        assert_eq!(engine.heap().get(handle).kind, v12_heap::KIND_FUNCTION);
+        assert_eq!(engine.heap().get(handle).kind, v12_heap::Kind::Function);
     }
 
     #[test]
@@ -1241,7 +1230,7 @@ mod tests {
             .expect("Object intrinsic must exist");
         assert!(object_val.is_object());
         let h = object_val.as_object().unwrap();
-        assert_eq!(engine.heap().get(h).kind, v12_heap::KIND_FUNCTION);
+        assert_eq!(engine.heap().get(h).kind, v12_heap::Kind::Function);
         // Verify native `Object.getPrototypeOf` handler is registered and works
         // via the global's heap. This exercises the `GetGlobal` → `Call` path
         // without needing a full shape for `Object.getPrototypeOf` in the

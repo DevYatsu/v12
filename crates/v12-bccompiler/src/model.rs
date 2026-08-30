@@ -669,7 +669,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     pub fn add_const(&mut self, c: Const) -> Result<u16, CompileError> {
         self.b.add_const(c).map_err(|e| CompileError {
-            message: e,
+            message: e.to_string(),
             span: None,
         })
     }

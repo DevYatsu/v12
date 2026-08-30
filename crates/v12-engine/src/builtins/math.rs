@@ -1,9 +1,10 @@
 //! Math built-ins.
 
 use v12_heap::{Heap, JsValue};
+use v12_native::Throw;
 
 /// `Math.abs(x)` – absolute value.
-pub fn math_abs(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn math_abs(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let n = to_number(heap, v);
     if n.is_nan() {

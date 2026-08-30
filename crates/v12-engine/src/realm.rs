@@ -74,9 +74,9 @@ impl Realm {
                 continue;
             }
             let kind = if matches!(name, "Math" | "JSON" | "console") {
-                v12_heap::KIND_ORDINARY
+                v12_heap::Kind::Ordinary
             } else {
-                v12_heap::KIND_FUNCTION
+                v12_heap::Kind::Function
             };
             let ctor = heap.alloc(JsObject {
                 kind,
@@ -131,44 +131,44 @@ impl Realm {
         let string_ctor = intrinsics.get("String").and_then(|v| v.as_object());
         if let Some(string_ctor) = string_ctor {
             heap.get_mut(string_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(NATIVE_STRING_CONSTRUCT);
+                v12_heap::FunctionTarget::Bytecode(u32::from(NATIVE_STRING_CONSTRUCT));
         }
         // `Error(x)` / `new Error(x)` are constructible: point the placeholder
         // at the native error creator.
         let error_ctor = intrinsics.get("Error").and_then(|v| v.as_object());
         if let Some(error_ctor) = error_ctor {
             heap.get_mut(error_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_ERROR_CREATE);
+                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_ERROR_CREATE));
         }
         // `Boolean(x)` / `new Boolean(x)` are constructible.
         let boolean_ctor = intrinsics.get("Boolean").and_then(|v| v.as_object());
         if let Some(boolean_ctor) = boolean_ctor {
             heap.get_mut(boolean_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_BOOLEAN_CONSTRUCT);
+                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_BOOLEAN_CONSTRUCT));
         }
         // `Map` / `Set` are constructible.
         let map_ctor = intrinsics.get("Map").and_then(|v| v.as_object());
         if let Some(map_ctor) = map_ctor {
             heap.get_mut(map_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_MAP_CONSTRUCT);
+                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_MAP_CONSTRUCT));
         }
         let set_ctor = intrinsics.get("Set").and_then(|v| v.as_object());
         if let Some(set_ctor) = set_ctor {
             heap.get_mut(set_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_SET_CONSTRUCT);
+                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_SET_CONSTRUCT));
         }
         // `RegExp` is constructible.
         let regexp_ctor = intrinsics.get("RegExp").and_then(|v| v.as_object());
         if let Some(regexp_ctor) = regexp_ctor {
             heap.get_mut(regexp_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_REGEXP_CONSTRUCT);
+                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_REGEXP_CONSTRUCT));
         }
         // `eval` is callable: route through the native registry (the
         // interpreter special-cases NATIVE_EVAL to run the source re-entrantly).
         let eval_global = intrinsics.get("eval").and_then(|v| v.as_object());
         if let Some(eval_global) = eval_global {
             heap.get_mut(eval_global).callable =
-                v12_heap::FunctionTarget::Bytecode(crate::builtins::NATIVE_EVAL);
+                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_EVAL));
         }
 
         Self { global, intrinsics }

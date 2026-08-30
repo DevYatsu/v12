@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 # Carries oxc Span pairs for traces/deopt metadata (plan §6); zero internal deps.
 oxc_span.workspace = true
+
+[lints]
+workspace = true

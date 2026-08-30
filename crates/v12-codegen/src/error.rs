@@ -1,6 +1,6 @@
 //! Error types and limits shared by the JIT tiers.
 
-use v12_bytecode::Opcode;
+use v12_bytecode::{BytecodeError, Opcode};
 
 /// Maximum number of bytecode instructions a function may contain before a
 /// JIT tier refuses to compile it.
@@ -32,7 +32,7 @@ pub enum JitError {
     /// The function uses a wide operation the tier does not yet support.
     UnsupportedWideOp(String),
     /// The bytecode is structurally invalid (e.g., truncated wide sequence).
-    InvalidBytecode(String),
+    InvalidBytecode(BytecodeError),
     /// Cranelift failed to build or verify the function.
     Cranelift(String),
 }
@@ -50,7 +50,7 @@ impl std::fmt::Display for JitError {
             Self::UnsupportedWideOp(msg) => {
                 write!(f, "unsupported wide op for JIT: {msg}")
             }
-            Self::InvalidBytecode(msg) => write!(f, "invalid bytecode: {msg}"),
+            Self::InvalidBytecode(err) => write!(f, "invalid bytecode: {err}"),
             Self::Cranelift(msg) => write!(f, "cranelift error: {msg}"),
         }
     }

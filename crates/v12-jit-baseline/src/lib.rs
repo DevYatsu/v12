@@ -78,12 +78,12 @@ mod tests {
         );
         let mut baseline = JitBaseline::new().expect("new");
         let compiled = baseline.compile(&fb).expect("compile supported");
-        let id: FunctionId = 42;
+        let id: FunctionId = 42.into();
         cache.insert(id, compiled);
         assert_eq!(cache.len(), 1);
         assert!(cache.get(id).is_some());
-        assert!(cache.get(99).is_none());
-        assert_eq!(cache.ids().collect::<Vec<_>>(), vec![42]);
+        assert!(cache.get(99.into()).is_none());
+        assert_eq!(cache.ids().collect::<Vec<_>>(), vec![FunctionId::from(42)]);
         cache.clear();
         assert!(cache.is_empty());
     }
@@ -461,6 +461,6 @@ mod stub_tests {
         // test cache insert/lookup with a manually constructed entry if the
         // stub exposes a test helper). For now just check empty behavior.
         assert_eq!(cache.len(), 0);
-        assert!(cache.get(0).is_none());
+        assert!(cache.get(0.into()).is_none());
     }
 }

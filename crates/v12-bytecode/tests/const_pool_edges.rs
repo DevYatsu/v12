@@ -109,7 +109,10 @@ fn capacity_error_is_a_clean_result_not_a_panic() {
     let err = pool
         .insert(Const::BigU64(MAX_CONSTANTS as u64))
         .expect_err("insertion past MAX_CONSTANTS must fail cleanly");
-    assert!(err.contains("full"), "unexpected error text: {err}");
+    assert!(
+        err.to_string().contains("full"),
+        "unexpected error text: {err}"
+    );
 
     // Dedup still resolves at capacity (checked before the cap).
     assert_eq!(

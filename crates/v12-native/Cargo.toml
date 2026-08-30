@@ -1,0 +1,15 @@
+[package]
+name = "v12-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Unified native dispatch: NativeId enum, typed argument signatures, and std From/TryFrom conversions shared by the interpreter and engine"
+
+[dependencies]
+v12-heap.workspace = true
+v12-bytecode.workspace = true
+strum.workspace = true
+
+[lints]
+workspace = true

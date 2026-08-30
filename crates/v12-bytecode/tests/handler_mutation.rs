@@ -54,7 +54,7 @@ fn must_reject(desc: &str, table: Vec<HandlerRange>, fragment: &str) {
         panic!("MUTANT SURVIVED validate(): {desc}")
     };
     assert!(
-        err.contains(fragment),
+        err.to_string().contains(fragment),
         "mutant {desc} was rejected by the wrong invariant:\n  got:    {err:?}\n  wanted: {fragment:?}"
     );
 }
@@ -239,7 +239,7 @@ fn every_single_field_mutant_is_rejected() {
         match fb(table.clone()).validate() {
             Ok(()) => survived.push(desc),
             Err(err) => assert!(
-                err.contains(fragment),
+                err.to_string().contains(fragment),
                 "mutant {desc} rejected by the wrong invariant:\n  got:    {err:?}\n  wanted: {fragment:?}"
             ),
         }
@@ -346,6 +346,6 @@ fn zero_max_regs_is_rejected_even_with_no_handlers() {
     fb.max_regs = 0;
     assert_eq!(
         fb.validate().unwrap_err(),
-        "max_regs must be greater than zero"
+        v12_bytecode::BytecodeError::ZeroMaxRegs
     );
 }

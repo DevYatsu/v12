@@ -6,58 +6,75 @@ use crate::gc::{MarkSink, Trace};
 use crate::handle::{Handle, HeapSpace, Space};
 use crate::shape::ValidityCellId;
 
-/// Default `JsObject` kind: the ordinary object. Further kinds are assigned
-/// as they become needed (function, array, Proxy, …).
-pub const KIND_ORDINARY: u8 = 0;
-
-/// Object kind for user functions created by `Closure`.
-pub const KIND_FUNCTION: u8 = 1;
-
-/// Object kind for array literals.
-pub const KIND_ARRAY: u8 = 2;
-
-/// Object kind for arguments exotic objects (ES `ArgumentsExoticObject`).
+/// The kind of a heap object.
 ///
-/// Layout: `properties` holds named properties (`length`, `callee`),
-/// `elements` holds indexed arguments, and `arguments_mapped` tracks the
-/// exotic parameter alias (see `JsObject::arguments_mapped`).
-pub const KIND_ARGUMENTS: u8 = 3;
+/// Replaces the flat `KIND_*` u8 constants: a single namespace, so no two
+/// kinds can collide, and `match` over a `Kind` is exhaustive (adding a kind
+/// is a compile error everywhere it must be handled).
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, strum::FromRepr)]
+pub enum Kind {
+    /// Default `JsObject` kind: the ordinary object. Further kinds are
+    /// assigned as they become needed (function, array, Proxy, …).
+    Ordinary = 0,
+    /// Object kind for user functions created by `Closure`.
+    Function = 1,
+    /// Object kind for array literals.
+    Array = 2,
+    /// Arguments exotic objects (ES `ArgumentsExoticObject`).
+    ///
+    /// Layout: `properties` holds named properties (`length`, `callee`),
+    /// `elements` holds indexed arguments, and `arguments_mapped` tracks the
+    /// exotic parameter alias (see `JsObject::arguments_mapped`).
+    Arguments = 3,
+    /// Generator object. Interpreter contract (v12-interp/src/lib.rs):
+    /// properties[0]=fn_idx, [1]=resume_pc, [2]=done (0.0 running / 1.0
+    /// completed / 2.0 suspended), [3]=yield_dst; elements=saved register
+    /// window snapshot; prototype=captured Env. DO NOT reorder without
+    /// updating interp.
+    Generator = 4,
+    /// Promise object. Internal slots live in `properties[0..3]` =
+    /// `[state, value, reactions]` (see [`PromiseExt`]). A dedicated kind
+    /// makes `is_promise` a single field test instead of a structural check.
+    Promise = 5,
+    /// Error object. Internal slots: `properties[0]` = name, `properties[1]`
+    /// = message. A dedicated kind lets `is_error` be a field test and keeps
+    /// error display (`message` extraction) off the shape path.
+    Error = 6,
+    /// Map object. Entries live in `elements` as `[k1, v1, k2, v2, …]` pairs
+    /// (see `v12-engine/src/builtins/map.rs`).
+    Map = 7,
+    /// Set object. Values live in `elements` (see
+    /// `v12-engine/src/builtins/map.rs`).
+    Set = 8,
+    /// Iterator object (Array/Map/Set iterators backing `Symbol.iterator`).
+    /// Internal state lives in `elements` as `[kind, source, index]` — see
+    /// `v12-engine/src/builtins/iterator.rs`. The `next` method is a native
+    /// routed through the registry.
+    Iterator = 9,
+    /// RegExp object. Internal slots live in `properties` as
+    /// `[source, flags, lastIndex]` — see `v12-engine/src/builtins/regexp.rs`.
+    /// The compiled pattern is cached inside the object's `elements[0]` via
+    /// the native registry's side table; the object itself only carries the
+    /// source text and flag string.
+    RegExp = 10,
+    /// Proxy object: every internal method traps (the engine's dispatch
+    /// reports a `TypeError` for the v1 stub).
+    Proxy = 99,
+    /// Receiver pseudo-kind for primitive strings in the built-in method
+    /// table. Never stored on a `JsObject`; used only to key `methods!`
+    /// tables.
+    StringPrim = 0xFF,
+}
 
-/// Generator object. Interpreter contract (v12-interp/src/lib.rs):
-/// properties[0]=fn_idx, [1]=resume_pc, [2]=done (0.0 running / 1.0 completed / 2.0 suspended), [3]=yield_dst;
-/// elements=saved register window snapshot; prototype=captured Env. DO NOT reorder without updating interp.
-pub const KIND_GENERATOR: u8 = 4;
-
-/// Promise object. Internal slots live in `properties[0..3]` =
-/// `[state, value, reactions]` (see [`PromiseExt`]). A dedicated kind makes
-/// `is_promise` a single field test instead of a structural check.
-pub const KIND_PROMISE: u8 = 5;
-
-/// Error object. Internal slots: `properties[0]` = name, `properties[1]` =
-/// message. A dedicated kind lets `is_error` be a field test and keeps error
-/// display (`message` extraction) off the shape path.
-pub const KIND_ERROR: u8 = 6;
-
-/// Map object. Entries live in `elements` as `[k1, v1, k2, v2, …]` pairs
-/// (see `v12-engine/src/builtins/map.rs`).
-pub const KIND_MAP: u8 = 7;
-
-/// Set object. Values live in `elements` (see
-/// `v12-engine/src/builtins/map.rs`).
-pub const KIND_SET: u8 = 8;
-
-/// Iterator object (Array/Map/Set iterators backing `Symbol.iterator`).
-/// Internal state lives in `elements` as `[kind, source, index]` — see
-/// `v12-engine/src/builtins/iterator.rs`. The `next` method is a native
-/// routed through the registry.
-pub const KIND_ITERATOR: u8 = 9;
-
-/// RegExp object. Internal slots live in `properties` as
-/// `[source, flags, lastIndex]` — see `v12-engine/src/builtins/regexp.rs`.
-/// The compiled pattern is cached inside the object's `elements[0]` via the
-/// native registry's side table; the object itself only carries the source
-/// text and flag string.
-pub const KIND_REGEXP: u8 = 10;
+/// The raw `u8` discriminant of a kind (for the `JsObject.kind` field and
+/// serialized layout).
+impl From<Kind> for u8 {
+    #[inline]
+    fn from(k: Kind) -> u8 {
+        k as u8
+    }
+}
 
 /// ES integrity levels ([`JsObject`]): how far an object has been locked
 /// down. Transitions are monotone — sealing then freezing is legal, nothing
@@ -77,8 +94,8 @@ pub enum IntegrityLevel {
 /// the storage.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsObject {
-    /// Object kind; [`KIND_ORDINARY`] by default.
-    pub kind: u8,
+    /// Object kind; [`Kind::Ordinary`] by default.
+    pub kind: Kind,
     /// Kind-specific flag bits (see the `FLAG_*` constants).
     pub flags: u8,
     /// For `KIND_FUNCTION` objects: what calling this object invokes (a
@@ -149,7 +166,7 @@ impl Default for JsObject {
     /// `bind_shape`.
     fn default() -> Self {
         Self {
-            kind: KIND_ORDINARY,
+            kind: Kind::Ordinary,
             flags: 0,
             callable: crate::function::FunctionTarget::Bytecode(0),
             program_id: 0,
@@ -237,7 +254,7 @@ impl JsObject {
     /// An ordinary object with the given properties and their keys.
     pub fn ordinary(properties: Vec<crate::JsValue>, property_keys: Vec<Option<crate::PropKey>>) -> Self {
         Self {
-            kind: KIND_ORDINARY,
+            kind: Kind::Ordinary,
             properties,
             property_keys,
             ..Self::default()
@@ -248,7 +265,7 @@ impl JsObject {
     /// is the closure environment.
     pub fn function(target: crate::function::FunctionTarget, env: Option<Handle<JsObject>>) -> Self {
         Self {
-            kind: KIND_FUNCTION,
+            kind: Kind::Function,
             callable: target,
             captured_env: env,
             ..Self::default()
@@ -269,7 +286,7 @@ impl JsObject {
             elements_array.set(i as u32, v);
         }
         Self {
-            kind: KIND_ARRAY,
+            kind: Kind::Array,
             properties: vec![crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi")],
             property_keys: vec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
             elements,
@@ -282,7 +299,7 @@ impl JsObject {
     pub fn arguments(properties: Vec<crate::JsValue>, elements: Vec<crate::JsValue>, mapped: Option<Box<[Option<u32>]>>) -> Self {
         let prop_len = properties.len();
         Self {
-            kind: KIND_ARGUMENTS,
+            kind: Kind::Arguments,
             properties,
             property_keys: vec![None; prop_len],
             elements,
@@ -297,7 +314,7 @@ impl JsObject {
     /// the object handle — this object carries only the source text.
     pub fn regexp(source: crate::Handle<crate::V12Str>, flags: crate::Handle<crate::V12Str>) -> Self {
         Self {
-            kind: KIND_REGEXP,
+            kind: Kind::RegExp,
             properties: vec![
                 crate::JsValue::string(source),
                 crate::JsValue::string(flags),
@@ -310,13 +327,13 @@ impl JsObject {
 
     /// A generator object (suspended frame).
     pub fn generator() -> Self {
-        Self { kind: KIND_GENERATOR, ..Default::default() }
+        Self { kind: Kind::Generator, ..Default::default() }
     }
 
     /// A Promise object (ordinary kind with Promise-specific fields set later).
     pub fn promise() -> Self {
         Self {
-            kind: KIND_ORDINARY,
+            kind: Kind::Ordinary,
             ..Self::default()
         }
     }
@@ -324,7 +341,7 @@ impl JsObject {
     /// Pending promise with `properties = [state=0, value=undefined, reactions]`.
     pub fn pending_promise(reactions: crate::Handle<JsObject>) -> Self {
         Self {
-            kind: KIND_PROMISE,
+            kind: Kind::Promise,
             properties: vec![
                 crate::JsValue::from_f64(0.0),
                 crate::JsValue::undefined(),
@@ -338,7 +355,7 @@ impl JsObject {
     /// Fulfilled promise `properties = [1, value, reactions]`.
     pub fn fulfilled_promise(value: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
-            kind: KIND_PROMISE,
+            kind: Kind::Promise,
             properties: vec![
                 crate::JsValue::from_i32_smi(1).expect("1 fits"),
                 value,
@@ -352,7 +369,7 @@ impl JsObject {
     /// Rejected promise `properties = [2, reason, reactions]`.
     pub fn rejected_promise(reason: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
-            kind: KIND_PROMISE,
+            kind: Kind::Promise,
             properties: vec![
                 crate::JsValue::from_i32_smi(2).expect("2 fits"),
                 reason,
@@ -368,7 +385,7 @@ impl JsObject {
     /// text. Both are heap strings.
     pub fn error(name: crate::Handle<crate::V12Str>, message: crate::Handle<crate::V12Str>) -> Self {
         Self {
-            kind: KIND_ERROR,
+            kind: Kind::Error,
             properties: vec![
                 crate::JsValue::string(name),
                 crate::JsValue::string(message),
@@ -400,7 +417,7 @@ impl JsObject {
         }
         let prop_len = props.len();
         Self {
-            kind: KIND_GENERATOR,
+            kind: Kind::Generator,
             properties: props,
             property_keys: vec![None; prop_len],
             elements: window,
@@ -499,7 +516,7 @@ pub trait GeneratorExt {
 impl GeneratorExt for crate::Handle<JsObject> {
     fn generator_state(&self, heap: &crate::Heap) -> Option<GeneratorState> {
         let o = heap.get(*self);
-        if o.kind != KIND_GENERATOR || o.properties.len() < 4 {
+        if o.kind != Kind::Generator || o.properties.len() < 4 {
             return None;
         }
         let fn_idx = o.properties[0].as_smi().unwrap_or(0) as u32;
@@ -696,7 +713,7 @@ mod tests {
         let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
         let mapped: Box<[Option<u32>]> = vec![Some(0), Some(1), None].into_boxed_slice();
         let obj = heap.alloc(JsObject {
-            kind: KIND_ARGUMENTS,
+            kind: Kind::Arguments,
             elements: vec![
                 JsValue::from_i32_smi(10).unwrap(),
                 JsValue::from_i32_smi(20).unwrap(),
@@ -707,7 +724,7 @@ mod tests {
         });
         heap.add_root(JsValue::object(obj));
         let stored = heap.get(obj);
-        assert_eq!(stored.kind, KIND_ARGUMENTS);
+        assert_eq!(stored.kind, Kind::Arguments);
         assert!(stored.arguments_mapped.is_some());
         let map = stored.arguments_mapped.as_ref().unwrap();
         assert_eq!(map[0], Some(0));
@@ -721,7 +738,7 @@ mod tests {
     fn arguments_exotic_unmapped_is_strict() {
         let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
         let obj = heap.alloc(JsObject {
-            kind: KIND_ARGUMENTS,
+            kind: Kind::Arguments,
             elements: vec![JsValue::from_i32_smi(1).unwrap()],
             arguments_mapped: None,
             ..JsObject::default()
@@ -737,7 +754,7 @@ mod tests {
         let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
         let h = heap.alloc(JsObject::generator());
         heap.get_mut(h).properties = vec![JsValue::from_f64(2.0), JsValue::from_f64(0.0), JsValue::from_f64(0.0)];
-        assert_eq!(heap.get(h).kind, KIND_GENERATOR);
+        assert_eq!(heap.get(h).kind, Kind::Generator);
         assert_eq!(heap.get(h).properties.len(), 3);
     }
 }

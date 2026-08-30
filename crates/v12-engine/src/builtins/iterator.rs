@@ -15,8 +15,9 @@
 //! (`{value, done}`).
 
 use v12_heap::{Handle, Heap, JsObject, JsValue};
+use v12_native::Throw;
 
-use super::{NativeRegistry, intern_type_error};
+use super::helpers;
 
 /// Iterator kind: array values (`for (const v of arr)`).
 pub const ITER_KIND_ARRAY_VALUES: i32 = 0;
@@ -38,25 +39,19 @@ const SLOT_KIND: usize = 0;
 const SLOT_SOURCE: usize = 1;
 const SLOT_INDEX: usize = 2;
 
-fn smi(v: i32) -> JsValue {
-    JsValue::from_i32_smi(v).expect("iterator state fits Smi")
-}
-
 /// Builds an iterator object over `source` with the given kind.
 fn create_iterator(heap: &mut Heap, source: Handle<JsObject>, kind: i32) -> Handle<JsObject> {
-    let iter = heap.alloc(JsObject {
-        kind: v12_heap::KIND_ITERATOR,
-        elements: vec![smi(kind), JsValue::object(source), smi(0)],
+    let iter = helpers::alloc_obj(heap, JsObject {
+        kind: v12_heap::Kind::Iterator,
+        elements: vec![helpers::smi_or_f64(i64::from(kind)), JsValue::object(source), helpers::smi_or_f64(0)],
         ..JsObject::default()
     });
-    heap.add_root(JsValue::object(iter));
     iter
 }
 
 /// Allocates an ES iterator result `{value, done}`.
 fn iterator_result(heap: &mut Heap, value: JsValue, done: bool) -> JsValue {
-    let h = heap.alloc(JsObject::default());
-    heap.add_root(JsValue::object(h));
+    let h = helpers::alloc_obj(heap, JsObject::default());
     // Shape-driven set: value then done, matching `make_iterator_result`.
     let value_key = heap.intern_string(v12_heap::V12Str::latin1(b"value".to_vec()));
     let done_key = heap.intern_string(v12_heap::V12Str::latin1(b"done".to_vec()));
@@ -78,7 +73,7 @@ fn iterator_result(heap: &mut Heap, value: JsValue, done: bool) -> JsValue {
 /// The iterator's source object and next index.
 fn state(heap: &Heap, iter: Handle<JsObject>) -> Option<(Handle<JsObject>, usize)> {
     let o = heap.get(iter);
-    if o.kind != v12_heap::KIND_ITERATOR || o.elements.len() < 3 {
+    if o.kind != v12_heap::Kind::Iterator || o.elements.len() < 3 {
         return None;
     }
     let source = o.elements[SLOT_SOURCE].as_object()?;
@@ -94,12 +89,12 @@ fn state(heap: &Heap, iter: Handle<JsObject>) -> Option<(Handle<JsObject>, usize
 fn source_elem(heap: &Heap, source: Handle<JsObject>, index: usize) -> JsValue {
     let o = heap.get(source);
     match o.kind {
-        v12_heap::KIND_ARRAY => o
+        v12_heap::Kind::Array => o
             .elements_array
             .get(index as u32)
             .map(|v| if v.is_hole() { JsValue::undefined() } else { v })
             .unwrap_or(JsValue::undefined()),
-        v12_heap::KIND_MAP | v12_heap::KIND_SET | v12_heap::KIND_ARGUMENTS => o
+        v12_heap::Kind::Map | v12_heap::Kind::Set | v12_heap::Kind::Arguments => o
             .elements
             .get(index)
             .copied()
@@ -112,9 +107,9 @@ fn source_elem(heap: &Heap, source: Handle<JsObject>, index: usize) -> JsValue {
 fn source_len(heap: &Heap, source: Handle<JsObject>) -> usize {
     let o = heap.get(source);
     match o.kind {
-        v12_heap::KIND_ARRAY => o.elements_array.len(),
-        v12_heap::KIND_MAP => o.elements.len() / 2,
-        v12_heap::KIND_SET | v12_heap::KIND_ARGUMENTS => o.elements.len(),
+        v12_heap::Kind::Array => o.elements_array.len(),
+        v12_heap::Kind::Map => o.elements.len() / 2,
+        v12_heap::Kind::Set | v12_heap::Kind::Arguments => o.elements.len(),
         _ => 0,
     }
 }
@@ -122,21 +117,19 @@ fn source_len(heap: &Heap, source: Handle<JsObject>) -> usize {
 /// `Array.prototype.values` / `Map.prototype[Symbol.iterator]` /
 /// `Set.prototype[Symbol.iterator]` shared implementation: returns a fresh
 /// iterator over `this`.
-pub fn iterator_for(heap: &mut Heap, this: JsValue, kind: i32) -> Result<JsValue, JsValue> {
-    let Some(obj) = this.as_object() else {
-        return Err(intern_type_error(heap, "TypeError: value is not iterable"));
-    };
+pub fn iterator_for(heap: &mut Heap, this: JsValue, kind: i32) -> Result<JsValue, Throw> {
+    let obj = this.as_object().ok_or_else(|| {
+        Throw::type_error(heap, "TypeError: value is not iterable")
+    })?;
     Ok(JsValue::object(create_iterator(heap, obj, kind)))
 }
 
 /// `iterator.next()` — shared by all four iterator kinds. Advances the
 /// internal index and produces `{value, done}`.
-pub fn iterator_next(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
-    let Some(iter) = this.as_object() else {
-        return Err(intern_type_error(heap, "TypeError: iterator.next called on non-object"));
-    };
+pub fn iterator_next(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let iter = helpers::as_object(heap, this, "iterator.next", Some(v12_heap::Kind::Iterator))?;
     let Some((source, index)) = state(heap, iter) else {
-        return Err(intern_type_error(heap, "TypeError: not an iterator"));
+        return Err(Throw::type_error(heap, "iterator.next called on non-iterator"));
     };
     let kind = heap.get(iter).elements[SLOT_KIND]
         .as_smi()
@@ -144,18 +137,18 @@ pub fn iterator_next(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Resul
     let len = source_len(heap, source);
     if index >= len {
         // Done: mark the iterator exhausted and return {undefined, true}.
-        heap.get_mut(iter).elements[SLOT_INDEX] = smi(v12_heap::JsValue::SMI_MAX);
+        heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(i64::from(v12_heap::JsValue::SMI_MAX));
         return Ok(iterator_result(heap, JsValue::undefined(), true));
     }
     // Advance the index before producing the value: iterator state updates
     // happen on each `next`, even when the value is a pair.
-    heap.get_mut(iter).elements[SLOT_INDEX] = smi(index as i32 + 1);
+    heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(index as i64 + 1);
     let value = match kind {
         ITER_KIND_ARRAY_VALUES => source_elem(heap, source, index),
-        ITER_KIND_ARRAY_KEYS => JsValue::from_i32_smi(index as i32).unwrap_or_else(|| JsValue::from_f64(index as f64)),
+        ITER_KIND_ARRAY_KEYS => helpers::smi_or_f64(index as i64),
         ITER_KIND_ARRAY_ENTRIES | ITER_KIND_MAP_ENTRIES => {
             let key = if kind == ITER_KIND_ARRAY_ENTRIES {
-                JsValue::from_i32_smi(index as i32).unwrap_or_else(|| JsValue::from_f64(index as f64))
+                helpers::smi_or_f64(index as i64)
             } else {
                 source_elem(heap, source, 2 * index)
             };
@@ -165,8 +158,7 @@ pub fn iterator_next(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Resul
                 source_elem(heap, source, 2 * index + 1)
             };
             // `[key, value]` pair.
-            let pair = heap.alloc(JsObject::array(vec![key, val]));
-            heap.add_root(JsValue::object(pair));
+            let pair = helpers::alloc_obj(heap, JsObject::array(vec![key, val]));
             JsValue::object(pair)
         }
         ITER_KIND_MAP_KEYS => source_elem(heap, source, 2 * index),
@@ -182,43 +174,32 @@ pub fn iterator_next(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Resul
 /// iterator object itself; without this, a `for-of` over an iterator
 /// (rather than an iterable) would fail. Satisfies the spec identity
 /// `iterator[Symbol.iterator]() === iterator`.
-pub fn iterator_self(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn iterator_self(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let _ = heap;
     Ok(this)
 }
 
 /// `Array.prototype[Symbol.iterator]` — values iterator over `this`.
-pub fn array_iterator(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn array_iterator(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_ARRAY_VALUES)
 }
 
 /// `Map.prototype[Symbol.iterator]` — entries iterator over `this`.
-pub fn map_iterator(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn map_iterator(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_MAP_ENTRIES)
 }
 
 /// `Set.prototype[Symbol.iterator]` — values iterator over `this`.
-pub fn set_iterator(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn set_iterator(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_SET_VALUES)
 }
 
 /// `Array.prototype.entries` — entries iterator over `this`.
-pub fn array_iterator_entries(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn array_iterator_entries(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_ARRAY_ENTRIES)
 }
 
 /// `Array.prototype.keys` — keys iterator over `this`.
-pub fn array_iterator_keys(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub fn array_iterator_keys(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_ARRAY_KEYS)
-}
-
-/// Installs the iterator natives into the registry.
-pub fn install(registry: &mut NativeRegistry) {
-    registry.register(super::NATIVE_ITERATOR_NEXT, iterator_next);
-    registry.register(super::NATIVE_ARRAY_ITERATOR, array_iterator);
-    registry.register(super::NATIVE_MAP_ITERATOR, map_iterator);
-    registry.register(super::NATIVE_SET_ITERATOR, set_iterator);
-    registry.register(super::NATIVE_ITERATOR_SELF, iterator_self);
-    registry.register(super::NATIVE_ARRAY_ITERATOR_ENTRIES, array_iterator_entries);
-    registry.register(super::NATIVE_ARRAY_ITERATOR_KEYS, array_iterator_keys);
 }

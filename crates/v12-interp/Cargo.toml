@@ -15,6 +15,7 @@ compiler = ["dep:v12-bccompiler"]
 [dependencies]
 v12-bytecode.workspace = true
 v12-heap.workspace = true
+v12-native.workspace = true
 # The interpreter runs `v12_bytecode::Program`s, not compiler
 # products. The front-end (`v12-bccompiler` / `oxc_*` / `lasso`) is no
 # longer a runtime dependency of the interpreter; embedders that want
@@ -25,3 +26,6 @@ v12-bccompiler = { workspace = true, optional = true }
 test-support.workspace = true
 # Property tests for the per-opcode type-feedback lattice (see feedback.rs).
 proptest = "1"
+
+[lints]
+workspace = true

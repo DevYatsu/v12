@@ -47,6 +47,12 @@ use crate::value::JsValue;
 use std::vec::Vec;
 
 /// Writes at or above this index switch the store to dictionary form.
+///
+/// V8's `ElementsKind` lattice switches to dictionary elements at a similar
+/// huge-index bound (its `kMaxFastIndex`/`kMaxFastArrayLength` policy) for
+/// the same reason: a flat vector grown to a sparse, huge index wastes memory
+/// and clearing cost on every operation. The exact value is a tuning
+/// constant; the *lattice-and-escape* shape is the shared precedent.
 pub const ELEMENTS_TO_DICTIONARY_INDEX: u32 = 1024;
 
 /// Writes leaving a gap larger than this above the current length switch the
@@ -156,7 +162,7 @@ fn smi_value(n: i32) -> JsValue {
 /// Sparse element store: index → value, with per-entry cached key hashes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ElementsDictionary {
-    entries: hashbrown::HashMap<u32, DictEntry>,
+    entries: rustc_hash::FxHashMap<u32, DictEntry>,
     /// Highest index ever inserted, plus one — the array-length view.
     length: u32,
 }
@@ -180,7 +186,7 @@ fn element_key_hash(index: u32) -> u64 {
 impl ElementsDictionary {
     /// Empty dictionary.
     pub fn new() -> Self {
-        Self { entries: hashbrown::HashMap::new(), length: 0 }
+        Self { entries: rustc_hash::FxHashMap::default(), length: 0 }
     }
 
     /// Inserts or overwrites `index`, refreshing the cached hash.

@@ -5,6 +5,7 @@
 
 use v12_bytecode::{Const, ConstantPool, FunctionBytecode, HandlerRange, Instr, Opcode, WideOp};
 use v12_heap::{GcPolicy, Heap, JsValue};
+use v12_native::{NativeId, Throw};
 
 use test_support::*;
 use crate::{Interp, JSException, NativeRegistry};
@@ -112,8 +113,8 @@ fn recursion_below_the_limit_still_works() {
     assert_eq!(expect_throw(&mut interp).as_smi(), Some(125_250));
 }
 
-/// Native seam probe: reports `argc * 10 + index`, proving both directions
-/// of the ABI handoff for indices beyond the compiled program.
+/// Native seam probe: reports `argc * 10 + discriminant`, proving both
+/// directions of the ABI handoff for indices beyond the compiled program.
 struct ProbeNatives;
 
 impl NativeRegistry for ProbeNatives {
@@ -122,11 +123,12 @@ impl NativeRegistry for ProbeNatives {
         _heap: &mut Heap,
         _this: JsValue,
         args: &[JsValue],
-        index: u32,
-    ) -> Result<JsValue, JsValue> {
-        assert_eq!(index, 255);
+        id: NativeId,
+    ) -> Result<JsValue, Throw> {
+        assert_eq!(id, NativeId::ModuleImport);
         Ok(crate::ops::box_number(
-            f64::from(u32::try_from(args.len()).expect("small")) * 10.0 + f64::from(index),
+            f64::from(u32::try_from(args.len()).expect("small")) * 10.0
+                + f64::from(u32::from(NativeId::ModuleImport)),
         ))
     }
 }
@@ -136,17 +138,25 @@ fn calls_beyond_the_program_route_through_the_native_seam() {
     let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(&mut heap, "let f = function (a, b) { return a; }; throw f(7, 8);")
         .expect("compiles");
-    // Retarget every closure to function index 255, which lies beyond the
-    // compiled program and therefore names a native.
+    // Retarget every closure to the module-import native discriminant (254),
+    // which fits the 8-bit instruction operand, lies beyond the compiled
+    // program, and decodes to a real `NativeId` — proving the bytecode-index
+    // handoff through the native seam.
     for f in interp.functions_mut_for_test() {
         for instr in &mut f.instrs {
             if instr.op() == Some(Opcode::Closure) {
-                *instr = Instr::new(Opcode::Closure, instr.a(), 255, 0);
+                *instr = Instr::new(
+                    Opcode::Closure,
+                    instr.a(),
+                    u32::from(NativeId::ModuleImport) as u8,
+                    0,
+                );
             }
         }
     }
     interp.set_natives(Box::new(ProbeNatives));
-    assert_eq!(expect_throw(&mut interp).as_smi(), Some(275));
+    // argc = 2 → 2 * 10 + 254.
+    assert_eq!(expect_throw(&mut interp).as_smi(), Some(274));
 }
 
 #[test]
@@ -155,11 +165,18 @@ fn unregistered_natives_report_type_error() {
     let mut interp =
         Interp::from_source(&mut heap, "let f = function () { return 1; }; try { f(); } catch (e) {}")
             .expect("compiles");
-    // Default registry: retargeted calls throw; here the catch swallows it.
+    // Retarget every closure to the module-import native discriminant (254):
+    // no registry serves it here (the default is empty), so the call throws a
+    // TypeError that the `try/catch` swallows.
     for f in interp.functions_mut_for_test() {
         for instr in &mut f.instrs {
             if instr.op() == Some(Opcode::Closure) {
-                *instr = Instr::new(Opcode::Closure, instr.a(), 255, 0);
+                *instr = Instr::new(
+                    Opcode::Closure,
+                    instr.a(),
+                    u32::from(NativeId::ModuleImport) as u8,
+                    0,
+                );
             }
         }
     }
@@ -428,7 +445,7 @@ fn instanceof_prototype_chain_via_heap() {
     let ctor = {
         let heap = interp.heap_mut_for_test();
         let c = heap.alloc(v12_heap::JsObject {
-            kind: crate::KIND_FUNCTION,
+            kind: crate::Kind::Function,
             ..Default::default()
         });
         heap.add_root(v12_heap::JsValue::object(c));
@@ -912,7 +929,7 @@ fn global_get_object_returns_function_kind() {
     // Mirror `v12-engine/src/realm.rs` order for the first 6 intrinsics so the
     // fast path lines up. We only need Object at index 0 for this test.
     let object_ctor = heap.alloc(v12_heap::JsObject {
-        kind: crate::KIND_FUNCTION,
+        kind: crate::Kind::Function,
         ..Default::default()
     });
     heap.add_root(v12_heap::JsValue::object(object_ctor));
@@ -921,7 +938,7 @@ fn global_get_object_returns_function_kind() {
     props[0] = v12_heap::JsValue::object(object_ctor);
     // Also add Array at 1 to verify second slot works.
     let array_ctor = heap.alloc(v12_heap::JsObject {
-        kind: crate::KIND_FUNCTION,
+        kind: crate::Kind::Function,
         ..Default::default()
     });
     heap.add_root(v12_heap::JsValue::object(array_ctor));
@@ -937,7 +954,7 @@ fn global_get_object_returns_function_kind() {
     let h = thrown.as_object().unwrap();
     assert_eq!(
         interp.heap().get(h).kind,
-        crate::KIND_FUNCTION,
+        crate::Kind::Function,
         "Object intrinsic should be a function"
     );
 }
@@ -952,7 +969,7 @@ fn global_object_get_prototype_property_is_reachable() {
     let global = heap.alloc(v12_heap::JsObject::default());
     heap.add_root(v12_heap::JsValue::object(global));
     let object_ctor = heap.alloc(v12_heap::JsObject {
-        kind: crate::KIND_FUNCTION,
+        kind: crate::Kind::Function,
         ..Default::default()
     });
     heap.add_root(v12_heap::JsValue::object(object_ctor));
@@ -992,7 +1009,7 @@ fn global_object_get_prototype_property_is_reachable() {
         "Object.getPrototypeOf should be a function object"
     );
     let fh = thrown.as_object().unwrap();
-    assert_eq!(interp.heap().get(fh).kind, crate::KIND_FUNCTION);
+    assert_eq!(interp.heap().get(fh).kind, crate::Kind::Function);
     // Second variant: call the native via JS to ensure dispatch works (prototype lookup).
     let mut heap2 = v12_heap::Heap::new(v12_heap::GcPolicy::NoGC);
     let global2 = heap2.alloc(v12_heap::JsObject::default());

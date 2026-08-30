@@ -93,18 +93,19 @@ fn sweep_all_256_opcode_bytes_through_every_decode_path() {
                         // unassigned discriminant in slot `c`.
                         if u32::from(c) <= 4 {
                             assert!(
-                                reason.contains("missing payload"),
+                                reason.to_string().contains("missing payload"),
                                 "truncated wide must report missing payload, got: {reason}"
                             );
                         } else {
                             assert!(
-                                reason.contains("unknown discriminant"),
+                                reason.to_string().contains("unknown discriminant"),
                                 "unknown wide discriminant must be reported, got: {reason}"
                             );
                         }
                     } else {
                         assert!(
-                            reason.contains("not Wide") || reason.contains("unknown discriminant"),
+                            reason.to_string().contains("not Wide")
+                                || reason.to_string().contains("unknown discriminant"),
                             "unexpected decode error for {byte:#04x}: {reason}"
                         );
                     }
@@ -168,7 +169,9 @@ fn fuzz_100k_random_words_through_every_decode_path() {
                 );
                 assert!(width <= words.len());
             }
-            Err(reason) => assert!(!reason.is_empty(), "errors must explain themselves"),
+            Err(reason) => {
+                assert!(!reason.to_string().is_empty(), "errors must explain themselves")
+            }
         }
 
         // Pool decoding is total over arbitrary indices.
@@ -199,7 +202,7 @@ fn structured_wide_op_roundtrip_and_truncation_fuzz() {
             let err = WideOp::try_decode(&encoded[..cut])
                 .expect_err("prefix shorter than the full sequence must not decode");
             assert!(
-                err.contains("missing") || err.contains("header"),
+                err.to_string().contains("missing") || err.to_string().contains("header"),
                 "truncation to {cut} reported: {err}"
             );
         }
@@ -254,7 +257,7 @@ fn wide_headers_with_unknown_discriminants_error_cleanly() {
             Instr(0x9ABC_DEF0),
         ];
         let err = WideOp::try_decode(&words).expect_err("unassigned discriminant");
-        assert!(err.contains("unknown discriminant"), "{err}");
-        assert!(err.contains(&format!("{disc:#x}")), "{err}");
+        assert!(err.to_string().contains("unknown discriminant"), "{err}");
+        assert!(err.to_string().contains(&format!("{disc:#x}")), "{err}");
     }
 }

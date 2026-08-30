@@ -7,9 +7,9 @@
 //! the Smi range become Smis, everything else stays a raw double — with the
 //! deliberate exception of negative zero, whose sign a Smi cannot carry.
 
-use v12_heap::{Handle, Heap, JsValue, V12Str};
+use v12_heap::{Handle, Heap, JsValue, Kind, V12Str};
 
-use crate::{JSException, KIND_FUNCTION};
+use crate::JSException;
 
 /// UTF-16 code units of a heap string, materializing composites first.
 pub(crate) fn string_units(heap: &mut Heap, h: Handle<V12Str>) -> Vec<u16> {
@@ -222,7 +222,7 @@ pub(crate) fn to_js_string(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>
     }
     if v.is_object() {
         let o = v.as_object().expect("object tag");
-        let text = if heap.get(o).kind == KIND_FUNCTION {
+        let text = if heap.get(o).kind == Kind::Function {
             "function"
         } else {
             "[object Object]"

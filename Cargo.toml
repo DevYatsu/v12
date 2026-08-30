@@ -9,6 +9,22 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = ""
 
+# Design-boundary guardrails (architecture plan phase A). Engine-core crates
+# opt into these via `[lints] workspace = true`; control-path crates may stay
+# outside. `unsafe_code` is deny (not forbid) so the two audited sites can keep
+# their scoped `#[allow(unsafe_code)]`: the `HostClosure` raw-pointer handle
+# (v12-heap/src/function.rs) and the JIT executable-memory layer
+# (v12-jit-baseline/src/mmap.rs). The unwrap/expect/panic lints are warn-level
+# here: the architecture check (scripts/check-architecture.py) is the gate that
+# blocks *new* unwraps in non-test code via its audited-site allowlist.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
 [workspace.dependencies]
 # Front end (ADR-1): weekly 0.x releases with breaking changes — pin exact,
 # upgrade deliberately.
@@ -28,7 +44,7 @@ cranelift-jit = "0.135"
 regress = "0.12"
 
 # BigInt.
-malachite = "0.10"
+malachite = "0.11"
 
 # Intl / Temporal.
 icu = "2.3"
@@ -40,12 +56,12 @@ lasso = "=0.7.3"
 # Arena allocation.
 bumpalo = "3.20"
 
-# Hash tables / hashing.
-hashbrown = "0.17"
-foldhash = "0.2"
+# Enum derive helpers (FromRepr for NativeId / Kind discriminants).
+strum = { version = "0.28", features = ["derive"] }
 
-# Insertion-ordered maps.
-indexmap = "2"
+# Hash tables / hashing: FxHashMap/FxHashSet (hashbrown-backed, rustc's
+# FxHasher) for the integer-keyed maps in v12-heap.
+rustc-hash = "2"
 
 # Benchmarks (dev-only).
 criterion = "0.8"
@@ -53,6 +69,7 @@ criterion = "0.8"
 # Internal crates.
 v12-bytecode = { path = "crates/v12-bytecode" }
 v12-heap = { path = "crates/v12-heap" }
+v12-native = { path = "crates/v12-native" }
 v12-bccompiler = { path = "crates/v12-bccompiler" }
 v12-interp = { path = "crates/v12-interp" }
 v12-codegen = { path = "crates/v12-codegen" }

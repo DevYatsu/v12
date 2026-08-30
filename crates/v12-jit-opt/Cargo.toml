@@ -34,3 +34,6 @@ jit = [
   "dep:cranelift-native",
   "dep:target-lexicon",
 ]
+
+[lints]
+workspace = true

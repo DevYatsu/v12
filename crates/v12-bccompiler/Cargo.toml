@@ -16,3 +16,6 @@ v12-bytecode.workspace = true
 
 [dev-dependencies]
 test-support.workspace = true
+
+[lints]
+workspace = true

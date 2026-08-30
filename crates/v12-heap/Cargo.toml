@@ -6,4 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-hashbrown.workspace = true
+rustc-hash.workspace = true
+strum.workspace = true
+
+[lints]
+workspace = true

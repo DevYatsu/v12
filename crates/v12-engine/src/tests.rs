@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod realm_tests {
-    use v12_heap::{GcPolicy, Heap};
+    use v12_heap::{GcPolicy, Heap, Kind};
 
     use crate::realm::Realm;
 
@@ -73,7 +73,7 @@ mod job_queue_tests {
 
 #[cfg(test)]
 mod internal_methods_tests {
-    use v12_heap::{GcPolicy, Heap, JsObject, JsValue, PropKey, V12Str};
+    use v12_heap::{GcPolicy, Heap, JsObject, JsValue, Kind, PropKey, V12Str};
 
     use crate::internal_methods::{
         ObjectKind, PropertyDescriptor, dispatch_get, dispatch_has, dispatch_set, kind_of,
@@ -101,7 +101,7 @@ mod internal_methods_tests {
     fn proxy_traps_throw_type_error() {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let proxy = JsObject {
-            kind: 99,
+            kind: Kind::Proxy,
             ..Default::default()
         };
         let obj = heap.alloc(proxy);

@@ -20,6 +20,17 @@ jobs:
       # workspace) ensures gated tests are not silently skipped.
       - run: cargo nextest run --workspace --all-features
 
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Design-boundary guardrails: unsafe/thread_local/String-error/unwrap
+      # discipline for the engine-core crates (plan phase A).
+      - run: ./scripts/check-architecture.sh
+      # Engine-core crates opt into workspace lints (unsafe_code forbid,
+      # unwrap/expect/panic deny). --all-features catches the JIT paths.
+      - run: cargo clippy --workspace --all-features -- -D warnings
+
   conformance:
     runs-on: ubuntu-latest
     timeout-minutes: 60

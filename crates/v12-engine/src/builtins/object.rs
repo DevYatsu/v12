@@ -1,8 +1,9 @@
 //! Object built-ins.
 
 use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, PropKey, V12Str};
+use v12_native::Throw;
 
-use super::intern_type_error;
+use super::{helpers, intern_type_error};
 
 /// `Object.create(proto)` – creates a new ordinary object with `proto` as
 /// its prototype. `proto` may be an object or `null`.
@@ -10,17 +11,17 @@ pub fn object_create(
     heap: &mut Heap,
     _this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
+) -> Result<JsValue, Throw> {
     let proto = args.first().copied().unwrap_or(JsValue::null());
     let proto_handle = if proto.is_null() {
         None
     } else if let Some(h) = proto.as_object() {
         Some(h)
     } else {
-        return Err(intern_type_error(
+        return Err((intern_type_error(
             heap,
             "TypeError: Object.create prototype must be object or null",
-        ));
+        )).into());
     };
     let obj = heap.alloc(JsObject::environment(0, proto_handle));
     Ok(JsValue::object(obj))
@@ -31,13 +32,11 @@ pub fn object_get_prototype_of(
     heap: &mut Heap,
     _this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
-    let Some(obj) = args.first().and_then(|v| v.as_object()) else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: Object.getPrototypeOf called on non-object",
-        ));
-    };
+) -> Result<JsValue, Throw> {
+    let obj = args
+        .first()
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| Throw::type_error(heap, "Object.getPrototypeOf called on non-object"))?;
     match heap.get(obj).prototype {
         Some(p) => Ok(JsValue::object(p)),
         None => Ok(JsValue::null()),
@@ -51,19 +50,16 @@ pub fn object_define_property(
     heap: &mut Heap,
     _this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
+) -> Result<JsValue, Throw> {
     if args.len() < 2 {
-        return Err(intern_type_error(
+        return Err((intern_type_error(
             heap,
             "TypeError: Object.defineProperty requires 2 arguments",
-        ));
+        )).into());
     }
-    let Some(obj) = args[0].as_object() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: Object.defineProperty called on non-object",
-        ));
-    };
+    let obj = args[0]
+        .as_object()
+        .ok_or_else(|| Throw::type_error(heap, "Object.defineProperty called on non-object"))?;
     let key = property_key(heap, args[1])?;
     let value = args.get(2).copied().unwrap_or(JsValue::undefined());
 
@@ -74,7 +70,7 @@ pub fn object_define_property(
     // already contain the key, mirroring the interpreter's shape-blind path for
     // the skeleton.
     if heap.get(obj).properties.len() >= 1024 {
-        return Err(intern_type_error(heap, "TypeError: too many properties"));
+        return Err((intern_type_error(heap, "TypeError: too many properties")).into());
     }
     // Check if property already exists by scanning heap lookup (best effort).
     let exists = heap.lookup_property(shape, key).is_some();
@@ -108,28 +104,6 @@ fn property_key(heap: &mut Heap, v: JsValue) -> Result<PropKey, JsValue> {
 }
 
 fn to_string_handle(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>, JsValue> {
-    if let Some(h) = v.as_string() {
-        return Ok(h);
-    }
-    if let Some(n) = v.as_smi() {
-        let s = n.to_string();
-        return Ok(heap.intern_string(V12Str::latin1(s.into_bytes())));
-    }
-    if let Some(n) = v.as_f64() {
-        let s = format!("{n}");
-        return Ok(heap.intern_string(V12Str::latin1(s.into_bytes())));
-    }
-    if v.is_true() {
-        return Ok(heap.intern_string(V12Str::latin1(b"true".to_vec())));
-    }
-    if v.is_false() {
-        return Ok(heap.intern_string(V12Str::latin1(b"false".to_vec())));
-    }
-    if v.is_undefined() {
-        return Ok(heap.intern_string(V12Str::latin1(b"undefined".to_vec())));
-    }
-    if v.is_null() {
-        return Ok(heap.intern_string(V12Str::latin1(b"null".to_vec())));
-    }
-    Ok(heap.intern_string(V12Str::latin1(b"[object Object]".to_vec())))
+    let text = helpers::value_text(heap, v);
+    Ok(helpers::intern_text(heap, &text))
 }

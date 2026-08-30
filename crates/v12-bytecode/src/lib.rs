@@ -11,6 +11,10 @@
 use std::collections::HashMap;
 use std::fmt;
 
+pub mod error;
+
+pub use error::BytecodeError;
+
 /// Source span as `(start, end)` byte offsets. Shape-compatible with
 /// `oxc_span::Span`'s start/end pair so front-end spans forward without a
 /// conversion layer.
@@ -676,22 +680,19 @@ impl WideOp {
     /// Decodes a wide op from the front of `words`, returning the op and its
     /// total word count (header included). Errors cover truncation, a
     /// non-Wide header, and unknown discriminants.
-    pub fn try_decode(words: &[Instr]) -> Result<(Self, usize), String> {
+    pub fn try_decode(words: &[Instr]) -> Result<(Self, usize), BytecodeError> {
         let Some(header) = words.first() else {
-            return Err("wide op: missing header word".into());
+            return Err(BytecodeError::TruncatedWide { word: 0 });
         };
         if header.op() != Some(Opcode::Wide) {
-            return Err(format!(
-                "wide op: header opcode is {:?}, not Wide",
-                header.op()
-            ));
+            return Err(BytecodeError::WideHeaderNotWide);
         }
         // Closure keeps payload indexing tied to the documented layout.
-        let payload = |i: usize| -> Result<u32, String> {
+        let payload = |i: usize| -> Result<u32, BytecodeError> {
             words
                 .get(i)
                 .map(|w| w.0)
-                .ok_or_else(|| format!("wide op: missing payload word {i}"))
+                .ok_or(BytecodeError::TruncatedWide { word: i })
         };
         match u32::from(header.c()) {
             Self::DISC_LOAD_CONST_W => {
@@ -781,7 +782,9 @@ impl WideOp {
                 let (depth, slots) = unpack_hi_lo(payload(1)?);
                 Ok((Self::NewEnvironmentW { depth, slots }, 2))
             }
-            other => Err(format!("wide op: unknown discriminant {other:#x}")),
+            other => Err(BytecodeError::UnknownWideDiscriminant {
+                discriminant: other,
+            }),
         }
     }
 }
@@ -1059,13 +1062,13 @@ impl ConstantPool {
 
     /// Returns the stable index of `constant`, inserting it if unseen.
     /// Errors once [`MAX_CONSTANTS`] is reached.
-    pub fn insert(&mut self, constant: Const) -> Result<u16, String> {
+    pub fn insert(&mut self, constant: Const) -> Result<u16, BytecodeError> {
         let key = constant.key();
         if let Some(&existing) = self.index.get(&key) {
             return Ok(existing);
         }
         if self.consts.len() >= MAX_CONSTANTS {
-            return Err("constant pool full".into());
+            return Err(BytecodeError::ConstantPoolFull);
         }
         let idx = self.consts.len() as u16;
         self.consts.push(constant);
@@ -1170,48 +1173,52 @@ impl FunctionBytecode {
     ///   runs at a strictly greater `stack_depth` so unwinding pops frames
     ///   in a well-defined order,
     /// - every handler target is a valid pc.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), BytecodeError> {
         if self.max_regs == 0 {
-            return Err("max_regs must be greater than zero".into());
+            return Err(BytecodeError::ZeroMaxRegs);
         }
         // Stack of still-open ranges; sortedness makes this a nesting check.
         let mut open: Vec<&HandlerRange> = Vec::new();
         let mut prev_start = 0;
         for h in &self.handlers {
             if h.end <= h.start {
-                return Err(format!(
-                    "handler range [{}, {}) is empty or inverted",
-                    h.start, h.end
-                ));
+                return Err(BytecodeError::InvalidFunction {
+                    reason: format!(
+                        "handler range [{}, {}) is empty or inverted",
+                        h.start, h.end
+                    ),
+                });
             }
             if h.start < prev_start {
-                return Err(format!(
-                    "handler starting at {} is not sorted by start",
-                    h.start
-                ));
+                return Err(BytecodeError::InvalidFunction {
+                    reason: format!("handler starting at {} is not sorted by start", h.start),
+                });
             }
             if h.target as usize >= self.instrs.len() {
-                return Err(format!(
-                    "handler target {} is out of bounds ({} instrs)",
-                    h.target,
-                    self.instrs.len()
-                ));
+                return Err(BytecodeError::HandlerTargetOutOfBounds {
+                    target: h.target,
+                    instrs: self.instrs.len(),
+                });
             }
             while open.last().is_some_and(|top| top.end <= h.start) {
                 open.pop();
             }
             if let Some(top) = open.last() {
                 if h.end > top.end {
-                    return Err(format!(
-                        "handler [{}, {}) partially overlaps [{}, {}) without nesting",
-                        h.start, h.end, top.start, top.end
-                    ));
+                    return Err(BytecodeError::InvalidFunction {
+                        reason: format!(
+                            "handler [{}, {}) partially overlaps [{}, {}) without nesting",
+                            h.start, h.end, top.start, top.end
+                        ),
+                    });
                 }
                 if h.stack_depth <= top.stack_depth {
-                    return Err(format!(
-                        "nested handler [{}, {}) has non-increasing stack depth ({} <= {})",
-                        h.start, h.end, h.stack_depth, top.stack_depth
-                    ));
+                    return Err(BytecodeError::InvalidFunction {
+                        reason: format!(
+                            "nested handler [{}, {}) has non-increasing stack depth ({} <= {})",
+                            h.start, h.end, h.stack_depth, top.stack_depth
+                        ),
+                    });
                 }
             }
             prev_start = h.start;
@@ -1562,7 +1569,7 @@ mod data_tests {
             },
         ];
         let err = nop_fn(unsorted).validate().unwrap_err();
-        assert!(err.contains("not sorted"), "{err}");
+        assert!(err.to_string().contains("not sorted"), "{err}");
     }
 
     #[test]
@@ -1574,7 +1581,7 @@ mod data_tests {
             stack_depth: 1,
         }];
         let err = nop_fn(bad_target).validate().unwrap_err();
-        assert!(err.contains("out of bounds"), "{err}");
+        assert!(err.to_string().contains("out of bounds"), "{err}");
     }
 
     #[test]
@@ -1594,7 +1601,7 @@ mod data_tests {
             },
         ];
         let err = nop_fn(partial).validate().unwrap_err();
-        assert!(err.contains("partially overlaps"), "{err}");
+        assert!(err.to_string().contains("partially overlaps"), "{err}");
     }
 
     #[test]
@@ -1614,7 +1621,7 @@ mod data_tests {
             },
         ];
         let err = nop_fn(flat).validate().unwrap_err();
-        assert!(err.contains("non-increasing stack depth"), "{err}");
+        assert!(err.to_string().contains("non-increasing stack depth"), "{err}");
     }
 
     #[test]
@@ -1623,7 +1630,7 @@ mod data_tests {
         fb.max_regs = 0;
         assert_eq!(
             fb.validate().unwrap_err(),
-            "max_regs must be greater than zero"
+            BytecodeError::ZeroMaxRegs
         );
     }
 
@@ -1764,7 +1771,7 @@ impl FunctionBuilder {
     }
 
     /// Interns `constant`, deduplicating like [`ConstantPool::insert`].
-    pub fn add_const(&mut self, constant: Const) -> Result<u16, String> {
+    pub fn add_const(&mut self, constant: Const) -> Result<u16, BytecodeError> {
         self.consts.insert(constant)
     }
 

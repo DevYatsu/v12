@@ -10,3 +10,6 @@ description = "Shared types and seams for the v12 JIT tiers (baseline + opt)"
 v12-bytecode.workspace = true
 v12-heap.workspace = true
 v12-interp.workspace = true
+
+[lints]
+workspace = true

@@ -108,6 +108,13 @@ impl Assumption {
     /// this helper handles the type guards only.
     #[must_use]
     pub fn check_value(&self, value: JsValue) -> bool {
+        // Invariant: a type guard is only ever evaluated against the register
+        // it was emitted for; the kind names the check, so a mismatch is an
+        // engine bug, not a deopt event.
+        v12_heap::assert_engine!(
+            value.is_canonical(),
+            "guard evaluated against a non-canonical value"
+        );
         match self.guard {
             GuardKind::TypeIsSmi { .. } => value.is_smi(),
             GuardKind::TypeIsNumber { .. } => value.is_smi() || value.is_f64(),

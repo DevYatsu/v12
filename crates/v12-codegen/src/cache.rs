@@ -6,7 +6,28 @@ use v12_bytecode::PcMapEntry;
 use v12_heap::JsValue;
 
 /// Identifier for a function in the program table.
-pub type FunctionId = u32;
+///
+/// Zero-cost nominal wrapper over the raw function-table index: callers that
+/// hold a `FunctionId` (rather than a bare `u32`) are naming a function, not
+/// just a number. Construct via [`FunctionId::from`] and read back with
+/// [`FunctionId::index`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct FunctionId(u32);
+
+impl FunctionId {
+    /// The raw function-table index.
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for FunctionId {
+    #[inline]
+    fn from(index: u32) -> Self {
+        Self(index)
+    }
+}
 
 /// Executable closure for a compiled function.
 pub type JitExecFn = Box<dyn Fn(&mut [JsValue]) -> JsValue + Send + Sync>;

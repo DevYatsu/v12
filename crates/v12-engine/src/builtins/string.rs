@@ -1,40 +1,35 @@
 //! String built-ins.
 
-use v12_heap::{Handle, Heap, JsValue, V12Str};
+use v12_heap::{Heap, JsValue};
+use v12_native::Throw;
 
-use super::{intern_type_error, regexp};
+use super::{helpers, regexp};
 
 /// `String.prototype.charAt(index)` – returns a single-character string.
 pub fn string_char_at(
     heap: &mut Heap,
     this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
-    let Some(handle) = this.as_string() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: String.prototype.charAt called on non-string",
-        ));
-    };
+) -> Result<JsValue, Throw> {
+    let handle = this
+        .as_string()
+        .ok_or_else(|| Throw::type_error(heap, "String.prototype.charAt called on non-string"))?;
     let index = args.first().and_then(to_index).unwrap_or(0);
     let units = string_units(heap, handle);
     if let Some(&unit) = units.get(index as usize) {
-        let h = heap.intern_string(V12Str::utf16(vec![unit]));
+        let h = heap.intern_string(v12_heap::V12Str::utf16(vec![unit]));
         Ok(JsValue::string(h))
     } else {
-        let h = heap.intern_string(V12Str::latin1(Vec::new()));
+        let h = heap.intern_string(v12_heap::V12Str::latin1(Vec::new()));
         Ok(JsValue::string(h))
     }
 }
 
 /// `String.prototype.slice(start, end)` – returns a sliced view.
-pub fn string_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
-    let Some(handle) = this.as_string() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: String.prototype.slice called on non-string",
-        ));
-    };
+pub fn string_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let handle = this
+        .as_string()
+        .ok_or_else(|| Throw::type_error(heap, "String.prototype.slice called on non-string"))?;
     let len = heap.get(handle).len() as i64;
     let start = args.first().and_then(to_integer).unwrap_or(0);
     let end = args.get(1).and_then(to_integer).unwrap_or(len);
@@ -43,7 +38,7 @@ pub fn string_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<
     let (from, to) = if from > to { (to, to) } else { (from, to) };
     let slice_len = to.saturating_sub(from);
     let Some(sliced) = heap.slice_string(handle, from, slice_len) else {
-        let h = heap.intern_string(V12Str::latin1(Vec::new()));
+        let h = heap.intern_string(v12_heap::V12Str::latin1(Vec::new()));
         return Ok(JsValue::string(h));
     };
     // Flatten lazily sliced strings when eagerly queried, otherwise keep lazy.
@@ -75,7 +70,7 @@ fn clamp_index(index: i64, len: i64) -> i64 {
     }
 }
 
-fn string_units(heap: &mut Heap, handle: Handle<V12Str>) -> Vec<u16> {
+fn string_units(heap: &mut Heap, handle: v12_heap::Handle<v12_heap::V12Str>) -> Vec<u16> {
     heap.flatten(handle);
     match &heap.get(handle).storage {
         v12_heap::StrStorage::Latin1(bytes) => bytes.iter().map(|&b| u16::from(b)).collect(),
@@ -96,21 +91,18 @@ pub fn string_match(
     cache: &regexp::RegexCache,
     this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
-    let Some(handle) = this.as_string() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: String.prototype.match called on non-string",
-        ));
-    };
-    let text = string_text(heap, handle);
+) -> Result<JsValue, Throw> {
+    let handle = this
+        .as_string()
+        .ok_or_else(|| Throw::type_error(heap, "String.prototype.match called on non-string"))?;
+    let text = helpers::string_text(heap, handle);
     let Some(re) = args.first().and_then(|v| v.as_object()) else {
         // Non-regexp argument: ToString and return a single-match array.
-        let arg = args.first().map(|v| super::value_display_text(heap, *v)).unwrap_or_default();
+        let arg = args.first().map(|v| helpers::value_text(heap, *v)).unwrap_or_default();
         return Ok(match_text_to_array(heap, &text, text.find(&arg).map(|i| (i, i + arg.len()))));
     };
-    if heap.get(re).kind != v12_heap::KIND_REGEXP {
-        let arg = super::value_display_text(heap, *args.first().unwrap());
+    if heap.get(re).kind != v12_heap::Kind::RegExp {
+        let arg = helpers::value_text(heap, *args.first().unwrap());
         return Ok(match_text_to_array(heap, &text, text.find(&arg).map(|i| (i, i + arg.len()))));
     }
     let (_, flags) = regexp::regexp_source_flags(heap, re);
@@ -143,8 +135,7 @@ pub fn string_match(
         if matches.is_empty() {
             return Ok(JsValue::null());
         }
-        let arr = heap.alloc(v12_heap::JsObject::array(matches));
-        heap.add_root(JsValue::object(arr));
+        let arr = helpers::alloc_obj(heap, v12_heap::JsObject::array(matches));
         Ok(JsValue::object(arr))
     } else {
         regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])
@@ -161,24 +152,21 @@ pub fn string_replace(
     cache: &regexp::RegexCache,
     this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
-    let Some(handle) = this.as_string() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: String.prototype.replace called on non-string",
-        ));
-    };
-    let text = string_text(heap, handle);
+) -> Result<JsValue, Throw> {
+    let handle = this
+        .as_string()
+        .ok_or_else(|| Throw::type_error(heap, "String.prototype.replace called on non-string"))?;
+    let text = helpers::string_text(heap, handle);
     let Some(search) = args.first().copied() else {
         return Ok(JsValue::string(handle));
     };
     let replacement = args
         .get(1)
-        .map(|v| super::value_display_text(heap, *v))
+        .map(|v| helpers::value_text(heap, *v))
         .unwrap_or_default();
     // Non-regexp search: replace the first occurrence.
     let Some(re) = search.as_object() else {
-        let needle = super::value_display_text(heap, search);
+        let needle = helpers::value_text(heap, search);
         if needle.is_empty() {
             let out = replacement.clone() + &text;
             return Ok(JsValue::string(heap.intern_text(&out)));
@@ -194,8 +182,8 @@ pub fn string_replace(
         };
         return Ok(JsValue::string(heap.intern_text(&out)));
     };
-    if heap.get(re).kind != v12_heap::KIND_REGEXP {
-        let needle = super::value_display_text(heap, search);
+    if heap.get(re).kind != v12_heap::Kind::RegExp {
+        let needle = helpers::value_text(heap, search);
         if needle.is_empty() {
             let out = replacement.clone() + &text;
             return Ok(JsValue::string(heap.intern_text(&out)));
@@ -224,10 +212,10 @@ pub fn string_replace(
         }
         let Some(arr) = m.as_object() else { break };
         let match_start = heap.get(arr).properties.get(1).and_then(|v| v.as_smi()).map(i64::from).unwrap_or(0) as usize;
-        let m0_len = heap.get(arr).elements_array.get(0).and_then(|v| v.as_string()).map(|h| string_text(heap, h).len()).unwrap_or(0);
+        let m0_len = heap.get(arr).elements_array.get(0).and_then(|v| v.as_string()).map(|h| helpers::string_text(heap, h).len()).unwrap_or(0);
         let mut groups = Vec::new();
         for i in 1..=9 {
-            let g = heap.get(arr).elements_array.get(i).and_then(|v| v.as_string()).map(|h| string_text(heap, h));
+            let g = heap.get(arr).elements_array.get(i).and_then(|v| v.as_string()).map(|h| helpers::string_text(heap, h));
             groups.push(g);
         }
         spans.push((match_start, match_start + m0_len, groups));
@@ -265,36 +253,33 @@ pub fn string_search(
     cache: &regexp::RegexCache,
     this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
-    let Some(handle) = this.as_string() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: String.prototype.search called on non-string",
-        ));
-    };
-    let text = string_text(heap, handle);
+) -> Result<JsValue, Throw> {
+    let handle = this
+        .as_string()
+        .ok_or_else(|| Throw::type_error(heap, "String.prototype.search called on non-string"))?;
+    let text = helpers::string_text(heap, handle);
     let Some(search) = args.first().copied() else {
-        return Ok(JsValue::from_i32_smi(0).unwrap());
+        return Ok(helpers::smi_or_f64(0));
     };
     let Some(re) = search.as_object() else {
-        let needle = super::value_display_text(heap, search);
-        return Ok(JsValue::from_i32_smi(text.find(&needle).map(|i| i as i32).unwrap_or(-1)).unwrap());
+        let needle = helpers::value_text(heap, search);
+        return Ok(helpers::smi_or_f64(text.find(&needle).map(|i| i as i64).unwrap_or(-1)));
     };
-    if heap.get(re).kind != v12_heap::KIND_REGEXP {
-        let needle = super::value_display_text(heap, search);
-        return Ok(JsValue::from_i32_smi(text.find(&needle).map(|i| i as i32).unwrap_or(-1)).unwrap());
+    if heap.get(re).kind != v12_heap::Kind::RegExp {
+        let needle = helpers::value_text(heap, search);
+        return Ok(helpers::smi_or_f64(text.find(&needle).map(|i| i as i64).unwrap_or(-1)));
     }
     let text_h = heap.intern_text(&text);
     let m = regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])?;
     if m.is_null() {
-        return Ok(JsValue::from_i32_smi(-1).unwrap());
+        return Ok(helpers::smi_or_f64(-1));
     }
     let idx = m
         .as_object()
         .and_then(|arr| heap.get(arr).properties.get(1))
         .and_then(|v| v.as_smi())
         .unwrap_or(0);
-    Ok(JsValue::from_i32_smi(idx as i32).unwrap())
+    Ok(helpers::smi_or_f64(i64::from(idx)))
 }
 
 /// `String.prototype.split(regexp, limit)` — split on regexp separators.
@@ -307,14 +292,11 @@ pub fn string_split(
     cache: &regexp::RegexCache,
     this: JsValue,
     args: &[JsValue],
-) -> Result<JsValue, JsValue> {
-    let Some(handle) = this.as_string() else {
-        return Err(intern_type_error(
-            heap,
-            "TypeError: String.prototype.split called on non-string",
-        ));
-    };
-    let text = string_text(heap, handle);
+) -> Result<JsValue, Throw> {
+    let handle = this
+        .as_string()
+        .ok_or_else(|| Throw::type_error(heap, "String.prototype.split called on non-string"))?;
+    let text = helpers::string_text(heap, handle);
     let limit = args
         .get(1)
         .and_then(|v| v.as_smi())
@@ -328,9 +310,9 @@ pub fn string_split(
     // Non-regexp separator.
     let is_regexp = search
         .as_object()
-        .is_some_and(|re| heap.get(re).kind == v12_heap::KIND_REGEXP);
+        .is_some_and(|re| heap.get(re).kind == v12_heap::Kind::RegExp);
     if !is_regexp {
-        let sep = super::value_display_text(heap, search);
+        let sep = helpers::value_text(heap, search);
         if sep.is_empty() {
             // Split into UTF-16 code units (no surrogate pairing).
             let chars: Vec<&str> = text.split("").filter(|s| !s.is_empty()).collect();
@@ -350,9 +332,7 @@ pub fn string_split(
     } else {
         let source_h = heap.intern_text(&source);
         let flags_h = heap.intern_text(&format!("{flags}g"));
-        let obj = heap.alloc(v12_heap::JsObject::regexp(source_h, flags_h));
-        heap.add_root(JsValue::object(obj));
-        obj
+        helpers::alloc_obj(heap, v12_heap::JsObject::regexp(source_h, flags_h))
     };
     let text_h = heap.intern_text(&text);
     // Collect separator spans.
@@ -365,7 +345,7 @@ pub fn string_split(
         }
         let Some(arr) = m.as_object() else { break };
         let s = heap.get(arr).properties.get(1).and_then(|v| v.as_smi()).map(i64::from).unwrap_or(0) as usize;
-        let len = heap.get(arr).elements_array.get(0).and_then(|v| v.as_string()).map(|h| string_text(heap, h).len()).unwrap_or(0);
+        let len = heap.get(arr).elements_array.get(0).and_then(|v| v.as_string()).map(|h| helpers::string_text(heap, h).len()).unwrap_or(0);
         spans.push((s, s + len));
         let li = regexp::last_index(heap, splitter);
         if li <= start {
@@ -393,8 +373,7 @@ fn array_of_strings<'a>(heap: &mut Heap, strs: Vec<&'a str>, limit: i64) -> JsVa
         }
         out.push(JsValue::string(heap.intern_text(s)));
     }
-    let arr = heap.alloc(v12_heap::JsObject::array(out));
-    heap.add_root(JsValue::object(arr));
+    let arr = helpers::alloc_obj(heap, v12_heap::JsObject::array(out));
     JsValue::object(arr)
 }
 
@@ -402,8 +381,7 @@ fn match_text_to_array(heap: &mut Heap, text: &str, found: Option<(usize, usize)
     match found {
         Some((s, e)) => {
             let matched_h = heap.intern_text(&text[s..e]);
-            let arr = heap.alloc(v12_heap::JsObject::array(vec![JsValue::string(matched_h)]));
-            heap.add_root(JsValue::object(arr));
+            let arr = helpers::alloc_obj(heap, v12_heap::JsObject::array(vec![JsValue::string(matched_h)]));
             JsValue::object(arr)
         }
         None => JsValue::null(),
@@ -442,11 +420,3 @@ fn expand_replacement(template: &str, whole: &str, groups: &[&str]) -> String {
     out
 }
 
-fn string_text(heap: &mut Heap, h: Handle<V12Str>) -> String {
-    heap.flatten(h);
-    match &heap.get(h).storage {
-        v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
-        _ => String::new(),
-    }
-}

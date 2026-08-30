@@ -29,7 +29,7 @@
 //! encodes, so the parent is simply the captured environment.
 //!
 //! Function objects store their program function index as element slot 0 and
-//! their captured environment as the prototype link; [`KIND_FUNCTION`] marks
+//! their captured environment as the prototype link; [`Kind::Function`] marks
 //! them. Indices at or beyond [`Program::functions`] route to the
 //! [`NativeRegistry`] seam instead of bytecode.
 //!
@@ -66,189 +66,78 @@ mod tests;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use v12_bytecode::{Const, FunctionBytecode, Instr, Opcode, WideOp};
+use v12_bytecode::{BytecodeError, Const, FunctionBytecode, Instr, Opcode, WideOp};
 use v12_heap::{
-    Attrs, Descriptor, Handle, Heap, HeapExt, JsObject, JsValue,
-    KIND_ARGUMENTS as HEAP_KIND_ARGUMENTS, KIND_ARRAY as HEAP_KIND_ARRAY,
-    KIND_ERROR as HEAP_KIND_ERROR, KIND_FUNCTION as HEAP_KIND_FUNCTION,
-    KIND_GENERATOR as HEAP_KIND_GENERATOR, KIND_ITERATOR as HEAP_KIND_ITERATOR,
-    KIND_MAP as HEAP_KIND_MAP, KIND_PROMISE as HEAP_KIND_PROMISE, KIND_REGEXP as HEAP_KIND_REGEXP,
-    KIND_SET as HEAP_KIND_SET, PropKey, ShapeHandle, V12Str,
+    Attrs, Descriptor, Handle, Heap, HeapExt, JsObject, JsValue, Kind, PropKey, ShapeHandle,
+    V12Str,
 };
 
 use crate::feedback::{FeedbackVector, Lattice, TYPE_NAME_COUNT, TYPE_NAMES, TierHooks};
 
-/// Object kind for user functions created by `Closure`.
-///
-/// Kind values are engine-assigned; these must stay distinct from the
-/// heap's [`v12_heap::KIND_ORDINARY`] and from each other.
-pub const KIND_FUNCTION: u8 = HEAP_KIND_FUNCTION;
+// ---------------------------------------------------------------------------
+// Native indices — one shared enum.
+//
+// The interpreter used to duplicate ~30 `NATIVE_*` u32 constants from the
+// engine (three fragile index spaces). All of them now live in the single
+// `v12_native::NativeId` enum; these re-exports keep existing `NATIVE_*`
+// spelling working and are typed as `NativeId`.
+// ---------------------------------------------------------------------------
 
-/// Object kind for array literals created by `NewArray`; canonical integer
-/// keys on arrays route through the element store instead of named shapes.
-pub const KIND_ARRAY: u8 = HEAP_KIND_ARRAY;
+pub use v12_native::NativeId as NativeId; // the shared enum itself
 
-/// Object kind for arguments exotic objects.
-pub const KIND_ARGUMENTS: u8 = HEAP_KIND_ARGUMENTS;
-
-/// Object kind for generator objects.
-pub const KIND_GENERATOR: u8 = HEAP_KIND_GENERATOR;
-
-/// Object kind for promise objects (real internal-slot kind, replacing the
-/// structural `properties[0..3]` check).
-pub const KIND_PROMISE: u8 = HEAP_KIND_PROMISE;
-
-/// Object kind for error objects (`name`/`message` internal slots).
-pub const KIND_ERROR: u8 = HEAP_KIND_ERROR;
-
-/// Object kind for Map objects (entries in `elements` as key/value pairs).
-pub const KIND_MAP: u8 = HEAP_KIND_MAP;
-
-/// Object kind for Set objects (values in `elements`).
-pub const KIND_SET: u8 = HEAP_KIND_SET;
-
-/// Object kind for iterator objects (Array/Map/Set iterators backing
-/// `Symbol.iterator`; state in `elements` as `[kind, source, index]`).
-pub const KIND_ITERATOR: u8 = HEAP_KIND_ITERATOR;
-
-/// Object kind for RegExp objects (`properties = [source, flags, lastIndex]`).
-pub const KIND_REGEXP: u8 = HEAP_KIND_REGEXP;
-
-/// Native index for `console.log` — a console method that prints its
-/// arguments and returns `undefined`. Chosen beyond any plausible program
-/// function count, matching `v12_engine::builtins::NATIVE_CONSOLE_LOG`.
-pub const NATIVE_CONSOLE_LOG: u32 = 1900;
-
-/// Native index for `Array.prototype.push`, mirroring
-/// `v12_engine::builtins::NATIVE_ARRAY_PUSH` (same duplication pattern as
-/// `NATIVE_CONSOLE_LOG`; the interpreter sits below the engine crate).
-pub const NATIVE_ARRAY_PUSH: u32 = 1100;
-
-/// Native index for `Array.prototype.join`, mirroring
-/// `v12_engine::builtins::NATIVE_ARRAY_JOIN`.
-pub const NATIVE_ARRAY_JOIN: u32 = 1102;
-
-/// Native index for `Array.prototype.pop`, mirroring
-/// `v12_engine::builtins::NATIVE_ARRAY_POP`.
-pub const NATIVE_ARRAY_POP: u32 = 1101;
-
-/// Native index for `Object.enumerableOwnKeys` (internal), mirroring
-/// `v12_engine::builtins::NATIVE_ENUMERABLE_OWN_KEYS`.
-pub const NATIVE_ENUMERABLE_OWN_KEYS: u32 = 1901;
-
-/// Native indices of the minimal Promise surface (`Promise.resolve`,
-/// `Promise.reject`, `Promise.prototype.then`), mirroring
-/// `v12_engine::builtins` constants.
-pub const NATIVE_PROMISE_RESOLVE: u32 = 1710;
-pub const NATIVE_PROMISE_REJECT: u32 = 1711;
-pub const NATIVE_PROMISE_THEN: u32 = 1712;
-
-/// Native index for `Generator.prototype.next`.
-pub const NATIVE_GENERATOR_NEXT: u32 = 1910;
-pub const NATIVE_GENERATOR_RETURN: u32 = 1911;
-pub const NATIVE_GENERATOR_THROW: u32 = 1912;
-
-/// Native indices of the iterator surface, mirroring
-/// `v12_engine::builtins` constants: `next` on iterator objects, the
-/// `Symbol.iterator` creators on Array/Map/Set, and `%IteratorPrototype%`
-/// self-return.
-pub const NATIVE_ITERATOR_NEXT: u32 = 2200;
-pub const NATIVE_ARRAY_ITERATOR: u32 = 2201;
-pub const NATIVE_MAP_ITERATOR: u32 = 2202;
-pub const NATIVE_SET_ITERATOR: u32 = 2203;
-pub const NATIVE_ITERATOR_SELF: u32 = 2204;
-pub const NATIVE_ARRAY_ITERATOR_ENTRIES: u32 = 2205;
-pub const NATIVE_ARRAY_ITERATOR_KEYS: u32 = 2206;
-
-/// Native indices of the RegExp surface, mirroring
-/// `v12_engine::builtins` constants.
-pub const NATIVE_REGEXP_CONSTRUCT: u32 = 2300;
-pub const NATIVE_REGEXP_EXEC: u32 = 2301;
-pub const NATIVE_REGEXP_TEST: u32 = 2302;
-pub const NATIVE_REGEXP_TO_STRING: u32 = 2303;
-pub const NATIVE_REGEXP_COMPILE: u32 = 2304;
-
-/// Native indices of the String regexp methods, mirroring
-/// `v12_engine::builtins` constants.
-pub const NATIVE_STRING_MATCH: u32 = 1203;
-pub const NATIVE_STRING_REPLACE: u32 = 1204;
-pub const NATIVE_STRING_SEARCH: u32 = 1205;
-pub const NATIVE_STRING_SPLIT: u32 = 1206;
-
-/// Native indices of the Map/Set surface, mirroring `v12_engine::builtins`
-/// constants (same duplication pattern as the promise/array constants; the
-/// interpreter sits below the engine crate).
-pub const NATIVE_MAP_GET: u32 = 2001;
-pub const NATIVE_MAP_SET: u32 = 2002;
-pub const NATIVE_MAP_HAS: u32 = 2003;
-pub const NATIVE_MAP_DELETE: u32 = 2004;
-pub const NATIVE_MAP_SIZE: u32 = 2005;
-pub const NATIVE_SET_ADD: u32 = 2101;
-pub const NATIVE_SET_HAS: u32 = 2102;
-pub const NATIVE_SET_DELETE: u32 = 2103;
-pub const NATIVE_SET_SIZE: u32 = 2104;
-
-/// Native index for direct `eval`, mirroring `v12_engine::builtins::NATIVE_EVAL`.
-pub const NATIVE_EVAL: u32 = 1800;
-
-/// Selector for [`Interp::cached_native`] — the interpreter's *internal*
-/// native fallbacks (synthesized only when the engine has not installed a
-/// real native on the realm). These are encoded as out-of-range bytecode
-/// indices (base + discriminant) so `prepare_call` routes them to the
-/// interpreter's own handlers; engine-installed natives use
-/// `FunctionTarget::Native` instead and never appear here.
-#[derive(Clone, Copy)]
-enum NativeFn {
-    PromiseResolve,
-    PromiseReject,
-    PromiseThen,
-    ArrayPush,
-    ArrayJoin,
-    EnumerableOwnKeys,
-    GeneratorNext,
-    GeneratorReturn,
-    GeneratorThrow,
-    ConsoleLog,
-}
-
-/// Base index for the interpreter's internal native fallbacks. Kept beyond
-/// any program function count and distinct from any engine constant — these
-/// are interpreter-local, never shared with the engine.
-const INTERP_NATIVE_BASE: u32 = 0x2000_0000;
-
-impl NativeFn {
-    /// The out-of-range bytecode index encoding this fallback.
-    const fn index(self) -> u32 {
-        INTERP_NATIVE_BASE + self as u32
-    }
-
-    /// Decodes an out-of-range index back into a fallback selector.
-    const fn from_index(idx: u32) -> Option<NativeFn> {
-        if idx < INTERP_NATIVE_BASE || idx >= INTERP_NATIVE_BASE + 16 {
-            return None;
-        }
-        // Discriminants are dense 0..10 in declaration order.
-        Some(match idx - INTERP_NATIVE_BASE {
-            0 => NativeFn::PromiseResolve,
-            1 => NativeFn::PromiseReject,
-            2 => NativeFn::PromiseThen,
-            3 => NativeFn::ArrayPush,
-            4 => NativeFn::ArrayJoin,
-            5 => NativeFn::EnumerableOwnKeys,
-            6 => NativeFn::GeneratorNext,
-            7 => NativeFn::GeneratorReturn,
-            8 => NativeFn::GeneratorThrow,
-            9 => NativeFn::ConsoleLog,
-            _ => return None,
-        })
-    }
-}
-
-/// Native indices of the only constructor-shaped built-ins (`new Boolean`,
-/// `new Error`, and subclasses), mirroring `v12_engine::builtins`
-/// constants so `Construct` can route them through the shared registry.
-pub const NATIVE_BOOLEAN_CONSTRUCT: u32 = 1500;
-pub const NATIVE_ERROR_CREATE: u32 = 1600;
+/// `console.log` — prints its arguments and returns `undefined`.
+pub const NATIVE_CONSOLE_LOG: NativeId = NativeId::ConsoleLog;
+/// `Array.prototype.push`.
+pub const NATIVE_ARRAY_PUSH: NativeId = NativeId::ArrayPush;
+/// `Array.prototype.join`.
+pub const NATIVE_ARRAY_JOIN: NativeId = NativeId::ArrayJoin;
+/// `Array.prototype.pop`.
+pub const NATIVE_ARRAY_POP: NativeId = NativeId::ArrayPop;
+/// `Object.enumerableOwnKeys` (internal).
+pub const NATIVE_ENUMERABLE_OWN_KEYS: NativeId = NativeId::ObjectEnumerableOwnKeys;
+/// Minimal Promise surface.
+pub const NATIVE_PROMISE_RESOLVE: NativeId = NativeId::PromiseResolve;
+pub const NATIVE_PROMISE_REJECT: NativeId = NativeId::PromiseReject;
+pub const NATIVE_PROMISE_THEN: NativeId = NativeId::PromiseThen;
+/// `Generator.prototype.next/return/throw`.
+pub const NATIVE_GENERATOR_NEXT: NativeId = NativeId::GeneratorNext;
+pub const NATIVE_GENERATOR_RETURN: NativeId = NativeId::GeneratorReturn;
+pub const NATIVE_GENERATOR_THROW: NativeId = NativeId::GeneratorThrow;
+/// Iterator surface: `next` on iterators, the `Symbol.iterator` creators on
+/// Array/Map/Set, and `%IteratorPrototype%` self-return.
+pub const NATIVE_ITERATOR_NEXT: NativeId = NativeId::IteratorNext;
+pub const NATIVE_ARRAY_ITERATOR: NativeId = NativeId::ArrayIterator;
+pub const NATIVE_MAP_ITERATOR: NativeId = NativeId::MapIterator;
+pub const NATIVE_SET_ITERATOR: NativeId = NativeId::SetIterator;
+pub const NATIVE_ITERATOR_SELF: NativeId = NativeId::IteratorSelf;
+pub const NATIVE_ARRAY_ITERATOR_ENTRIES: NativeId = NativeId::ArrayIteratorEntries;
+pub const NATIVE_ARRAY_ITERATOR_KEYS: NativeId = NativeId::ArrayIteratorKeys;
+/// RegExp surface.
+pub const NATIVE_REGEXP_CONSTRUCT: NativeId = NativeId::RegExpConstruct;
+pub const NATIVE_REGEXP_EXEC: NativeId = NativeId::RegExpExec;
+pub const NATIVE_REGEXP_TEST: NativeId = NativeId::RegExpTest;
+pub const NATIVE_REGEXP_TO_STRING: NativeId = NativeId::RegExpToString;
+pub const NATIVE_REGEXP_COMPILE: NativeId = NativeId::RegExpCompile;
+/// String regexp methods.
+pub const NATIVE_STRING_MATCH: NativeId = NativeId::StringMatch;
+pub const NATIVE_STRING_REPLACE: NativeId = NativeId::StringReplace;
+pub const NATIVE_STRING_SEARCH: NativeId = NativeId::StringSearch;
+pub const NATIVE_STRING_SPLIT: NativeId = NativeId::StringSplit;
+/// Map/Set surface.
+pub const NATIVE_MAP_GET: NativeId = NativeId::MapGet;
+pub const NATIVE_MAP_SET: NativeId = NativeId::MapSet;
+pub const NATIVE_MAP_HAS: NativeId = NativeId::MapHas;
+pub const NATIVE_MAP_DELETE: NativeId = NativeId::MapDelete;
+pub const NATIVE_MAP_SIZE: NativeId = NativeId::MapSize;
+pub const NATIVE_SET_ADD: NativeId = NativeId::SetAdd;
+pub const NATIVE_SET_HAS: NativeId = NativeId::SetHas;
+pub const NATIVE_SET_DELETE: NativeId = NativeId::SetDelete;
+pub const NATIVE_SET_SIZE: NativeId = NativeId::SetSize;
+/// Direct `eval`.
+pub const NATIVE_EVAL: NativeId = NativeId::Eval;
+/// Constructor-shaped built-ins.
+pub const NATIVE_BOOLEAN_CONSTRUCT: NativeId = NativeId::BooleanConstruct;
+pub const NATIVE_ERROR_CREATE: NativeId = NativeId::ErrorCreate;
 
 /// Offset of user-declared global slots in the global object's `properties`.
 ///
@@ -325,59 +214,23 @@ impl From<JsValue> for JSException {
     }
 }
 
+impl JSException {
+    /// Resolves a [`v12_native::Throw`] into a `JSException`, interning any
+    /// pending message against `heap`.
+    pub fn from_throw(heap: &mut Heap, t: v12_native::Throw) -> Self {
+        JSException(t.into_js(heap))
+    }
+}
+
 /// Seam for host-provided native functions.
 ///
 /// A call whose function index lies beyond [`Program::functions`] denotes a
 /// native: the interpreter hands the receiver, arguments, and heap to the
-/// registry and takes back the result or the value to throw. The default
-/// registry is empty — every native index throws `TypeError` — so programs
-/// compiled without built-ins behave identically whether or not a registry
-/// is wired in.
-pub trait NativeRegistry {
-    /// Executes native function `index`. `args` excludes the receiver.
-    fn call_native(
-        &mut self,
-        heap: &mut Heap,
-        this: JsValue,
-        args: &[JsValue],
-        index: u32,
-    ) -> Result<JsValue, JsValue>;
-
-    /// Direct `eval(source)`: compile and execute `source` against `heap`,
-    /// returning the completion value. `global` is the realm's global object
-    /// (so eval's `var`/assignments share the caller's global). `programs` is
-    /// the caller's cross-program registry; the engine registers the eval
-    /// program there so eval-created closures resolve from the caller. The
-    /// default implementation refuses (no eval support).
-    fn eval(
-        &mut self,
-        _heap: &mut Heap,
-        _source: &str,
-        _this: JsValue,
-        _global: Option<Handle<JsObject>>,
-        _programs: std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>>,
-    ) -> Result<JsValue, JsValue> {
-        Err(JsValue::undefined())
-    }
-}
-
-/// The default [`NativeRegistry`]: no natives exist.
-#[derive(Default)]
-pub struct EmptyNativeRegistry;
-
-impl NativeRegistry for EmptyNativeRegistry {
-    fn call_native(
-        &mut self,
-        heap: &mut Heap,
-        _this: JsValue,
-        _args: &[JsValue],
-        index: u32,
-    ) -> Result<JsValue, JsValue> {
-        Err(JsValue::string(heap.intern_text(
-            &format!("TypeError: native function #{index} is not registered"),
-        )))
-    }
-}
+/// registry and takes back the result or the value to throw.
+///
+/// The trait lives in `v12-native` (the shared dispatch seam); this is a
+/// re-export so existing `use v12_interp::NativeRegistry` sites keep working.
+pub use v12_native::{EmptyNativeRegistry, NativeRegistry};
 
 /// Outcome of preparing a call.
 enum CallOutcome {
@@ -501,21 +354,22 @@ fn decode_instr(instrs: &[Instr], pc: usize) -> (Opcode, u16, u16, u16, usize, I
 /// Returns `Err` on corrupt bytecode instead of panicking — callers turn it
 /// into a JS `TypeError` (or, for the Await resume path, fall back to
 /// undefined advancement) rather than unwinding the native stack.
-fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u16, usize), String> {
+fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u16, usize), BytecodeError> {
     let instr = instrs
         .get(pc)
         .copied()
-        .ok_or_else(|| format!("parked call at pc {pc} past the end of the stream"))?;
+        .ok_or(BytecodeError::TruncatedWide { word: pc })?;
     match instr.op() {
         Some(Opcode::Wide) => match WideOp::try_decode(&instrs[pc..]) {
             Ok((WideOp::CallW { dst, .. }, width)) => Ok((false, dst, width)),
             Ok((WideOp::ConstructW { dst, .. }, width)) => Ok((true, dst, width)),
             Ok((WideOp::RegExt { mask, a_hi, .. }, _)) => {
                 // The narrow call/construct follows the 2-word prefix.
-                let narrow = instrs
-                    .get(pc + 2)
-                    .copied()
-                    .ok_or_else(|| "RegExt prefix without its narrow instruction".to_string())?;
+                let narrow = instrs.get(pc + 2).copied().ok_or(
+                    BytecodeError::InvalidFunction {
+                        reason: "RegExt prefix without its narrow instruction".to_string(),
+                    },
+                )?;
                 let dst = if mask & 1 != 0 {
                     (u16::from(a_hi) << 8) | u16::from(narrow.a())
                 } else {
@@ -524,7 +378,9 @@ fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u16, usize),
                 let is_construct = narrow.op() == Some(Opcode::Construct);
                 Ok((is_construct, dst, 3))
             }
-            other => Err(format!("call parked on malformed wide header: {other:?}")),
+            other => Err(BytecodeError::InvalidFunction {
+                reason: format!("call parked on malformed wide header: {other:?}"),
+            }),
         },
         _ => Ok((
             instr.op() == Some(Opcode::Construct),
@@ -598,7 +454,7 @@ pub struct Interp<'a> {
     /// `properties[GLOBAL_VAR_OFFSET + slot]`; see [`Self::global_slot_index`].
     global: Option<Handle<JsObject>>,
     /// Cached `console.log` function object, synthesized lazily on first
-    /// `get_property` for `console.log`. The object is a `KIND_FUNCTION`
+    /// `get_property` for `console.log`. The object is a `Kind::Function`
     /// whose `elements[0]` is `NATIVE_CONSOLE_LOG`, so `prepare_call` routes
     /// it through the `NativeRegistry`.
     console_log: Option<JsValue>,
@@ -902,7 +758,7 @@ impl<'a> Interp<'a> {
         // Minimal Promise wiring for standalone interp tests (mirrors realm.rs)
         let promise_proto = self.heap.alloc(JsObject::default());
         self.heap.add_root(JsValue::object(promise_proto));
-        let promise_ctor = self.heap.alloc(JsObject { kind: KIND_FUNCTION, prototype: Some(promise_proto), ..JsObject::default() });
+        let promise_ctor = self.heap.alloc(JsObject { kind: Kind::Function, prototype: Some(promise_proto), ..JsObject::default() });
         self.heap.add_root(JsValue::object(promise_ctor));
         {
             let props = &mut self.heap.get_mut(g).properties;
@@ -1027,7 +883,7 @@ impl<'a> Interp<'a> {
     ///
     /// Host-driven activation seam (Promise reaction jobs, embedder calls):
     /// synthesizes the callee object `prepare_call` expects — a
-    /// `KIND_FUNCTION` whose `elements[0]` selects the target, bytecode index
+    /// `Kind::Function` whose `elements[0]` selects the target, bytecode index
     /// below `functions.len()` or native index above — then delegates to
     /// [`Self::call_object`]. Must not be called while `run()` is active.
     pub fn call_function(
@@ -1084,7 +940,7 @@ impl<'a> Interp<'a> {
     pub fn to_display_string(&mut self, v: JsValue) -> String {
         if v.is_object()
             && let Some(obj) = v.as_object()
-            && self.heap.get(obj).kind == KIND_ERROR
+            && self.heap.get(obj).kind == Kind::Error
         {
             // Snapshot the name/message handles first so the text decode
             // below (which needs `&mut self`) doesn't fight the borrow.
@@ -1114,6 +970,14 @@ impl<'a> Interp<'a> {
     /// current frame's pc, redirects it, pushes/pops frames, or raises a
     /// pending exception for delivery at the top of the next iteration.
     fn execute(&mut self) -> Result<(), JSException> {
+        // Cross-boundary canonical-form guard: every value on the stack must
+        // be canonical (spare bits zero, assigned tag) at dispatch entry.
+        // Forged words from embedders/JIT helpers fail here in debug builds
+        // instead of corrupting type predicates downstream.
+        debug_assert!(
+            self.stack.iter().all(|v| v.is_canonical()),
+            "non-canonical value on the stack at dispatch entry"
+        );
         // Thrown value awaiting delivery to a handler (or escape).
         let mut pending: Option<JsValue> = None;
 
@@ -1726,7 +1590,7 @@ impl<'a> Interp<'a> {
                     let func_idx = self.stack.get(base + usize::from(src)).and_then(|v| v.as_smi()).map(|v| v as u32).unwrap_or(fn_idx);
                     self.gc_protect();
                     let h = self.heap.alloc(JsObject {
-                        kind: KIND_GENERATOR,
+                        kind: Kind::Generator,
                         properties: vec![
                             ops::box_number(f64::from(func_idx)),
                             ops::box_number(f64::from((pc + op_width) as u32)),
@@ -1924,7 +1788,7 @@ impl<'a> Interp<'a> {
             // null historically types as "object"; functions split out here.
             let function = v
                 .as_object()
-                .is_some_and(|h| self.heap.get(h).kind == KIND_FUNCTION);
+                .is_some_and(|h| self.heap.get(h).kind == Kind::Function);
             if function { 7 } else { 6 }
         } else {
             panic!("non-canonical value cannot be typed: {:#x}", v.bits())
@@ -1953,7 +1817,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: callee is not a function"),
             ));
         };
-        if self.heap.get(callee_obj).kind != KIND_FUNCTION {
+        if self.heap.get(callee_obj).kind != Kind::Function {
             return Err(JSException(
                 self.error_value("TypeError: callee is not a function"),
             ));
@@ -2001,7 +1865,7 @@ impl<'a> Interp<'a> {
         // closure's index compares against the eval program, not this one.
         let callee_funcs = self.functions_for_program(callee_program);
         if (target_idx as usize) >= callee_funcs.len() {
-            if let Some(native_fn) = NativeFn::from_index(target_idx) {
+            if let Some(native_fn) = NativeId::try_from(target_idx).ok() {
                 let arg = if (callee_slot + 2) < self.stack.len() && argc > 0 {
                     self.stack[callee_slot + 2]
                 } else {
@@ -2011,22 +1875,22 @@ impl<'a> Interp<'a> {
                 let args_end = args_start + usize::from(argc);
                 let args_slice = self.stack[args_start..args_end].to_vec();
                 return match native_fn {
-                    NativeFn::GeneratorNext => {
+                    NativeId::GeneratorNext => {
                         Ok(CallOutcome::Value(self.generator_next(this_v, arg)?))
                     }
-                    NativeFn::GeneratorReturn => {
+                    NativeId::GeneratorReturn => {
                         Ok(CallOutcome::Value(self.generator_return(this_v, arg)?))
                     }
-                    NativeFn::GeneratorThrow => {
+                    NativeId::GeneratorThrow => {
                         Ok(CallOutcome::Value(self.generator_throw(this_v, arg)?))
                     }
-                    NativeFn::ArrayJoin => {
+                    NativeId::ArrayJoin => {
                         Ok(CallOutcome::Value(self.array_join_fallback(this_v, &args_slice)?))
                     }
-                    NativeFn::ArrayPush => {
+                    NativeId::ArrayPush => {
                         Ok(CallOutcome::Value(self.array_push_fallback(this_v, &args_slice)?))
                     }
-                    NativeFn::ConsoleLog => {
+                    NativeId::ConsoleLog => {
                         let mut parts = Vec::with_capacity(args_slice.len());
                         for &v in &args_slice {
                             parts.push(self.to_display_string(v));
@@ -2038,40 +1902,48 @@ impl<'a> Interp<'a> {
                     // engine's promise builtins run; the interp fallback is
                     // only used standalone. The registry is keyed by the
                     // engine's native constants, so translate the selector.
-                    NativeFn::PromiseResolve => {
+                    NativeId::PromiseResolve => {
                         self.gc_protect();
                         let result = self
                             .natives
                             .call_native(self.heap, this_v, &args_slice, NATIVE_PROMISE_RESOLVE);
-                        result.map(CallOutcome::Value).map_err(JSException)
+                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
                     }
-                    NativeFn::PromiseReject => {
+                    NativeId::PromiseReject => {
                         self.gc_protect();
                         let result = self
                             .natives
                             .call_native(self.heap, this_v, &args_slice, NATIVE_PROMISE_REJECT);
-                        result.map(CallOutcome::Value).map_err(JSException)
+                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
                     }
-                    NativeFn::PromiseThen => {
+                    NativeId::PromiseThen => {
                         self.gc_protect();
                         let result = self
                             .natives
                             .call_native(self.heap, this_v, &args_slice, NATIVE_PROMISE_THEN);
-                        result.map(CallOutcome::Value).map_err(JSException)
+                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
                     }
-                    NativeFn::EnumerableOwnKeys => {
+                    NativeId::ObjectEnumerableOwnKeys => {
                         self.gc_protect();
                         let result = self
                             .natives
                             .call_native(self.heap, this_v, &args_slice, NATIVE_ENUMERABLE_OWN_KEYS);
-                        result.map(CallOutcome::Value).map_err(JSException)
+                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
+                    }
+                    // Any other native id: route through the registry seam.
+                    _ => {
+                        self.gc_protect();
+                        let result = self
+                            .natives
+                            .call_native(self.heap, this_v, &args_slice, native_fn);
+                        result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t))
                     }
                 };
             }
             let args_start = callee_slot + 2;
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
-            if target_idx == NATIVE_EVAL {
+            if target_idx == u32::from(NATIVE_EVAL) {
                 // Direct eval: hand the source, shared global, and the
                 // cross-program registry to the engine's eval implementation,
                 // which compiles and runs a nested interpreter against this
@@ -2086,17 +1958,19 @@ impl<'a> Interp<'a> {
                 let global = self.global;
                 let programs = self.programs();
                 let result = self.natives.eval(self.heap, &source, this_v, global, programs);
-                return result.map(CallOutcome::Value).map_err(JSException);
+                return result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t));
             }
             self.gc_protect();
+            let id = self.native_id_for(target_idx)?;
             let result = {
                 let args = &self.stack[args_start..args_end];
                 // Disjoint field borrows: heap + natives mut, stack immut.
                 // Borrow checker allows distinct fields in 2024 edition.
                 self.natives
-                    .call_native(self.heap, this_v, args, target_idx)
+                    .call_native(self.heap, this_v, args, id)
+                    .map_err(|t| JSException::from_throw(self.heap, t))
             };
-            return result.map(CallOutcome::Value).map_err(JSException);
+            return result.map(CallOutcome::Value);
         }
 
         // Generator function: calling it returns a generator object without executing body.
@@ -2289,18 +2163,18 @@ impl<'a> Interp<'a> {
                 // Interpreter-internal natives (generator next/return/throw,
                 // console.log, promise fallbacks) dispatch through the
                 // `NativeFn` seam before any registry lookup.
-                if let Some(native_fn) = NativeFn::from_index(fn_idx) {
+                if let Some(native_fn) = NativeId::try_from(fn_idx).ok() {
                     return match native_fn {
-                        NativeFn::GeneratorNext => {
+                        NativeId::GeneratorNext => {
                             self.generator_next(this, args.first().copied().unwrap_or(JsValue::undefined()))
                         }
-                        NativeFn::GeneratorReturn => {
+                        NativeId::GeneratorReturn => {
                             self.generator_return(this, args.first().copied().unwrap_or(JsValue::undefined()))
                         }
-                        NativeFn::GeneratorThrow => {
+                        NativeId::GeneratorThrow => {
                             self.generator_throw(this, args.first().copied().unwrap_or(JsValue::undefined()))
                         }
-                        NativeFn::ConsoleLog => {
+                        NativeId::ConsoleLog => {
                             let mut parts = Vec::with_capacity(args.len());
                             for &v in args {
                                 parts.push(self.to_display_string(v));
@@ -2308,37 +2182,46 @@ impl<'a> Interp<'a> {
                             println!("{}", parts.join(" "));
                             Ok(JsValue::undefined())
                         }
-                        NativeFn::ArrayJoin => self.array_join_fallback(this, args),
-                        NativeFn::ArrayPush => self.array_push_fallback(this, args),
+                        NativeId::ArrayJoin => self.array_join_fallback(this, args),
+                        NativeId::ArrayPush => self.array_push_fallback(this, args),
                         // Promise/keys natives translate to the engine's
                         // native indices before the registry lookup.
-                        NativeFn::PromiseResolve => {
+                        NativeId::PromiseResolve => {
                             self.gc_protect();
                             let result = self
                                 .natives
                                 .call_native(self.heap, this, args, NATIVE_PROMISE_RESOLVE);
-                            result.map_err(JSException)
+                            result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
-                        NativeFn::PromiseReject => {
+                        NativeId::PromiseReject => {
                             self.gc_protect();
                             let result = self
                                 .natives
                                 .call_native(self.heap, this, args, NATIVE_PROMISE_REJECT);
-                            result.map_err(JSException)
+                            result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
-                        NativeFn::PromiseThen => {
+                        NativeId::PromiseThen => {
                             self.gc_protect();
                             let result = self
                                 .natives
                                 .call_native(self.heap, this, args, NATIVE_PROMISE_THEN);
-                            result.map_err(JSException)
+                            result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
-                        NativeFn::EnumerableOwnKeys => {
+                        NativeId::ObjectEnumerableOwnKeys => {
                             self.gc_protect();
                             let result = self
                                 .natives
                                 .call_native(self.heap, this, args, NATIVE_ENUMERABLE_OWN_KEYS);
-                            result.map_err(JSException)
+                            result.map_err(|t| JSException::from_throw(self.heap, t))
+                        }
+                        // Any other native id: the interpreter has no internal
+                        // fallback for it — route through the registry seam.
+                        _ => {
+                            self.gc_protect();
+                            let result = self
+                                .natives
+                                .call_native(self.heap, this, args, native_fn);
+                            result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
                     };
                 }
@@ -2347,10 +2230,11 @@ impl<'a> Interp<'a> {
                     // Out-of-range bytecode index: the native seam (engine
                     // iterator creators, Map/Set methods, console, …).
                     self.gc_protect();
+                    let id = self.native_id_for(fn_idx)?;
                     return self
                         .natives
-                        .call_native(self.heap, this, args, fn_idx)
-                        .map_err(JSException);
+                        .call_native(self.heap, this, args, id)
+                        .map_err(|t| JSException::from_throw(self.heap, t));
                 }
                 let callee_max_regs = funcs[fn_idx as usize].max_regs;
                 let new_base = self.stack.len();
@@ -2541,7 +2425,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Materializes a real error object (`KIND_ERROR`) as a throwable value.
+    /// Materializes a real error object (`Kind::Error`) as a throwable value.
     ///
     /// `text` conventionally follows the `"TypeError: msg"` spelling; the part
     /// before the first `": "` becomes the error `name`, the rest the
@@ -2673,12 +2557,12 @@ impl<'a> Interp<'a> {
     }
 
     /// Synthesizes a Map/Set method function object whose callable routes
-    /// through the engine's native registry (`constant` is an out-of-range
-    /// bytecode index the registry dispatches). Cached per constant.
-    fn map_set_method(&mut self, constant: u32) -> JsValue {
+    /// through the engine's native registry (`id` is an out-of-range
+    /// bytecode index the registry dispatches). Cached per id.
+    fn map_set_method(&mut self, id: NativeId) -> JsValue {
         self.gc_protect();
         let func = self.heap.alloc(JsObject::function(
-            v12_heap::FunctionTarget::Bytecode(constant),
+            v12_heap::FunctionTarget::Bytecode(u32::from(id)),
             None,
         ));
         let value = JsValue::object(func);
@@ -2740,7 +2624,7 @@ impl<'a> Interp<'a> {
     /// element store.
     /// Lazily materializes the `console.log` native function object.
     ///
-    /// The function is a `KIND_FUNCTION` whose `elements[0]` is
+    /// The function is a `Kind::Function` whose `elements[0]` is
     /// `NATIVE_CONSOLE_LOG`, so `prepare_call` routes it through the
     /// `NativeRegistry`. The object is cached in `self.console_log` and
     /// rooted, so repeated `get_property` for `console.log` returns the
@@ -2751,13 +2635,52 @@ impl<'a> Interp<'a> {
         }
         self.gc_protect();
         let func = self.heap.alloc(JsObject::function(
-            v12_heap::FunctionTarget::Bytecode(NativeFn::index(NativeFn::ConsoleLog)),
+            v12_heap::FunctionTarget::Bytecode(u32::from(NativeId::ConsoleLog)),
             None,
         ));
         let value = JsValue::object(func);
         self.heap.add_root(value);
         self.console_log = Some(value);
         value
+    }
+
+    /// Decodes a raw bytecode index into the shared [`NativeId`] enum.
+    ///
+    /// Out-of-range indices beyond the program's function table are the
+    /// native seam; an index that names no native is an error the registry
+    /// reports (mirrors the old "not registered" TypeError).
+    fn native_id_for(&mut self, idx: u32) -> Result<NativeId, JSException> {
+        NativeId::try_from(idx).map_err(|unknown| {
+            JSException(self.error_value(&format!(
+                "TypeError: native function #{} is not registered",
+                unknown.0
+            )))
+        })
+    }
+
+    /// The native for `key` on receiver kind `kind`, from the const method
+    /// table. Returns `None` when the key is not a method of that kind.
+    ///
+    /// O(1): flattens the key once, then a single [`v12_native::lookup_method`]
+    /// (a `Kind` jump table + a bounded switch over the method names).
+    fn method_native(&mut self, kind: Kind, key_v: JsValue) -> Option<NativeId> {
+        let handle = key_v.as_string()?;
+        self.heap.flatten(handle);
+        match &self.heap.get(handle).storage {
+            v12_heap::StrStorage::Latin1(bytes) => {
+                v12_native::lookup_method(kind, std::str::from_utf8(bytes).ok()?)
+            }
+            v12_heap::StrStorage::Utf16(units) => {
+                // Method names are ASCII; a UTF-16 key with non-ASCII units
+                // cannot be a declared method.
+                if !units.iter().all(|&u| u < 128) {
+                    return None;
+                }
+                let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
+                v12_native::lookup_method(kind, std::str::from_utf8(&bytes).ok()?)
+            }
+            _ => None,
+        }
     }
 
     /// Compares a key value's string text against `text` (flattening first).
@@ -2790,19 +2713,22 @@ impl<'a> Interp<'a> {
     ///
     /// Grouped so the synthesis body is written once; `console_log_fn`
     /// predates it and keeps its own copy.
-    fn cached_native(&mut self, which: NativeFn) -> JsValue {
+    fn cached_native(&mut self, which: NativeId) -> JsValue {
         let (index, cached) = match which {
-            NativeFn::PromiseResolve => (NativeFn::index(NativeFn::PromiseResolve), self.promise_resolve_fn),
-            NativeFn::PromiseReject => (NativeFn::index(NativeFn::PromiseReject), self.promise_reject_fn),
-            NativeFn::PromiseThen => (NativeFn::index(NativeFn::PromiseThen), self.promise_then_fn),
-            NativeFn::ArrayPush => (NativeFn::index(NativeFn::ArrayPush), self.array_push_fn),
-            NativeFn::ArrayJoin => (NativeFn::index(NativeFn::ArrayJoin), self.array_join_fn),
-            NativeFn::EnumerableOwnKeys => (NativeFn::index(NativeFn::EnumerableOwnKeys), self.enumerable_own_keys_fn),
-            NativeFn::GeneratorNext => (NativeFn::index(NativeFn::GeneratorNext), self.generator_next_fn),
-            NativeFn::GeneratorReturn => (NativeFn::index(NativeFn::GeneratorReturn), self.generator_return_fn),
-            NativeFn::GeneratorThrow => (NativeFn::index(NativeFn::GeneratorThrow), self.generator_throw_fn),
+            NativeId::PromiseResolve => (u32::from(NativeId::PromiseResolve), self.promise_resolve_fn),
+            NativeId::PromiseReject => (u32::from(NativeId::PromiseReject), self.promise_reject_fn),
+            NativeId::PromiseThen => (u32::from(NativeId::PromiseThen), self.promise_then_fn),
+            NativeId::ArrayPush => (u32::from(NativeId::ArrayPush), self.array_push_fn),
+            NativeId::ArrayJoin => (u32::from(NativeId::ArrayJoin), self.array_join_fn),
+            NativeId::ObjectEnumerableOwnKeys => (u32::from(NativeId::ObjectEnumerableOwnKeys), self.enumerable_own_keys_fn),
+            NativeId::GeneratorNext => (u32::from(NativeId::GeneratorNext), self.generator_next_fn),
+            NativeId::GeneratorReturn => (u32::from(NativeId::GeneratorReturn), self.generator_return_fn),
+            NativeId::GeneratorThrow => (u32::from(NativeId::GeneratorThrow), self.generator_throw_fn),
             // console.log is synthesized via `console_log_fn`, not here.
-            NativeFn::ConsoleLog => (NativeFn::index(NativeFn::ConsoleLog), self.console_log),
+            NativeId::ConsoleLog => (u32::from(NativeId::ConsoleLog), self.console_log),
+            // Only the ids below are ever synthesized through `cached_native`
+            // (see the call sites); the rest of the enum is out of contract.
+            _ => unreachable!("cached_native called with an unsynthesized id"),
         };
         if let Some(cached) = cached {
             return cached;
@@ -2815,16 +2741,17 @@ impl<'a> Interp<'a> {
         let value = JsValue::object(func);
         self.heap.add_root(value);
         match which {
-            NativeFn::PromiseResolve => self.promise_resolve_fn = Some(value),
-            NativeFn::PromiseReject => self.promise_reject_fn = Some(value),
-            NativeFn::PromiseThen => self.promise_then_fn = Some(value),
-            NativeFn::ArrayPush => self.array_push_fn = Some(value),
-            NativeFn::ArrayJoin => self.array_join_fn = Some(value),
-            NativeFn::EnumerableOwnKeys => self.enumerable_own_keys_fn = Some(value),
-            NativeFn::GeneratorNext => self.generator_next_fn = Some(value),
-            NativeFn::GeneratorReturn => self.generator_return_fn = Some(value),
-            NativeFn::GeneratorThrow => self.generator_throw_fn = Some(value),
-            NativeFn::ConsoleLog => self.console_log = Some(value),
+            NativeId::PromiseResolve => self.promise_resolve_fn = Some(value),
+            NativeId::PromiseReject => self.promise_reject_fn = Some(value),
+            NativeId::PromiseThen => self.promise_then_fn = Some(value),
+            NativeId::ArrayPush => self.array_push_fn = Some(value),
+            NativeId::ArrayJoin => self.array_join_fn = Some(value),
+            NativeId::ObjectEnumerableOwnKeys => self.enumerable_own_keys_fn = Some(value),
+            NativeId::GeneratorNext => self.generator_next_fn = Some(value),
+            NativeId::GeneratorReturn => self.generator_return_fn = Some(value),
+            NativeId::GeneratorThrow => self.generator_throw_fn = Some(value),
+            NativeId::ConsoleLog => self.console_log = Some(value),
+            _ => unreachable!("cached_native called with an unsynthesized id"),
         }
         value
     }
@@ -2842,17 +2769,11 @@ impl<'a> Interp<'a> {
         // `search`/`split`) synthesized structurally.
         let Some(obj) = obj_v.as_object() else {
             if obj_v.is_string() {
-                if self.key_is(key_v, "match") {
-                    return Ok(self.map_set_method(crate::NATIVE_STRING_MATCH));
-                }
-                if self.key_is(key_v, "replace") {
-                    return Ok(self.map_set_method(crate::NATIVE_STRING_REPLACE));
-                }
-                if self.key_is(key_v, "search") {
-                    return Ok(self.map_set_method(crate::NATIVE_STRING_SEARCH));
-                }
-                if self.key_is(key_v, "split") {
-                    return Ok(self.map_set_method(crate::NATIVE_STRING_SPLIT));
+                // String primitives get the regexp method surface
+                // (`match`/`replace`/`search`/`split`) from the const method
+                // table (the `StringPrim` pseudo-kind).
+                if let Some(id) = self.method_native(Kind::StringPrim, key_v) {
+                    return Ok(self.map_set_method(id));
                 }
             }
             return Ok(JsValue::undefined());
@@ -2925,16 +2846,16 @@ impl<'a> Interp<'a> {
             if let Some(promise_ctor) = promise_ctor {
                 if obj == promise_ctor {
                     if self.key_is(key_v, "resolve") {
-                        return Ok(self.cached_native(NativeFn::PromiseResolve));
+                        return Ok(self.cached_native(NativeId::PromiseResolve));
                     }
                     if self.key_is(key_v, "reject") {
-                        return Ok(self.cached_native(NativeFn::PromiseReject));
+                        return Ok(self.cached_native(NativeId::PromiseReject));
                     }
                 } else if self.key_is(key_v, "then")
                     && self.heap.get(obj).prototype.is_some()
                     && self.heap.get(obj).prototype == self.heap.get(promise_ctor).prototype
                 {
-                    return Ok(self.cached_native(NativeFn::PromiseThen));
+                    return Ok(self.cached_native(NativeId::PromiseThen));
                 }
             }
             // Fast path for Object.enumerableOwnKeys on the Object constructor
@@ -2943,18 +2864,18 @@ impl<'a> Interp<'a> {
                 && obj == object_ctor
                 && self.key_is(key_v, "enumerableOwnKeys")
             {
-                return Ok(self.cached_native(NativeFn::EnumerableOwnKeys));
+                return Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys));
             }
         }
-        if self.heap.get(obj).kind == KIND_GENERATOR {
+        if self.heap.get(obj).kind == Kind::Generator {
             if self.key_is(key_v, "next") {
-                return Ok(self.cached_native(NativeFn::GeneratorNext));
+                return Ok(self.cached_native(NativeId::GeneratorNext));
             }
             if self.key_is(key_v, "return") {
-                return Ok(self.cached_native(NativeFn::GeneratorReturn));
+                return Ok(self.cached_native(NativeId::GeneratorReturn));
             }
             if self.key_is(key_v, "throw") {
-                return Ok(self.cached_native(NativeFn::GeneratorThrow));
+                return Ok(self.cached_native(NativeId::GeneratorThrow));
             }
         }
         // `obj[Symbol.iterator]` — the well-known symbol key is a symbol
@@ -2964,35 +2885,28 @@ impl<'a> Interp<'a> {
         if self.key_is_symbol_iterator(key_v) {
             let kind = self.heap.get(obj).kind;
             let constant = match kind {
-                KIND_ARRAY | KIND_ARGUMENTS => crate::NATIVE_ARRAY_ITERATOR,
-                KIND_MAP => crate::NATIVE_MAP_ITERATOR,
-                KIND_SET => crate::NATIVE_SET_ITERATOR,
-                KIND_ITERATOR | KIND_GENERATOR => crate::NATIVE_ITERATOR_SELF,
-                _ => 0,
+                Kind::Array | Kind::Arguments => Some(crate::NATIVE_ARRAY_ITERATOR),
+                Kind::Map => Some(crate::NATIVE_MAP_ITERATOR),
+                Kind::Set => Some(crate::NATIVE_SET_ITERATOR),
+                Kind::Iterator | Kind::Generator => Some(crate::NATIVE_ITERATOR_SELF),
+                _ => None,
             };
-            if constant != 0 {
+            if let Some(constant) = constant {
                 return Ok(self.map_set_method(constant));
             }
         }
-        if self.heap.get(obj).kind == KIND_ITERATOR {
-            if self.key_is(key_v, "next") {
-                return Ok(self.map_set_method(crate::NATIVE_ITERATOR_NEXT));
+        if self.heap.get(obj).kind == Kind::Iterator {
+            // `next` from the const method table.
+            if let Some(id) = self.method_native(Kind::Iterator, key_v) {
+                return Ok(self.map_set_method(id));
             }
         }
         // RegExp object surface: methods `exec`/`test`/`toString`/`compile`
-        // and the `source`/`flags`/`lastIndex` properties (internal slots).
-        if self.heap.get(obj).kind == KIND_REGEXP {
-            if self.key_is(key_v, "exec") {
-                return Ok(self.map_set_method(crate::NATIVE_REGEXP_EXEC));
-            }
-            if self.key_is(key_v, "test") {
-                return Ok(self.map_set_method(crate::NATIVE_REGEXP_TEST));
-            }
-            if self.key_is(key_v, "toString") {
-                return Ok(self.map_set_method(crate::NATIVE_REGEXP_TO_STRING));
-            }
-            if self.key_is(key_v, "compile") {
-                return Ok(self.map_set_method(crate::NATIVE_REGEXP_COMPILE));
+        // from the const table, and the `source`/`flags`/`lastIndex` property
+        // reads (internal slots).
+        if self.heap.get(obj).kind == Kind::RegExp {
+            if let Some(id) = self.method_native(Kind::RegExp, key_v) {
+                return Ok(self.map_set_method(id));
             }
             // Property reads off the internal slots.
             let slot = if self.key_is(key_v, "source") {
@@ -3032,25 +2946,16 @@ impl<'a> Interp<'a> {
             self.heap.get_mut(obj).prototype = Some(proto);
             return Ok(JsValue::object(proto));
         }
-        if self.heap.get(obj).kind == KIND_ARRAY {
-            if self.key_is(key_v, "push") {
-                return Ok(self.cached_native(NativeFn::ArrayPush));
-            }
-            if self.key_is(key_v, "pop") {
-                return Ok(self.map_set_method(crate::NATIVE_ARRAY_POP));
-            }
-            if self.key_is(key_v, "join") {
-                return Ok(self.cached_native(NativeFn::ArrayJoin));
-            }
-            // `Array.prototype.entries` / `keys` / `values` — iterator creators.
-            if self.key_is(key_v, "entries") {
-                return Ok(self.map_set_method(crate::NATIVE_ARRAY_ITERATOR_ENTRIES));
-            }
-            if self.key_is(key_v, "keys") {
-                return Ok(self.map_set_method(crate::NATIVE_ARRAY_ITERATOR_KEYS));
-            }
-            if self.key_is(key_v, "values") {
-                return Ok(self.map_set_method(crate::NATIVE_ARRAY_ITERATOR));
+        if self.heap.get(obj).kind == Kind::Array {
+            // Method surface from the const table (push/pop/join/entries/
+            // keys/values); `length` stays a property read.
+            if let Some(id) = self.method_native(Kind::Array, key_v) {
+                // Array methods are synthesized via the cached native path.
+                return match id {
+                    NativeId::ArrayPush => Ok(self.cached_native(NativeId::ArrayPush)),
+                    NativeId::ArrayJoin => Ok(self.cached_native(NativeId::ArrayJoin)),
+                    _ => Ok(self.map_set_method(id)),
+                };
             }
             if self.key_is(key_v, "length") {
                 // Length is properties[0] for arrays regardless of shape state
@@ -3063,7 +2968,7 @@ impl<'a> Interp<'a> {
 
         // Arguments and arrays store integer indices in `elements`.
         let kind = self.heap.get(obj).kind;
-        if (kind == KIND_ARRAY || kind == KIND_ARGUMENTS)
+        if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
             // For arguments exotic, a mapped index mirrors the parameter slot;
@@ -3077,7 +2982,7 @@ impl<'a> Interp<'a> {
         // synthesizes a function whose callable routes through the engine's
         // native registry (the `NATIVE_*` constants are out-of-range bytecode
         // indices the registry dispatches).
-        if kind == KIND_MAP || kind == KIND_SET {
+        if kind == Kind::Map || kind == Kind::Set {
             if let Some(handle) = key_v.as_string() {
                 let mut name_is = |text: &str| -> bool {
                     self.heap.flatten(handle);
@@ -3091,7 +2996,7 @@ impl<'a> Interp<'a> {
                 };
                 // `size` is a getter: invoke the handler directly with the
                 // Map/Set as `this`. Methods return the synthesized function.
-                let size_const = if kind == KIND_MAP {
+                let size_const = if kind == Kind::Map {
                     NATIVE_MAP_SIZE
                 } else {
                     NATIVE_SET_SIZE
@@ -3101,9 +3006,9 @@ impl<'a> Interp<'a> {
                     return self
                         .natives
                         .call_native(self.heap, JsValue::object(obj), &[], size_const)
-                        .map_err(JSException);
+                        .map_err(|t| JSException::from_throw(self.heap, t));
                 }
-                let constant = if kind == KIND_MAP {
+                let constant = if kind == Kind::Map {
                     if name_is("get") {
                         Some(NATIVE_MAP_GET)
                     } else if name_is("set") {
@@ -3213,7 +3118,7 @@ impl<'a> Interp<'a> {
         };
 
         let kind = self.heap.get(obj).kind;
-        if (kind == KIND_ARRAY || kind == KIND_ARGUMENTS)
+        if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
             // Arguments exotic: if mapped, the element mirrors the parameter
@@ -3224,7 +3129,7 @@ impl<'a> Interp<'a> {
         }
         // RegExp `lastIndex` write: stores into the internal slot. Per spec
         // the value is coerced via ToNumber.
-        if kind == KIND_REGEXP && self.key_is(key_v, "lastIndex") {
+        if kind == Kind::RegExp && self.key_is(key_v, "lastIndex") {
             let n = ops::to_number(self.heap, value);
             if n.fract() == 0.0 && n >= -1e15 && n <= 1e15 {
                 if let Some(smi) = JsValue::from_i32_smi(n as i32) {
@@ -3340,7 +3245,7 @@ impl<'a> Interp<'a> {
         // Fast path for array/arguments indices: check element storage before
         // coercing the key, which may allocate. Holes count as absent.
         let kind = self.heap.get(obj).kind;
-        if (kind == KIND_ARRAY || kind == KIND_ARGUMENTS)
+        if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
             && let Some(slot) = self.heap.get(obj).elements.get(idx as usize)
             && !slot.is_hole()
@@ -3390,7 +3295,7 @@ impl<'a> Interp<'a> {
                 {
                     return Ok(lhs_v
                         .as_object()
-                        .is_some_and(|h| self.heap.get(h).kind == KIND_ARRAY));
+                        .is_some_and(|h| self.heap.get(h).kind == Kind::Array));
                 }
             }
         }
@@ -3455,7 +3360,7 @@ impl<'a> Interp<'a> {
             return Ok(true);
         };
 
-        if (self.heap.get(obj).kind == KIND_ARRAY || self.heap.get(obj).kind == KIND_ARGUMENTS)
+        if (self.heap.get(obj).kind == Kind::Array || self.heap.get(obj).kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
             let els = &mut self.heap.get_mut(obj).elements;
@@ -3487,7 +3392,7 @@ impl<'a> Interp<'a> {
 
     fn array_element(&self, obj: Handle<JsObject>, idx: u32) -> JsValue {
         let o = self.heap.get(obj);
-        if o.kind == KIND_ARRAY {
+        if o.kind == Kind::Array {
             // Arrays route through the elements-kind lattice.
             o.elements_array.get(idx).unwrap_or(JsValue::undefined())
         } else {
@@ -3502,7 +3407,7 @@ impl<'a> Interp<'a> {
 
     /// Stores an element, hole-filling gaps and keeping `length` current.
     fn array_set_element(&mut self, obj: Handle<JsObject>, idx: u32, value: JsValue) {
-        let is_array = self.heap.get(obj).kind == KIND_ARRAY;
+        let is_array = self.heap.get(obj).kind == Kind::Array;
         if is_array {
             let len_before = self.heap.get(obj).elements_array.len() as u32;
             self.heap.get_mut(obj).elements_array.set(idx, value);
@@ -3550,7 +3455,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: cannot destructure non-iterable"),
             ));
         };
-        if self.heap.get(src_obj).kind != KIND_ARRAY {
+        if self.heap.get(src_obj).kind != Kind::Array {
             // For destructuring, non-array iterable is still an error in our subset (only arrays).
             return Err(JSException(
                 self.error_value("TypeError: spread/rest source is not an array"),
@@ -3918,7 +3823,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: spread source is not an array"),
             ));
         };
-        if self.heap.get(obj).kind != KIND_ARRAY {
+        if self.heap.get(obj).kind != Kind::Array {
             return Err(JSException(
                 self.error_value("TypeError: spread source is not an array"),
             ));
@@ -3932,7 +3837,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: destination is not an object"),
             ));
         };
-        if self.heap.get(dst_obj).kind != KIND_ARRAY {
+        if self.heap.get(dst_obj).kind != Kind::Array {
             return Err(JSException(
                 self.error_value("TypeError: destination is not an array"),
             ));
@@ -3942,12 +3847,12 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: spread source is not an array"),
             ));
         };
-        if self.heap.get(src_obj).kind != KIND_ARRAY {
+        if self.heap.get(src_obj).kind != Kind::Array {
             return Err(JSException(
                 self.error_value("TypeError: spread source is not an array"),
             ));
         }
-        let src_elements: Vec<JsValue> = if self.heap.get(src_obj).kind == KIND_ARRAY {
+        let src_elements: Vec<JsValue> = if self.heap.get(src_obj).kind == Kind::Array {
             self.heap.get(src_obj).elements_array.iter().collect()
         } else {
             self.heap.get(src_obj).elements.clone()
@@ -4107,7 +4012,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: callee is not a function"),
             ));
         };
-        if self.heap.get(callee_obj).kind != KIND_FUNCTION {
+        if self.heap.get(callee_obj).kind != Kind::Function {
             return Err(JSException(
                 self.error_value("TypeError: callee is not a function"),
             ));
@@ -4127,7 +4032,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: args is not an array"),
             ));
         };
-        if self.heap.get(args_obj).kind != KIND_ARRAY {
+        if self.heap.get(args_obj).kind != Kind::Array {
             return Err(JSException(
                 self.error_value("TypeError: spread args is not an array"),
             ));
@@ -4156,10 +4061,11 @@ impl<'a> Interp<'a> {
         let callee_funcs = self.functions_for_program(callee_program);
         if (target_idx as usize) >= callee_funcs.len() {
             self.gc_protect();
+            let id = self.native_id_for(target_idx)?;
             let result = self
                 .natives
-                .call_native(self.heap, this_v, &args_vec, target_idx);
-            return result.map(CallOutcome::Value).map_err(JSException);
+                .call_native(self.heap, this_v, &args_vec, id);
+            return result.map(CallOutcome::Value).map_err(|t| JSException::from_throw(self.heap, t));
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(JSException(
@@ -4258,7 +4164,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: value is not a constructor"),
             ));
         };
-        if self.heap.get(callee_obj).kind != KIND_FUNCTION {
+        if self.heap.get(callee_obj).kind != Kind::Function {
             return Err(JSException(
                 self.error_value("TypeError: value is not a constructor"),
             ));
@@ -4278,12 +4184,14 @@ impl<'a> Interp<'a> {
                     let args_start = callee_slot + 2;
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
+                    let id = self.native_id_for(idx)?;
                     let result = {
                         let args = &self.stack[args_start..args_end];
                         self.natives
-                            .call_native(self.heap, JsValue::undefined(), args, idx)
+                            .call_native(self.heap, JsValue::undefined(), args, id)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
                     };
-                    return result.map(CallOutcome::Value).map_err(JSException);
+                    return result.map(CallOutcome::Value);
                 }
                 idx
             }
@@ -4500,7 +4408,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Allocates an array object for a rest parameter from `elements`. Centralises
-    /// the `array_shape` + `KIND_ARRAY` + `bind_shape` sequence (finding #4).
+    /// the `array_shape` + `Kind::Array` + `bind_shape` sequence (finding #4).
     /// Delegates to `call::alloc_rest_array` for DRY.
     #[allow(dead_code)]
     fn alloc_rest_array(&mut self, elements: Vec<JsValue>) -> JsValue {
@@ -4556,7 +4464,7 @@ impl<'a> Interp<'a> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(self.error_value("TypeError: generator next called on non-object")));
         };
-        if self.heap.get(r#gen).kind != KIND_GENERATOR {
+        if self.heap.get(r#gen).kind != Kind::Generator {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
         let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())).unwrap_or(0.0) == 1.0;
@@ -4597,7 +4505,7 @@ impl<'a> Interp<'a> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(self.error_value("TypeError: generator return called on non-object")));
         };
-        if self.heap.get(r#gen).kind != KIND_GENERATOR {
+        if self.heap.get(r#gen).kind != Kind::Generator {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
         let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64))).unwrap_or(0.0) == 1.0;
@@ -4617,7 +4525,7 @@ impl<'a> Interp<'a> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(self.error_value("TypeError: generator throw called on non-object")));
         };
-        if self.heap.get(r#gen).kind != KIND_GENERATOR {
+        if self.heap.get(r#gen).kind != Kind::Generator {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
         let done = self.heap.get(r#gen).properties.get(2).and_then(|v| v.as_f64().or(v.as_smi().map(|n| n as f64))).unwrap_or(0.0) == 1.0;
@@ -4638,7 +4546,7 @@ impl<'a> Interp<'a> {
         let sep = if let Some(&v) = args.first() {
             if v.is_undefined() { ",".to_string() } else { self.to_display_string(v) }
         } else { ",".to_string() };
-        let elements: Vec<JsValue> = if self.heap.get(arr).kind == KIND_ARRAY {
+        let elements: Vec<JsValue> = if self.heap.get(arr).kind == Kind::Array {
             self.heap.get(arr).elements_array.iter().collect()
         } else {
             self.heap.get(arr).elements.clone()
@@ -4659,7 +4567,7 @@ impl<'a> Interp<'a> {
         let Some(obj) = this_v.as_object() else {
             return Err(JSException(self.error_value("TypeError: Array.prototype.push called on non-object")));
         };
-        if self.heap.get(obj).kind == KIND_ARRAY {
+        if self.heap.get(obj).kind == Kind::Array {
             for &item in args {
                 self.heap.get_mut(obj).elements_array.push(item);
             }
@@ -4668,7 +4576,7 @@ impl<'a> Interp<'a> {
                 self.heap.get_mut(obj).elements.push(item);
             }
         }
-        let new_len = if self.heap.get(obj).kind == KIND_ARRAY {
+        let new_len = if self.heap.get(obj).kind == Kind::Array {
             self.heap.get(obj).elements_array.len() as u32
         } else {
             self.heap.get(obj).elements.len() as u32
@@ -4687,7 +4595,7 @@ impl<'a> Interp<'a> {
     fn is_promise(&self, v: JsValue) -> bool {
         let Some(obj) = v.as_object() else { return false; };
         let o = self.heap.get(obj);
-        o.kind == KIND_PROMISE && o.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s))
+        o.kind == Kind::Promise && o.properties[0].as_smi().is_some_and(|s| (0..=2).contains(&s))
     }
 
     fn promise_resolve_for_await(&mut self, v: JsValue) -> (JsValue, bool, JsValue) {
@@ -4945,7 +4853,7 @@ fn integral_index(v: JsValue) -> Option<u32> {
 /// `undefined`/non-functions (absent accessor).
 fn accessor_target(heap: &Heap, v: JsValue) -> Option<Handle<JsObject>> {
     let obj = v.as_object()?;
-    if heap.get(obj).kind != KIND_FUNCTION {
+    if heap.get(obj).kind != Kind::Function {
         return None;
     }
     Some(obj)

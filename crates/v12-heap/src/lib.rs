@@ -120,6 +120,7 @@ mod elements;
 mod function;
 mod gc;
 mod handle;
+mod macros;
 mod object;
 mod prop_key;
 mod shape;
@@ -128,23 +129,21 @@ mod stub_cache;
 mod value;
 
 pub use elements::{
-    ElementsArray, ElementsDictionary, ElementsKind, ELEMENTS_TO_DICTIONARY_INDEX,
+    ELEMENTS_TO_DICTIONARY_INDEX, ElementsArray, ElementsDictionary, ElementsKind,
     MAX_FAST_ELEMENT_GAP,
 };
 pub use function::{FunctionTarget, HostClosure, Native};
 pub use gc::{GcPolicy, Heap, MarkSink, RootSet, Trace};
 pub use handle::{Handle, HeapSpace, Space};
 pub use object::{
-    EnginePromise, GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject,
-    KIND_ARGUMENTS, KIND_ARRAY, KIND_ERROR, KIND_FUNCTION, KIND_GENERATOR, KIND_MAP, KIND_ORDINARY,
-    KIND_PROMISE, KIND_SET, KIND_ITERATOR, KIND_REGEXP, PromiseExt, PromiseState, V12BigInt,
-    V12Symbol,
+    EnginePromise, GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject, Kind,
+    PromiseExt, PromiseState, V12BigInt, V12Symbol,
 };
 pub use prop_key::PropKey;
 pub use shape::{
-    Attrs, DESCRIPTORS_INLINE_CAP, Descriptor, Descriptors, Shape, ShapeHandle,
+    Attrs, DESCRIPTORS_INLINE_CAP, Descriptor, Descriptors, Serial, Shape, ShapeHandle,
     TRANSITIONS_INLINE_CAP, Transitions, ValidityCellId,
 };
 pub use string::{CONCAT_EAGER_FLATTEN_MAX_UNITS, ROPE_MAX_DEPTH, StrStorage, V12Str};
 pub use stub_cache::{STUB_CACHE_CAPACITY, StubCache};
-pub use value::{BOX_MASK, JsValue, QUIET_NAN_BITS};
+pub use value::{BOX_MASK, DecodeError, JsValue, QUIET_NAN_BITS};
