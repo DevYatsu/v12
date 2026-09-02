@@ -178,6 +178,104 @@ const GLOBAL_INTRINSIC_NAMES: &[&str] = &[
     "globalThis",
 ];
 
+/// Const-stable string equality. `str == str` goes through `PartialEq`,
+/// which is not yet a const trait on stable rustc; byte-wise comparison is
+/// (integer compares are const-stable). Used only at compile time.
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// First index of `name` in [`GLOBAL_INTRINSIC_NAMES`], computed at compile
+/// time. Identical first-match semantics to `iter().position(|&n| n == name)`,
+/// so callers pay zero runtime cost for a slot that is fixed at compile time.
+const fn intrinsic_idx(name: &'static str) -> Option<usize> {
+    let mut i = 0;
+    while i < GLOBAL_INTRINSIC_NAMES.len() {
+        if const_str_eq(GLOBAL_INTRINSIC_NAMES[i], name) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Fixed property-slot positions (in the global object's `properties` prefix)
+/// of the intrinsics the hot lookup paths read by name. Each element index in
+/// [`GLOBAL_INTRINSIC_NAMES`] doubles as that slot, so these are constants.
+const CONSOLE_IDX: Option<usize> = intrinsic_idx("console");
+const SYMBOL_IDX: Option<usize> = intrinsic_idx("Symbol");
+const PROMISE_IDX: Option<usize> = intrinsic_idx("Promise");
+const ARRAY_IDX: Option<usize> = intrinsic_idx("Array");
+const OBJECT_IDX: Option<usize> = intrinsic_idx("Object");
+const REGEXP_IDX: Option<usize> = intrinsic_idx("RegExp");
+
+/// Maps a runtime `text` (already borrowed from the string table at the call
+/// site) to the fixed property-slot index of the matching global intrinsic,
+/// or `None` if `text` is not an intrinsic name. O(1) jump table mirroring
+/// [`GLOBAL_INTRINSIC_NAMES`] — keep its arms in the same order as the array.
+#[inline]
+fn intrinsic_slot(text: &str) -> Option<usize> {
+    match text {
+        "Object" => Some(OBJECT_IDX.expect("intrinsic 'Object' present")),
+        "Array" => Some(ARRAY_IDX.expect("intrinsic 'Array' present")),
+        "String" => Some(intrinsic_idx("String").expect("intrinsic 'String' present")),
+        "Number" => Some(intrinsic_idx("Number").expect("intrinsic 'Number' present")),
+        "Boolean" => Some(intrinsic_idx("Boolean").expect("intrinsic 'Boolean' present")),
+        "Math" => Some(intrinsic_idx("Math").expect("intrinsic 'Math' present")),
+        "JSON" => Some(intrinsic_idx("JSON").expect("intrinsic 'JSON' present")),
+        "Error" => Some(intrinsic_idx("Error").expect("intrinsic 'Error' present")),
+        "TypeError" => Some(intrinsic_idx("TypeError").expect("intrinsic 'TypeError' present")),
+        "RangeError" => Some(intrinsic_idx("RangeError").expect("intrinsic 'RangeError' present")),
+        "Promise" => Some(PROMISE_IDX.expect("intrinsic 'Promise' present")),
+        "Symbol" => Some(SYMBOL_IDX.expect("intrinsic 'Symbol' present")),
+        "Map" => Some(intrinsic_idx("Map").expect("intrinsic 'Map' present")),
+        "Set" => Some(intrinsic_idx("Set").expect("intrinsic 'Set' present")),
+        "RegExp" => Some(REGEXP_IDX.expect("intrinsic 'RegExp' present")),
+        "eval" => Some(intrinsic_idx("eval").expect("intrinsic 'eval' present")),
+        "console" => Some(CONSOLE_IDX.expect("intrinsic 'console' present")),
+        "globalThis" => Some(intrinsic_idx("globalThis").expect("intrinsic 'globalThis' present")),
+        _ => None,
+    }
+}
+
+/// Compile-time guard: every name in [`GLOBAL_INTRINSIC_NAMES`] must resolve
+/// identically to its array position. `Iterator::all`, `match` on `&str`, and
+/// `PartialEq` as a const trait (for `str`/`Option`) are not const-stable in
+/// this toolchain, so the runtime `match` table in [`intrinsic_slot`] cannot
+/// itself be const-evaluated. Instead a const `while` loop re-derives each
+/// name's slot via [`intrinsic_idx`] and asserts it equals the array index,
+/// comparing only primitive `usize` (const-safe); a hand-written arm in
+/// [`intrinsic_slot`] that resolves a name to the wrong slot then fails to
+/// compile, and an unresolvable name hits the `None` sentinel branch below.
+const fn intrinsic_slot_guard() {
+    let mut i = 0;
+    while i < GLOBAL_INTRINSIC_NAMES.len() {
+        // A `None` (unresolvable) name is mapped to `!i`, which always differs
+        // from `i`, forcing the mismatch branch below.
+        let hit = match intrinsic_idx(GLOBAL_INTRINSIC_NAMES[i]) {
+            Some(idx) => idx,
+            None => !i,
+        };
+        if hit != i {
+            panic!("intrinsic_slot drifted from GLOBAL_INTRINSIC_NAMES");
+        }
+        i += 1;
+    }
+}
+const _: () = intrinsic_slot_guard();
+
 /// Maximum simultaneous JavaScript activations.
 ///
 /// Why a limit exists: the dispatch loop is iterative, so recursion costs
@@ -709,8 +807,7 @@ impl<'a> Interp<'a> {
             // (prototype object, shape transitions) and the collector can run
             // before the `Closure` arm stores `h` into its register.
             self.stack.push(JsValue::object(h));
-            self
-                .materialize_function_prototype(h)
+            self.materialize_function_prototype(h)
                 .expect("closure prototype materialization cannot fail");
             self.stack.pop();
         }
@@ -986,7 +1083,9 @@ impl<'a> Interp<'a> {
                 let exec = self.execute();
                 exec.and_then(|()| {
                     self.top_result.take().ok_or_else(|| {
-                        JSException(self.error_value("InternalError: call completed without a result"))
+                        JSException(
+                            self.error_value("InternalError: call completed without a result"),
+                        )
                     })
                 })
             }
@@ -1001,35 +1100,82 @@ impl<'a> Interp<'a> {
         result
     }
 
-    fn private_get(&mut self, obj_v: crate::JsValue, class_id: u32, name_id: u32) -> Result<crate::JsValue, JSException> {
-        let Some(h) = obj_v.as_object() else { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); };
+    fn private_get(
+        &mut self,
+        obj_v: crate::JsValue,
+        class_id: u32,
+        name_id: u32,
+    ) -> Result<crate::JsValue, JSException> {
+        let Some(h) = obj_v.as_object() else {
+            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+        };
         let o = self.heap.get(h);
-        if o.private_brand != Some(class_id) { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); }
-        if let Some(m) = &o.private_fields { if let Some(v) = m.get(&name_id) { return Ok(*v); } }
+        if o.private_brand != Some(class_id) {
+            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+        }
+        if let Some(m) = &o.private_fields {
+            if let Some(v) = m.get(&name_id) {
+                return Ok(*v);
+            }
+        }
         Ok(crate::JsValue::undefined())
     }
     fn private_has(&self, obj_v: crate::JsValue, class_id: u32, name_id: u32) -> bool {
         if let Some(h) = obj_v.as_object() {
             let o = self.heap.get(h);
-            if o.private_brand != Some(class_id) { return false; }
-            if let Some(m) = &o.private_fields { return m.contains_key(&name_id); }
+            if o.private_brand != Some(class_id) {
+                return false;
+            }
+            if let Some(m) = &o.private_fields {
+                return m.contains_key(&name_id);
+            }
         }
         false
     }
-    fn private_define(&mut self, obj_v: crate::JsValue, class_id: u32, name_id: u32, val: crate::JsValue) -> Result<(), JSException> {
-        let Some(h) = obj_v.as_object() else { return Err(JSException(self.error_value("TypeError: Cannot define private field on non-object"))); };
+    fn private_define(
+        &mut self,
+        obj_v: crate::JsValue,
+        class_id: u32,
+        name_id: u32,
+        val: crate::JsValue,
+    ) -> Result<(), JSException> {
+        let Some(h) = obj_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: Cannot define private field on non-object",
+            )));
+        };
         let o = self.heap.get_mut(h);
-        if o.private_brand.is_none() { o.private_brand = Some(class_id); }
-        if o.private_brand != Some(class_id) { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); }
-        let m = o.private_fields.get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
+        if o.private_brand.is_none() {
+            o.private_brand = Some(class_id);
+        }
+        if o.private_brand != Some(class_id) {
+            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+        }
+        let m = o
+            .private_fields
+            .get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
         m.insert(name_id, val);
         Ok(())
     }
-    fn private_set(&mut self, obj_v: crate::JsValue, class_id: u32, name_id: u32, val: crate::JsValue) -> Result<(), JSException> {
-        let Some(h) = obj_v.as_object() else { return Err(JSException(self.error_value("TypeError: Cannot set private member on non-object"))); };
+    fn private_set(
+        &mut self,
+        obj_v: crate::JsValue,
+        class_id: u32,
+        name_id: u32,
+        val: crate::JsValue,
+    ) -> Result<(), JSException> {
+        let Some(h) = obj_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: Cannot set private member on non-object"),
+            ));
+        };
         let o = self.heap.get_mut(h);
-        if o.private_brand != Some(class_id) { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); }
-        let m = o.private_fields.get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
+        if o.private_brand != Some(class_id) {
+            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+        }
+        let m = o
+            .private_fields
+            .get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
         m.insert(name_id, val);
         Ok(())
     }
@@ -1069,14 +1215,20 @@ impl<'a> Interp<'a> {
         if v.is_object() {
             if let Some(obj) = v.as_object() {
                 let shape = self.heap.shape_of_mut(obj);
-                let lookup = |heap: &mut v12_heap::Heap, shape: v12_heap::ShapeHandle, key: &str| -> Option<v12_heap::Handle<v12_heap::V12Str>> {
+                let lookup = |heap: &mut v12_heap::Heap,
+                              shape: v12_heap::ShapeHandle,
+                              key: &str|
+                 -> Option<v12_heap::Handle<v12_heap::V12Str>> {
                     let h = heap.intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));
                     let pk = v12_heap::PropKey::from_string(h);
                     let desc = heap.lookup_property(shape, pk)?;
                     let slot = desc.slot()?;
                     // Interp objects have no GLOBAL_VAR_OFFSET bias (only engine global does).
                     let idx = slot as usize;
-                    heap.get(obj).properties.get(idx).and_then(|val| val.as_string())
+                    heap.get(obj)
+                        .properties
+                        .get(idx)
+                        .and_then(|val| val.as_string())
                 };
                 let shape2 = self.heap.shape_of_mut(obj);
                 // Need two separate lookups without overlapping mutable borrows.
@@ -1086,10 +1238,14 @@ impl<'a> Interp<'a> {
                     let msg = self.string_text(mh);
                     if let Some(nh) = name_h {
                         let name = self.string_text(nh);
-                        if msg.is_empty() { return name; }
+                        if msg.is_empty() {
+                            return name;
+                        }
                         return format!("{name}: {msg}");
                     }
-                    if !msg.is_empty() { return msg; }
+                    if !msg.is_empty() {
+                        return msg;
+                    }
                 }
             }
         }
@@ -1138,9 +1294,9 @@ impl<'a> Interp<'a> {
                 if let Some(dl) = self.deadline {
                     if Instant::now() >= dl {
                         self.deadline_exceeded = true;
-                        return Err(JSException(self.error_value(
-                            "ScriptRuntimeError: execution deadline exceeded",
-                        )));
+                        return Err(JSException(
+                            self.error_value("ScriptRuntimeError: execution deadline exceeded"),
+                        ));
                     }
                 }
             }
@@ -1300,25 +1456,49 @@ impl<'a> Interp<'a> {
                         WideOp::RegExt { .. } => {
                             panic!("corrupt bytecode: bare RegExt reached dispatch")
                         }
-                        WideOp::GetPrivateW { dst, obj, class_id, name_id } => {
+                        WideOp::GetPrivateW {
+                            dst,
+                            obj,
+                            class_id,
+                            name_id,
+                        } => {
                             let obj_v = self.stack[base + usize::from(obj)];
                             let v = attempt!(self.private_get(obj_v, class_id, name_id));
                             self.stack[base + usize::from(dst)] = v;
                         }
-                        WideOp::SetPrivateW { obj, class_id, name_id, value } => {
+                        WideOp::SetPrivateW {
+                            obj,
+                            class_id,
+                            name_id,
+                            value,
+                        } => {
                             let obj_v = self.stack[base + usize::from(obj)];
                             let val = self.stack[base + usize::from(value)];
                             attempt!(self.private_set(obj_v, class_id, name_id, val));
                         }
-                        WideOp::DefinePrivateW { obj, class_id, name_id, value } => {
+                        WideOp::DefinePrivateW {
+                            obj,
+                            class_id,
+                            name_id,
+                            value,
+                        } => {
                             let obj_v = self.stack[base + usize::from(obj)];
                             let val = self.stack[base + usize::from(value)];
                             attempt!(self.private_define(obj_v, class_id, name_id, val));
                         }
-                        WideOp::HasPrivateW { dst, obj, class_id, name_id } => {
+                        WideOp::HasPrivateW {
+                            dst,
+                            obj,
+                            class_id,
+                            name_id,
+                        } => {
                             let obj_v = self.stack[base + usize::from(obj)];
                             let present = self.private_has(obj_v, class_id, name_id);
-                            self.stack[base + usize::from(dst)] = if present { v12_heap::JsValue::true_() } else { v12_heap::JsValue::false_() };
+                            self.stack[base + usize::from(dst)] = if present {
+                                v12_heap::JsValue::true_()
+                            } else {
+                                v12_heap::JsValue::false_()
+                            };
                         }
                     }
                     self.set_pc(pc + width);
@@ -1785,7 +1965,7 @@ impl<'a> Interp<'a> {
                     self.gc_protect();
                     let h = self.heap.alloc(JsObject {
                         kind: Kind::Generator,
-                        properties: vec![
+                        properties: smallvec::smallvec![
                             ops::box_number(f64::from(func_idx)),
                             ops::box_number(f64::from((pc + op_width) as u32)),
                             ops::box_number(0.0),
@@ -1965,7 +2145,10 @@ impl<'a> Interp<'a> {
                 // Preserve BigInt identity via heap BigInt object (magnitude from decimal text).
                 // Minimal decode: text from string table, parse decimal into bytes.
                 let strings = self.strings_for_program(program);
-                let text = strings.get(str_id as usize).cloned().unwrap_or_else(|| "0".to_string());
+                let text = strings
+                    .get(str_id as usize)
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_string());
                 // Strip sign/prefix already normalized; store as utf8 bytes magnitude placeholder.
                 let sign = text.starts_with('-');
                 let body = text.trim_start_matches('-').trim_start_matches('+');
@@ -1975,21 +2158,36 @@ impl<'a> Interp<'a> {
                     while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
                         bytes.pop();
                     }
-                    if v == 0 { bytes = vec![]; }
-                    let h = self.heap.alloc(v12_heap::V12BigInt { sign, magnitude_le: bytes });
+                    if v == 0 {
+                        bytes = vec![];
+                    }
+                    let h = self.heap.alloc(v12_heap::V12BigInt {
+                        sign,
+                        magnitude_le: bytes,
+                    });
                     self.heap.add_root(JsValue::bigint(h));
                     Ok(JsValue::bigint(h))
                 } else {
-                    let h = self.heap.alloc(v12_heap::V12BigInt { sign, magnitude_le: body.as_bytes().to_vec() });
+                    let h = self.heap.alloc(v12_heap::V12BigInt {
+                        sign,
+                        magnitude_le: body.as_bytes().to_vec(),
+                    });
                     self.heap.add_root(JsValue::bigint(h));
                     Ok(JsValue::bigint(h))
                 }
             }
             Const::BigU64(v) => {
                 let mut bytes = v.to_le_bytes().to_vec();
-                while bytes.len() > 1 && *bytes.last().unwrap() == 0 { bytes.pop(); }
-                if v == 0 { bytes = vec![]; }
-                let h = self.heap.alloc(v12_heap::V12BigInt { sign: false, magnitude_le: bytes });
+                while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
+                    bytes.pop();
+                }
+                if v == 0 {
+                    bytes = vec![];
+                }
+                let h = self.heap.alloc(v12_heap::V12BigInt {
+                    sign: false,
+                    magnitude_le: bytes,
+                });
                 self.heap.add_root(JsValue::bigint(h));
                 Ok(JsValue::bigint(h))
             }
@@ -2204,7 +2402,11 @@ impl<'a> Interp<'a> {
                             )));
                         }
                         let this_arg = args_slice.first().copied().unwrap_or(JsValue::undefined());
-                        let fwd = if args_slice.len() > 1 { &args_slice[1..] } else { &[] as &[JsValue] };
+                        let fwd = if args_slice.len() > 1 {
+                            &args_slice[1..]
+                        } else {
+                            &[] as &[JsValue]
+                        };
                         let res = self.call_object(target, this_arg, fwd)?;
                         return Ok(CallOutcome::Value(res));
                     }
@@ -2229,7 +2431,13 @@ impl<'a> Interp<'a> {
                                 let mut v = Vec::with_capacity(len);
                                 for i in 0..len as u32 {
                                     // use elements array + shape path: simplest read via snapshot
-                                    let elem = self.heap.get(arr_obj).elements.get(i as usize).copied().unwrap_or(JsValue::undefined());
+                                    let elem = self
+                                        .heap
+                                        .get(arr_obj)
+                                        .elements
+                                        .get(i as usize)
+                                        .copied()
+                                        .unwrap_or(JsValue::undefined());
                                     v.push(elem);
                                 }
                                 v
@@ -2697,20 +2905,20 @@ impl<'a> Interp<'a> {
                     {
                         let instrs = &self.functions[caller.fn_idx as usize].instrs;
                         if let Some(ph) = self.heap.get(r#gen).properties.get(4).copied()
-                            && let Ok((_, dst, width)) = decode_parked_call(instrs, pc) {
-                                let caller_base = caller.base;
-                                let idx = caller_base + usize::from(dst);
-                                let is_undef =
-                                    self.stack.get(idx).is_some_and(|v| v.is_undefined());
-                                if is_undef {
-                                    if idx >= self.stack.len() {
-                                        self.stack.resize(idx + 1, JsValue::undefined());
-                                    }
-                                    self.stack[idx] = ph;
-                                    caller.pc += width;
-                                    return Ok(false);
+                            && let Ok((_, dst, width)) = decode_parked_call(instrs, pc)
+                        {
+                            let caller_base = caller.base;
+                            let idx = caller_base + usize::from(dst);
+                            let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
+                            if is_undef {
+                                if idx >= self.stack.len() {
+                                    self.stack.resize(idx + 1, JsValue::undefined());
                                 }
+                                self.stack[idx] = ph;
+                                caller.pc += width;
+                                return Ok(false);
                             }
+                        }
                     }
                     // Caller already advanced (prepare_call returned Value); just resume it
                     return Ok(false);
@@ -2816,7 +3024,10 @@ impl<'a> Interp<'a> {
             // `call_inline`'s `exec_result?` forwards it to the parked
             // dispatch arm, which re-raises it through the normal unwind
             // path with the caller's frames intact.
-            if self.stop_at_frames.is_some_and(|n| self.frames.len() == n + 1) {
+            if self
+                .stop_at_frames
+                .is_some_and(|n| self.frames.len() == n + 1)
+            {
                 let popped = self.frames.pop().expect("boundary frame exists");
                 self.stack.truncate(popped.base);
                 self.notify_tier_ups();
@@ -3205,7 +3416,7 @@ impl<'a> Interp<'a> {
         // (its position in the global's property prefix), so adding
         // intrinsics cannot drift these indices. When the lookup is for
         // `"log"` on that object, synthesize the native function.
-        let console_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "console");
+        let console_idx = CONSOLE_IDX;
         let console_obj_opt = if let (Some(g), Some(idx)) = (self.global, console_idx) {
             let val_opt = {
                 let heap = &*self.heap;
@@ -3237,7 +3448,7 @@ impl<'a> Interp<'a> {
         // `Symbol.iterator` — reading the well-known symbol off the `Symbol`
         // intrinsic (found by name in the global's property prefix) yields
         // the realm's singleton symbol value.
-        let symbol_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "Symbol");
+        let symbol_idx = SYMBOL_IDX;
         if let (Some(g), Some(symbol_idx)) = (self.global, symbol_idx)
             && let Some(symbol_ctor) = {
                 let heap = &*self.heap;
@@ -3262,7 +3473,7 @@ impl<'a> Interp<'a> {
         //   `prototype` link — the realm installs that link, and the engine's
         //   promise built-ins give every promise instance the same prototype.
         // - `push` / `join` on array-kind objects.
-        let promise_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "Promise");
+        let promise_idx = PROMISE_IDX;
         if let (Some(g), Some(promise_idx)) = (self.global, promise_idx) {
             let promise_ctor = {
                 let heap = &*self.heap;
@@ -3294,7 +3505,8 @@ impl<'a> Interp<'a> {
                 .first()
                 .and_then(|v| v.as_object());
             if let Some(object_ctor) = object_ctor
-                && obj == object_ctor {
+                && obj == object_ctor
+            {
                 if self.key_is(key_v, "enumerableOwnKeys") {
                     return Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys));
                 }
@@ -3361,16 +3573,20 @@ impl<'a> Interp<'a> {
                 None
             };
             if let Some(slot) = slot
-                && let Some(v) = self.heap.get(obj).properties.get(slot).copied() {
-                    return Ok(v);
-                }
+                && let Some(v) = self.heap.get(obj).properties.get(slot).copied()
+            {
+                return Ok(v);
+            }
         }
         // `Array.isArray` — static method on the Array constructor.
-        let array_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "Array");
+        let array_idx = ARRAY_IDX;
         if let (Some(g), Some(array_idx)) = (self.global, array_idx)
             && let Some(array_ctor) = {
                 let heap = &*self.heap;
-                heap.get(g).properties.get(array_idx).and_then(|v| v.as_object())
+                heap.get(g)
+                    .properties
+                    .get(array_idx)
+                    .and_then(|v| v.as_object())
             }
             && obj == array_ctor
             && self.key_is(key_v, "isArray")
@@ -3378,10 +3594,13 @@ impl<'a> Interp<'a> {
             return Ok(self.map_set_method(NativeId::ArrayIsArray));
         }
         // `Object.keys` / `values` / `entries` — static methods on Object.
-        if let (Some(g), Some(object_idx)) = (self.global, GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "Object"))
+        if let (Some(g), Some(object_idx)) = (self.global, OBJECT_IDX)
             && let Some(object_ctor) = {
                 let heap = &*self.heap;
-                heap.get(g).properties.get(object_idx).and_then(|v| v.as_object())
+                heap.get(g)
+                    .properties
+                    .get(object_idx)
+                    .and_then(|v| v.as_object())
             }
             && obj == object_ctor
         {
@@ -3435,7 +3654,7 @@ impl<'a> Interp<'a> {
         // for `new RegExp(...)` instanceof wiring and `RegExp.prototype.exec`
         // style reads). The realm's RegExp placeholder has no real prototype
         // object; synthesize a minimal one on first read.
-        let regexp_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "RegExp");
+        let regexp_idx = REGEXP_IDX;
         if let (Some(g), Some(regexp_idx)) = (self.global, regexp_idx)
             && let Some(regexp_ctor) = {
                 let heap = &*self.heap;
@@ -3493,56 +3712,57 @@ impl<'a> Interp<'a> {
         // native registry (the `NATIVE_*` constants are out-of-range bytecode
         // indices the registry dispatches).
         if (kind == Kind::Map || kind == Kind::Set)
-            && let Some(handle) = key_v.as_string() {
-                let mut name_is = |text: &str| -> bool {
-                    self.heap.flatten(handle);
-                    match &self.heap.get(handle).storage {
-                        v12_heap::StrStorage::Latin1(bytes) => bytes == text.as_bytes(),
-                        v12_heap::StrStorage::Utf16(units) => {
-                            units.iter().copied().eq(text.encode_utf16())
-                        }
-                        _ => false,
+            && let Some(handle) = key_v.as_string()
+        {
+            let mut name_is = |text: &str| -> bool {
+                self.heap.flatten(handle);
+                match &self.heap.get(handle).storage {
+                    v12_heap::StrStorage::Latin1(bytes) => bytes == text.as_bytes(),
+                    v12_heap::StrStorage::Utf16(units) => {
+                        units.iter().copied().eq(text.encode_utf16())
                     }
-                };
-                // `size` is a getter: invoke the handler directly with the
-                // Map/Set as `this`. Methods return the synthesized function.
-                let size_const = if kind == Kind::Map {
-                    NATIVE_MAP_SIZE
-                } else {
-                    NATIVE_SET_SIZE
-                };
-                if name_is("size") {
-                    self.gc_protect();
-                    return self
-                        .natives
-                        .call_native(self.heap, JsValue::object(obj), &[], size_const)
-                        .map_err(|t| JSException::from_throw(self.heap, t));
+                    _ => false,
                 }
-                let constant = if kind == Kind::Map {
-                    if name_is("get") {
-                        Some(NATIVE_MAP_GET)
-                    } else if name_is("set") {
-                        Some(NATIVE_MAP_SET)
-                    } else if name_is("has") {
-                        Some(NATIVE_MAP_HAS)
-                    } else if name_is("delete") {
-                        Some(NATIVE_MAP_DELETE)
-                    } else {
-                        None
-                    }
-                } else if name_is("add") {
-                    Some(NATIVE_SET_ADD)
+            };
+            // `size` is a getter: invoke the handler directly with the
+            // Map/Set as `this`. Methods return the synthesized function.
+            let size_const = if kind == Kind::Map {
+                NATIVE_MAP_SIZE
+            } else {
+                NATIVE_SET_SIZE
+            };
+            if name_is("size") {
+                self.gc_protect();
+                return self
+                    .natives
+                    .call_native(self.heap, JsValue::object(obj), &[], size_const)
+                    .map_err(|t| JSException::from_throw(self.heap, t));
+            }
+            let constant = if kind == Kind::Map {
+                if name_is("get") {
+                    Some(NATIVE_MAP_GET)
+                } else if name_is("set") {
+                    Some(NATIVE_MAP_SET)
                 } else if name_is("has") {
-                    Some(NATIVE_SET_HAS)
+                    Some(NATIVE_MAP_HAS)
                 } else if name_is("delete") {
-                    Some(NATIVE_SET_DELETE)
+                    Some(NATIVE_MAP_DELETE)
                 } else {
                     None
-                };
-                if let Some(constant) = constant {
-                    return Ok(self.map_set_method(constant));
                 }
+            } else if name_is("add") {
+                Some(NATIVE_SET_ADD)
+            } else if name_is("has") {
+                Some(NATIVE_SET_HAS)
+            } else if name_is("delete") {
+                Some(NATIVE_SET_DELETE)
+            } else {
+                None
+            };
+            if let Some(constant) = constant {
+                return Ok(self.map_set_method(constant));
             }
+        }
 
         let key = self.property_key(key_v)?;
         let shape = self.shape_of(obj);
@@ -3640,11 +3860,13 @@ impl<'a> Interp<'a> {
         // the value is coerced via ToNumber.
         if kind == Kind::RegExp && self.key_is(key_v, "lastIndex") {
             let n = ops::to_number(self.heap, value);
-            if n.fract() == 0.0 && (-1e15..=1e15).contains(&n)
-                && let Some(smi) = JsValue::from_i32_smi(n as i32) {
-                    self.heap.get_mut(obj).properties[2] = smi;
-                    return Ok(());
-                }
+            if n.fract() == 0.0
+                && (-1e15..=1e15).contains(&n)
+                && let Some(smi) = JsValue::from_i32_smi(n as i32)
+            {
+                self.heap.get_mut(obj).properties[2] = smi;
+                return Ok(());
+            }
             self.heap.get_mut(obj).properties[2] = JsValue::from_f64(n);
             return Ok(());
         }
@@ -3845,7 +4067,13 @@ impl<'a> Interp<'a> {
             // Check if this is an arrow-function flag by looking up its bytecode.
             let is_arrow = self
                 .functions_for_program(self.heap.get(rhs_obj).program_id)
-                .get(self.heap.get(rhs_obj).callable.bytecode_index().unwrap_or(u32::MAX) as usize)
+                .get(
+                    self.heap
+                        .get(rhs_obj)
+                        .callable
+                        .bytecode_index()
+                        .unwrap_or(u32::MAX) as usize,
+                )
                 .map(|f| f.is_arrow)
                 .unwrap_or(false);
             if !is_arrow {
@@ -4084,7 +4312,7 @@ impl<'a> Interp<'a> {
             let sh = self.heap.get(shape);
             sh.descriptors.as_slice().to_vec()
         };
-        let src_props: Vec<JsValue> = self.heap.get(src_obj).properties.clone();
+        let src_props: Vec<JsValue> = self.heap.get(src_obj).properties.as_slice().to_vec();
         self.gc_protect();
         let dst_h = self.heap.alloc(JsObject::default());
         let mut cur_shape = self.heap.root_shape();
@@ -4142,7 +4370,7 @@ impl<'a> Interp<'a> {
             let sh = self.heap.get(shape);
             sh.descriptors.as_slice().to_vec()
         };
-        let src_props: Vec<JsValue> = self.heap.get(src_obj).properties.clone();
+        let src_props: Vec<JsValue> = self.heap.get(src_obj).properties.as_slice().to_vec();
         let mut cur_shape = self.shape_of(dst_obj);
         self.gc_protect();
         for desc in descs {
@@ -4457,7 +4685,7 @@ impl<'a> Interp<'a> {
             .get(str_id as usize)
             .map(String::as_str)
             .unwrap_or("");
-        if let Some(idx) = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == text)
+        if let Some(idx) = intrinsic_slot(text)
             && idx < self.heap.get(global).properties.len()
         {
             let v = self.heap.get(global).properties[idx];
@@ -4496,7 +4724,7 @@ impl<'a> Interp<'a> {
         self.gc_protect();
         let strings = self.strings_for_program(program);
         let text = strings.get(str_id as usize).cloned().unwrap_or_default();
-        if let Some(idx) = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == text) {
+        if let Some(idx) = intrinsic_slot(&text) {
             // Intrinsics are at fixed indices; allow overwriting.
             if idx < self.heap.get(global).properties.len() {
                 self.heap.get_mut(global).properties[idx] = val;
@@ -4804,7 +5032,12 @@ impl<'a> Interp<'a> {
         // Clone private field template from constructor to instance for brand check
         {
             let brand = self.heap.get(callee_obj).private_brand;
-            let fields = self.heap.get(callee_obj).private_fields.as_ref().map(|m| m.as_ref().clone());
+            let fields = self
+                .heap
+                .get(callee_obj)
+                .private_fields
+                .as_ref()
+                .map(|m| m.as_ref().clone());
             let inst = self.heap.get_mut(instance);
             inst.private_brand = brand;
             if let Some(f) = fields {
@@ -5082,8 +5315,8 @@ impl<'a> Interp<'a> {
         } else {
             JsValue::false_()
         };
-        self.heap.get_mut(h).properties = vec![value, done_val];
-        self.heap.get_mut(h).property_keys = vec![Some(pk_value), Some(pk_done)];
+        self.heap.get_mut(h).properties = smallvec::smallvec![value, done_val];
+        self.heap.get_mut(h).property_keys = smallvec::smallvec![Some(pk_value), Some(pk_done)];
         JsValue::object(h)
     }
 

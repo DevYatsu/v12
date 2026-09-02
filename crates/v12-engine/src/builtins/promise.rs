@@ -72,7 +72,7 @@ fn create_promise(
     heap.add_root(JsValue::object(reactions));
     let promise = heap.alloc(JsObject {
         kind: v12_heap::Kind::Promise,
-        properties: vec![smi(state), payload, JsValue::object(reactions)],
+        properties: smallvec::smallvec![smi(state), payload, JsValue::object(reactions)],
         prototype,
         ..JsObject::default()
     });
@@ -149,8 +149,8 @@ pub fn promise_then(
                 .as_object()
                 .expect("promise carries a reactions array");
             let record = heap.alloc(JsObject::ordinary(
-                vec![handler, on_rejected, JsValue::object(derived)],
-                vec![None; 3],
+                smallvec::smallvec![handler, on_rejected, JsValue::object(derived)],
+                smallvec::smallvec![None; 3],
             ));
             heap.add_root(JsValue::object(record));
             heap.get_mut(reactions)

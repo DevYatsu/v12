@@ -175,6 +175,73 @@ impl Realm {
                 v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_EVAL));
         }
 
+        // Materialize the standard prototypes the built-in installs target.
+        // Each is an ordinary object rooted here (like `promise_proto` above);
+        // constructors link to them via their `prototype` field.
+        let object_proto = {
+            let h = heap.alloc(JsObject::default());
+            heap.add_root(JsValue::object(h));
+            h
+        };
+        let array_proto = {
+            let h = heap.alloc(JsObject::default());
+            heap.add_root(JsValue::object(h));
+            h
+        };
+        let string_proto = {
+            let h = heap.alloc(JsObject::default());
+            heap.add_root(JsValue::object(h));
+            h
+        };
+        let number_proto = {
+            let h = heap.alloc(JsObject::default());
+            heap.add_root(JsValue::object(h));
+            h
+        };
+        let function_proto = {
+            let h = heap.alloc(JsObject::default());
+            heap.add_root(JsValue::object(h));
+            h
+        };
+
+        // Link the intrinsic constructors to their prototypes, mirroring the
+        // Promise wiring above, and make `Number(x)` callable.
+        let link_ctor = |heap: &mut Heap,
+                         intrinsics: &HashMap<String, JsValue>,
+                         name: &str,
+                         proto: Handle<JsObject>| {
+            if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
+                heap.get_mut(o).prototype = Some(proto);
+            }
+        };
+        link_ctor(heap, &intrinsics, "Object", object_proto);
+        link_ctor(heap, &intrinsics, "Array", array_proto);
+        link_ctor(heap, &intrinsics, "String", string_proto);
+        link_ctor(heap, &intrinsics, "Number", number_proto);
+        if let Some(number_ctor) = intrinsics.get("Number").and_then(|v| v.as_object()) {
+            heap.get_mut(number_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
+                crate::builtins::NATIVE_NUMBER_CONSTRUCT,
+            ));
+        }
+
+        // Install the compile-time builtin table (isNaN, Math.floor, Array.push,
+        // …) as shape-bound properties on the global and the constructors/
+        // prototypes. Must run after the 18 intrinsic slots are pushed so the
+        // global's shape slot `n` maps to `properties[GLOBAL_VAR_OFFSET + n]`.
+        let targets = crate::builtins::BuiltinTargets {
+            global,
+            math: intrinsics.get("Math").and_then(|v| v.as_object()),
+            number: intrinsics.get("Number").and_then(|v| v.as_object()),
+            number_proto,
+            string_proto,
+            array: intrinsics.get("Array").and_then(|v| v.as_object()),
+            array_proto,
+            object: intrinsics.get("Object").and_then(|v| v.as_object()),
+            object_proto,
+            function_proto,
+        };
+        crate::builtins::install_builtins(heap, &targets);
+
         Self { global, intrinsics }
     }
 

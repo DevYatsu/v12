@@ -24,6 +24,18 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-02 — Step 8 Number/Math globals + static/dynamic registry (DRY, zero-cost dispatch)
+
+- **Filter:** `language/expressions` (11 164 files) and `language` (11 190 files incl. annexB)
+- **Before:** 3 771 pass / 7 210 fail (expressions) — 3 785 pass / 7 222 fail total (34.4 %); `callee` 2 232, `not a function` 329
+- **After:**  4 008 pass / 6 973 fail (expressions) — **4 022 pass / 6 985 fail total, 36.5 % pass** (annexB 14/26)
+- **Delta:** +237 pass, −237 fail, +2.1 pts on slice; `callee` 2 232 → 2 137 (−95), `not a function` 329 → ~250 (−79); combined callee bucket −174
+- **Engine change:** Number ctor + `Number.isNaN/isFinite/parseInt/parseFloat`, globals `isNaN/isFinite/parseInt/parseFloat`, `Math` `floor/ceil/trunc/round/sqrt/pow/max/min/random` via static `define_builtins!` registry + `BuiltinTargets`/`install_builtins` (compile-time straight-line installs, no data array), `helpers::to_number`/`js_number` DRY, zero-cost `NativeId` match (jump table) + shape-lookup dispatch
+- **Files:** `crates/v12-native/src/id.rs`, `crates/v12-engine/src/builtins/{helpers,number,math,mod}.rs`, `crates/v12-engine/src/realm.rs`, `crates/v12-interp/src/lib.rs`
+- **Bucket:** `known-failures.md` A (`callee is not a function`) — shrank (2232 → 2137; remaining ~2 k callee still Array/JSON etc.)
+- **Runner:** `cargo run -p test262-runner -- --filter language/expressions --jobs 4 --format json` (4022/6985/183) + `cargo nextest run --workspace` 563 pass
+- **Notes:** Reconstructed 2026-09-02 after a workspace reset wiped the uncommitted diff (recovery from `stash@{0}` + spec-driven rebuild; see CONTEXT.md incident note).
+
 ### 2026-08-30 — Iterator protocol + `for-of` (Priority 2)
 
 - **Filter:** `language/statements/for-of` (752 files, 8 jobs)

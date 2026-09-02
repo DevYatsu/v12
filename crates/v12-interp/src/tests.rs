@@ -729,7 +729,7 @@ fn arguments_exotic_mapped_access_via_elements() {
         let heap = interp.heap_mut_for_test();
         let mapped: Box<[Option<u32>]> = vec![Some(0), None].into_boxed_slice();
         let o = heap.alloc(v12_heap::JsObject::arguments(
-            Vec::new(),
+            Vec::new().into(),
             vec![
                 v12_heap::JsValue::from_i32_smi(7).unwrap(),
                 v12_heap::JsValue::from_i32_smi(8).unwrap(),
@@ -989,7 +989,7 @@ fn global_get_object_returns_function_kind() {
     });
     heap.add_root(v12_heap::JsValue::object(array_ctor));
     props[1] = v12_heap::JsValue::object(array_ctor);
-    heap.get_mut(global).properties = props;
+    heap.get_mut(global).properties = props.into();
     // Compile `throw Object;` and `throw Array;` – each should be GetGlobal.
     let src_obj = "throw Object;";
     let (prog, strings) =
@@ -1037,7 +1037,7 @@ fn global_object_get_prototype_property_is_reachable() {
     // Set up heap for test: global has Object at slot 0, plus other intrinsics.
     let mut props = vec![v12_heap::JsValue::undefined(); 14];
     props[0] = v12_heap::JsValue::object(object_ctor);
-    heap.get_mut(global).properties = props;
+    heap.get_mut(global).properties = props.into();
     // Bind shape and property value for Object.
     // Need a separate Interp to hold the shape_of map.
     let src = "throw Object.getPrototypeOf;";

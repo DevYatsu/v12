@@ -129,12 +129,19 @@ pub struct JsObject {
     pub overflow: Option<Box<[crate::JsValue]>>,
     /// Named-property slots (shape-backed layout arrives with the object
     /// model work).
-    pub properties: Vec<crate::JsValue>,
+    ///
+    /// `SmallVec` with an inline capacity of 4 (typical own-prop count for a
+    /// small object) keeps zero heap allocation for the common case; larger
+    /// objects and the shared globals (~18 intrinsics) spill to the heap
+    /// automatically via `SmallVec`'s heap overflow.
+    pub properties: smallvec::SmallVec<[crate::JsValue; 4]>,
     /// Property keys (names) parallel to `properties` vector. `None` for
     /// empty slots; `Some(PropKey)` for populated slots. Used by native
     /// handlers that need to enumerate property names without interpreter's
     /// shape cache.
-    pub property_keys: Vec<Option<crate::PropKey>>,
+    ///
+    /// `SmallVec` with an inline capacity of 4, mirroring `properties`.
+    pub property_keys: smallvec::SmallVec<[Option<crate::PropKey>; 4]>,
     /// Integer-indexed element slots (legacy `Vec` used for the overloaded
     /// slots: function index, generator register window, promise reactions).
     pub elements: Vec<crate::JsValue>,
@@ -152,7 +159,7 @@ pub struct JsObject {
     /// hot path — `shape` is the shape binding.
     pub validity_cell: ValidityCellId,
     pub private_brand: Option<u32>,
-    pub private_fields: Option<Box<rustc_hash::FxHashMap<u32, crate::JsValue>>> ,
+    pub private_fields: Option<Box<rustc_hash::FxHashMap<u32, crate::JsValue>>>,
     /// Arguments exotic mapping: `Some(map)` where `map[i]` is `Some(slot)`
     /// when indexed property `i` is aliased to the `slot`-th parameter slot,
     /// `None` for mapped holes and `None` for unmapped (strict) arguments.
@@ -176,8 +183,8 @@ impl Default for JsObject {
             shape: crate::shape::ShapeHandle::new(0),
             inline_props: [crate::JsValue::undefined(); Self::IN_OBJECT_PROP_CAP],
             overflow: None,
-            properties: Vec::new(),
-            property_keys: Vec::new(),
+            properties: smallvec::SmallVec::new(),
+            property_keys: smallvec::SmallVec::new(),
             elements: Vec::new(),
             elements_array: crate::elements::ElementsArray::new(),
             prototype: None,
@@ -257,8 +264,8 @@ impl JsObject {
 
     /// An ordinary object with the given properties and their keys.
     pub fn ordinary(
-        properties: Vec<crate::JsValue>,
-        property_keys: Vec<Option<crate::PropKey>>,
+        properties: smallvec::SmallVec<[crate::JsValue; 4]>,
+        property_keys: smallvec::SmallVec<[Option<crate::PropKey>; 4]>,
     ) -> Self {
         Self {
             kind: Kind::Ordinary,
@@ -299,10 +306,10 @@ impl JsObject {
         }
         Self {
             kind: Kind::Array,
-            properties: vec![
+            properties: smallvec::smallvec![
                 crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi"),
             ],
-            property_keys: vec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
+            property_keys: smallvec::smallvec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
             elements,
             elements_array,
             ..Self::default()
@@ -311,7 +318,7 @@ impl JsObject {
 
     /// An arguments exotic object with the given properties and elements.
     pub fn arguments(
-        properties: Vec<crate::JsValue>,
+        properties: smallvec::SmallVec<[crate::JsValue; 4]>,
         elements: Vec<crate::JsValue>,
         mapped: Option<Box<[Option<u32>]>>,
     ) -> Self {
@@ -319,7 +326,7 @@ impl JsObject {
         Self {
             kind: Kind::Arguments,
             properties,
-            property_keys: vec![None; prop_len],
+            property_keys: smallvec::smallvec![None; prop_len],
             elements,
             arguments_mapped: mapped,
             ..Self::default()
@@ -338,12 +345,12 @@ impl JsObject {
     ) -> Self {
         Self {
             kind: Kind::RegExp,
-            properties: vec![
+            properties: smallvec::smallvec![
                 crate::JsValue::string(source),
                 crate::JsValue::string(flags),
                 crate::JsValue::from_i32_smi(0).expect("0 fits Smi"),
             ],
-            property_keys: vec![None; 3],
+            property_keys: smallvec::smallvec![None; 3],
             ..Self::default()
         }
     }
@@ -368,12 +375,12 @@ impl JsObject {
     pub fn pending_promise(reactions: crate::Handle<JsObject>) -> Self {
         Self {
             kind: Kind::Promise,
-            properties: vec![
+            properties: smallvec::smallvec![
                 crate::JsValue::from_f64(0.0),
                 crate::JsValue::undefined(),
                 crate::JsValue::object(reactions),
             ],
-            property_keys: vec![None; 3],
+            property_keys: smallvec::smallvec![None; 3],
             ..Self::default()
         }
     }
@@ -384,12 +391,12 @@ impl JsObject {
     pub fn fulfilled_promise(value: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
             kind: Kind::Promise,
-            properties: vec![
+            properties: smallvec::smallvec![
                 crate::JsValue::from_i32_smi(1).expect("1 fits"),
                 value,
                 crate::JsValue::object(reactions),
             ],
-            property_keys: vec![None; 3],
+            property_keys: smallvec::smallvec![None; 3],
             ..Self::default()
         }
     }
@@ -400,12 +407,12 @@ impl JsObject {
     pub fn rejected_promise(reason: crate::JsValue, reactions: crate::Handle<JsObject>) -> Self {
         Self {
             kind: Kind::Promise,
-            properties: vec![
+            properties: smallvec::smallvec![
                 crate::JsValue::from_i32_smi(2).expect("2 fits"),
                 reason,
                 crate::JsValue::object(reactions),
             ],
-            property_keys: vec![None; 3],
+            property_keys: smallvec::smallvec![None; 3],
             ..Self::default()
         }
     }
@@ -419,11 +426,11 @@ impl JsObject {
     ) -> Self {
         Self {
             kind: Kind::Error,
-            properties: vec![
+            properties: smallvec::smallvec![
                 crate::JsValue::string(name),
                 crate::JsValue::string(message),
             ],
-            property_keys: vec![None; 2],
+            property_keys: smallvec::smallvec![None; 2],
             ..Self::default()
         }
     }
@@ -439,7 +446,7 @@ impl JsObject {
         env: Option<crate::Handle<JsObject>>,
         async_promise: Option<crate::JsValue>,
     ) -> Self {
-        let mut props = vec![
+        let mut props = smallvec::smallvec![
             crate::JsValue::from_f64(f64::from(fn_idx)),
             crate::JsValue::from_f64(f64::from(resume_pc)),
             crate::JsValue::from_f64(done),
@@ -452,7 +459,7 @@ impl JsObject {
         Self {
             kind: Kind::Generator,
             properties: props,
-            property_keys: vec![None; prop_len],
+            property_keys: smallvec::smallvec![None; prop_len],
             elements: window,
             prototype: env,
             ..Self::default()
@@ -462,8 +469,8 @@ impl JsObject {
     /// Environment object with `slots` undefined slots.
     pub fn environment(slots: usize, parent: Option<crate::Handle<JsObject>>) -> Self {
         Self {
-            properties: vec![crate::JsValue::undefined(); slots],
-            property_keys: vec![None; slots],
+            properties: smallvec::smallvec![crate::JsValue::undefined(); slots],
+            property_keys: smallvec::smallvec![None; slots],
             prototype: parent,
             ..Self::default()
         }
@@ -624,7 +631,10 @@ impl HeapExt for crate::Heap {
     }
     fn alloc_ordinary(&mut self, props: Vec<crate::JsValue>) -> crate::Handle<JsObject> {
         let n = props.len();
-        let h = self.alloc(JsObject::ordinary(props, vec![None; n]));
+        let h = self.alloc(JsObject::ordinary(
+            props.into_iter().collect(),
+            (0..n).map(|_| None).collect(),
+        ));
         self.add_root(crate::JsValue::object(h));
         h
     }
@@ -723,7 +733,11 @@ impl Trace for JsObject {
         self.elements_array.trace(sink);
         self.prototype.trace(sink);
         self.captured_env.trace(sink);
-        if let Some(m) = &self.private_fields { for v in m.values() { v.trace(sink); } }
+        if let Some(m) = &self.private_fields {
+            for v in m.values() {
+                v.trace(sink);
+            }
+        }
     }
 }
 
@@ -746,7 +760,7 @@ mod tests {
         let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
         let child = heap.alloc(JsObject::default());
         let parent = heap.alloc(JsObject {
-            properties: vec![JsValue::object(child)],
+            properties: smallvec::smallvec![JsValue::object(child)],
             elements: vec![JsValue::object(child)],
             prototype: Some(child),
             ..JsObject::default()
@@ -811,7 +825,7 @@ mod tests {
     fn generator_object_slots() {
         let mut heap = crate::Heap::new(crate::GcPolicy::NoGC);
         let h = heap.alloc(JsObject::generator());
-        heap.get_mut(h).properties = vec![
+        heap.get_mut(h).properties = smallvec::smallvec![
             JsValue::from_f64(2.0),
             JsValue::from_f64(0.0),
             JsValue::from_f64(0.0),

@@ -41,7 +41,6 @@ const SLOT_INDEX: usize = 2;
 
 /// Builds an iterator object over `source` with the given kind.
 fn create_iterator(heap: &mut Heap, source: Handle<JsObject>, kind: i32) -> Handle<JsObject> {
-    
     helpers::alloc_obj(
         heap,
         JsObject {
@@ -76,8 +75,8 @@ fn iterator_result(heap: &mut Heap, value: JsValue, done: bool) -> JsValue {
     } else {
         JsValue::false_()
     };
-    heap.get_mut(h).properties = vec![value, done_val];
-    heap.get_mut(h).property_keys = vec![Some(pk_value), Some(pk_done)];
+    heap.get_mut(h).properties = smallvec::smallvec![value, done_val];
+    heap.get_mut(h).property_keys = smallvec::smallvec![Some(pk_value), Some(pk_done)];
     JsValue::object(h)
 }
 

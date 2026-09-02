@@ -2391,6 +2391,8 @@ name = "v12-engine"
 version = "0.1.0"
 dependencies = [
  "malachite",
+ "rustc-hash",
+ "smallvec",
  "v12-bccompiler",
  "v12-bytecode",
  "v12-codegen",
@@ -2407,6 +2409,7 @@ name = "v12-heap"
 version = "0.1.0"
 dependencies = [
  "rustc-hash",
+ "smallvec",
  "strum",
 ]
 
@@ -2416,6 +2419,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "rustc-hash",
+ "smallvec",
  "test-support",
  "v12-bccompiler",
  "v12-bytecode",

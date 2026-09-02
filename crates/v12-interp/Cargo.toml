@@ -17,6 +17,7 @@ v12-bytecode.workspace = true
 v12-heap.workspace = true
 v12-native.workspace = true
 rustc-hash.workspace = true
+smallvec.workspace = true
 # The interpreter runs `v12_bytecode::Program`s, not compiler
 # products. The front-end (`v12-bccompiler` / `oxc_*` / `lasso`) is no
 # longer a runtime dependency of the interpreter; embedders that want

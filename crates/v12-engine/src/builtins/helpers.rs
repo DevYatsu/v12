@@ -111,3 +111,43 @@ pub fn intern_text(heap: &mut Heap, text: &str) -> v12_heap::Handle<V12Str> {
         heap.intern_string(V12Str::utf16(text.encode_utf16().collect()))
     }
 }
+
+/// ES `ToNumber` subset: Smi/double pass through; `true`→1.0, `false`/`null`→0.0,
+/// `undefined`→NaN; a string is trimmed (empty→0.0, else parsed as f64, failure→NaN);
+/// objects → NaN. Reused by all numeric built-ins (DRY).
+pub fn to_number(heap: &mut Heap, v: JsValue) -> f64 {
+    if let Some(n) = v.as_smi().map(f64::from) {
+        return n;
+    }
+    if let Some(n) = v.as_f64() {
+        return n;
+    }
+    if v.is_true() {
+        return 1.0;
+    }
+    if v.is_false() || v.is_null() {
+        return 0.0;
+    }
+    if let Some(h) = v.as_string() {
+        let trimmed = string_text(heap, h);
+        let trimmed = trimmed.trim();
+        if trimmed.is_empty() {
+            return 0.0;
+        }
+        return trimmed.parse::<f64>().unwrap_or(f64::NAN);
+    }
+    f64::NAN
+}
+
+/// Canonicalizes an f64 to a JavaScript number value: an integral value within
+/// Smi range becomes a Smi, anything else stays a double.
+pub fn js_number(n: f64) -> JsValue {
+    if n.fract() == 0.0
+        && n >= f64::from(JsValue::SMI_MIN)
+        && n <= f64::from(JsValue::SMI_MAX)
+        && let Some(smi) = JsValue::from_i32_smi(n as i32)
+    {
+        return smi;
+    }
+    JsValue::from_f64(n)
+}

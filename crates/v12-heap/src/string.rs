@@ -187,6 +187,11 @@ impl V12Str {
         }
     }
 
+    /// A flat Latin-1 string over a byte slice (clones the slice).
+    pub fn latin1_slice(bytes: &[u8]) -> Self {
+        Self::latin1(bytes.to_vec())
+    }
+
     /// A flat UTF-16 string over `units`.
     pub fn utf16(units: Vec<u16>) -> Self {
         Self {

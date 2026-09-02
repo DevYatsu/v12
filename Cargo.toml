@@ -63,6 +63,11 @@ strum = { version = "0.28", features = ["derive"] }
 # FxHasher) for the integer-keyed maps in v12-heap.
 rustc-hash = "2"
 
+# Inline small-vector storage for `JsObject` descriptor slots
+# (`properties` / `property_keys`): zero heap alloc for the common
+# small-object case, spills to the heap automatically past the inline cap.
+smallvec = "1"
+
 # Benchmarks (dev-only).
 criterion = "0.8"
 

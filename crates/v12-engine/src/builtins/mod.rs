@@ -37,7 +37,7 @@ use crate::job_queue::Job;
 /// capturing Rust closures, stored separately from the fn-pointer handlers.
 #[derive(Default, Clone)]
 pub struct NativeRegistry {
-    handlers: std::collections::HashMap<NativeId, NativeHandler>,
+    handlers: rustc_hash::FxHashMap<NativeId, NativeHandler>,
     pending: Rc<RefCell<Vec<Job>>>,
     /// Compiled-regexp cache for RegExp natives. Per-registry (per-engine) so
     /// object-handle indexes never collide across engines. Single-threaded
@@ -230,6 +230,7 @@ pub const NATIVE_STRING_SEARCH: NativeId = NativeId::StringSearch;
 pub const NATIVE_STRING_SPLIT: NativeId = NativeId::StringSplit;
 pub const NATIVE_NUMBER_IS_NAN: NativeId = NativeId::NumberIsNan;
 pub const NATIVE_MATH_ABS: NativeId = NativeId::MathAbs;
+pub const NATIVE_NUMBER_CONSTRUCT: NativeId = NativeId::NumberConstruct;
 pub const NATIVE_BOOLEAN_CONSTRUCT: NativeId = NativeId::BooleanConstruct;
 pub const NATIVE_ERROR_CREATE: NativeId = NativeId::ErrorCreate;
 pub const NATIVE_QUEUE_MICROTASK: NativeId = NativeId::QueueMicrotask;
@@ -270,33 +271,337 @@ pub const NATIVE_ARRAY_ITERATOR_ENTRIES: NativeId = NativeId::ArrayIteratorEntri
 /// `Array.prototype.keys` — array-keys iterator.
 pub const NATIVE_ARRAY_ITERATOR_KEYS: NativeId = NativeId::ArrayIteratorKeys;
 
-// The compile-time builtin table: every pure, stateless native.
-//
-// Declared at module scope so `builtin_dispatch` is a module-level `match`
-// (a jump table the compiler emits); `call_native` consults it before the
-// runtime map. No array, no `HashMap`, no runtime construction.
-v12_native::native_table! {
-    ObjectCreate => object::object_create,
-    ObjectGetPrototypeOf => object::object_get_prototype_of,
-    ObjectDefineProperty => object::object_define_property,
-    ObjectKeys => object::object_keys,
-    ObjectValues => object::object_values,
-    ObjectEntries => object::object_entries,
-    ObjectHasOwnProperty => object::object_has_own_property,
-    ObjectProtoToString => object::object_proto_to_string,
-    ObjectProtoValueOf => object::object_proto_value_of,
-    FunctionProtoToString => object::function_proto_to_string,
-    ArrayIsArray => array::array_is_array,
-    ArrayPush => array::array_push,
-    ArrayPop => array::array_pop,
-    ArrayJoin => array_join,
-    ArraySlice => array::array_slice,
-    ArraySort => array::array_sort,
-    StringCharAt => string::string_char_at,
-    StringSlice => string::string_slice,
+/// Handles needed to install built-ins. Constructed by `Realm::new` from its
+/// materialized prototypes/constructors and passed to [`install_builtins`].
+///
+/// The macro's *grouped* entries (`Global`, `Math`, `Number`, `Array`, ...)
+/// route to the corresponding field here by host name; prototypes and
+/// singletons that always exist are plain handles, optional constructor
+/// objects are `Option`.
+pub struct BuiltinTargets {
+    pub global: v12_heap::Handle<v12_heap::JsObject>,
+    pub math: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub number: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub number_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub string_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub array: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub array_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub object: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub object_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub function_proto: v12_heap::Handle<v12_heap::JsObject>,
+}
+
+fn builtin_install_prop(
+    heap: &mut Heap,
+    obj: v12_heap::Handle<v12_heap::JsObject>,
+    name: &str,
+    value: JsValue,
+) {
+    use v12_heap::{Attrs, PropKey, V12Str};
+    let h = if name.is_ascii() {
+        heap.intern_string(V12Str::latin1_slice(name.as_bytes()))
+    } else {
+        heap.intern_string(V12Str::utf16(name.encode_utf16().collect()))
+    };
+    let key = PropKey::from_string(h);
+    let shape = heap.shape_of_mut(obj);
+    let child = heap.add_property(shape, key, Attrs::DEFAULT);
+    heap.bind_shape(obj, child);
+    heap.get_mut(obj).properties.push(value);
+    heap.get_mut(obj).property_keys.push(Some(key));
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __builtin_emit_install {
+    (Global, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let func = $heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+            ..Default::default()
+        });
+        $heap.add_root(JsValue::object(func));
+        $crate::builtins::builtin_install_prop(
+            $heap,
+            $targets.global,
+            $name,
+            JsValue::object(func),
+        );
+    }};
+    (Math, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        if let Some(obj) = $targets.math {
+            let func = $heap.alloc(v12_heap::JsObject {
+                kind: v12_heap::Kind::Function,
+                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+                ..Default::default()
+            });
+            $heap.add_root(JsValue::object(func));
+            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
+        }
+    }};
+    (Number, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        if let Some(obj) = $targets.number {
+            let func = $heap.alloc(v12_heap::JsObject {
+                kind: v12_heap::Kind::Function,
+                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+                ..Default::default()
+            });
+            $heap.add_root(JsValue::object(func));
+            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
+        }
+    }};
+    (NumberProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let func = $heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+            ..Default::default()
+        });
+        $heap.add_root(JsValue::object(func));
+        $crate::builtins::builtin_install_prop(
+            $heap,
+            $targets.number_proto,
+            $name,
+            JsValue::object(func),
+        );
+    }};
+    (StringProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let func = $heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+            ..Default::default()
+        });
+        $heap.add_root(JsValue::object(func));
+        $crate::builtins::builtin_install_prop(
+            $heap,
+            $targets.string_proto,
+            $name,
+            JsValue::object(func),
+        );
+    }};
+    (Json, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (Array, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        if let Some(obj) = $targets.array {
+            let func = $heap.alloc(v12_heap::JsObject {
+                kind: v12_heap::Kind::Function,
+                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+                ..Default::default()
+            });
+            $heap.add_root(JsValue::object(func));
+            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
+        }
+    }};
+    (ArrayProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let func = $heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+            ..Default::default()
+        });
+        $heap.add_root(JsValue::object(func));
+        $crate::builtins::builtin_install_prop(
+            $heap,
+            $targets.array_proto,
+            $name,
+            JsValue::object(func),
+        );
+    }};
+    (Object, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        if let Some(obj) = $targets.object {
+            let func = $heap.alloc(v12_heap::JsObject {
+                kind: v12_heap::Kind::Function,
+                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+                ..Default::default()
+            });
+            $heap.add_root(JsValue::object(func));
+            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
+        }
+    }};
+    (ObjectProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let func = $heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+            ..Default::default()
+        });
+        $heap.add_root(JsValue::object(func));
+        $crate::builtins::builtin_install_prop(
+            $heap,
+            $targets.object_proto,
+            $name,
+            JsValue::object(func),
+        );
+    }};
+    (FunctionProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let func = $heap.alloc(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
+            ..Default::default()
+        });
+        $heap.add_root(JsValue::object(func));
+        $crate::builtins::builtin_install_prop(
+            $heap,
+            $targets.function_proto,
+            $name,
+            JsValue::object(func),
+        );
+    }};
+    // Reserved future hosts — no installs yet, keep exhaustive.
+    (BooleanProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (ErrorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (RegExp, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (RegExpProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (Map, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (MapProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (Set, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (SetProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (Iterator, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+    (IteratorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
+        let _ = ($heap, $targets, $name, $id);
+    }};
+}
+
+/// Unified builtin declaration: single source of truth for dispatch + install.
+///
+/// *Grouped* entries `Target { "jsName" => Variant => handler }` emit both a
+/// `builtin_dispatch` match arm and a straight-line `install_builtins` call.
+/// Grouped targets distinguish **static** (constructor) vs **dynamic**
+/// (prototype) installs: `Array { "isArray" => ... }` installs on the `Array`
+/// constructor, `ArrayProto { "push" => ... }` installs on `Array.prototype`.
+/// No intermediate `BUILTIN_INSTALLS` array is stored — the macro expands to
+/// direct `install_prop` calls (zero rodata, no iteration).
+/// *Bare* entries `Variant => handler` (after `;`) emit only a dispatch arm
+/// for truly internal / non-JS-visible natives (e.g. `Eval`, `ModuleImport`,
+/// `ConsoleLog`). They are not installed on any JS object.
+///
+/// Example:
+/// ```ignore
+/// define_builtins! {
+///     Global { "isNaN" => GlobalIsNaN => number::global_is_nan },
+///     Math { "floor" => MathFloor => math::math_floor },
+///     Array { "isArray" => ArrayIsArray => array::array_is_array },
+///     ArrayProto { "push" => ArrayPush => array::array_push };
+///     Eval => eval_stub,
+/// }
+/// ```
+macro_rules! define_builtins {
+    (
+        $( $target:ident { $($name:literal => $id:ident => $handler:expr),* $(,)? } ),* $(,)? ;
+        $( $bare_id:ident => $bare_handler:expr ),* $(,)?
+    ) => {
+        /// Compile-time dispatch over every builtin. `None` means "not a
+        /// builtin" — the caller falls through to the runtime registry.
+        ///
+        /// This is the O(1) static lookup: `match` lowers to a jump table on
+        /// the discriminants, so a builtin call costs no hashing and no index
+        /// tables. A `phf`/perfect-hash table is deliberately NOT used here —
+        /// the match runs faster than any hash (neither hashing nor table
+        /// memory) — and the runtime `handlers` map cannot be `phf` anyway,
+        /// because host closures register at runtime and `phf` keys must be
+        /// known at compile time.
+        pub fn builtin_dispatch(
+            id: NativeId,
+            heap: &mut Heap,
+            this: JsValue,
+            args: &[JsValue],
+        ) -> Option<Result<JsValue, Throw>> {
+            match id {
+                $( $( NativeId::$id => Some(($handler)(heap, this, args)), )* )*
+                $( NativeId::$bare_id => Some(($bare_handler)(heap, this, args)), )*
+                _ => None,
+            }
+        }
+
+        /// Installs all grouped built-ins as shape-bound properties. This is
+        /// the only install path — there is no `BUILTIN_INSTALLS` array. Each
+        /// grouped entry expands to a straight-line `install_prop` call, so the
+        /// compiler can inline and no rodata table is emitted.
+        pub fn install_builtins(heap: &mut Heap, targets: &BuiltinTargets) {
+            $( $( $crate::__builtin_emit_install!($target, heap, targets, $name, NativeId::$id); )* )*
+            // Bare ids are dispatch-only; silence unused warnings.
+            $( let _ = NativeId::$bare_id; )*
+        }
+    };
+}
+
+define_builtins! {
+    Global {
+        "isNaN" => GlobalIsNaN => number::global_is_nan,
+        "isFinite" => GlobalIsFinite => number::global_is_finite,
+        "parseInt" => GlobalParseInt => number::global_parse_int,
+        "parseFloat" => GlobalParseFloat => number::global_parse_float,
+    },
+    Math {
+        "abs" => MathAbs => math::math_abs,
+        "floor" => MathFloor => math::math_floor,
+        "ceil" => MathCeil => math::math_ceil,
+        "trunc" => MathTrunc => math::math_trunc,
+        "pow" => MathPow => math::math_pow,
+        "max" => MathMax => math::math_max,
+        "min" => MathMin => math::math_min,
+        "random" => MathRandom => math::math_random,
+        "round" => MathRound => math::math_round,
+        "sqrt" => MathSqrt => math::math_sqrt,
+    },
+    Number {
+        "isNaN" => NumberIsNan => number::number_is_nan,
+        "isFinite" => NumberIsFinite => number::number_is_finite,
+        "parseInt" => NumberParseInt => number::global_parse_int,
+        "parseFloat" => NumberParseFloat => number::global_parse_float,
+    },
+    Array {
+        "isArray" => ArrayIsArray => array::array_is_array,
+    },
+    ArrayProto {
+        "push" => ArrayPush => array::array_push,
+        "pop" => ArrayPop => array::array_pop,
+        "join" => ArrayJoin => array_join,
+        "slice" => ArraySlice => array::array_slice,
+        "sort" => ArraySort => array::array_sort,
+        "entries" => ArrayIteratorEntries => iterator::array_iterator_entries,
+        "keys" => ArrayIteratorKeys => iterator::array_iterator_keys,
+        "values" => ArrayIterator => iterator::array_iterator,
+    },
+    Object {
+        "create" => ObjectCreate => object::object_create,
+        "getPrototypeOf" => ObjectGetPrototypeOf => object::object_get_prototype_of,
+        "defineProperty" => ObjectDefineProperty => object::object_define_property,
+        "keys" => ObjectKeys => object::object_keys,
+        "values" => ObjectValues => object::object_values,
+        "entries" => ObjectEntries => object::object_entries,
+    },
+    ObjectProto {
+        "hasOwnProperty" => ObjectHasOwnProperty => object::object_has_own_property,
+        "toString" => ObjectProtoToString => object::object_proto_to_string,
+        "valueOf" => ObjectProtoValueOf => object::object_proto_value_of,
+    },
+    FunctionProto {
+        "toString" => FunctionProtoToString => object::function_proto_to_string,
+    },
+    StringProto {
+        "charAt" => StringCharAt => string::string_char_at,
+        "slice" => StringSlice => string::string_slice,
+    };
+    // Truly internal / non-JS-visible dispatch-only natives (not installed).
     StringConstruct => string_construct,
-    NumberIsNan => number::number_is_nan,
-    MathAbs => math::math_abs,
+    NumberConstruct => number::number_construct,
     BooleanConstruct => boolean::boolean_construct,
     ErrorCreate => error::error_create,
     Eval => eval_stub,
@@ -314,12 +619,9 @@ v12_native::native_table! {
     SetDelete => map::set_delete,
     SetSize => map::set_size,
     IteratorNext => iterator::iterator_next,
-    ArrayIterator => iterator::array_iterator,
     MapIterator => iterator::map_iterator,
     SetIterator => iterator::set_iterator,
     IteratorSelf => iterator::iterator_self,
-    ArrayIteratorEntries => iterator::array_iterator_entries,
-    ArrayIteratorKeys => iterator::array_iterator_keys,
     RegExpConstruct => regexp::regexp_construct,
     RegExpToString => regexp::regexp_to_string,
     ModuleImport => module_import,

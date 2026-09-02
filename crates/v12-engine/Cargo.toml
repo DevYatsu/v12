@@ -18,6 +18,8 @@ malachite.workspace = true
 # tier-up against any tier (`v12-codegen::TierCompiler`).
 v12-codegen.workspace = true
 v12-jit-baseline = { workspace = true, optional = true }
+rustc-hash.workspace = true
+smallvec.workspace = true
 
 [features]
 # Interpreter-only builds stay first-class: the JIT is a cargo feature (plan §4).

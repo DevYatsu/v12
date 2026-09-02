@@ -1215,7 +1215,10 @@ mod tests {
     use super::*;
     use crate::{Kind, StrStorage};
 
-    const fn ordinary_with(props: Vec<JsValue>, proto: Option<Handle<JsObject>>) -> JsObject {
+    fn ordinary_with(
+        props: smallvec::SmallVec<[JsValue; 4]>,
+        proto: Option<Handle<JsObject>>,
+    ) -> JsObject {
         JsObject {
             kind: Kind::Ordinary,
             flags: 0,
@@ -1226,7 +1229,7 @@ mod tests {
             inline_props: [crate::JsValue::undefined(); JsObject::IN_OBJECT_PROP_CAP],
             overflow: None,
             properties: props,
-            property_keys: Vec::new(),
+            property_keys: smallvec::SmallVec::new(),
             elements: Vec::new(),
             elements_array: crate::elements::ElementsArray::new(),
             prototype: proto,
@@ -1241,7 +1244,7 @@ mod tests {
     fn alloc_get_roundtrip_and_mutation() {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let h = heap.alloc(JsObject {
-            properties: vec![JsValue::from_i32_smi(7).unwrap()],
+            properties: smallvec::smallvec![JsValue::from_i32_smi(7).unwrap()],
             ..JsObject::default()
         });
         assert_eq!(Handle::<JsObject>::space(), Space::Objects);
@@ -1291,7 +1294,7 @@ mod tests {
             magnitude_le: vec![1, 2, 3],
         });
         let o = heap.alloc(ordinary_with(
-            vec![JsValue::string(s), JsValue::symbol(y), JsValue::bigint(b)],
+            smallvec::smallvec![JsValue::string(s), JsValue::symbol(y), JsValue::bigint(b)],
             None,
         ));
         heap.add_root(JsValue::object(o));
@@ -1316,7 +1319,10 @@ mod tests {
         assert_eq!(heap.growth_threshold(), 128);
 
         // One rooted survivor must ride out automatic collections.
-        let survivor = heap.alloc(ordinary_with(vec![JsValue::from_i32_smi(1).unwrap()], None));
+        let survivor = heap.alloc(ordinary_with(
+            smallvec::smallvec![JsValue::from_i32_smi(1).unwrap()],
+            None,
+        ));
         heap.add_root(JsValue::object(survivor));
 
         // Allocation itself never collects (safepoint model): a burst of
@@ -1437,7 +1443,7 @@ mod tests {
 
         // First allocation sweeps just far enough to surface one dead slot.
         let d = heap.alloc(JsObject {
-            properties: vec![JsValue::from_i32_smi(1).unwrap()],
+            properties: smallvec::smallvec![JsValue::from_i32_smi(1).unwrap()],
             ..JsObject::default()
         });
         assert_eq!(d.index(), a.index()); // lowest dead slot first
