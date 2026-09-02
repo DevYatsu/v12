@@ -3707,6 +3707,12 @@ impl<'a> Interp<'a> {
                 "TypeError: right-hand side of 'instanceof' is not an object",
             )));
         };
+        // Per ES OrdinaryHasInstance, RHS must be callable.
+        if self.heap.get(rhs_obj).kind != Kind::Function {
+            return Err(JSException(self.error_value(
+                "TypeError: right-hand side of 'instanceof' is not callable",
+            )));
+        }
         // Fast path for built-in constructors whose prototype has not been
         // wired via `Heap::add_property` (Realm creates them as empty objects).
         if let Some(global) = self.global {
@@ -3750,11 +3756,35 @@ impl<'a> Interp<'a> {
                 cur = self.heap.get(o).prototype;
             }
         }
+        // Lazily materialize prototype for functions that never had one
+        // (realm placeholders and any function whose closure was created
+        // before materialization existed). Arrow functions intentionally
+        // have no prototype and must still throw.
+        if rhs_proto_val.is_none() && self.heap.get(rhs_obj).kind == Kind::Function {
+            // Check if this is an arrow-function flag by looking up its bytecode.
+            let is_arrow = self
+                .functions_for_program(self.heap.get(rhs_obj).program_id)
+                .get(self.heap.get(rhs_obj).callable.bytecode_index().unwrap_or(u32::MAX) as usize)
+                .map(|f| f.is_arrow)
+                .unwrap_or(false);
+            if !is_arrow {
+                self.materialize_function_prototype(rhs_obj)?;
+                // Re-read after materialization.
+                let sh = self.shape_of(rhs_obj);
+                if let Some(d) = self.heap.lookup_property(sh, proto_key)
+                    && let Some(slot) = d.slot()
+                {
+                    rhs_proto_val = Some(self.heap.get(rhs_obj).properties[slot as usize]);
+                }
+            }
+        }
         let Some(proto_val) = rhs_proto_val else {
             return Err(JSException(self.error_value(
                 "TypeError: function has non-object prototype 'prototype' in instanceof check",
             )));
         };
+        // Per spec, null prototype is also an error for instanceof (throws).
+        // Non-object primitive also throws the same TypeError.
         let Some(proto_obj) = proto_val.as_object() else {
             return Err(JSException(self.error_value(
                 "TypeError: function has non-object prototype 'prototype' in instanceof check",
