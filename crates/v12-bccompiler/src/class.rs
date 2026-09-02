@@ -15,7 +15,7 @@
 
 use oxc_ast::ast::{Class, ClassBody, ClassElement, MethodDefinitionKind, PropertyKey};
 use oxc_span::{GetSpan, Span};
-use v12_bytecode::Opcode;
+use v12_bytecode::{Const, Opcode};
 
 use crate::expr::static_key_text;
 use crate::model::{CompileError, FnCtx};
@@ -76,6 +76,13 @@ pub(crate) fn class_expression(
 
     // 5. Wire `extends` prototype chains.
     if has_super {
+        // Check if parent is null (extends null) - in that case don't wire static/prototype inheritance
+        let parent_is_null = cx.new_temp();
+        let null_reg = cx.new_temp();
+        cx.load_const(null_reg, Const::Null, span).unwrap();
+        cx.emit_reg3(Opcode::StrictEq, parent_is_null, parent, null_reg, span);
+        let skip_wire = cx.label();
+        cx.emit_jump(Opcode::JumpIfTrue, parent_is_null, skip_wire);
         // Constructor [[Prototype]] = parent constructor (static inheritance).
         cx.emit_reg3(Opcode::SetPrototype, 0, ctor, parent, span);
         // proto [[Prototype]] = parent.prototype
@@ -83,6 +90,7 @@ pub(crate) fn class_expression(
         let pp = cx.new_temp();
         cx.emit_reg3(Opcode::GetProperty, pp, parent, parent_proto_key, span);
         cx.emit_reg3(Opcode::SetPrototype, 0, proto, pp, span);
+        cx.bind(skip_wire);
     }
 
     // 6. Define the class elements (methods, getters/setters, statics).

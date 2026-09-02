@@ -281,6 +281,9 @@ struct Frame {
     /// `dead_code` warning so the build stays clean.
     #[allow(dead_code)]
     yield_dst: Option<u16>,
+    /// The `new.target` value for this frame's function activation.
+    /// `Some` for constructor calls, `None` for regular calls and arrow functions.
+    new_target: Option<JsValue>,
 }
 
 pub mod generator;
@@ -902,6 +905,7 @@ impl<'a> Interp<'a> {
             env: None,
             generator: None,
             yield_dst: None,
+            new_target: None,
         });
         self.note_entry(self.main);
         self.execute()
@@ -1451,6 +1455,11 @@ impl<'a> Interp<'a> {
                         }
                     }
                     continue 'drive;
+                }
+                Opcode::GetNewTarget => {
+                    let new_target = self.frames.last().expect("frame").new_target;
+                    self.stack[base + usize::from(ra)] = new_target.unwrap_or(JsValue::undefined());
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::Return => {
                     let v = self.stack[base + usize::from(ra)];
@@ -2221,6 +2230,7 @@ impl<'a> Interp<'a> {
             env: captured_env,
             generator: None,
             yield_dst: None,
+            new_target: None,
         });
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
@@ -2289,6 +2299,7 @@ impl<'a> Interp<'a> {
                     env: captured_env,
                     generator: None,
                     yield_dst: None,
+                    new_target: None,
                 });
                 self.top_result = None;
                 // Stop the nested execute after the accessor frame completes,
@@ -2442,6 +2453,7 @@ impl<'a> Interp<'a> {
                     env: captured_env,
                     generator: None,
                     yield_dst: None,
+                    new_target: None,
                 });
                 self.top_result = None;
                 // Save/restore the prior boundary so a re-entrant accessor or
@@ -4378,6 +4390,7 @@ impl<'a> Interp<'a> {
             env: captured_env,
             generator: None,
             yield_dst: None,
+            new_target: None,
         });
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
@@ -4556,6 +4569,7 @@ impl<'a> Interp<'a> {
             env: self.heap.get(callee_obj).captured_env,
             generator: None,
             yield_dst: None,
+            new_target: Some(callee_v),
         });
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
@@ -5036,6 +5050,7 @@ impl<'a> Interp<'a> {
             env,
             generator: Some(r#gen),
             yield_dst: None,
+            new_target: None,
         });
         self.top_result = None;
         let frames_before = self.frames.len();

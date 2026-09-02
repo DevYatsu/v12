@@ -392,7 +392,8 @@ impl<'p> Mini<'p> {
                 | Opcode::DefineAccessor
                 | Opcode::GetIterator
                 | Opcode::IteratorNext
-                | Opcode::IteratorClose => {
+                | Opcode::IteratorClose
+                | Opcode::GetNewTarget => {
                     panic!("generator/async/copy opcodes not expected in tier-1 mini programs")
                 }
                 Opcode::Construct => {

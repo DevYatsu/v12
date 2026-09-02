@@ -326,11 +326,26 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Err(self.err(t.span, "tagged template literals are not supported"))
             }
             Expression::ImportExpression(i) => {
-                Err(self.err(i.span, "dynamic import() is not supported"))
+                // Dynamic import: desugar to a call to the native import helper
+                // import(source) -> native_import(source)
+                let src = self.expr(&i.source)?;
+                let dst = self.new_temp();
+                let block = self.new_temps(crate::model::CALL_HEADER_REGS + 1);
+                let callee = block;
+                self.emit_closure(callee, crate::model::NATIVE_IMPORT_INDEX, i.span);
+                self.load_undefined(callee + 1, i.span);
+                self.move_reg(callee + 2, src, i.span);
+                self.emit_call(callee, callee, 1, i.span);
+                self.move_reg(dst, callee, i.span);
+                Ok(dst)
             }
             Expression::Super(x) => self.super_expr(x.span),
             Expression::ImportMeta(x) => Err(self.err(x.span, "`import.meta` is not supported")),
-            Expression::NewTarget(x) => Err(self.err(x.span, "`new.target` is not supported")),
+            Expression::NewTarget(x) => {
+                let dst = self.new_temp();
+                self.emit_reg2(Opcode::GetNewTarget, dst, 0, x.span);
+                Ok(dst)
+            }
             Expression::PrivateInExpression(x) => Err(self.err(
                 x.span,
                 "private field membership checks (`#field in obj`) are not supported",
@@ -1743,7 +1758,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// the class env. For member access the caller additionally dereferences
     /// `.prototype` for instance methods.
     fn super_ctor(&mut self, span: Span) -> Res<u16> {
-        if !self.comp.plans.units[self.unit].uses_super {
+        // Walk up to find the nearest non-arrow unit that uses super (the class method/constructor).
+        let units = &self.comp.plans.units;
+        let mut cur = Some(self.unit);
+        let mut found = false;
+        while let Some(u) = cur {
+            if !units[u].is_arrow && units[u].uses_super {
+                found = true;
+                break;
+            }
+            cur = units[u].parent;
+        }
+        if !found {
             return Err(self.err(span, "`super` outside a class method is not supported"));
         }
         let depth = self.super_env_depth();
@@ -1781,6 +1807,7 @@ pub(crate) fn static_key_text(key: &PropertyKey<'_>) -> Option<String> {
         PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
         PropertyKey::StringLiteral(s) => Some(s.value.to_string()),
         PropertyKey::NumericLiteral(n) => Some(number_to_key(n.value)),
+        PropertyKey::PrivateIdentifier(p) => Some(format!("#{}", p.name)),
         _ => None,
     }
 }

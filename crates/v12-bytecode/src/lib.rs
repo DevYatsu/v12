@@ -111,38 +111,43 @@ pub enum Opcode {
     /// returned object when the body returns one, otherwise the instance
     /// itself. Anything else throws TypeError "not a constructor".
     Construct = 62,
+    /// ES `new.target`: `r{a} = new.target`. Returns the constructor function
+    /// that was invoked with `new`, or `undefined` when not in a constructor
+    /// call (e.g., when the function was called directly). Arrow functions
+    /// inherit `new.target` from their enclosing non-arrow function.
+    GetNewTarget = 63,
     /// ES ToNumber: `r{a} = ToNumber(r{b})`. Supports the unary `+`
     /// operator; boxes the numeric result (Smi or double).
-    ToNumber = 63,
+    ToNumber = 64,
     /// Copies every enumerable own property of `r{c}` onto the object `r{b}`
     /// (object spread merge; later writes win). `r{a}` is unused.
-    MergeObject = 64,
+    MergeObject = 65,
     /// Defines an accessor property: `r{a}` = object, `r{b}` = key,
     /// `r{c}` = packed `(getter_fn, setter_fn)` pair register base. The
     /// getter/setter are function objects (or `undefined` for absent).
-    DefineAccessor = 65,
+    DefineAccessor = 66,
     /// Jumps to `target` (imm16) when `r{a}` is `null` or `undefined`.
     /// Supports optional chaining (`a?.b`) short-circuiting.
-    JumpIfNullish = 66,
+    JumpIfNullish = 67,
     /// Sets `r{b}`'s `[[Prototype]]` to `r{c}` (the class `extends` wiring;
     /// also used by `Object.setPrototypeOf`). `r{a}` is unused. Rejects
     /// primitive targets with a TypeError.
-    SetPrototype = 67,
+    SetPrototype = 68,
     /// ES GetIterator: `r{a} = GetIterator(r{b})`. Reads the `@@iterator`
     /// method off `r{b}` (the realm's `Symbol.iterator` well-known symbol),
     /// calls it with `r{b}` as receiver, and validates that the result is an
     /// object. Throws TypeError when the method is missing or the result is
     /// not an object. Supports the `for-of` statement, spread, and `yield*`.
-    GetIterator = 68,
+    GetIterator = 69,
     /// ES IteratorNext: `r{a} = IteratorNext(r{b})` — calls the iterator
     /// object's `next` method (property `"next"`) with the iterator as
     /// receiver and stores the result. `r{c}` is unused (kept for a future
     /// `IteratorNextValue` fused op).
-    IteratorNext = 69,
+    IteratorNext = 70,
     /// ES IteratorClose: `IteratorClose(r{a})`. Calls the iterator's
     /// `"return"` method (if any) when the loop exits abruptly (break /
     /// throw). `r{b}` and `r{c}` are unused.
-    IteratorClose = 70,
+    IteratorClose = 71,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -208,14 +213,15 @@ impl TryFrom<u8> for Opcode {
             60 => Ok(Self::GetGlobal),
             61 => Ok(Self::SetGlobal),
             62 => Ok(Self::Construct),
-            63 => Ok(Self::ToNumber),
-            64 => Ok(Self::MergeObject),
-            65 => Ok(Self::DefineAccessor),
-            66 => Ok(Self::JumpIfNullish),
-            67 => Ok(Self::SetPrototype),
-            68 => Ok(Self::GetIterator),
-            69 => Ok(Self::IteratorNext),
-            70 => Ok(Self::IteratorClose),
+            63 => Ok(Self::GetNewTarget),
+            64 => Ok(Self::ToNumber),
+            65 => Ok(Self::MergeObject),
+            66 => Ok(Self::DefineAccessor),
+            67 => Ok(Self::JumpIfNullish),
+            68 => Ok(Self::SetPrototype),
+            69 => Ok(Self::GetIterator),
+            70 => Ok(Self::IteratorNext),
+            71 => Ok(Self::IteratorClose),
             other => Err(other),
         }
     }
@@ -382,6 +388,7 @@ mod encoding_tests {
         Opcode::GetGlobal,
         Opcode::SetGlobal,
         Opcode::Construct,
+        Opcode::GetNewTarget,
         Opcode::ToNumber,
         Opcode::MergeObject,
         Opcode::DefineAccessor,
@@ -407,6 +414,7 @@ mod encoding_tests {
         assert_eq!(Opcode::GetGlobal as u8, 60);
         assert_eq!(Opcode::SetGlobal as u8, 61);
         assert_eq!(Opcode::Construct as u8, 62);
+        assert_eq!(Opcode::GetNewTarget as u8, 63);
         let unique: std::collections::HashSet<u8> = ALL_OPS.iter().map(|&op| op as u8).collect();
         assert_eq!(unique.len(), ALL_OPS.len());
     }
@@ -1353,6 +1361,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::GetIterator => "get_iterator",
         Opcode::IteratorNext => "iterator_next",
         Opcode::IteratorClose => "iterator_close",
+        Opcode::GetNewTarget => "get_new_target",
     }
 }
 
@@ -1419,6 +1428,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::ArrayAppend => write!(f, " r{a}, r{b}"),
         Opcode::GetGlobal => write!(f, " r{a}, k{}", i.imm16()),
         Opcode::SetGlobal => write!(f, " k{}, r{a}", i.imm16()),
+        Opcode::GetNewTarget => write!(f, " r{a}"),
     }
 }
 
