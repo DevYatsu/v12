@@ -79,8 +79,9 @@ consistently in docs, ADRs, and discussion. Implementation details live in
 ## Conformance & tooling
 
 - Always run tests with **`cargo nextest run --workspace`**, not `cargo test`. `cargo nextest` is the workspace gate (faster, clearer output, same 563 tests). `cargo test` remains available but is not the canonical command.
-- **Test262 pass rate** — `language` suite: **33.0 %** (8 066 / 24 446 executable, 427 skipped) after Step 1 batch (2026-09-02). Baseline was 19.9 % (4 858 pass). Verified via `cargo run -p test262-runner -- --filter language --jobs 8 --format json`.
-- **cargo nextest** — **563 passed, 1 skipped** (`cargo nextest run --workspace`, 17.3 s). Covers `v12-bytecode` decode sweeps (6/6), `v12-bccompiler`, `v12-interp`, `v12-engine` builtins, `v12-jit-*`, `v12-cli` spawns.
+- **Test262 pass rate** — `language` suite: **33.6 %** (8 216 / 24 446 executable, 427 skipped) after Step 2 (2026-09-02). Step 1 was 33.0 % (8 066); baseline 19.9 % (4 858). Verified via `cargo run -p test262-runner -- --filter language --jobs 8 --format json`.
+- **cargo nextest** — **563 passed, 1 skipped** (`cargo nextest run --workspace`, 8.0 s). Covers `v12-bytecode` decode sweeps (6/6), `v12-bccompiler` (132), `v12-interp`, `v12-engine` builtins, `v12-jit-*`, `v12-cli` spawns.
 - **GetNewTarget** — bytecode opcode 63 (`r{a} = new.target`). Returns the constructor for `new` calls, `undefined` otherwise. Arrow functions inherit from enclosing non-arrow frame. Backed by `Frame::new_target: Option<JsValue>`.
-- **Dynamic import** — `import(source)` desugared to `Closure #NATIVE_IMPORT_INDEX` call (254) in `v12-bccompiler/src/expr.rs`. Native helper pending registration (`ModuleImport` not yet registered → 298 fails).
-- **Private field** — `#x` class key via `static_key_text` (`#` prefix). Still largely unsupported (3 020 fails) — tracked as next bucket after nested-function fix.
+- **Dynamic import** — `import(source)` desugared to `Closure #NATIVE_IMPORT_INDEX` call (254) in `v12-bccompiler/src/expr.rs`. Native helper pending registration (`ModuleImport` not yet registered → 306 fails).
+- **Collector walk** — `crates/v12-bccompiler/src/collect.rs` now walks `Switch`/`With`/`New`/`Template`/`Yield`/`Await` and destructuring assignment targets. Closed `nested function missing from plans` 684 → 115 (−569).
+- **Private field** — `#x` class key via `static_key_text` (`#` prefix). Still largely unsupported (3 029 fails) — next buckets are `callee is not a function` (4 518) and `for-of` (479).
