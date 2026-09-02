@@ -136,6 +136,12 @@ impl JobQueue {
             job(&mut ctx);
             drop(ctx);
             count += 1;
+            // A job may have run bytecode that tripped the deadline; stop
+            // draining so the engine's checkpoint loop sees the latch and
+            // terminates the drain instead of spinning on remaining jobs.
+            if interp.is_deadline_exceeded() {
+                break;
+            }
             if count > MAX_QUEUE_LEN * 2 {
                 break;
             }

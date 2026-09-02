@@ -499,6 +499,12 @@ pub struct Interp<'a> {
     /// terminating test doesn't trip the counter. Sampled every
     /// [`DEADLINE_CHECK_INTERVAL`] iterations.
     deadline_ticks: u64,
+    /// Latched `true` the first time the cooperative deadline fires inside
+    /// `execute`. `resume_next_await` / `JobQueue::drain` / `drain_checkpoint`
+    /// poll this instead of inspecting the swallowed `execute` result, so an
+    /// async drain terminates instead of spinning on pending jobs whose
+    /// bytecode can never finish.
+    deadline_exceeded: bool,
 }
 
 impl<'a> Interp<'a> {
@@ -565,6 +571,7 @@ impl<'a> Interp<'a> {
             pending_awaits: std::collections::VecDeque::new(),
             deadline: None,
             deadline_ticks: 0,
+            deadline_exceeded: false,
         };
         interp.ensure_default_global();
         interp
@@ -596,10 +603,20 @@ impl<'a> Interp<'a> {
     /// Sets a cooperative execution deadline. When set, the dispatch loop
     /// aborts with a timeout error once `Instant::now` exceeds `deadline`, so a
     /// runaway test (no `await`/IO to yield on) cannot block the calling host.
-    /// Passing `None` restores the unbounded default.
+    /// Passing `None` restores the unbounded default. Also clears any prior
+    /// `deadline_exceeded` latch set by a previous overrun.
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
-        self.deadline_ticks = 0;
+        self.deadline_exceeded = false;
+    }
+
+    /// Returns `true` once the cooperative deadline has fired during this
+    /// interpreter's `execute` runs. The engine's async-drain loop polls this
+    /// to short-circuit instead of spinning on pending jobs whose bytecode can
+    /// never complete.
+    #[must_use]
+    pub fn is_deadline_exceeded(&self) -> bool {
+        self.deadline_exceeded
     }
 
     /// Registers a program in the cross-program table, returning its id.
@@ -1055,6 +1072,7 @@ impl<'a> Interp<'a> {
             if (self.deadline_ticks & (DEADLINE_CHECK_INTERVAL - 1)) == 0 {
                 if let Some(dl) = self.deadline {
                     if Instant::now() >= dl {
+                        self.deadline_exceeded = true;
                         return Err(JSException(self.error_value(
                             "ScriptRuntimeError: execution deadline exceeded",
                         )));
@@ -2448,6 +2466,17 @@ impl<'a> Interp<'a> {
         // A re-entrant accessor call stops the nested execute here: the
         // accessor's frame is done, and the caller's frames must remain
         // intact for the `set_property`/`get_property` arm that invoked it.
+        // For a *generator* completion (resume_generator's nested execute),
+        // this is the finish path — the frame is a generator activation, so
+        // mark it done here. Without this, properties[2] stays at 2.0
+        // (suspended from suspend()) and resume_generator's suspension
+        // detector misclassifies completion as another yield, which in turn
+        // makes for-of over a generator never observe done=true (hang).
+        if let Some(r#gen) = finished.generator {
+            if self.heap.get(r#gen).properties.len() >= 3 {
+                self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+            }
+        }
         if self.stop_at_frames.is_some_and(|n| self.frames.len() == n) {
             self.stack.truncate(finished.base);
             self.top_result = Some(result);
@@ -5076,7 +5105,7 @@ impl<'a> Interp<'a> {
             };
             let _ = res;
             count += 1;
-            if count > 10000 {
+            if self.deadline_exceeded || count > 10000 {
                 break;
             }
         }
@@ -5087,7 +5116,16 @@ impl<'a> Interp<'a> {
     /// when a resume ran. The engine's single microtask checkpoint calls this
     /// between draining host jobs, so generator/async resumes and host jobs
     /// interleave per microtask semantics.
+    ///
+    /// Short-circuits to `false` once the cooperative deadline has fired: a
+    /// resumed generator/async body that hits the deadline will abort its
+    /// `execute` with a timeout error (swallowed here as `let _ = res`), but
+    /// the latch lets us skip the *remaining* awaits whose bodies can never
+    /// finish within the budget.
     pub fn resume_next_await(&mut self) -> bool {
+        if self.deadline_exceeded {
+            return false;
+        }
         let Some((r#gen, val, is_reject)) = self.pending_awaits.pop_front() else {
             return false;
         };
@@ -5097,6 +5135,11 @@ impl<'a> Interp<'a> {
             self.resume_async(r#gen, val)
         };
         let _ = res;
+        // A deadline can fire *during* the resume above; latch so the drain
+        // loop sees it before scheduling more awaits.
+        if self.deadline_exceeded {
+            return false;
+        }
         true
     }
 

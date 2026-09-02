@@ -718,8 +718,13 @@ impl Engine {
             count += resumed;
 
             // Loop ends when neither host jobs nor awaits nor native
-            // follow-ups remain.
-            if jobs.is_empty() && !interp.has_pending_awaits() {
+            // follow-ups remain, or when the deadline fired mid-drain:
+            // remaining microtask bodies can never complete within the budget
+            // (their `execute` will re-trip the deadline), so abort instead of
+            // spinning on the pending queue.
+            if interp.is_deadline_exceeded()
+                || (jobs.is_empty() && !interp.has_pending_awaits())
+            {
                 break;
             }
         }
