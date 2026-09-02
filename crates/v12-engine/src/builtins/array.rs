@@ -96,6 +96,15 @@ fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> u32 {
     heap.get(obj).elements.len() as u32
 }
 
+/// `Array.isArray(value)` – true if value is an Array exotic object.
+pub fn array_is_array(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let v = args.first().copied().unwrap_or(JsValue::undefined());
+    let is = v
+        .as_object()
+        .is_some_and(|h| _heap.get(h).kind == v12_heap::Kind::Array);
+    Ok(if is { JsValue::true_() } else { JsValue::false_() })
+}
+
 fn sync_length(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
     let key = length_prop(heap);
     let shape = heap.root_shape();

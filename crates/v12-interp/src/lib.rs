@@ -3108,7 +3108,7 @@ impl<'a> Interp<'a> {
                     return Ok(self.cached_native(NativeId::PromiseThen));
                 }
             }
-            // Fast path for Object.enumerableOwnKeys on the Object constructor
+            // Fast paths for Object static methods on the Object constructor.
             let object_ctor = self
                 .heap
                 .get(g)
@@ -3116,10 +3116,19 @@ impl<'a> Interp<'a> {
                 .first()
                 .and_then(|v| v.as_object());
             if let Some(object_ctor) = object_ctor
-                && obj == object_ctor
-                && self.key_is(key_v, "enumerableOwnKeys")
-            {
-                return Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys));
+                && obj == object_ctor {
+                if self.key_is(key_v, "enumerableOwnKeys") {
+                    return Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys));
+                }
+                if self.key_is(key_v, "create") {
+                    return Ok(self.map_set_method(NativeId::ObjectCreate));
+                }
+                if self.key_is(key_v, "getPrototypeOf") {
+                    return Ok(self.map_set_method(NativeId::ObjectGetPrototypeOf));
+                }
+                if self.key_is(key_v, "defineProperty") {
+                    return Ok(self.map_set_method(NativeId::ObjectDefineProperty));
+                }
             }
         }
         if self.heap.get(obj).kind == Kind::Generator {
@@ -3178,6 +3187,19 @@ impl<'a> Interp<'a> {
                     return Ok(v);
                 }
         }
+        // `Array.isArray` — static method on the Array constructor.
+        let array_idx = GLOBAL_INTRINSIC_NAMES.iter().position(|&n| n == "Array");
+        if let (Some(g), Some(array_idx)) = (self.global, array_idx)
+            && let Some(array_ctor) = {
+                let heap = &*self.heap;
+                heap.get(g).properties.get(array_idx).and_then(|v| v.as_object())
+            }
+            && obj == array_ctor
+            && self.key_is(key_v, "isArray")
+        {
+            return Ok(self.map_set_method(NativeId::ArrayIsArray));
+        }
+
         // `RegExp.prototype` — the constructor's prototype property (needed
         // for `new RegExp(...)` instanceof wiring and `RegExp.prototype.exec`
         // style reads). The realm's RegExp placeholder has no real prototype

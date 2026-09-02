@@ -22,6 +22,7 @@ pub enum NativeId {
     ArrayPush = 1100,
     ArrayPop = 1101,
     ArrayJoin = 1102,
+    ArrayIsArray = 1106,
     ArrayIterator = 1103,
     ArrayIteratorEntries = 1104,
     ArrayIteratorKeys = 1105,

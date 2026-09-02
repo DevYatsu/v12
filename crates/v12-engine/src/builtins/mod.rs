@@ -279,6 +279,7 @@ v12_native::native_table! {
     ObjectCreate => object::object_create,
     ObjectGetPrototypeOf => object::object_get_prototype_of,
     ObjectDefineProperty => object::object_define_property,
+    ArrayIsArray => array::array_is_array,
     ArrayPush => array::array_push,
     ArrayPop => array::array_pop,
     ArrayJoin => array_join,
