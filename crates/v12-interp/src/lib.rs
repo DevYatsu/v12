@@ -65,6 +65,7 @@ mod tests;
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Instant;
 
 use v12_bytecode::{BytecodeError, Const, FunctionBytecode, Instr, Opcode, WideOp};
 use v12_heap::{
@@ -186,6 +187,15 @@ const GLOBAL_INTRINSIC_NAMES: &[&str] = &[
 /// legitimate Tier-1 program while capping worst-case memory at a few
 /// megabytes of stack slots; mainstream engines converge on the same order.
 const MAX_CALL_DEPTH: usize = 10_000;
+
+/// How often (in dispatch iterations) the cooperative deadline is sampled.
+///
+/// A tight bytecode loop never yields to the runtime, so the deadline is
+/// checked every N iterations: a 5s budget is enforced within N further
+/// iterations of elapsing it, which adds one `Instant::now` syscall per
+/// ~8k instructions — negligible for normal tests but enough to guarantee
+/// a runaway loop never blocks the harness indefinitely.
+const DEADLINE_CHECK_INTERVAL: u64 = 1 << 13;
 
 /// Initial capacity reserved for the shared value stack and root set, sized
 /// to absorb typical bring-up workloads before geometric growth kicks in.
@@ -479,6 +489,16 @@ pub struct Interp<'a> {
     top_result: Option<JsValue>,
     /// Pending async resumes as FIFO microtask queue: (generator, value, is_reject).
     pending_awaits: std::collections::VecDeque<(Handle<JsObject>, JsValue, bool)>,
+    /// Cooperative execution deadline for Test262 conformance runs. When set,
+    /// the dispatch loop aborts with a catchable timeout error as soon as the
+    /// budget elapses, so a runaway test can never block the harness. `None`
+    /// (the default) leaves execution unbounded — used by the production
+    /// engine/embed path, which manages its own budgeting.
+    deadline: Option<Instant>,
+    /// Dispatch iterations since the last deadline sample; wraps so a never-
+    /// terminating test doesn't trip the counter. Sampled every
+    /// [`DEADLINE_CHECK_INTERVAL`] iterations.
+    deadline_ticks: u64,
 }
 
 impl<'a> Interp<'a> {
@@ -543,6 +563,8 @@ impl<'a> Interp<'a> {
             symbol_iterator: None,
             top_result: None,
             pending_awaits: std::collections::VecDeque::new(),
+            deadline: None,
+            deadline_ticks: 0,
         };
         interp.ensure_default_global();
         interp
@@ -569,6 +591,15 @@ impl<'a> Interp<'a> {
     /// Installs a native-function seam, replacing any previous registry.
     pub fn set_natives(&mut self, natives: Box<dyn NativeRegistry>) {
         self.natives = natives;
+    }
+
+    /// Sets a cooperative execution deadline. When set, the dispatch loop
+    /// aborts with a timeout error once `Instant::now` exceeds `deadline`, so a
+    /// runaway test (no `await`/IO to yield on) cannot block the calling host.
+    /// Passing `None` restores the unbounded default.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+        self.deadline_ticks = 0;
     }
 
     /// Registers a program in the cross-program table, returning its id.
@@ -897,36 +928,56 @@ impl<'a> Interp<'a> {
     /// Going through `prepare_call` (rather than pushing a frame by hand)
     /// preserves closure environment capture and native routing; the captured
     /// environment of a closure lives in the function object's `prototype`
-    /// slot. Requires an empty frame stack — jobs run between `run()`
-    /// activations, never inside one.
+    /// slot. Unlike `run()`/`call_object`'s old contract, this is safe to
+    /// call with frames live on the stack (e.g. a microtask checkpoint drained
+    /// mid-evaluation during top-level `await`): the callee runs in a nested
+    /// `execute` bounded by `stop_at_frames`, so the caller's frames survive
+    /// untouched. Native/host callees return inline and never touch frames.
     pub fn call_object(
         &mut self,
         callee: Handle<JsObject>,
         this: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        debug_assert!(
-            self.frames.is_empty(),
-            "call_object must run outside of run()"
-        );
-        // Lay out `[callee][this][args…]` exactly as a parked `Call` would.
-        self.stack.clear();
+        // Lay out `[callee][this][args…]` on top of the current window, mirroring
+        // exactly what a parked `Call` instruction deposits. `prepare_call`
+        // reads `callee`/`this`/args from `base + 0/1/2..`, so `base` is the
+        // current stack length and `callee_reg` is 0.
+        let base = self.stack.len();
         self.stack.push(JsValue::object(callee));
         self.stack.push(this);
         self.stack.extend_from_slice(args);
         let caller_max_regs =
-            u16::try_from(self.stack.len()).expect("arguments fit a frame window");
+            u16::try_from(self.stack.len() - base).expect("arguments fit a frame window");
         let argc = u16::try_from(args.len()).expect("argument count fits u16");
+        let saved = self.stop_at_frames;
+        // Bound the nested run at the current frame count so a throwing/nested
+        // callee unwinds only its own frame and returns to us — it must not
+        // drain the caller's frames (e.g. the module frame during TLA).
+        // `prepare_call` pushes exactly one callee frame on the `Pushed` path;
+        // `complete_frame`/`unwind` stop when the frame count falls back to
+        // this value (matching the accessor-call contract in `call_accessor_with`).
+        self.stop_at_frames = Some(self.frames.len());
         self.top_result = None;
-        match self.prepare_call(0, caller_max_regs, 0, argc)? {
-            CallOutcome::Pushed => {
-                self.execute()?;
-                self.top_result.take().ok_or_else(|| {
-                    JSException(self.error_value("InternalError: call completed without a result"))
+        let outcome = self.prepare_call(base, caller_max_regs, 0, argc);
+        let result = match outcome {
+            Ok(CallOutcome::Pushed) => {
+                let exec = self.execute();
+                exec.and_then(|()| {
+                    self.top_result.take().ok_or_else(|| {
+                        JSException(self.error_value("InternalError: call completed without a result"))
+                    })
                 })
             }
-            CallOutcome::Value(v) => Ok(v),
-        }
+            Ok(CallOutcome::Value(v)) => Ok(v),
+            Err(e) => Err(e),
+        };
+        self.stop_at_frames = saved;
+        // Shed the `[callee][this][args…]` window we appended (prepare_call's
+        // pushed frame already got popped by complete_frame/unwind; native and
+        // CallOutcome::Value paths leave the window untouched).
+        self.stack.truncate(base);
+        result
     }
 
     /// Applies ES `ToString` from outside the machine — diagnostics and test
@@ -993,6 +1044,22 @@ impl<'a> Interp<'a> {
                 // Either lands in a handler (pc rewritten, value delivered)
                 // or pops frames; escaping the bottom frame ends the run.
                 self.unwind(exc)?;
+            }
+
+            // Cooperative deadline: sample the wall clock periodically so a
+            // runaway bytecode loop (no IO/await to yield on) cannot block the
+            // host. Force-returns the timeout out of `execute` so it escapes
+            // every user `try/catch` (they all live in this same loop), rather
+            // than being swallowed and letting the loop resume its spin.
+            self.deadline_ticks = self.deadline_ticks.wrapping_add(1);
+            if (self.deadline_ticks & (DEADLINE_CHECK_INTERVAL - 1)) == 0 {
+                if let Some(dl) = self.deadline {
+                    if Instant::now() >= dl {
+                        return Err(JSException(self.error_value(
+                            "ScriptRuntimeError: execution deadline exceeded",
+                        )));
+                    }
+                }
             }
 
             // Snapshot hot frame state: arms call back into `self` and must
@@ -1805,7 +1872,14 @@ impl<'a> Interp<'a> {
     }
 
     /// `typeof` classification, indexing [`TYPE_NAMES`].
+    ///
+    /// Internal markers (`hole`, `empty`) are never legitimate JavaScript
+    /// values; if one leaks here (e.g. an array-hole escape), classify it as
+    /// `undefined` — the observable analogue — instead of crashing the run.
     fn type_tag(&self, v: JsValue) -> usize {
+        if v.is_hole() || v.is_empty() {
+            return 0;
+        }
         if v.is_undefined() {
             0
         } else if v.is_boolean() {
@@ -2203,9 +2277,14 @@ impl<'a> Interp<'a> {
                 // leaving the caller's frames in place (the default `execute`
                 // runs to the bottom frame, which would wrongly drain the
                 // caller while `set_property`/`get_property` is mid-arm).
+                // Save/restore the prior boundary so a **nested** accessor
+                // call (a getter that itself invokes another getter, e.g.
+                // `super.x` resolving through the prototype chain) cannot
+                // clobber the outer `stop_at_frames`.
+                let saved = self.stop_at_frames;
                 self.stop_at_frames = Some(self.frames.len() - 1);
                 let exec_result = self.execute();
-                self.stop_at_frames = None;
+                self.stop_at_frames = saved;
                 exec_result?;
                 Ok(self.top_result.take().unwrap_or(JsValue::undefined()))
             }
@@ -2347,9 +2426,13 @@ impl<'a> Interp<'a> {
                     yield_dst: None,
                 });
                 self.top_result = None;
+                // Save/restore the prior boundary so a re-entrant accessor or
+                // iterator call invoked from within this callee cannot clobber
+                // this call's `stop_at_frames`.
+                let saved = self.stop_at_frames;
                 self.stop_at_frames = Some(self.frames.len() - 1);
                 let exec_result = self.execute();
-                self.stop_at_frames = None;
+                self.stop_at_frames = saved;
                 exec_result?;
                 Ok(self.top_result.take().unwrap_or(JsValue::undefined()))
             }
@@ -2479,6 +2562,12 @@ impl<'a> Interp<'a> {
 
     /// Delivers `exc` to the innermost applicable handler, popping frames
     /// until one accepts. Escaping the bottom frame returns `Err` to `run`.
+    ///
+    /// When a nested `execute` runs under `stop_at_frames` (an accessor
+    /// invoked mid-dispatch via `call_inline`), an unhandled exception must
+    /// stop at that boundary instead of draining the caller's frames: the
+    /// caller is parked mid-arm and resumes its own dispatch once the nested
+    /// `Err` propagates through `call_inline`'s `exec_result?`.
     fn unwind(&mut self, exc: JsValue) -> Result<(), JSException> {
         loop {
             let covering = self.frames.last().and_then(|frame| {
@@ -2507,6 +2596,18 @@ impl<'a> Interp<'a> {
                 self.stack[base + depth] = exc;
                 fr.pc = h.target as usize;
                 return Ok(());
+            }
+            // Never pop the frame `stop_at_frames` names — it belongs to the
+            // caller of the nested execute (accessor/getter path). Pop the
+            // accessor frame itself and return the exception so
+            // `call_inline`'s `exec_result?` forwards it to the parked
+            // dispatch arm, which re-raises it through the normal unwind
+            // path with the caller's frames intact.
+            if self.stop_at_frames.is_some_and(|n| self.frames.len() == n + 1) {
+                let popped = self.frames.pop().expect("boundary frame exists");
+                self.stack.truncate(popped.base);
+                self.notify_tier_ups();
+                return Err(JSException(exc));
             }
             let Some(popped) = self.frames.pop() else {
                 return Err(JSException(exc));
@@ -4912,9 +5013,19 @@ impl<'a> Interp<'a> {
         let exec_res = if is_throw {
             // Inject the exception through the normal unwind path first.
             self.unwind(value)?;
-            self.execute()
+            // The nested run must stop at this frame's boundary: a throwing
+            // generator body unwinds only the generator frame, leaving the
+            // caller's frames intact for `generator_next`'s caller (the
+            // for-of/await dispatch arm, which resumes its own dispatch).
+            self.stop_at_frames = Some(self.frames.len() - 1);
+            let r = self.execute();
+            self.stop_at_frames = None;
+            r
         } else {
-            self.execute()
+            self.stop_at_frames = Some(self.frames.len() - 1);
+            let r = self.execute();
+            self.stop_at_frames = None;
+            r
         };
         match exec_res {
             Ok(()) => {
@@ -5018,13 +5129,22 @@ impl<'a> Interp<'a> {
     /// until the generator itself becomes unreachable.
     pub(crate) fn gc_protect(&mut self) {
         let roots = &mut self.heap.roots_mut().0;
-        // The root set is fully republished here, so long-lived interpreter
-        // state kept outside the stack/frames — the global object and the
-        // cached `console.log` native — must be re-rooted on every pass or
-        // a collection between allocations drops their referents.
-        let persistent: [Option<JsValue>; 5] = [
+        // Long-lived interpreter state kept outside the stack must be re-rooted on
+        // every safepoint. `roots_mut` borrows only `self.heap`; the cached native
+        // fields below are disjoint fields, so they can be read here (direct field
+        // reads, not a `&self` method) without conflicting.
+        // Finding #5 / stale-handle root cause: a previous version listed only 5 of
+        // the 11 cached natives here, so a collection between allocations could free
+        // an unregistered one (e.g. `Promise.then`) and leave a stale handle.
+        let persistent: [Option<JsValue>; 11] = [
             self.global.map(JsValue::object),
             self.console_log,
+            self.promise_resolve_fn,
+            self.promise_reject_fn,
+            self.promise_then_fn,
+            self.array_push_fn,
+            self.array_join_fn,
+            self.enumerable_own_keys_fn,
             self.generator_next_fn,
             self.generator_return_fn,
             self.generator_throw_fn,

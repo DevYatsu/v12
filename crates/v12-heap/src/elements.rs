@@ -475,37 +475,43 @@ impl ElementsArray {
             return None;
         }
         let needs_gap_fill = index as usize > self.fast_len();
+        // Minimum rung that admits the value's *payload*, independent of holes:
+        // a hole never changes how neighbours decode, so it only forces
+        // holeiness; a Smi fits every rung; a double needs a number rung;
+        // anything else lands on the object rung.
         let minimum = match class {
-            // A hole never changes how neighbors decode: holey sibling only.
             ValueClass::Hole => current.to_holey(),
-            // Smis fit every rung; only gap-filling forces holeiness.
-            ValueClass::Smi(_) => {
-                if needs_gap_fill {
-                    current.to_holey()
-                } else {
-                    current
-                }
-            }
+            ValueClass::Smi(_) => current,
             ValueClass::Double(_) => {
-                if current.is_holey() || needs_gap_fill {
+                if current.is_holey() {
                     ElementsKind::HoleyDouble
                 } else {
                     ElementsKind::PackedDouble
                 }
             }
             ValueClass::Other(_) => {
-                if current.is_holey() || needs_gap_fill {
+                if current.is_holey() {
                     ElementsKind::HoleyObject
                 } else {
                     ElementsKind::PackedObject
                 }
             }
         };
-        Some(if minimum.rank() > current.rank() {
+        // Take the more general of the current rung and the value's minimum.
+        let mut result = if minimum.rank() > current.rank() {
             minimum
         } else {
             current
-        })
+        };
+        // A gap write inserts internal holes, which only hole-bearing rungs can
+        // represent. A higher-ranked *packed* payload rung (e.g. storing a
+        // number into a `PackedObject` array with a gap) would otherwise be
+        // selected by the rank max and leave the storage packed — promote it to
+        // its holey sibling so `fill_gaps` stays legal.
+        if needs_gap_fill && !result.is_dictionary() && !result.is_holey() {
+            result = result.to_holey();
+        }
+        Some(result)
     }
 
     fn convert_to(&mut self, target: ElementsKind) {
@@ -518,14 +524,15 @@ impl ElementsArray {
         self.storage = convert_storage(source, target);
     }
 
-    /// Appends holes until the flat vector reaches `len`. Only legal — and
-    /// only reachable — on holey rungs, which storage conversion promotes to
-    /// before any gap fill.
+    /// Appends holes until the flat vector reaches `len`. Only legal on holey
+    /// fast rungs (which storage conversion promotes to before any gap fill).
+    /// Dictionary storage is a sparse map with no gap concept, so gap-fills are
+    /// a no-op there; the `set` path reaches `fill_gaps` for sparse/huge writes
+    /// whose `fast_len()` is 0, which must not panic.
     fn fill_gaps(&mut self, len: usize) {
-        debug_assert!(
-            self.kind().is_holey(),
-            "gap fill requested on non-holey storage"
-        );
+        if !self.kind().is_holey() {
+            return;
+        }
         while self.fast_len() < len {
             match &mut self.storage {
                 ElementsStorage::HoleySmi(v)

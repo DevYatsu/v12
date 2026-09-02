@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 
 use v12_bytecode::FunctionBytecode;
 use v12_heap::HeapExt;
@@ -55,6 +56,11 @@ pub struct Engine {
     /// Tier-up policy. `OnDemand` (the default) means tier-up
     /// only happens when the host asks; `Profile` is the v2 hook.
     tier_policy: v12_codegen::TierPolicy,
+    /// Cooperative execution deadline applied to every interpreter spawned by
+    /// `eval*`/`run_jobs`. `None` by default (production embeds manage their
+    /// own budgeting); the Test262 runner sets a per-test budget so a runaway
+    /// loop cannot stall the harness.
+    deadline: Option<Instant>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -85,6 +91,7 @@ impl Engine {
             retained: None,
             completion: None,
             tier_policy: v12_codegen::TierPolicy::default(),
+            deadline: None,
         }
     }
 
@@ -154,6 +161,14 @@ impl Engine {
     #[must_use]
     pub fn tier_policy(&self) -> v12_codegen::TierPolicy {
         self.tier_policy
+    }
+
+    /// Sets the per-run execution deadline handed to every interpreter spawned
+    /// by `eval*`/`run_jobs`. A `Some(instant)` budget makes a runaway script
+    /// (no IO/await to yield on) abort with a catchable timeout error instead
+    /// of blocking the caller. `None` restores the unbounded default.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
     }
 
     /// Evaluates `source` as a script.
@@ -270,6 +285,7 @@ impl Engine {
         // the heap borrow and the job-queue/registry accesses are disjoint
         // locals (the borrow checker cannot see field disjointness through
         // `&mut self`).
+        let deadline = self.deadline;
         let Engine {
             heap,
             jobs,
@@ -287,6 +303,7 @@ impl Engine {
         );
         let natives = registry.clone();
         interp.set_natives(Box::new(natives));
+        interp.set_deadline(deadline);
         let outcome = interp.run();
         // Drain the single microtask checkpoint against the still-live
         // interpreter: host jobs and async resumes alternate until empty.
@@ -345,6 +362,7 @@ impl Engine {
             strings,
         );
         interp.set_natives(Box::new(local_registry.clone()));
+        interp.set_deadline(self.deadline);
         let outcome = interp.run();
         // Drain this realm's checkpoint against its own interpreter; the
         // engine's own queued jobs reference the engine heap and are left
@@ -429,6 +447,7 @@ impl Engine {
         });
         // Borrow the engine's heap; no swap. Destructure `self` so
         // the heap borrow and job-queue/registry accesses are disjoint locals.
+        let deadline = self.deadline;
         let Engine {
             heap,
             jobs,
@@ -471,6 +490,7 @@ impl Engine {
             inner: registry.clone(),
         };
         interp.set_natives(Box::new(natives));
+        interp.set_deadline(deadline);
         let outcome = interp.run();
         // Single checkpoint: host jobs + async resumes alternate until empty.
         let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
@@ -732,6 +752,7 @@ impl Engine {
         // Borrow the engine's heap; no swap. The interpreter is
         // scoped to this method, so the borrow ends when it drops. Destructure
         // `self` so heap and jobs/registry accesses are disjoint locals.
+        let deadline = self.deadline;
         let Engine {
             heap,
             jobs,
@@ -741,6 +762,7 @@ impl Engine {
         } = self;
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
+        interp.set_deadline(deadline);
         let count = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         drop(interp); // releases the `&mut heap` borrow
         count

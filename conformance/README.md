@@ -82,6 +82,12 @@ Options:
 
 Examples:
 
+Run in debug mode (the default). The workspace `release` profile pins
+`panic = "abort"`, which defeats `catch_unwind` and lets one engine panic
+abort the whole run — so conformance runs use the `dev` profile (no
+`--release`), which compiles with `panic = "unwind"` and isolates panicking
+tests as `Fail: engine panic`.
+
 ```sh
 # Run ~800 assignment-expression tests, human summary + 4 workers
 cargo run -p test262-runner -- --filter language/expressions/assignment --jobs 4

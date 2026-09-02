@@ -277,18 +277,25 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     }
 
     // Execute in a fresh engine. Catch panics to avoid killing the parallel
-    // runner.
+    // runner. A cooperative deadline is installed so a runaway script (no
+    // IO/await to yield on) aborts instead of stalling a worker: the
+    // interpreter samples the deadline every N dispatch iterations and throws
+    // a recognizable error if it elapses. This is the wall-clock backstop behind
+    // the advisory post-check below.
     let exec_start = Instant::now();
+    let deadline = exec_start + std::time::Duration::from_millis(TEST_TIMEOUT_MS as u64);
     let is_module = frontmatter.has_flag("module");
     let base_path = file_path.parent().unwrap_or_else(|| Path::new("."));
     let exec_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = v12_engine::Engine::new();
+        engine.set_deadline(Some(deadline));
         let res = if is_module {
             engine.eval_module_source(&combined, base_path)
         } else {
             engine.eval(&combined)
         };
         let _ = engine.run_jobs();
+        engine.set_deadline(None);
         match res {
             Ok(v) => Ok(engine.to_display_string(v)),
             Err(thrown) => Err(engine.to_display_string(thrown)),
@@ -315,14 +322,31 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
         Ok(Ok(_ok_value)) => {
             handle_positive_or_negative_ok(&frontmatter, file_path, relative, suite, duration_ms)
         }
-        Ok(Err(thrown_str)) => handle_thrown(
-            &frontmatter,
-            thrown_str,
-            file_path,
-            relative,
-            suite,
-            duration_ms,
-        ),
+        Ok(Err(thrown_str)) => {
+            // A cooperative deadline miss reads back as a thrown error inside
+            // the engine; classify it as a timeout rather than running it
+            // through negative-expectation matching.
+            if is_deadline_error(&thrown_str) {
+                return TestOutcome {
+                    path: file_path.to_path_buf(),
+                    relative,
+                    suite,
+                    status: Status::Fail,
+                    message: format!("timeout after {} ms", duration_ms),
+                    skip_reason: None,
+                    duration_ms,
+                    frontmatter,
+                };
+            }
+            handle_thrown(
+                &frontmatter,
+                thrown_str,
+                file_path,
+                relative,
+                suite,
+                duration_ms,
+            )
+        }
         Err(_) => TestOutcome {
             path: file_path.to_path_buf(),
             relative,
@@ -334,6 +358,12 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
             frontmatter,
         },
     }
+}
+
+/// Returns `true` if `thrown_str` is the engine's cooperative-deadline error,
+/// surfaced as a timeout rather than a real test failure.
+fn is_deadline_error(thrown_str: &str) -> bool {
+    thrown_str.contains("execution deadline exceeded")
 }
 
 /// Returns `Some(reason)` if the test should be skipped before execution.
