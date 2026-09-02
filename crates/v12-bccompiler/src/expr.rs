@@ -1163,7 +1163,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// from the same `Rodeo` but the `GetProperty` key operand must be the
     /// `Str32` for `"log"`, not the `Spur` for `"console"`. The two
     /// namespaces are documented in `crate::model::Interner`.
-    fn member_parts(&mut self, m: &MemberExpression<'_>) -> Res<(u16, u16)> {
+    pub(crate) fn member_parts(&mut self, m: &MemberExpression<'_>) -> Res<(u16, u16)> {
         if m.optional() {
             return Err(self.err(m.span(), "optional chaining is not supported"));
         }
