@@ -1771,12 +1771,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.emit_call(block, block, argc, c.span);
             return Ok(block);
         }
-        // Spread path: build args array and use CallApply.
+        // Spread path: build args array and use CallApply. Callee/receiver
+        // layout mirrors the non-spread path above, `super(...)` included.
         let block = self.new_temps(CALL_HEADER_REGS);
-        if let Some(m) = c.callee.as_member_expression() {
+        if c.callee.is_super() {
+            let super_ctor = self.super_ctor(c.span)?;
+            self.move_reg(block, super_ctor, c.span);
+            self.move_reg(block + 1, REG_THIS, c.span);
+        } else if let Some(m) = c.callee.as_member_expression() {
             let (obj, key) = self.member_parts(m)?;
             self.emit_reg3(Opcode::GetProperty, block, obj, key, c.span);
-            self.move_reg(block + 1, obj, c.span);
+            if m.object().is_super() {
+                self.move_reg(block + 1, REG_THIS, c.span);
+            } else {
+                self.move_reg(block + 1, obj, c.span);
+            }
         } else {
             let v = self.expr(&c.callee)?;
             self.move_reg(block, v, c.span);
@@ -1878,7 +1887,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(proto)
     }
 
-    fn emit_closure_instr(&mut self, dst: u16, idx: usize, span: Span) -> Res<()> {
+    pub(crate) fn emit_closure_instr(&mut self, dst: u16, idx: usize, span: Span) -> Res<()> {
         let idx16 = u16::try_from(idx)
             .map_err(|_| self.err(span, "programs above 65535 functions are not supported"))?;
         self.emit_closure(dst, idx16, span);

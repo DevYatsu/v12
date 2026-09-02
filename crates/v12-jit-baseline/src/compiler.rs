@@ -8,7 +8,8 @@
 //! to `jit_call_native` and remain on the runtime path.
 
 use cranelift_codegen::ir::{
-    AbiParam, ExternalName, InstBuilder, Signature, UserFuncName, condcodes::IntCC, types::I64,
+    AbiParam, Block, ExternalName, InstBuilder, Signature, UserFuncName, condcodes::IntCC,
+    types::I64,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -227,40 +228,28 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 .map_err(|e| invalid_bytecode(format!("wide decode at {pc}: {e}")))?;
             match wide {
                 WideOp::LoadConstW { dst, const_id } => {
+                    ensure_reg(dst as usize, bytecode.max_regs)?;
                     let bits = resolve_const_bits(bytecode, const_id)?;
                     let val = builder.ins().iconst(I64, bits as i64);
                     builder.def_var(vars[dst as usize], val);
-                    let next = pc + width;
-                    if next < blocks.len() {
-                        builder.ins().jump(blocks[next], &[]);
-                    } else {
-                        builder.ins().jump(exit_block, &[]);
-                    }
+                    jump_to_next(&mut builder, &blocks, pc + width, exit_block);
                 }
                 WideOp::LoadIntW { dst, value } => {
+                    ensure_reg(dst as usize, bytecode.max_regs)?;
                     let bits = runtime::box_number(value as f64).bits();
                     let val = builder.ins().iconst(I64, bits as i64);
                     builder.def_var(vars[dst as usize], val);
-                    let next = pc + width;
-                    if next < blocks.len() {
-                        builder.ins().jump(blocks[next], &[]);
-                    } else {
-                        builder.ins().jump(exit_block, &[]);
-                    }
+                    jump_to_next(&mut builder, &blocks, pc + width, exit_block);
                 }
                 WideOp::CallW { dst, func, argc } => {
                     // Call r(dst) = call r(func), argc
+                    ensure_regs(&[dst as usize, func as usize], bytecode.max_regs)?;
                     let callee = builder.use_var(vars[func as usize]);
                     let argc_val = builder.ins().iconst(I64, i64::from(argc));
                     let call = builder.ins().call(fn_call, &[callee, argc_val]);
                     let ret = builder.inst_results(call)[0];
                     builder.def_var(vars[dst as usize], ret);
-                    let next = pc + width;
-                    if next < blocks.len() {
-                        builder.ins().jump(blocks[next], &[]);
-                    } else {
-                        builder.ins().jump(exit_block, &[]);
-                    }
+                    jump_to_next(&mut builder, &blocks, pc + width, exit_block);
                 }
                 WideOp::GetEnvSlotW { .. }
                 | WideOp::SetEnvSlotW { .. }
@@ -290,12 +279,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 ensure_reg(src, bytecode.max_regs)?;
                 let v = builder.use_var(vars[src]);
                 builder.def_var(vars[dst], v);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::LoadInt => {
                 let dst = instr.a() as usize;
@@ -304,12 +288,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let bits = runtime::box_number(imm).bits();
                 let val = builder.ins().iconst(I64, bits as i64);
                 builder.def_var(vars[dst], val);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::LoadConst => {
                 let dst = instr.a() as usize;
@@ -318,12 +297,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let bits = resolve_const_bits(bytecode, const_id)?;
                 let val = builder.ins().iconst(I64, bits as i64);
                 builder.def_var(vars[dst], val);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Add => {
                 let dst = instr.a() as usize;
@@ -335,12 +309,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_add, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Sub => {
                 let dst = instr.a() as usize;
@@ -352,12 +321,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_sub, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Mul => {
                 let dst = instr.a() as usize;
@@ -369,12 +333,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_mul, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Div => {
                 let dst = instr.a() as usize;
@@ -386,12 +345,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_div, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Neg => {
                 let dst = instr.a() as usize;
@@ -401,12 +355,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_neg, &[a]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Eq => {
                 let dst = instr.a() as usize;
@@ -418,12 +367,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_eq, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Ne => {
                 let dst = instr.a() as usize;
@@ -435,12 +379,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_ne, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Lt => {
                 let dst = instr.a() as usize;
@@ -452,12 +391,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_lt, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Le => {
                 let dst = instr.a() as usize;
@@ -469,12 +403,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_le, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Gt => {
                 let dst = instr.a() as usize;
@@ -486,12 +415,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_gt, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Ge => {
                 let dst = instr.a() as usize;
@@ -503,12 +427,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_ge, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::StrictEq => {
                 let dst = instr.a() as usize;
@@ -520,12 +439,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_strict_eq, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::StrictNe => {
                 let dst = instr.a() as usize;
@@ -537,12 +451,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_strict_ne, &[a, b]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Jump => {
                 let target = instr.imm24() as usize;
@@ -553,50 +462,36 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 }
                 builder.ins().jump(blocks[target], &[]);
             }
-            Opcode::JumpIfFalse => {
+            Opcode::JumpIfFalse | Opcode::JumpIfTrue => {
                 let cond = instr.a() as usize;
                 let target = usize::from(instr.imm16());
                 ensure_reg(cond, bytecode.max_regs)?;
                 if target >= blocks.len() {
                     return Err(invalid_bytecode(format!(
-                        "JumpIfFalse target {target} out of bounds at pc {pc}"
+                        "{op:?} target {target} out of bounds at pc {pc}"
                     )));
                 }
-                let cond_val = builder.use_var(vars[cond]);
-                // Branch if the boolean value is false (bits == false_).
-                let false_val = builder.ins().iconst(I64, JsValue::false_().bits() as i64);
-                let is_false = builder.ins().icmp(IntCC::Equal, cond_val, false_val);
-                // Also treat any falsy numeric? Simplified: compare to false directly.
-                // For numeric tests, the condition comes from a comparison that
-                // already produced true/false, so direct equality is correct.
-                builder
-                    .ins()
-                    .brif(is_false, blocks[target], &[], blocks[pc + 1], &[]);
-            }
-            Opcode::JumpIfTrue => {
-                let cond = instr.a() as usize;
-                let target = usize::from(instr.imm16());
-                ensure_reg(cond, bytecode.max_regs)?;
-                if target >= blocks.len() {
+                let fallthrough = pc + 1;
+                if fallthrough >= blocks.len() {
                     return Err(invalid_bytecode(format!(
-                        "JumpIfTrue target {target} out of bounds at pc {pc}"
+                        "{op:?} fallthrough {fallthrough} out of bounds at pc {pc}"
                     )));
                 }
                 let cond_val = builder.use_var(vars[cond]);
+                // The condition register holds a boolean produced by a
+                // comparison op, so direct equality with `false` is the
+                // correct falsy test.
                 let false_val = builder.ins().iconst(I64, JsValue::false_().bits() as i64);
                 let is_false = builder.ins().icmp(IntCC::Equal, cond_val, false_val);
-                builder
-                    .ins()
-                    .brif(is_false, blocks[pc + 1], &[], blocks[target], &[]);
+                let (taken, not_taken) = match op {
+                    Opcode::JumpIfFalse => (blocks[target], blocks[fallthrough]),
+                    _ => (blocks[fallthrough], blocks[target]),
+                };
+                builder.ins().brif(is_false, taken, &[], not_taken, &[]);
             }
             Opcode::LoopHeader => {
                 // Tier-up counter site: no-op in the baseline template.
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Call => {
                 let dst = instr.a() as usize;
@@ -608,12 +503,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 let call = builder.ins().call(fn_call, &[callee, argc_val]);
                 let res = builder.inst_results(call)[0];
                 builder.def_var(vars[dst], res);
-                let next = pc + 1;
-                if next < blocks.len() {
-                    builder.ins().jump(blocks[next], &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
+                jump_to_next(&mut builder, &blocks, pc + 1, exit_block);
             }
             Opcode::Return => {
                 let src = instr.a() as usize;
@@ -661,6 +551,21 @@ fn resolve_const_bits(bytecode: &FunctionBytecode, id: u32) -> Result<u64, JitEr
         Some(v12_bytecode::Const::Null) => Ok(JsValue::null().bits()),
         Some(other) => Err(JitError::UnsupportedWideOp(format!("const kind {other:?}"))),
         None => Err(invalid_bytecode(format!("const id {id} out of range"))),
+    }
+}
+
+/// Emits the sequential jump to the next instruction's block, or to the exit
+/// block when the instruction is the last in the stream.
+fn jump_to_next(
+    builder: &mut FunctionBuilder<'_>,
+    blocks: &[Block],
+    next: usize,
+    exit_block: Block,
+) {
+    if next < blocks.len() {
+        builder.ins().jump(blocks[next], &[]);
+    } else {
+        builder.ins().jump(exit_block, &[]);
     }
 }
 

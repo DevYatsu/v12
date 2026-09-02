@@ -635,13 +635,13 @@ impl<'a> Interp<'a> {
     /// paths stay in bounds.
     pub fn new(
         heap: &'a mut Heap,
-        functions: Vec<FunctionBytecode>,
+        functions: impl Into<Rc<[FunctionBytecode]>>,
         main: u32,
-        strings: Vec<String>,
+        strings: impl Into<Rc<[String]>>,
     ) -> Self {
         heap.roots_mut().0.reserve(INITIAL_STACK_CAPACITY);
-        let functions = Rc::from(functions.into_boxed_slice());
-        let strings = Rc::from(strings.into_boxed_slice());
+        let functions = functions.into();
+        let strings = strings.into();
         let programs = std::rc::Rc::new(std::cell::RefCell::new(vec![(
             Rc::clone(&functions),
             Rc::clone(&strings),
@@ -735,15 +735,12 @@ impl<'a> Interp<'a> {
     /// its closure objects, so calls from other programs resolve here.
     pub fn register_program(
         &mut self,
-        functions: Vec<FunctionBytecode>,
-        strings: Vec<String>,
+        functions: impl Into<Rc<[FunctionBytecode]>>,
+        strings: impl Into<Rc<[String]>>,
     ) -> u32 {
         let mut table = self.programs.borrow_mut();
         let id = table.len() as u32;
-        table.push((
-            Rc::from(functions.into_boxed_slice()),
-            Rc::from(strings.into_boxed_slice()),
-        ));
+        table.push((functions.into(), strings.into()));
         id
     }
 
@@ -879,9 +876,9 @@ impl<'a> Interp<'a> {
     pub fn new_with_heap(
         heap: &'a mut Heap,
         global: Option<Handle<JsObject>>,
-        functions: Vec<FunctionBytecode>,
+        functions: impl Into<Rc<[FunctionBytecode]>>,
         main: u32,
-        strings: Vec<String>,
+        strings: impl Into<Rc<[String]>>,
     ) -> Self {
         let mut interp = Self::new(heap, functions, main, strings);
         interp.global = global;
@@ -2436,19 +2433,16 @@ impl<'a> Interp<'a> {
                             if arr_v.is_null() || arr_v.is_undefined() {
                                 Vec::new()
                             } else if let Some(arr_obj) = arr_v.as_object() {
-                                // Collect array elements (including ElementsArray)
-                                let len = self.heap.get(arr_obj).elements.len();
+                                // Collect array elements (holes read as undefined)
+                                let len = self.heap.get(arr_obj).element_len();
                                 let mut v = Vec::with_capacity(len);
                                 for i in 0..len as u32 {
-                                    // use elements array + shape path: simplest read via snapshot
-                                    let elem = self
-                                        .heap
-                                        .get(arr_obj)
-                                        .elements
-                                        .get(i as usize)
-                                        .copied()
-                                        .unwrap_or(JsValue::undefined());
-                                    v.push(elem);
+                                    v.push(
+                                        self.heap
+                                            .get(arr_obj)
+                                            .get_element(i)
+                                            .unwrap_or(JsValue::undefined()),
+                                    );
                                 }
                                 v
                             } else {
@@ -4135,8 +4129,7 @@ impl<'a> Interp<'a> {
         let kind = self.heap.get(obj).kind;
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
-            && let Some(slot) = self.heap.get(obj).elements.get(idx as usize)
-            && !slot.is_hole()
+            && self.heap.get(obj).get_element(idx).is_some()
         {
             return Ok(true);
         }
@@ -4287,10 +4280,7 @@ impl<'a> Interp<'a> {
         if (self.heap.get(obj).kind == Kind::Array || self.heap.get(obj).kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
-            let els = &mut self.heap.get_mut(obj).elements;
-            if usize::try_from(idx).is_ok_and(|i| i < els.len()) {
-                els[idx as usize] = JsValue::hole();
-            }
+            self.heap.get_mut(obj).delete_element(idx);
             return Ok(true);
         }
 
@@ -4315,61 +4305,31 @@ impl<'a> Interp<'a> {
     }
 
     fn array_element(&self, obj: Handle<JsObject>, idx: u32) -> JsValue {
-        let o = self.heap.get(obj);
-        if o.kind == Kind::Array {
-            // Arrays route through the elements-kind lattice.
-            o.elements_array.get(idx).unwrap_or(JsValue::undefined())
-        } else {
-            // Arguments exotic and other overloaded `elements` uses.
-            o.elements
-                .get(idx as usize)
-                .filter(|v| !v.is_hole())
-                .copied()
-                .unwrap_or(JsValue::undefined())
-        }
+        self.heap
+            .get(obj)
+            .get_element(idx)
+            .unwrap_or(JsValue::undefined())
     }
 
     /// Stores an element, hole-filling gaps and keeping `length` current.
     fn array_set_element(&mut self, obj: Handle<JsObject>, idx: u32, value: JsValue) {
-        let is_array = self.heap.get(obj).kind == Kind::Array;
-        if is_array {
-            let len_before = self.heap.get(obj).elements_array.len() as u32;
-            self.heap.get_mut(obj).elements_array.set(idx, value);
-            let len_after = self.heap.get(obj).elements_array.len() as u32;
-            if len_after > len_before {
-                let len_key = self.length_key();
-                let shape = self.shape_of(obj);
-                let slot = self
-                    .heap
-                    .lookup_property(shape, len_key)
-                    .and_then(|d| d.slot())
-                    .map(|s| s as usize);
-                if let Some(slot) = slot {
-                    self.heap.get_mut(obj).properties[slot] = ops::box_number(f64::from(len_after));
-                }
-            }
+        let len_before = self.heap.get(obj).element_len() as u32;
+        self.heap.get_mut(obj).set_element(idx, value);
+        let len_after = self.heap.get(obj).element_len() as u32;
+        if len_after <= len_before {
             return;
         }
-        let grows = usize::try_from(idx).is_ok_and(|i| i >= self.heap.get(obj).elements.len());
-        if grows {
-            {
-                let els = &mut self.heap.get_mut(obj).elements;
-                els.resize(idx as usize + 1, JsValue::hole());
-            }
-            let len_key = self.length_key();
-            let shape = self.shape_of(obj);
-            // Copy the slot out: the descriptor borrows the heap immutably,
-            // which would conflict with the store below.
-            let slot = self
-                .heap
-                .lookup_property(shape, len_key)
-                .and_then(|d| d.slot())
-                .map(|s| s as usize);
-            if let Some(slot) = slot {
-                self.heap.get_mut(obj).properties[slot] = ops::box_number(f64::from(idx + 1));
-            }
+        let len_key = self.length_key();
+        let shape = self.shape_of(obj);
+        let slot = self
+            .heap
+            .lookup_property(shape, len_key)
+            .and_then(|d| d.slot())
+            .map(|s| s as usize);
+        if let Some(slot) = slot {
+            self.heap.get_mut(obj).properties[slot] =
+                ops::box_number(f64::from(len_after));
         }
-        self.heap.get_mut(obj).elements[idx as usize] = value;
     }
 
     fn op_copy_array_rest(&mut self, src_v: JsValue, start: u16) -> Result<JsValue, JSException> {
@@ -4780,11 +4740,7 @@ impl<'a> Interp<'a> {
                 self.error_value("TypeError: spread source is not an array"),
             ));
         }
-        let src_elements: Vec<JsValue> = if self.heap.get(src_obj).kind == Kind::Array {
-            self.heap.get(src_obj).elements_array.iter().collect()
-        } else {
-            self.heap.get(src_obj).elements.clone()
-        };
+        let src_elements: Vec<JsValue> = self.heap.get(src_obj).elements_snapshot();
         if src_elements.is_empty() {
             return Ok(());
         }
@@ -5569,11 +5525,7 @@ impl<'a> Interp<'a> {
         } else {
             ",".to_string()
         };
-        let elements: Vec<JsValue> = if self.heap.get(arr).kind == Kind::Array {
-            self.heap.get(arr).elements_array.iter().collect()
-        } else {
-            self.heap.get(arr).elements.clone()
-        };
+        let elements: Vec<JsValue> = self.heap.get(arr).elements_snapshot();
         let mut parts = Vec::with_capacity(elements.len());
         for &v in &elements {
             if v.is_undefined() || v.is_null() || v.is_hole() {
@@ -5596,20 +5548,10 @@ impl<'a> Interp<'a> {
                 "TypeError: Array.prototype.push called on non-object",
             )));
         };
-        if self.heap.get(obj).kind == Kind::Array {
-            for &item in args {
-                self.heap.get_mut(obj).elements_array.push(item);
-            }
-        } else {
-            for &item in args {
-                self.heap.get_mut(obj).elements.push(item);
-            }
+        for &item in args {
+            self.heap.get_mut(obj).push_element(item);
         }
-        let new_len = if self.heap.get(obj).kind == Kind::Array {
-            self.heap.get(obj).elements_array.len() as u32
-        } else {
-            self.heap.get(obj).elements.len() as u32
-        };
+        let new_len = self.heap.get(obj).element_len() as u32;
         // Sync length if shape exists
         let key = self.length_key();
         let shape = self.shape_of(obj);

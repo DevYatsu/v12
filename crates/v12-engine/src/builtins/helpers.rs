@@ -122,15 +122,6 @@ fn display_text(v: JsValue) -> String {
     "<unprintable>".to_string()
 }
 
-/// Interns a string value in the heap (Latin1 when ASCII, UTF-16 otherwise).
-pub fn intern_text(heap: &mut Heap, text: &str) -> v12_heap::Handle<V12Str> {
-    if text.is_ascii() {
-        heap.intern_string(V12Str::latin1(text.as_bytes().to_vec()))
-    } else {
-        heap.intern_string(V12Str::utf16(text.encode_utf16().collect()))
-    }
-}
-
 /// ES `ToNumber` subset: Smi/double pass through; `true`→1.0, `false`/`null`→0.0,
 /// `undefined`→NaN; a string is trimmed (empty→0.0, else parsed as f64, failure→NaN);
 /// objects → NaN. Reused by all numeric built-ins (DRY).

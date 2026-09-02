@@ -1,6 +1,6 @@
 //! Object built-ins.
 
-use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, PropKey, V12Str};
+use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey, V12Str};
 use v12_native::Throw;
 
 use super::{helpers, intern_type_error};
@@ -61,31 +61,20 @@ pub fn object_define_property(
     let key = property_key(heap, args[1])?;
     let value = args.get(2).copied().unwrap_or(JsValue::undefined());
 
-    // Attempt to find existing descriptor via shape.
-    let shape = heap.root_shape();
-    // For the engine's own heap objects we maintain shapes in the interpreter
-    // layer; here we directly push to the property vector when the shape does not
-    // already contain the key, mirroring the interpreter's shape-blind path for
-    // the skeleton.
-    if heap.get(obj).properties.len() >= 1024 {
-        return Err((intern_type_error(heap, "TypeError: too many properties")).into());
-    }
-    // Check if property already exists by scanning heap lookup (best effort).
-    let exists = heap.lookup_property(shape, key).is_some();
-    if exists {
-        // Overwrite slot 0 for skeleton simplicity.
-        if !heap.get(obj).properties.is_empty() {
-            heap.get_mut(obj).properties[0] = value;
-        }
-    } else {
-        let child = heap.add_property(shape, key, Attrs::DEFAULT);
-        // Publishing the child shape would normally bind via validity cell side
-        // table; for this heap-local use we rely on the shape being anchored via
-        // the heap's root transitions until the next allocation,
-        // satisfying the allocation contract before the property store.
-        let _ = child;
-        heap.get_mut(obj).properties.push(value);
-    }
+    // Delegate to the ordinary [[DefineOwnProperty]] implementation: it
+    // dispatches on object kind (arrays, arguments exotics) and handles the
+    // shape extension + binding for new keys. A missing value argument
+    // defines a writable/enumerable/configurable data property.
+    crate::internal_methods::ordinary_define_own_property(
+        heap,
+        obj,
+        key,
+        crate::internal_methods::PropertyDescriptor {
+            value: Some(value),
+            ..Default::default()
+        },
+    )
+    .map_err(Throw::Value)?;
     Ok(JsValue::object(obj))
 }
 
@@ -130,7 +119,7 @@ pub fn object_has_own_property(heap: &mut Heap, this: JsValue, args: &[JsValue])
 
 pub fn object_proto_to_string(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let text = if this.is_object() && heap.get(this.as_object().unwrap()).kind == v12_heap::Kind::Array { "[object Array]" } else { "[object Object]" };
-    Ok(JsValue::string(helpers::intern_text(heap, text)))
+    Ok(JsValue::string(heap.intern_text(text)))
 }
 
 pub fn object_proto_value_of(_heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
@@ -138,7 +127,7 @@ pub fn object_proto_value_of(_heap: &mut Heap, this: JsValue, _args: &[JsValue])
 }
 
 pub fn function_proto_to_string(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    Ok(JsValue::string(helpers::intern_text(heap, "function() {}")))
+    Ok(JsValue::string(heap.intern_text("function() {}")))
 }
 
 fn collect_own_string_keys(heap: &Heap, obj: Handle<v12_heap::JsObject>) -> Vec<Handle<V12Str>> {
@@ -165,5 +154,5 @@ fn property_key(heap: &mut Heap, v: JsValue) -> Result<PropKey, JsValue> {
 
 fn to_string_handle(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>, JsValue> {
     let text = helpers::value_text(heap, v);
-    Ok(helpers::intern_text(heap, &text))
+    Ok(heap.intern_text(&text))
 }

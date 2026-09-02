@@ -142,13 +142,14 @@ pub struct JsObject {
     ///
     /// `SmallVec` with an inline capacity of 4, mirroring `properties`.
     pub property_keys: smallvec::SmallVec<[Option<crate::PropKey>; 4]>,
-    /// Integer-indexed element slots (legacy `Vec` used for the overloaded
-    /// slots: function index, generator register window, promise reactions).
+    /// Integer-indexed element slots for non-array overloaded uses
+    /// (arguments exotics, generator register window, promise reactions,
+    /// map/set entries, iterator slots). Arrays use `elements_array` only.
     pub elements: Vec<crate::JsValue>,
     /// Integer-indexed element storage for *arrays*, backed by the
     /// [`ElementsArray`] kind lattice (PackedSmi → … → Dictionary). Array
-    /// element reads/writes route through here; `elements` remains for the
-    /// non-array overloaded uses above.
+    /// element reads/writes route through here; `elements` is never touched
+    /// for arrays. Access via the `get_element`/`set_element`/… helpers.
     pub elements_array: crate::elements::ElementsArray,
     /// Prototype link; traced as a strong reference. Guards over this chain
     /// watch a validity-cell serial, not this field alone.
@@ -293,9 +294,8 @@ impl JsObject {
     ///
     /// The length is stored as a Smi to match the interpreter's array
     /// allocations (`NewArray`/`CopyArrayRest` use `ops::box_number`, which
-    /// boxes small integers as Smi). The elements are mirrored into both the
-    /// legacy `elements` vec (overloaded uses read it) and the live
-    /// `elements_array` lattice that array element accesses route through.
+    /// boxes small integers as Smi). Elements live exclusively in the
+    /// `elements_array` lattice; the legacy `elements` vec is left empty.
     // Element count fits the i31 Smi bound; audited invariant.
     #[allow(clippy::expect_used)]
     pub fn array(elements: Vec<crate::JsValue>) -> Self {
@@ -310,9 +310,101 @@ impl JsObject {
                 crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi"),
             ],
             property_keys: smallvec::smallvec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
-            elements,
             elements_array,
             ..Self::default()
+        }
+    }
+
+    // -- element access -----------------------------------------------------------------
+    //
+    // Two kinds keep integer-indexed data in an element store: arrays in the
+    // `elements_array` lattice, arguments exotics in the flat `elements` vec.
+    // These accessors are the only sanctioned way to touch either; direct
+    // field access bypasses the dispatch and silently misses the other store.
+
+    /// Element at `idx`; `None` when out of bounds or a hole.
+    pub fn get_element(&self, idx: u32) -> Option<crate::JsValue> {
+        if self.kind == Kind::Array {
+            self.elements_array.get(idx)
+        } else {
+            self.elements
+                .get(idx as usize)
+                .filter(|v| !v.is_hole())
+                .copied()
+        }
+    }
+
+    /// Element count: array-length view for arrays, flat vec length otherwise.
+    pub fn element_len(&self) -> usize {
+        if self.kind == Kind::Array {
+            self.elements_array.len()
+        } else {
+            self.elements.len()
+        }
+    }
+
+    /// Snapshot of every stored slot in index order, holes included (arrays
+    /// in holey rungs yield hole markers; other kinds yield their vec).
+    pub fn elements_snapshot(&self) -> Vec<crate::JsValue> {
+        if self.kind == Kind::Array {
+            self.elements_array.iter().collect()
+        } else {
+            self.elements.clone()
+        }
+    }
+
+    /// Writes `idx`, gap-filling as the store requires (lattice promotion for
+    /// arrays, hole-filled resize for other kinds).
+    pub fn set_element(&mut self, idx: u32, value: crate::JsValue) {
+        if self.kind == Kind::Array {
+            self.elements_array.set(idx, value);
+        } else {
+            let i = idx as usize;
+            if i >= self.elements.len() {
+                self.elements.resize(i + 1, crate::JsValue::hole());
+            }
+            self.elements[i] = value;
+        }
+    }
+
+    /// Appends at the end of the element store.
+    pub fn push_element(&mut self, value: crate::JsValue) {
+        if self.kind == Kind::Array {
+            self.elements_array.push(value);
+        } else {
+            self.elements.push(value);
+        }
+    }
+
+    /// Removes and returns the last element (`None` when empty).
+    pub fn pop_element(&mut self) -> Option<crate::JsValue> {
+        if self.kind == Kind::Array {
+            self.elements_array.pop()
+        } else {
+            self.elements.pop()
+        }
+    }
+
+    /// Marks the element at `idx` absent (delete).
+    pub fn delete_element(&mut self, idx: u32) {
+        if self.kind == Kind::Array {
+            self.elements_array.set(idx, crate::JsValue::hole());
+        } else if let Some(slot) = self.elements.get_mut(idx as usize) {
+            *slot = crate::JsValue::hole();
+        }
+    }
+
+    /// Replaces the whole element store, e.g. after an out-of-place rewrite
+    /// such as sort: arrays rebuild the lattice, other kinds swap the vec.
+    pub fn replace_elements(&mut self, values: Vec<crate::JsValue>) {
+        if self.kind == Kind::Array {
+            let mut elements_array = crate::elements::ElementsArray::new();
+            for (i, &v) in values.iter().enumerate() {
+                elements_array.set(i as u32, v);
+            }
+            self.elements_array = elements_array;
+        } else {
+            self.elements = values;
         }
     }
 

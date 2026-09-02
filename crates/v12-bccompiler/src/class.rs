@@ -50,7 +50,7 @@ pub(crate) fn class_expression(
         .map_err(|_| cx.err(span, "internal: class missing from plans"))?;
     crate::unit::compile_unit(cx.comp, ctor_idx, crate::unit::UnitNode::Class(c))?;
     let ctor = cx.new_temp();
-    cx.emit_closure(ctor, u16::try_from(ctor_idx).unwrap_or(0), span);
+    cx.emit_closure_instr(ctor, ctor_idx, span)?;
 
     // 2. Evaluate `extends` (parent constructor) before the prototype exists.
     let parent = if let Some(h) = &c.heritage {
@@ -79,7 +79,7 @@ pub(crate) fn class_expression(
         // Check if parent is null (extends null) - in that case don't wire static/prototype inheritance
         let parent_is_null = cx.new_temp();
         let null_reg = cx.new_temp();
-        cx.load_const(null_reg, Const::Null, span).unwrap();
+        cx.load_const(null_reg, Const::Null, span)?;
         cx.emit_reg3(Opcode::StrictEq, parent_is_null, parent, null_reg, span);
         let skip_wire = cx.label();
         cx.emit_jump(Opcode::JumpIfTrue, parent_is_null, skip_wire);
@@ -125,11 +125,14 @@ fn define_elements(
                 // private methods: store as private on ctor
                 let is_private = matches!(&m.key, PropertyKey::PrivateIdentifier(_));
                 if is_private {
-                    let name = match &m.key { PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name), _ => unreachable!() };
+                    // Private methods are defined on the constructor template
+                    // (static on the function itself, instance-side via the
+                    // brand-checked clone at construction).
+                    let name = static_key_text(&m.key)
+                        .ok_or_else(|| cx.err(m.span, "unsupported private method name"))?;
                     let name_id = crate::model::str_id_of(cx.comp.strings.get_or_intern(&name));
                     let fn_reg = method_fn(cx, m)?;
-                    let target_obj = if m.r#static { ctor } else { ctor };
-                    let words = v12_bytecode::WideOp::DefinePrivateW { obj: target_obj, class_id: 0, name_id, value: fn_reg }.encode();
+                    let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: fn_reg }.encode();
                     cx.emit_words(words, m.span);
                     continue;
                 }
@@ -161,18 +164,15 @@ fn define_elements(
             ClassElement::PropertyDefinition(p) => {
                 let is_private = matches!(&p.key, PropertyKey::PrivateIdentifier(_));
                 if is_private {
-                    let name = match &p.key { PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name), _ => unreachable!() };
+                    // Both static and instance private fields are defined on
+                    // the constructor template; Construct clones instance
+                    // fields to the new object via the brand check.
+                    let name = static_key_text(&p.key)
+                        .ok_or_else(|| cx.err(p.span, "unsupported private field name"))?;
                     let name_id = crate::model::str_id_of(cx.comp.strings.get_or_intern(&name));
                     let value_reg = if let Some(v) = &p.value { cx.expr(v)? } else { let d = cx.new_temp(); cx.load_undefined(d, p.span); d };
-                    if p.r#static {
-                        let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: value_reg }.encode();
-                        cx.emit_words(words, p.span);
-                    } else {
-                        // instance private field: store as template on ctor (will be cloned on construct)
-                        // For now define on ctor template; Construct will clone to instances
-                        let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: value_reg }.encode();
-                        cx.emit_words(words, p.span);
-                    }
+                    let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: value_reg }.encode();
+                    cx.emit_words(words, p.span);
                     continue;
                 }
                 let target = if p.r#static { ctor } else { proto };
@@ -214,7 +214,7 @@ fn method_fn(
         .map_err(|_| cx.err(m.span, "internal: class method missing from plans"))?;
     crate::unit::compile_unit(cx.comp, idx, crate::unit::UnitNode::Method(&m.value))?;
     let d = cx.new_temp();
-    cx.emit_closure(d, u16::try_from(idx).unwrap_or(0), m.value.span);
+    cx.emit_closure_instr(d, idx, m.value.span)?;
     Ok(d)
 }
 

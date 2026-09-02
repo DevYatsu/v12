@@ -118,7 +118,10 @@ pub fn compile_unit(
     emit_prologue(&mut cx, idx, self_symbol)?;
     if cx.b.is_generator {
         let dst = cx.new_temp();
-        let func_idx = u16::try_from(idx).unwrap_or(0);
+        let func_idx = u16::try_from(idx).map_err(|_| CompileError {
+            message: "programs above 65535 functions are not supported".into(),
+            span: None,
+        })?;
         cx.emit_reg3(
             Opcode::CreateGenerator,
             dst,

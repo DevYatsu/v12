@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use v12_bytecode::FunctionBytecode;
 use v12_heap::HeapExt;
-use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
+use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue, V12Str};
 use v12_interp::{Interp, JSException};
 use v12_native::{NativeId, Throw};
 
@@ -15,6 +15,12 @@ use crate::builtins::{NativeRegistry, install_core};
 use crate::error::EngineError;
 use crate::job_queue::{Job, JobCtx, JobQueue};
 use crate::realm::Realm;
+
+/// Interns `text` in the heap and wraps it as a string `JsValue` — the shape
+/// of every compile/host error result in this file.
+fn string_value(heap: &mut Heap, text: &str) -> JsValue {
+    JsValue::string(heap.intern_text(text))
+}
 
 /// Maximum length of a source text accepted by `eval`.
 const MAX_SOURCE_LEN: usize = 1_000_000;
@@ -232,29 +238,7 @@ impl Engine {
     /// code become properties on the global object (simple global merge for
     /// `v1`).
     pub fn eval_direct(&mut self, source: &str) -> Result<JsValue, JsValue> {
-        match self.eval_inner(source) {
-            Ok(value) => Ok(value),
-            Err(EngineError::Thrown(t)) => Err(t),
-            Err(EngineError::Host(msg)) => {
-                let h = if msg.is_ascii() {
-                    self.heap.intern_string(V12Str::latin1(msg.into_bytes()))
-                } else {
-                    self.heap
-                        .intern_string(V12Str::utf16(msg.encode_utf16().collect()))
-                };
-                Err(JsValue::string(h))
-            }
-            Err(EngineError::Compile(err)) => {
-                let msg = err.message;
-                let handle = if msg.is_ascii() {
-                    self.heap.intern_string(V12Str::latin1(msg.into_bytes()))
-                } else {
-                    self.heap
-                        .intern_string(V12Str::utf16(msg.encode_utf16().collect()))
-                };
-                Err(JsValue::string(handle))
-            }
-        }
+        self.eval_inner(source).map_err(|e| self.error_to_value(e))
     }
 
     /// Private inner: compiles + runs + captures completion, returning a
@@ -268,24 +252,50 @@ impl Engine {
         self.heap.add_root(JsValue::object(global));
         let (program, strings) =
             v12_bccompiler::compile_source_with_strings(source).map_err(EngineError::Compile)?;
-        // Retain the program so queued jobs can rebuild an interpreter and
-        // activate the script's functions later (Promise reactions).
-        // Wrap the `Vec`s in `Rc` once; subsequent `eval`/`run_jobs` clone
+        // Wrap the tables in `Rc` once; subsequent `eval`/`run_jobs` clone
         // the `Rc` instead of deep-cloning the function/string tables.
         let functions: Rc<[FunctionBytecode]> = Rc::from(program.functions.into_boxed_slice());
-        let strings_arc: Rc<[String]> = Rc::from(strings.into_boxed_slice());
+        let strings: Rc<[String]> = Rc::from(strings.into_boxed_slice());
+        let natives = Box::new(self.registry.clone());
+        self.run_compiled(global, functions, program.main, strings, natives)
+    }
+
+    /// Flattens a structured [`EngineError`] into the legacy thrown-`JsValue`
+    /// representation: thrown values pass through, host/compile errors become
+    /// interned string values.
+    fn error_to_value(&mut self, err: EngineError) -> JsValue {
+        match err {
+            EngineError::Thrown(t) => t,
+            EngineError::Host(msg) => string_value(&mut self.heap, &msg),
+            EngineError::Compile(err) => string_value(&mut self.heap, &err.message),
+        }
+    }
+
+    /// Runs a compiled program in a fresh interpreter borrowing the engine
+    /// heap: retains the program so queued jobs can rebuild an interpreter
+    /// later, installs `natives`, runs, drains the single microtask
+    /// checkpoint, and captures the completion value. Shared by script eval
+    /// ([`Self::eval_inner`]) and module eval.
+    fn run_compiled(
+        &mut self,
+        global: Handle<JsObject>,
+        functions: Rc<[FunctionBytecode]>,
+        main: u32,
+        strings: Rc<[String]>,
+        natives: Box<dyn v12_interp::NativeRegistry>,
+    ) -> Result<JsValue, EngineError> {
         self.retained = Some(RetainedProgram {
             functions: Rc::clone(&functions),
-            main: program.main,
-            strings: Rc::clone(&strings_arc),
+            main,
+            strings: Rc::clone(&strings),
         });
+        let deadline = self.deadline;
         // Borrow the engine's heap for the interpreter's lifetime —
         // no `mem::replace` swap, no sentinel heap, `Engine::heap()` stays
         // valid the whole time the interpreter runs. Destructure `self` so
         // the heap borrow and the job-queue/registry accesses are disjoint
         // locals (the borrow checker cannot see field disjointness through
         // `&mut self`).
-        let deadline = self.deadline;
         let Engine {
             heap,
             jobs,
@@ -294,27 +304,17 @@ impl Engine {
             completion,
             ..
         } = self;
-        let mut interp = Interp::new_with_heap(
-            heap,
-            Some(global),
-            functions.to_vec(),
-            program.main,
-            strings_arc.to_vec(),
-        );
-        let natives = registry.clone();
-        interp.set_natives(Box::new(natives));
+        let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
+        interp.set_natives(natives);
         interp.set_deadline(deadline);
         let outcome = interp.run();
         // Drain the single microtask checkpoint against the still-live
         // interpreter: host jobs and async resumes alternate until empty.
         let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
-        // Capture the actual completion value (e.g. `1+1` → 2);
-        // `eval` and `eval_with_completion` both return it.
+        // Capture the actual completion value (e.g. `1+1` -> 2).
         *completion = interp.completion_value();
         drop(interp); // releases the `&mut heap` borrow
         match outcome {
-            // Return the real script completion value (e.g.
-            // `1+1` → 2) instead of hard-coded `undefined`.
             Ok(()) => Ok(completion.unwrap_or_else(JsValue::undefined)),
             Err(JSException(thrown)) => Err(EngineError::Thrown(thrown)),
         }
@@ -325,10 +325,7 @@ impl Engine {
     /// `var` declarations in `source` do **not** affect the caller's global.
     pub fn eval_indirect(&mut self, source: &str) -> Result<JsValue, JsValue> {
         if source.len() > MAX_SOURCE_LEN {
-            let h = self
-                .heap
-                .intern_string(V12Str::latin1(b"RangeError: source too large".to_vec()));
-            return Err(JsValue::string(h));
+            return Err(string_value(&mut self.heap, "RangeError: source too large"));
         }
         // Fresh heap + realm for the indirect eval.
         let mut heap = Heap::new(GcPolicy::default());
@@ -336,15 +333,8 @@ impl Engine {
         let global = realm.global();
         heap.add_root(JsValue::object(global));
         let (program, strings) =
-            v12_bccompiler::compile_source_with_strings(source).map_err(|err| {
-                let msg = err.message;
-                let handle = if msg.is_ascii() {
-                    heap.intern_string(V12Str::latin1(msg.into_bytes()))
-                } else {
-                    heap.intern_string(V12Str::utf16(msg.encode_utf16().collect()))
-                };
-                JsValue::string(handle)
-            })?;
+            v12_bccompiler::compile_source_with_strings(source)
+                .map_err(|err| string_value(&mut heap, &err.message))?;
         // The indirect-eval gets its OWN `NativeRegistry` with its
         // OWN pending sink, so jobs enqueued in this realm never reach the
         // engine's queue and no `set_pending` save/restore is needed. The
@@ -380,17 +370,10 @@ impl Engine {
             Err(JSException(thrown)) => {
                 // Translate thrown string into the caller's heap.
                 if let Some(h) = thrown.as_string() {
-                    // Need to get text from the fresh heap's string, then intern in caller.
-                    // For v1, we use the interpreter's display helper.
+                    // Read the text from the fresh heap's string, intern in caller.
                     let text = interp.to_display_string(thrown);
                     let _ = h;
-                    let handle = if text.is_ascii() {
-                        self.heap.intern_string(V12Str::latin1(text.into_bytes()))
-                    } else {
-                        self.heap
-                            .intern_string(V12Str::utf16(text.encode_utf16().collect()))
-                    };
-                    Err(JsValue::string(handle))
+                    Err(string_value(&mut self.heap, &text))
                 } else {
                     Err(thrown)
                 }
@@ -412,57 +395,21 @@ impl Engine {
     /// Evaluates `source` as a module with `base` for import resolution.
     pub fn eval_module_source(&mut self, source: &str, _base: &Path) -> Result<JsValue, JsValue> {
         if source.len() > MAX_SOURCE_LEN {
-            let h = self
-                .heap
-                .intern_string(V12Str::latin1(b"RangeError: source too large".to_vec()));
-            return Err(JsValue::string(h));
+            return Err(string_value(&mut self.heap, "RangeError: source too large"));
         }
         let global = self.realm.global();
         self.heap.add_root(JsValue::object(global));
         // Compile as module.
         let mut interner = v12_bccompiler::Interner::default();
         let module = v12_bccompiler::compile_source_as_module_with_interner(source, &mut interner)
-            .map_err(|err| {
-                let msg = err.message;
-                let handle = if msg.is_ascii() {
-                    self.heap.intern_string(V12Str::latin1(msg.into_bytes()))
-                } else {
-                    self.heap
-                        .intern_string(V12Str::utf16(msg.encode_utf16().collect()))
-                };
-                JsValue::string(handle)
-            })?;
+            .map_err(|err| string_value(&mut self.heap, &err.message))?;
         let strings: Vec<String> = v12_bccompiler::freeze_interner(interner)
             .iter()
             .map(|(_, s)| s.to_string())
             .collect();
         let program = module.program;
-        // Wrap in `Rc` once so `run_jobs` can clone the handle.
         let functions: Rc<[FunctionBytecode]> = Rc::from(program.functions.into_boxed_slice());
-        let strings_arc: Rc<[String]> = Rc::from(strings.into_boxed_slice());
-        self.retained = Some(RetainedProgram {
-            functions: Rc::clone(&functions),
-            main: program.main,
-            strings: Rc::clone(&strings_arc),
-        });
-        // Borrow the engine's heap; no swap. Destructure `self` so
-        // the heap borrow and job-queue/registry accesses are disjoint locals.
-        let deadline = self.deadline;
-        let Engine {
-            heap,
-            jobs,
-            registry,
-            pending,
-            completion,
-            ..
-        } = self;
-        let mut interp = Interp::new_with_heap(
-            heap,
-            Some(global),
-            functions.to_vec(),
-            program.main,
-            strings_arc.to_vec(),
-        );
+        let strings: Rc<[String]> = Rc::from(strings.into_boxed_slice());
         // Install module-aware natives: 254 returns empty namespace.
         struct ModuleImportNatives {
             inner: NativeRegistry,
@@ -487,28 +434,17 @@ impl Engine {
             }
         }
         let natives = ModuleImportNatives {
-            inner: registry.clone(),
+            inner: self.registry.clone(),
         };
-        interp.set_natives(Box::new(natives));
-        interp.set_deadline(deadline);
-        let outcome = interp.run();
-        // Single checkpoint: host jobs + async resumes alternate until empty.
-        let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
-        // Capture the module's completion value too.
-        *completion = interp.completion_value();
-        drop(interp); // releases the `&mut heap` borrow
-        match outcome {
-            Ok(()) => Ok(completion.unwrap_or_else(JsValue::undefined)),
-            Err(JSException(thrown)) => Err(thrown),
-        }
+        self.run_compiled(global, functions, program.main, strings, Box::new(natives))
+            .map_err(|e| self.error_to_value(e))
     }
 
     /// Evaluates a module file at `path`, resolving imports relative to its directory.
     pub fn eval_module_file(&mut self, path: &Path) -> Result<JsValue, JsValue> {
         let source = std::fs::read_to_string(path).map_err(|e| {
             let msg = format!("Error reading {}: {e}", path.display());
-            let h = self.heap.intern_string(V12Str::latin1(msg.into_bytes()));
-            JsValue::string(h)
+            string_value(&mut self.heap, &msg)
         })?;
         self.eval_module_source(&source, path.parent().unwrap_or(Path::new(".")))
     }
@@ -524,16 +460,8 @@ impl Engine {
     pub fn create_function(&mut self, params: &str, body: &str) -> Result<JsValue, JsValue> {
         let src = format!("function __f({params}){{{body}}}");
         let (program, _strings) =
-            v12_bccompiler::compile_source_with_strings(&src).map_err(|err| {
-                let msg = err.message;
-                let handle = if msg.is_ascii() {
-                    self.heap.intern_string(V12Str::latin1(msg.into_bytes()))
-                } else {
-                    self.heap
-                        .intern_string(V12Str::utf16(msg.encode_utf16().collect()))
-                };
-                JsValue::string(handle)
-            })?;
+            v12_bccompiler::compile_source_with_strings(&src)
+                .map_err(|err| string_value(&mut self.heap, &err.message))?;
         let idx = program
             .functions
             .iter()
@@ -580,7 +508,7 @@ impl Engine {
         // the interpreter's `op_set_global` does (GLOBAL_VAR_OFFSET bias).
         let h = self
             .heap
-            .intern_string(V12Str::latin1(name.as_bytes().to_vec()));
+            .intern_text(&name);
         let key = v12_heap::PropKey::from_string(h);
         let shape = self.heap.shape_of(global);
         if let Some(desc) = self.heap.lookup_property(shape, key)
@@ -625,15 +553,12 @@ impl Engine {
         let func = {
             let h = self
                 .heap
-                .intern_string(V12Str::latin1(name.as_bytes().to_vec()));
+                .intern_text(&name);
             let key = v12_heap::PropKey::from_string(h);
             let shape = self.heap.shape_of(global);
             let desc = self.heap.lookup_property(shape, key);
             let slot = desc.and_then(|d| d.slot()).ok_or_else(|| {
-                let h = self.heap.intern_string(V12Str::latin1(
-                    format!("ReferenceError: {name} is not defined").into_bytes(),
-                ));
-                JsValue::string(h)
+                string_value(&mut self.heap, &format!("ReferenceError: {name} is not defined"))
             })?;
             let idx = crate::realm::INTRINSIC_COUNT + slot as usize;
             self.heap
@@ -642,27 +567,24 @@ impl Engine {
                 .get(idx)
                 .copied()
                 .ok_or_else(|| {
-                    let h = self.heap.intern_string(V12Str::latin1(
-                        format!("ReferenceError: {name} is not defined").into_bytes(),
-                    ));
-                    JsValue::string(h)
+                    string_value(
+                        &mut self.heap,
+                        &format!("ReferenceError: {name} is not defined"),
+                    )
                 })?
         };
         let callee = func.as_object().ok_or_else(|| {
-            let h = self.heap.intern_string(V12Str::latin1(
-                format!("TypeError: {name} is not a function").into_bytes(),
-            ));
-            JsValue::string(h)
+            string_value(&mut self.heap, &format!("TypeError: {name} is not a function"))
         })?;
         self.heap.add_root(JsValue::object(callee));
 
         let (functions, main, strings) = match &self.retained {
-            Some(r) => (
-                r.functions.to_vec(),
-                r.main,
-                r.strings.iter().map(|s| s.to_string()).collect(),
+            Some(r) => (Rc::clone(&r.functions), r.main, Rc::clone(&r.strings)),
+            None => (
+                Rc::<[FunctionBytecode]>::from(Vec::new()),
+                0,
+                Rc::<[String]>::from(Vec::new()),
             ),
-            None => (Vec::new(), 0, Vec::new()),
         };
         let Engine {
             heap,
@@ -747,12 +669,12 @@ impl Engine {
         // calls (the same `Rc<[String]>` is shared with the original
         // eval that produced it).
         let (functions, main, strings) = match &self.retained {
-            Some(r) => (
-                r.functions.to_vec(),
-                r.main,
-                r.strings.iter().map(|s| s.to_string()).collect(),
+            Some(r) => (Rc::clone(&r.functions), r.main, Rc::clone(&r.strings)),
+            None => (
+                Rc::<[FunctionBytecode]>::from(Vec::new()),
+                0,
+                Rc::<[String]>::from(Vec::new()),
             ),
-            None => (Vec::new(), 0, Vec::new()),
         };
         // Borrow the engine's heap; no swap. The interpreter is
         // scoped to this method, so the borrow ends when it drops. Destructure
@@ -872,7 +794,7 @@ impl Engine {
             if let Some(obj) = value.as_object() {
                 let shape = self.heap.shape_of(obj);
                 let lookup_str_prop = |heap: &mut v12_heap::Heap, key: &str| -> Option<v12_heap::Handle<v12_heap::V12Str>> {
-                    let h = heap.intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));
+                    let h = heap.intern_text(&key);
                     let pk = v12_heap::PropKey::from_string(h);
                     let desc = heap.lookup_property(shape, pk)?;
                     let slot = desc.slot()?;
@@ -933,12 +855,7 @@ fn translate_value(engine_heap: &mut Heap, interp: &mut Interp<'_>, value: JsVal
     }
     if let Some(_handle) = value.as_string() {
         let text = interp.to_display_string(value);
-        let heap_handle = if text.is_ascii() {
-            engine_heap.intern_string(V12Str::latin1(text.into_bytes()))
-        } else {
-            engine_heap.intern_string(V12Str::utf16(text.encode_utf16().collect()))
-        };
-        return JsValue::string(heap_handle);
+        return JsValue::string(engine_heap.intern_text(&text));
     }
     // For objects and other reference types, return undefined as a placeholder
     // in the minimal embedding; a full structured clone would be needed for

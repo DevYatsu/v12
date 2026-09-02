@@ -576,7 +576,7 @@ fn string_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result
         Some(&v) => helpers::value_text(heap, v),
         None => "undefined".to_string(),
     };
-    Ok(JsValue::string(helpers::intern_text(heap, &text)))
+    Ok(JsValue::string(heap.intern_text(&text)))
 }
 
 /// `Array.prototype.join(separator?)`: element display strings joined by
@@ -594,11 +594,7 @@ fn array_join(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValu
     };
     // Snapshot before formatting: the display helpers may allocate (and thus
     // collect), invalidating a live borrow of the element store.
-    let elements: Vec<JsValue> = if heap.get(arr).kind == v12_heap::Kind::Array {
-        heap.get(arr).elements_array.iter().collect()
-    } else {
-        heap.get(arr).elements.clone()
-    };
+    let elements: Vec<JsValue> = heap.get(arr).elements_snapshot();
     let mut parts = Vec::with_capacity(elements.len());
     for &v in &elements {
         if v.is_undefined() || v.is_null() {
@@ -620,7 +616,7 @@ fn eval_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValu
             let text = helpers::string_text(heap, h);
             if let Err(err) = v12_bccompiler::compile_source_with_strings(&text) {
                 let msg = err.message;
-                let handle = helpers::intern_text(heap, &msg);
+                let handle = heap.intern_text(&msg);
                 return Err((JsValue::string(handle)).into());
             }
             Ok(JsValue::undefined())
@@ -657,7 +653,7 @@ fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
     let src = format!("function __f({param_str}){{{body}}}");
     if let Err(err) = v12_bccompiler::compile_source_with_strings(&src) {
         let msg = err.message;
-        let handle = helpers::intern_text(heap, &msg);
+        let handle = heap.intern_text(&msg);
         return Err((JsValue::string(handle)).into());
     }
     let func = helpers::alloc_obj(

@@ -22,18 +22,9 @@ pub fn array_push(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<Js
         return Err((intern_type_error(heap, "RangeError: invalid array length")).into());
     }
     for &item in args {
-        let obj_mut = heap.get_mut(obj);
-        if obj_mut.kind == v12_heap::Kind::Array {
-            obj_mut.elements_array.push(item);
-        } else {
-            obj_mut.elements.push(item);
-        }
+        heap.get_mut(obj).push_element(item);
     }
-    let new_len = if heap.get(obj).kind == v12_heap::Kind::Array {
-        heap.get(obj).elements_array.len() as u32
-    } else {
-        heap.get(obj).elements.len() as u32
-    };
+    let new_len = heap.get(obj).element_len() as u32;
     sync_length(heap, obj, new_len);
     Ok(helpers::smi_or_f64(i64::from(new_len)))
 }
@@ -41,27 +32,13 @@ pub fn array_push(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<Js
 /// `Array.prototype.pop()` – removes the last element.
 pub fn array_pop(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = helpers::as_object(heap, this, "Array.prototype.pop", None)?;
-    let popped = if heap.get(obj).kind == v12_heap::Kind::Array {
-        heap.get_mut(obj)
-            .elements_array
-            .pop()
-            .unwrap_or(JsValue::undefined())
-    } else {
-        heap.get_mut(obj)
-            .elements
-            .pop()
-            .unwrap_or(JsValue::undefined())
-    };
+    let popped = heap.get_mut(obj).pop_element().unwrap_or(JsValue::undefined());
     let value = if popped.is_hole() {
         JsValue::undefined()
     } else {
         popped
     };
-    let new_len = if heap.get(obj).kind == v12_heap::Kind::Array {
-        heap.get(obj).elements_array.len() as u32
-    } else {
-        heap.get(obj).elements.len() as u32
-    };
+    let new_len = heap.get(obj).element_len() as u32;
     sync_length(heap, obj, new_len);
     Ok(value)
 }
@@ -93,7 +70,7 @@ fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> u32 {
         }
     }
     // Fallback to elements length.
-    heap.get(obj).elements.len() as u32
+    heap.get(obj).element_len() as u32
 }
 
 /// `Array.isArray(value)` – true if value is an Array exotic object.
@@ -107,7 +84,7 @@ pub fn array_is_array(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Res
 
 pub fn array_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = helpers::as_object(heap, this, "Array.prototype.slice", None)?;
-    let elems: Vec<JsValue> = if heap.get(obj).kind == v12_heap::Kind::Array { heap.get(obj).elements_array.iter().collect() } else { heap.get(obj).elements.clone() };
+    let elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     let len = elems.len() as i64;
     let to_idx = |v: JsValue| -> i64 {
         if v.is_undefined() { return 0; }
@@ -124,19 +101,11 @@ pub fn array_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<J
 
 pub fn array_sort(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = helpers::as_object(heap, this, "Array.prototype.sort", None)?;
-    let mut elems: Vec<JsValue> = if heap.get(obj).kind == v12_heap::Kind::Array { heap.get(obj).elements_array.iter().collect() } else { heap.get(obj).elements.clone() };
+    let mut elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     // Filter holes (undefined) to end per spec simplified: keep order for undefined.
     elems.retain(|v| !v.is_undefined() && !v.is_hole());
     elems.sort_by(|a,b| helpers::value_text(heap, *a).cmp(&helpers::value_text(heap, *b)));
-    // write back
-    if heap.get(obj).kind == v12_heap::Kind::Array {
-        let h = heap.get_mut(obj);
-        h.elements_array = v12_heap::ElementsArray::new();
-        for (i, v) in elems.iter().enumerate() { h.elements_array.set(i as u32, *v); }
-        h.elements = elems;
-    } else {
-        heap.get_mut(obj).elements = elems;
-    }
+    heap.get_mut(obj).replace_elements(elems);
     Ok(this)
 }
 

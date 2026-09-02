@@ -158,12 +158,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Statement::ForInStatement(f) => self.for_in_loop(f, None),
             Statement::ForOfStatement(f) => self.for_of_loop(f, None),
-            Statement::WithStatement(w) => {
-                // Minimal: evaluate object for side effects, then execute body
-                // ignoring scope extension (passes syntax, best-effort).
-                self.expr(&w.object)?;
-                self.stmt(&w.body)?;
-                Ok(())
+            Statement::WithStatement(_) => {
+                // `with` needs dynamic scope resolution; silently ignoring the
+                // scope object would resolve identifiers wrongly, so reject.
+                Err(self.err(s.span(), "with statements are not supported"))
             }
             Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => {
                 Err(self.err(
