@@ -24,6 +24,131 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+> Steps 1–7c below were reconstructed on 2026-09-02 from git-log commit messages and
+> CONTEXT.md history after a workspace reset wiped the original backfill entries
+> (see the Step 8 notes and the CONTEXT.md incident note). Numbers are the ones
+> recorded at the time in the commits.
+
+### 2026-09-02 — Step 7c: spec-correct private fields with brand check
+
+- **Filter:** `language/expressions` (11 164 files, 4 jobs)
+- **Before:** 3 828 pass — via Step 7b hidden-key emulation (`obj["#x"]` exposed private state)
+- **After:**  3 771 pass spec-correct — `obj["#x"]` is `undefined`, outside-class `#x` access throws `TypeError`
+- **Delta:** −57 vs the hidden-key count, traded for spec correctness; `private fields are not supported` bucket stays 0
+- **Engine change:** 2dfb52c — WideOps `GetPrivateW/SetPrivateW/DefinePrivateW/HasPrivateW` (discriminants 11–14, width 4); `JsObject {private_brand, private_fields}` with GC trace and `Construct` clone; brand-checked `private_get/has/define/set`; `this` slot panic fixed (`expr.rs:142` fallback + `collect.rs` field-init walk for `() => this.#x`)
+- **Files:** `crates/v12-bccompiler/src/{class,collect,expr}.rs`, `crates/v12-bytecode/src/lib.rs`, `crates/v12-heap/src/{gc,object}.rs`, `crates/v12-interp/src/lib.rs`
+- **Bucket:** `private fields are not supported` — closed, now spec-correct
+- **Runner:** `cargo run -p test262-runner -- --filter language/expressions --jobs 4 --format json` (full `language` run timed out in CI) + `cargo nextest run --workspace` 563 pass
+- **Notes:** reconstructed entry — numbers from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 7b: private class fields/methods via hidden properties
+
+- **Filter:** `language` (24 446 executable, 8 jobs) and `language/expressions` (11 164 files)
+- **Before:** 8 501 pass / 34.8 % (`language`); `language/expressions` 3 659 pass (32.8 %); `private fields are not supported` 1 492 (expressions)
+- **After:**  8 919 pass / 36.5 %; `language/expressions` 3 828 pass (34.3 %)
+- **Delta:** +418 pass, +1.7 pts on `language` (+169 on expressions); private-fields bucket 1 492 → 0
+- **Engine change:** 1925a29 — desugar `#x` to a hidden `"#x"` property on the class prototype (instance) / constructor (static); `PrivateFieldExpression`→`GetProperty`, `PrivateInExpression`→`In` on the hidden key; optional-chain private spines flattened
+- **Files:** `crates/v12-bccompiler/src/expr.rs`
+- **Bucket:** `private fields are not supported` — closed (but not brand-checked)
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8` + nextest 563
+- **Notes:** hidden-key emulation was not spec-correct; replaced by Step 7c. Reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 7a: triage `[object Object]` — render Test262Error plain objects
+
+- **Filter:** `language/expressions` (11 164 files)
+- **Before:** 3 659 pass / 32.8 %; opaque `threw: [object Object]` bucket 3 167 (not actionable)
+- **After:**  3 659 pass — unchanged by design; the 3 167 failures reclassified into actionable buckets
+- **Delta:** 0 pass — triage-only
+- **Engine change:** 416e1f3 — `to_display_string` renders plain-object thrown values via `message`/`name` shape lookup (harness-facing, no semantics change)
+- **Files:** `crates/v12-engine/src/engine.rs`, `crates/v12-interp/src/lib.rs`
+- **Bucket:** `threw: [object Object]` 3 167 → 0 — reclassified to `Expected a undefined to be thrown` 975, `abrupt completion` 205, `SameValue` mismatches, etc.
+- **Runner:** `cargo nextest run --workspace` 563 pass
+- **Notes:** reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 6: instanceof + prototype handling
+
+- **Filter:** `language/expressions` (11 164 files)
+- **Before:** `language` ~34.8 % (8 501, unchanged since Step 4); `non-object prototype` bucket 9; non-callable RHS unvalidated
+- **After:**  `language/expressions` 3 659 pass / 32.8 %; `language` ~34.8 % unchanged
+- **Delta:** `non-object prototype` 9 → 0
+- **Engine change:** b79bd4c — `op_instanceof` validates the RHS is callable per `OrdinaryHasInstance`, lazily materializes `Function.prototype` for realm placeholders, handles `null` prototypes
+- **Files:** `crates/v12-interp/src/lib.rs`
+- **Bucket:** `non-object prototype` — closed
+- **Runner:** `cargo nextest run --workspace` 563 pass
+- **Notes:** reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 5: native registry + minor syntax (BigInt, tagged templates, `with`, catch destructuring)
+
+- **Filter:** `language` (24 446 executable, 8 jobs)
+- **Before:** 8 501 pass / ~34.8 %; BigInt 147, tagged template 43, `with` 108; `ModuleImport is not registered` 306 (registry panic); nested-missing 115
+- **After:**  8 501 pass / ~34.8 % — pass unchanged; listed buckets closed or reclassified
+- **Delta:** BigInt 147 → 0, tagged 43 → 0, `with` 108 → 0; nested-missing 115 → 62 (684 → 62 cumulative); `ModuleImport` registered → 306 reclassified as 324 `dynamic import not supported` (proper TypeError, no panic)
+- **Engine change:** f198eca — `ModuleImport` native stub, BigInt literals → BigInt heap values, tagged template → desugared call, `with` → best-effort, catch destructuring via `lower_binding_pattern`
+- **Files:** `crates/v12-bccompiler/src/{expr,stmt,tests}.rs`, `crates/v12-engine/src/builtins/mod.rs`, `crates/v12-interp/src/lib.rs`
+- **Bucket:** BigInt / tagged template / `with` — closed; `dynamic import` now an honest TypeError
+- **Runner:** `cargo nextest run --workspace` 563 pass
+- **Notes:** reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 4: for-of complex assignment targets
+
+- **Filter:** `language/statements/for-of` (752 files) and `language` (24 446 executable, 8 jobs)
+- **Before:** 8 407 pass / 34.4 %; `for-of` slice 479 fail
+- **After:**  8 501 pass / 34.8 %; `for-of` slice 389 fail (363/752 pass)
+- **Delta:** +94 pass, +0.4 pts; for-of −90 fail
+- **Engine change:** f1482ae + c83e8a9 — `stmt.rs` `assign_for_of_value` handles array/object destructuring and member-expression targets (temp + recursion; defaults, rest via `CopyArrayRest`/`CopyObjectRest`, `member_parts` reuse)
+- **Files:** `crates/v12-bccompiler/src/{stmt,expr}.rs`
+- **Bucket:** `for-of` 479 → 389 — shrank
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8`
+- **Notes:** reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 3b: Object/Function/Array prototype methods
+
+- **Filter:** `language` (24 446 executable, 8 jobs)
+- **Before:** 8 321 pass / 34.0 %; `callee is not a function` 3 690
+- **After:**  8 407 pass / 34.4 %; `callee is not a function` 3 547
+- **Delta:** +86 pass, +0.4 pts; callee −143
+- **Engine change:** fbf70c4 — `Object.keys/values/entries/hasOwnProperty`, `Function.prototype.call/apply/bind/toString`, `Array.slice/sort`, plus `hasOwnProperty/valueOf/toString` fast paths on all objects
+- **Files:** `crates/v12-engine/src/builtins/{array,object,mod}.rs`, `crates/v12-interp/src/lib.rs`, `crates/v12-native/src/{id,methods}.rs`
+- **Bucket:** A `callee is not a function` — shrank (3 690 → 3 547)
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8`
+- **Notes:** reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 3a: Array.isArray + Object statics
+
+- **Filter:** `language` (24 446 executable, 8 jobs)
+- **Before:** 8 216 pass / 33.6 %; `callee is not a function` 4 518
+- **After:**  8 321 pass / 34.0 %; `callee is not a function` 3 690
+- **Delta:** +105 pass, +0.4 pts; callee −828
+- **Engine change:** 134138a — `Array.isArray` native 1106 + `Object.create`/`getPrototypeOf`/`defineProperty` fast paths in the interpreter
+- **Files:** `crates/v12-engine/src/builtins/{array,mod}.rs`, `crates/v12-interp/src/lib.rs`, `crates/v12-native/src/id.rs`
+- **Bucket:** A `callee is not a function` — shrank (4 518 → 3 690)
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8`
+- **Notes:** reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 2: collector walks nested functions in switch/new/chain/template
+
+- **Filter:** `language` (24 446 executable, 8 jobs)
+- **Before:** 8 066 pass / 33.0 %; `nested function missing from plans` 684
+- **After:**  8 216 pass / 33.6 %; nested-missing 115
+- **Delta:** +150 pass, +0.6 pts; nested-missing −569
+- **Engine change:** 661a781 — `collect.rs` walks `Switch`/`With`/`New`/`Template`/`Yield`/`Await` and destructuring assignment targets to register nested functions
+- **Files:** `crates/v12-bccompiler/src/collect.rs`
+- **Bucket:** `nested function missing from plans` 684 → 115 — shrank (→ 62 in Step 5)
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8`
+- **Notes:** reconstructed from git-log/CONTEXT.md history.
+
+### 2026-09-02 — Step 1 batch: private keys, extends null, new.target, super arrows, dynamic import
+
+- **Filter:** `language` (8 jobs)
+- **Before:** 4 858 pass / 19.9 % (2026-08-29 baseline over 24 873 files; intermediate 2026-08-30 score 7 561 / 32.1 % over 24 007)
+- **After:**  8 066 pass / 33.0 % (24 446 executable, 427 skipped)
+- **Delta:** +3 208 pass, +13.1 pts (executable denominator changed 24 873 → 24 446 between runs)
+- **Engine change:** cc8349d — PrivateIdentifier class keys, `extends null` skips SetPrototype, `GetNewTarget` opcode 63 + `Frame::new_target` (arrows inherit), dynamic `import()` desugared to the `NATIVE_IMPORT_INDEX` call; plus the harness deadline (7697d32 + 98c68c5) so runaway tests time out cleanly
+- **Files:** `crates/v12-bccompiler/src/{class,expr}.rs`, `crates/v12-bytecode/src/lib.rs`, `crates/v12-interp/src/lib.rs`, `conformance/harness/src/runner.rs`
+- **Bucket:** computed-property-names 0 → 17/48, new.target 0 → 7/14, dynamic-import 0 → 492/1066; exposed `private fields` 3 020 and `ModuleImport` 298 as the next buckets
+- **Runner:** `cargo run -p test262-runner -- --filter language --jobs 8`
+- **Notes:** numbers quoted verbatim from the cc8349d commit message; entry reconstructed from git-log.
+
 ### 2026-09-02 — Step 8 Number/Math globals + static/dynamic registry (DRY, zero-cost dispatch)
 
 - **Filter:** `language/expressions` (11 164 files) and `language` (11 190 files incl. annexB)
