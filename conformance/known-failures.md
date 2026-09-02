@@ -1,14 +1,12 @@
-# Known failures — last scored 2026-08-30
+# Known failures — last scored 2026-09-02
 
-> Latest run: `cargo run -p test262-runner -- --filter language --jobs 8 --format json --json-out /tmp/t262.json`
-> Totals: **24 007 tests, 7 561 pass / 16 019 fail / 427 skip, 32.1 % pass** over `test/language`.
+> Latest verified run: `cargo run -p test262-runner -- --filter language/expressions --jobs 4 --format json`
+> Totals: **11 190 tests, 4 047 pass / 6 960 fail / 183 skip, 36.8 % pass** over `language/expressions` (+ annexB).
 > Treatment: `pass%` is over executable tests (`pass + fail`). Skips are not counted.
-> Since the 2026-08-29 score (19.9 %): the iterator protocol + `for-of`, the
-> RegExp runtime, and the unified native dispatch landed (+12.2 pts).
->
-> The assignment-expression slice (`--filter language/expressions/assignment`, 818 files)
-> on the same build: **411 pass / 405 fail / 2 skip, 50.4 % pass** (baseline 49.5 %).
-> See `fix-log.md` for the burn-down log. Move a bucket there when green.
+> After Step 8 (Number/Math globals + static registry, `24e838f`) and the harness
+> sta.js/assert.js always-prepend fix. The full `language` run still times out in CI;
+> the last completed full-language score was 8 919 / 24 446 / 427 skip, 36.5 % (Step 7b).
+> Baseline was 19.9 % (4 858) on 2026-08-29. See `fix-log.md` for the burn-down log.
 
 This file is the fix-it queue. Each bullet is a bucket — a single engine gap that, once closed, will flip a visible swath of red to green. Keep the buckets small and ordered by estimated lift.
 
@@ -20,27 +18,50 @@ This file is the fix-it queue. Each bullet is a bucket — a single engine gap t
 
 ## Buckets
 
-### A. `unsupported expression` — 12 625 failures, new largest bucket (was #5)
+### A. `callee is not a function` — 2 138 failures, two root causes identified (2026-09-02)
 
-- **Symptom:** `threw: unsupported expression` from `v12-bccompiler` Tier coverage limits. Dominates every large suite: `expressions` (6 840 fail), `statements` (5 302), plus all of annexB/eval-code.
-- **Filter reproducing it:** `--filter language --verbose | head -n 50`.
-- **Scope:** getters/setters & object methods (`object methods / accessors are not supported`, ×56), RegExp literals ×47, class declarations ×25 — but the bulk is unnamed expression-kind gaps; must be split by sub-suite before fixing.
-- **Fix location:** crates/v12-bccompiler/src/expr.rs Tier coverage docs + v12-interp dispatch tables. Work smallest surface first (`computed-property-names` still 0/48).
-- **Gating:** each closed expression kind flips its sub-suite visibly on the per-suite table.
+- **Symptom:** `TypeError: callee is not a function`. Top bucket on `language/expressions`. Two independent causes:
 
-### B. `too many functions/constants` — 1 303 failures (successor of old #2)
+**A1. The `Function` intrinsic is not a global** — `typeof Function === "undefined"`, so Test262's `propertyHelper.js` throws at load on its third line of executable code (`var __join = Function.prototype.call.bind(Array.prototype.join);`). Every test declaring `includes: [propertyHelper.js]` dies before its body runs.
+  - **Count:** class/elements 735, object/method-definition 66, class/gen-method-* etc. — roughly 800+ of the callee bucket.
+  - **Repro:** `cargo run -p test262-runner -- --filter language/expressions/class/elements/after-same-line-gen-literal-names --jobs 1`; standalone: concatenate `harness/propertyHelper.js` + `verifyProperty({}, "x", {value: 1})` and run through `v12`.
+  - **Fix location:** `crates/v12-interp/src/lib.rs` `GLOBAL_INTRINSIC_NAMES` (+ `intrinsic_slot`) and `crates/v12-engine/src/realm.rs` — materialize a `Function` constructor object (kind Function, `prototype` → the existing `function_proto` target, `length`/`name` own properties) and push it as a new intrinsic slot (bump `GLOBAL_VAR_OFFSET`). `Function.prototype.call.bind(...)` then resolves through the existing function-method surface.
 
-- **Symptom:** was a panic at collect.rs:706 (`attempt to add with overflow`, caught as engine panic); since `262aed8` it is a clean compile error, but the index counters still saturate on large files.
-- **Fix location:** widen counters, dedupe constants in plans, or spill to a second plan segment. Zero panics now, so this is purely a capacity fix.
+**A2. Parameter-default register bug** — inside a function whose parameter list destructures with a default (`([arrow = () => {}]) => …`), a member read on the destructured binding (`arrow.name`) makes **every subsequent call in that body** throw `callee is not a function` (callee register clobbered by the member-read temp). Without the member read, calls resolve fine.
+  - **Count:** class/dstr 376, object/dstr 95, async-generator/dstr 84, arrow/function/generators/assignment dstr ~110.
+  - **Repro:** `var f = ([a = () => {}]) => { var n = a.x; return assert.sameValue(1, 2); }; f([]);` → throws; delete `var n = a.x;` → throws `Test262Error` (correct).
+  - **Fix location:** `crates/v12-bccompiler/src/{expr,collect}.rs` — parameter-default lowering / register allocation for member expressions on destructured bindings.
 
-### C. Remaining skips — 427 skips (async now executable)
+### B. `Expected a undefined to be thrown but no exception was thrown at all` — 975 failures
 
-- **Counts at f9dd7de:** async harness 0 (was 4 883 at f47ec78) — generators + async/await now executable via `__test262Prints` capture + `run_jobs` drain. `$262` host object skips are also gone except multi-realm/agent. Remaining skips are only `createRealm(` (multi-realm), `$262.agent`, and `$DONE` without async flag.
-- **Progress (2026-08-29, this commit):** async skip removed from `skip_reason_for` in `conformance/harness/src/runner.rs:322`. `cargo run -p test262-runner -- --filter language --jobs 8 --format json --json-out /tmp/t262.json` now reports **4 858 pass / 19 588 fail / 427 skip, 19.9 % pass** (was 4 940 / 14 972 / 4 961, 24.8 %). Delta: −82 pass, +4 616 fail, −4 534 skip — the ~4.5k formerly-skipped async tests became executable; most fail on remaining gaps (`yield*`, `for-await-of`, promise reaction jobs).
-- **Remaining gaps for async pass%:** `yield*` delegation and `for-await-of` are tracked under bucket A (`unsupported expression`); promise reaction jobs already drain via `run_jobs` but some async tests still need fuller job coverage.
-- **Note:** Skips do not count toward the `pass%` denominator; un-skipping lowers pass% transiently until the newly-exposed failures are fixed.
+- **Symptom:** negative tests (early SyntaxError/TypeError violations) execute successfully instead of throwing. The engine lacks the corresponding early-error validations.
+- **Filter:** `cargo run -p test262-runner -- --filter language/expressions --jobs 4 --format json` then group by message; split by sub-suite (class/strict/eval-arguments…) before fixing.
+
+### C. `dynamic import not supported in this context` — 324 failures
+
+- **Symptom:** `import()` desugars to the registered `ModuleImport` native stub, which throws a proper TypeError. Needs the real dynamic-import path: module resolution + job-queue-backed promise.
+- **Filter:** `--filter language/expressions/dynamic-import --jobs 4`.
+- **Fix location:** `crates/v12-engine/src/builtins/mod.rs` (`ModuleImport` stub) + the ESM loader.
+
+### D. Assertion-detail mismatches (SameValue / boolean) — ~800 failures combined
+
+- **Symptom:** `Expected SameValue(«0», «1») to be true` 264, `Expected true but got false` 143, `Expected SameValue(«undefined», «23»)` 137, `Expected SameValue(«[object Object]», «23»)` 120, etc. Engine semantics gaps, one sub-suite at a time (value coercion, property attributes, Number formatting).
+- **Note:** group by test path before fixing; this is a queue of small fixes, not one gap.
+
+### E. Iterator/async semantics — ~300 failures combined
+
+- **Symptom:** `abrupt completion closes iter` 205 (IteratorClose on abrupt completion), plus `yield*`/for-await gaps.
+- **Fix location:** `crates/v12-interp/src/lib.rs` `op_iterator_close` + compiler lowering.
+
+### F. Remaining type errors — ~430 failures combined
+
+- **Symptom:** `TypeError: not a function` 174, `cannot set properties of null or undefined` 142, `right-hand side of 'instanceof' is not an object` 114. Mostly downstream of A/B gaps.
 
 ## Done (moved out of the queue)
+
+### ~~`unsupported expression` (12 625)~~ — closed as a bucket by Steps 1–8 (2026-09-02)
+
+- The compiler-coverage mega-bucket was burned down through the Step 1–8 passes: collector walks (Step 2), Array/Object/Function builtins (Step 3a/b), for-of destructuring (Step 4), BigInt/tagged templates/`with` (Step 5), instanceof (Step 6), private fields (Step 7b/c), Number/Math globals (Step 8). Residual per-feature gaps live in buckets A–F above.
 
 ### D5. ~~Loose equality number↔string coercion~~ — **closed** (found by the differential suite, e4902d4)
 

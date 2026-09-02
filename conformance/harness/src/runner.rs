@@ -171,18 +171,19 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
         // Determine which harness files to load.
         let mut includes_to_load = frontmatter.includes.clone();
 
-        // Auto-inject default harness when the test uses assert/Test262Error
-        // but lists no includes (common in older Sputnik-era tests). This
-        // keeps the bootstrap useful without silently masking real include
-        // errors — we only inject when the explicit list is empty.
-        if includes_to_load.is_empty() && !frontmatter.has_flag("raw") {
-            let needs_assert = test_body.contains("assert.")
-                || test_body.contains("Test262Error")
-                || test_body.contains("$DONOTEVALUATE");
-            if needs_assert {
-                includes_to_load.push("sta.js".to_string());
-                includes_to_load.push("assert.js".to_string());
+        // sta.js and assert.js are implicitly included in every non-raw test
+        // (official test262 runner semantics): `Test262Error` lives in sta.js,
+        // `assert` in assert.js, and declared helpers such as
+        // propertyHelper.js rely on both. Prepend them ahead of the declared
+        // list, deduped so an explicit entry still loads once.
+        if !frontmatter.has_flag("raw") {
+            let mut with_defaults = vec!["sta.js".to_string(), "assert.js".to_string()];
+            for inc in &includes_to_load {
+                if !with_defaults.contains(inc) {
+                    with_defaults.push(inc.clone());
+                }
             }
+            includes_to_load = with_defaults;
         }
 
         if includes_to_load.is_empty() {
@@ -698,6 +699,10 @@ mod tests {
         ));
         let _ = fs::create_dir_all(tmp.join("test").join("language"));
         let _ = fs::create_dir_all(tmp.join("harness"));
+        // Non-raw tests always load sta.js/assert.js (official test262
+        // semantics), so the fixtures must provide them.
+        let _ = fs::write(tmp.join("harness").join("sta.js"), "");
+        let _ = fs::write(tmp.join("harness").join("assert.js"), "");
         let cfg = HarnessConfig::new(tmp.clone());
         (cfg, tmp)
     }

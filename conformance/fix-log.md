@@ -24,6 +24,18 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-02 — Harness: always load sta.js/assert.js for non-raw tests
+
+- **Filter:** `language/expressions` (11 190 files, 4 jobs)
+- **Before:** 4 022 pass / 6 985 fail / 183 skip, 36.5 %
+- **After:**  4 047 pass / 6 960 fail / 183 skip, 36.8 %
+- **Delta:** +25 pass, −25 fail, +0.2 pts — harness-only, no engine semantics change
+- **Engine change:** none — `conformance/harness/src/runner.rs` now prepends `sta.js`+`assert.js` to every non-raw test's include list (official test262 runner semantics), instead of only when the test declares no includes. Tests declaring e.g. `propertyHelper.js` previously ran without `Test262Error`/`assert`, so every failing assertion died as `TypeError: callee is not a function` (`new Test262Error(…)` on an undefined global) instead of a scored harness error.
+- **Files:** `conformance/harness/src/runner.rs` (include assembly; `tmp_config` fixtures now provide sta.js/assert.js)
+- **Bucket:** reclassified scattered assert-artifact failures into the real buckets (`Expected a undefined to be thrown`, SameValue mismatches)
+- **Runner:** `cargo run -p test262-runner -- --filter language/expressions --jobs 4 --format json` (4 047/6 960/183) + `cargo nextest run --workspace` 563 pass
+- **Notes:** the remaining `callee is not a function` 2 138 failures have two engine root causes, documented as buckets A1/A2 in `known-failures.md`: the missing `Function` global (propertyHelper.js cannot load) and the parameter-default member-read register bug.
+
 > Steps 1–7c below were reconstructed on 2026-09-02 from git-log commit messages and
 > CONTEXT.md history after a workspace reset wiped the original backfill entries
 > (see the Step 8 notes and the CONTEXT.md incident note). Numbers are the ones
