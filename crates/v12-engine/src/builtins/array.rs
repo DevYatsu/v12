@@ -105,6 +105,41 @@ pub fn array_is_array(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Res
     Ok(if is { JsValue::true_() } else { JsValue::false_() })
 }
 
+pub fn array_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "Array.prototype.slice", None)?;
+    let elems: Vec<JsValue> = if heap.get(obj).kind == v12_heap::Kind::Array { heap.get(obj).elements_array.iter().collect() } else { heap.get(obj).elements.clone() };
+    let len = elems.len() as i64;
+    let to_idx = |v: JsValue| -> i64 {
+        if v.is_undefined() { return 0; }
+        let n = v.as_smi().map(|s| i64::from(s)).or_else(|| v.as_f64().map(|f| f.trunc() as i64)).unwrap_or(0);
+        n
+    };
+    let start = if args.is_empty() { 0 } else { let n=to_idx(args[0]); if n<0 { (len+n).max(0) } else { n.min(len) } };
+    let end = if args.len()<2 || args[1].is_undefined() { len } else { let n=to_idx(args[1]); if n<0 { (len+n).max(0) } else { n.min(len) } };
+    let slice = if start>=end { Vec::new() } else { elems[start as usize..end as usize].to_vec() };
+    let arr = heap.alloc(JsObject::array(slice));
+    heap.add_root(JsValue::object(arr));
+    Ok(JsValue::object(arr))
+}
+
+pub fn array_sort(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "Array.prototype.sort", None)?;
+    let mut elems: Vec<JsValue> = if heap.get(obj).kind == v12_heap::Kind::Array { heap.get(obj).elements_array.iter().collect() } else { heap.get(obj).elements.clone() };
+    // Filter holes (undefined) to end per spec simplified: keep order for undefined.
+    elems.retain(|v| !v.is_undefined() && !v.is_hole());
+    elems.sort_by(|a,b| helpers::value_text(heap, *a).cmp(&helpers::value_text(heap, *b)));
+    // write back
+    if heap.get(obj).kind == v12_heap::Kind::Array {
+        let h = heap.get_mut(obj);
+        h.elements_array = v12_heap::ElementsArray::new();
+        for (i, v) in elems.iter().enumerate() { h.elements_array.set(i as u32, *v); }
+        h.elements = elems;
+    } else {
+        heap.get_mut(obj).elements = elems;
+    }
+    Ok(this)
+}
+
 fn sync_length(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
     let key = length_prop(heap);
     let shape = heap.root_shape();

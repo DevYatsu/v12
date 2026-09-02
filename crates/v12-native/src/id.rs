@@ -18,10 +18,20 @@ pub enum NativeId {
     ObjectGetPrototypeOf = 1001,
     ObjectDefineProperty = 1002,
     ObjectEnumerableOwnKeys = 1003,
+    ObjectKeys = 1004,
+    ObjectValues = 1005,
+    ObjectEntries = 1006,
+    ObjectHasOwnProperty = 1007,
+    ObjectProtoToString = 1008,
+    ObjectProtoValueOf = 1009,
     // Array
     ArrayPush = 1100,
     ArrayPop = 1101,
     ArrayJoin = 1102,
+    ArraySlice = 1107,
+    ArraySort = 1108,
+    ArrayForEach = 1109,
+    ArrayMap = 1110,
     ArrayIsArray = 1106,
     ArrayIterator = 1103,
     ArrayIteratorEntries = 1104,
@@ -42,6 +52,10 @@ pub enum NativeId {
     // Eval / function / console
     Eval = 1800,
     Function = 1801,
+    FunctionCall = 1802,
+    FunctionApply = 1803,
+    FunctionBind = 1804,
+    FunctionProtoToString = 1805,
     ConsoleLog = 1900,
     // Promise
     PromiseResolve = 1710,
@@ -141,6 +155,6 @@ mod tests {
         assert!(NativeId::try_from(999).is_err());
         assert!(NativeId::try_from(0xFFFF_FFFF).is_err());
         // A gap in the explicit discriminants is not a valid id.
-        assert!(NativeId::try_from(1004).is_err());
+        assert!(NativeId::try_from(1010).is_err());
     }
 }

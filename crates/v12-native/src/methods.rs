@@ -44,6 +44,8 @@ crate::builtin_methods! {
         push => ArrayPush,
         pop => ArrayPop,
         join => ArrayJoin,
+        slice => ArraySlice,
+        sort => ArraySort,
         entries => ArrayIteratorEntries,
         keys => ArrayIteratorKeys,
         values => ArrayIterator,
