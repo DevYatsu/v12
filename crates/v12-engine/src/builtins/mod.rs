@@ -311,171 +311,98 @@ fn builtin_install_prop(
     heap.get_mut(obj).property_keys.push(Some(key));
 }
 
+/// Allocates the native function object for `id` and installs it as a
+/// shape-bound property `name` on `target`.
+///
+/// A `None` target installs nothing: optional constructors that this realm
+/// has not materialized, and the reserved future hosts (`Json`, `Map`, …)
+/// whose target fields do not exist yet. This is the one install shape —
+/// every `__builtin_emit_install!` arm routes through it.
+pub(crate) fn install_native(
+    heap: &mut Heap,
+    target: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    name: &str,
+    id: NativeId,
+) {
+    let Some(obj) = target else { return };
+    let func = heap.alloc(v12_heap::JsObject {
+        kind: v12_heap::Kind::Function,
+        callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+        ..Default::default()
+    });
+    heap.add_root(JsValue::object(func));
+    builtin_install_prop(heap, obj, name, JsValue::object(func));
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __builtin_emit_install {
-    (Global, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let func = $heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::Kind::Function,
-            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-            ..Default::default()
-        });
-        $heap.add_root(JsValue::object(func));
-        $crate::builtins::builtin_install_prop(
-            $heap,
-            $targets.global,
-            $name,
-            JsValue::object(func),
-        );
-    }};
-    (Math, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        if let Some(obj) = $targets.math {
-            let func = $heap.alloc(v12_heap::JsObject {
-                kind: v12_heap::Kind::Function,
-                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-                ..Default::default()
-            });
-            $heap.add_root(JsValue::object(func));
-            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
-        }
-    }};
-    (Number, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        if let Some(obj) = $targets.number {
-            let func = $heap.alloc(v12_heap::JsObject {
-                kind: v12_heap::Kind::Function,
-                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-                ..Default::default()
-            });
-            $heap.add_root(JsValue::object(func));
-            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
-        }
-    }};
-    (NumberProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let func = $heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::Kind::Function,
-            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-            ..Default::default()
-        });
-        $heap.add_root(JsValue::object(func));
-        $crate::builtins::builtin_install_prop(
-            $heap,
-            $targets.number_proto,
-            $name,
-            JsValue::object(func),
-        );
-    }};
-    (StringProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let func = $heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::Kind::Function,
-            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-            ..Default::default()
-        });
-        $heap.add_root(JsValue::object(func));
-        $crate::builtins::builtin_install_prop(
-            $heap,
-            $targets.string_proto,
-            $name,
-            JsValue::object(func),
-        );
-    }};
-    (Json, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (Array, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        if let Some(obj) = $targets.array {
-            let func = $heap.alloc(v12_heap::JsObject {
-                kind: v12_heap::Kind::Function,
-                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-                ..Default::default()
-            });
-            $heap.add_root(JsValue::object(func));
-            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
-        }
-    }};
-    (ArrayProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let func = $heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::Kind::Function,
-            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-            ..Default::default()
-        });
-        $heap.add_root(JsValue::object(func));
-        $crate::builtins::builtin_install_prop(
-            $heap,
-            $targets.array_proto,
-            $name,
-            JsValue::object(func),
-        );
-    }};
-    (Object, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        if let Some(obj) = $targets.object {
-            let func = $heap.alloc(v12_heap::JsObject {
-                kind: v12_heap::Kind::Function,
-                callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-                ..Default::default()
-            });
-            $heap.add_root(JsValue::object(func));
-            $crate::builtins::builtin_install_prop($heap, obj, $name, JsValue::object(func));
-        }
-    }};
-    (ObjectProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let func = $heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::Kind::Function,
-            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-            ..Default::default()
-        });
-        $heap.add_root(JsValue::object(func));
-        $crate::builtins::builtin_install_prop(
-            $heap,
-            $targets.object_proto,
-            $name,
-            JsValue::object(func),
-        );
-    }};
-    (FunctionProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let func = $heap.alloc(v12_heap::JsObject {
-            kind: v12_heap::Kind::Function,
-            callable: v12_heap::FunctionTarget::Bytecode(u32::from($id)),
-            ..Default::default()
-        });
-        $heap.add_root(JsValue::object(func));
-        $crate::builtins::builtin_install_prop(
-            $heap,
-            $targets.function_proto,
-            $name,
-            JsValue::object(func),
-        );
-    }};
-    // Reserved future hosts — no installs yet, keep exhaustive.
-    (BooleanProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (ErrorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (RegExp, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (RegExpProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (Map, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (MapProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (Set, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (SetProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (Iterator, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
-    (IteratorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {{
-        let _ = ($heap, $targets, $name, $id);
-    }};
+    // Plain-handle targets: the prototype/singleton always exists.
+    (Global, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.global), $name, $id)
+    };
+    (NumberProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.number_proto), $name, $id)
+    };
+    (StringProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.string_proto), $name, $id)
+    };
+    (ArrayProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.array_proto), $name, $id)
+    };
+    (ObjectProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.object_proto), $name, $id)
+    };
+    (FunctionProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.function_proto), $name, $id)
+    };
+    // Optional constructor targets: skipped until the realm materializes them.
+    (Math, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.math, $name, $id)
+    };
+    (Number, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.number, $name, $id)
+    };
+    (Array, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.array, $name, $id)
+    };
+    (Object, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.object, $name, $id)
+    };
+    // Reserved future hosts — no target field yet, nothing to install.
+    (Json, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (BooleanProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (ErrorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (RegExp, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (RegExpProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (Map, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (MapProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (Set, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (SetProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (Iterator, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    (IteratorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, None, $name, $id)
+    };
 }
 
 /// Unified builtin declaration: single source of truth for dispatch + install.
@@ -531,8 +458,8 @@ macro_rules! define_builtins {
 
         /// Installs all grouped built-ins as shape-bound properties. This is
         /// the only install path — there is no `BUILTIN_INSTALLS` array. Each
-        /// grouped entry expands to a straight-line `install_prop` call, so the
-        /// compiler can inline and no rodata table is emitted.
+        /// grouped entry expands to a straight-line [`install_native`] call,
+        /// so the compiler can inline and no rodata table is emitted.
         pub fn install_builtins(heap: &mut Heap, targets: &BuiltinTargets) {
             $( $( $crate::__builtin_emit_install!($target, heap, targets, $name, NativeId::$id); )* )*
             // Bare ids are dispatch-only; silence unused warnings.

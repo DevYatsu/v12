@@ -250,6 +250,16 @@ fn intrinsic_slot(text: &str) -> Option<usize> {
     }
 }
 
+/// The internal-slot property reads on a RegExp object, in the order the
+/// realm materializes them in the object's `properties` vector (`source`,
+/// `flags`, `lastIndex`). Match on this enum, never on the raw slot numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegExpSlot {
+    Source,
+    Flags,
+    LastIndex,
+}
+
 /// Compile-time guard: every name in [`GLOBAL_INTRINSIC_NAMES`] must resolve
 /// identically to its array position. `Iterator::all`, `match` on `&str`, and
 /// `PartialEq` as a const trait (for `str`/`Option`) are not const-stable in
@@ -3397,305 +3407,447 @@ impl<'a> Interp<'a> {
         key_v: JsValue,
     ) -> Result<JsValue, JSException> {
         // Primitives have no wrappers yet: reads yield undefined, matching
-        // real JS minus the built-ins that would populate the wrappers.
-        // String primitives get the regexp method surface (`match`/`replace`/
-        // `search`/`split`) synthesized structurally.
+        // real JS minus the built-ins that would populate the wrappers
+        // (string primitives do get the regexp method surface).
         let Some(obj) = obj_v.as_object() else {
-            if obj_v.is_string() {
-                // String primitives get the regexp method surface
-                // (`match`/`replace`/`search`/`split`) from the const method
-                // table (the `StringPrim` pseudo-kind).
-                if let Some(id) = self.method_native(Kind::StringPrim, key_v) {
-                    return Ok(self.map_set_method(id));
-                }
-            }
-            return Ok(JsValue::undefined());
+            return self.string_prim_surface(obj_v, key_v);
         };
+        // Structural fast-path surfaces, probed in a fixed order. Each helper
+        // recognizes one `(receiver, key)` surface and answers the read, or
+        // returns `None` to defer to the next; the shape-bound lookup with the
+        // inline cache runs only when no surface matches.
+        if let Some(answer) = self.console_log_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.symbol_iterator_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.promise_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.object_statics_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.generator_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.well_known_iterator_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.iterator_method_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.regexp_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.array_statics_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.function_method_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.object_proto_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.regexp_prototype_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.array_instance_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.element_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.map_set_surface(obj, key_v) {
+            return answer;
+        }
+        self.ic_lookup(site_fn, site_pc, obj, key_v)
+    }
 
-        // Fast path for `console.log`: locate the console intrinsic by name
-        // (its position in the global's property prefix), so adding
-        // intrinsics cannot drift these indices. When the lookup is for
-        // `"log"` on that object, synthesize the native function.
+    /// String primitives synthesize the regexp method surface (`match`/
+    /// `replace`/`search`/`split`) from the const method table (the
+    /// `StringPrim` pseudo-kind); other primitives read `undefined`.
+    fn string_prim_surface(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        if obj_v.is_string()
+            && let Some(id) = self.method_native(Kind::StringPrim, key_v)
+        {
+            return Ok(self.map_set_method(id));
+        }
+        Ok(JsValue::undefined())
+    }
+
+    /// `console.log` — the console intrinsic is located by name in the
+    /// global's property prefix (adding intrinsics cannot drift the index);
+    /// a `"log"` read on that object synthesizes the native function.
+    fn console_log_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
         let console_idx = CONSOLE_IDX;
-        let console_obj_opt = if let (Some(g), Some(idx)) = (self.global, console_idx) {
-            let val_opt = {
-                let heap = &*self.heap;
-                heap.get(g).properties.get(idx).copied()
-            };
-            val_opt.and_then(|v| v.as_object())
+        let (Some(g), Some(console_idx)) = (self.global, console_idx) else {
+            return None;
+        };
+        let console_obj = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(console_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != console_obj || !self.key_is(key_v, "log") {
+            return None;
+        }
+        Some(Ok(self.console_log_fn()))
+    }
+
+    /// `Symbol.iterator` — reading the well-known symbol off the `Symbol`
+    /// intrinsic (found by name in the global's property prefix) yields
+    /// the realm's singleton symbol value.
+    fn symbol_iterator_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let symbol_idx = SYMBOL_IDX;
+        let (Some(g), Some(symbol_idx)) = (self.global, symbol_idx) else {
+            return None;
+        };
+        let symbol_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(symbol_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != symbol_ctor || !self.key_is(key_v, "iterator") {
+            return None;
+        }
+        Some(Ok(JsValue::symbol(self.symbol_iterator_key())))
+    }
+
+    /// The Promise surface. Natives cannot attach shape-bound properties
+    /// (shape binding is interpreter state), so these reads are recognized
+    /// structurally:
+    /// - `Promise.resolve` / `Promise.reject` on the Promise constructor
+    ///   (located by name in the duplicated `GLOBAL_INTRINSIC_NAMES`).
+    /// - `then` on any object whose prototype is the Promise constructor's
+    ///   `prototype` link — the realm installs that link, and the engine's
+    ///   promise built-ins give every promise instance the same prototype.
+    fn promise_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let promise_idx = PROMISE_IDX;
+        let (Some(g), Some(promise_idx)) = (self.global, promise_idx) else {
+            return None;
+        };
+        let promise_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(promise_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj == promise_ctor {
+            if self.key_is(key_v, "resolve") {
+                return Some(Ok(self.cached_native(NativeId::PromiseResolve)));
+            }
+            if self.key_is(key_v, "reject") {
+                return Some(Ok(self.cached_native(NativeId::PromiseReject)));
+            }
+            return None;
+        }
+        if self.key_is(key_v, "then")
+            && self.heap.get(obj).prototype.is_some()
+            && self.heap.get(obj).prototype == self.heap.get(promise_ctor).prototype
+        {
+            return Some(Ok(self.cached_native(NativeId::PromiseThen)));
+        }
+        None
+    }
+
+    /// Static methods on the `Object` constructor: `create`/
+    /// `getPrototypeOf`/`defineProperty`/`enumerableOwnKeys` and the
+    /// `keys`/`values`/`entries` trio. The constructor is the global's first
+    /// intrinsic slot (`OBJECT_IDX`).
+    fn object_statics_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let object_idx = OBJECT_IDX;
+        let (Some(g), Some(object_idx)) = (self.global, object_idx) else {
+            return None;
+        };
+        let object_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(object_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != object_ctor {
+            return None;
+        }
+        if self.key_is(key_v, "enumerableOwnKeys") {
+            return Some(Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys)));
+        }
+        let constant = if self.key_is(key_v, "create") {
+            NativeId::ObjectCreate
+        } else if self.key_is(key_v, "getPrototypeOf") {
+            NativeId::ObjectGetPrototypeOf
+        } else if self.key_is(key_v, "defineProperty") {
+            NativeId::ObjectDefineProperty
+        } else if self.key_is(key_v, "keys") {
+            NativeId::ObjectKeys
+        } else if self.key_is(key_v, "values") {
+            NativeId::ObjectValues
+        } else if self.key_is(key_v, "entries") {
+            NativeId::ObjectEntries
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+    /// Generator instances expose `next`/`return`/`throw` as synthesized
+    /// natives.
+    fn generator_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Generator {
+            return None;
+        }
+        let constant = if self.key_is(key_v, "next") {
+            NativeId::GeneratorNext
+        } else if self.key_is(key_v, "return") {
+            NativeId::GeneratorReturn
+        } else if self.key_is(key_v, "throw") {
+            NativeId::GeneratorThrow
+        } else {
+            return None;
+        };
+        Some(Ok(self.cached_native(constant)))
+    }
+
+    /// `obj[Symbol.iterator]` — the well-known symbol key is a symbol
+    /// value, not a string; recognize it by comparing against the cached
+    /// realm symbol handle, then pick the iterator constructor by receiver
+    /// kind. Returns a synthesized native function that creates an iterator
+    /// over `obj`.
+    fn well_known_iterator_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if !self.key_is_symbol_iterator(key_v) {
+            return None;
+        }
+        let constant = match self.heap.get(obj).kind {
+            Kind::Array | Kind::Arguments => crate::NATIVE_ARRAY_ITERATOR,
+            Kind::Map => crate::NATIVE_MAP_ITERATOR,
+            Kind::Set => crate::NATIVE_SET_ITERATOR,
+            Kind::Iterator | Kind::Generator => crate::NATIVE_ITERATOR_SELF,
+            _ => return None,
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// `%IteratorPrototype%`-family instances resolve `next` from the const
+    /// method table.
+    fn iterator_method_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Iterator {
+            return None;
+        }
+        let id = self.method_native(Kind::Iterator, key_v)?;
+        Some(Ok(self.map_set_method(id)))
+    }
+
+    /// RegExp object surface: methods `exec`/`test`/`toString`/`compile`
+    /// from the const table, and the `source`/`flags`/`lastIndex` property
+    /// reads (internal slots).
+    fn regexp_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::RegExp {
+            return None;
+        }
+        if let Some(id) = self.method_native(Kind::RegExp, key_v) {
+            return Some(Ok(self.map_set_method(id)));
+        }
+        let slot = self.regexp_slot(key_v)?;
+        let value = self.heap.get(obj).properties.get(slot as usize).copied()?;
+        Some(Ok(value))
+    }
+
+    /// Which internal-slot property a key names on a RegExp object. Slots
+    /// live at fixed positions in `properties` (see [`RegExpSlot`]).
+    fn regexp_slot(&mut self, key_v: JsValue) -> Option<RegExpSlot> {
+        if self.key_is(key_v, "source") {
+            Some(RegExpSlot::Source)
+        } else if self.key_is(key_v, "flags") {
+            Some(RegExpSlot::Flags)
+        } else if self.key_is(key_v, "lastIndex") {
+            Some(RegExpSlot::LastIndex)
         } else {
             None
-        };
-        if let Some(console_obj) = console_obj_opt
-            && obj == console_obj
-            && let Some(handle) = key_v.as_string()
-        {
-            let is_log = {
-                self.heap.flatten(handle);
-                match &self.heap.get(handle).storage {
-                    v12_heap::StrStorage::Latin1(bytes) => bytes == b"log",
-                    v12_heap::StrStorage::Utf16(units) => {
-                        units.len() == 3 && units[0] == 108 && units[1] == 111 && units[2] == 103
-                    }
-                    _ => false,
-                }
-            };
-            if is_log {
-                return Ok(self.console_log_fn());
-            }
         }
-
-        // `Symbol.iterator` — reading the well-known symbol off the `Symbol`
-        // intrinsic (found by name in the global's property prefix) yields
-        // the realm's singleton symbol value.
-        let symbol_idx = SYMBOL_IDX;
-        if let (Some(g), Some(symbol_idx)) = (self.global, symbol_idx)
-            && let Some(symbol_ctor) = {
-                let heap = &*self.heap;
-                heap.get(g)
-                    .properties
-                    .get(symbol_idx)
-                    .and_then(|v| v.as_object())
-            }
-            && obj == symbol_ctor
-            && self.key_is(key_v, "iterator")
-        {
-            return Ok(JsValue::symbol(self.symbol_iterator_key()));
-        }
-
-        // Fast paths for the Promise surface and the array `push`/`join`
-        // methods, mirroring the `console.log` synthesis above. Natives cannot
-        // attach shape-bound properties (shape binding is interpreter state),
-        // so these reads are recognized structurally:
-        // - `Promise.resolve` / `Promise.reject` on the Promise constructor
-        //   (located by name in the duplicated `GLOBAL_INTRINSIC_NAMES`).
-        // - `then` on any object whose prototype is the Promise constructor's
-        //   `prototype` link — the realm installs that link, and the engine's
-        //   promise built-ins give every promise instance the same prototype.
-        // - `push` / `join` on array-kind objects.
-        let promise_idx = PROMISE_IDX;
-        if let (Some(g), Some(promise_idx)) = (self.global, promise_idx) {
-            let promise_ctor = {
-                let heap = &*self.heap;
-                heap.get(g)
-                    .properties
-                    .get(promise_idx)
-                    .and_then(|v| v.as_object())
-            };
-            if let Some(promise_ctor) = promise_ctor {
-                if obj == promise_ctor {
-                    if self.key_is(key_v, "resolve") {
-                        return Ok(self.cached_native(NativeId::PromiseResolve));
-                    }
-                    if self.key_is(key_v, "reject") {
-                        return Ok(self.cached_native(NativeId::PromiseReject));
-                    }
-                } else if self.key_is(key_v, "then")
-                    && self.heap.get(obj).prototype.is_some()
-                    && self.heap.get(obj).prototype == self.heap.get(promise_ctor).prototype
-                {
-                    return Ok(self.cached_native(NativeId::PromiseThen));
-                }
-            }
-            // Fast paths for Object static methods on the Object constructor.
-            let object_ctor = self
-                .heap
-                .get(g)
-                .properties
-                .first()
-                .and_then(|v| v.as_object());
-            if let Some(object_ctor) = object_ctor
-                && obj == object_ctor
-            {
-                if self.key_is(key_v, "enumerableOwnKeys") {
-                    return Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys));
-                }
-                if self.key_is(key_v, "create") {
-                    return Ok(self.map_set_method(NativeId::ObjectCreate));
-                }
-                if self.key_is(key_v, "getPrototypeOf") {
-                    return Ok(self.map_set_method(NativeId::ObjectGetPrototypeOf));
-                }
-                if self.key_is(key_v, "defineProperty") {
-                    return Ok(self.map_set_method(NativeId::ObjectDefineProperty));
-                }
-            }
-        }
-        if self.heap.get(obj).kind == Kind::Generator {
-            if self.key_is(key_v, "next") {
-                return Ok(self.cached_native(NativeId::GeneratorNext));
-            }
-            if self.key_is(key_v, "return") {
-                return Ok(self.cached_native(NativeId::GeneratorReturn));
-            }
-            if self.key_is(key_v, "throw") {
-                return Ok(self.cached_native(NativeId::GeneratorThrow));
-            }
-        }
-        // `obj[Symbol.iterator]` — the well-known symbol key is a symbol
-        // value, not a string; recognize it by comparing against the cached
-        // realm symbol handle. Returns a synthesized native function that
-        // creates an iterator over `obj`.
-        if self.key_is_symbol_iterator(key_v) {
-            let kind = self.heap.get(obj).kind;
-            let constant = match kind {
-                Kind::Array | Kind::Arguments => Some(crate::NATIVE_ARRAY_ITERATOR),
-                Kind::Map => Some(crate::NATIVE_MAP_ITERATOR),
-                Kind::Set => Some(crate::NATIVE_SET_ITERATOR),
-                Kind::Iterator | Kind::Generator => Some(crate::NATIVE_ITERATOR_SELF),
-                _ => None,
-            };
-            if let Some(constant) = constant {
-                return Ok(self.map_set_method(constant));
-            }
-        }
-        if self.heap.get(obj).kind == Kind::Iterator {
-            // `next` from the const method table.
-            if let Some(id) = self.method_native(Kind::Iterator, key_v) {
-                return Ok(self.map_set_method(id));
-            }
-        }
-        // RegExp object surface: methods `exec`/`test`/`toString`/`compile`
-        // from the const table, and the `source`/`flags`/`lastIndex` property
-        // reads (internal slots).
-        if self.heap.get(obj).kind == Kind::RegExp {
-            if let Some(id) = self.method_native(Kind::RegExp, key_v) {
-                return Ok(self.map_set_method(id));
-            }
-            // Property reads off the internal slots.
-            let slot = if self.key_is(key_v, "source") {
-                Some(0)
-            } else if self.key_is(key_v, "flags") {
-                Some(1)
-            } else if self.key_is(key_v, "lastIndex") {
-                Some(2)
-            } else {
-                None
-            };
-            if let Some(slot) = slot
-                && let Some(v) = self.heap.get(obj).properties.get(slot).copied()
-            {
-                return Ok(v);
-            }
-        }
-        // `Array.isArray` — static method on the Array constructor.
+    }
+    /// `Array.isArray` — static method on the Array constructor.
+    fn array_statics_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
         let array_idx = ARRAY_IDX;
-        if let (Some(g), Some(array_idx)) = (self.global, array_idx)
-            && let Some(array_ctor) = {
-                let heap = &*self.heap;
-                heap.get(g)
-                    .properties
-                    .get(array_idx)
-                    .and_then(|v| v.as_object())
-            }
-            && obj == array_ctor
-            && self.key_is(key_v, "isArray")
-        {
-            return Ok(self.map_set_method(NativeId::ArrayIsArray));
+        let (Some(g), Some(array_idx)) = (self.global, array_idx) else {
+            return None;
+        };
+        let array_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(array_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != array_ctor || !self.key_is(key_v, "isArray") {
+            return None;
         }
-        // `Object.keys` / `values` / `entries` — static methods on Object.
-        if let (Some(g), Some(object_idx)) = (self.global, OBJECT_IDX)
-            && let Some(object_ctor) = {
-                let heap = &*self.heap;
-                heap.get(g)
-                    .properties
-                    .get(object_idx)
-                    .and_then(|v| v.as_object())
-            }
-            && obj == object_ctor
-        {
-            if self.key_is(key_v, "keys") {
-                return Ok(self.map_set_method(NativeId::ObjectKeys));
-            }
-            if self.key_is(key_v, "values") {
-                return Ok(self.map_set_method(NativeId::ObjectValues));
-            }
-            if self.key_is(key_v, "entries") {
-                return Ok(self.map_set_method(NativeId::ObjectEntries));
-            }
+        Some(Ok(self.map_set_method(NativeId::ArrayIsArray)))
+    }
+    /// `Function.prototype.call` / `apply` / `bind` / `toString` on any
+    /// function object.
+    fn function_method_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Function {
+            return None;
         }
-        // `Function.prototype.call` / `apply` / `bind` / `toString` on any function object.
-        if self.heap.get(obj).kind == Kind::Function {
-            if self.key_is(key_v, "call") {
-                return Ok(self.map_set_method(NativeId::FunctionCall));
-            }
-            if self.key_is(key_v, "apply") {
-                return Ok(self.map_set_method(NativeId::FunctionApply));
-            }
-            if self.key_is(key_v, "bind") {
-                return Ok(self.map_set_method(NativeId::FunctionBind));
-            }
-            if self.key_is(key_v, "toString") {
-                return Ok(self.map_set_method(NativeId::FunctionProtoToString));
-            }
-            if self.key_is(key_v, "valueOf") {
-                return Ok(self.map_set_method(NativeId::ObjectProtoValueOf));
-            }
-            if self.key_is(key_v, "hasOwnProperty") {
-                return Ok(self.map_set_method(NativeId::ObjectHasOwnProperty));
-            }
-        }
-        // `Object.prototype` methods on any ordinary object (including arrays for toString/valueOf).
-        if self.key_is(key_v, "hasOwnProperty") {
-            return Ok(self.map_set_method(NativeId::ObjectHasOwnProperty));
-        }
-        if self.key_is(key_v, "valueOf") {
-            return Ok(self.map_set_method(NativeId::ObjectProtoValueOf));
-        }
-        if self.key_is(key_v, "toString") {
+        let constant = if self.key_is(key_v, "call") {
+            NativeId::FunctionCall
+        } else if self.key_is(key_v, "apply") {
+            NativeId::FunctionApply
+        } else if self.key_is(key_v, "bind") {
+            NativeId::FunctionBind
+        } else if self.key_is(key_v, "toString") {
+            NativeId::FunctionProtoToString
+        } else if self.key_is(key_v, "valueOf") {
+            NativeId::ObjectProtoValueOf
+        } else if self.key_is(key_v, "hasOwnProperty") {
+            NativeId::ObjectHasOwnProperty
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// `Object.prototype` methods on any ordinary object (including arrays
+    /// for toString/valueOf).
+    fn object_proto_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let constant = if self.key_is(key_v, "hasOwnProperty") {
+            NativeId::ObjectHasOwnProperty
+        } else if self.key_is(key_v, "valueOf") {
+            NativeId::ObjectProtoValueOf
+        } else if self.key_is(key_v, "toString") {
             // Functions already handled above; this covers ordinary objects and arrays.
             if self.heap.get(obj).kind == Kind::Function {
-                return Ok(self.map_set_method(NativeId::FunctionProtoToString));
+                NativeId::FunctionProtoToString
+            } else {
+                NativeId::ObjectProtoToString
             }
-            return Ok(self.map_set_method(NativeId::ObjectProtoToString));
-        }
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
 
-        // `RegExp.prototype` — the constructor's prototype property (needed
-        // for `new RegExp(...)` instanceof wiring and `RegExp.prototype.exec`
-        // style reads). The realm's RegExp placeholder has no real prototype
-        // object; synthesize a minimal one on first read.
+    /// `RegExp.prototype` — the constructor's prototype property (needed
+    /// for `new RegExp(...)` instanceof wiring and `RegExp.prototype.exec`
+    /// style reads). The realm's RegExp placeholder has no real prototype
+    /// object; synthesize a minimal one on first read.
+    fn regexp_prototype_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
         let regexp_idx = REGEXP_IDX;
-        if let (Some(g), Some(regexp_idx)) = (self.global, regexp_idx)
-            && let Some(regexp_ctor) = {
-                let heap = &*self.heap;
-                heap.get(g)
-                    .properties
-                    .get(regexp_idx)
-                    .and_then(|v| v.as_object())
-            }
-            && obj == regexp_ctor
-            && self.key_is(key_v, "prototype")
-        {
-            if let Some(p) = self.heap.get(obj).prototype {
-                return Ok(JsValue::object(p));
-            }
-            self.gc_protect();
-            let proto = self.heap.alloc(JsObject::default());
-            self.heap.add_root(JsValue::object(proto));
-            self.heap.get_mut(obj).prototype = Some(proto);
-            return Ok(JsValue::object(proto));
+        let (Some(g), Some(regexp_idx)) = (self.global, regexp_idx) else {
+            return None;
+        };
+        let regexp_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(regexp_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != regexp_ctor || !self.key_is(key_v, "prototype") {
+            return None;
         }
-        if self.heap.get(obj).kind == Kind::Array {
-            // Method surface from the const table (push/pop/join/entries/
-            // keys/values); `length` stays a property read.
-            if let Some(id) = self.method_native(Kind::Array, key_v) {
-                // Array methods are synthesized via the cached native path.
-                return match id {
-                    NativeId::ArrayPush => Ok(self.cached_native(NativeId::ArrayPush)),
-                    NativeId::ArrayJoin => Ok(self.cached_native(NativeId::ArrayJoin)),
-                    _ => Ok(self.map_set_method(id)),
-                };
-            }
-            if self.key_is(key_v, "length") {
-                // Length is properties[0] for arrays regardless of shape state
-                // (covers arrays created by native handlers without shape binding)
-                if let Some(v) = self.heap.get(obj).properties.first().copied() {
-                    return Ok(v);
-                }
-            }
+        if let Some(p) = self.heap.get(obj).prototype {
+            return Some(Ok(JsValue::object(p)));
         }
+        self.gc_protect();
+        let proto = self.heap.alloc(JsObject::default());
+        self.heap.add_root(JsValue::object(proto));
+        self.heap.get_mut(obj).prototype = Some(proto);
+        Some(Ok(JsValue::object(proto)))
+    }
+    /// Array instance surface: the method table (push/pop/join/entries/
+    /// keys/values, with push/join via the cached native path) and the
+    /// `length` slot read.
+    fn array_instance_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Array {
+            return None;
+        }
+        if let Some(id) = self.method_native(Kind::Array, key_v) {
+            // Array methods are synthesized via the cached native path.
+            let value = match id {
+                NativeId::ArrayPush => self.cached_native(NativeId::ArrayPush),
+                NativeId::ArrayJoin => self.cached_native(NativeId::ArrayJoin),
+                _ => self.map_set_method(id),
+            };
+            return Some(Ok(value));
+        }
+        if !self.key_is(key_v, "length") {
+            return None;
+        }
+        // Length is properties[0] for arrays regardless of shape state
+        // (covers arrays created by native handlers without shape binding)
+        let value = self.heap.get(obj).properties.first().copied()?;
+        Some(Ok(value))
+    }
 
-        // Arguments and arrays store integer indices in `elements`.
+    /// Integer-index reads on arrays and arguments objects come from the
+    /// element store.
+    fn element_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
         let kind = self.heap.get(obj).kind;
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
@@ -3703,72 +3855,77 @@ impl<'a> Interp<'a> {
             // For arguments exotic, a mapped index mirrors the parameter slot;
             // v1 simply returns the element (the param alias is exercised via
             // the mapped array in heap tests).
-            let v = self.array_element(obj, idx);
-            return Ok(v);
+            return Some(Ok(self.array_element(obj, idx)));
         }
+        None
+    }
 
-        // Map/Set method fast paths, recognized by object kind. Each
-        // synthesizes a function whose callable routes through the engine's
-        // native registry (the `NATIVE_*` constants are out-of-range bytecode
-        // indices the registry dispatches).
-        if (kind == Kind::Map || kind == Kind::Set)
-            && let Some(handle) = key_v.as_string()
-        {
-            let mut name_is = |text: &str| -> bool {
-                self.heap.flatten(handle);
-                match &self.heap.get(handle).storage {
-                    v12_heap::StrStorage::Latin1(bytes) => bytes == text.as_bytes(),
-                    v12_heap::StrStorage::Utf16(units) => {
-                        units.iter().copied().eq(text.encode_utf16())
-                    }
-                    _ => false,
-                }
-            };
-            // `size` is a getter: invoke the handler directly with the
-            // Map/Set as `this`. Methods return the synthesized function.
+    /// Map/Set method fast paths, recognized by object kind. Each
+    /// synthesizes a function whose callable routes through the engine's
+    /// native registry (the `NATIVE_*` constants are out-of-range bytecode
+    /// indices the registry dispatches).
+    fn map_set_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let kind = self.heap.get(obj).kind;
+        if kind != Kind::Map && kind != Kind::Set {
+            return None;
+        }
+        // `size` is a getter: invoke the handler directly with the
+        // Map/Set as `this`. Methods return the synthesized function.
+        if self.key_is(key_v, "size") {
             let size_const = if kind == Kind::Map {
                 NATIVE_MAP_SIZE
             } else {
                 NATIVE_SET_SIZE
             };
-            if name_is("size") {
-                self.gc_protect();
-                return self
-                    .natives
-                    .call_native(self.heap, JsValue::object(obj), &[], size_const)
-                    .map_err(|t| JSException::from_throw(self.heap, t));
-            }
-            let constant = if kind == Kind::Map {
-                if name_is("get") {
-                    Some(NATIVE_MAP_GET)
-                } else if name_is("set") {
-                    Some(NATIVE_MAP_SET)
-                } else if name_is("has") {
-                    Some(NATIVE_MAP_HAS)
-                } else if name_is("delete") {
-                    Some(NATIVE_MAP_DELETE)
-                } else {
-                    None
-                }
-            } else if name_is("add") {
-                Some(NATIVE_SET_ADD)
-            } else if name_is("has") {
-                Some(NATIVE_SET_HAS)
-            } else if name_is("delete") {
-                Some(NATIVE_SET_DELETE)
-            } else {
-                None
-            };
-            if let Some(constant) = constant {
-                return Ok(self.map_set_method(constant));
-            }
+            self.gc_protect();
+            let result = self
+                .natives
+                .call_native(self.heap, JsValue::object(obj), &[], size_const)
+                .map_err(|t| JSException::from_throw(self.heap, t));
+            return Some(result);
         }
+        let constant = if kind == Kind::Map {
+            if self.key_is(key_v, "get") {
+                NATIVE_MAP_GET
+            } else if self.key_is(key_v, "set") {
+                NATIVE_MAP_SET
+            } else if self.key_is(key_v, "has") {
+                NATIVE_MAP_HAS
+            } else if self.key_is(key_v, "delete") {
+                NATIVE_MAP_DELETE
+            } else {
+                return None;
+            }
+        } else if self.key_is(key_v, "add") {
+            NATIVE_SET_ADD
+        } else if self.key_is(key_v, "has") {
+            NATIVE_SET_HAS
+        } else if self.key_is(key_v, "delete") {
+            NATIVE_SET_DELETE
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
 
+    /// Shape-bound lookup with the polymorphic inline cache: probe the IC
+    /// first (only data descriptors with a slot are cached; up to
+    /// `IC_MAX_ENTRIES` shapes per site), then walk the own shape and the
+    /// prototype chain, recording own-shape hits in the IC.
+    fn ic_lookup(
+        &mut self,
+        site_fn: u32,
+        site_pc: u32,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
         let key = self.property_key(key_v)?;
         let shape = self.shape_of(obj);
 
-        // Inline-cache probe: only data descriptors with a slot are cached.
-        // The cache is polymorphic (up to IC_MAX_ENTRIES shapes per site).
         let cached_slot = self
             .feedback
             .get(&site_fn)
@@ -3864,10 +4021,11 @@ impl<'a> Interp<'a> {
                 && (-1e15..=1e15).contains(&n)
                 && let Some(smi) = JsValue::from_i32_smi(n as i32)
             {
-                self.heap.get_mut(obj).properties[2] = smi;
+                self.heap.get_mut(obj).properties[RegExpSlot::LastIndex as usize] = smi;
                 return Ok(());
             }
-            self.heap.get_mut(obj).properties[2] = JsValue::from_f64(n);
+            self.heap.get_mut(obj).properties[RegExpSlot::LastIndex as usize] =
+                JsValue::from_f64(n);
             return Ok(());
         }
 
@@ -4668,6 +4826,57 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The value of a populated global slot: `None` for out-of-range and
+    /// hole slots (a hole means "never initialized").
+    fn global_slot_value(&self, global: Handle<JsObject>, idx: usize) -> Option<JsValue> {
+        let v = *self.heap.get(global).properties.get(idx)?;
+        if v.is_hole() { None } else { Some(v) }
+    }
+
+    /// The intrinsic-slot value for a global name (the fixed prefix slots),
+    /// or `None` when the name is not an intrinsic or the slot is unpopulated.
+    fn global_intrinsic_value(&self, global: Handle<JsObject>, text: &str) -> Option<JsValue> {
+        let idx = intrinsic_slot(text)?;
+        self.global_slot_value(global, idx)
+    }
+
+    /// The own-property value for `text` via the shape graph, mapped through
+    /// [`Self::global_slot_index`]. `None` when the name is not an own data
+    /// property or the slot is unpopulated.
+    fn global_property_value(&mut self, global: Handle<JsObject>, text: &str) -> Option<JsValue> {
+        let h = self.heap.intern_text(text);
+        let key = PropKey::from_string(h);
+        let shape = self.shape_of(global);
+        let desc = self.heap.lookup_property(shape, key)?;
+        let idx = self.global_slot_index(global, desc.slot()? as usize);
+        self.global_slot_value(global, idx)
+    }
+
+    /// The physical slot for an own data property named `text`, mapped
+    /// through [`Self::global_slot_index`]: intern the name, resolve the
+    /// shape descriptor, translate the slot.
+    fn global_own_property_slot(&mut self, global: Handle<JsObject>, text: &str) -> Option<usize> {
+        let h = self.heap.intern_text(text);
+        let key = PropKey::from_string(h);
+        let shape = self.shape_of(global);
+        let desc = self.heap.lookup_property(shape, key)?;
+        let slot = desc.slot()?;
+        Some(self.global_slot_index(global, slot as usize))
+    }
+
+    /// Writes a global slot, growing the properties vector when an
+    /// embedder-assembled global lacks the full slot range.
+    fn write_global_slot(&mut self, global: Handle<JsObject>, idx: usize, val: JsValue) {
+        let len = self.heap.get(global).properties.len();
+        if len <= idx {
+            self.heap
+                .get_mut(global)
+                .properties
+                .resize(idx + 1, JsValue::undefined());
+        }
+        self.heap.get_mut(global).properties[idx] = val;
+    }
+
     fn op_get_global(&mut self, str_id: u32, program: u32) -> Result<JsValue, JSException> {
         let Some(global) = self.global else {
             return Ok(JsValue::undefined());
@@ -4685,27 +4894,11 @@ impl<'a> Interp<'a> {
             .get(str_id as usize)
             .map(String::as_str)
             .unwrap_or("");
-        if let Some(idx) = intrinsic_slot(text)
-            && idx < self.heap.get(global).properties.len()
-        {
-            let v = self.heap.get(global).properties[idx];
-            if !v.is_hole() {
-                return Ok(v);
-            }
+        if let Some(v) = self.global_intrinsic_value(global, text) {
+            return Ok(v);
         }
-        let h = self.heap.intern_text(text);
-        let key = PropKey::from_string(h);
-        let shape = self.shape_of(global);
-        if let Some(desc) = self.heap.lookup_property(shape, key)
-            && let Some(slot) = desc.slot()
-        {
-            let idx = self.global_slot_index(global, slot as usize);
-            if idx < self.heap.get(global).properties.len() {
-                let v = self.heap.get(global).properties[idx];
-                if !v.is_hole() {
-                    return Ok(v);
-                }
-            }
+        if let Some(v) = self.global_property_value(global, text) {
+            return Ok(v);
         }
         Ok(JsValue::undefined())
     }
@@ -4724,31 +4917,17 @@ impl<'a> Interp<'a> {
         self.gc_protect();
         let strings = self.strings_for_program(program);
         let text = strings.get(str_id as usize).cloned().unwrap_or_default();
-        if let Some(idx) = intrinsic_slot(&text) {
-            // Intrinsics are at fixed indices; allow overwriting.
-            if idx < self.heap.get(global).properties.len() {
-                self.heap.get_mut(global).properties[idx] = val;
-                return Ok(());
-            }
-        }
-        let h = self.heap.intern_text(&text);
-        let key = PropKey::from_string(h);
-        let shape = self.shape_of(global);
-        // If already a property, update.
-        if let Some(desc) = self.heap.lookup_property(shape, key)
-            && let Some(slot) = desc.slot()
+        if let Some(idx) = intrinsic_slot(&text)
+            && idx < self.heap.get(global).properties.len()
         {
-            let idx = self.global_slot_index(global, slot as usize);
-            let len = self.heap.get(global).properties.len();
-            if idx >= len {
-                // Repair the vector if an embedder assembled the global
-                // without the full intrinsic prefix.
-                self.heap
-                    .get_mut(global)
-                    .properties
-                    .resize(idx + 1, JsValue::undefined());
-            }
+            // Intrinsics are at fixed indices; allow overwriting. An
+            // out-of-range intrinsic slot (an embedder-built global without
+            // the full prefix) falls through to the shape path instead.
             self.heap.get_mut(global).properties[idx] = val;
+            return Ok(());
+        }
+        if let Some(idx) = self.global_own_property_slot(global, &text) {
+            self.write_global_slot(global, idx, val);
             return Ok(());
         }
         // Otherwise, create new global property. The shape transition may
@@ -4756,18 +4935,13 @@ impl<'a> Interp<'a> {
         // nothing here introduces values beyond that set (the interned key is
         // kept alive by the strong intern table), so no re-protect is needed.
         // Keep the physical index in sync with the shape's slot numbering.
+        let h = self.heap.intern_text(&text);
+        let key = PropKey::from_string(h);
+        let shape = self.shape_of(global);
         let child = self.heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
         self.bind_shape(global, child);
         let new_slot = usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
-        let idx = self.global_slot_index(global, new_slot);
-        let len = self.heap.get(global).properties.len();
-        if len <= idx {
-            self.heap
-                .get_mut(global)
-                .properties
-                .resize(idx + 1, JsValue::undefined());
-        }
-        self.heap.get_mut(global).properties[idx] = val;
+        self.write_global_slot(global, self.global_slot_index(global, new_slot), val);
         Ok(())
     }
 
