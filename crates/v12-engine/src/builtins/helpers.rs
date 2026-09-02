@@ -6,6 +6,8 @@
 //! implementation; the native handlers call them and stay focused on their
 //! own semantics.
 
+use std::borrow::Cow;
+
 use v12_heap::{Handle, Heap, JsObject, JsValue, V12Str};
 use v12_native::Throw;
 
@@ -38,23 +40,40 @@ pub fn as_object(
     Ok(obj)
 }
 
-/// The string text of a heap string, flattened and lossy-converted.
-pub fn string_text(heap: &mut Heap, h: Handle<V12Str>) -> String {
+/// The string text of a heap string, borrowing when possible.
+///
+/// Flattens first, then borrows the Latin-1 bytes as `&str` when they form
+/// valid UTF-8 (ASCII always does) — zero allocation; invalid Latin-1 or
+/// UTF-16 storage falls back to an owned lossy conversion. Prefer this over
+/// [`string_text`] when the text is consumed before the next heap access —
+/// the returned `Cow` holds the heap until dropped.
+pub fn string_text_cow<'a>(heap: &'a mut Heap, h: Handle<V12Str>) -> Cow<'a, str> {
     heap.flatten(h);
     match &heap.get(h).storage {
-        v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
-        _ => String::new(),
+        v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes),
+        v12_heap::StrStorage::Utf16(units) => Cow::Owned(String::from_utf16_lossy(units)),
+        _ => Cow::Borrowed(""),
     }
+}
+
+/// The string text of a heap string, flattened and lossy-converted.
+pub fn string_text(heap: &mut Heap, h: Handle<V12Str>) -> String {
+    string_text_cow(heap, h).into_owned()
+}
+
+/// The text of a value, borrowing the string storage when possible (see
+/// [`string_text_cow`] for the borrow/allocate contract).
+pub fn value_text_cow<'a>(heap: &'a mut Heap, v: JsValue) -> Cow<'a, str> {
+    if let Some(h) = v.as_string() {
+        return string_text_cow(heap, h);
+    }
+    Cow::Owned(display_text(v))
 }
 
 /// The text of a value: strings render their text, everything else renders
 /// the way `console.log` observes it (Tier-0 display subset).
 pub fn value_text(heap: &mut Heap, v: JsValue) -> String {
-    if let Some(h) = v.as_string() {
-        return string_text(heap, h);
-    }
-    display_text(v)
+    value_text_cow(heap, v).into_owned()
 }
 
 /// A number value: a Smi when integral and in Smi range, a double otherwise.
@@ -129,8 +148,8 @@ pub fn to_number(heap: &mut Heap, v: JsValue) -> f64 {
         return 0.0;
     }
     if let Some(h) = v.as_string() {
-        let trimmed = string_text(heap, h);
-        let trimmed = trimmed.trim();
+        let text = string_text_cow(heap, h);
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             return 0.0;
         }

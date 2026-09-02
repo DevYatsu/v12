@@ -1,5 +1,7 @@
 //! Number built-ins.
 
+use std::borrow::Cow;
+
 use v12_heap::{Heap, JsValue};
 use v12_native::Throw;
 
@@ -97,11 +99,20 @@ pub fn global_parse_int(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    // Resolve the radix before extracting the text: the borrowed text holds
+    // the heap until it is dropped, so the radix coercion must run first
+    // (unobservable here — `to_number` never runs user code).
+    let radix_arg = args.get(1).copied();
+    let mut radix = match radix_arg {
+        Some(v) => helpers::to_number(heap, v) as i32,
+        None => 0,
+    };
+
     // ToString the first argument; default empty string stays NaN.
-    let text = args
-        .first()
-        .map(|v| helpers::value_text(heap, *v))
-        .unwrap_or_default();
+    let text = match args.first() {
+        Some(v) => helpers::value_text_cow(heap, *v),
+        None => Cow::Borrowed(""),
+    };
     let mut s = text.trim();
 
     // Strip an optional leading sign; the `0x` prefix is only honored on the
@@ -116,13 +127,8 @@ pub fn global_parse_int(
         }
     }
 
-    // Resolve the radix. ToNumber → i32; NaN → 0; 0/absent → default 10,
-    // honoring a `0x`/`0X` hex prefix (→ 16).
-    let radix_arg = args.get(1).copied();
-    let mut radix = match radix_arg {
-        Some(v) => helpers::to_number(heap, v) as i32,
-        None => 0,
-    };
+    // NaN radix → 0; 0/absent → default 10, honoring a `0x`/`0X` hex prefix
+    // (→ 16).
     if radix == 0 {
         if s.len() >= 2 && s.as_bytes().starts_with(b"0x") {
             return Ok(helpers::js_number(scan_int_digits(&s[2..], 16, sign)));
@@ -144,10 +150,10 @@ pub fn global_parse_float(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let text = args
-        .first()
-        .map(|v| helpers::value_text(heap, *v))
-        .unwrap_or_default();
+    let text = match args.first() {
+        Some(v) => helpers::value_text_cow(heap, *v),
+        None => Cow::Borrowed(""),
+    };
     let trimmed = text.trim_start();
 
     // Scan a StrDecimalLiteral prefix: sign?, digits?, '.', digits?, e/E
