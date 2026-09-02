@@ -151,6 +151,8 @@ pub struct JsObject {
     /// registry holding serials lives on the heap. Not on the shape-lookup
     /// hot path — `shape` is the shape binding.
     pub validity_cell: ValidityCellId,
+    pub private_brand: Option<u32>,
+    pub private_fields: Option<Box<rustc_hash::FxHashMap<u32, crate::JsValue>>> ,
     /// Arguments exotic mapping: `Some(map)` where `map[i]` is `Some(slot)`
     /// when indexed property `i` is aliased to the `slot`-th parameter slot,
     /// `None` for mapped holes and `None` for unmapped (strict) arguments.
@@ -180,6 +182,8 @@ impl Default for JsObject {
             elements_array: crate::elements::ElementsArray::new(),
             prototype: None,
             validity_cell: ValidityCellId::NONE,
+            private_brand: None,
+            private_fields: None,
             arguments_mapped: None,
         }
     }
@@ -719,6 +723,7 @@ impl Trace for JsObject {
         self.elements_array.trace(sink);
         self.prototype.trace(sink);
         self.captured_env.trace(sink);
+        if let Some(m) = &self.private_fields { for v in m.values() { v.trace(sink); } }
     }
 }
 

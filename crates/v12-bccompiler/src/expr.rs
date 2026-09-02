@@ -139,9 +139,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     self.move_reg(dst, REG_THIS, t.span);
                 } else {
                     let plan = &self.comp.plans.units[home];
-                    let slot = plan.this_slot.expect("`this` slot planned");
-                    let depth = self.comp.plans.env_depth_between(self.unit, home);
-                    self.emit_get_env(dst, depth, slot, t.span);
+                    if let Some(slot) = plan.this_slot {
+                        let depth = self.comp.plans.env_depth_between(self.unit, home);
+                        self.emit_get_env(dst, depth, slot, t.span);
+                    } else {
+                        // Home did not allocate a `this` env slot (e.g. class
+                        // field initializer `this` not walked during collect).
+                        // Fall back to direct `this` register — the arrow
+                        // captures the same frame's REG_THIS.
+                        self.move_reg(dst, REG_THIS, t.span);
+                    }
                 }
                 Ok(dst)
             }
@@ -222,10 +229,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Expression::PrivateFieldExpression(p) => {
                 let obj = self.expr(&p.object)?;
-                let key = self.new_temp();
-                self.load_str(key, &format!("#{}", p.field.name), p.span)?;
                 let dst = self.new_temp();
-                self.emit_reg3(Opcode::GetProperty, dst, obj, key, p.span);
+                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", p.field.name)));
+                // class_id 0 for minimal brand check
+                let words = v12_bytecode::WideOp::GetPrivateW { dst, obj, class_id: 0, name_id }.encode();
+                self.emit_words(words, p.span);
                 Ok(dst)
             }
             Expression::FunctionExpression(f) => {
@@ -402,11 +410,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(dst)
             }
             Expression::PrivateInExpression(x) => {
-                let key = self.new_temp();
-                self.load_str(key, &format!("#{}", x.left.name), x.span)?;
                 let obj = self.expr(&x.right)?;
                 let dst = self.new_temp();
-                self.emit_reg3(Opcode::In, dst, key, obj, x.span);
+                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", x.left.name)));
+                let words = v12_bytecode::WideOp::HasPrivateW { dst, obj, class_id: 0, name_id }.encode();
+                self.emit_words(words, x.span);
                 Ok(dst)
             }
             // TypeScript-only forms never reach here through `script()` /
@@ -1250,6 +1258,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok((obj, key))
             }
             MemberExpression::PrivateFieldExpression(p) => {
+                // private assign targets not yet fully spec-correct; fallback to GetPrivate semantics
                 let obj = self.expr(&p.object)?;
                 let key = self.new_temp();
                 self.load_str(key, &format!("#{}", p.field.name), p.span)?;

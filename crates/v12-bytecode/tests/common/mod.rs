@@ -72,14 +72,14 @@ pub fn fn_with(len: u32, handlers: Vec<HandlerRange>) -> FunctionBytecode {
 }
 
 /// Wide payload word count per discriminant (header excluded).
-pub const WIDE_PAYLOAD_WORDS: [u32; 11] = [2, 3, 2, 2, 2, 2, 2, 1, 1, 1, 2];
+pub const WIDE_PAYLOAD_WORDS: [u32; 15] = [2, 3, 2, 2, 2, 2, 2, 1, 1, 1, 2, 3, 3, 3, 3];
 
 /// Total encoded width per discriminant (header included).
-pub const WIDE_TOTAL_WORDS: [u32; 11] = [3, 4, 3, 3, 3, 3, 3, 2, 2, 2, 3];
+pub const WIDE_TOTAL_WORDS: [u32; 15] = [3, 4, 3, 3, 3, 3, 3, 2, 2, 2, 3, 4, 4, 4, 4];
 
 /// Builds a random `WideOp` for structured roundtrip fuzzing.
 pub fn random_wide_op(rng: &mut Rng) -> WideOp {
-    match rng.below(11) {
+    match rng.below(15) {
         0 => WideOp::LoadConstW {
             dst: rng.next_u32() as u16,
             const_id: rng.next_u32(),
@@ -127,6 +127,30 @@ pub fn random_wide_op(rng: &mut Rng) -> WideOp {
         9 => WideOp::NewEnvironmentW {
             depth: rng.next_u32() as u16,
             slots: rng.next_u32() as u16,
+        },
+        10 => WideOp::GetPrivateW {
+            dst: rng.next_u32() as u16,
+            obj: rng.next_u32() as u16,
+            class_id: rng.next_u32(),
+            name_id: rng.next_u32(),
+        },
+        11 => WideOp::SetPrivateW {
+            obj: rng.next_u32() as u16,
+            class_id: rng.next_u32(),
+            name_id: rng.next_u32(),
+            value: rng.next_u32() as u16,
+        },
+        12 => WideOp::DefinePrivateW {
+            obj: rng.next_u32() as u16,
+            class_id: rng.next_u32(),
+            name_id: rng.next_u32(),
+            value: rng.next_u32() as u16,
+        },
+        13 => WideOp::HasPrivateW {
+            dst: rng.next_u32() as u16,
+            obj: rng.next_u32() as u16,
+            class_id: rng.next_u32(),
+            name_id: rng.next_u32(),
         },
         _ => WideOp::ConstructW {
             dst: rng.next_u32() as u16,

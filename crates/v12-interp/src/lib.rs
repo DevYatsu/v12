@@ -1001,6 +1001,39 @@ impl<'a> Interp<'a> {
         result
     }
 
+    fn private_get(&mut self, obj_v: crate::JsValue, class_id: u32, name_id: u32) -> Result<crate::JsValue, JSException> {
+        let Some(h) = obj_v.as_object() else { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); };
+        let o = self.heap.get(h);
+        if o.private_brand != Some(class_id) { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); }
+        if let Some(m) = &o.private_fields { if let Some(v) = m.get(&name_id) { return Ok(*v); } }
+        Ok(crate::JsValue::undefined())
+    }
+    fn private_has(&self, obj_v: crate::JsValue, class_id: u32, name_id: u32) -> bool {
+        if let Some(h) = obj_v.as_object() {
+            let o = self.heap.get(h);
+            if o.private_brand != Some(class_id) { return false; }
+            if let Some(m) = &o.private_fields { return m.contains_key(&name_id); }
+        }
+        false
+    }
+    fn private_define(&mut self, obj_v: crate::JsValue, class_id: u32, name_id: u32, val: crate::JsValue) -> Result<(), JSException> {
+        let Some(h) = obj_v.as_object() else { return Err(JSException(self.error_value("TypeError: Cannot define private field on non-object"))); };
+        let o = self.heap.get_mut(h);
+        if o.private_brand.is_none() { o.private_brand = Some(class_id); }
+        if o.private_brand != Some(class_id) { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); }
+        let m = o.private_fields.get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
+        m.insert(name_id, val);
+        Ok(())
+    }
+    fn private_set(&mut self, obj_v: crate::JsValue, class_id: u32, name_id: u32, val: crate::JsValue) -> Result<(), JSException> {
+        let Some(h) = obj_v.as_object() else { return Err(JSException(self.error_value("TypeError: Cannot set private member on non-object"))); };
+        let o = self.heap.get_mut(h);
+        if o.private_brand != Some(class_id) { return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it"))); }
+        let m = o.private_fields.get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
+        m.insert(name_id, val);
+        Ok(())
+    }
+
     /// Applies ES `ToString` from outside the machine — diagnostics and test
     /// harnesses, not executable semantics. Error objects render as
     /// `"Name: message"`.
@@ -1266,6 +1299,26 @@ impl<'a> Interp<'a> {
                         // operand); reaching this arm means corrupt bytecode.
                         WideOp::RegExt { .. } => {
                             panic!("corrupt bytecode: bare RegExt reached dispatch")
+                        }
+                        WideOp::GetPrivateW { dst, obj, class_id, name_id } => {
+                            let obj_v = self.stack[base + usize::from(obj)];
+                            let v = attempt!(self.private_get(obj_v, class_id, name_id));
+                            self.stack[base + usize::from(dst)] = v;
+                        }
+                        WideOp::SetPrivateW { obj, class_id, name_id, value } => {
+                            let obj_v = self.stack[base + usize::from(obj)];
+                            let val = self.stack[base + usize::from(value)];
+                            attempt!(self.private_set(obj_v, class_id, name_id, val));
+                        }
+                        WideOp::DefinePrivateW { obj, class_id, name_id, value } => {
+                            let obj_v = self.stack[base + usize::from(obj)];
+                            let val = self.stack[base + usize::from(value)];
+                            attempt!(self.private_define(obj_v, class_id, name_id, val));
+                        }
+                        WideOp::HasPrivateW { dst, obj, class_id, name_id } => {
+                            let obj_v = self.stack[base + usize::from(obj)];
+                            let present = self.private_has(obj_v, class_id, name_id);
+                            self.stack[base + usize::from(dst)] = if present { v12_heap::JsValue::true_() } else { v12_heap::JsValue::false_() };
                         }
                     }
                     self.set_pc(pc + width);
@@ -4748,6 +4801,16 @@ impl<'a> Interp<'a> {
         // frame with `this` = instance.
         self.gc_protect();
         let instance = self.heap.alloc(JsObject::environment(0, Some(proto)));
+        // Clone private field template from constructor to instance for brand check
+        {
+            let brand = self.heap.get(callee_obj).private_brand;
+            let fields = self.heap.get(callee_obj).private_fields.as_ref().map(|m| m.as_ref().clone());
+            let inst = self.heap.get_mut(instance);
+            inst.private_brand = brand;
+            if let Some(f) = fields {
+                inst.private_fields = Some(Box::new(f));
+            }
+        }
         let instance_v = JsValue::object(instance);
 
         let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {

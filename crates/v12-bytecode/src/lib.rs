@@ -580,6 +580,10 @@ pub enum WideOp {
         depth: u16,
         slots: u16,
     },
+    GetPrivateW { dst: u16, obj: u16, class_id: u32, name_id: u32 },
+    SetPrivateW { obj: u16, class_id: u32, name_id: u32, value: u16 },
+    DefinePrivateW { obj: u16, class_id: u32, name_id: u32, value: u16 },
+    HasPrivateW { dst: u16, obj: u16, class_id: u32, name_id: u32 },
 }
 
 fn pack_hi_lo(hi: u16, lo: u16) -> u32 {
@@ -603,6 +607,10 @@ impl WideOp {
     pub const DISC_CLOSURE_W: u32 = 8;
     pub const DISC_NEW_ENVIRONMENT_W: u32 = 9;
     pub const DISC_CONSTRUCT_W: u32 = 10;
+    pub const DISC_GET_PRIVATE_W: u32 = 11;
+    pub const DISC_SET_PRIVATE_W: u32 = 12;
+    pub const DISC_DEFINE_PRIVATE_W: u32 = 13;
+    pub const DISC_HAS_PRIVATE_W: u32 = 14;
 
     /// Serializes to a header word plus the documented payload words.
     ///
@@ -681,6 +689,30 @@ impl WideOp {
             Self::NewEnvironmentW { depth, slots } => vec![
                 hdr(0, Self::DISC_NEW_ENVIRONMENT_W),
                 Instr(pack_hi_lo(depth, slots)),
+            ],
+            Self::GetPrivateW { dst, obj, class_id, name_id } => vec![
+                hdr(0, Self::DISC_GET_PRIVATE_W),
+                Instr(pack_hi_lo(dst, obj)),
+                Instr(class_id),
+                Instr(name_id),
+            ],
+            Self::SetPrivateW { obj, class_id, name_id, value } => vec![
+                hdr(0, Self::DISC_SET_PRIVATE_W),
+                Instr(pack_hi_lo(obj, value)),
+                Instr(class_id),
+                Instr(name_id),
+            ],
+            Self::DefinePrivateW { obj, class_id, name_id, value } => vec![
+                hdr(0, Self::DISC_DEFINE_PRIVATE_W),
+                Instr(pack_hi_lo(obj, value)),
+                Instr(class_id),
+                Instr(name_id),
+            ],
+            Self::HasPrivateW { dst, obj, class_id, name_id } => vec![
+                hdr(0, Self::DISC_HAS_PRIVATE_W),
+                Instr(pack_hi_lo(dst, obj)),
+                Instr(class_id),
+                Instr(name_id),
             ],
         }
     }
@@ -790,6 +822,30 @@ impl WideOp {
                 let (depth, slots) = unpack_hi_lo(payload(1)?);
                 Ok((Self::NewEnvironmentW { depth, slots }, 2))
             }
+            Self::DISC_GET_PRIVATE_W => {
+                let (dst, obj) = unpack_hi_lo(payload(1)?);
+                let class_id = payload(2)?;
+                let name_id = payload(3)?;
+                Ok((Self::GetPrivateW { dst, obj, class_id, name_id }, 4))
+            }
+            Self::DISC_SET_PRIVATE_W => {
+                let (obj, value) = unpack_hi_lo(payload(1)?);
+                let class_id = payload(2)?;
+                let name_id = payload(3)?;
+                Ok((Self::SetPrivateW { obj, class_id, name_id, value }, 4))
+            }
+            Self::DISC_DEFINE_PRIVATE_W => {
+                let (obj, value) = unpack_hi_lo(payload(1)?);
+                let class_id = payload(2)?;
+                let name_id = payload(3)?;
+                Ok((Self::DefinePrivateW { obj, class_id, name_id, value }, 4))
+            }
+            Self::DISC_HAS_PRIVATE_W => {
+                let (dst, obj) = unpack_hi_lo(payload(1)?);
+                let class_id = payload(2)?;
+                let name_id = payload(3)?;
+                Ok((Self::HasPrivateW { dst, obj, class_id, name_id }, 4))
+            }
             other => Err(BytecodeError::UnknownWideDiscriminant {
                 discriminant: other,
             }),
@@ -840,6 +896,10 @@ impl fmt::Display for WideOp {
             Self::NewEnvironmentW { depth, slots } => {
                 write!(f, "new_environment_w depth={depth}, slots={slots}")
             }
+            Self::GetPrivateW { dst, obj, class_id, name_id } => write!(f, "get_private_w r{dst}, r{obj}, class={class_id} name={name_id}"),
+            Self::SetPrivateW { obj, class_id, name_id, value } => write!(f, "set_private_w r{obj}, class={class_id} name={name_id} r{value}"),
+            Self::DefinePrivateW { obj, class_id, name_id, value } => write!(f, "define_private_w r{obj}, class={class_id} name={name_id} r{value}"),
+            Self::HasPrivateW { dst, obj, class_id, name_id } => write!(f, "has_private_w r{dst}, r{obj}, class={class_id} name={name_id}"),
         }
     }
 }

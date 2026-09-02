@@ -122,6 +122,17 @@ fn define_elements(
                 let target = if m.r#static { ctor } else { proto };
                 let is_ctor = m.kind == MethodDefinitionKind::Constructor;
                 let key_reg = property_key_reg(cx, &m.key, m.computed, m.span)?;
+                // private methods: store as private on ctor
+                let is_private = matches!(&m.key, PropertyKey::PrivateIdentifier(_));
+                if is_private {
+                    let name = match &m.key { PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name), _ => unreachable!() };
+                    let name_id = crate::model::str_id_of(cx.comp.strings.get_or_intern(&name));
+                    let fn_reg = method_fn(cx, m)?;
+                    let target_obj = if m.r#static { ctor } else { ctor };
+                    let words = v12_bytecode::WideOp::DefinePrivateW { obj: target_obj, class_id: 0, name_id, value: fn_reg }.encode();
+                    cx.emit_words(words, m.span);
+                    continue;
+                }
                 match m.kind {
                     MethodDefinitionKind::Get => {
                         let pair = cx.new_temps(2);
@@ -148,9 +159,22 @@ fn define_elements(
                 }
             }
             ClassElement::PropertyDefinition(p) => {
-                // Static fields initialize on the constructor here. Instance
-                // fields define a prototype default (real instance-field
-                // initialization in the constructor lands with field support).
+                let is_private = matches!(&p.key, PropertyKey::PrivateIdentifier(_));
+                if is_private {
+                    let name = match &p.key { PropertyKey::PrivateIdentifier(id) => format!("#{}", id.name), _ => unreachable!() };
+                    let name_id = crate::model::str_id_of(cx.comp.strings.get_or_intern(&name));
+                    let value_reg = if let Some(v) = &p.value { cx.expr(v)? } else { let d = cx.new_temp(); cx.load_undefined(d, p.span); d };
+                    if p.r#static {
+                        let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: value_reg }.encode();
+                        cx.emit_words(words, p.span);
+                    } else {
+                        // instance private field: store as template on ctor (will be cloned on construct)
+                        // For now define on ctor template; Construct will clone to instances
+                        let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: value_reg }.encode();
+                        cx.emit_words(words, p.span);
+                    }
+                    continue;
+                }
                 let target = if p.r#static { ctor } else { proto };
                 let key_reg = property_key_reg(cx, &p.key, p.computed, p.span)?;
                 let value_reg = if let Some(v) = &p.value {

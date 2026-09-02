@@ -164,7 +164,7 @@ fn fuzz_100k_random_words_through_every_decode_path() {
         match WideOp::try_decode(&words) {
             Ok((_, width)) => {
                 assert!(
-                    width == 2 || width == 3,
+                    width == 2 || width == 3 || width == 4,
                     "decoded width {width} impossible for sample {i} ({word:#010x})"
                 );
                 assert!(width <= words.len());
@@ -251,9 +251,9 @@ fn known_discriminants_exactly_match_opcode_enum() {
 /// "unknown discriminant" diagnostic.
 #[test]
 fn wide_headers_with_unknown_discriminants_error_cleanly() {
-    // Discriminants 11.. are unassigned (7..10 name RegExt, ClosureW,
-    // NewEnvironmentW, and ConstructW).
-    for disc in [11u32, 31, 99, 255] {
+    // Discriminants 15.. are unassigned (7..14 name RegExt, ClosureW,
+    // NewEnvironmentW, ConstructW, GetPrivateW, SetPrivateW, DefinePrivateW, HasPrivateW).
+    for disc in [15u32, 31, 99, 255] {
         let words = [
             Instr::new_imm24(Opcode::Wide, disc),
             Instr(0x1234_5678),

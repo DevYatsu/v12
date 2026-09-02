@@ -1231,6 +1231,8 @@ mod tests {
             elements_array: crate::elements::ElementsArray::new(),
             prototype: proto,
             validity_cell: ValidityCellId::NONE,
+            private_brand: None,
+            private_fields: None,
             arguments_mapped: None,
         }
     }

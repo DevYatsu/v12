@@ -453,6 +453,19 @@ impl<'s> Collector<'s> {
             }
         }
         self.unit_stack.pop();
+        // Walk field initializers for `this`/`super`/captures (e.g. `#x = () => this.#y`).
+        for el in &c.body.body {
+            if let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el
+                && let Some(init) = &p.value
+            {
+                // Instance field initializers conceptually run in constructor;
+                // attribute any `this` inside them to the constructor unit so
+                // `this` slot is planned. We push constructor idx as current.
+                self.unit_stack.push(idx);
+                self.expr(init);
+                self.unit_stack.pop();
+            }
+        }
         // Each non-constructor method is its own unit.
         for el in &c.body.body {
             if let oxc_ast::ast::ClassElement::MethodDefinition(m) = el

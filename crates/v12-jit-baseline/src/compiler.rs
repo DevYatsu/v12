@@ -269,7 +269,11 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 | WideOp::ClosureW { .. }
                 | WideOp::NewEnvironmentW { .. }
                 | WideOp::ConstructW { .. }
-                | WideOp::RegExt { .. } => {
+                | WideOp::RegExt { .. }
+                | WideOp::GetPrivateW { .. }
+                | WideOp::SetPrivateW { .. }
+                | WideOp::DefinePrivateW { .. }
+                | WideOp::HasPrivateW { .. } => {
                     return Err(JitError::UnsupportedWideOp(format!("{wide:?}")));
                 }
             }

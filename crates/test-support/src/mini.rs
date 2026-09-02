@@ -161,7 +161,11 @@ impl<'p> Mini<'p> {
                         | WideOp::ConstructW { .. }
                         | WideOp::CopyObjectRestW { .. }
                         | WideOp::CopyArrayRestW { .. }
-                        | WideOp::RegExt { .. } => {
+                        | WideOp::RegExt { .. }
+                        | WideOp::GetPrivateW { .. }
+                        | WideOp::SetPrivateW { .. }
+                        | WideOp::DefinePrivateW { .. }
+                        | WideOp::HasPrivateW { .. } => {
                             panic!("wide op not expected in mini-interp snippets")
                         }
                     }
