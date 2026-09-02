@@ -1032,6 +1032,34 @@ impl<'a> Interp<'a> {
             }
             return format!("{name}: {msg}");
         }
+        // Plain-object errors (e.g. Test262Error): render `message`/`name` instead of opaque fallthrough.
+        if v.is_object() {
+            if let Some(obj) = v.as_object() {
+                let shape = self.heap.shape_of_mut(obj);
+                let lookup = |heap: &mut v12_heap::Heap, shape: v12_heap::ShapeHandle, key: &str| -> Option<v12_heap::Handle<v12_heap::V12Str>> {
+                    let h = heap.intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));
+                    let pk = v12_heap::PropKey::from_string(h);
+                    let desc = heap.lookup_property(shape, pk)?;
+                    let slot = desc.slot()?;
+                    // Interp objects have no GLOBAL_VAR_OFFSET bias (only engine global does).
+                    let idx = slot as usize;
+                    heap.get(obj).properties.get(idx).and_then(|val| val.as_string())
+                };
+                let shape2 = self.heap.shape_of_mut(obj);
+                // Need two separate lookups without overlapping mutable borrows.
+                let msg_h = lookup(&mut self.heap, shape, "message");
+                if let Some(mh) = msg_h {
+                    let name_h = lookup(&mut self.heap, shape2, "name");
+                    let msg = self.string_text(mh);
+                    if let Some(nh) = name_h {
+                        let name = self.string_text(nh);
+                        if msg.is_empty() { return name; }
+                        return format!("{name}: {msg}");
+                    }
+                    if !msg.is_empty() { return msg; }
+                }
+            }
+        }
         match ops::to_js_string(self.heap, v) {
             Ok(h) => {
                 let units = ops::string_units(self.heap, h);

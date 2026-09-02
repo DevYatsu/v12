@@ -866,6 +866,38 @@ impl Engine {
             return "null".to_string();
         }
         if value.is_object() {
+            // Plain-object errors (e.g. Test262Error) are not Kind::Error but
+            // carry a `message` property. Render them usefully instead of
+            // opaque "[object Object]" so the runner bucket becomes actionable.
+            if let Some(obj) = value.as_object() {
+                let shape = self.heap.shape_of(obj);
+                let lookup_str_prop = |heap: &mut v12_heap::Heap, key: &str| -> Option<v12_heap::Handle<v12_heap::V12Str>> {
+                    let h = heap.intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));
+                    let pk = v12_heap::PropKey::from_string(h);
+                    let desc = heap.lookup_property(shape, pk)?;
+                    let slot = desc.slot()?;
+                    // Ordinary objects store properties at `slot`; the global object biases by INTRINSIC_COUNT.
+                    let props = &heap.get(obj).properties;
+                    let idx_plain = slot as usize;
+                    if let Some(v) = props.get(idx_plain).and_then(|v| v.as_string()) { return Some(v); }
+                    let idx_global = crate::realm::INTRINSIC_COUNT + slot as usize;
+                    props.get(idx_global).and_then(|v| v.as_string())
+                };
+                // Snapshot handles before borrowing self mutably for text decode.
+                let msg_h = lookup_str_prop(&mut self.heap, "message");
+                if let Some(mh) = msg_h {
+                    let name_h = lookup_str_prop(&mut self.heap, "name");
+                    let msg = self.heap_string_text(mh);
+                    if let Some(nh) = name_h {
+                        let name = self.heap_string_text(nh);
+                        if msg.is_empty() { return name; }
+                        return format!("{name}: {msg}");
+                    }
+                    // No name — return the message directly (covers Test262Error which
+                    // stores only `message`; prefixing with generic "Error" would be noisy).
+                    if !msg.is_empty() { return msg; }
+                }
+            }
             return "[object Object]".to_string();
         }
         "<unprintable>".to_string()
