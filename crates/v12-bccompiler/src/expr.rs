@@ -221,7 +221,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(dst)
             }
             Expression::PrivateFieldExpression(p) => {
-                Err(self.err(p.span, "private fields are not supported"))
+                let obj = self.expr(&p.object)?;
+                let key = self.new_temp();
+                self.load_str(key, &format!("#{}", p.field.name), p.span)?;
+                let dst = self.new_temp();
+                self.emit_reg3(Opcode::GetProperty, dst, obj, key, p.span);
+                Ok(dst)
             }
             Expression::FunctionExpression(f) => {
                 let dst = self.new_temp();
@@ -396,10 +401,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_reg2(Opcode::GetNewTarget, dst, 0, x.span);
                 Ok(dst)
             }
-            Expression::PrivateInExpression(x) => Err(self.err(
-                x.span,
-                "private field membership checks (`#field in obj`) are not supported",
-            )),
+            Expression::PrivateInExpression(x) => {
+                let key = self.new_temp();
+                self.load_str(key, &format!("#{}", x.left.name), x.span)?;
+                let obj = self.expr(&x.right)?;
+                let dst = self.new_temp();
+                self.emit_reg3(Opcode::In, dst, key, obj, x.span);
+                Ok(dst)
+            }
             // TypeScript-only forms never reach here through `script()` /
             // `mjs()` parsing; named rejection keeps direct AST callers safe.
             Expression::TSAsExpression(_)
@@ -1241,7 +1250,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok((obj, key))
             }
             MemberExpression::PrivateFieldExpression(p) => {
-                Err(self.err(p.span, "private fields are not supported"))
+                let obj = self.expr(&p.object)?;
+                let key = self.new_temp();
+                self.load_str(key, &format!("#{}", p.field.name), p.span)?;
+                Ok((obj, key))
             }
         }
     }
@@ -1387,7 +1399,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         });
                         cur = &c.callee;
                     }
-                    Expression::PrivateFieldExpression(p) => return Err(p.span),
+                    Expression::PrivateFieldExpression(p) => {
+                        links.push(SpineLink::Member {
+                            span: p.span,
+                            optional: p.optional,
+                            member: cur.as_member_expression().expect("private field"),
+                        });
+                        cur = &p.object;
+                    }
                     _ => return Ok(cur),
                 }
             }
@@ -1423,7 +1442,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 &c.callee
             }
             ChainElement::PrivateFieldExpression(p) => {
-                return Err(self.err(p.span, "private fields are not supported"));
+                links.push(SpineLink::Member {
+                    span: p.span,
+                    optional: p.optional,
+                    member: cx.expression.member_expression().expect("private field"),
+                });
+                &p.object
             }
             ChainElement::TSNonNullExpression(t) => {
                 return Err(self.err(t.span, "non-null assertions are TypeScript-only"));
@@ -1457,8 +1481,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         MemberExpression::ComputedMemberExpression(c) => {
                             self.expr(&c.expression)?
                         }
-                        MemberExpression::PrivateFieldExpression(_) => {
-                            unreachable!("rejected during collect")
+                        MemberExpression::PrivateFieldExpression(p) => {
+                            let r = self.new_temp();
+                            self.load_str(r, &format!("#{}", p.field.name), p.span)?;
+                            r
                         }
                     };
                     prev_recv = Some(cur);
