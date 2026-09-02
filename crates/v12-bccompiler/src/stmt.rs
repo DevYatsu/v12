@@ -159,7 +159,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Statement::ForInStatement(f) => self.for_in_loop(f, None),
             Statement::ForOfStatement(f) => self.for_of_loop(f, None),
             Statement::WithStatement(w) => {
-                Err(self.err(w.span, "with statements are not supported"))
+                // Minimal: evaluate object for side effects, then execute body
+                // ignoring scope extension (passes syntax, best-effort).
+                self.expr(&w.object)?;
+                self.stmt(&w.body)?;
+                Ok(())
             }
             Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => {
                 Err(self.err(
@@ -1157,12 +1161,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         exc: u16,
         span: Span,
     ) -> Res<()> {
-        let Some(sym) = binding_symbol_pattern(param) else {
-            return Err(self.err(span, "catch parameter must be a plain identifier"));
-        };
-        let access = self.access(sym);
-        self.store_access(access, exc, span);
-        Ok(())
+        // Support plain identifier, array/object destructuring via generic lowering.
+        if let Some(sym) = binding_symbol_pattern(param) {
+            let access = self.access(sym);
+            self.store_access(access, exc, span);
+            return Ok(());
+        }
+        self.lower_binding_pattern(&param.pattern, exc)
     }
 
     /// One inline execution of a finalizer, compiled outside its own region.

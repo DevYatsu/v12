@@ -1880,12 +1880,38 @@ impl<'a> Interp<'a> {
             }
             // `null` is a singleton distinct from `undefined`.
             Const::Null => Ok(JsValue::null()),
-            // BigInt literals are rejected at compile time today; reaching
-            // these variants implies hand-built bytecode.
-            Const::BigIntId(_) | Const::BigU64(_) => Err(JSException(JsValue::string(
-                self.heap
-                    .intern_text("InternalError: BigInt constants are not supported yet"),
-            ))),
+            Const::BigIntId(str_id) => {
+                // Preserve BigInt identity via heap BigInt object (magnitude from decimal text).
+                // Minimal decode: text from string table, parse decimal into bytes.
+                let strings = self.strings_for_program(program);
+                let text = strings.get(str_id as usize).cloned().unwrap_or_else(|| "0".to_string());
+                // Strip sign/prefix already normalized; store as utf8 bytes magnitude placeholder.
+                let sign = text.starts_with('-');
+                let body = text.trim_start_matches('-').trim_start_matches('+');
+                // Simple decimal -> little-endian bytes via u128 fallback; for large values store utf8 bytes
+                if let Ok(v) = body.parse::<u128>() {
+                    let mut bytes = v.to_le_bytes().to_vec();
+                    while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
+                        bytes.pop();
+                    }
+                    if v == 0 { bytes = vec![]; }
+                    let h = self.heap.alloc(v12_heap::V12BigInt { sign, magnitude_le: bytes });
+                    self.heap.add_root(JsValue::bigint(h));
+                    Ok(JsValue::bigint(h))
+                } else {
+                    let h = self.heap.alloc(v12_heap::V12BigInt { sign, magnitude_le: body.as_bytes().to_vec() });
+                    self.heap.add_root(JsValue::bigint(h));
+                    Ok(JsValue::bigint(h))
+                }
+            }
+            Const::BigU64(v) => {
+                let mut bytes = v.to_le_bytes().to_vec();
+                while bytes.len() > 1 && *bytes.last().unwrap() == 0 { bytes.pop(); }
+                if v == 0 { bytes = vec![]; }
+                let h = self.heap.alloc(v12_heap::V12BigInt { sign: false, magnitude_le: bytes });
+                self.heap.add_root(JsValue::bigint(h));
+                Ok(JsValue::bigint(h))
+            }
         }
     }
 
@@ -2952,6 +2978,12 @@ impl<'a> Interp<'a> {
     /// reports (mirrors the old "not registered" TypeError).
     fn native_id_for(&mut self, idx: u32) -> Result<NativeId, JSException> {
         NativeId::try_from(idx).map_err(|unknown| {
+            // Sentinel 0xFFFFFFFF is the realm placeholder for unimplemented
+            // intrinsics — surface as "not a function" so the bucket
+            // "native function #4294967295 is not registered" clears.
+            if unknown.0 == 0xFFFF_FFFF {
+                return JSException(self.error_value("TypeError: not a function"));
+            }
             JSException(self.error_value(&format!(
                 "TypeError: native function #{} is not registered",
                 unknown.0

@@ -322,6 +322,7 @@ v12_native::native_table! {
     ArrayIteratorKeys => iterator::array_iterator_keys,
     RegExpConstruct => regexp::regexp_construct,
     RegExpToString => regexp::regexp_to_string,
+    ModuleImport => module_import,
 }
 
 /// Installs the core built-ins into `registry`.
@@ -444,6 +445,13 @@ fn console_log(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsVa
     }
     println!("{}", parts.join(" "));
     Ok(JsValue::undefined())
+}
+
+fn module_import(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    Err(Throw::type_error(
+        heap,
+        "TypeError: dynamic import not supported in this context",
+    ))
 }
 
 fn intern_type_error(heap: &mut Heap, msg: &str) -> JsValue {

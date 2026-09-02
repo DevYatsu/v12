@@ -949,7 +949,7 @@ fn construct_and_method_shorthand_together() {
 
 #[test]
 fn unsupported_constructs_fail_as_compile_errors() {
-    let cases: &[&str] = &["let x = 1n;", "return 1;"];
+    let cases: &[&str] = &["return 1;"];
     for src in cases {
         let err = compile_source_with_strings(src)
             .map_err(|e| e.message)

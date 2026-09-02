@@ -58,7 +58,33 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Expression::TemplateLiteral(t) => self.template_literal(t),
             Expression::BigIntLiteral(b) => {
-                Err(self.err(b.span, "BigInt literals are not supported"))
+                // Minimal BigInt support: strip separators and suffix, try u64,
+                // otherwise preserve as BigIntId string. Falls back to Number
+                // only if parsing fails — never the "not supported" error.
+                let raw_opt = b.raw.as_deref().unwrap_or("");
+                let stripped = raw_opt.trim_end_matches('n').replace('_', "");
+                let stripped = if stripped.is_empty() { b.value.to_string() } else { stripped };
+                let body = stripped.as_str();
+                let dst = self.new_temp();
+                // Try hex/binary/octal prefixes via u64
+                let parsed_u64 = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+                    u64::from_str_radix(hex, 16).ok()
+                } else if let Some(bin) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+                    u64::from_str_radix(bin, 2).ok()
+                } else if let Some(oct) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+                    u64::from_str_radix(oct, 8).ok()
+                } else {
+                    // decimal — allow leading sign handled by parser? BigInt is unsigned with optional sign stripped earlier
+                    body.parse::<u64>().ok()
+                };
+                if let Some(v) = parsed_u64 {
+                    self.load_const(dst, Const::BigU64(v), b.span)?;
+                } else {
+                    // Preserve original decimal text (without suffix/underscores) as BigIntId
+                    let id = crate::model::str_id_of(self.comp.strings.get_or_intern(&stripped));
+                    self.load_const(dst, Const::BigIntId(id), b.span)?;
+                }
+                Ok(dst)
             }
             Expression::RegExpLiteral(r) => {
                 // `/pattern/flags` → `RegExp("pattern", "flags")`: read the
@@ -323,7 +349,31 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Expression::ClassExpression(c) => crate::class::class_expression(self, c, false),
             Expression::TaggedTemplateExpression(t) => {
-                Err(self.err(t.span, "tagged template literals are not supported"))
+                // Minimal: evaluate as tag`template` -> call tag with template strings.
+                // Build array of cooked strings, pass as first arg, then expressions.
+                let tag = self.expr(&t.tag)?;
+                let quasi = &t.quasi;
+                let n = quasi.quasis.len();
+                let arr_base = self.new_temps(n as u16);
+                for (i, q) in quasi.quasis.iter().enumerate() {
+                    let raw = q.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
+                    self.load_str(arr_base + i as u16, raw, q.span)?;
+                }
+                let arr = self.new_temp();
+                self.emit_new_array(arr, arr_base, n as u8, t.span);
+                let argc = (1 + quasi.expressions.len()) as u16;
+                let block = self.new_temps(CALL_HEADER_REGS + argc);
+                self.move_reg(block, tag, t.span);
+                self.load_undefined(block + 1, t.span);
+                self.move_reg(block + 2, arr, t.span);
+                for (i, e) in quasi.expressions.iter().enumerate() {
+                    let r = self.expr(e)?;
+                    self.move_reg(block + 3 + i as u16, r, t.span);
+                }
+                self.emit_call(block, block, argc, t.span);
+                let dst = self.new_temp();
+                self.move_reg(dst, block, t.span);
+                Ok(dst)
             }
             Expression::ImportExpression(i) => {
                 // Dynamic import: desugar to a call to the native import helper
