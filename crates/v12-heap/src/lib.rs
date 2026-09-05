@@ -136,7 +136,7 @@ pub use function::{FunctionTarget, HostClosure, Native};
 pub use gc::{GcPolicy, Heap, MarkSink, RootSet, Trace};
 pub use handle::{Handle, HeapSpace, Space};
 pub use object::{
-    EnginePromise, GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject, Kind,
+    GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject, Kind,
     PromiseExt, PromiseState, V12BigInt, V12Symbol,
 };
 pub use prop_key::PropKey;

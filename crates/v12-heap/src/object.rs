@@ -118,15 +118,6 @@ pub struct JsObject {
     /// to the pinned empty-object root shape; `Heap::bind_shape` transitions
     /// it as properties are added.
     pub shape: crate::shape::ShapeHandle,
-    /// In-object property slots (V8-style): shape descriptor slots below
-    /// [`Self::IN_OBJECT_PROP_CAP`] live here, avoiding a separate backing
-    /// allocation for the common few-property case. Access through
-    /// [`Self::prop_slot`].
-    pub inline_props: [crate::JsValue; Self::IN_OBJECT_PROP_CAP],
-    /// Out-of-line property backing store for slots at or beyond
-    /// [`Self::IN_OBJECT_PROP_CAP`]. `None` until a shape grows past the
-    /// inline cap. Access through [`Self::prop_slot`].
-    pub overflow: Option<Box<[crate::JsValue]>>,
     /// Named-property slots (shape-backed layout arrives with the object
     /// model work).
     ///
@@ -182,8 +173,6 @@ impl Default for JsObject {
             program_id: 0,
             captured_env: None,
             shape: crate::shape::ShapeHandle::new(0),
-            inline_props: [crate::JsValue::undefined(); Self::IN_OBJECT_PROP_CAP],
-            overflow: None,
             properties: smallvec::SmallVec::new(),
             property_keys: smallvec::SmallVec::new(),
             elements: Vec::new(),
@@ -198,10 +187,6 @@ impl Default for JsObject {
 }
 
 impl JsObject {
-    /// An ordinary object with empty storage.
-    pub fn new() -> Self {
-        Self::default()
-    }
     /// `[[Extensible]] == false`. Implied by both integrity transitions.
     pub const FLAG_NOT_EXTENSIBLE: u8 = 0b0000_0001;
     /// Every own property non-configurable: sealed or stricter.
@@ -218,49 +203,6 @@ impl JsObject {
     /// True only when frozen: sealed plus every own property non-writable.
     pub fn is_frozen(&self) -> bool {
         self.flags & Self::FLAG_FROZEN != 0
-    }
-
-    /// Number of property slots stored inline in the object header.
-    ///
-    /// This is the V8-style in-object/overflow split: shape descriptor slots
-    /// below this cap live in `inline_props`, slots at or above it live in
-    /// `overflow`. Kept small (V8 uses 3–4); benchmark and tune.
-    pub const IN_OBJECT_PROP_CAP: usize = 4;
-
-    /// Reads the property value at shape-slot `slot`.
-    ///
-    /// Slots below [`Self::IN_OBJECT_PROP_CAP`] come from the inline array,
-    /// slots at or above it from the overflow backing store. This is the
-    /// single accessor for shape-derived slots — the interpreter's
-    /// `GetProperty`/`SetProperty` fast paths index through it.
-    ///
-    /// # Panics
-    /// Panics when `slot` is out of range of both stores (corrupt shape).
-    #[inline]
-    pub fn prop_slot(&self, slot: usize) -> crate::JsValue {
-        if slot < Self::IN_OBJECT_PROP_CAP {
-            self.inline_props[slot]
-        } else {
-            self.overflow
-                .as_deref()
-                .and_then(|o| o.get(slot - Self::IN_OBJECT_PROP_CAP))
-                .copied()
-                .unwrap_or(crate::JsValue::undefined())
-        }
-    }
-
-    /// Writes the property value at shape-slot `slot`. See
-    /// [`Self::prop_slot`] for the store layout.
-    #[inline]
-    pub fn set_prop_slot(&mut self, slot: usize, value: crate::JsValue) {
-        if slot < Self::IN_OBJECT_PROP_CAP {
-            self.inline_props[slot] = value;
-        } else {
-            let idx = slot - Self::IN_OBJECT_PROP_CAP;
-            if let Some(overflow) = self.overflow.as_deref_mut() {
-                overflow[idx] = value;
-            }
-        }
     }
 
     /// An ordinary object with the given properties and their keys.
@@ -701,9 +643,6 @@ pub trait HeapExt {
     ) -> crate::Handle<JsObject>;
     fn alloc_ordinary(&mut self, props: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
     fn alloc_pending_promise(&mut self) -> crate::Handle<JsObject>;
-    fn alloc_array_with_roots(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject> {
-        self.alloc_array(elements)
-    }
 }
 
 impl HeapExt for crate::Heap {
@@ -739,18 +678,6 @@ impl HeapExt for crate::Heap {
     }
 }
 
-/// Engine-side promise allocation seam: Interp should call through this trait
-/// rather than `heap.alloc(JsObject{...})` directly. Provided for layering;
-/// Interp currently documents the TODO and calls `HeapExt::alloc_pending_promise`.
-pub trait EnginePromise {
-    fn new_pending_promise(&mut self) -> crate::Handle<JsObject>;
-}
-
-impl EnginePromise for crate::Heap {
-    fn new_pending_promise(&mut self) -> crate::Handle<JsObject> {
-        self.alloc_pending_promise()
-    }
-}
 /// A heap symbol. Identity *is* the handle for now; descriptions,
 /// well-known singletons, and `#private` names come with interning work.
 #[derive(Clone, Debug, Default, PartialEq)]

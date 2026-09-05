@@ -1226,8 +1226,6 @@ mod tests {
             program_id: 0,
             captured_env: None,
             shape: crate::shape::ShapeHandle::new(0),
-            inline_props: [crate::JsValue::undefined(); JsObject::IN_OBJECT_PROP_CAP],
-            overflow: None,
             properties: props,
             property_keys: smallvec::SmallVec::new(),
             elements: Vec::new(),
