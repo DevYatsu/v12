@@ -1579,6 +1579,26 @@ fn destructuring_object_defaults() {
     }
 }
 
+#[test]
+fn destructuring_assignment_targets_with_defaults() {
+    // Assignment-target destructuring with defaults (`[a = 1] = []`,
+    // `{x = 1} = {}`): array-element defaults used to be silently skipped
+    // and object-property defaults were unhandled; both now lower through
+    // the shared `lower_default`.
+    for src in [
+        "[a = 1, b = a + 1] = [];",
+        "({x = 5, y: z = x * 2} = {});",
+        "[a = 1, ...rest] = [1];",
+        "for (const [v = 3] of [[]]) {}",
+    ] {
+        let (prog, _) = compile_source_with_strings(src)
+            .unwrap_or_else(|e| panic!("{src:?} should compile: {e}"));
+        for f in &prog.functions {
+            f.validate().unwrap_or_else(|e| panic!("{src:?}: {e}"));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bucket 6 — Rest parameters & spread
 // ---------------------------------------------------------------------------

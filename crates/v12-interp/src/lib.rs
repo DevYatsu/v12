@@ -68,6 +68,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use v12_bytecode::{BytecodeError, Const, FunctionBytecode, Instr, Opcode, WideOp};
+use v12_bytecode::{GLOBAL_INTRINSICS as GLOBAL_INTRINSIC_NAMES, GLOBAL_VAR_OFFSET};
 use v12_heap::{
     Attrs, Descriptor, Handle, Heap, HeapExt, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
 };
@@ -85,99 +86,8 @@ use crate::feedback::{FeedbackVector, Lattice, TYPE_NAME_COUNT, TYPE_NAMES, Tier
 
 pub use v12_native::NativeId; // the shared enum itself
 
-/// `console.log` — prints its arguments and returns `undefined`.
-pub const NATIVE_CONSOLE_LOG: NativeId = NativeId::ConsoleLog;
-/// `Array.prototype.push`.
-pub const NATIVE_ARRAY_PUSH: NativeId = NativeId::ArrayPush;
-/// `Array.prototype.join`.
-pub const NATIVE_ARRAY_JOIN: NativeId = NativeId::ArrayJoin;
-/// `Array.prototype.pop`.
-pub const NATIVE_ARRAY_POP: NativeId = NativeId::ArrayPop;
-/// `Object.enumerableOwnKeys` (internal).
-pub const NATIVE_ENUMERABLE_OWN_KEYS: NativeId = NativeId::ObjectEnumerableOwnKeys;
-/// Minimal Promise surface.
-pub const NATIVE_PROMISE_RESOLVE: NativeId = NativeId::PromiseResolve;
-pub const NATIVE_PROMISE_REJECT: NativeId = NativeId::PromiseReject;
-pub const NATIVE_PROMISE_THEN: NativeId = NativeId::PromiseThen;
-/// `Generator.prototype.next/return/throw`.
-pub const NATIVE_GENERATOR_NEXT: NativeId = NativeId::GeneratorNext;
-pub const NATIVE_GENERATOR_RETURN: NativeId = NativeId::GeneratorReturn;
-pub const NATIVE_GENERATOR_THROW: NativeId = NativeId::GeneratorThrow;
-/// Iterator surface: `next` on iterators, the `Symbol.iterator` creators on
-/// Array/Map/Set, and `%IteratorPrototype%` self-return.
-pub const NATIVE_ITERATOR_NEXT: NativeId = NativeId::IteratorNext;
-pub const NATIVE_ARRAY_ITERATOR: NativeId = NativeId::ArrayIterator;
-pub const NATIVE_MAP_ITERATOR: NativeId = NativeId::MapIterator;
-pub const NATIVE_SET_ITERATOR: NativeId = NativeId::SetIterator;
-pub const NATIVE_ITERATOR_SELF: NativeId = NativeId::IteratorSelf;
-pub const NATIVE_ARRAY_ITERATOR_ENTRIES: NativeId = NativeId::ArrayIteratorEntries;
-pub const NATIVE_ARRAY_ITERATOR_KEYS: NativeId = NativeId::ArrayIteratorKeys;
-/// RegExp surface.
-pub const NATIVE_REGEXP_CONSTRUCT: NativeId = NativeId::RegExpConstruct;
-pub const NATIVE_REGEXP_EXEC: NativeId = NativeId::RegExpExec;
-pub const NATIVE_REGEXP_TEST: NativeId = NativeId::RegExpTest;
-pub const NATIVE_REGEXP_TO_STRING: NativeId = NativeId::RegExpToString;
-pub const NATIVE_REGEXP_COMPILE: NativeId = NativeId::RegExpCompile;
-/// String regexp methods.
-pub const NATIVE_STRING_MATCH: NativeId = NativeId::StringMatch;
-pub const NATIVE_STRING_REPLACE: NativeId = NativeId::StringReplace;
-pub const NATIVE_STRING_SEARCH: NativeId = NativeId::StringSearch;
-pub const NATIVE_STRING_SPLIT: NativeId = NativeId::StringSplit;
-/// Map/Set surface.
-pub const NATIVE_MAP_GET: NativeId = NativeId::MapGet;
-pub const NATIVE_MAP_SET: NativeId = NativeId::MapSet;
-pub const NATIVE_MAP_HAS: NativeId = NativeId::MapHas;
-pub const NATIVE_MAP_DELETE: NativeId = NativeId::MapDelete;
-pub const NATIVE_MAP_SIZE: NativeId = NativeId::MapSize;
-pub const NATIVE_SET_ADD: NativeId = NativeId::SetAdd;
-pub const NATIVE_SET_HAS: NativeId = NativeId::SetHas;
-pub const NATIVE_SET_DELETE: NativeId = NativeId::SetDelete;
-pub const NATIVE_SET_SIZE: NativeId = NativeId::SetSize;
-/// Direct `eval`.
-pub const NATIVE_EVAL: NativeId = NativeId::Eval;
-/// Constructor-shaped built-ins.
-pub const NATIVE_BOOLEAN_CONSTRUCT: NativeId = NativeId::BooleanConstruct;
-pub const NATIVE_ERROR_CREATE: NativeId = NativeId::ErrorCreate;
 
 /// Offset of user-declared global slots in the global object's `properties`.
-///
-/// The realm pushes this many intrinsic slots (`INTRINSIC_NAMES`) onto the
-/// global's `properties` vector without shape descriptors, so any slot a
-/// shape descriptor reports for the global must be biased by this constant
-/// before indexing storage (see [`Interp::global_slot_index`]). Must stay in
-/// sync with `v12-engine/src/realm.rs` `INTRINSIC_NAMES.len()` and
-/// `v12-bccompiler/src/model.rs` `GLOBAL_INTRINSICS.len()` (v1: 18).
-const GLOBAL_VAR_OFFSET: usize = 18;
-
-/// Names of the intrinsic slots installed by the realm at fixed positions
-/// in the global object's `properties` vector.
-///
-/// Mirrors `v12-engine/src/realm.rs` `INTRINSIC_NAMES` exactly (same names,
-/// same order, same length as [`GLOBAL_VAR_OFFSET`]); duplicated here because
-/// the interpreter sits below the engine crate. Deliberately *not* the
-/// compiler's longer [`v12_bccompiler::model::GLOBAL_INTRINSICS`] table,
-/// which lists more names than the v1 realm installs.
-const GLOBAL_INTRINSIC_NAMES: &[&str] = &[
-    "Object",
-    "Array",
-    "String",
-    "Number",
-    "Boolean",
-    "Math",
-    "JSON",
-    "Error",
-    "TypeError",
-    "RangeError",
-    "Promise",
-    "Symbol",
-    "Map",
-    "Set",
-    "RegExp",
-    "eval",
-    "console",
-    "globalThis",
-];
-
 /// Const-stable string equality. `str == str` goes through `PartialEq`,
 /// which is not yet a const trait on stable rustc; byte-wise comparison is
 /// (integer compares are const-stable). Used only at compile time.
@@ -576,7 +486,7 @@ pub struct Interp<'a> {
     global: Option<Handle<JsObject>>,
     /// Cached `console.log` function object, synthesized lazily on first
     /// `get_property` for `console.log`. The object is a `Kind::Function`
-    /// whose `elements[0]` is `NATIVE_CONSOLE_LOG`, so `prepare_call` routes
+    /// whose `elements[0]` is `NativeId::ConsoleLog`, so `prepare_call` routes
     /// it through the `NativeRegistry`.
     console_log: Option<JsValue>,
     /// Cached native function objects for the Promise surface and the array
@@ -2355,7 +2265,7 @@ impl<'a> Interp<'a> {
                             self.heap,
                             this_v,
                             &args_slice,
-                            NATIVE_PROMISE_RESOLVE,
+                            NativeId::PromiseResolve,
                         );
                         result
                             .map(CallOutcome::Value)
@@ -2367,7 +2277,7 @@ impl<'a> Interp<'a> {
                             self.heap,
                             this_v,
                             &args_slice,
-                            NATIVE_PROMISE_REJECT,
+                            NativeId::PromiseReject,
                         );
                         result
                             .map(CallOutcome::Value)
@@ -2379,7 +2289,7 @@ impl<'a> Interp<'a> {
                             self.heap,
                             this_v,
                             &args_slice,
-                            NATIVE_PROMISE_THEN,
+                            NativeId::PromiseThen,
                         );
                         result
                             .map(CallOutcome::Value)
@@ -2391,7 +2301,7 @@ impl<'a> Interp<'a> {
                             self.heap,
                             this_v,
                             &args_slice,
-                            NATIVE_ENUMERABLE_OWN_KEYS,
+                            NativeId::ObjectEnumerableOwnKeys,
                         );
                         result
                             .map(CallOutcome::Value)
@@ -2484,7 +2394,7 @@ impl<'a> Interp<'a> {
             let args_start = callee_slot + 2;
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
-            if target_idx == u32::from(NATIVE_EVAL) {
+            if target_idx == u32::from(NativeId::Eval) {
                 // Direct eval: hand the source, shared global, and the
                 // cross-program registry to the engine's eval implementation,
                 // which compiles and runs a nested interpreter against this
@@ -2765,7 +2675,7 @@ impl<'a> Interp<'a> {
                                 self.heap,
                                 this,
                                 args,
-                                NATIVE_PROMISE_RESOLVE,
+                                NativeId::PromiseResolve,
                             );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
@@ -2775,7 +2685,7 @@ impl<'a> Interp<'a> {
                                 self.heap,
                                 this,
                                 args,
-                                NATIVE_PROMISE_REJECT,
+                                NativeId::PromiseReject,
                             );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
@@ -2785,7 +2695,7 @@ impl<'a> Interp<'a> {
                                 self.heap,
                                 this,
                                 args,
-                                NATIVE_PROMISE_THEN,
+                                NativeId::PromiseThen,
                             );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
@@ -2795,7 +2705,7 @@ impl<'a> Interp<'a> {
                                 self.heap,
                                 this,
                                 args,
-                                NATIVE_ENUMERABLE_OWN_KEYS,
+                                NativeId::ObjectEnumerableOwnKeys,
                             );
                             result.map_err(|t| JSException::from_throw(self.heap, t))
                         }
@@ -3248,7 +3158,7 @@ impl<'a> Interp<'a> {
     /// Lazily materializes the `console.log` native function object.
     ///
     /// The function is a `Kind::Function` whose `elements[0]` is
-    /// `NATIVE_CONSOLE_LOG`, so `prepare_call` routes it through the
+    /// `NativeId::ConsoleLog`, so `prepare_call` routes it through the
     /// `NativeRegistry`. The object is cached in `self.console_log` and
     /// rooted, so repeated `get_property` for `console.log` returns the
     /// same handle.
@@ -3645,10 +3555,10 @@ impl<'a> Interp<'a> {
             return None;
         }
         let constant = match self.heap.get(obj).kind {
-            Kind::Array | Kind::Arguments => crate::NATIVE_ARRAY_ITERATOR,
-            Kind::Map => crate::NATIVE_MAP_ITERATOR,
-            Kind::Set => crate::NATIVE_SET_ITERATOR,
-            Kind::Iterator | Kind::Generator => crate::NATIVE_ITERATOR_SELF,
+            Kind::Array | Kind::Arguments => crate::NativeId::ArrayIterator,
+            Kind::Map => crate::NativeId::MapIterator,
+            Kind::Set => crate::NativeId::SetIterator,
+            Kind::Iterator | Kind::Generator => crate::NativeId::IteratorSelf,
             _ => return None,
         };
         Some(Ok(self.map_set_method(constant)))
@@ -3871,9 +3781,9 @@ impl<'a> Interp<'a> {
         // Map/Set as `this`. Methods return the synthesized function.
         if self.key_is(key_v, "size") {
             let size_const = if kind == Kind::Map {
-                NATIVE_MAP_SIZE
+                NativeId::MapSize
             } else {
-                NATIVE_SET_SIZE
+                NativeId::SetSize
             };
             self.gc_protect();
             let result = self
@@ -3884,22 +3794,22 @@ impl<'a> Interp<'a> {
         }
         let constant = if kind == Kind::Map {
             if self.key_is(key_v, "get") {
-                NATIVE_MAP_GET
+                NativeId::MapGet
             } else if self.key_is(key_v, "set") {
-                NATIVE_MAP_SET
+                NativeId::MapSet
             } else if self.key_is(key_v, "has") {
-                NATIVE_MAP_HAS
+                NativeId::MapHas
             } else if self.key_is(key_v, "delete") {
-                NATIVE_MAP_DELETE
+                NativeId::MapDelete
             } else {
                 return None;
             }
         } else if self.key_is(key_v, "add") {
-            NATIVE_SET_ADD
+            NativeId::SetAdd
         } else if self.key_is(key_v, "has") {
-            NATIVE_SET_HAS
+            NativeId::SetHas
         } else if self.key_is(key_v, "delete") {
-            NATIVE_SET_DELETE
+            NativeId::SetDelete
         } else {
             return None;
         };
@@ -5044,8 +4954,8 @@ impl<'a> Interp<'a> {
     ///   instance is allocated with [[Prototype]] = `F.prototype` (the
     ///   property is created on first use, as spec-mandated for plain
     ///   functions), bound as `this`, and the body runs;
-    /// - the constructor-shaped natives ([`NATIVE_ERROR_CREATE`],
-    ///   [`NATIVE_BOOLEAN_CONSTRUCT`]) route through the registry ignoring
+    /// - the constructor-shaped natives ([`NativeId::ErrorCreate`],
+    ///   [`NativeId::BooleanConstruct`]) route through the registry ignoring
     ///   the receiver, like their spec counterparts do when called;
     /// - everything else throws TypeError "not a constructor".
     ///

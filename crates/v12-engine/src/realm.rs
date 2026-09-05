@@ -7,43 +7,20 @@
 use std::collections::HashMap;
 
 use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue, PropKey, V12Str};
-
-use crate::builtins::NATIVE_STRING_CONSTRUCT;
+use v12_native::NativeId;
 
 /// Maximum number of intrinsics a realm may host.
 const MAX_INTRINSICS: usize = 64;
 
-/// Names of the standard intrinsics installed at realm creation.
-///
-/// Order is part of the `GLOBAL_VAR_OFFSET` contract with `v12-interp`: the
-/// `n`th entry lives at `global.properties[n]`. Changing the order or length
-/// must be reflected in `v12-interp/src/lib.rs` (`INTRINSICS` and
-/// `GLOBAL_VAR_OFFSET`) and in `v12-bccompiler/src/model.rs` (`GLOBAL_INTRINSICS`).
-pub const INTRINSIC_NAMES: &[&str] = &[
-    "Object",
-    "Array",
-    "String",
-    "Number",
-    "Boolean",
-    "Math",
-    "JSON",
-    "Error",
-    "TypeError",
-    "RangeError",
-    "Promise",
-    "Symbol",
-    "Map",
-    "Set",
-    "RegExp",
-    "eval",
-    "console",
-    "globalThis",
-];
+// Names of the standard intrinsics installed at realm creation. Canonical
+// copy lives in `v12-bytecode` (`GLOBAL_INTRINSICS`); the realm and the
+// interpreter both read it from there, so the `GLOBAL_VAR_OFFSET` slot-order
+// contract is enforced by sharing rather than by hand-synced duplicates.
+use v12_bytecode::GLOBAL_INTRINSICS as INTRINSIC_NAMES;
 
-/// `INTRINSIC_NAMES.len()` — kept as a const for `GLOBAL_VAR_OFFSET` sync.
-///
-/// `v12-interp` duplicates this value as `GLOBAL_VAR_OFFSET`; see its docs.
-pub const INTRINSIC_COUNT: usize = INTRINSIC_NAMES.len();
+/// `INTRINSIC_NAMES.len()` — the engine-side name for
+/// [`v12_bytecode::GLOBAL_VAR_OFFSET`].
+pub const INTRINSIC_COUNT: usize = v12_bytecode::GLOBAL_VAR_OFFSET;
 
 /// A single realm: global object plus the intrinsic registry.
 #[derive(Debug)]
@@ -131,48 +108,48 @@ impl Realm {
         let string_ctor = intrinsics.get("String").and_then(|v| v.as_object());
         if let Some(string_ctor) = string_ctor {
             heap.get_mut(string_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(NATIVE_STRING_CONSTRUCT));
+                v12_heap::FunctionTarget::Bytecode(u32::from(NativeId::StringConstruct));
         }
         // `Error(x)` / `new Error(x)` are constructible: point the placeholder
         // at the native error creator.
         let error_ctor = intrinsics.get("Error").and_then(|v| v.as_object());
         if let Some(error_ctor) = error_ctor {
             heap.get_mut(error_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_ERROR_CREATE));
+                v12_heap::FunctionTarget::Bytecode(u32::from(v12_native::NativeId::ErrorCreate));
         }
         // `Boolean(x)` / `new Boolean(x)` are constructible.
         let boolean_ctor = intrinsics.get("Boolean").and_then(|v| v.as_object());
         if let Some(boolean_ctor) = boolean_ctor {
             heap.get_mut(boolean_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                crate::builtins::NATIVE_BOOLEAN_CONSTRUCT,
+                v12_native::NativeId::BooleanConstruct,
             ));
         }
         // `Map` / `Set` are constructible.
         let map_ctor = intrinsics.get("Map").and_then(|v| v.as_object());
         if let Some(map_ctor) = map_ctor {
             heap.get_mut(map_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                crate::builtins::NATIVE_MAP_CONSTRUCT,
+                v12_native::NativeId::MapConstruct,
             ));
         }
         let set_ctor = intrinsics.get("Set").and_then(|v| v.as_object());
         if let Some(set_ctor) = set_ctor {
             heap.get_mut(set_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                crate::builtins::NATIVE_SET_CONSTRUCT,
+                v12_native::NativeId::SetConstruct,
             ));
         }
         // `RegExp` is constructible.
         let regexp_ctor = intrinsics.get("RegExp").and_then(|v| v.as_object());
         if let Some(regexp_ctor) = regexp_ctor {
             heap.get_mut(regexp_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                crate::builtins::NATIVE_REGEXP_CONSTRUCT,
+                v12_native::NativeId::RegExpConstruct,
             ));
         }
         // `eval` is callable: route through the native registry (the
-        // interpreter special-cases NATIVE_EVAL to run the source re-entrantly).
+        // interpreter special-cases NativeId::Eval to run the source re-entrantly).
         let eval_global = intrinsics.get("eval").and_then(|v| v.as_object());
         if let Some(eval_global) = eval_global {
             heap.get_mut(eval_global).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(crate::builtins::NATIVE_EVAL));
+                v12_heap::FunctionTarget::Bytecode(u32::from(v12_native::NativeId::Eval));
         }
 
         // Materialize the standard prototypes the built-in installs target.
@@ -220,7 +197,7 @@ impl Realm {
         link_ctor(heap, &intrinsics, "Number", number_proto);
         if let Some(number_ctor) = intrinsics.get("Number").and_then(|v| v.as_object()) {
             heap.get_mut(number_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                crate::builtins::NATIVE_NUMBER_CONSTRUCT,
+                v12_native::NativeId::NumberConstruct,
             ));
         }
 

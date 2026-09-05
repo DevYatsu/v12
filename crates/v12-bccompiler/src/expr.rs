@@ -119,7 +119,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     flags.push('y');
                 }
                 let dst = self.new_temp();
-                let gid = crate::model::str_id_of(self.comp.strings.get_or_intern("RegExp"));
+                let gid = self.global_name_id("RegExp");
                 self.emit_get_global(dst, gid, r.span);
                 let block = self.new_temps(CALL_HEADER_REGS + 2);
                 self.move_reg(block, dst, r.span);
@@ -230,7 +230,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::PrivateFieldExpression(p) => {
                 let obj = self.expr(&p.object)?;
                 let dst = self.new_temp();
-                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", p.field.name)));
+                let name_id =
+                    crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", p.field.name)));
                 // class_id 0 for minimal brand check
                 let words = v12_bytecode::WideOp::GetPrivateW { dst, obj, class_id: 0, name_id }.encode();
                 self.emit_words(words, p.span);
@@ -412,7 +413,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::PrivateInExpression(x) => {
                 let obj = self.expr(&x.right)?;
                 let dst = self.new_temp();
-                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", x.left.name)));
+                let name_id =
+                    crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", x.left.name)));
                 let words = v12_bytecode::WideOp::HasPrivateW { dst, obj, class_id: 0, name_id }.encode();
                 self.emit_words(words, x.span);
                 Ok(dst)
@@ -478,7 +480,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             other => {
                 let dst = self.new_temp();
-                let id = crate::model::str_id_of(self.comp.strings.get_or_intern(other));
+                let id = self.global_name_id(other);
                 self.emit_get_global(dst, id, span);
                 Ok(dst)
             }
@@ -492,7 +494,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             VarAccess::Env { depth, slot } => self.emit_get_env(dst, depth, slot, span),
             VarAccess::Global { sym } => {
                 let name = self.comp.scoping.symbol_name(sym);
-                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(name));
+                let name_id = self.global_name_id(name);
                 self.emit_get_global(dst, name_id, span);
             }
         }
@@ -509,7 +511,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             VarAccess::Env { depth, slot } => self.emit_set_env(depth, slot, src, span),
             VarAccess::Global { sym } => {
                 let name = self.comp.scoping.symbol_name(sym);
-                let name_id = crate::model::str_id_of(self.comp.strings.get_or_intern(name));
+                let name_id = self.global_name_id(name);
                 self.emit_set_global(name_id, src, span);
             }
         }
@@ -927,7 +929,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     // unbound name is treated as a global (missing globals read
                     // as `undefined`, writes create the property).
                     let gid =
-                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+                        self.global_name_id(id.name.as_str());
                     let old = self.new_temp();
                     self.emit_get_global(old, gid, span);
                     let one = self.new_temp();
@@ -1029,7 +1031,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         }
                     };
                     let gid =
-                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+                        self.global_name_id(id.name.as_str());
                     self.emit_set_global(gid, rhs_val, span);
                     return Ok(rhs_val);
                 };
@@ -1110,10 +1112,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         d,
                     ) = el
                     {
-                        // `[a = default]`: default applies when the read is
-                        // undefined — not handled in this pass.
+                        // `[a = default]`: the default applies when the read
+                        // is `undefined` (shared `lower_default` lowering).
                         if let Some(target) = d.binding.as_simple_assignment_target() {
-                            let val = self.read_index(src, index, span)?;
+                            let raw = self.read_index(src, index, span)?;
+                            let val = self.lower_default(raw, &d.init, span)?;
                             self.assign_simple(target, val, span)?;
                         }
                         index += 1;
@@ -1146,13 +1149,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 for prop in &obj.properties {
                     match prop {
                         oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
-                            // `{x} = rhs`: property `x` → target variable `x`.
+                            // `{x} = rhs`: property `x` → target variable `x`;
+                            // `{x = default} = rhs` applies the default when
+                            // the read is `undefined` (shared `lower_default`).
                             let key = self.new_temp();
                             self.load_str(key, id.binding.name.as_str(), span)?;
-                            let val = self.new_temp();
-                            self.emit_reg3(Opcode::GetProperty, val, src, key, span);
+                            let raw = self.new_temp();
+                            self.emit_reg3(Opcode::GetProperty, raw, src, key, span);
+                            let val = match &id.init {
+                                Some(default) => self.lower_default(raw, default, span)?,
+                                None => raw,
+                            };
                             let Some(sym) = self.comp.symbol_of(id.binding.reference_id.get()) else {
-                                let gid = crate::model::str_id_of(self.comp.strings.get_or_intern(id.binding.name.as_str()));
+                                let gid = self.global_name_id(id.binding.name.as_str());
                                 self.emit_set_global(gid, val, span);
                                 continue;
                             };
@@ -1178,7 +1187,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// Reads `src[index]` into a temp (missing → undefined).
-    fn read_index(&mut self, src: u16, index: u32, span: Span) -> Res<u16> {
+    pub(crate) fn read_index(&mut self, src: u16, index: u32, span: Span) -> Res<u16> {
         let key = self.new_temp();
         self.load_int(key, index as i64, span);
         let dst = self.new_temp();
@@ -1187,7 +1196,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// Assigns `val` to a simple target (identifier, member, or global).
-    fn assign_simple(
+    pub(crate) fn assign_simple(
         &mut self,
         target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
         val: u16,
@@ -1197,7 +1206,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
                     let gid =
-                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+                        self.global_name_id(id.name.as_str());
                     self.emit_set_global(gid, val, span);
                     return Ok(());
                 };
@@ -1639,7 +1648,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         right: &Expression<'_>,
         span: Span,
     ) -> Res<u16> {
-        let gid = crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+        let gid = self.global_name_id(id.name.as_str());
         let cur = self.new_temp();
         self.emit_get_global(cur, gid, span);
         let end = self.label();

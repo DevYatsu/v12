@@ -24,6 +24,18 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-05 — P1 refactor: shared `lower_default` fixes assignment-target destructuring defaults
+
+- **Filter:** `language/expressions` + annexB (11 190 files, 4 jobs)
+- **Before:** 4 047 pass / 6 960 fail / 183 skip, 36.8 % (last recorded, pre-P0-commit `1b0f73b`)
+- **After:**  4 054 pass / 6 953 fail / 183 skip, 36.8 %
+- **Delta:** +7 pass net vs the recorded pre-P0 number; decomposition against a post-P0 baseline was not measured, but the P0 with-statement `CompileError` costs ~108 false passes on this slice (now honestly failing), so the destructuring-default fix recovered ~+115 on top.
+- **Engine change:** part of the P1 refactor (`docs/refactor-plan.md`) — `FnCtx::lower_default` is now the single `src === undefined ? default : src` lowering; the expr.rs assignment-target destructuring walker previously *silently skipped* array-element defaults (`[a = 1] = []` bound the raw read) and ignored object-property defaults (`{x = 5} = {}`); both now apply the default. Also: object-property identifier defaults (`{x = 5}`) handled via oxc's `AssignmentTargetPropertyIdentifier.init`. Everything else in the change is a pure refactor (intrinsic-table consolidation into `v12_bytecode::GLOBAL_INTRINSICS` + derived `GLOBAL_VAR_OFFSET`; deletion of 87 `NATIVE_*` alias consts; `global_name_id`/`with_loop` helpers; for-of helper copies deleted).
+- **Files:** `crates/v12-bytecode/src/lib.rs`, `crates/v12-bccompiler/src/{expr,stmt,model}.rs`, `crates/v12-engine/src/{realm,engine,builtins/mod}.rs`, `crates/v12-interp/src/lib.rs`
+- **Bucket:** none — small distributed gain across `assignment/dstr` and `destructuring` slices (verified directly: `[a = 1, b = a + 1, ...rest] = [10]`, `{x = 5, y = x * 2} = {}`, for-of defaults)
+- **Runner:** `./conformance/run.sh --filter language/expressions --jobs 4 --format json` + `cargo nextest run --workspace` 564 pass
+- **Notes:** pure-refactor commit; the only semantic changes are the assignment-target default fixes. `with` slice still fails honestly by design (P0, accepted in the refactor plan).
+
 ### 2026-09-02 — Harness: always load sta.js/assert.js for non-raw tests
 
 - **Filter:** `language/expressions` (11 190 files, 4 jobs)

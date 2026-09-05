@@ -1315,19 +1315,52 @@ pub struct Program {
     pub main: u32,
 }
 
-/// Names of standard intrinsics that are always present on the global object.
+/// Names of the standard intrinsics the v1 realm installs, in slot order.
 ///
-/// An unresolved `IdentifierReference` whose text is in this table is treated
-/// as a global access (`GetGlobal`/`SetGlobal`) rather than a compile error.
-/// The list is intentionally small for v1 — enough to cover `known-failures.md`
-/// bucket 3 (`Object`, `Array`, `String`, `Number`, `Boolean`, `Math`, `JSON`,
-/// `Error`, …) without claiming full spec coverage.
-///
-/// Lives in `v12-bytecode` so the compiler, the interpreter, and
-/// the realm can all reference the same list without depending on
-/// `v12-bccompiler`. The compiler's `model::GLOBAL_INTRINSICS` re-exports
-/// this constant for back-compat.
+/// This is the canonical copy of the table: `v12-engine` (realm creation,
+/// slots 0..len of the global object's `properties`) and `v12-interp`
+/// (`GLOBAL_VAR_OFFSET` bias, intrinsic fast paths) both read it from here,
+/// so the order/length contract is enforced by sharing instead of by
+/// hand-synced duplicates. The list is intentionally small for v1 — enough
+/// to cover `known-failures.md` bucket 3 (`Object`, `Array`, `String`,
+/// `Number`, `Boolean`, `Math`, `JSON`, `Error`, …) without claiming full
+/// spec coverage.
 pub const GLOBAL_INTRINSICS: &[&str] = &[
+    "Object",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Math",
+    "JSON",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "Promise",
+    "Symbol",
+    "Map",
+    "Set",
+    "RegExp",
+    "eval",
+    "console",
+    "globalThis",
+];
+
+/// Offset of user-declared global slots in the global object's `properties`.
+///
+/// The realm pushes exactly [`GLOBAL_INTRINSICS`] intrinsic slots onto the
+/// global's `properties` vector without shape descriptors, so any slot a
+/// shape descriptor reports for the global must be biased by this constant
+/// before indexing storage. Derived from the table itself, so it cannot
+/// drift.
+pub const GLOBAL_VAR_OFFSET: usize = GLOBAL_INTRINSICS.len();
+
+/// Names the compiler treats as global references (`GetGlobal`/`SetGlobal`)
+/// even when no binding exists — a superset of [`GLOBAL_INTRINSICS`] that
+/// also covers error constructors the v1 realm does not install as intrinsic
+/// slots. An unresolved `IdentifierReference` outside this table is a
+/// compile error.
+pub const GLOBAL_ACCESS_INTRINSICS: &[&str] = &[
     "Object",
     "Array",
     "String",

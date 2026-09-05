@@ -1,12 +1,15 @@
-# Known failures — last scored 2026-09-02
+# Known failures — last scored 2026-09-05
 
-> Latest verified run: `cargo run -p test262-runner -- --filter language/expressions --jobs 4 --format json`
-> Totals: **11 190 tests, 4 047 pass / 6 960 fail / 183 skip, 36.8 % pass** over `language/expressions` (+ annexB).
+> Latest verified run: `./conformance/run.sh --filter language/expressions --jobs 4 --format json`
+> Totals: **11 190 tests, 4 054 pass / 6 953 fail / 183 skip, 36.8 % pass** over `language/expressions` (+ annexB).
 > Treatment: `pass%` is over executable tests (`pass + fail`). Skips are not counted.
-> After Step 8 (Number/Math globals + static registry, `24e838f`) and the harness
-> sta.js/assert.js always-prepend fix. The full `language` run still times out in CI;
-> the last completed full-language score was 8 919 / 24 446 / 427 skip, 36.5 % (Step 7b).
-> Baseline was 19.9 % (4 858) on 2026-08-29. See `fix-log.md` for the burn-down log.
+> After Step 8 (Number/Math globals + static registry, `24e838f`), the harness
+> sta.js/assert.js always-prepend fix, the P0 commit (`1b0f73b`, incl. the
+> with-statement `CompileError` that honestly costs ~108 false passes on this
+> slice), and the P1 destructuring-default fix (2026-09-05). The full `language`
+> run still times out in CI; the last completed full-language score was
+> 8 919 / 24 446 / 427 skip, 36.5 % (Step 7b). Baseline was 19.9 % (4 858) on
+> 2026-08-29. See `fix-log.md` for the burn-down log.
 
 This file is the fix-it queue. Each bullet is a bucket — a single engine gap that, once closed, will flip a visible swath of red to green. Keep the buckets small and ordered by estimated lift.
 

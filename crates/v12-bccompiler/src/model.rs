@@ -177,20 +177,15 @@ pub enum VarLoc {
     Global,
 }
 
-/// Names of standard intrinsics that are always present on the global object.
+/// Names the compiler treats as global references (`GetGlobal`/`SetGlobal`)
+/// when no binding exists.
 ///
-/// An unresolved `IdentifierReference` whose text is in this table is treated
-/// as a global access (`GetGlobal`/`SetGlobal`) rather than a compile error.
-/// The list is intentionally small for v1 — enough to cover `known-failures.md`
-/// bucket 3 (`Object`, `Array`, `String`, `Number`, `Boolean`, `Math`, `JSON`,
-/// `Error`, …) without claiming full spec coverage. The realm
-/// (`v12-engine/src/realm.rs`) and interpreter (`v12-interp`) share the same
-/// ordering via their own copies of this list (kept in sync manually for now).
-///
-/// Re-exported from [`v12_bytecode::GLOBAL_INTRINSICS`]: the
-/// canonical home of the table is the bytecode crate so the interpreter
-/// does not have to depend on the compiler to know the list.
-pub use v12_bytecode::GLOBAL_INTRINSICS;
+/// Re-exported from [`v12_bytecode::GLOBAL_ACCESS_INTRINSICS`]: the
+/// canonical home of the table is the bytecode crate. This is the compiler's
+/// superset of the realm-installed [`v12_bytecode::GLOBAL_INTRINSICS`]
+/// (whose slot order also fixes `GLOBAL_VAR_OFFSET`) — it additionally lists
+/// error constructors the v1 realm does not install as intrinsic slots.
+pub use v12_bytecode::GLOBAL_ACCESS_INTRINSICS as GLOBAL_INTRINSICS;
 
 /// Per-function-unit layout decided by the collect pass.
 #[derive(Debug)]
@@ -647,6 +642,55 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.b.bind(l);
     }
 
+    /// Pushes a [`LoopCtx`] (or labeled-statement break target) for the
+    /// scope of `f`, popping it afterwards — including on the error path,
+    /// where a `CompileError` aborts the whole unit anyway. `break` lands at
+    /// `break_label`; `continue`, when the construct has a continuation
+    /// point, at `continue_label`.
+    pub fn with_loop<R>(
+        &mut self,
+        break_label: Label,
+        continue_label: Option<Label>,
+        name: Option<String>,
+        f: impl FnOnce(&mut Self) -> Result<R, CompileError>,
+    ) -> Result<R, CompileError> {
+        self.loops.push(LoopCtx {
+            break_label,
+            continue_label,
+            name,
+            finally_base: self.finallies.len(),
+        });
+        let out = f(self);
+        self.loops.pop();
+        out
+    }
+
+    /// `src === undefined ? default : src` — the ES destructuring-default
+    /// semantics. Evaluates `default` into a fresh temp only when `src` is
+    /// `undefined`; returns the register holding the chosen value.
+    pub fn lower_default(
+        &mut self,
+        src: u16,
+        default: &oxc_ast::ast::Expression<'_>,
+        span: Span,
+    ) -> Result<u16, CompileError> {
+        let chosen = self.new_temp();
+        let undef = self.new_temp();
+        self.load_undefined(undef, span);
+        let cond = self.new_temp();
+        self.emit_reg3(Opcode::StrictEq, cond, src, undef, span);
+        let use_src = self.label();
+        let end = self.label();
+        self.emit_jump(Opcode::JumpIfFalse, cond, use_src);
+        let def = self.expr(default)?;
+        self.move_reg(chosen, def, span);
+        self.emit_jump(Opcode::Jump, 0, end);
+        self.bind(use_src);
+        self.move_reg(chosen, src, span);
+        self.bind(end);
+        Ok(chosen)
+    }
+
     pub fn pc(&self) -> u32 {
         self.b.pc()
     }
@@ -792,9 +836,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// `GetGlobal dst, name_id` where `name_id` is the `Spur`'s
-    /// `str_id_of` (string table index) for the global name. The immediate
-    /// is a direct string table id, not a pool index — distinct from
-    /// `LoadConst`'s `Str32` pool immediate. See `Interner` docs.
+    /// Interns a global name and returns its string-table id — the immediate
+    /// accepted by [`Self::emit_get_global`]/[`Self::emit_set_global`]. Same
+    /// id namespace as [`str_id_of`] (a direct string table index, not a
+    /// `LoadConst` pool index); see `Interner` docs.
+    pub fn global_name_id(&mut self, name: &str) -> u32 {
+        str_id_of(self.comp.strings.get_or_intern(name))
+    }
+
+    /// `GetGlobal dst, name_id` — the `Spur`-derived string table id, not a
+    /// pool index — distinct from `LoadConst`'s `Str32` pool immediate. See
+    /// `Interner` docs.
     // Global-name table ids fit u16 in this subset; audited invariant.
     #[allow(clippy::expect_used)]
     pub fn emit_get_global(&mut self, dst: u16, name_id: u32, span: oxc_span::Span) {

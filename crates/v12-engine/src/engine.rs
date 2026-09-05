@@ -1258,7 +1258,7 @@ mod tests {
                 heap,
                 JsValue::undefined(),
                 &args,
-                crate::builtins::NATIVE_OBJECT_GET_PROTOTYPE_OF,
+                v12_native::NativeId::ObjectGetPrototypeOf,
             )
             .expect("getPrototypeOf should succeed");
         assert_eq!(res.as_object(), Some(proto));
@@ -1270,7 +1270,7 @@ mod tests {
                 heap,
                 JsValue::undefined(),
                 &[JsValue::object(lone)],
-                crate::builtins::NATIVE_OBJECT_GET_PROTOTYPE_OF,
+                v12_native::NativeId::ObjectGetPrototypeOf,
             )
             .unwrap();
         assert!(res2.is_null());

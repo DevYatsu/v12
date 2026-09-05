@@ -17,7 +17,7 @@ use oxc_ast::ast::{
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{HandlerRange, Instr, Label, Opcode, WideOp};
 
-use crate::model::{CompileError, FinallyCtx, FnCtx, LoopCtx};
+use crate::model::{CompileError, FinallyCtx, FnCtx};
 
 type Res<T> = Result<T, CompileError>;
 
@@ -434,14 +434,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), test.span());
         let cond = self.expr(test)?;
         self.emit_jump(Opcode::JumpIfFalse, cond, end);
-        self.loops.push(LoopCtx {
-            break_label: end,
-            continue_label: Some(cont),
-            name,
-            finally_base: self.finallies.len(),
-        });
-        self.stmt(body)?;
-        self.loops.pop();
+        self.with_loop(end, Some(cont), name, |s| s.stmt(body))?;
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
         self.bind(end);
@@ -459,14 +452,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let end = self.label();
         self.bind(top);
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), body.span());
-        self.loops.push(LoopCtx {
-            break_label: end,
-            continue_label: Some(cont),
-            name,
-            finally_base: self.finallies.len(),
-        });
-        self.stmt(body)?;
-        self.loops.pop();
+        self.with_loop(end, Some(cont), name, |s| s.stmt(body))?;
         self.bind(cont);
         let cond = self.expr(test)?;
         self.emit_jump(Opcode::JumpIfTrue, cond, top);
@@ -516,7 +502,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     self.store_access(access, src, span);
                 } else {
                     let gid =
-                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
+                        self.global_name_id(id.name.as_str());
                     self.emit_set_global(gid, src, span);
                 }
             }
@@ -535,14 +521,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
         }
         // 5. Body with break → IteratorClose. `continue` skips the close.
-        self.loops.push(LoopCtx {
-            break_label: end,
-            continue_label: Some(cont),
-            name,
-            finally_base: self.finallies.len(),
-        });
-        self.stmt(&f.body)?;
-        self.loops.pop();
+        self.with_loop(end, Some(cont), name, |s| s.stmt(&f.body))?;
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
         self.bind(end);
@@ -557,7 +536,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     ) -> Res<()> {
         use oxc_ast::ast::AssignmentTarget;
         if let Some(simple) = target.as_simple_assignment_target() {
-            return self.assign_simple_for_of(simple, src, span);
+            return self.assign_simple(simple, src, span);
         }
         match target {
             AssignmentTarget::ArrayAssignmentTarget(arr) => {
@@ -590,21 +569,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                             raw
                         };
                         if let Some(simple) = binding.as_simple_assignment_target() {
-                            ctx.assign_simple_for_of(simple, val, span)
+                            ctx.assign_simple(simple, val, span)
                         } else {
                             ctx.assign_for_of_value(val, binding, span)
                         }
                     };
                     if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) = el {
-                        let raw = self.read_index_for_of(src, index, span)?;
+                        let raw = self.read_index(src, index, span)?;
                         bind_with_default(self, raw, &d.binding, Some(&d.init))?;
                         index += 1;
                     } else if let Some(simple) = el.as_simple_assignment_target() {
-                        let val = self.read_index_for_of(src, index, span)?;
-                        self.assign_simple_for_of(simple, val, span)?;
+                        let val = self.read_index(src, index, span)?;
+                        self.assign_simple(simple, val, span)?;
                         index += 1;
                     } else if let Some(inner) = el.as_assignment_target() {
-                        let val = self.read_index_for_of(src, index, span)?;
+                        let val = self.read_index(src, index, span)?;
                         self.assign_for_of_value(val, inner, span)?;
                         index += 1;
                     } else {
@@ -621,7 +600,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         self.emit_words(words, span);
                     }
                     if let Some(simple) = rest.target.as_simple_assignment_target() {
-                        self.assign_simple_for_of(simple, dst, span)?;
+                        self.assign_simple(simple, dst, span)?;
                     } else {
                         self.assign_for_of_value(dst, &rest.target, span)?;
                     }
@@ -666,9 +645,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                                 let access = self.access(sym);
                                 self.store_access(access, val, span);
                             } else {
-                                let gid = crate::model::str_id_of(
-                                    self.comp.strings.get_or_intern(id.binding.name.as_str()),
-                                );
+                                let gid = self.global_name_id(id.binding.name.as_str());
                                 self.emit_set_global(gid, val, span);
                             }
                         }
@@ -682,7 +659,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                                 self.move_reg(key_reg, computed_key, span);
                             }
                             let actual_key = if has_rest { key_reg } else { computed_key };
-                            let mut val = self.new_temp();
+                            let val = self.new_temp();
                             self.emit_reg3(Opcode::GetProperty, val, src, actual_key, span);
                             // default handling if binding is AssignmentTargetWithDefault inside property
                             // p.binding may be AssignmentTargetWithDefault wrapping inner target
@@ -695,7 +672,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                             // Fall back to simple recursion with default detection inside assign_for_of_value already;
                             // instead just handle simple/default manually here:
                             if let Some(simple) = p.binding.as_simple_assignment_target() {
-                                self.assign_simple_for_of(simple, val, span)?;
+                                self.assign_simple(simple, val, span)?;
                             } else if let Some(inner) = p.binding.as_assignment_target() {
                                 // Check if inner is actually a default wrapper: we need to peek if p.binding
                                 // was AssignmentTargetMaybeDefault::WithDefault - but p.binding is AssignmentTarget,
@@ -722,7 +699,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         self.emit_words(words, span);
                     }
                     if let Some(simple) = rest.target.as_simple_assignment_target() {
-                        self.assign_simple_for_of(simple, dst, span)?;
+                        self.assign_simple(simple, dst, span)?;
                     } else {
                         self.assign_for_of_value(dst, &rest.target, span)?;
                     }
@@ -730,44 +707,6 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(())
             }
             _ => Err(self.err(span, "unsupported destructuring target")),
-        }
-    }
-
-    fn read_index_for_of(&mut self, src: u16, index: u32, span: Span) -> Res<u16> {
-        let key = self.new_temp();
-        self.load_int(key, index as i64, span);
-        let dst = self.new_temp();
-        self.emit_reg3(Opcode::GetProperty, dst, src, key, span);
-        Ok(dst)
-    }
-
-    fn assign_simple_for_of(
-        &mut self,
-        target: &oxc_ast::ast::SimpleAssignmentTarget<'_>,
-        val: u16,
-        span: Span,
-    ) -> Res<()> {
-        match target {
-            oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
-                if let Some(sym) = self.comp.symbol_of(id.reference_id.get()) {
-                    let access = self.access(sym);
-                    self.store_access(access, val, span);
-                } else {
-                    let gid =
-                        crate::model::str_id_of(self.comp.strings.get_or_intern(id.name.as_str()));
-                    self.emit_set_global(gid, val, span);
-                }
-                Ok(())
-            }
-            _ => {
-                if let Some(m) = target.as_member_expression() {
-                    let (obj, key) = self.member_parts(m)?;
-                    self.emit_reg3(Opcode::SetProperty, obj, key, val, span);
-                    Ok(())
-                } else {
-                    Err(self.err(span, "unsupported assignment target"))
-                }
-            }
         }
     }
 
@@ -859,14 +798,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
         self.lower_binding_pattern(pattern, key_reg)?;
 
-        self.loops.push(LoopCtx {
-            break_label: end,
-            continue_label: Some(cont),
-            name,
-            finally_base: self.finallies.len(),
-        });
-        self.stmt(&f.body)?;
-        self.loops.pop();
+        self.with_loop(end, Some(cont), name, |s| s.stmt(&f.body))?;
 
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
@@ -900,14 +832,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             let cond = self.expr(test)?;
             self.emit_jump(Opcode::JumpIfFalse, cond, end);
         }
-        self.loops.push(LoopCtx {
-            break_label: end,
-            continue_label: Some(cont),
-            name,
-            finally_base: self.finallies.len(),
-        });
-        self.stmt(&f.body)?;
-        self.loops.pop();
+        self.with_loop(end, Some(cont), name, |s| s.stmt(&f.body))?;
         self.bind(cont); // `continue` re-runs the update expression
         if let Some(update) = &f.update {
             self.expr(update)?;
@@ -927,14 +852,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             // Labeled non-loop statement: break-only target.
             body => {
                 let end = self.label();
-                self.loops.push(LoopCtx {
-                    break_label: end,
-                    continue_label: None,
-                    name: Some(name),
-                    finally_base: self.finallies.len(),
-                });
-                self.stmt(body)?;
-                self.loops.pop();
+                self.with_loop(end, None, Some(name), |s| s.stmt(body))?;
                 self.bind(end);
                 Ok(())
             }
@@ -1000,30 +918,26 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
 
         // Phase 2: bodies in source order (fallthrough = straight-line flow).
-        self.loops.push(LoopCtx {
-            break_label: end,
-            continue_label: None,
-            name,
-            finally_base: self.finallies.len(),
-        });
-        let mut bound_default = false;
-        for (case, entry) in s.cases.iter().zip(entries) {
-            match entry {
-                Some(entry) => self.bind(entry),
-                None => {
-                    if let Some(d) = default_entry {
-                        self.bind(d);
-                        bound_default = true;
+        self.with_loop(end, None, name, |cx| {
+            let mut bound_default = false;
+            for (case, entry) in s.cases.iter().zip(entries) {
+                match entry {
+                    Some(entry) => cx.bind(entry),
+                    None => {
+                        if let Some(d) = default_entry {
+                            cx.bind(d);
+                            bound_default = true;
+                        }
                     }
                 }
+                cx.stmt_list(&case.consequent)?;
             }
-            self.stmt_list(&case.consequent)?;
-        }
-        debug_assert!(
-            !has_default || bound_default,
-            "default clause must bind its label"
-        );
-        self.loops.pop();
+            debug_assert!(
+                !has_default || bound_default,
+                "default clause must bind its label"
+            );
+            Ok(())
+        })?;
         self.bind(end);
         Ok(())
     }
