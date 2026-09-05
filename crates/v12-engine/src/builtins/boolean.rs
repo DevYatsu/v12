@@ -11,11 +11,7 @@ pub fn boolean_construct(
 ) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let truthy = to_boolean(heap, v);
-    Ok(if truthy {
-        JsValue::true_()
-    } else {
-        JsValue::false_()
-    })
+    Ok(JsValue::from_bool(truthy))
 }
 
 fn to_boolean(heap: &Heap, v: JsValue) -> bool {

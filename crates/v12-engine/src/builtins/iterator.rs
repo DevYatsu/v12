@@ -70,11 +70,7 @@ fn iterator_result(heap: &mut Heap, value: JsValue, done: bool) -> JsValue {
     // through its shape walk (unbound objects stay on the root shape, which
     // has no descriptors).
     heap.bind_shape(h, shape2);
-    let done_val = if done {
-        JsValue::true_()
-    } else {
-        JsValue::false_()
-    };
+    let done_val = JsValue::from_bool(done);
     heap.get_mut(h).properties = smallvec::smallvec![value, done_val];
     heap.get_mut(h).property_keys = smallvec::smallvec![Some(pk_value), Some(pk_done)];
     JsValue::object(h)

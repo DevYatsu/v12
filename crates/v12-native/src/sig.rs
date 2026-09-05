@@ -107,7 +107,7 @@ mod tests {
     }
 
     /// A typed handler: `(start, end)` is the declared signature.
-    fn add_pair(heap: &mut Heap, _this: JsValue, (a, b): (f64, f64)) -> Result<JsValue, Throw> {
+    fn add_pair(_heap: &mut Heap, _this: JsValue, (a, b): (f64, f64)) -> Result<JsValue, Throw> {
         Ok(JsValue::from(a + b))
     }
 

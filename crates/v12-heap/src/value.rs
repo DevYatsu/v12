@@ -133,6 +133,15 @@ impl JsValue {
         Self::boxed_with(TAG_FALSE)
     }
 
+    /// The boolean `b` as a value (`true_`/`false_` for runtime bools).
+    pub const fn from_bool(b: bool) -> JsValue {
+        if b {
+            Self::true_()
+        } else {
+            Self::false_()
+        }
+    }
+
     /// The internal absent-element marker; never observable from conforming
     /// JavaScript.
     pub const fn hole() -> JsValue {

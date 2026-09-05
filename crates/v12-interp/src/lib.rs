@@ -206,6 +206,14 @@ const _: () = intrinsic_slot_guard();
 /// megabytes of stack slots; mainstream engines converge on the same order.
 const MAX_CALL_DEPTH: usize = 10_000;
 
+/// Maximum simultaneous native `execute()` re-entries (generator resumes and
+/// similar host→JS re-entry). Each level costs several KiB of *native* stack,
+/// so this cap — not [`MAX_CALL_DEPTH`] — is what keeps a self-resuming
+/// generator (`function* g() { g().next(); }`) from overflowing the thread
+/// stack and aborting the process; ordinary recursion stays governed by
+/// `MAX_CALL_DEPTH`, which this budget will not exhaust first.
+const MAX_RESUME_DEPTH: usize = 1_000;
+
 /// How often (in dispatch iterations) the cooperative deadline is sampled.
 ///
 /// A tight bytecode loop never yields to the runtime, so the deadline is
@@ -471,6 +479,14 @@ pub struct Interp<'a> {
     /// bottom frame.
     stop_at_frames: Option<usize>,
 
+    /// Number of `execute()` re-entries currently on the native stack
+    /// (generator resumes and other host→JS re-entry). Each re-entry costs
+    /// several KiB of native stack — unlike ordinary JS calls, which are
+    /// iterative — so `MAX_CALL_DEPTH` alone lets a self-resuming generator
+    /// grow the native stack past any thread limit before the frame cap
+    /// fires. Capped by [`MAX_RESUME_DEPTH`].
+    resume_depth: usize,
+
     natives: Box<dyn NativeRegistry>,
     hooks: Box<dyn TierHooks>,
     /// Per-function execution feedback, allocated on first observation.
@@ -572,6 +588,7 @@ impl<'a> Interp<'a> {
             stack: Vec::with_capacity(INITIAL_STACK_CAPACITY),
             frames: Vec::new(),
             stop_at_frames: None,
+            resume_depth: 0,
             natives: Box::new(EmptyNativeRegistry),
             hooks: Box::new(()),
             feedback: std::collections::HashMap::new(),
@@ -1411,11 +1428,7 @@ impl<'a> Interp<'a> {
                         } => {
                             let obj_v = self.stack[base + usize::from(obj)];
                             let present = self.private_has(obj_v, class_id, name_id);
-                            self.stack[base + usize::from(dst)] = if present {
-                                v12_heap::JsValue::true_()
-                            } else {
-                                v12_heap::JsValue::false_()
-                            };
+                            self.stack[base + usize::from(dst)] = v12_heap::JsValue::from_bool(present);
                         }
                     }
                     self.set_pc(pc + width);
@@ -2019,11 +2032,7 @@ impl<'a> Interp<'a> {
     }
 
     fn write_bool(&mut self, base: usize, reg: u16, b: bool) {
-        self.stack[base + usize::from(reg)] = if b {
-            JsValue::true_()
-        } else {
-            JsValue::false_()
-        };
+        self.stack[base + usize::from(reg)] = JsValue::from_bool(b);
     }
 
     // ------------------------------------------------------------------
@@ -5350,11 +5359,7 @@ impl<'a> Interp<'a> {
             .add_property(shape1, pk_done, v12_heap::Attrs::DEFAULT);
         // Bind shape to object via interp's shape_of tracking
         self.bind_shape(h, shape2);
-        let done_val = if done {
-            JsValue::true_()
-        } else {
-            JsValue::false_()
-        };
+        let done_val = JsValue::from_bool(done);
         self.heap.get_mut(h).properties = smallvec::smallvec![value, done_val];
         self.heap.get_mut(h).property_keys = smallvec::smallvec![Some(pk_value), Some(pk_done)];
         JsValue::object(h)
@@ -5551,6 +5556,23 @@ impl<'a> Interp<'a> {
     /// `generator_next` (which wraps the result in `{value, done}`) and by
     /// the async resume paths (which settle the async promise instead).
     fn resume_generator(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        value: JsValue,
+        is_throw: bool,
+    ) -> Result<Option<JsValue>, JSException> {
+        if self.resume_depth >= MAX_RESUME_DEPTH {
+            return Err(JSException(
+                self.error_value("RangeError: maximum call stack size exceeded"),
+            ));
+        }
+        self.resume_depth += 1;
+        let result = self.resume_generator_nested(r#gen, value, is_throw);
+        self.resume_depth -= 1;
+        result
+    }
+
+    fn resume_generator_nested(
         &mut self,
         r#gen: Handle<JsObject>,
         value: JsValue,

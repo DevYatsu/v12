@@ -62,9 +62,10 @@ pub type NativeHandler = fn(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, T
 /// The closure receives the heap (for allocating return values), the `this`
 /// value, and the argument slice; an `Err` return is thrown inside JS.
 #[derive(Clone)]
-pub struct HostClosure(
-    Rc<RefCell<dyn FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, Throw>>>,
-);
+pub struct HostClosure(Rc<RefCell<HostFn>>);
+
+/// The capturing host-function signature (see [`HostClosure`]).
+pub type HostFn = dyn FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, Throw>;
 
 impl HostClosure {
     /// Wraps a user closure. `F` must match the host-function signature
