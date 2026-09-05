@@ -88,7 +88,7 @@ impl Engine {
             if let Some(obj) = value.as_object() {
                 let shape = self.heap.shape_of(obj);
                 let lookup_str_prop = |heap: &mut v12_heap::Heap, key: &str| -> Option<v12_heap::Handle<v12_heap::V12Str>> {
-                    let h = heap.intern_text(&key);
+                    let h = heap.intern_text(key);
                     let pk = v12_heap::PropKey::from_string(h);
                     let desc = heap.lookup_property(shape, pk)?;
                     let slot = desc.slot()?;

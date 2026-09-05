@@ -231,7 +231,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 let obj = self.expr(&p.object)?;
                 let dst = self.new_temp();
                 let name_id =
-                    crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", p.field.name)));
+                    crate::model::str_id_of(self.comp.strings.get_or_intern(format!("#{}", p.field.name)));
                 // class_id 0 for minimal brand check
                 let words = v12_bytecode::WideOp::GetPrivateW { dst, obj, class_id: 0, name_id }.encode();
                 self.emit_words(words, p.span);
@@ -414,7 +414,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 let obj = self.expr(&x.right)?;
                 let dst = self.new_temp();
                 let name_id =
-                    crate::model::str_id_of(self.comp.strings.get_or_intern(&format!("#{}", x.left.name)));
+                    crate::model::str_id_of(self.comp.strings.get_or_intern(format!("#{}", x.left.name)));
                 let words = v12_bytecode::WideOp::HasPrivateW { dst, obj, class_id: 0, name_id }.encode();
                 self.emit_words(words, x.span);
                 Ok(dst)

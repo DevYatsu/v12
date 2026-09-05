@@ -112,7 +112,7 @@ pub fn object_entries(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Resu
 pub fn object_has_own_property(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let this_obj = this.as_object().ok_or_else(|| Throw::type_error(heap, "Object.prototype.hasOwnProperty called on non-object"))?;
     let key = args.first().copied().unwrap_or(JsValue::undefined());
-    let pk = property_key(heap, key).map_err(|e| Throw::Value(e))?;
+    let pk = property_key(heap, key).map_err(Throw::Value)?;
     let found = heap.get(this_obj).property_keys.iter().any(|k| k.is_some_and(|kk| kk == pk));
     Ok(JsValue::from_bool(found))
 }

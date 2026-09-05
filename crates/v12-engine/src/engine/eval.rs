@@ -99,7 +99,6 @@ impl Engine {
     /// later, installs `natives`, runs, drains the single microtask
     /// checkpoint, and captures the completion value. Shared by script eval
     /// ([`Self::eval_inner`]) and module eval.
-
     pub(crate) fn run_compiled(
         &mut self,
         global: Handle<JsObject>,
@@ -289,7 +288,6 @@ impl Engine {
     /// index. The caller can invoke it by constructing an `Interp` with the
     /// same program (for `v1` the program is not retained; tests verify
     /// compilation and allocation only).
-
     /// Drains the microtask checkpoint: host jobs and interpreter async
     /// resumes, alternating until both are empty.
     ///

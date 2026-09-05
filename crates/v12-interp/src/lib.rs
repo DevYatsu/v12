@@ -933,11 +933,10 @@ impl<'a> Interp<'a> {
         if o.private_brand != Some(class_id) {
             return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
         }
-        if let Some(m) = &o.private_fields {
-            if let Some(v) = m.get(&name_id) {
+        if let Some(m) = &o.private_fields
+            && let Some(v) = m.get(&name_id) {
                 return Ok(*v);
             }
-        }
         Ok(crate::JsValue::undefined())
     }
     fn private_has(&self, obj_v: crate::JsValue, class_id: u32, name_id: u32) -> bool {
@@ -1032,8 +1031,8 @@ impl<'a> Interp<'a> {
             return format!("{name}: {msg}");
         }
         // Plain-object errors (e.g. Test262Error): render `message`/`name` instead of opaque fallthrough.
-        if v.is_object() {
-            if let Some(obj) = v.as_object() {
+        if v.is_object()
+            && let Some(obj) = v.as_object() {
                 let shape = self.heap.shape_of_mut(obj);
                 let lookup = |heap: &mut v12_heap::Heap,
                               shape: v12_heap::ShapeHandle,
@@ -1052,9 +1051,9 @@ impl<'a> Interp<'a> {
                 };
                 let shape2 = self.heap.shape_of_mut(obj);
                 // Need two separate lookups without overlapping mutable borrows.
-                let msg_h = lookup(&mut self.heap, shape, "message");
+                let msg_h = lookup(self.heap, shape, "message");
                 if let Some(mh) = msg_h {
-                    let name_h = lookup(&mut self.heap, shape2, "name");
+                    let name_h = lookup(self.heap, shape2, "name");
                     let msg = self.string_text(mh);
                     if let Some(nh) = name_h {
                         let name = self.string_text(nh);
@@ -1068,7 +1067,6 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-        }
         match ops::to_js_string(self.heap, v) {
             Ok(h) => {
                 let units = ops::string_units(self.heap, h);

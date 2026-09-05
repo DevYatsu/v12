@@ -59,7 +59,7 @@ impl Engine {
         // the interpreter's `op_set_global` does (GLOBAL_VAR_OFFSET bias).
         let h = self
             .heap
-            .intern_text(&name);
+            .intern_text(name);
         let key = v12_heap::PropKey::from_string(h);
         let shape = self.heap.shape_of(global);
         if let Some(desc) = self.heap.lookup_property(shape, key)

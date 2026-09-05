@@ -188,7 +188,7 @@ impl Engine {
         let func = {
             let h = self
                 .heap
-                .intern_text(&name);
+                .intern_text(name);
             let key = v12_heap::PropKey::from_string(h);
             let shape = self.heap.shape_of(global);
             let desc = self.heap.lookup_property(shape, key);

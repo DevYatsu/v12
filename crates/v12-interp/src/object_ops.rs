@@ -449,7 +449,6 @@ impl Interp<'_> {
     /// track (the realm installs them by pushing directly), so every
     /// descriptor slot on the global maps to `GLOBAL_VAR_OFFSET + slot`;
     /// ordinary objects use the slot as-is.
-
 pub(crate) fn array_join_fallback(
         &mut self,
         this_v: JsValue,

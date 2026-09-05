@@ -387,7 +387,6 @@ impl Interp<'_> {
 
     /// Invokes an accessor function object (getter) with `this` = the receiver
     /// and no arguments. `func` comes from a `Descriptor::Accessor`.
-
     pub(crate) fn call_accessor(
         &mut self,
         func: Handle<JsObject>,
@@ -634,11 +633,10 @@ impl Interp<'_> {
         // (suspended from suspend()) and resume_generator's suspension
         // detector misclassifies completion as another yield, which in turn
         // makes for-of over a generator never observe done=true (hang).
-        if let Some(r#gen) = finished.generator {
-            if self.heap.get(r#gen).properties.len() >= 3 {
+        if let Some(r#gen) = finished.generator
+            && self.heap.get(r#gen).properties.len() >= 3 {
                 self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
             }
-        }
         if self.stop_at_frames.is_some_and(|n| self.frames.len() == n) {
             self.stack.truncate(finished.base);
             self.top_result = Some(result);
@@ -1168,7 +1166,6 @@ impl Interp<'_> {
     }
 
     /// Counts one loop-header crossing for `fn_idx`.
-
     /// Allocates an array object for a rest parameter from `elements`. Centralises
     /// the `array_shape` + `Kind::Array` + `bind_shape` sequence (finding #4).
     /// Delegates to `call::alloc_rest_array` for DRY.

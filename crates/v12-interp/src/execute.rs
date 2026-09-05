@@ -133,7 +133,6 @@ pub(crate) fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u
 /// function table, the entry index, and the string table that
 /// `Const::Str32` ids resolve through (as produced by
 /// `v12_bccompiler::compile_source_with_strings`).
-
 impl Interp<'_> {
     /// The single iterative dispatch loop. Each arm either advances the
     /// current frame's pc, redirects it, pushes/pops frames, or raises a
@@ -163,16 +162,14 @@ impl Interp<'_> {
             // every user `try/catch` (they all live in this same loop), rather
             // than being swallowed and letting the loop resume its spin.
             self.deadline_ticks = self.deadline_ticks.wrapping_add(1);
-            if (self.deadline_ticks & (DEADLINE_CHECK_INTERVAL - 1)) == 0 {
-                if let Some(dl) = self.deadline {
-                    if Instant::now() >= dl {
+            if (self.deadline_ticks & (DEADLINE_CHECK_INTERVAL - 1)) == 0
+                && let Some(dl) = self.deadline
+                    && Instant::now() >= dl {
                         self.deadline_exceeded = true;
                         return Err(JSException(
                             self.error_value("ScriptRuntimeError: execution deadline exceeded"),
                         ));
                     }
-                }
-            }
 
             // Snapshot hot frame state: arms call back into `self` and must
             // not hold borrows across those calls. Resolve the frame's

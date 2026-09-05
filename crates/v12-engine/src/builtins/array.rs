@@ -88,8 +88,8 @@ pub fn array_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<J
     let len = elems.len() as i64;
     let to_idx = |v: JsValue| -> i64 {
         if v.is_undefined() { return 0; }
-        let n = v.as_smi().map(|s| i64::from(s)).or_else(|| v.as_f64().map(|f| f.trunc() as i64)).unwrap_or(0);
-        n
+        
+        v.as_smi().map(i64::from).or_else(|| v.as_f64().map(|f| f.trunc() as i64)).unwrap_or(0)
     };
     let start = if args.is_empty() { 0 } else { let n=to_idx(args[0]); if n<0 { (len+n).max(0) } else { n.min(len) } };
     let end = if args.len()<2 || args[1].is_undefined() { len } else { let n=to_idx(args[1]); if n<0 { (len+n).max(0) } else { n.min(len) } };
@@ -104,7 +104,8 @@ pub fn array_sort(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<J
     let mut elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     // Filter holes (undefined) to end per spec simplified: keep order for undefined.
     elems.retain(|v| !v.is_undefined() && !v.is_hole());
-    elems.sort_by(|a,b| helpers::value_text(heap, *a).cmp(&helpers::value_text(heap, *b)));
+    // `value_text` allocates per call; sort_by_cached_key computes each key once.
+    elems.sort_by_cached_key(|a| helpers::value_text(heap, *a));
     heap.get_mut(obj).replace_elements(elems);
     Ok(this)
 }
