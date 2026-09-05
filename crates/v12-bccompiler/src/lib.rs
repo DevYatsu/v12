@@ -192,11 +192,8 @@ pub fn compile_source_with_interner(
     let scoping = semantic.semantic.into_scoping();
     let program = compile_ast_inner(&parsed.program, &scoping, interner)?;
     // `collect` records imports/exports even for scripts; scripts must reject
-    // them explicitly rather than silently ignoring.
-    if let Some(err) = script_linkage_error(&program) {
-        // Prefer the module-only diagnostic when present.
-        return Err(err);
-    }
+    // them explicitly rather than silently ignoring (via
+    // `early_module_syntax_error`).
     Ok(program)
 }
 
@@ -327,15 +324,6 @@ fn early_module_syntax_error(src: &str) -> Option<CompileError> {
     None
 }
 
-fn script_linkage_error(program: &Program) -> Option<CompileError> {
-    // Placeholder: actual linkage check happens on `Plans` in
-    // `compile_ast_inner`; this helper is kept for symmetry and future
-    // `Program`-level string searches. For now scripts are rejected
-    // earlier via `early_module_syntax_error`.
-    let _ = program;
-    None
-}
-
 /// Consumes a finished interner into a key→string table: resolving a
 /// [`v12_bytecode::Const::Str32`] id's key yields the interned text, for
 /// consumers like error messages and disassembly.
@@ -394,7 +382,6 @@ fn compile_ast_inner(
     }
     let mut comp = model::Compiler {
         scoping,
-        strict,
         strings: interner,
         plans,
         functions: Vec::new(),
@@ -424,7 +411,6 @@ fn compile_ast_as_module_inner(
     let exports = plans.exports.clone();
     let mut comp = model::Compiler {
         scoping,
-        strict,
         strings: interner,
         plans,
         functions: Vec::new(),

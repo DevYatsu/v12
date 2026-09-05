@@ -344,10 +344,6 @@ impl Plans {
 /// Program-global state threaded through both passes.
 pub struct Compiler<'s, 'i> {
     pub scoping: &'s Scoping,
-    /// Program-wide strict mode (directive prologue / source type); inherited
-    /// by all nested units in this subset.
-    #[allow(dead_code)]
-    pub strict: bool,
     /// Shared string table; emission interns into it mutably so identifiers
     /// seen across compilations reuse their existing keys.
     pub strings: &'i mut Interner,
