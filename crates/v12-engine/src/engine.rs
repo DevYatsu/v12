@@ -11,7 +11,7 @@ use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue, V12Str};
 use v12_interp::{Interp, JSException};
 use v12_native::{NativeId, Throw};
 
-use crate::builtins::{NativeRegistry, install_core};
+use crate::builtins::NativeRegistry;
 use crate::error::EngineError;
 use crate::job_queue::{Job, JobCtx, JobQueue};
 use crate::realm::Realm;
@@ -87,7 +87,6 @@ impl Engine {
         let pending: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
         let mut registry = NativeRegistry::new();
         registry.set_pending(Rc::clone(&pending));
-        install_core(&mut registry);
         Self {
             heap,
             realm,
@@ -117,11 +116,6 @@ impl Engine {
     /// promise objects directly — hides `properties`/`property_keys` invariants.
     pub fn new_async_promise(&mut self) -> v12_heap::Handle<JsObject> {
         self.heap.alloc_pending_promise()
-    }
-
-    /// Alias required by `engine_owns_async_promise` (brief) — pending promise with `properties[0]==0`.
-    pub fn new_pending_promise(&mut self) -> v12_heap::Handle<JsObject> {
-        self.new_async_promise()
     }
 
     /// Engine-owned helper for creating a generator object (delegates to heap).
@@ -207,17 +201,6 @@ impl Engine {
             Ok(_unused) => Ok(self.last_completion()),
             Err(e) => Err(e),
         }
-    }
-
-    /// Legacy shim: `eval` that swallows the completion value, returning
-    /// `Ok(JsValue::undefined())` on normal completion.
-    ///
-    /// `eval` and `eval_unwrap_value` are equivalent today; the latter is
-    /// kept as the migration target for the next release (one-cycle
-    /// deprecation: `eval` becomes the typed entry point and the unwrap
-    /// variant moves to the facade).
-    pub fn eval_unwrap_value(&mut self, source: &str) -> Result<JsValue, JsValue> {
-        self.eval_direct(source)
     }
 
     /// The last script's actual completion value, or
@@ -340,8 +323,7 @@ impl Engine {
         // engine's queue and no `set_pending` save/restore is needed. The
         // engine's `self.registry` is left untouched for the whole call.
         // `NativeRegistry` is `Clone`, so the local registry starts as a full
-        // copy of the engine's (builtins + host functions) — the old
-        // `snapshot_handlers` + `install_core` dance is obsolete.
+        // copy of the engine's (builtins + host functions).
         let mut local_registry = self.registry.clone();
         local_registry.set_pending(Rc::new(RefCell::new(Vec::new())));
         let mut interp = Interp::new_with_heap(
@@ -832,37 +814,6 @@ impl Default for Engine {
     }
 }
 
-pub trait EnginePromiseFactory {
-    fn new_pending_promise(&mut self) -> v12_heap::Handle<JsObject>;
-}
-impl EnginePromiseFactory for Engine {
-    fn new_pending_promise(&mut self) -> v12_heap::Handle<JsObject> {
-        Engine::new_pending_promise(self)
-    }
-}
-
-#[allow(dead_code)]
-fn translate_value(engine_heap: &mut Heap, interp: &mut Interp<'_>, value: JsValue) -> JsValue {
-    if value.is_smi()
-        || value.is_f64()
-        || value.is_undefined()
-        || value.is_null()
-        || value.is_boolean()
-        || value.is_hole()
-        || value.is_empty()
-    {
-        return value;
-    }
-    if let Some(_handle) = value.as_string() {
-        let text = interp.to_display_string(value);
-        return JsValue::string(engine_heap.intern_text(&text));
-    }
-    // For objects and other reference types, return undefined as a placeholder
-    // in the minimal embedding; a full structured clone would be needed for
-    // complete fidelity.
-    JsValue::undefined()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,7 +1197,6 @@ mod tests {
         // without needing a full shape for `Object.getPrototypeOf` in the
         // minimal realm.
         let mut registry = crate::builtins::NativeRegistry::new();
-        crate::builtins::install_core(&mut registry);
         let heap = engine.heap_mut();
         let proto = heap.alloc(v12_heap::JsObject::default());
         heap.add_root(JsValue::object(proto));

@@ -14,10 +14,8 @@
 //!   call. Carries a description string.
 //!
 //! `Ok(JsValue)` from `eval` is the *real* script completion value: `1+1`
-//! returns `2`, `({a:1})` returns the object, etc. The legacy `Result<_, _>`
-//! signature is preserved on a small shim ([`crate::Engine::eval_unwrap_value`])
-//! for one release; the canonical entry point is
-//! [`crate::Engine::eval_with_completion`].
+//! returns `2`, `({a:1})` returns the object, etc. The canonical typed entry
+//! point is [`crate::Engine::eval_with_completion`].
 
 use std::fmt;
 

@@ -492,19 +492,6 @@ define_builtins! {
 
 /// Installs the core built-ins into `registry`.
 ///
-/// Stateless builtins live in the compile-time [`native_table!`] above and
-/// need no registration. Stateful natives (Promise needs the job-queue sink;
-/// RegExp needs the compiled-pattern cache) are intercepted in
-/// `NativeRegistry::call_native`, so this stays a no-op today — kept for the
-/// API shape (engine construction calls it) and for host hooks that register
-/// additional natives.
-pub fn install_core(registry: &mut NativeRegistry) {
-    // Stateful natives carry per-engine state and are intercepted in
-    // `NativeRegistry::call_native` (the job-queue sink, the compiled-pattern
-    // cache), not registered as plain handlers.
-    let _ = registry;
-}
-
 /// `String(x)`: ES ToString subset for the callable `String` intrinsic.
 /// The realm points the `String` placeholder's `elements[0]` at this index.
 fn string_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
