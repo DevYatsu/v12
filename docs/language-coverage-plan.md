@@ -27,6 +27,18 @@
 
 ---
 
+## 1b. Status update (2026-09-05)
+
+| # | Bucket | Status (2026-09-05) |
+|---|--------|---------------------|
+| 1–8 | in/instanceof, overflow, null, computed props, destructuring, rest/spread, eval entry points, arguments, private fields | **landed** (fix-log Steps 1–8) |
+| 9 | strict/Annex B function hoisting | **audited, no gap**: sloppy Annex B block-level fn declarations already conform (7/7 on `block-scope/syntax/function-declarations`; if/else-body and labeled cases behave per Annex B: function-scoped binding, initialization at block entry / branch execution; strict if-body negative tests pass). Strict-mode *lexical* block fn declarations remain an honest `CompileError` — they need per-block environments + TDZ (block scoping is not modeled yet; `let`/`const` in blocks are function-scoped too), which is a separate language-wide feature, not a hoisting patch. Zero strict block-scope tests exist in the local checkout. |
+| 10 | accessor descriptors | **done** — `Descriptor::Accessor` in `v12-heap/shape.rs` |
+| 11 | module loader | **partial**: dynamic `import()` now returns a spec-shaped *rejected* promise (scripts and module seam) — `.catch` observes a real rejection. Still missing: `ModuleMap` (specifier → compiled module cache), resolve (path join + file-URL), link (bind `ImportEntry` locals to the dependency's export values), evaluate (per-module env capture — module top-level bindings live in a `NewEnvironment` env object that is currently dropped after `run_compiled`, so export values are unreachable without an interp/engine capture path), namespace objects. Design: engine `ModuleMap: HashMap<PathBuf, ModuleRecord>`; evaluate deps depth-first before the importer; capture the module env handle at `run_compiled` and extract `plans.exports` values into a namespace object; retain per-module programs in the shared `ProgramTable` so jobs keep working when nested evaluation replaces `self.retained`. |
+| 12 | async harness verdict path | **landed** (fix-log 2026-09-05): doneprintHandle.js injection, `$DONE` markers verdict, Promise constructor, await-polling, `.catch`. `async` slice 6 252 tests: 1 045 pass / 5 202 fail / 5 skip. Remaining async gaps: `Promise.all/race/finally`, async-generator `.next()` promise semantics, timers, async iteration. |
+
+---
+
 ## 2. Memory- and speed-optimal choices per feature
 
 **`in` / `instanceof`** — no new per-object state. Both are pure prototype walks, so they reuse the existing `validity_cell` guard (already a `u32` serial per prototype) and the `FeedbackVector` IC slot (monomorphic shape → bool). Walk is iterative, no recursion, no allocation; `instanceof`'s `prototype` load is a single `GetProperty` for `"prototype"` then pointer-equality loop.

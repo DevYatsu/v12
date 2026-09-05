@@ -24,6 +24,19 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-05 — Async verdict path + Promise constructor + `import()` rejection promise
+
+- **Filter:** `language/expressions` (11 190 files, 4 jobs) + `async` slice (6 252 files)
+- **Before:** 4 054 pass / 6 953 fail / 183 skip, 36.8 %; every `$DONE`-containing test (~643) skipped, no async verdict
+- **After:**  4 112 pass / 7 062 fail / 16 skip, 36.8 %
+- **Delta:** +58 pass, −91 fail, −167 skip; pass rate flat but 167 async tests now *execute* — 36 of the old "passes" were false (they only passed because a missing async verdict auto-passed a sync `Ok` eval), and 91 previously-skipped tests now fail honestly against the async machinery
+- **Engine change:** `new Promise(executor)` implemented (capability resolve/reject as host closures sharing the registry pending-jobs sink; executor runs as a microtask job — natives cannot re-enter the interpreter, documented divergence; promise adoption incl. already-settled values; `Promise()` without `new` throws); `Promise.prototype.catch`; await on a *pending* promise now polls instead of resuming with `undefined` (fulfilled-with-promise adoption chains; drain stalls honestly on never-settling promises); promise state slots are Smis (f64 broke `is_promise`); dynamic `import()` returns a rejected promise instead of throwing synchronously (`60857f3`, `2992c9d`)
+- **Runner change:** `doneprintHandle.js` injected for async-flagged / `$DONE`-calling tests; verdict read from `Test262:AsyncTestComplete` / `Test262:AsyncTestFailure:` markers in `__test262Prints` (negative runtime expectations match through `handle_thrown`); missing marker = honest "async test did not complete" fail; the ignored Promise gate test is re-enabled and green
+- **Files:** `conformance/harness/src/runner.rs`, `crates/v12-engine/src/builtins/{promise,mod,registry}.rs`, `crates/v12-engine/src/realm.rs`, `crates/v12-engine/src/engine/eval.rs`, `crates/v12-interp/src/{execute,lib,property,call_setup,generator_async}.rs`, `crates/v12-heap/src/object.rs`, `crates/v12-native/src/id.rs`
+- **Bucket:** `async harness not yet implemented` — closed (replaced by real execution); exposed one pre-existing panic (await in async-generator bodies mis-decoded the non-parked caller frame — fixed by suspending generator-body awaits like `yield`)
+- **Runner:** `./conformance/run.sh --filter language/expressions --jobs 4` + `cargo nextest run --workspace` 563 pass
+- **Notes:** remaining async failures are engine gaps deeper than the verdict path: `Promise.all/race/finally`, async-generator `.next()` promise semantics, timers (`setTimeout`), async iteration.
+
 ### 2026-09-05 — P1 refactor: shared `lower_default` fixes assignment-target destructuring defaults
 
 - **Filter:** `language/expressions` + annexB (11 190 files, 4 jobs)
