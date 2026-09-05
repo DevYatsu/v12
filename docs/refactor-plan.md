@@ -48,11 +48,11 @@ JIT stays off unless explicitly enabled.
 
 | Status | Item |
 |--------|------|
-| todo | JIT: `build_ssa_ir` (jit-opt compile.rs:451-795, result discarded at 946), `TierCompiler` trait (v12-codegen:66), `OptCompiler` external API, `ClashCounter` (guard.rs:199-242), `DeoptMap::live_regs`, mmap.rs doc module, dead `cranelift-jit` dep; scope the blanket `#![allow(dead_code)]` on jit-opt modules to individual items. |
-| todo | heap: unused `inline_props`/`overflow`/`prop_slot`/`set_prop_slot` (also untraced — hazard), `EnginePromise` trait (object.rs:653), `alloc_array_with_roots`, `JsObject::new`. |
-| todo | engine: `install_core` (builtins/mod.rs:638), `translate_value` (engine.rs:922), `new_pending_promise` alias + `EnginePromiseFactory` trait, `eval`/`eval_unwrap_value` dup (drop one, keep `eval`). |
-| todo | v12-native: ~300 lines dead (`native_table!`, `typed_wrapper!`, `NativeSig`, `RuntimeRegistry`, `BUILTIN_METHODS`). |
-| todo | bccompiler: `script_linkage_error`, `GLOBAL_INTRINSICS` re-export, `Compiler.strict`. |
+| done | JIT: `build_ssa_ir` (jit-opt compile.rs:451-795, result discarded at 946), `TierCompiler` trait (v12-codegen:66), `OptCompiler` external API, `ClashCounter` (guard.rs:199-242), `DeoptMap::live_regs`, mmap.rs doc module, dead `cranelift-jit` dep; scope the blanket `#![allow(dead_code)]` on jit-opt modules to individual items. |
+| done | heap: `inline_props`/`overflow` fields + `IN_OBJECT_PROP_CAP`/`prop_slot`/`set_prop_slot` (untraced hazard — gone), `EnginePromise` trait + impl, `HeapExt::alloc_array_with_roots`, `JsObject::new` deleted. `properties` SmallVec is the single property store. |
+| done | engine: `install_core` (no-op) + call sites, `translate_value` (dead), `EnginePromiseFactory` trait, `Engine::new_pending_promise` alias (kept `new_async_promise`), `eval_unwrap_value` (kept `eval`) deleted. |
+| done | v12-native: `native_table!` (table.rs), `typed_wrapper!`, `NativeSig` (sig.rs), `RuntimeRegistry` + `Handler`, and the `BUILTIN_METHODS`/`KindMethods`/`Method` const table deleted; `builtin_methods!` now generates only `lookup_method` (the single dispatch path). ~330 lines. |
+| done | bccompiler: `script_linkage_error` (always-None placeholder), the collect.rs `GLOBAL_INTRINSICS` mirror const, and the dead `Compiler.strict` field deleted. |
 
 ## P2b — wire the JIT behind `V12_JIT` (user directive)
 
