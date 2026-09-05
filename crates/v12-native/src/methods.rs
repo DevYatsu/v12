@@ -14,8 +14,6 @@
 //!
 //! Zero allocation, no runtime construction, no dependencies.
 
-use crate::id::NativeId;
-use v12_heap::Kind;
 
 // The built-in method surface, declared at the kinds.
 //
@@ -63,38 +61,14 @@ crate::builtin_methods! {
     },
 }
 
-/// One method binding on a receiver kind: name → native.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Method {
-    /// The JS method name (e.g. `"push"`).
-    pub name: &'static str,
-    /// The native it routes to.
-    pub id: NativeId,
-}
-
-/// A kind's const method surface.
-///
-/// `kind` is a [`Kind`] (including the `StringPrim` pseudo-kind for
-/// primitive-string receivers). The table is const; dispatch happens through
-/// [`lookup_method`]'s compiled matches (O(1)), not by scanning this slice.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct KindMethods {
-    /// The receiver kind this table serves.
-    pub kind: Kind,
-    /// The method bindings, in declaration order (for enumeration).
-    pub methods: &'static [Method],
-}
-
 /// Declares the built-in method surface for the receiver kinds.
 ///
-/// Each arm is `KindVariant => { name => Native, … }`. The macro expands to:
-///
-/// * `BUILTIN_METHODS` — the kind-ordered table (for enumeration/reflection).
-/// * [`lookup_method`] — an outer `match` over the kinds (a jump table), each
-///   arm an inner `match` over the method-name literals. rustc lowers the
-///   string arms to a bounded switch, so a lookup is O(1) — a constant number
-///   of comparisons, never a linear scan. Adding a kind with methods means
-///   adding one arm; the compiler enforces exhaustiveness.
+/// Each arm is `KindVariant => { name => Native, … }`. The macro expands to
+/// [`lookup_method`] — an outer `match` over the kinds (a jump table), each
+/// arm an inner `match` over the method-name literals. rustc lowers the
+/// string arms to a bounded switch, so a lookup is O(1) — a constant number
+/// of comparisons, never a linear scan. Adding a kind with methods means
+/// adding one arm; the compiler enforces exhaustiveness.
 ///
 /// ```rust
 /// v12_native::builtin_methods! {
@@ -110,18 +84,6 @@ pub struct KindMethods {
 #[macro_export]
 macro_rules! builtin_methods {
     ($( $kind:ident => { $( $method:ident => $native:ident ),* $(,)? } ),* $(,)?) => {
-        /// The full built-in method table, in declaration order.
-        ///
-        /// DEFINED IN-CASE BUT NOT USED, everything is dispatched via [`lookup_method`]
-        pub const BUILTIN_METHODS: &[$crate::KindMethods] = &[
-            $( $crate::KindMethods {
-                kind: v12_heap::Kind::$kind,
-                methods: &[
-                    $( $crate::Method { name: stringify!($method), id: $crate::NativeId::$native } ),*
-                ],
-            } ),*
-        ];
-
         /// Looks up the native for `name` on receiver kind `kind`.
         ///
         /// O(1): the outer `match` on `kind` is a jump table over the enum

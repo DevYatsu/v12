@@ -9,13 +9,11 @@
 //!   fallback enum collapse into this one type).
 //! * [`Throw`] — the error type for native handlers (a distinct type from the
 //!   success `JsValue`, so a handler reads "produce a value or throw one").
-//! * [`NativeSig`] — a trait implemented for argument tuples; the dispatch
-//!   converts `&[JsValue]` into the tuple's Rust types automatically.
 //! * std [`From`]/[`TryFrom`] conversions between [`JsValue`] and Rust types
 //!   (zero-alloc only; heap-dependent conversions are explicit [`Heap`]
 //!   methods).
-//! * [`KindMethods`] — a const method table per object [`Kind`], declared via
-//!   the [`builtin_methods!`] macro.
+//! * [`lookup_method`] — the const name→native method surface per object
+//!   [`Kind`], declared via the [`builtin_methods!`] macro.
 //!
 //! Dependency direction: `v12-heap ← v12-native ← {v12-interp, v12-engine}`.
 
@@ -23,15 +21,12 @@ mod convert;
 mod id;
 mod methods;
 mod registry;
-mod sig;
-mod table;
 mod throw;
 
 pub use convert::DecodeError;
 pub use id::{NativeId, UnknownNativeId};
-pub use methods::{BUILTIN_METHODS, KindMethods, Method, lookup_method};
-pub use registry::{EmptyNativeRegistry, Handler, NativeRegistry, ProgramTable, RuntimeRegistry};
-pub use sig::NativeSig;
+pub use methods::lookup_method;
+pub use registry::{EmptyNativeRegistry, NativeRegistry, ProgramTable};
 pub use throw::Throw;
 
 // Re-exported for the macros and downstream users.

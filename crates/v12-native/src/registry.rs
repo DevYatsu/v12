@@ -1,19 +1,10 @@
-//! The native dispatch seam: the [`NativeRegistry`] trait, the runtime-only
-//! [`RuntimeRegistry`], and the shared [`Handler`] fn-pointer type.
-
-use std::collections::HashMap;
+//! The native dispatch seam: the [`NativeRegistry`] trait and the default
+//! empty registry.
 
 use v12_heap::{Heap, JsValue};
 
 use crate::id::NativeId;
 use crate::throw::Throw;
-
-/// A native implementation: a plain fn pointer.
-///
-/// "Typed" vs "raw" is erased at declaration — typed handlers are wrapped
-/// (via [`NativeSig`]) into this same fn-pointer shape. `Copy`, so a runtime
-/// registry clones by value.
-pub type Handler = fn(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, Throw>;
 
 /// The dispatch seam between the interpreter and a native provider.
 ///
@@ -77,74 +68,4 @@ impl NativeRegistry for EmptyNativeRegistry {
             format!("native function {id:?} is not registered"),
         ))
     }
-}
-
-/// The runtime-only half of native dispatch.
-///
-/// Builtins do NOT appear here — they live in the compile-time
-/// [`builtin_dispatch`](crate::builtin_dispatch) match. This map holds only
-/// runtime insertions: embedder host functions and per-engine stateful
-/// natives.
-#[derive(Clone, Default)]
-pub struct RuntimeRegistry {
-    handlers: HashMap<NativeId, Handler>,
-}
-
-impl RuntimeRegistry {
-    /// Registers a runtime function (host fn, stateful native).
-    pub fn register(&mut self, id: NativeId, f: Handler) {
-        self.handlers.insert(id, f);
-    }
-
-    /// Looks up a runtime handler by id, if present.
-    pub fn get(&self, id: NativeId) -> Option<Handler> {
-        self.handlers.get(&id).copied()
-    }
-}
-
-/// Wraps a typed handler into the raw [`Handler`] shape *at the call site*.
-///
-/// Expands to a closure that decodes the argument slice through
-/// [`NativeSig`](crate::NativeSig) and calls the typed handler. The closure
-/// captures only the fn item (zero-sized) and is used directly as a
-/// `native_table!` entry — the wrap is inlined into the match arm at compile
-/// time, with no indirection beyond the call itself.
-///
-/// The tuple type is explicit (e.g. `(f64, f64)`): Rust cannot recover the
-/// argument tuple from a bare fn path, so the declared signature is spelled
-/// once here.
-///
-/// ```rust
-/// use v12_native::{NativeSig, Throw};
-/// # fn dummy(_h: &mut v12_native::Heap, _t: v12_native::JsValue, _a: (f64, f64)) -> Result<v12_native::JsValue, v12_native::Throw> {
-/// #     Ok(v12_native::JsValue::undefined())
-/// # }
-/// // Used inside `native_table!`:
-/// //   NativeId::X => v12_native::typed_wrapper!(dummy, (f64, f64)),
-/// let _ = v12_native::typed_wrapper!(dummy, (f64, f64));
-/// ```
-#[macro_export]
-macro_rules! typed_wrapper {
-    ($fn_path:path, $tuple:ty) => {{
-        |heap: &mut $crate::Heap,
-         this: $crate::JsValue,
-         args: &[$crate::JsValue]|
-         -> Result<$crate::JsValue, $crate::Throw> {
-            // `S` is the declared signature; `from_js` decodes positionally.
-            fn decode<S: $crate::NativeSig>(
-                heap: &mut $crate::Heap,
-                this: $crate::JsValue,
-                args: &[$crate::JsValue],
-                f: fn(
-                    &mut $crate::Heap,
-                    $crate::JsValue,
-                    S,
-                ) -> Result<$crate::JsValue, $crate::Throw>,
-            ) -> Result<$crate::JsValue, $crate::Throw> {
-                let decoded = S::from_js(heap, args)?;
-                f(heap, this, decoded)
-            }
-            decode::<$tuple>(heap, this, args, $fn_path)
-        }
-    }};
 }
