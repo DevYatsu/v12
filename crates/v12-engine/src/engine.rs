@@ -13,6 +13,8 @@ use v12_native::{NativeId, Throw};
 
 use crate::builtins::NativeRegistry;
 use crate::error::EngineError;
+#[cfg(feature = "jit")]
+use crate::jit_tier;
 use crate::job_queue::{Job, JobCtx, JobQueue};
 use crate::realm::Realm;
 
@@ -287,8 +289,12 @@ impl Engine {
             completion,
             ..
         } = self;
+        #[cfg(feature = "jit")]
+        let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(natives);
+        #[cfg(feature = "jit")]
+        jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
         interp.set_deadline(deadline);
         let outcome = interp.run();
         // Drain the single microtask checkpoint against the still-live
@@ -326,14 +332,19 @@ impl Engine {
         // copy of the engine's (builtins + host functions).
         let mut local_registry = self.registry.clone();
         local_registry.set_pending(Rc::new(RefCell::new(Vec::new())));
+        let functions = Rc::from(program.functions);
         let mut interp = Interp::new_with_heap(
             &mut heap,
             Some(global),
-            program.functions,
+            Rc::clone(&functions),
             program.main,
             strings,
         );
         interp.set_natives(Box::new(local_registry.clone()));
+        #[cfg(feature = "jit")]
+        jit_tier::JitTierHooks::install_if_enabled(&mut interp, &functions);
+        #[cfg(feature = "jit")]
+        jit_tier::JitTierHooks::install_if_enabled(&mut interp, &functions);
         interp.set_deadline(self.deadline);
         let outcome = interp.run();
         // Drain this realm's checkpoint against its own interpreter; the
@@ -575,8 +586,12 @@ impl Engine {
             pending,
             ..
         } = self;
+        #[cfg(feature = "jit")]
+        let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
+        #[cfg(feature = "jit")]
+        jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
         let outcome = interp.call_object(callee, JsValue::undefined(), args);
         let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         drop(interp);
@@ -669,8 +684,12 @@ impl Engine {
             pending,
             ..
         } = self;
+        #[cfg(feature = "jit")]
+        let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
+        #[cfg(feature = "jit")]
+        jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
         interp.set_deadline(deadline);
         let count = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         drop(interp); // releases the `&mut heap` borrow

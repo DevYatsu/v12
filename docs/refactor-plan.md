@@ -58,8 +58,8 @@ JIT stays off unless explicitly enabled.
 
 | Status | Item |
 |--------|------|
-| todo | Investigate the tier seam: interp has `set_hooks` / tier hooks; jit-baseline's executor is heap-agnostic and bails with `UnsupportedOpcode`. |
-| todo | Wire: when `std::env::var("V12_JIT")` is set (default **unset/off**), install the baseline JIT hook on the interp/engine path; when unset, pure interpreter. No behavior change by default; unit test covers both modes. |
+| done | Investigated the tier seam: interp reports hot functions via `TierHooks::on_tier_up` (entry/loop counter ≥ 1024, fired between frame completions); jit-baseline's executor is heap-agnostic, so *executing* compiled artifacts in place would diverge (strings → NaN, calls cannot re-enter) — execution delegation waits on OSR/deopt (post-v1). |
+| done | Wired (2026-09-05): engine `jit_tier` module — when `V12_JIT` is set (non-empty, ≠ `0`; default unset/off) every interpreter the engine drives gets a `JitTierHooks` hook that compiles each hot function once with the baseline template JIT and caches the `CompiledFn` (stats: tier-ups/compiled/refused via a shared handle). When unset, no hook → pure interpreter, zero work. Tests cover the flag decision table, hot-loop compilation through the hook, and engine-path semantic equality. |
 
 ## P3 — structural splits (giant files/functions)
 

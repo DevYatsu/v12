@@ -7,6 +7,8 @@ pub mod builtins;
 pub mod engine;
 pub mod error;
 pub mod internal_methods;
+#[cfg(feature = "jit")]
+pub mod jit_tier;
 pub mod job_queue;
 pub mod realm;
 pub mod value;
