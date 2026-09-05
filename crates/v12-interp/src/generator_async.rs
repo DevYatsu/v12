@@ -217,8 +217,10 @@ impl Interp<'_> {
             } else if state == 2 {
                 return (v, true, payload);
             } else {
-                // Pending promise: for task 6, treat as fulfilled with undefined payload (no thenable unwrapping)
-                return (v, false, JsValue::undefined());
+                // Pending promise: the await parks on the promise itself; the
+                // resume paths poll its state (`await_resume_value`) and only
+                // wake the frame once it settles, with its payload.
+                return (v, false, v);
             }
         }
         // Create fulfilled promise for non-promise arg

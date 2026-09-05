@@ -310,26 +310,37 @@ impl Engine {
         loop {
             // Adopt follow-ups enqueued by natives/promises during the last
             // iteration, then run host jobs until the queue is empty.
-            for job in registry.take_pending() {
+            let follow_ups = registry.take_pending();
+            let adopted = follow_ups.len();
+            for job in follow_ups {
                 jobs.enqueue(job);
             }
-            count += jobs.drain(interp, Rc::clone(pending));
+            let drained = jobs.drain(interp, Rc::clone(pending));
+            count += drained;
 
-            // One pass of async resumes: each may enqueue more host jobs
+            // One pass of async resumes: each queued await is attempted once;
+            // awaits parked on still-pending promises re-queue and retry after
+            // more host jobs run. Each resume may enqueue more host jobs
             // (promise settlements), which the loop picks up next.
             let mut resumed = 0usize;
-            while interp.resume_next_await() {
-                resumed += 1;
+            let attempts = interp.pending_jobs();
+            for _ in 0..attempts {
+                if interp.resume_next_await() {
+                    resumed += 1;
+                }
             }
             count += resumed;
 
             // Loop ends when neither host jobs nor awaits nor native
-            // follow-ups remain, or when the deadline fired mid-drain:
-            // remaining microtask bodies can never complete within the budget
-            // (their `execute` will re-trip the deadline), so abort instead of
-            // spinning on the pending queue.
+            // follow-ups remain, when the deadline fired mid-drain (remaining
+            // microtask bodies can never complete within the budget; their
+            // `execute` will re-trip the deadline), or when the pass was
+            // quiescent: adopted nothing, drained nothing, resumed nothing —
+            // the only remaining awaits are parked on promises that (without
+            // timers or external resolution) can never settle.
             if interp.is_deadline_exceeded()
                 || (jobs.is_empty() && !interp.has_pending_awaits())
+                || (adopted == 0 && drained == 0 && resumed == 0)
             {
                 break;
             }

@@ -1011,10 +1011,9 @@ impl Interp<'_> {
         let target = self.heap.get(callee_obj).callable;
 
         // Native seam: constructor-shaped natives (Boolean, Error) dispatch
-        // their handler directly with `this = undefined` (their spec behavior
-        // when called as a constructor mirrors the plain call). Out-of-range
-        // bytecode indices (placeholders, engine natives) route through the
-        // registry, which rejects unregistered indices as not a constructor.
+        // their handler directly. Out-of-range bytecode indices (placeholders,
+        // engine natives) route through the registry, which rejects
+        // unregistered indices as not a constructor.
         let target_idx = match target {
             v12_heap::FunctionTarget::Bytecode(idx) => {
                 if (idx as usize) >= self.functions_for_program(callee_program).len() {
@@ -1022,10 +1021,14 @@ impl Interp<'_> {
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
                     let id = self.native_id_for(idx)?;
+                    // The constructor is passed as `this`: spec-undefined is
+                    // useless to these handlers, and the identity read lets
+                    // e.g. `new Promise` link instances to `Promise.prototype`.
+                    // Every construct handler ignores `this` except for that.
                     let result = {
                         let args = &self.stack[args_start..args_end];
                         self.natives
-                            .call_native(self.heap, JsValue::undefined(), args, id)
+                            .call_native(self.heap, callee_v, args, id)
                             .map_err(|t| JSException::from_throw(self.heap, t))
                     };
                     return result.map(CallOutcome::Value);

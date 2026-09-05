@@ -199,19 +199,17 @@ pub fn queue_microtask(
     Ok(JsValue::undefined())
 }
 
-/// Builds one reaction-settling job and hands it to `push`.
-///
-/// The job calls the handler with the payload (or passes the payload straight
-/// through when the handler is absent), then settles the derived promise —
-/// which in turn schedules that promise's own queued reactions.
-fn enqueue_reaction(
-    push: &mut dyn FnMut(Job),
+/// Builds one reaction-settling job. The job calls the handler with the
+/// payload (or passes the payload straight through when the handler is
+/// absent), then settles the derived promise — which in turn schedules that
+/// promise's own queued reactions.
+fn reaction_job(
     handler: JsValue,
     payload: JsValue,
     derived: v12_heap::Handle<JsObject>,
     rejecting: bool,
-) {
-    let job: Job = Box::new(move |ctx: &mut JobCtx<'_, '_>| {
+) -> Job {
+    Box::new(move |ctx: &mut JobCtx<'_, '_>| {
         let callable = handler
             .as_object()
             .is_some_and(|h| ctx.heap_mut().get(h).kind == Kind::Function);
@@ -229,8 +227,57 @@ fn enqueue_reaction(
             Ok(v) => settle(ctx, derived, STATE_FULFILLED, v),
             Err(JSException(e)) => settle(ctx, derived, STATE_REJECTED, e),
         }
-    });
-    push(job);
+    })
+}
+
+/// Builds one reaction-settling job and hands it to `push`.
+///
+/// The job calls the handler with the payload (or passes the payload straight
+/// through when the handler is absent), then settles the derived promise —
+/// which in turn schedules that promise's own queued reactions.
+fn enqueue_reaction(
+    push: &mut dyn FnMut(Job),
+    handler: JsValue,
+    payload: JsValue,
+    derived: v12_heap::Handle<JsObject>,
+    rejecting: bool,
+) {
+    push(reaction_job(handler, payload, derived, rejecting));
+}
+
+/// Takes `promise`'s queued reaction records and builds one settling job per
+/// record for the given settlement. The records are consumed (the reactions
+/// array is emptied); the returned jobs still need an enqueue sink.
+fn drain_reaction_jobs(
+    heap: &mut Heap,
+    promise: v12_heap::Handle<JsObject>,
+    state: i32,
+    value: JsValue,
+) -> Vec<Job> {
+    let Some(reactions) = heap.get(promise).properties[2].as_object() else {
+        return Vec::new();
+    };
+    let records = std::mem::take(&mut heap.get_mut(reactions).elements);
+    let mut jobs = Vec::with_capacity(records.len());
+    for record_v in records {
+        let Some(record) = record_v.as_object() else {
+            continue;
+        };
+        let (fulfill, reject, derived_v) = {
+            let r = heap.get(record);
+            (r.properties[0], r.properties[1], r.properties[2])
+        };
+        let Some(derived) = derived_v.as_object() else {
+            continue;
+        };
+        let (handler, rejecting) = if state == STATE_FULFILLED {
+            (fulfill, false)
+        } else {
+            (reject, true)
+        };
+        jobs.push(reaction_job(handler, value, derived, rejecting));
+    }
+    jobs
 }
 
 /// Settles `promise` with `state`/`value` and schedules one job per queued
@@ -242,40 +289,209 @@ fn settle(
     state: i32,
     value: JsValue,
 ) {
-    let reactions = {
+    {
         let heap = ctx.heap_mut();
         heap.get_mut(promise).properties[0] = smi(state);
         heap.get_mut(promise).properties[1] = value;
-        heap.get(promise).properties[2].as_object()
-    };
-    let Some(reactions) = reactions else {
-        return;
-    };
-    let records = std::mem::take(&mut ctx.heap_mut().get_mut(reactions).elements);
-    for record_v in records {
-        let Some(record) = record_v.as_object() else {
-            continue;
-        };
-        let (fulfill, reject, derived_v) = {
-            let r = ctx.heap_mut().get(record);
-            (r.properties[0], r.properties[1], r.properties[2])
-        };
-        let Some(derived) = derived_v.as_object() else {
-            continue;
-        };
-        let (handler, rejecting) = if state == STATE_FULFILLED {
-            (fulfill, false)
-        } else {
-            (reject, true)
-        };
-        enqueue_reaction(
-            &mut |job| {
-                ctx.enqueue(job);
-            },
-            handler,
-            value,
-            derived,
-            rejecting,
-        );
     }
+    for job in drain_reaction_jobs(ctx.heap_mut(), promise, state, value) {
+        ctx.enqueue(job);
+    }
+}
+
+/// Resolves or rejects `promise` through a constructor capability. No-op once
+/// the promise has settled (first resolution wins). A promise value is
+/// adopted: an adoption record `[resolve, reject, derived]` joins its
+/// reactions, so settling the adopted promise routes the outcome back here.
+/// Everything else fulfills/rejects `promise` directly, and its queued
+/// reaction jobs join the shared pending sink for the next checkpoint.
+#[allow(clippy::too_many_arguments)]
+fn capability_settle(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+    resolve_v: JsValue,
+    reject_v: JsValue,
+    value: JsValue,
+    rejecting: bool,
+) -> Result<JsValue, JsValue> {
+    let still_pending =
+        heap.get(promise).properties[0].as_smi() == Some(STATE_PENDING);
+    if !still_pending {
+        return Ok(JsValue::undefined());
+    }
+    if !rejecting && is_promise(heap, value) {
+        let value_obj = value.as_object().expect("checked above");
+        let (v_state, v_payload) = {
+            let o = heap.get(value_obj);
+            (
+                o.properties[0].as_smi().unwrap_or(STATE_PENDING),
+                o.properties[1],
+            )
+        };
+        if v_state != STATE_PENDING {
+            // Already-settled adopted promise: a late-attached record would
+            // never drain (settle runs once), so route the outcome directly.
+            let state = if v_state == STATE_FULFILLED {
+                STATE_FULFILLED
+            } else {
+                STATE_REJECTED
+            };
+            heap.get_mut(promise).properties[0] = smi(state);
+            heap.get_mut(promise).properties[1] = v_payload;
+            let jobs = drain_reaction_jobs(heap, promise, state, v_payload);
+            sink.borrow_mut().extend(jobs);
+            return Ok(JsValue::undefined());
+        }
+        let proto = heap.get(promise).prototype;
+        let derived = create_promise(heap, proto, STATE_PENDING, JsValue::undefined());
+        let record = heap.alloc(JsObject::ordinary(
+            smallvec::smallvec![resolve_v, reject_v, JsValue::object(derived)],
+            smallvec::smallvec![None; 3],
+        ));
+        heap.add_root(JsValue::object(record));
+        if let Some(reactions) = heap.get(value_obj).properties[2].as_object() {
+            heap.get_mut(reactions).elements.push(JsValue::object(record));
+        }
+        return Ok(JsValue::undefined());
+    }
+    let state = if rejecting { STATE_REJECTED } else { STATE_FULFILLED };
+    heap.get_mut(promise).properties[0] = smi(state);
+    heap.get_mut(promise).properties[1] = value;
+    let jobs = drain_reaction_jobs(heap, promise, state, value);
+    sink.borrow_mut().extend(jobs);
+    Ok(JsValue::undefined())
+}
+
+/// `new Promise(executor)`.
+///
+/// The executor runs as a microtask job rather than synchronously (natives
+/// cannot re-enter the interpreter): side effects land one checkpoint later.
+/// Spec-conforming scripts that only observe ordering *within* the
+/// asynchronous surface are unaffected. Calling `Promise` without `new`
+/// throws per spec (prepare_construct passes the constructor as `this`; a
+/// plain call's receiver never carries the construct target).
+pub fn promise_construct(
+    heap: &mut Heap,
+    pending: &Rc<RefCell<Vec<Job>>>,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let executor = args.first().copied().unwrap_or_else(JsValue::undefined);
+    if !executor
+        .as_object()
+        .is_some_and(|o| heap.get(o).kind == Kind::Function)
+    {
+        return Err(Throw::type_error(heap, "Promise executor must be a function"));
+    }
+    let is_ctor = |heap: &Heap, v: JsValue| {
+        v.as_object().is_some_and(|o| {
+            matches!(
+                &heap.get(o).callable,
+                v12_heap::FunctionTarget::Bytecode(idx)
+                    if *idx == u32::from(v12_native::NativeId::PromiseConstruct)
+            )
+        })
+    };
+    if !is_ctor(heap, this) {
+        return Err(Throw::type_error(
+            heap,
+            "Promise constructor requires 'new'",
+        ));
+    }
+    let ctor = this.as_object().expect("checked above");
+    let prototype = heap.get(ctor).prototype;
+    let promise = create_promise(heap, prototype, STATE_PENDING, JsValue::undefined());
+    let promise_v = JsValue::object(promise);
+
+    // Capability: the resolve/reject function objects handed to the executor.
+    // They are ordinary function objects whose targets are host closures
+    // capturing the shared pending-jobs sink — host closures cannot touch the
+    // interpreter, so reaction settling they trigger joins the same sink
+    // `Promise#then` on a settled promise uses.
+    let alloc_capability = |heap: &mut Heap| -> v12_heap::Handle<JsObject> {
+        // Placeholder target replaced with the host closure after both
+        // capability objects exist (each closure needs both handles).
+        let func = heap.alloc(JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(u32::MAX),
+            None,
+        ));
+        heap.add_root(JsValue::object(func));
+        func
+    };
+    let resolve_obj = alloc_capability(heap);
+    let reject_obj = alloc_capability(heap);
+    let resolve_v = JsValue::object(resolve_obj);
+    let reject_v = JsValue::object(reject_obj);
+
+    let sink = Rc::clone(pending);
+    let p = promise_v;
+    let rv = resolve_v;
+    let jv = reject_v;
+    let resolve_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
+        let value = args.first().copied().unwrap_or_else(JsValue::undefined);
+        capability_settle(
+            heap,
+            &sink,
+            p.as_object().expect("capability promise is rooted"),
+            rv,
+            jv,
+            value,
+            false,
+        )
+    });
+    heap.get_mut(resolve_obj).callable = v12_heap::FunctionTarget::Host(resolve_closure);
+
+    let sink = Rc::clone(pending);
+    let p = promise_v;
+    let rv = resolve_v;
+    let jv = reject_v;
+    let reject_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
+        let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
+        capability_settle(
+            heap,
+            &sink,
+            p.as_object().expect("capability promise is rooted"),
+            rv,
+            jv,
+            reason,
+            true,
+        )
+    });
+    heap.get_mut(reject_obj).callable = v12_heap::FunctionTarget::Host(reject_closure);
+
+    // The executor joins the pending sink: it runs at the next checkpoint
+    // (see the divergence note above). A throw from the executor rejects the
+    // promise.
+    heap.add_root(executor);
+    let executor_obj = executor.as_object().expect("checked above");
+    let sink = Rc::clone(pending);
+    pending.borrow_mut().push(Box::new(move |ctx: &mut JobCtx<'_, '_>| {
+        match ctx.call_object(executor_obj, JsValue::undefined(), &[resolve_v, reject_v]) {
+            Ok(_) => {}
+            Err(JSException(e)) => {
+                let _ = capability_settle(
+                    ctx.heap_mut(),
+                    &sink,
+                    promise,
+                    resolve_v,
+                    reject_v,
+                    e,
+                    true,
+                );
+            }
+        }
+    }));
+    Ok(promise_v)
+}
+
+/// `Promise.prototype.catch(on_rejected)`: `then(undefined, on_rejected)`.
+pub fn promise_catch(
+    heap: &mut Heap,
+    this: JsValue,
+    args: &[JsValue],
+    sink: &Rc<RefCell<Vec<Job>>>,
+) -> Result<JsValue, Throw> {
+    let on_rejected = args.first().copied().unwrap_or_else(JsValue::undefined);
+    promise_then(heap, this, &[JsValue::undefined(), on_rejected], sink)
 }

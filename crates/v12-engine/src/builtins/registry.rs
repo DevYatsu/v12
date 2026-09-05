@@ -135,6 +135,8 @@ impl v12_native::NativeRegistry for NativeRegistry {
             NativeId::PromiseResolve => promise::promise_resolve(heap, this, args),
             NativeId::PromiseReject => promise::promise_reject(heap, this, args),
             NativeId::PromiseThen => promise::promise_then(heap, this, args, &self.pending),
+            NativeId::PromiseCatch => promise::promise_catch(heap, this, args, &self.pending),
+            NativeId::PromiseConstruct => promise::promise_construct(heap, &self.pending, this, args),
             NativeId::QueueMicrotask => promise::queue_microtask(heap, args, &self.pending),
             NativeId::RegExpExec => regexp::regexp_exec(heap, &self.regex_cache, this, args),
             NativeId::RegExpTest => regexp::regexp_test(heap, &self.regex_cache, this, args),

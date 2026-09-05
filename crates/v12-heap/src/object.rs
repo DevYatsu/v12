@@ -406,11 +406,15 @@ impl JsObject {
     }
 
     /// Pending promise with `properties = [state=0, value=undefined, reactions]`.
+    // State must be a Smi: the interp/engine structural `is_promise` checks
+    // read it via `as_smi` (a double here silently breaks `.then` on async
+    // promises).
+    #[allow(clippy::expect_used)]
     pub fn pending_promise(reactions: crate::Handle<JsObject>) -> Self {
         Self {
             kind: Kind::Promise,
             properties: smallvec::smallvec![
-                crate::JsValue::from_f64(0.0),
+                crate::JsValue::from_i32_smi(0).expect("0 fits"),
                 crate::JsValue::undefined(),
                 crate::JsValue::object(reactions),
             ],

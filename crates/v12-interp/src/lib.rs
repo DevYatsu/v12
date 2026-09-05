@@ -282,6 +282,17 @@ enum CallOutcome {
     Value(JsValue),
 }
 
+/// What the await-resume driver does with one parked await (see
+/// `Interp::await_resume_value`).
+enum AwaitResume {
+    /// The awaited promise is still pending — poll again on a later pass.
+    Skip,
+    /// The awaited promise fulfilled with another promise — adopt it.
+    Adopt(JsValue),
+    /// Resume the frame (value, reject?).
+    Run(JsValue, bool),
+}
+
 /// One registered program: its function table and the string table that
 /// `Const::Str32` ids in that program resolve through. Kept as a pair so a
 /// cross-program closure resolves both its bytecode and its constants
@@ -397,6 +408,7 @@ pub struct Interp<'a> {
     promise_resolve_fn: Option<JsValue>,
     promise_reject_fn: Option<JsValue>,
     promise_then_fn: Option<JsValue>,
+    promise_catch_fn: Option<JsValue>,
     array_push_fn: Option<JsValue>,
     array_join_fn: Option<JsValue>,
     enumerable_own_keys_fn: Option<JsValue>,
@@ -484,6 +496,7 @@ impl<'a> Interp<'a> {
             promise_resolve_fn: None,
             promise_reject_fn: None,
             promise_then_fn: None,
+            promise_catch_fn: None,
             array_push_fn: None,
             array_join_fn: None,
             enumerable_own_keys_fn: None,
@@ -1357,6 +1370,7 @@ impl<'a> Interp<'a> {
             }
             NativeId::PromiseReject => (u32::from(NativeId::PromiseReject), self.promise_reject_fn),
             NativeId::PromiseThen => (u32::from(NativeId::PromiseThen), self.promise_then_fn),
+            NativeId::PromiseCatch => (u32::from(NativeId::PromiseCatch), self.promise_catch_fn),
             NativeId::ArrayPush => (u32::from(NativeId::ArrayPush), self.array_push_fn),
             NativeId::ArrayJoin => (u32::from(NativeId::ArrayJoin), self.array_join_fn),
             NativeId::ObjectEnumerableOwnKeys => (
@@ -1391,6 +1405,7 @@ impl<'a> Interp<'a> {
             NativeId::PromiseResolve => self.promise_resolve_fn = Some(value),
             NativeId::PromiseReject => self.promise_reject_fn = Some(value),
             NativeId::PromiseThen => self.promise_then_fn = Some(value),
+            NativeId::PromiseCatch => self.promise_catch_fn = Some(value),
             NativeId::ArrayPush => self.array_push_fn = Some(value),
             NativeId::ArrayJoin => self.array_join_fn = Some(value),
             NativeId::ObjectEnumerableOwnKeys => self.enumerable_own_keys_fn = Some(value),
@@ -1460,25 +1475,67 @@ impl<'a> Interp<'a> {
     /// Drains pending async awaits FIFO (microtask checkpoint). Returns number executed.
     pub fn run_jobs(&mut self) -> usize {
         let mut count = 0;
-        while let Some((r#gen, val, is_reject)) = self.pending_awaits.pop_front() {
-            let res = if is_reject {
-                self.resume_async_throw(r#gen, val)
-            } else {
-                self.resume_async(r#gen, val)
-            };
-            let _ = res;
-            count += 1;
-            if self.deadline_exceeded || count > 10000 {
+        loop {
+            // One pass: try each queued await once. Entries whose promise is
+            // still pending are re-queued; a pass with zero resumes means
+            // every await is parked on an unsettled promise — quiescent.
+            let attempts = self.pending_awaits.len();
+            if attempts == 0 {
+                break;
+            }
+            let mut progressed = 0;
+            for _ in 0..attempts {
+                if self.resume_next_await() {
+                    progressed += 1;
+                }
+                if self.deadline_exceeded || count + progressed > 10000 {
+                    break;
+                }
+            }
+            count += progressed;
+            if progressed == 0 || self.deadline_exceeded || count > 10000 {
                 break;
             }
         }
         count
     }
 
+    /// Decides how a parked await proceeds. `Skip` = the await parked on a
+    /// promise that is still pending (re-queue and poll again later);
+    /// `Adopt` = the awaited promise fulfilled with another promise, so the
+    /// frame parks on that one instead (thenable adoption); `Run` resumes
+    /// the frame.
+    fn await_resume_value(&mut self, val: JsValue, is_reject: bool) -> AwaitResume {
+        if is_reject {
+            // A rejection reason passes through untouched — no adoption.
+            return AwaitResume::Run(val, true);
+        }
+        if self.is_promise(val) {
+            let obj = val.as_object().expect("checked above");
+            let (state, payload) = {
+                let o = self.heap.get(obj);
+                (o.properties[0].as_smi().unwrap_or(0), o.properties[1])
+            };
+            match state {
+                0 => AwaitResume::Skip,
+                1 if self.is_promise(payload) => AwaitResume::Adopt(payload),
+                1 => AwaitResume::Run(payload, false),
+                _ => AwaitResume::Run(payload, true),
+            }
+        } else {
+            AwaitResume::Run(val, false)
+        }
+    }
+
     /// Resumes exactly one pending await (the oldest), if any. Returns `true`
     /// when a resume ran. The engine's single microtask checkpoint calls this
     /// between draining host jobs, so generator/async resumes and host jobs
     /// interleave per microtask semantics.
+    ///
+    /// An await parked on a still-pending promise returns `false` and is
+    /// re-queued at the back — the driver's stall detection treats a full
+    /// cycle of no progress as quiescence, so a promise that never settles
+    /// ends the drain instead of spinning.
     ///
     /// Short-circuits to `false` once the cooperative deadline has fired: a
     /// resumed generator/async body that hits the deadline will abort its
@@ -1492,12 +1549,27 @@ impl<'a> Interp<'a> {
         let Some((r#gen, val, is_reject)) = self.pending_awaits.pop_front() else {
             return false;
         };
-        let res = if is_reject {
-            self.resume_async_throw(r#gen, val)
-        } else {
-            self.resume_async(r#gen, val)
-        };
-        let _ = res;
+        match self.await_resume_value(val, is_reject) {
+            AwaitResume::Skip => {
+                // Promise still pending — re-queue at the back and poll later.
+                self.pending_awaits.push_back((r#gen, val, is_reject));
+                return false;
+            }
+            AwaitResume::Adopt(payload) => {
+                // The awaited promise resolved to another promise — park the
+                // frame on that one instead (thenable adoption for promises).
+                self.pending_awaits.push_back((r#gen, payload, false));
+                return false;
+            }
+            AwaitResume::Run(resume_val, resume_reject) => {
+                let res = if resume_reject {
+                    self.resume_async_throw(r#gen, resume_val)
+                } else {
+                    self.resume_async(r#gen, resume_val)
+                };
+                let _ = res;
+            }
+        }
         // A deadline can fire *during* the resume above; latch so the drain
         // loop sees it before scheduling more awaits.
         if self.deadline_exceeded {

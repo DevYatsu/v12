@@ -178,11 +178,17 @@ impl Interp<'_> {
             }
             return None;
         }
-        if self.key_is(key_v, "then")
-            && self.heap.get(obj).prototype.is_some()
-            && self.heap.get(obj).prototype == self.heap.get(promise_ctor).prototype
-        {
-            return Some(Ok(self.cached_native(NativeId::PromiseThen)));
+        // Structural promise check rather than prototype identity: async
+        // functions return engine-created promises (no `Promise.prototype`
+        // link — the interp has no realm handle at allocation time), so
+        // prototype matching would miss `.then`/`.catch` on them.
+        if self.is_promise(JsValue::object(obj)) {
+            if self.key_is(key_v, "then") {
+                return Some(Ok(self.cached_native(NativeId::PromiseThen)));
+            }
+            if self.key_is(key_v, "catch") {
+                return Some(Ok(self.cached_native(NativeId::PromiseCatch)));
+            }
         }
         None
     }

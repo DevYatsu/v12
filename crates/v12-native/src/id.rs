@@ -79,6 +79,8 @@ pub enum NativeId {
     PromiseResolve = 1710,
     PromiseReject = 1711,
     PromiseThen = 1712,
+    PromiseConstruct = 1713,
+    PromiseCatch = 1714,
     QueueMicrotask = 1700,
     // Map / Set
     MapConstruct = 2000,

@@ -95,6 +95,9 @@ impl Realm {
         if let Some(promise_ctor) = promise_ctor {
             heap.get_mut(promise_ctor).prototype = Some(promise_proto);
         }
+        // The Promise constructor itself: `new Promise(executor)` routes to
+        // the stateful native seam (the capability needs the job sink).
+        wire_callable(heap, &intrinsics, "Promise", NativeId::PromiseConstruct);
         // Point the placeholder constructors that are already callable at
         // their native seam (out-of-range bytecode → native registry).
         wire_callable(heap, &intrinsics, "String", NativeId::StringConstruct);
