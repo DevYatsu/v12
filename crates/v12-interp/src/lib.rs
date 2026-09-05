@@ -1411,11 +1411,7 @@ impl<'a> Interp<'a> {
                         } => {
                             let obj_v = self.stack[base + usize::from(obj)];
                             let present = self.private_has(obj_v, class_id, name_id);
-                            self.stack[base + usize::from(dst)] = if present {
-                                v12_heap::JsValue::true_()
-                            } else {
-                                v12_heap::JsValue::false_()
-                            };
+                            self.stack[base + usize::from(dst)] = v12_heap::JsValue::from_bool(present);
                         }
                     }
                     self.set_pc(pc + width);
@@ -2019,11 +2015,7 @@ impl<'a> Interp<'a> {
     }
 
     fn write_bool(&mut self, base: usize, reg: u16, b: bool) {
-        self.stack[base + usize::from(reg)] = if b {
-            JsValue::true_()
-        } else {
-            JsValue::false_()
-        };
+        self.stack[base + usize::from(reg)] = JsValue::from_bool(b);
     }
 
     // ------------------------------------------------------------------
@@ -5350,11 +5342,7 @@ impl<'a> Interp<'a> {
             .add_property(shape1, pk_done, v12_heap::Attrs::DEFAULT);
         // Bind shape to object via interp's shape_of tracking
         self.bind_shape(h, shape2);
-        let done_val = if done {
-            JsValue::true_()
-        } else {
-            JsValue::false_()
-        };
+        let done_val = JsValue::from_bool(done);
         self.heap.get_mut(h).properties = smallvec::smallvec![value, done_val];
         self.heap.get_mut(h).property_keys = smallvec::smallvec![Some(pk_value), Some(pk_done)];
         JsValue::object(h)

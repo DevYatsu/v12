@@ -1,31 +1,40 @@
 //! String built-ins.
 
-use v12_heap::{Heap, JsValue};
+use v12_heap::{Handle, Heap, JsValue, V12Str};
 use v12_native::Throw;
 
 use super::{helpers, regexp};
 
+/// The `this` string primitive, or a `TypeError` naming `method`.
+fn this_string(heap: &mut Heap, this: JsValue, method: &str) -> Result<Handle<V12Str>, Throw> {
+    this.as_string()
+        .ok_or_else(|| Throw::type_error(heap, format!("{method} called on non-string")))
+}
+
+/// The regexp argument as a compiled-regexp object, or `None` when the
+/// argument is not an object of `Kind::RegExp` (callers fall back to plain
+/// text matching).
+fn as_regexp(heap: &Heap, v: Option<&JsValue>) -> Option<Handle<v12_heap::JsObject>> {
+    v.and_then(|v| v.as_object())
+        .filter(|&re| heap.get(re).kind == v12_heap::Kind::RegExp)
+}
+
 /// `String.prototype.charAt(index)` – returns a single-character string.
 pub fn string_char_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let handle = this
-        .as_string()
-        .ok_or_else(|| Throw::type_error(heap, "String.prototype.charAt called on non-string"))?;
+    let handle = this_string(heap, this, "String.prototype.charAt")?;
     let index = args.first().and_then(to_index).unwrap_or(0);
     let units = string_units(heap, handle);
-    if let Some(&unit) = units.get(index as usize) {
-        let h = heap.intern_string(v12_heap::V12Str::utf16(vec![unit]));
-        Ok(JsValue::string(h))
-    } else {
-        let h = heap.intern_string(v12_heap::V12Str::latin1(Vec::new()));
-        Ok(JsValue::string(h))
-    }
+    let unit = match units.get(index as usize) {
+        Some(&unit) => vec![unit],
+        None => Vec::new(),
+    };
+    let h = heap.intern_string(v12_heap::V12Str::utf16(unit));
+    Ok(JsValue::string(h))
 }
 
 /// `String.prototype.slice(start, end)` – returns a sliced view.
 pub fn string_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let handle = this
-        .as_string()
-        .ok_or_else(|| Throw::type_error(heap, "String.prototype.slice called on non-string"))?;
+    let handle = this_string(heap, this, "String.prototype.slice")?;
     let len = heap.get(handle).len() as i64;
     let start = args.first().and_then(to_integer).unwrap_or(0);
     let end = args.get(1).and_then(to_integer).unwrap_or(len);
@@ -66,7 +75,7 @@ fn clamp_index(index: i64, len: i64) -> i64 {
     }
 }
 
-fn string_units(heap: &mut Heap, handle: v12_heap::Handle<v12_heap::V12Str>) -> Vec<u16> {
+fn string_units(heap: &mut Heap, handle: Handle<V12Str>) -> Vec<u16> {
     heap.flatten(handle);
     match &heap.get(handle).storage {
         v12_heap::StrStorage::Latin1(bytes) => bytes.iter().map(|&b| u16::from(b)).collect(),
@@ -75,142 +84,23 @@ fn string_units(heap: &mut Heap, handle: v12_heap::Handle<v12_heap::V12Str>) -> 
     }
 }
 
-/// `String.prototype.match(regexp)` — the regexp `match` method.
-///
-/// ES 22.2.6.10 subset: with a global regexp, repeatedly `exec` until
-/// exhaustion, returning the array of matched substrings (no groups, no
-/// `index`/`input`). With a non-global regexp, delegates to
-/// `RegExp.prototype.exec` and returns that result directly (`null` or a
-/// match array).
-pub fn string_match(
-    heap: &mut Heap,
-    cache: &regexp::RegexCache,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
-    let handle = this
-        .as_string()
-        .ok_or_else(|| Throw::type_error(heap, "String.prototype.match called on non-string"))?;
-    let text = helpers::string_text(heap, handle);
-    let Some(re) = args.first().and_then(|v| v.as_object()) else {
-        // Non-regexp argument: ToString and return a single-match array.
-        let arg = args
-            .first()
-            .map(|v| helpers::value_text(heap, *v))
-            .unwrap_or_default();
-        return Ok(match_text_to_array(
-            heap,
-            &text,
-            text.find(&arg).map(|i| (i, i + arg.len())),
-        ));
-    };
-    if heap.get(re).kind != v12_heap::Kind::RegExp {
-        let arg = helpers::value_text(heap, *args.first().unwrap());
-        return Ok(match_text_to_array(
-            heap,
-            &text,
-            text.find(&arg).map(|i| (i, i + arg.len())),
-        ));
-    }
-    let (_, flags) = regexp::regexp_source_flags(heap, re);
-    let text_h = heap.intern_text(&text);
-    if flags.contains('g') {
-        // Global: collect every match's whole text.
-        let mut matches = Vec::new();
-        let mut start = 0.0;
-        loop {
-            let m =
-                regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])?;
-            if m.is_null() {
-                break;
-            }
-            // Extract `m[0]`.
-            if let Some(arr) = m.as_object()
-                && let Some(v) = heap.get(arr).elements_array.get(0) {
-                    matches.push(v);
-                }
-            // Guard against infinite loop on zero-width matches.
-            let li = regexp::last_index(heap, re);
-            if li <= start {
-                regexp::set_last_index(heap, re, start + 1.0);
-            }
-            start = li;
-            if start > text.len() as f64 {
-                break;
-            }
-        }
-        if matches.is_empty() {
-            return Ok(JsValue::null());
-        }
-        let arr = helpers::alloc_obj(heap, v12_heap::JsObject::array(matches));
-        Ok(JsValue::object(arr))
-    } else {
-        regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])
-    }
-}
+/// One regexp match: `(start, end)` byte span in the subject text plus
+/// capture groups 1–9 (`None` = group did not participate).
+type MatchSpan = (usize, usize, Vec<Option<String>>);
 
-/// `String.prototype.replace(regexp, replacement)` — regexp replace.
-///
-/// ES 22.2.6.11 subset: global regexps replace every match; otherwise only
-/// the first. The replacement is a string; `$&`, `$1`–`$9`, and `$$` are
-/// expanded (no function replacements).
-pub fn string_replace(
+/// Drives `RegExp.prototype.exec` over `text_h` until exhaustion (or the
+/// first match when `!global`), collecting each match's byte span in `text`
+/// plus capture groups 1–9. Guards against infinite loops on zero-width
+/// matches by forcing `lastIndex` forward.
+fn collect_match_spans(
     heap: &mut Heap,
     cache: &regexp::RegexCache,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
-    let handle = this
-        .as_string()
-        .ok_or_else(|| Throw::type_error(heap, "String.prototype.replace called on non-string"))?;
-    let text = helpers::string_text(heap, handle);
-    let Some(search) = args.first().copied() else {
-        return Ok(JsValue::string(handle));
-    };
-    let replacement = args
-        .get(1)
-        .map(|v| helpers::value_text(heap, *v))
-        .unwrap_or_default();
-    // Non-regexp search: replace the first occurrence.
-    let Some(re) = search.as_object() else {
-        let needle = helpers::value_text(heap, search);
-        if needle.is_empty() {
-            let out = replacement.clone() + &text;
-            return Ok(JsValue::string(heap.intern_text(&out)));
-        }
-        let out = match text.find(&needle) {
-            Some(i) => format!(
-                "{}{}{}",
-                &text[..i],
-                expand_replacement(&replacement, &needle, &[]),
-                &text[i + needle.len()..]
-            ),
-            None => text.clone(),
-        };
-        return Ok(JsValue::string(heap.intern_text(&out)));
-    };
-    if heap.get(re).kind != v12_heap::Kind::RegExp {
-        let needle = helpers::value_text(heap, search);
-        if needle.is_empty() {
-            let out = replacement.clone() + &text;
-            return Ok(JsValue::string(heap.intern_text(&out)));
-        }
-        let out = match text.find(&needle) {
-            Some(i) => format!(
-                "{}{}{}",
-                &text[..i],
-                expand_replacement(&replacement, &needle, &[]),
-                &text[i + needle.len()..]
-            ),
-            None => text.clone(),
-        };
-        return Ok(JsValue::string(heap.intern_text(&out)));
-    }
-    let (_, flags) = regexp::regexp_source_flags(heap, re);
-    let global = flags.contains('g');
-    let text_h = heap.intern_text(&text);
-    // Collect all match spans (byte offsets in `text`).
-    let mut spans: Vec<(usize, usize, Vec<Option<String>>)> = Vec::new();
+    re: Handle<v12_heap::JsObject>,
+    text_h: Handle<V12Str>,
+    text_len: usize,
+    global: bool,
+) -> Result<Vec<MatchSpan>, Throw> {
+    let mut spans = Vec::new();
     let mut start = 0.0;
     loop {
         let m = regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])?;
@@ -232,16 +122,15 @@ pub fn string_replace(
             .and_then(|v| v.as_string())
             .map(|h| helpers::string_text(heap, h).len())
             .unwrap_or(0);
-        let mut groups = Vec::new();
-        for i in 1..=9 {
-            let g = heap
-                .get(arr)
-                .elements_array
-                .get(i)
-                .and_then(|v| v.as_string())
-                .map(|h| helpers::string_text(heap, h));
-            groups.push(g);
-        }
+        let groups = (1..=9)
+            .map(|i| {
+                heap.get(arr)
+                    .elements_array
+                    .get(i)
+                    .and_then(|v| v.as_string())
+                    .map(|h| helpers::string_text(heap, h))
+            })
+            .collect();
         spans.push((match_start, match_start + m0_len, groups));
         // Zero-width guard.
         let li = regexp::last_index(heap, re);
@@ -249,13 +138,88 @@ pub fn string_replace(
             regexp::set_last_index(heap, re, start + 1.0);
         }
         start = li;
-        if start > text.len() as f64 {
-            break;
-        }
-        if !global {
+        if start > text_len as f64 || !global {
             break;
         }
     }
+    Ok(spans)
+}
+
+/// `String.prototype.match(regexp)` — the regexp `match` method.
+///
+/// ES 22.2.6.10 subset: with a global regexp, repeatedly `exec` until
+/// exhaustion, returning the array of matched substrings (no groups, no
+/// `index`/`input`). With a non-global regexp, delegates to
+/// `RegExp.prototype.exec` and returns that result directly (`null` or a
+/// match array).
+pub fn string_match(
+    heap: &mut Heap,
+    cache: &regexp::RegexCache,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let handle = this_string(heap, this, "String.prototype.match")?;
+    let text = helpers::string_text(heap, handle);
+    let Some(re) = as_regexp(heap, args.first()) else {
+        // Non-regexp argument: ToString and return a single-match array.
+        let arg = args
+            .first()
+            .map(|v| helpers::value_text(heap, *v))
+            .unwrap_or_default();
+        return Ok(match_text_to_array(
+            heap,
+            &text,
+            text.find(&arg).map(|i| (i, i + arg.len())),
+        ));
+    };
+    let (_, flags) = regexp::regexp_source_flags(heap, re);
+    let text_h = heap.intern_text(&text);
+    if flags.contains('g') {
+        // Global: collect every match's whole text.
+        let spans = collect_match_spans(heap, cache, re, text_h, text.len(), true)?;
+        if spans.is_empty() {
+            return Ok(JsValue::null());
+        }
+        let matches = spans
+            .iter()
+            .map(|&(s, e, _)| JsValue::string(heap.intern_text(&text[s..e])))
+            .collect();
+        let arr = helpers::alloc_obj(heap, v12_heap::JsObject::array(matches));
+        Ok(JsValue::object(arr))
+    } else {
+        regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])
+    }
+}
+
+/// `String.prototype.replace(regexp, replacement)` — regexp replace.
+///
+/// ES 22.2.6.11 subset: global regexps replace every match; otherwise only
+/// the first. The replacement is a string; `$&`, `$1`–`$9`, and `$$` are
+/// expanded (no function replacements).
+pub fn string_replace(
+    heap: &mut Heap,
+    cache: &regexp::RegexCache,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let handle = this_string(heap, this, "String.prototype.replace")?;
+    let text = helpers::string_text(heap, handle);
+    let Some(search) = args.first().copied() else {
+        return Ok(JsValue::string(handle));
+    };
+    let replacement = args
+        .get(1)
+        .map(|v| helpers::value_text(heap, *v))
+        .unwrap_or_default();
+    // Non-regexp search: replace the first occurrence.
+    let Some(re) = as_regexp(heap, Some(&search)) else {
+        let needle = helpers::value_text(heap, search);
+        return replace_first_occurrence(heap, &text, &needle, &replacement);
+    };
+    let (_, flags) = regexp::regexp_source_flags(heap, re);
+    let global = flags.contains('g');
+    let text_h = heap.intern_text(&text);
+    let spans = collect_match_spans(heap, cache, re, text_h, text.len(), global)?;
     if spans.is_empty() {
         return Ok(JsValue::string(handle));
     }
@@ -278,6 +242,30 @@ pub fn string_replace(
     Ok(JsValue::string(heap.intern_text(&out)))
 }
 
+/// The non-regexp `replace` fallback: substitute `replacement` (with `$&`/
+/// `$1`–`$9`/`$$` expansion) for the first occurrence of `needle` in `text`.
+fn replace_first_occurrence(
+    heap: &mut Heap,
+    text: &str,
+    needle: &str,
+    replacement: &str,
+) -> Result<JsValue, Throw> {
+    let out = if needle.is_empty() {
+        replacement.to_string() + text
+    } else {
+        match text.find(needle) {
+            Some(i) => format!(
+                "{}{}{}",
+                &text[..i],
+                expand_replacement(replacement, needle, &[]),
+                &text[i + needle.len()..]
+            ),
+            None => text.to_string(),
+        }
+    };
+    Ok(JsValue::string(heap.intern_text(&out)))
+}
+
 /// `String.prototype.search(regexp)` — the index of the first match, or -1.
 pub fn string_search(
     heap: &mut Heap,
@@ -285,25 +273,17 @@ pub fn string_search(
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let handle = this
-        .as_string()
-        .ok_or_else(|| Throw::type_error(heap, "String.prototype.search called on non-string"))?;
+    let handle = this_string(heap, this, "String.prototype.search")?;
     let text = helpers::string_text(heap, handle);
     let Some(search) = args.first().copied() else {
         return Ok(helpers::smi_or_f64(0));
     };
-    let Some(re) = search.as_object() else {
+    let Some(re) = as_regexp(heap, Some(&search)) else {
         let needle = helpers::value_text(heap, search);
         return Ok(helpers::smi_or_f64(
             text.find(&needle).map(|i| i as i64).unwrap_or(-1),
         ));
     };
-    if heap.get(re).kind != v12_heap::Kind::RegExp {
-        let needle = helpers::value_text(heap, search);
-        return Ok(helpers::smi_or_f64(
-            text.find(&needle).map(|i| i as i64).unwrap_or(-1),
-        ));
-    }
     let text_h = heap.intern_text(&text);
     let m = regexp::regexp_exec(heap, cache, JsValue::object(re), &[JsValue::string(text_h)])?;
     if m.is_null() {
@@ -328,9 +308,7 @@ pub fn string_split(
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let handle = this
-        .as_string()
-        .ok_or_else(|| Throw::type_error(heap, "String.prototype.split called on non-string"))?;
+    let handle = this_string(heap, this, "String.prototype.split")?;
     let text = helpers::string_text(heap, handle);
     let limit = args
         .get(1)
@@ -343,10 +321,7 @@ pub fn string_split(
         return Ok(array_of_strings(heap, pieces, limit));
     };
     // Non-regexp separator.
-    let is_regexp = search
-        .as_object()
-        .is_some_and(|re| heap.get(re).kind == v12_heap::Kind::RegExp);
-    if !is_regexp {
+    let Some(re) = as_regexp(heap, Some(&search)) else {
         let sep = helpers::value_text(heap, search);
         if sep.is_empty() {
             // Split into UTF-16 code units (no surrogate pairing).
@@ -355,8 +330,7 @@ pub fn string_split(
         }
         pieces = text.split(&sep).collect();
         return Ok(array_of_strings(heap, pieces, limit));
-    }
-    let re = search.as_object().unwrap();
+    };
     let (source, flags) = regexp::regexp_source_flags(heap, re);
     // Spec (22.2.6.17): `split` treats the separator as global — when the
     // separator regexp lacks `g`, the spec creates a clone with `g` added
@@ -370,46 +344,9 @@ pub fn string_split(
         helpers::alloc_obj(heap, v12_heap::JsObject::regexp(source_h, flags_h))
     };
     let text_h = heap.intern_text(&text);
-    // Collect separator spans.
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0.0;
-    loop {
-        let m = regexp::regexp_exec(
-            heap,
-            cache,
-            JsValue::object(splitter),
-            &[JsValue::string(text_h)],
-        )?;
-        if m.is_null() {
-            break;
-        }
-        let Some(arr) = m.as_object() else { break };
-        let s = heap
-            .get(arr)
-            .properties
-            .get(1)
-            .and_then(|v| v.as_smi())
-            .map(i64::from)
-            .unwrap_or(0) as usize;
-        let len = heap
-            .get(arr)
-            .elements_array
-            .get(0)
-            .and_then(|v| v.as_string())
-            .map(|h| helpers::string_text(heap, h).len())
-            .unwrap_or(0);
-        spans.push((s, s + len));
-        let li = regexp::last_index(heap, splitter);
-        if li <= start {
-            regexp::set_last_index(heap, splitter, start + 1.0);
-        }
-        start = li;
-        if start > text.len() as f64 {
-            break;
-        }
-    }
+    let spans = collect_match_spans(heap, cache, splitter, text_h, text.len(), true)?;
     let mut cursor = 0;
-    for (s, e) in spans {
+    for (s, e, _) in spans {
         pieces.push(&text[cursor..s]);
         cursor = e;
     }

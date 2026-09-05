@@ -17,11 +17,7 @@ pub fn number_is_nan(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Resu
         // A Smi or any non-number is never NaN.
         false
     };
-    Ok(if is_nan {
-        JsValue::true_()
-    } else {
-        JsValue::false_()
-    })
+    Ok(JsValue::from_bool(is_nan))
 }
 
 /// `Number.isFinite(value)` – no coercion: only true when the value is a
@@ -40,11 +36,7 @@ pub fn number_is_finite(
     } else {
         false
     };
-    Ok(if finite {
-        JsValue::true_()
-    } else {
-        JsValue::false_()
-    })
+    Ok(JsValue::from_bool(finite))
 }
 
 /// Global `isNaN(value)` – COERCES via `ToNumber`, then tests for NaN. So
@@ -52,11 +44,7 @@ pub fn number_is_finite(
 pub fn global_is_nan(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let n = helpers::to_number(heap, v);
-    Ok(if n.is_nan() {
-        JsValue::true_()
-    } else {
-        JsValue::false_()
-    })
+    Ok(JsValue::from_bool(n.is_nan()))
 }
 
 /// Global `isFinite(value)` – COERCES via `ToNumber`, then requires a finite
@@ -68,11 +56,7 @@ pub fn global_is_finite(
 ) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let n = helpers::to_number(heap, v);
-    Ok(if n.is_finite() {
-        JsValue::true_()
-    } else {
-        JsValue::false_()
-    })
+    Ok(JsValue::from_bool(n.is_finite()))
 }
 
 /// Accumulates the maximal integer prefix of the sign-less digit string `digits`

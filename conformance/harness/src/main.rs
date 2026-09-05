@@ -121,6 +121,11 @@ fn main() {
     if jobs > 1 {
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
+            // Worker threads must have the stack headroom the main thread
+            // gets (~8 MiB via ulimit): deep-recursion test262 tests overflow
+            // the std 2 MiB thread default, and a stack overflow aborts the
+            // whole run (uncatchable), losing every later result.
+            .stack_size(16 * 1024 * 1024)
             .build_global();
     }
 

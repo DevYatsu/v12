@@ -79,7 +79,7 @@ pub fn array_is_array(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Res
     let is = v
         .as_object()
         .is_some_and(|h| _heap.get(h).kind == v12_heap::Kind::Array);
-    Ok(if is { JsValue::true_() } else { JsValue::false_() })
+    Ok(JsValue::from_bool(is))
 }
 
 pub fn array_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {

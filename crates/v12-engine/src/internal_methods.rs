@@ -409,93 +409,34 @@ fn proxy_get_prototype_of(_heap: &Heap, _obj: Handle<JsObject>) -> Option<Handle
     None
 }
 
-fn proxy_set_prototype_of(
-    heap: &mut Heap,
-    _obj: Handle<JsObject>,
-    _proto: Option<Handle<JsObject>>,
-) -> InternalResult<bool> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[SetPrototypeOf]] trap not implemented",
-    ))
-}
-
 fn proxy_is_extensible(_heap: &Heap, _obj: Handle<JsObject>) -> bool {
     true
 }
 
-fn proxy_prevent_extensions(heap: &mut Heap, _obj: Handle<JsObject>) -> InternalResult<bool> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[PreventExtensions]] trap not implemented",
-    ))
+/// Stub trap bodies: every unimplemented proxy trap throws the same
+/// "not implemented" TypeError naming its internal-method slot; only the
+/// signature varies. Non-throwing stubs (`get_prototype_of`,
+/// `is_extensible`, `own_property_keys`) stay hand-written.
+macro_rules! proxy_trap_stub {
+    ($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty, $trap:literal) => {
+        fn $name(heap: &mut Heap, $($arg: $ty),*) -> InternalResult<$ret> {
+            $(let _ = $arg;)*
+            Err(type_error(
+                heap,
+                concat!("TypeError: proxy [[", $trap, "]] trap not implemented"),
+            ))
+        }
+    };
 }
 
-fn proxy_get_own_property(
-    heap: &mut Heap,
-    _obj: Handle<JsObject>,
-    _key: PropKey,
-) -> InternalResult<Option<PropertyDescriptor>> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[GetOwnProperty]] trap not implemented",
-    ))
-}
-
-fn proxy_define_own_property(
-    heap: &mut Heap,
-    _obj: Handle<JsObject>,
-    _key: PropKey,
-    _descriptor: PropertyDescriptor,
-) -> InternalResult<bool> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[DefineOwnProperty]] trap not implemented",
-    ))
-}
-
-fn proxy_has_property(
-    heap: &mut Heap,
-    _obj: Handle<JsObject>,
-    _key: PropKey,
-) -> InternalResult<bool> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[HasProperty]] trap not implemented",
-    ))
-}
-
-fn proxy_get(
-    heap: &mut Heap,
-    _obj: Handle<JsObject>,
-    _key: PropKey,
-    _receiver: JsValue,
-) -> InternalResult<JsValue> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[Get]] trap not implemented",
-    ))
-}
-
-fn proxy_set(
-    heap: &mut Heap,
-    _obj: Handle<JsObject>,
-    _key: PropKey,
-    _value: JsValue,
-    _receiver: JsValue,
-) -> InternalResult<bool> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[Set]] trap not implemented",
-    ))
-}
-
-fn proxy_delete(heap: &mut Heap, _obj: Handle<JsObject>, _key: PropKey) -> InternalResult<bool> {
-    Err(type_error(
-        heap,
-        "TypeError: proxy [[Delete]] trap not implemented",
-    ))
-}
+proxy_trap_stub!(proxy_set_prototype_of(_obj: Handle<JsObject>, _proto: Option<Handle<JsObject>>) -> bool, "SetPrototypeOf");
+proxy_trap_stub!(proxy_prevent_extensions(_obj: Handle<JsObject>) -> bool, "PreventExtensions");
+proxy_trap_stub!(proxy_get_own_property(_obj: Handle<JsObject>, _key: PropKey) -> Option<PropertyDescriptor>, "GetOwnProperty");
+proxy_trap_stub!(proxy_define_own_property(_obj: Handle<JsObject>, _key: PropKey, _descriptor: PropertyDescriptor) -> bool, "DefineOwnProperty");
+proxy_trap_stub!(proxy_has_property(_obj: Handle<JsObject>, _key: PropKey) -> bool, "HasProperty");
+proxy_trap_stub!(proxy_get(_obj: Handle<JsObject>, _key: PropKey, _receiver: JsValue) -> JsValue, "Get");
+proxy_trap_stub!(proxy_set(_obj: Handle<JsObject>, _key: PropKey, _value: JsValue, _receiver: JsValue) -> bool, "Set");
+proxy_trap_stub!(proxy_delete(_obj: Handle<JsObject>, _key: PropKey) -> bool, "Delete");
 
 fn proxy_own_property_keys(_heap: &Heap, _obj: Handle<JsObject>) -> Vec<PropKey> {
     Vec::new()

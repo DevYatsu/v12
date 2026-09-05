@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue, PropKey, V12Str};
+use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue};
 use v12_native::NativeId;
 
 /// Maximum number of intrinsics a realm may host.
@@ -33,10 +33,9 @@ impl Realm {
     /// Creates a new realm, allocating its global object in `heap` and
     /// populating the intrinsic table with placeholder objects.
     pub fn new(heap: &mut Heap) -> Self {
-        let global = heap.alloc(JsObject::default());
-        // Root the global so it survives collection before the engine publishes
-        // its heap roots.
-        heap.add_root(JsValue::object(global));
+        // Rooted immediately: the global must survive collection before the
+        // engine publishes its heap roots.
+        let global = alloc_root(heap);
 
         let mut intrinsics = HashMap::with_capacity(MAX_INTRINSICS);
 
@@ -45,8 +44,6 @@ impl Realm {
             // intrinsics are placeholders (functions except `Math`/`JSON`/`console`
             // which are ordinary objects).
             if name == "globalThis" {
-                let key = intern_key(heap, name);
-                let _ = key;
                 intrinsics.insert(name.to_string(), JsValue::object(global));
                 continue;
             }
@@ -55,19 +52,18 @@ impl Realm {
             } else {
                 v12_heap::Kind::Function
             };
-            let ctor = heap.alloc(JsObject {
-                kind,
-                // Placeholder: no real callable yet. `u32::MAX` is beyond any
-                // program function count, so calling/constructing it routes to
-                // the native seam, which reports "not registered" — the same
-                // rejection a pre-FunctionTarget empty `elements[0]` gave.
-                callable: v12_heap::FunctionTarget::Bytecode(u32::MAX),
-                ..JsObject::default()
-            });
-            // Publish the placeholder immediately to honor the allocation contract.
-            heap.add_root(JsValue::object(ctor));
-            let key = intern_key(heap, name);
-            let _ = key;
+            // Placeholder: no real callable yet. `u32::MAX` is beyond any
+            // program function count, so calling/constructing it routes to
+            // the native seam, which reports "not registered" — the same
+            // rejection a pre-FunctionTarget empty `elements[0]` gave.
+            let ctor = crate::builtins::helpers::alloc_obj(
+                heap,
+                JsObject {
+                    kind,
+                    callable: v12_heap::FunctionTarget::Bytecode(u32::MAX),
+                    ..JsObject::default()
+                },
+            );
             intrinsics.insert(name.to_string(), JsValue::object(ctor));
         }
 
@@ -83,8 +79,6 @@ impl Realm {
                 .get(name)
                 .copied()
                 .expect("intrinsic must have been inserted");
-            let handle = intern_key(heap, name);
-            let _ = handle;
             heap.get_mut(global).properties.push(value);
         }
 
@@ -96,110 +90,40 @@ impl Realm {
         // properties). The intrinsic order above is untouched — only the
         // placeholder's prototype field is filled — preserving the
         // `GLOBAL_VAR_OFFSET` contract.
-        let promise_proto = heap.alloc(JsObject::default());
-        heap.add_root(JsValue::object(promise_proto));
+        let promise_proto = alloc_root(heap);
         let promise_ctor = intrinsics.get("Promise").and_then(|v| v.as_object());
         if let Some(promise_ctor) = promise_ctor {
             heap.get_mut(promise_ctor).prototype = Some(promise_proto);
         }
-        // `String(x)` must be callable (ES ToString): point the placeholder's
-        // callable at the native constructor index (out-of-range bytecode →
-        // native seam → engine registry dispatches `string_construct`).
-        let string_ctor = intrinsics.get("String").and_then(|v| v.as_object());
-        if let Some(string_ctor) = string_ctor {
-            heap.get_mut(string_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(NativeId::StringConstruct));
-        }
-        // `Error(x)` / `new Error(x)` are constructible: point the placeholder
-        // at the native error creator.
-        let error_ctor = intrinsics.get("Error").and_then(|v| v.as_object());
-        if let Some(error_ctor) = error_ctor {
-            heap.get_mut(error_ctor).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(v12_native::NativeId::ErrorCreate));
-        }
-        // `Boolean(x)` / `new Boolean(x)` are constructible.
-        let boolean_ctor = intrinsics.get("Boolean").and_then(|v| v.as_object());
-        if let Some(boolean_ctor) = boolean_ctor {
-            heap.get_mut(boolean_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                v12_native::NativeId::BooleanConstruct,
-            ));
-        }
-        // `Map` / `Set` are constructible.
-        let map_ctor = intrinsics.get("Map").and_then(|v| v.as_object());
-        if let Some(map_ctor) = map_ctor {
-            heap.get_mut(map_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                v12_native::NativeId::MapConstruct,
-            ));
-        }
-        let set_ctor = intrinsics.get("Set").and_then(|v| v.as_object());
-        if let Some(set_ctor) = set_ctor {
-            heap.get_mut(set_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                v12_native::NativeId::SetConstruct,
-            ));
-        }
-        // `RegExp` is constructible.
-        let regexp_ctor = intrinsics.get("RegExp").and_then(|v| v.as_object());
-        if let Some(regexp_ctor) = regexp_ctor {
-            heap.get_mut(regexp_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                v12_native::NativeId::RegExpConstruct,
-            ));
-        }
-        // `eval` is callable: route through the native registry (the
-        // interpreter special-cases NativeId::Eval to run the source re-entrantly).
-        let eval_global = intrinsics.get("eval").and_then(|v| v.as_object());
-        if let Some(eval_global) = eval_global {
-            heap.get_mut(eval_global).callable =
-                v12_heap::FunctionTarget::Bytecode(u32::from(v12_native::NativeId::Eval));
-        }
+        // Point the placeholder constructors that are already callable at
+        // their native seam (out-of-range bytecode → native registry).
+        wire_callable(heap, &intrinsics, "String", NativeId::StringConstruct);
+        wire_callable(heap, &intrinsics, "Error", NativeId::ErrorCreate);
+        wire_callable(heap, &intrinsics, "Boolean", NativeId::BooleanConstruct);
+        wire_callable(heap, &intrinsics, "Map", NativeId::MapConstruct);
+        wire_callable(heap, &intrinsics, "Set", NativeId::SetConstruct);
+        wire_callable(heap, &intrinsics, "RegExp", NativeId::RegExpConstruct);
+        // `eval` routes through the native registry (the interpreter
+        // special-cases NativeId::Eval to run the source re-entrantly).
+        wire_callable(heap, &intrinsics, "eval", NativeId::Eval);
+        // `Number(x)` is callable too (wired below with the prototype links).
 
         // Materialize the standard prototypes the built-in installs target.
         // Each is an ordinary object rooted here (like `promise_proto` above);
         // constructors link to them via their `prototype` field.
-        let object_proto = {
-            let h = heap.alloc(JsObject::default());
-            heap.add_root(JsValue::object(h));
-            h
-        };
-        let array_proto = {
-            let h = heap.alloc(JsObject::default());
-            heap.add_root(JsValue::object(h));
-            h
-        };
-        let string_proto = {
-            let h = heap.alloc(JsObject::default());
-            heap.add_root(JsValue::object(h));
-            h
-        };
-        let number_proto = {
-            let h = heap.alloc(JsObject::default());
-            heap.add_root(JsValue::object(h));
-            h
-        };
-        let function_proto = {
-            let h = heap.alloc(JsObject::default());
-            heap.add_root(JsValue::object(h));
-            h
-        };
+        let object_proto = alloc_root(heap);
+        let array_proto = alloc_root(heap);
+        let string_proto = alloc_root(heap);
+        let number_proto = alloc_root(heap);
+        let function_proto = alloc_root(heap);
 
-        // Link the intrinsic constructors to their prototypes, mirroring the
-        // Promise wiring above, and make `Number(x)` callable.
-        let link_ctor = |heap: &mut Heap,
-                         intrinsics: &HashMap<String, JsValue>,
-                         name: &str,
-                         proto: Handle<JsObject>| {
-            if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
-                heap.get_mut(o).prototype = Some(proto);
-            }
-        };
-        link_ctor(heap, &intrinsics, "Object", object_proto);
-        link_ctor(heap, &intrinsics, "Array", array_proto);
-        link_ctor(heap, &intrinsics, "String", string_proto);
-        link_ctor(heap, &intrinsics, "Number", number_proto);
-        if let Some(number_ctor) = intrinsics.get("Number").and_then(|v| v.as_object()) {
-            heap.get_mut(number_ctor).callable = v12_heap::FunctionTarget::Bytecode(u32::from(
-                v12_native::NativeId::NumberConstruct,
-            ));
-        }
+        // Link the intrinsic constructors to their prototypes and make
+        // `Number(x)` callable.
+        wire_prototype(heap, &intrinsics, "Object", object_proto);
+        wire_prototype(heap, &intrinsics, "Array", array_proto);
+        wire_prototype(heap, &intrinsics, "String", string_proto);
+        wire_prototype(heap, &intrinsics, "Number", number_proto);
+        wire_callable(heap, &intrinsics, "Number", NativeId::NumberConstruct);
 
         // Install the compile-time builtin table (isNaN, Math.floor, Array.push,
         // …) as shape-bound properties on the global and the constructors/
@@ -248,11 +172,30 @@ impl Default for Realm {
     }
 }
 
-fn intern_key(heap: &mut Heap, name: &str) -> PropKey {
-    let h = if name.is_ascii() {
-        heap.intern_string(V12Str::latin1(name.as_bytes().to_vec()))
-    } else {
-        heap.intern_string(V12Str::utf16(name.encode_utf16().collect()))
-    };
-    PropKey::from_string(h)
+/// Allocates an ordinary object and roots it so it survives collection until
+/// the engine publishes its heap roots (same contract as the natives'
+/// `helpers::alloc_obj`).
+fn alloc_root(heap: &mut Heap) -> Handle<JsObject> {
+    crate::builtins::helpers::alloc_obj(heap, JsObject::default())
+}
+
+/// Points an intrinsic constructor's placeholder callable at a native:
+/// out-of-range bytecode routes to the native seam, which dispatches by
+/// `native`. A missing intrinsic is silently skipped (optional constructors).
+fn wire_callable(heap: &mut Heap, intrinsics: &HashMap<String, JsValue>, name: &str, native: NativeId) {
+    if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
+        heap.get_mut(o).callable = v12_heap::FunctionTarget::Bytecode(u32::from(native));
+    }
+}
+
+/// Links an intrinsic constructor's `prototype` field to `proto`.
+fn wire_prototype(
+    heap: &mut Heap,
+    intrinsics: &HashMap<String, JsValue>,
+    name: &str,
+    proto: Handle<JsObject>,
+) {
+    if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
+        heap.get_mut(o).prototype = Some(proto);
+    }
 }

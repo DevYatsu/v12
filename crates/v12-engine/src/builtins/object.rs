@@ -114,7 +114,7 @@ pub fn object_has_own_property(heap: &mut Heap, this: JsValue, args: &[JsValue])
     let key = args.first().copied().unwrap_or(JsValue::undefined());
     let pk = property_key(heap, key).map_err(|e| Throw::Value(e))?;
     let found = heap.get(this_obj).property_keys.iter().any(|k| k.is_some_and(|kk| kk == pk));
-    Ok(if found { JsValue::true_() } else { JsValue::false_() })
+    Ok(JsValue::from_bool(found))
 }
 
 pub fn object_proto_to_string(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
