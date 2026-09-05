@@ -10,9 +10,9 @@
 //! by a `match`, never `dyn`/reflection. New object kinds add a row to the
 //! table (and to the `match` in the dispatch helpers); the table stays
 //! predictable and trace-friendly, which is what lets the JIT tiers emit
-//! shape-guarded direct calls instead of runtime lookups. The `dyn` sites in
-//! the codebase are confined to the control-path seams (`TierCompiler`,
-//! `JitExecFn` in `v12-codegen`); the engine's hot dispatch is always flat
+//! shape-guarded direct calls instead of runtime lookups. The remaining
+//! `dyn` sites in the codebase are confined to the control-path seam
+//! (`JitExecFn` in `v12-codegen`); the engine's hot dispatch is always flat
 //! `match` over a concrete enum.
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey, ShapeHandle};

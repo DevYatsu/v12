@@ -11,10 +11,9 @@ repository = ""
 
 # Design-boundary guardrails (architecture plan phase A). Engine-core crates
 # opt into these via `[lints] workspace = true`; control-path crates may stay
-# outside. `unsafe_code` is deny (not forbid) so the two audited sites can keep
-# their scoped `#[allow(unsafe_code)]`: the `HostClosure` raw-pointer handle
-# (v12-heap/src/function.rs) and the JIT executable-memory layer
-# (v12-jit-baseline/src/mmap.rs). The unwrap/expect/panic lints are warn-level
+# outside. `unsafe_code` is deny (not forbid) so the audited site can keep
+# its scoped `#[allow(unsafe_code)]`: the `HostClosure` raw-pointer handle
+# (v12-heap/src/function.rs). The unwrap/expect/panic lints are warn-level
 # here: the architecture check (scripts/check-architecture.py) is the gate that
 # blocks *new* unwraps in non-test code via its audited-site allowlist.
 [workspace.lints.rust]
@@ -36,9 +35,6 @@ oxc_span = "=0.147.0"
 # JIT backend (ADR-3).
 cranelift-frontend = "0.135"
 cranelift-codegen = "0.135"
-cranelift-module = "0.135"
-cranelift-native = "0.135"
-cranelift-jit = "0.135"
 
 # ECMA-262 RegExp engine.
 regress = "0.12"

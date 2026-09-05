@@ -13,30 +13,18 @@ pub use v12_codegen::{
     CompiledFn, FunctionId, JitCache, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS,
 };
 
-#[cfg(feature = "jit")]
 mod compile;
 mod deopt;
 mod guard;
-#[cfg(not(feature = "jit"))]
-mod stub;
 
 pub use deopt::DeoptMap;
 pub use guard::{Assumption, GuardKind};
-#[cfg(not(feature = "jit"))]
-pub use stub::JitOpt;
 
-/// Tier-2 compiler trait. One method to keep surface minimal.
-pub trait OptCompiler {
-    fn compile(&mut self, fb: &FunctionBytecode, id: FunctionId) -> Result<CompiledFn, JitError>;
-}
-
-#[cfg(feature = "jit")]
 /// Speculative optimizer. Delegates to baseline template until profiling gates fire.
 pub struct JitOpt {
     inner: Option<compile::Pipeline>,
 }
 
-#[cfg(feature = "jit")]
 impl JitOpt {
     pub fn new() -> Result<Self, JitError> {
         Ok(Self {
@@ -58,12 +46,5 @@ impl JitOpt {
     }
     pub fn clear(&mut self) {
         self.inner = None;
-    }
-}
-
-#[cfg(feature = "jit")]
-impl OptCompiler for JitOpt {
-    fn compile(&mut self, fb: &FunctionBytecode, id: FunctionId) -> Result<CompiledFn, JitError> {
-        JitOpt::compile(self, fb, id)
     }
 }

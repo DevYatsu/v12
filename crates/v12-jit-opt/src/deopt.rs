@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 //! Deoptimization map. Reuses baseline `PcMapEntry` 1:1 block mapping.
 //!
@@ -78,7 +77,6 @@ impl ValidityRegistry {
 #[derive(Debug, Clone, Default)]
 pub struct DeoptMap {
     pc_map: Vec<PcMapEntry>,
-    live_regs: Vec<u8>,
     guards: Vec<Assumption>,
     /// Validity cells observed for loop versioning (snapshot).
     validity: ValidityRegistry,
@@ -88,14 +86,9 @@ impl DeoptMap {
     pub fn from_pc_map(pc_map: Vec<PcMapEntry>) -> Self {
         Self {
             pc_map,
-            live_regs: Vec::new(),
             guards: Vec::new(),
             validity: ValidityRegistry::default(),
         }
-    }
-    pub fn with_live_regs(mut self, regs: Vec<u8>) -> Self {
-        self.live_regs = regs;
-        self
     }
     pub fn lookup(&self, bc_pc: u32) -> Option<usize> {
         self.pc_map.iter().position(|e| e.bc_pc == bc_pc)
@@ -108,9 +101,6 @@ impl DeoptMap {
     }
     pub fn pc_map(&self) -> &[PcMapEntry] {
         &self.pc_map
-    }
-    pub fn live_regs(&self) -> &[u8] {
-        &self.live_regs
     }
 
     /// Records a guard assumption. Returns `false` when the per-function guard

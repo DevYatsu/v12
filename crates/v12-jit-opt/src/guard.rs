@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 //! Guards and speculation policy for tier-2.
 //!
@@ -55,6 +54,7 @@ pub const LOOP_HOT_THRESHOLD: u16 = 800;
 /// frequency. The mismatch is intentional; baseline also uses `800` for its
 /// loop OSR gate. Tuning remains open (`bench/` hyperfine) — see
 /// `FEEDBACK_THRESHOLD_MISMATCH_NOTE`.
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub const FEEDBACK_THRESHOLD_MISMATCH_NOTE: &str =
     "jit-opt 512/800 vs interp 1024 — intentional split, see should_speculate docs";
 
@@ -180,77 +180,18 @@ impl core::fmt::Display for Assumption {
 // Monomorphism tracking — Oracle 1 finding 3
 // ---------------------------------------------------------------------------
 
-/// Tracks shape clashes per inline-cache site.
-///
-/// `FeedbackVector::is_mono` reports whether every site has ≤1 recorded shape.
-/// The `PolyIc` remembers up to [`v12_interp::feedback::IC_MAX_ENTRIES`]
-/// shapes per site, so a polymorphic access now makes `is_mono()` return
-/// `false`, and the optimizer's guard selection uses the first (most recent)
-/// shape.
-///
-/// This counter provides the missing signal today without mutating the
-/// interpreter's `FeedbackVector`. The optimizer calls `observe` on every IC
-/// feedback sample; `is_mono` becomes `false` once any site has seen ≥2
-/// distinct shapes.
-///
-/// The counter is deliberately separate from `FeedbackVector` so that
-/// `v12-interp` stays heap-agnostic and `v12-jit-opt` can evolve the
-/// heuristic without changing the tier-0 ABI.
-#[derive(Debug, Default)]
-pub struct ClashCounter {
-    /// Last shape seen per pc.
-    seen: HashMap<u32, ShapeHandle>,
-    /// Set of pcs that have clashed.
-    clashed: HashMap<u32, bool>,
-}
-
-impl ClashCounter {
-    /// Creates an empty counter.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Observes `shape` at `pc`. Returns `true` if this observation caused a
-    /// new clash (i.e., this site just became polymorphic).
-    pub fn observe(&mut self, pc: u32, shape: ShapeHandle) -> bool {
-        if let Some(&prev) = self.seen.get(&pc) {
-            if prev == shape {
-                return false;
-            }
-            if self.clashed.contains_key(&pc) {
-                return false;
-            }
-            self.clashed.insert(pc, true);
-            return true;
-        }
-        self.seen.insert(pc, shape);
-        false
-    }
-
-    /// Number of clash sites.
-    pub fn clash_count(&self) -> usize {
-        self.clashed.len()
-    }
-
-    /// Whether all observed IC sites are still monomorphic.
-    ///
-    /// Equivalent to `clash_count() == 0`. Mirrors the future
-    /// `FeedbackVector::is_mono` once poly-IC lands.
-    pub fn is_mono(&self) -> bool {
-        self.clashed.is_empty()
-    }
-}
-
 /// Simplified clash tracker with per-pc clash dedup.
 ///
 /// Split from `ClashCounter` above to keep the documented vacuous-`is_mono`
 /// note separate from the minimal correct implementation used in tests.
 #[derive(Debug, Default)]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub struct MonoTracker {
     seen: HashMap<u32, ShapeHandle>,
     clashed: HashMap<u32, bool>,
 }
 
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 impl MonoTracker {
     /// Creates an empty tracker.
     pub fn new() -> Self {

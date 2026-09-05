@@ -57,19 +57,6 @@ pub enum TierPolicy {
     Profile,
 }
 
-/// Trait implemented by every tier to recompile a single bytecode function.
-///
-/// v1 has two implementors: the baseline template JIT (`JitBaseline`) and
-/// the speculative opt JIT (`JitOpt`). The engine owns a `Vec<Box<dyn
-/// TierCompiler>>` ordered by tier and calls them in sequence when a
-/// `tier_up_pending` flag fires.
-pub trait TierCompiler {
-    /// Recompile `fb` into native code. The result is opaque; the engine
-    /// hands it back to the next tier or to the runtime for patching.
-    fn compile(&mut self, fb: &FunctionBytecode)
-    -> Result<Box<dyn std::fmt::Debug + Send>, String>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

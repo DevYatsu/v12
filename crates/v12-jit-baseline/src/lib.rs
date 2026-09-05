@@ -6,10 +6,7 @@
 //! one block per bytecode instruction. Arithmetic is baked via
 //! `box_number` immediates and heap-agnostic helpers; control flow maps
 //! bytecode jumps to Cranelift branches; calls go through a runtime helper
-//! that re-enters the interpreter or native registry. The W^X strategy is
-//! documented in [`mmap`].
-
-pub mod mmap;
+//! that re-enters the interpreter or native registry.
 
 #[cfg(feature = "jit")]
 mod compiler;

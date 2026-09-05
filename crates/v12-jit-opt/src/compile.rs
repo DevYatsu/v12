@@ -1,15 +1,10 @@
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 //! Tier-2 pipeline: speculative specialization over the baseline template.
 //!
-//! Phase 2 adds:
-//! - SSA construction: one Cranelift block per bytecode op, phi nodes at
-//!   loop headers via `LoopHeader`/`Jump`, explicit block sealing for loops.
-//! - Type-specialized arithmetic: `Add` with `Lattice::Smi` emits an
-//!   `is_smi` diamond (`brif`) with an `i32` fast path and a double
-//!   fallback. Overflow branches to fallback. No `ops::` helpers on the hot
-//!   Smi path.
+//! Speculation adds:
+//! - Guard selection: type/shape guards recorded from interpreter feedback
+//!   (`guard_for_lattice` → `Assumption` entries in the `DeoptMap`).
 //! - Inlining: callees `≤ MAX_INLINE_SIZE (20)` ops are inlined when
 //!   monomorphic (single shape feedback), by copying their blocks into the
 //!   caller at the `Call` site.
@@ -17,37 +12,11 @@
 //!   the first iteration is peeled with a `ShapeEq` guard for loop-carried
 //!   objects, and counted loops (`header…exit…backedge`) are unrolled `2×`.
 //!
-//! ```text
-//!   // Smi Add at pc 3 — Cranelift diamond (fix finding 2)
-//!   block0(pc3):
-//!     v0 = load r0  (i64 bits)
-//!     v1 = load r1
-//!     v2 = is_smi v0   // (v0 & BOX_MASK)==BOX_MASK && tag==0
-//!     v3 = is_smi v1
-//!     v4 = band v2, v3
-//!     brif v4, block_fast, block_fallback
-//!   block_fast:
-//!     // unboxed i31 payloads, checked add, overflow → fallback
-//!     v5 = band v0, 0x7FFF_FFFF
-//!     v6 = band v1, 0x7FFF_FFFF
-//!     // sign-extend 31→64: (v << 33) >> 33
-//!     v5e = sshr(ishl(v5, 33), 33)
-//!     v6e = sshr(ishl(v6, 33), 33)
-//!     v7, v_overflow = sadd_overflow v5e, v6e
-//!     brif v_overflow, block_fallback, block_check_range
-//!   block_check_range:
-//!     // Smi range -2^30..2^30-1
-//!     v_in_range = icmp ...  // SMI_MIN ≤ v7 ≤ SMI_MAX
-//!     brif v_in_range, block_box, block_fallback
-//!   block_box:
-//!     v8 = bor BOX_MASK, band(v7, 0x7FFF_FFFF)
-//!     jump block_next
-//!   block_fallback:
-//!     v9 = call jit_add(v0, v1)  // generic helper only here
-//!     jump block_next
-//!   block_next:
-//!     phi = phi(v8, v9)
-//!```
+//! Code emission always delegates to the baseline template
+//! (`v12-jit-baseline`); the speculative layer decides *what* to guard, not
+//! how to lower IR. (An earlier SSA-over-Cranelift builder here was dead —
+//! its output was discarded — and was deleted; revisit when tier-2 gets its
+//! own backend.)
 
 use v12_bytecode::{BytecodeError, FunctionBytecode, Opcode};
 use v12_codegen::{CompiledFn, JitError, MAX_JIT_FUNCTION_SIZE, MAX_JIT_REGISTERS};
@@ -63,27 +32,6 @@ fn invalid_bytecode(reason: impl Into<String>) -> JitError {
     })
 }
 
-#[cfg(feature = "jit")]
-use cranelift_codegen::ir::InstBuilder;
-
-/// Local `box_number` helper mirroring `v12-jit-baseline::runtime::box_number`.
-///
-/// Boxes `n` as Smi if integral and in Smi range, otherwise as f64.
-/// Used without calling `ops::` helpers on the hot Smi path.
-#[inline]
-fn box_number(n: f64) -> JsValue {
-    if n.is_finite() && n.fract() == 0.0 && !(n == 0.0 && n.is_sign_negative()) {
-        let lo = f64::from(JsValue::SMI_MIN);
-        let hi = f64::from(JsValue::SMI_MAX);
-        if (lo..=hi).contains(&n)
-            && let Some(smi) = JsValue::from_i32_smi(n as i32)
-        {
-            return smi;
-        }
-    }
-    JsValue::from_f64(n)
-}
-
 // ---------------------------------------------------------------------------
 // Named constants
 // ---------------------------------------------------------------------------
@@ -93,15 +41,19 @@ fn box_number(n: f64) -> JsValue {
 /// Matches `v12-bytecode::MAX_INLINE_SIZE` so the budget is consistent
 /// across crates. Keep as `MAX_INLINE_SIZE` per task spec; `INLINE_BUDGET_OPS`
 /// remains as an alias for backward compatibility.
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub const MAX_INLINE_SIZE: usize = 20;
 
 /// Alias for `MAX_INLINE_SIZE` used by existing code.
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub const INLINE_BUDGET_OPS: usize = MAX_INLINE_SIZE;
 
 /// Unroll factor for counted loops where trip count is loop-bound.
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub const UNROLL_FACTOR: usize = 2;
 
 /// Loop-peel hotness threshold — mirrors `guard::LOOP_HOT_THRESHOLD`.
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub const LOOP_PEEL_HOT: u16 = LOOP_HOT_THRESHOLD;
 
 // ---------------------------------------------------------------------------
@@ -116,6 +68,7 @@ pub const LOOP_PEEL_HOT: u16 = LOOP_HOT_THRESHOLD;
 /// * `Object(shape)` → `ShapeEq`
 /// * `Any`, `Unknown` → no guard (cannot profitably specialize yet).
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn guard_for_lattice(lattice: Lattice, reg: u8, pc: u32) -> Option<Assumption> {
     let guard = match lattice {
         Lattice::Smi => GuardKind::TypeIsSmi { reg },
@@ -131,6 +84,7 @@ pub fn guard_for_lattice(lattice: Lattice, reg: u8, pc: u32) -> Option<Assumptio
 ///
 /// Returns `true` on success, `false` when the budget is exhausted (caller
 /// should emit unspecialized code).
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn emit_guard(map: &mut DeoptMap, assumption: Assumption) -> bool {
     map.record_guard(assumption)
 }
@@ -142,6 +96,7 @@ pub fn emit_guard(map: &mut DeoptMap, assumption: Assumption) -> bool {
 /// Returns `true` iff `lattice` calls for the Smi fast path.
 #[inline]
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn is_smi_fast_path(lattice: Lattice) -> bool {
     lattice == Lattice::Smi
 }
@@ -154,6 +109,7 @@ pub fn is_smi_fast_path(lattice: Lattice) -> bool {
 /// No call to `ops::` helpers is made on the `Some` return — the hot path
 /// is fully inline.
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn smi_add_fast(lhs: JsValue, rhs: JsValue) -> Option<JsValue> {
     let a = lhs.as_smi()?;
     let b = rhs.as_smi()?;
@@ -164,66 +120,18 @@ pub fn smi_add_fast(lhs: JsValue, rhs: JsValue) -> Option<JsValue> {
     JsValue::from_i32_smi(sum)
 }
 
-/// Emits an `is_smi` tag-bits check for Cranelift I64 `value`.
-///
-/// Matches `value.rs` canonical form:
-/// `is_boxed = (bits & BOX_MASK)==BOX_MASK`,
-/// `tag == TAG_SMI (0)`, spare bits zero, and payload masked.
-///
-/// In Cranelift IR:
-/// ```text
-///   is_boxed = icmp eq (band val, BOX_MASK), BOX_MASK
-///   tag = band val, TAG_MASK
-///   is_smi_tag = icmp eq tag, 0
-///   spare_ok = icmp eq (band val, SPARE_MASK), 0
-///   is_smi = band is_boxed, is_smi_tag, spare_ok
-/// ```
-#[cfg(feature = "jit")]
-#[allow(dead_code)]
-fn emit_is_smi_check(
-    builder: &mut cranelift_frontend::FunctionBuilder<'_>,
-    value: cranelift_codegen::ir::Value,
-) -> cranelift_codegen::ir::Value {
-    use cranelift_codegen::ir::{condcodes::IntCC, types::I64};
-    const BOX_MASK: u64 = 0xFFF8_0000_0000_0000;
-    const TAG_SHIFT: u32 = 44;
-    const TAG_MASK: u64 = 0xF_u64 << TAG_SHIFT;
-    const SPARE_MASK: u64 = 0x7_u64 << 48;
-
-    let box_mask = builder.ins().iconst(I64, BOX_MASK as i64);
-    let and_box = builder.ins().band(value, box_mask);
-    let is_boxed = builder.ins().icmp(IntCC::Equal, and_box, box_mask);
-
-    let tag_mask = builder.ins().iconst(I64, TAG_MASK as i64);
-    let tag_bits = builder.ins().band(value, tag_mask);
-    let zero = builder.ins().iconst(I64, 0);
-    let is_smi_tag = builder.ins().icmp(IntCC::Equal, tag_bits, zero);
-
-    let spare_mask = builder.ins().iconst(I64, SPARE_MASK as i64);
-    let spare_bits = builder.ins().band(value, spare_mask);
-    let spare_ok = builder.ins().icmp(IntCC::Equal, spare_bits, zero);
-
-    let tmp = builder.ins().band(is_boxed, is_smi_tag);
-    builder.ins().band(tmp, spare_ok)
-}
-
 // ---------------------------------------------------------------------------
 // Inlining — small callees ≤ MAX_INLINE_SIZE when monomorphic
 // ---------------------------------------------------------------------------
 
 /// Whether `callee` is small enough and monomorphic to inline.
 ///
-/// `is_mono` must come from a *clash-aware* tracker — [`crate::guard::MonoTracker`]
-/// or [`crate::guard::ClashCounter`] — not from
-/// `FeedbackVector::is_mono` alone, whose current representation stores one
-/// shape per site and therefore reports vacuous mono under polymorphism
-/// (Oracle 1 finding 3). TODO(poly IC): when `FeedbackVector` grows a real
-/// polymorphic IC, replace the clash-counting trackers with its native
-/// monomorphism predicate.
-///
-/// Size is measured in logical ops (`v12_bytecode::logical_pcs`) so wide ops
+/// `is_mono` must come from a clash-aware tracker — [`crate::guard::MonoTracker`]
+/// — not from `FeedbackVector::is_mono` alone when the feedback stores one
+/// shape per site (that reports vacuous mono under polymorphism).
 /// do not inflate the count; the budget is [`MAX_INLINE_SIZE`] body ops.
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn should_inline(callee: &FunctionBytecode, is_mono: bool) -> bool {
     if !is_mono {
         return false;
@@ -247,6 +155,7 @@ pub fn should_inline(callee: &FunctionBytecode, is_mono: bool) -> bool {
 /// Returns `None` if `call_pc` is not a call or if the callee is too large.
 /// This is a pure bytecode transform; the caller is not mutated.
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn inline_at(
     caller: &FunctionBytecode,
     call_pc: u32,
@@ -346,6 +255,7 @@ pub fn inline_at(
 
 /// Decision for loop versioning at a hot header.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub enum LoopVersion {
     /// Do not version (cold or not a loop header).
     None,
@@ -366,6 +276,7 @@ pub enum LoopVersion {
 /// property lookup out of the loop.
 #[inline]
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn should_peel_loop(loop_counter: u16) -> bool {
     loop_counter > LOOP_PEEL_HOT
 }
@@ -377,6 +288,7 @@ pub fn should_peel_loop(loop_counter: u16) -> bool {
 /// counted loops where trip count is loop-bound."
 #[inline]
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn should_unroll_counted(
     loop_counter: u16,
     counted: Option<v12_bytecode::CountedLoop>,
@@ -390,6 +302,7 @@ pub fn should_unroll_counted(
 /// When `shape_reg` is `Some`, peel inserts a `ShapeEq` guard; otherwise
 /// only unrolling is considered for counted loops.
 #[must_use]
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn decide_loop_version(
     fb: &FunctionBytecode,
     header: u32,
@@ -419,6 +332,7 @@ pub fn decide_loop_version(
 /// also returned.
 ///
 /// Returns `None` if the guard budget is exhausted.
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn peel_first_iteration(
     deopt: &mut DeoptMap,
     header: u32,
@@ -440,397 +354,9 @@ pub fn peel_first_iteration(
 /// Loops that observe prototype shapes via inline caches guard the
 /// corresponding validity cell so that a later prototype mutation deopts
 /// the peeled fast path. Cell `0` is never valid.
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
 pub fn validity_guard_for_loop(deopt: &mut DeoptMap, header: u32, cell: u32, serial: u32) -> bool {
     deopt.record_validity_guard(header, cell, serial)
-}
-
-// ---------------------------------------------------------------------------
-// SSA construction — one Cranelift block per bytecode op, phi for loop heads
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "jit")]
-#[allow(dead_code)]
-fn build_ssa_ir(
-    fb: &FunctionBytecode,
-    feedback: Option<&v12_interp::feedback::FeedbackVector>,
-) -> Result<Vec<v12_bytecode::PcMapEntry>, JitError> {
-    use cranelift_codegen::ir::{AbiParam, ExternalName, Signature, UserFuncName, types::I64};
-    use cranelift_codegen::isa::CallConv;
-    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-
-    let mut sig = Signature::new(CallConv::SystemV);
-    sig.params.push(AbiParam::new(I64));
-    sig.returns.push(AbiParam::new(I64));
-    let mut func =
-        cranelift_codegen::ir::Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
-    let mut ctx = FunctionBuilderContext::new();
-    let mut builder = FunctionBuilder::new(&mut func, &mut ctx);
-
-    let helper_sig = {
-        let mut s = Signature::new(CallConv::SystemV);
-        s.params.push(AbiParam::new(I64));
-        s.params.push(AbiParam::new(I64));
-        s.returns.push(AbiParam::new(I64));
-        s
-    };
-    let sig_ref = builder.import_signature(helper_sig);
-    let fn_add = builder.import_function(cranelift_codegen::ir::ExtFuncData {
-        name: ExternalName::testcase("jit_helper_add"),
-        signature: sig_ref,
-        colocated: false,
-        patchable: false,
-    });
-
-    let mut vars: Vec<Variable> = Vec::new();
-    for _ in 0..fb.max_regs {
-        vars.push(builder.declare_var(I64));
-    }
-
-    let pcs = v12_bytecode::logical_pcs(fb);
-    let pc_to_block: std::collections::HashMap<u32, cranelift_codegen::ir::Block> =
-        pcs.iter().map(|&pc| (pc, builder.create_block())).collect();
-    let exit_block = builder.create_block();
-    let entry_block = builder.create_block();
-
-    builder.append_block_params_for_function_params(entry_block);
-    builder.switch_to_block(entry_block);
-    for &var in &vars {
-        let undef = builder
-            .ins()
-            .iconst(I64, JsValue::undefined().bits() as i64);
-        builder.def_var(var, undef);
-    }
-    if let Some(&first) = pcs.first().and_then(|p| pc_to_block.get(p)) {
-        builder.ins().jump(first, &[]);
-    } else {
-        let undef = builder
-            .ins()
-            .iconst(I64, JsValue::undefined().bits() as i64);
-        builder.ins().return_(&[undef]);
-    }
-    builder.seal_block(entry_block);
-
-    for &pc in &pcs {
-        let block = pc_to_block[&pc];
-        builder.switch_to_block(block);
-
-        let instr = fb.instrs[pc as usize];
-        let Some(op) = instr.op() else {
-            return Err(invalid_bytecode(format!(
-                "unassigned opcode byte at pc {pc}"
-            )));
-        };
-
-        if op == Opcode::Wide {
-            let words = &fb.instrs[pc as usize..];
-            let Ok((wide, _width)) = v12_bytecode::WideOp::try_decode(words) else {
-                return Err(invalid_bytecode(format!("wide decode at {pc}")));
-            };
-            match wide {
-                v12_bytecode::WideOp::LoadConstW { dst, const_id } => {
-                    let bits = resolve_const_bits(fb, const_id)?;
-                    let val = builder.ins().iconst(I64, bits as i64);
-                    builder.def_var(vars[dst as usize], val);
-                    jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-                }
-                v12_bytecode::WideOp::LoadIntW { dst, value } => {
-                    let bits = box_number(value as f64).bits();
-                    let val = builder.ins().iconst(I64, bits as i64);
-                    builder.def_var(vars[dst as usize], val);
-                    jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-                }
-                v12_bytecode::WideOp::CallW { dst, func, .. } => {
-                    let callee = builder.use_var(vars[func as usize]);
-                    let argc_val = builder.ins().iconst(I64, 0);
-                    let call = builder.ins().call(fn_add, &[callee, argc_val]);
-                    let ret = builder.inst_results(call)[0];
-                    builder.def_var(vars[dst as usize], ret);
-                    jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-                }
-                _ => {
-                    return Err(JitError::UnsupportedWideOp(format!("{wide:?}")));
-                }
-            }
-            if !v12_bytecode::is_loop_header(fb, pc) {
-                builder.seal_block(block);
-            }
-            continue;
-        }
-
-        match op {
-            Opcode::Move => {
-                let dst = instr.a() as usize;
-                let src = instr.b() as usize;
-                let v = builder.use_var(vars[src]);
-                builder.def_var(vars[dst], v);
-                jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-            }
-            Opcode::LoadInt => {
-                let dst = instr.a() as usize;
-                let imm = i8::from_be_bytes([instr.c()]) as f64;
-                let bits = box_number(imm).bits();
-                let val = builder.ins().iconst(I64, bits as i64);
-                builder.def_var(vars[dst], val);
-                jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-            }
-            Opcode::LoadConst => {
-                let dst = instr.a() as usize;
-                let const_id = u32::from(instr.imm16());
-                let bits = resolve_const_bits(fb, const_id)?;
-                let val = builder.ins().iconst(I64, bits as i64);
-                builder.def_var(vars[dst], val);
-                jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-            }
-            Opcode::Add => {
-                let dst = instr.a() as usize;
-                let lhs = instr.b() as usize;
-                let rhs = instr.c() as usize;
-                let lat = feedback
-                    .map(|fv| fv.type_at(pc))
-                    .unwrap_or(Lattice::Unknown);
-                if is_smi_fast_path(lat) {
-                    // Guard policy lives in `Pipeline::compile_with_feedback`
-                    // (single emission site); the SSA builder only shapes the
-                    // Cranelift diamond.
-                    let a_val = builder.use_var(vars[lhs]);
-                    let b_val = builder.use_var(vars[rhs]);
-                    let a_is_smi = emit_is_smi_check(&mut builder, a_val);
-                    let b_is_smi = emit_is_smi_check(&mut builder, b_val);
-                    let both_smi = builder.ins().band(a_is_smi, b_is_smi);
-
-                    let fast_block = builder.create_block();
-                    let fallback_block = builder.create_block();
-                    let next_pc = v12_bytecode::next_logical_pc(fb, pc);
-                    let next_block = next_pc.and_then(|n| pc_to_block.get(&n).copied());
-
-                    builder
-                        .ins()
-                        .brif(both_smi, fast_block, &[], fallback_block, &[]);
-
-                    builder.switch_to_block(fast_block);
-                    let a2 = builder.use_var(vars[lhs]);
-                    let b2 = builder.use_var(vars[rhs]);
-                    const SMI_MASK: i64 = 0x7FFF_FFFF;
-                    let mask = builder.ins().iconst(I64, SMI_MASK);
-                    let a_pay = builder.ins().band(a2, mask);
-                    let b_pay = builder.ins().band(b2, mask);
-                    let c33 = builder.ins().iconst(I64, 33);
-                    let a_ext = builder.ins().ishl(a_pay, c33);
-                    let a_se = builder.ins().sshr(a_ext, c33);
-                    let b_ext = builder.ins().ishl(b_pay, c33);
-                    let b_se = builder.ins().sshr(b_ext, c33);
-                    let sum = builder.ins().iadd(a_se, b_se);
-                    const SMI_MIN: i64 = -(1i64 << 30);
-                    const SMI_MAX: i64 = (1i64 << 30) - 1;
-                    let smin = builder.ins().iconst(I64, SMI_MIN);
-                    let smax = builder.ins().iconst(I64, SMI_MAX);
-                    let lt_min = builder.ins().icmp(
-                        cranelift_codegen::ir::condcodes::IntCC::SignedLessThan,
-                        sum,
-                        smin,
-                    );
-                    let gt_max = builder.ins().icmp(
-                        cranelift_codegen::ir::condcodes::IntCC::SignedGreaterThan,
-                        sum,
-                        smax,
-                    );
-                    let out_of_range = builder.ins().bor(lt_min, gt_max);
-                    let box_block = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(out_of_range, fallback_block, &[], box_block, &[]);
-
-                    builder.switch_to_block(box_block);
-                    const BOX_MASK_U: i64 = 0xFFF8_0000_0000_0000u64 as i64;
-                    let box_mask = builder.ins().iconst(I64, BOX_MASK_U);
-                    let masked = builder.ins().band(sum, mask);
-                    let boxed = builder.ins().bor(box_mask, masked);
-                    builder.def_var(vars[dst], boxed);
-                    if let Some(next) = next_block {
-                        builder.ins().jump(next, &[]);
-                    } else {
-                        builder.ins().jump(exit_block, &[]);
-                    }
-                    builder.seal_block(fast_block);
-                    builder.seal_block(box_block);
-
-                    builder.switch_to_block(fallback_block);
-                    let a3 = builder.use_var(vars[lhs]);
-                    let b3 = builder.use_var(vars[rhs]);
-                    let call = builder.ins().call(fn_add, &[a3, b3]);
-                    let res = builder.inst_results(call)[0];
-                    builder.def_var(vars[dst], res);
-                    if let Some(next) = next_block {
-                        builder.ins().jump(next, &[]);
-                    } else {
-                        builder.ins().jump(exit_block, &[]);
-                    }
-                    builder.seal_block(fallback_block);
-                } else {
-                    let a = builder.use_var(vars[lhs]);
-                    let b = builder.use_var(vars[rhs]);
-                    let call = builder.ins().call(fn_add, &[a, b]);
-                    let res = builder.inst_results(call)[0];
-                    builder.def_var(vars[dst], res);
-                    jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-                }
-            }
-            Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Neg => {
-                let a = builder.use_var(vars[instr.b() as usize]);
-                let b = if matches!(op, Opcode::Sub | Opcode::Mul | Opcode::Div) {
-                    Some(builder.use_var(vars[instr.c() as usize]))
-                } else {
-                    None
-                };
-                let res = if let Some(bv) = b {
-                    let call = builder.ins().call(fn_add, &[a, bv]);
-                    builder.inst_results(call)[0]
-                } else {
-                    let call = builder.ins().call(fn_add, &[a, a]);
-                    builder.inst_results(call)[0]
-                };
-                builder.def_var(vars[instr.a() as usize], res);
-                jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-            }
-            Opcode::Jump => {
-                let target = instr.imm24();
-                if let Some(&blk) = pc_to_block.get(&target) {
-                    builder.ins().jump(blk, &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
-            }
-            Opcode::JumpIfFalse | Opcode::JumpIfTrue => {
-                let cond = instr.a() as usize;
-                let target = u32::from(instr.imm16());
-                let next = v12_bytecode::next_logical_pc(fb, pc);
-                let cond_val = builder.use_var(vars[cond]);
-                let false_val = builder.ins().iconst(I64, JsValue::false_().bits() as i64);
-                let is_false = builder.ins().icmp(
-                    cranelift_codegen::ir::condcodes::IntCC::Equal,
-                    cond_val,
-                    false_val,
-                );
-                let t_block = pc_to_block.get(&target).copied();
-                let f_block = next.and_then(|n| pc_to_block.get(&n).copied());
-                if op == Opcode::JumpIfFalse {
-                    match (t_block, f_block) {
-                        (Some(t), Some(f)) => {
-                            builder.ins().brif(is_false, t, &[], f, &[]);
-                        }
-                        (Some(t), None) => {
-                            builder.ins().brif(is_false, t, &[], exit_block, &[]);
-                        }
-                        (None, Some(f)) => {
-                            builder.ins().brif(is_false, exit_block, &[], f, &[]);
-                        }
-                        _ => {
-                            builder.ins().jump(exit_block, &[]);
-                        }
-                    }
-                } else if let (Some(t), Some(f)) = (f_block, t_block) {
-                    builder.ins().brif(is_false, f, &[], t, &[]);
-                } else {
-                    builder.ins().jump(exit_block, &[]);
-                }
-            }
-            Opcode::LoopHeader => {
-                jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-            }
-            Opcode::Call => {
-                let dst = instr.a() as usize;
-                let func = instr.b() as usize;
-                let callee = builder.use_var(vars[func]);
-                let argc_val = builder.ins().iconst(I64, i64::from(instr.c()));
-                let call = builder.ins().call(fn_add, &[callee, argc_val]);
-                let res = builder.inst_results(call)[0];
-                builder.def_var(vars[dst], res);
-                jump_to_next(&mut builder, fb, pc, &pc_to_block, exit_block);
-            }
-            Opcode::Return => {
-                let src = instr.a() as usize;
-                let v = builder.use_var(vars[src]);
-                builder.ins().return_(&[v]);
-            }
-            _ => {
-                return Err(JitError::UnsupportedOpcode(op));
-            }
-        }
-
-        if !v12_bytecode::is_loop_header(fb, pc) {
-            builder.seal_block(block);
-        }
-    }
-
-    for &pc in &pcs {
-        if v12_bytecode::is_loop_header(fb, pc)
-            && let Some(&blk) = pc_to_block.get(&pc)
-        {
-            builder.seal_block(blk);
-        }
-    }
-
-    builder.switch_to_block(exit_block);
-    let undef = builder
-        .ins()
-        .iconst(I64, JsValue::undefined().bits() as i64);
-    builder.ins().return_(&[undef]);
-    builder.seal_block(exit_block);
-
-    builder.seal_all_blocks();
-    builder.finalize(cranelift_codegen::isa::TargetFrontendConfig {
-        default_call_conv: cranelift_codegen::isa::CallConv::SystemV,
-        pointer_width: target_lexicon::PointerWidth::U64,
-        page_size_align_log2: 12,
-    });
-
-    let pc_map = pcs
-        .iter()
-        .map(|&pc| v12_bytecode::PcMapEntry {
-            jit_pc: pc * 4,
-            bc_pc: pc,
-        })
-        .collect();
-    Ok(pc_map)
-}
-
-#[cfg(feature = "jit")]
-fn jump_to_next(
-    builder: &mut cranelift_frontend::FunctionBuilder<'_>,
-    fb: &FunctionBytecode,
-    pc: u32,
-    pc_to_block: &std::collections::HashMap<u32, cranelift_codegen::ir::Block>,
-    exit_block: cranelift_codegen::ir::Block,
-) {
-    use cranelift_codegen::ir::types::I64;
-    if let Some(next) = v12_bytecode::next_logical_pc(fb, pc)
-        && let Some(&blk) = pc_to_block.get(&next)
-    {
-        builder.ins().jump(blk, &[]);
-        return;
-    }
-    let undef = builder
-        .ins()
-        .iconst(I64, JsValue::undefined().bits() as i64);
-    let _ = undef;
-    builder.ins().jump(exit_block, &[]);
-}
-
-#[cfg(feature = "jit")]
-fn resolve_const_bits(fb: &FunctionBytecode, id: u32) -> Result<u64, JitError> {
-    let idx = id as u16;
-    match fb.consts.get(idx) {
-        Some(v12_bytecode::Const::F64(n)) => Ok(box_number(n).bits()),
-        Some(v12_bytecode::Const::Str32(_)) => Ok(JsValue::undefined().bits()),
-        Some(v12_bytecode::Const::Null) => Ok(JsValue::null().bits()),
-        Some(other) => Err(JitError::UnsupportedWideOp(format!("const kind {other:?}"))),
-        None => Err(invalid_bytecode(format!("const id {id} out of range"))),
-    }
-}
-
-#[cfg(not(feature = "jit"))]
-fn resolve_const_bits(_fb: &FunctionBytecode, _id: u32) -> Result<u64, JitError> {
-    Ok(JsValue::undefined().bits())
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +381,7 @@ impl Pipeline {
     ///   `Lattice::Smi`,
     /// - inlines small monomorphic callees `≤ MAX_INLINE_SIZE`,
     /// - versions hot loops (peel + unroll `2×` for counted loops).
+#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
     pub fn compile_with_feedback(
         &mut self,
         fb: &FunctionBytecode,
@@ -941,11 +468,6 @@ impl Pipeline {
                     }
                 }
             }
-        }
-
-        #[cfg(feature = "jit")]
-        {
-            let _ = build_ssa_ir(fb, feedback);
         }
 
         let mut baseline = v12_jit_baseline::JitBaseline::new()?;

@@ -14,9 +14,6 @@ v12-interp.workspace = true
 v12-codegen.workspace = true
 cranelift-frontend = { workspace = true, optional = true }
 cranelift-codegen = { workspace = true, optional = true }
-cranelift-module = { workspace = true, optional = true }
-cranelift-native = { workspace = true, optional = true }
-cranelift-jit = { workspace = true, optional = true }
 target-lexicon = { version = "0.13", optional = true }
 
 [features]
@@ -25,9 +22,6 @@ default = ["jit"]
 jit = [
   "dep:cranelift-frontend",
   "dep:cranelift-codegen",
-  "dep:cranelift-module",
-  "dep:cranelift-native",
-  "dep:cranelift-jit",
   "dep:target-lexicon",
 ]
 
