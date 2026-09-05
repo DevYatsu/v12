@@ -59,10 +59,5 @@ fi
 
 # --- Run -------------------------------------------------------------------
 
-# The workspace `release` profile pins `panic = "abort"`, which defeats
-# `catch_unwind` and lets one engine panic abort the whole suite. Conformance
-# runs therefore use the default `dev` profile (no `--release`), which Cargo
-# compiles with `panic = "unwind"`, so panicking tests report as
-# `Fail: engine panic` and the run keeps going.
-echo "Running: cargo run -p test262-runner -- $*" >&2
-exec cargo run -p test262-runner -- "$@"
+echo "Running: cargo run -r -p test262-runner -- $*" >&2
+exec cargo run -r -p test262-runner -- "$@"

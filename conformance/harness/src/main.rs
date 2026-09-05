@@ -116,11 +116,35 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
+    // Run the whole sweep on a thread with explicit stack headroom. The
+    // dispatch loop itself is iterative, but pathological test262 sources
+    // drive deep native recursion (AST lowering, re-entrant host calls), and
+    // the OS main-thread stack (~8 MiB) plus the std 2 MiB thread default
+    // both overflow. A stack overflow is uncatchable and aborts the process,
+    // losing every result, so the sweep thread gets far more than needed.
+    let sweep = std::thread::Builder::new()
+        .name("sweep".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || run(cli))
+        .expect("spawn sweep thread");
+    if sweep.join().is_err() {
+        // Propagate a panicking sweep as a failed exit (dev profile unwinds;
+        // release builds abort before reaching this).
+        std::process::exit(101);
+    }
+}
+
+fn run(cli: Cli) {
     let jobs = normalize_jobs(cli.jobs);
     // Configure rayon for the chosen parallelism.
     if jobs > 1 {
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
+            // Worker threads must have the stack headroom the main thread
+            // gets (~8 MiB via ulimit): deep-recursion test262 tests overflow
+            // the std 2 MiB thread default, and a stack overflow aborts the
+            // whole run (uncatchable), losing every later result.
+            .stack_size(16 * 1024 * 1024)
             .build_global();
     }
 
