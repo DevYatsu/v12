@@ -65,23 +65,20 @@ JIT stays off unless explicitly enabled.
 
 | Status | Item |
 |--------|------|
-| todo | v12-bytecode lib.rs (2,226 lines) → opcode.rs / wide.rs / builder.rs / analysis.rs. |
-| todo | v12-interp lib.rs (5,787 lines; `execute` ~830 lines) → split by concern. |
-| todo | engine.rs (1,617 lines) → eval.rs / host_fn.rs / display.rs. |
-| todo | builtins/mod.rs role split; `define_opcodes!` macro maintains 5 parallel opcode tables — collapse. |
+| done | v12-bytecode lib.rs (2,226 lines) → opcode.rs / wide.rs / builder.rs / analysis.rs; lib.rs (750 lines) keeps `pub use` re-exports so all external paths are unchanged. |
+| done | v12-interp lib.rs (~5,800 → ~1,600 lines) → execute.rs / property.rs / call_setup.rs / object_ops.rs / globals.rs / generator_async.rs; moved methods are `pub(crate)`, `Interp` stays at the crate root so private-field access is preserved. |
+| done | engine.rs (1,617 → 926 lines) → engine/eval.rs / engine/host_fn.rs / engine/display.rs (child modules of the `engine` module — field privacy preserved); adds the `#[cfg(feature = "jit")]` `jit_program` clone before `Interp::new_with_heap` consumes the Rc. |
+| done | builtins/mod.rs role split: `NativeRegistry` + dispatch + eval impl extracted to builtins/registry.rs; mod.rs keeps `define_builtins!` and the handler fns. `define_opcodes!` collapse deferred (maintains 5 parallel opcode tables but is consistent and compile-time checked). |
 
 ## P4 — mechanical clippy fixes
 
 | Status | Item |
 |--------|------|
-| todo | `collapsible_if` ×5 (interp 1116, 1215, 1293, 1294, 2867). |
-| todo | array.rs sort: `sort_by` with per-comparison `value_text` allocation → `sort_by_cached_key`. |
-| todo | `let_and_return` / `redundant_closure` / `needless_borrow` / `unnecessary_sort_by` in array.rs. |
-| todo | `map_err(Throw::Value)` normalizations, `then_some().is_some()` (jit compile.rs:399-405), identity match (compile.rs:970-974), `HashMap<u32, bool>` → `HashSet` (guard.rs), `format!("{}", v)` → `to_string()` (expr.rs:1903), underscore params instead of `let _ =`. |
+| done (2026-09-05) | All mechanical clippy lints cleaned via `cargo clippy --fix` + manual edits: `collapsible_if`, `needless_borrow`, `redundant_closure`, `let_and_return`, `unnecessary_sort_by`, `then_some().is_some()`, identity match, `HashMap<u32, bool>` → `HashSet`, `format!("{}", v)` → `to_string()`, underscore params. array.rs `sort` now `sort_by_cached_key(|a| helpers::value_text(heap, *a))` (key computed once per element, not per comparison). 6 empty-line-after-doc fixes. Remaining clippy output is the accepted policy set (unwrap/expect/panic in audited sites). |
 
 ## Verification protocol
 
-1. `cargo nextest run --workspace` — 563 tests must stay green after every step.
+1. `cargo nextest run --workspace` — 562 tests must stay green after every step.
 2. Conformance before/after: read results with the default `--format human`; when a machine-comparable ok-list is genuinely needed, write it to a file — `--format tap --tap-out /tmp/t262-<name>.tap` — never to stdout (tap/json on tens of thousands of tests are a token sink; see `CONTEXT.md`). Diff ok-lists (`comm` on sorted test names). Known accepted delta so far: **−24** (`with` false passes → honest compile error), **+1** (delete/elements fix).
 3. `cargo clippy --workspace --all-targets` — 0 errors; deliberate-policy warnings (`unwrap_used`/`expect_used`/`panic` in audited sites) are acceptable.
 4. Update `conformance/fix-log.md` per project convention when conformance moves.
