@@ -1,0 +1,955 @@
+//! Property access and mutation: `get_property`/`set_property`, the
+//! built-in-method "surface" dispatch, inline-cache lookup, and the
+//! `in`/`instanceof`/`delete` operators plus array element access.
+
+use v12_heap::{
+    Attrs, Descriptor, Handle, JsObject, JsValue, Kind, PropKey,
+};
+
+use super::{
+    Interp, JSException, RegExpSlot, ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET, OBJECT_IDX,
+    PROMISE_IDX, REGEXP_IDX, SYMBOL_IDX,
+};
+use v12_native::NativeId;
+use crate::ops;
+
+impl Interp<'_> {
+    pub(crate) fn get_property(
+        &mut self,
+        site_fn: u32,
+        site_pc: u32,
+        obj_v: JsValue,
+        key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        // Primitives have no wrappers yet: reads yield undefined, matching
+        // real JS minus the built-ins that would populate the wrappers
+        // (string primitives do get the regexp method surface).
+        let Some(obj) = obj_v.as_object() else {
+            return self.string_prim_surface(obj_v, key_v);
+        };
+        // Structural fast-path surfaces, probed in a fixed order. Each helper
+        // recognizes one `(receiver, key)` surface and answers the read, or
+        // returns `None` to defer to the next; the shape-bound lookup with the
+        // inline cache runs only when no surface matches.
+        if let Some(answer) = self.console_log_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.symbol_iterator_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.promise_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.object_statics_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.generator_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.well_known_iterator_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.iterator_method_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.regexp_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.array_statics_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.function_method_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.object_proto_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.regexp_prototype_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.array_instance_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.element_surface(obj, key_v) {
+            return answer;
+        }
+        if let Some(answer) = self.map_set_surface(obj, key_v) {
+            return answer;
+        }
+        self.ic_lookup(site_fn, site_pc, obj, key_v)
+    }
+
+    /// String primitives synthesize the regexp method surface (`match`/
+    /// `replace`/`search`/`split`) from the const method table (the
+    /// `StringPrim` pseudo-kind); other primitives read `undefined`.
+    pub(crate) fn string_prim_surface(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        if obj_v.is_string()
+            && let Some(id) = self.method_native(Kind::StringPrim, key_v)
+        {
+            return Ok(self.map_set_method(id));
+        }
+        Ok(JsValue::undefined())
+    }
+
+    /// `console.log` — the console intrinsic is located by name in the
+    /// global's property prefix (adding intrinsics cannot drift the index);
+    /// a `"log"` read on that object synthesizes the native function.
+    pub(crate) fn console_log_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let console_idx = CONSOLE_IDX;
+        let (Some(g), Some(console_idx)) = (self.global, console_idx) else {
+            return None;
+        };
+        let console_obj = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(console_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != console_obj || !self.key_is(key_v, "log") {
+            return None;
+        }
+        Some(Ok(self.console_log_fn()))
+    }
+
+    /// `Symbol.iterator` — reading the well-known symbol off the `Symbol`
+    /// intrinsic (found by name in the global's property prefix) yields
+    /// the realm's singleton symbol value.
+    pub(crate) fn symbol_iterator_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let symbol_idx = SYMBOL_IDX;
+        let (Some(g), Some(symbol_idx)) = (self.global, symbol_idx) else {
+            return None;
+        };
+        let symbol_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(symbol_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != symbol_ctor || !self.key_is(key_v, "iterator") {
+            return None;
+        }
+        Some(Ok(JsValue::symbol(self.symbol_iterator_key())))
+    }
+
+    /// The Promise surface. Natives cannot attach shape-bound properties
+    /// (shape binding is interpreter state), so these reads are recognized
+    /// structurally:
+    /// - `Promise.resolve` / `Promise.reject` on the Promise constructor
+    ///   (located by name in the duplicated `GLOBAL_INTRINSIC_NAMES`).
+    /// - `then` on any object whose prototype is the Promise constructor's
+    ///   `prototype` link — the realm installs that link, and the engine's
+    ///   promise built-ins give every promise instance the same prototype.
+    pub(crate) fn promise_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let promise_idx = PROMISE_IDX;
+        let (Some(g), Some(promise_idx)) = (self.global, promise_idx) else {
+            return None;
+        };
+        let promise_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(promise_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj == promise_ctor {
+            if self.key_is(key_v, "resolve") {
+                return Some(Ok(self.cached_native(NativeId::PromiseResolve)));
+            }
+            if self.key_is(key_v, "reject") {
+                return Some(Ok(self.cached_native(NativeId::PromiseReject)));
+            }
+            return None;
+        }
+        if self.key_is(key_v, "then")
+            && self.heap.get(obj).prototype.is_some()
+            && self.heap.get(obj).prototype == self.heap.get(promise_ctor).prototype
+        {
+            return Some(Ok(self.cached_native(NativeId::PromiseThen)));
+        }
+        None
+    }
+
+    /// Static methods on the `Object` constructor: `create`/
+    /// `getPrototypeOf`/`defineProperty`/`enumerableOwnKeys` and the
+    /// `keys`/`values`/`entries` trio. The constructor is the global's first
+    /// intrinsic slot (`OBJECT_IDX`).
+    pub(crate) fn object_statics_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let object_idx = OBJECT_IDX;
+        let (Some(g), Some(object_idx)) = (self.global, object_idx) else {
+            return None;
+        };
+        let object_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(object_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != object_ctor {
+            return None;
+        }
+        if self.key_is(key_v, "enumerableOwnKeys") {
+            return Some(Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys)));
+        }
+        let constant = if self.key_is(key_v, "create") {
+            NativeId::ObjectCreate
+        } else if self.key_is(key_v, "getPrototypeOf") {
+            NativeId::ObjectGetPrototypeOf
+        } else if self.key_is(key_v, "defineProperty") {
+            NativeId::ObjectDefineProperty
+        } else if self.key_is(key_v, "keys") {
+            NativeId::ObjectKeys
+        } else if self.key_is(key_v, "values") {
+            NativeId::ObjectValues
+        } else if self.key_is(key_v, "entries") {
+            NativeId::ObjectEntries
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+    /// Generator instances expose `next`/`return`/`throw` as synthesized
+    /// natives.
+    pub(crate) fn generator_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Generator {
+            return None;
+        }
+        let constant = if self.key_is(key_v, "next") {
+            NativeId::GeneratorNext
+        } else if self.key_is(key_v, "return") {
+            NativeId::GeneratorReturn
+        } else if self.key_is(key_v, "throw") {
+            NativeId::GeneratorThrow
+        } else {
+            return None;
+        };
+        Some(Ok(self.cached_native(constant)))
+    }
+
+    /// `obj[Symbol.iterator]` — the well-known symbol key is a symbol
+    /// value, not a string; recognize it by comparing against the cached
+    /// realm symbol handle, then pick the iterator constructor by receiver
+    /// kind. Returns a synthesized native function that creates an iterator
+    /// over `obj`.
+    pub(crate) fn well_known_iterator_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if !self.key_is_symbol_iterator(key_v) {
+            return None;
+        }
+        let constant = match self.heap.get(obj).kind {
+            Kind::Array | Kind::Arguments => crate::NativeId::ArrayIterator,
+            Kind::Map => crate::NativeId::MapIterator,
+            Kind::Set => crate::NativeId::SetIterator,
+            Kind::Iterator | Kind::Generator => crate::NativeId::IteratorSelf,
+            _ => return None,
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// `%IteratorPrototype%`-family instances resolve `next` from the const
+    /// method table.
+    pub(crate) fn iterator_method_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Iterator {
+            return None;
+        }
+        let id = self.method_native(Kind::Iterator, key_v)?;
+        Some(Ok(self.map_set_method(id)))
+    }
+
+    /// RegExp object surface: methods `exec`/`test`/`toString`/`compile`
+    /// from the const table, and the `source`/`flags`/`lastIndex` property
+    /// reads (internal slots).
+    pub(crate) fn regexp_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::RegExp {
+            return None;
+        }
+        if let Some(id) = self.method_native(Kind::RegExp, key_v) {
+            return Some(Ok(self.map_set_method(id)));
+        }
+        let slot = self.regexp_slot(key_v)?;
+        let value = self.heap.get(obj).properties.get(slot as usize).copied()?;
+        Some(Ok(value))
+    }
+
+    /// Which internal-slot property a key names on a RegExp object. Slots
+    /// live at fixed positions in `properties` (see [`RegExpSlot`]).
+    pub(crate) fn regexp_slot(&mut self, key_v: JsValue) -> Option<RegExpSlot> {
+        if self.key_is(key_v, "source") {
+            Some(RegExpSlot::Source)
+        } else if self.key_is(key_v, "flags") {
+            Some(RegExpSlot::Flags)
+        } else if self.key_is(key_v, "lastIndex") {
+            Some(RegExpSlot::LastIndex)
+        } else {
+            None
+        }
+    }
+    /// `Array.isArray` — static method on the Array constructor.
+    pub(crate) fn array_statics_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let array_idx = ARRAY_IDX;
+        let (Some(g), Some(array_idx)) = (self.global, array_idx) else {
+            return None;
+        };
+        let array_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(array_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != array_ctor || !self.key_is(key_v, "isArray") {
+            return None;
+        }
+        Some(Ok(self.map_set_method(NativeId::ArrayIsArray)))
+    }
+    /// `Function.prototype.call` / `apply` / `bind` / `toString` on any
+    /// function object.
+    pub(crate) fn function_method_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Function {
+            return None;
+        }
+        let constant = if self.key_is(key_v, "call") {
+            NativeId::FunctionCall
+        } else if self.key_is(key_v, "apply") {
+            NativeId::FunctionApply
+        } else if self.key_is(key_v, "bind") {
+            NativeId::FunctionBind
+        } else if self.key_is(key_v, "toString") {
+            NativeId::FunctionProtoToString
+        } else if self.key_is(key_v, "valueOf") {
+            NativeId::ObjectProtoValueOf
+        } else if self.key_is(key_v, "hasOwnProperty") {
+            NativeId::ObjectHasOwnProperty
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// `Object.prototype` methods on any ordinary object (including arrays
+    /// for toString/valueOf).
+    pub(crate) fn object_proto_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let constant = if self.key_is(key_v, "hasOwnProperty") {
+            NativeId::ObjectHasOwnProperty
+        } else if self.key_is(key_v, "valueOf") {
+            NativeId::ObjectProtoValueOf
+        } else if self.key_is(key_v, "toString") {
+            // Functions already handled above; this covers ordinary objects and arrays.
+            if self.heap.get(obj).kind == Kind::Function {
+                NativeId::FunctionProtoToString
+            } else {
+                NativeId::ObjectProtoToString
+            }
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// `RegExp.prototype` — the constructor's prototype property (needed
+    /// for `new RegExp(...)` instanceof wiring and `RegExp.prototype.exec`
+    /// style reads). The realm's RegExp placeholder has no real prototype
+    /// object; synthesize a minimal one on first read.
+    pub(crate) fn regexp_prototype_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let regexp_idx = REGEXP_IDX;
+        let (Some(g), Some(regexp_idx)) = (self.global, regexp_idx) else {
+            return None;
+        };
+        let regexp_ctor = {
+            let heap = &*self.heap;
+            heap.get(g)
+                .properties
+                .get(regexp_idx)
+                .and_then(|v| v.as_object())
+        }?;
+        if obj != regexp_ctor || !self.key_is(key_v, "prototype") {
+            return None;
+        }
+        if let Some(p) = self.heap.get(obj).prototype {
+            return Some(Ok(JsValue::object(p)));
+        }
+        self.gc_protect();
+        let proto = self.heap.alloc(JsObject::default());
+        self.heap.add_root(JsValue::object(proto));
+        self.heap.get_mut(obj).prototype = Some(proto);
+        Some(Ok(JsValue::object(proto)))
+    }
+    /// Array instance surface: the method table (push/pop/join/entries/
+    /// keys/values, with push/join via the cached native path) and the
+    /// `length` slot read.
+    pub(crate) fn array_instance_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        if self.heap.get(obj).kind != Kind::Array {
+            return None;
+        }
+        if let Some(id) = self.method_native(Kind::Array, key_v) {
+            // Array methods are synthesized via the cached native path.
+            let value = match id {
+                NativeId::ArrayPush => self.cached_native(NativeId::ArrayPush),
+                NativeId::ArrayJoin => self.cached_native(NativeId::ArrayJoin),
+                _ => self.map_set_method(id),
+            };
+            return Some(Ok(value));
+        }
+        if !self.key_is(key_v, "length") {
+            return None;
+        }
+        // Length is properties[0] for arrays regardless of shape state
+        // (covers arrays created by native handlers without shape binding)
+        let value = self.heap.get(obj).properties.first().copied()?;
+        Some(Ok(value))
+    }
+
+    /// Integer-index reads on arrays and arguments objects come from the
+    /// element store.
+    pub(crate) fn element_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let kind = self.heap.get(obj).kind;
+        if (kind == Kind::Array || kind == Kind::Arguments)
+            && let Some(idx) = self.array_index_of(key_v)
+        {
+            // For arguments exotic, a mapped index mirrors the parameter slot;
+            // v1 simply returns the element (the param alias is exercised via
+            // the mapped array in heap tests).
+            return Some(Ok(self.array_element(obj, idx)));
+        }
+        None
+    }
+
+    /// Map/Set method fast paths, recognized by object kind. Each
+    /// synthesizes a function whose callable routes through the engine's
+    /// native registry (the `NATIVE_*` constants are out-of-range bytecode
+    /// indices the registry dispatches).
+    pub(crate) fn map_set_surface(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let kind = self.heap.get(obj).kind;
+        if kind != Kind::Map && kind != Kind::Set {
+            return None;
+        }
+        // `size` is a getter: invoke the handler directly with the
+        // Map/Set as `this`. Methods return the synthesized function.
+        if self.key_is(key_v, "size") {
+            let size_const = if kind == Kind::Map {
+                NativeId::MapSize
+            } else {
+                NativeId::SetSize
+            };
+            self.gc_protect();
+            let result = self
+                .natives
+                .call_native(self.heap, JsValue::object(obj), &[], size_const)
+                .map_err(|t| JSException::from_throw(self.heap, t));
+            return Some(result);
+        }
+        let constant = if kind == Kind::Map {
+            if self.key_is(key_v, "get") {
+                NativeId::MapGet
+            } else if self.key_is(key_v, "set") {
+                NativeId::MapSet
+            } else if self.key_is(key_v, "has") {
+                NativeId::MapHas
+            } else if self.key_is(key_v, "delete") {
+                NativeId::MapDelete
+            } else {
+                return None;
+            }
+        } else if self.key_is(key_v, "add") {
+            NativeId::SetAdd
+        } else if self.key_is(key_v, "has") {
+            NativeId::SetHas
+        } else if self.key_is(key_v, "delete") {
+            NativeId::SetDelete
+        } else {
+            return None;
+        };
+        Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// Shape-bound lookup with the polymorphic inline cache: probe the IC
+    /// first (only data descriptors with a slot are cached; up to
+    /// `IC_MAX_ENTRIES` shapes per site), then walk the own shape and the
+    /// prototype chain, recording own-shape hits in the IC.
+    pub(crate) fn ic_lookup(
+        &mut self,
+        site_fn: u32,
+        site_pc: u32,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let key = self.property_key(key_v)?;
+        let shape = self.shape_of(obj);
+
+        let cached_slot = self
+            .feedback
+            .get(&site_fn)
+            .and_then(|fv| fv.ics.get(&site_pc))
+            .and_then(|ic| ic.get(shape));
+        if let Some(slot) = cached_slot
+            && let Some(v) = self
+                .heap
+                .get(obj)
+                .properties
+                .get(self.global_slot_index(obj, slot as usize))
+        {
+            return Ok(*v);
+        }
+
+        // Slow path: own shape first, then the prototype chain.
+        let mut cur = Some(obj);
+        let mut hit: Option<(Handle<JsObject>, Descriptor)> = None;
+        while let Some(o) = cur {
+            let sh = self.shape_of(o);
+            if let Some(d) = self.heap.lookup_property(sh, key) {
+                hit = Some((o, *d));
+                break;
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        match hit {
+            Some((owner, desc)) => match desc {
+                Descriptor::Data { slot, .. } => {
+                    let value = self.heap.get(owner).properties
+                        [self.global_slot_index(owner, slot as usize)];
+                    if owner == obj {
+                        self.feedback
+                            .entry(site_fn)
+                            .or_default()
+                            .ics
+                            .entry(site_pc)
+                            .or_default()
+                            .record(shape, slot);
+                    }
+                    Ok(value)
+                }
+                Descriptor::Accessor { getter, .. } => {
+                    if let Some(getter) = getter {
+                        // Real callable: invoke the getter with `this` = the
+                        // receiver object.
+                        self.call_accessor(getter, JsValue::object(obj))
+                    } else {
+                        Ok(JsValue::undefined())
+                    }
+                }
+            },
+            None => Ok(JsValue::undefined()),
+        }
+    }
+
+    /// `SetProperty`: overwrite own writable slots, create new own properties
+    /// through shape transitions, shadow writable inherited ones, and route
+    /// canonical indices on arrays through the element store. Blocked writes
+    /// are silently dropped, matching sloppy-mode JS; strict-mode throwing
+    /// awaits error-object plumbing.
+    pub(crate) fn set_property(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+        value: JsValue,
+    ) -> Result<(), JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            if obj_v.is_null() || obj_v.is_undefined() {
+                return Err(JSException(self.error_value(
+                    "TypeError: cannot set properties of null or undefined",
+                )));
+            }
+            // Primitive targets accept and drop writes (no wrapper objects).
+            return Ok(());
+        };
+
+        let kind = self.heap.get(obj).kind;
+        if (kind == Kind::Array || kind == Kind::Arguments)
+            && let Some(idx) = self.array_index_of(key_v)
+        {
+            // Arguments exotic: if mapped, the element mirrors the parameter
+            // slot (v1 keeps the element store authoritative; callers inspect
+            // `heap.get(obj).arguments_mapped` directly).
+            self.array_set_element(obj, idx, value);
+            return Ok(());
+        }
+        // RegExp `lastIndex` write: stores into the internal slot. Per spec
+        // the value is coerced via ToNumber.
+        if kind == Kind::RegExp && self.key_is(key_v, "lastIndex") {
+            let n = ops::to_number(self.heap, value);
+            if n.fract() == 0.0
+                && (-1e15..=1e15).contains(&n)
+                && let Some(smi) = JsValue::from_i32_smi(n as i32)
+            {
+                self.heap.get_mut(obj).properties[RegExpSlot::LastIndex as usize] = smi;
+                return Ok(());
+            }
+            self.heap.get_mut(obj).properties[RegExpSlot::LastIndex as usize] =
+                JsValue::from_f64(n);
+            return Ok(());
+        }
+
+        let key = self.property_key(key_v)?;
+        let shape = self.shape_of(obj);
+        let own = self.heap.get(shape).descriptors.find(key).copied();
+
+        if let Some(d) = own {
+            match d {
+                Descriptor::Data { slot, attrs, .. } => {
+                    if attrs.writable() {
+                        let idx = self.global_slot_index(obj, slot as usize);
+                        self.heap.get_mut(obj).properties[idx] = value;
+                    }
+                    return Ok(());
+                }
+                Descriptor::Accessor { setter, .. } => {
+                    // Accessor with setter: invoke it with `this` = the
+                    // receiver and the assigned value as the argument. Without
+                    // a setter, sloppy sets are silently dropped.
+                    if let Some(setter) = setter {
+                        let args = [value];
+                        self.call_accessor_with(setter, JsValue::object(obj), &args)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // An inherited non-writable data property or accessor without setter
+        // blocks shadowing (ES OrdinarySet).
+        if let Some(d) = self.inherited_descriptor(obj, key) {
+            match d {
+                Descriptor::Data { attrs, .. } if !attrs.writable() => return Ok(()),
+                Descriptor::Accessor { setter, .. } if setter.is_none() => return Ok(()),
+                Descriptor::Accessor {
+                    setter: Some(setter),
+                    ..
+                } => {
+                    // Inherited accessor with setter: invoke it with the
+                    // receiver and the assigned value.
+                    self.call_accessor_with(setter, JsValue::object(obj), &[value])?;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        if self.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
+            return Ok(());
+        }
+
+        // Extend the layout: the transition may allocate, so protect roots
+        // first and publish the new shape before touching storage again.
+        self.gc_protect();
+        let child = self.heap.add_property(shape, key, Attrs::DEFAULT);
+        self.bind_shape(obj, child);
+        if Some(obj) == self.global {
+            // Global storage keeps the intrinsic prefix; slot numbering from
+            // the shared shape chain must not overlap it. The invariant
+            // `properties.len() == GLOBAL_VAR_OFFSET + num_own` restores
+            // itself by appending (and backfilling if an embedder's global
+            // was assembled with fewer slots).
+            let idx = GLOBAL_VAR_OFFSET
+                + usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
+            let len = self.heap.get(obj).properties.len();
+            if len <= idx {
+                self.heap
+                    .get_mut(obj)
+                    .properties
+                    .resize(idx + 1, JsValue::undefined());
+                self.heap.get_mut(obj).property_keys.resize(idx + 1, None);
+            }
+            self.heap.get_mut(obj).properties[idx] = value;
+            self.heap.get_mut(obj).property_keys[idx] = Some(key);
+        } else {
+            self.heap.get_mut(obj).properties.push(value);
+            self.heap.get_mut(obj).property_keys.push(Some(key));
+        }
+        Ok(())
+    }
+
+    /// First descriptor naming `key` along `obj`'s prototype chain.
+    pub(crate) fn inherited_descriptor(&mut self, obj: Handle<JsObject>, key: PropKey) -> Option<Descriptor> {
+        let mut cur = self.heap.get(obj).prototype;
+        while let Some(o) = cur {
+            let sh = self.shape_of(o);
+            if let Some(d) = self.heap.lookup_property(sh, key) {
+                return Some(*d);
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        None
+    }
+
+    /// `in` operator: `key in obj`. Throws TypeError if `obj` is not an
+    /// object; otherwise returns true when `key` (after ToPropertyKey)
+    /// exists anywhere on `obj`'s prototype chain, including array indices.
+    pub(crate) fn op_in(&mut self, key_v: JsValue, obj_v: JsValue) -> Result<bool, JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: right-hand side of 'in' should be an object",
+            )));
+        };
+        // Fast path for array/arguments indices: check element storage before
+        // coercing the key, which may allocate. Holes count as absent.
+        let kind = self.heap.get(obj).kind;
+        if (kind == Kind::Array || kind == Kind::Arguments)
+            && let Some(idx) = self.array_index_of(key_v)
+            && self.heap.get(obj).get_element(idx).is_some()
+        {
+            return Ok(true);
+        }
+        let key = self.property_key(key_v)?;
+        let mut cur = Some(obj);
+        while let Some(o) = cur {
+            let sh = self.shape_of(o);
+            if self.heap.lookup_property(sh, key).is_some() {
+                return Ok(true);
+            }
+            // For arrays, the prototype chain check after the element fast
+            // path already covers named properties; indices are only in the
+            // element store, so no extra work is needed. We still walk in
+            // case a numeric string was installed as a named property.
+            cur = self.heap.get(o).prototype;
+        }
+        // If we fell through from the array fast path with a hole, and the
+        // shape walk found nothing, the property is absent.
+        Ok(false)
+    }
+
+    /// `instanceof` operator. Throws TypeError if `rhs` is not an object
+    /// with an object-typed `prototype` property; returns false if `lhs`
+    /// is not an object; otherwise walks `lhs`'s prototype chain for
+    /// identity against `rhs.prototype`.
+    pub(crate) fn op_instanceof(&mut self, lhs_v: JsValue, rhs_v: JsValue) -> Result<bool, JSException> {
+        let Some(rhs_obj) = rhs_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: right-hand side of 'instanceof' is not an object",
+            )));
+        };
+        // Per ES OrdinaryHasInstance, RHS must be callable.
+        if self.heap.get(rhs_obj).kind != Kind::Function {
+            return Err(JSException(self.error_value(
+                "TypeError: right-hand side of 'instanceof' is not callable",
+            )));
+        }
+        // Fast path for built-in constructors whose prototype has not been
+        // wired via `Heap::add_property` (Realm creates them as empty objects).
+        if let Some(global) = self.global {
+            let props = &self.heap.get(global).properties;
+            if props.len() >= 2 {
+                if let Some(obj_ctor) = props[0].as_object()
+                    && rhs_obj == obj_ctor
+                {
+                    return Ok(lhs_v.as_object().is_some());
+                }
+                if let Some(arr_ctor) = props[1].as_object()
+                    && rhs_obj == arr_ctor
+                {
+                    return Ok(lhs_v
+                        .as_object()
+                        .is_some_and(|h| self.heap.get(h).kind == Kind::Array));
+                }
+            }
+        }
+        let proto_key = self.prototype_key();
+        // Locate `rhs.prototype` along rhs's prototype chain (own or inherited).
+        let mut rhs_proto_val: Option<JsValue> = None;
+        {
+            let mut cur = Some(rhs_obj);
+            while let Some(o) = cur {
+                let sh = self.shape_of(o);
+                if let Some(d) = self.heap.lookup_property(sh, proto_key) {
+                    let val = match *d {
+                        Descriptor::Data { slot, .. } => self.heap.get(o).properties[slot as usize],
+                        Descriptor::Accessor { getter, .. } => {
+                            if let Some(getter) = getter {
+                                self.call_accessor(getter, JsValue::object(o))?
+                            } else {
+                                JsValue::undefined()
+                            }
+                        }
+                    };
+                    rhs_proto_val = Some(val);
+                    break;
+                }
+                cur = self.heap.get(o).prototype;
+            }
+        }
+        // Lazily materialize prototype for functions that never had one
+        // (realm placeholders and any function whose closure was created
+        // before materialization existed). Arrow functions intentionally
+        // have no prototype and must still throw.
+        if rhs_proto_val.is_none() && self.heap.get(rhs_obj).kind == Kind::Function {
+            // Check if this is an arrow-function flag by looking up its bytecode.
+            let is_arrow = self
+                .functions_for_program(self.heap.get(rhs_obj).program_id)
+                .get(
+                    self.heap
+                        .get(rhs_obj)
+                        .callable
+                        .bytecode_index()
+                        .unwrap_or(u32::MAX) as usize,
+                )
+                .map(|f| f.is_arrow)
+                .unwrap_or(false);
+            if !is_arrow {
+                self.materialize_function_prototype(rhs_obj)?;
+                // Re-read after materialization.
+                let sh = self.shape_of(rhs_obj);
+                if let Some(d) = self.heap.lookup_property(sh, proto_key)
+                    && let Some(slot) = d.slot()
+                {
+                    rhs_proto_val = Some(self.heap.get(rhs_obj).properties[slot as usize]);
+                }
+            }
+        }
+        let Some(proto_val) = rhs_proto_val else {
+            return Err(JSException(self.error_value(
+                "TypeError: function has non-object prototype 'prototype' in instanceof check",
+            )));
+        };
+        // Per spec, null prototype is also an error for instanceof (throws).
+        // Non-object primitive also throws the same TypeError.
+        let Some(proto_obj) = proto_val.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: function has non-object prototype 'prototype' in instanceof check",
+            )));
+        };
+        let Some(mut cur) = lhs_v.as_object() else {
+            return Ok(false);
+        };
+        loop {
+            let next = self.heap.get(cur).prototype;
+            match next {
+                None => return Ok(false),
+                Some(p) if p == proto_obj => return Ok(true),
+                Some(p) => cur = p,
+            }
+        }
+    }
+
+    /// `DeleteProperty`: configurable own properties become holes (slot
+    /// numbering survives for siblings), absent ones report success, locked
+    /// ones report failure. Element deletes hole out the slot.
+    pub(crate) fn delete_property(&mut self, obj_v: JsValue, key_v: JsValue) -> Result<bool, JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            if obj_v.is_null() || obj_v.is_undefined() {
+                return Err(JSException(self.error_value(
+                    "TypeError: cannot delete properties of null or undefined",
+                )));
+            }
+            // Primitives have no own properties: nothing to remove.
+            return Ok(true);
+        };
+
+        if (self.heap.get(obj).kind == Kind::Array || self.heap.get(obj).kind == Kind::Arguments)
+            && let Some(idx) = self.array_index_of(key_v)
+        {
+            self.heap.get_mut(obj).delete_element(idx);
+            return Ok(true);
+        }
+
+        let key = self.property_key(key_v)?;
+        let shape = self.shape_of(obj);
+        let Some(d) = self.heap.get(shape).descriptors.find(key).copied() else {
+            return Ok(true); // not an own property: ES says success
+        };
+        if !d.attrs().configurable() {
+            return Ok(false);
+        }
+        match d {
+            Descriptor::Data { slot, .. } => {
+                let idx = self.global_slot_index(obj, slot as usize);
+                self.heap.get_mut(obj).properties[idx] = JsValue::hole();
+            }
+            Descriptor::Accessor { .. } => {
+                // Accessor: no slot to hole; deletion succeeds if configurable.
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn array_element(&self, obj: Handle<JsObject>, idx: u32) -> JsValue {
+        self.heap
+            .get(obj)
+            .get_element(idx)
+            .unwrap_or(JsValue::undefined())
+    }
+
+    /// Stores an element, hole-filling gaps and keeping `length` current.
+    pub(crate) fn array_set_element(&mut self, obj: Handle<JsObject>, idx: u32, value: JsValue) {
+        let len_before = self.heap.get(obj).element_len() as u32;
+        self.heap.get_mut(obj).set_element(idx, value);
+        let len_after = self.heap.get(obj).element_len() as u32;
+        if len_after <= len_before {
+            return;
+        }
+        let len_key = self.length_key();
+        let shape = self.shape_of(obj);
+        let slot = self
+            .heap
+            .lookup_property(shape, len_key)
+            .and_then(|d| d.slot())
+            .map(|s| s as usize);
+        if let Some(slot) = slot {
+            self.heap.get_mut(obj).properties[slot] =
+                ops::box_number(f64::from(len_after));
+        }
+    }
+}
