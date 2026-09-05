@@ -94,6 +94,14 @@ impl Realm {
         let promise_ctor = intrinsics.get("Promise").and_then(|v| v.as_object());
         if let Some(promise_ctor) = promise_ctor {
             heap.get_mut(promise_ctor).prototype = Some(promise_proto);
+            // Shape-bound `prototype` property so `Promise.prototype` reads
+            // (and `instanceof`) work like on the other constructors.
+            crate::builtins::builtin_install_prop(
+                heap,
+                promise_ctor,
+                "prototype",
+                JsValue::object(promise_proto),
+            );
         }
         // The Promise constructor itself: `new Promise(executor)` routes to
         // the stateful native seam (the capability needs the job sink).

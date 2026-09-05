@@ -903,6 +903,18 @@ impl Interp<'_> {
                             self.error_value("SyntaxError: await outside async"),
                         ));
                     };
+                    // Async *functions* park their caller at the async-call
+                    // header (the caller-advance below delivers the return
+                    // promise there). Async *generators* resume through
+                    // `resume_generator` like yield — after `suspend` pops
+                    // the body frame, the frame below is NOT parked at a
+                    // call, so decoding one there corrupts the caller's pc.
+                    let frame_is_async_fn = {
+                        let funcs = self.functions_for_program(frame.program);
+                        funcs
+                            .get(frame.fn_idx as usize)
+                            .is_some_and(|f| f.is_async && !f.is_generator)
+                    };
                     let async_promise = if self.heap.get(r#gen).properties.len() > 4 {
                         self.heap.get(r#gen).properties[4]
                     } else {
@@ -918,6 +930,11 @@ impl Interp<'_> {
                     let _rgen = self.suspend(u16::from(dst), arg, resume_pc)?;
                     self.pending_awaits.push_back((r#gen, payload, is_rejected));
                     self.top_result = None;
+                    if !frame_is_async_fn {
+                        // Generator-body await: behave like SuspendYield —
+                        // the resume machinery picks the frame back up.
+                        return Ok(());
+                    }
                     // Advance caller past its Call header: async call returns Promise if available else undefined (task 7)
                     if let Some(caller) = self.frames.last_mut() {
                         let instrs = &self.functions[caller.fn_idx as usize].instrs;

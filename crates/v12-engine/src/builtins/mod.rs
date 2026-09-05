@@ -43,7 +43,7 @@ pub struct BuiltinTargets {
     pub function_proto: v12_heap::Handle<v12_heap::JsObject>,
 }
 
-fn builtin_install_prop(
+pub(crate) fn builtin_install_prop(
     heap: &mut Heap,
     obj: v12_heap::Handle<v12_heap::JsObject>,
     name: &str,
@@ -412,10 +412,15 @@ fn console_log(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsVa
 }
 
 fn module_import(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    Err(Throw::type_error(
-        heap,
-        "TypeError: dynamic import not supported in this context",
-    ))
+    // Spec shape: `import()` returns a promise. There is no module loader
+    // yet (ModuleMap/resolve/link/evaluate are v1 work-in-progress), so the
+    // promise rejects — `import(x).catch(...)` observes a real rejection
+    // instead of a synchronous throw.
+    let err = Throw::type_error(heap, "dynamic import: no module loader in this context");
+    match err {
+        Throw::Value(v) => Ok(promise::make_rejected_promise(heap, v)),
+        other => Err(other),
+    }
 }
 
 fn intern_type_error(heap: &mut Heap, msg: &str) -> JsValue {

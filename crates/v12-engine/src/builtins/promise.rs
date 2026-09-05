@@ -113,6 +113,13 @@ pub fn promise_reject(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Resul
     )))
 }
 
+/// A pre-rejected promise value for internal seams (`import()` before a
+/// module loader exists). Prototype-less: the interpreter's promise surface
+/// recognizes promises structurally, so `.then`/`.catch` still work.
+pub(crate) fn make_rejected_promise(heap: &mut Heap, reason: JsValue) -> JsValue {
+    JsValue::object(create_promise(heap, None, STATE_REJECTED, reason))
+}
+
 /// `Promise.prototype.then(on_fulfilled, on_rejected)`.
 ///
 /// On a pending promise: appends a reaction record. On a settled promise:

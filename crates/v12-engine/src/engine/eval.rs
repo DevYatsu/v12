@@ -11,7 +11,7 @@ use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue};
 use v12_interp::{Interp, JSException};
 
 use super::{string_value, Engine, RetainedProgram, MAX_SOURCE_LEN};
-use crate::builtins::NativeRegistry;
+use crate::builtins::{promise, NativeRegistry};
 use crate::error::EngineError;
 #[cfg(feature = "jit")]
 use crate::jit_tier;
@@ -254,12 +254,21 @@ impl Engine {
                 id: NativeId,
             ) -> Result<JsValue, Throw> {
                 // The module-import seam is the shared `ModuleImport` native
-                // (discriminant 254): the engine builds an empty namespace.
+                // (discriminant 254). Static imports use the result for
+                // property reads only; dynamic `import()` must return a
+                // promise. A rejected promise satisfies both: reads yield
+                // `undefined` bindings (no linking yet) and `import()`
+                // observes a real rejection.
                 if id == NativeId::ModuleImport {
-                    let h = heap.alloc(JsObject::default());
-                    // Empty namespace object (no properties).
-                    heap.add_root(JsValue::object(h));
-                    return Ok(JsValue::object(h));
+                    let err = Throw::type_error(
+                        heap,
+                        "dynamic import: no module loader in this context",
+                    );
+                    let reason = match err {
+                        Throw::Value(v) => v,
+                        other => return Err(other),
+                    };
+                    return Ok(promise::make_rejected_promise(heap, reason));
                 }
                 self.inner.call_native(heap, this, args, id)
             }

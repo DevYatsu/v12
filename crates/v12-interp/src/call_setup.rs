@@ -311,6 +311,21 @@ impl Interp<'_> {
         if self.is_async_fn_for(target_idx, callee_program) {
             self.gc_protect();
             let promise = self.heap.alloc_pending_promise();
+            // Link the promise's internal prototype to `Promise.prototype`
+            // (the realm stores it on the constructor) so `instanceof
+            // Promise` and `Promise.prototype`-identity checks see async
+            // return promises as real promises.
+            if let Some(g) = self.global {
+                let promise_proto = self.heap
+                    .get(g)
+                    .properties
+                    .get(super::PROMISE_IDX.expect("intrinsic 'Promise' present"))
+                    .and_then(|v| v.as_object())
+                    .and_then(|ctor| self.heap.get(ctor).prototype);
+                if let Some(pp) = promise_proto {
+                    self.heap.get_mut(promise).prototype = Some(pp);
+                }
+            }
             // Capture initial register window for deferred execution
             let funcs = self.functions_for_program(callee_program);
             let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {

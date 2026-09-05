@@ -164,12 +164,26 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     // Strip frontmatter early — needed for harness decision.
     let test_body = strip_frontmatter(&source);
 
+    // Async verdict needed when the test carries the `async` flag or calls
+    // `$DONE` directly (older style). Raw tests get neither harness nor
+    // verdict — `$DONE` cannot exist there.
+    let needs_async_verdict =
+        !frontmatter.has_flag("raw") && (frontmatter.has_flag("async") || source.contains("$DONE("));
+
     // Harness preamble.
     let (harness_source, harness_errors) = if frontmatter.has_flag("raw") {
         (String::new(), Vec::new())
     } else {
         // Determine which harness files to load.
         let mut includes_to_load = frontmatter.includes.clone();
+
+        // Async tests get doneprintHandle.js injected (official runner
+        // semantics): it defines `$DONE`, which prints the
+        // `Test262:AsyncTestComplete` / `Test262:AsyncTestFailure:` markers
+        // the async verdict path reads back.
+        if needs_async_verdict && !includes_to_load.iter().any(|n| n == "doneprintHandle.js") {
+            includes_to_load.push("doneprintHandle.js".to_string());
+        }
 
         // sta.js and assert.js are implicitly included in every non-raw test
         // (official test262 runner semantics): `Test262Error` lives in sta.js,
@@ -297,9 +311,19 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
         };
         let _ = engine.run_jobs();
         engine.set_deadline(None);
+        // The captured async markers only matter when an async verdict is
+        // pending; reading them back is one tiny eval on the same engine.
+        let prints = if needs_async_verdict {
+            engine
+                .eval("globalThis.__test262Prints.join('\\n')")
+                .map(|v| engine.to_display_string(v))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         match res {
-            Ok(v) => Ok(engine.to_display_string(v)),
-            Err(thrown) => Err(engine.to_display_string(thrown)),
+            Ok(v) => Ok((engine.to_display_string(v), prints)),
+            Err(thrown) => Err((engine.to_display_string(thrown), prints)),
         }
     }));
 
@@ -320,10 +344,14 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     }
 
     match exec_result {
-        Ok(Ok(_ok_value)) => {
-            handle_positive_or_negative_ok(&frontmatter, file_path, relative, suite, duration_ms)
+        Ok(Ok((_ok_value, prints))) => {
+            if needs_async_verdict {
+                handle_async_ok(&prints, &frontmatter, file_path, relative, suite, duration_ms)
+            } else {
+                handle_positive_or_negative_ok(&frontmatter, file_path, relative, suite, duration_ms)
+            }
         }
-        Ok(Err(thrown_str)) => {
+        Ok(Err((thrown_str, _prints))) => {
             // A cooperative deadline miss reads back as a thrown error inside
             // the engine; classify it as a timeout rather than running it
             // through negative-expectation matching.
@@ -367,6 +395,47 @@ fn is_deadline_error(thrown_str: &str) -> bool {
     thrown_str.contains("execution deadline exceeded")
 }
 
+/// Async verdict: the test's top-level eval succeeded; the verdict comes from
+/// the `$DONE` markers doneprintHandle.js printed into `__test262Prints`.
+///
+/// - `Test262:AsyncTestComplete` → normal positive/negative handling (a
+///   negative test that completes successfully is a failure, as it should be).
+/// - `Test262:AsyncTestFailure:<name>: <msg>` → the async failure string is
+///   run through `handle_thrown`, so negative runtime expectations match.
+/// - Neither marker → the microtask queue drained without `$DONE` being
+///   called; that is a failure (with the negative note if one is expected).
+fn handle_async_ok(
+    prints: &str,
+    fm: &Frontmatter,
+    path: &Path,
+    relative: String,
+    suite: String,
+    duration_ms: u128,
+) -> TestOutcome {
+    if prints.contains("Test262:AsyncTestComplete") {
+        return handle_positive_or_negative_ok(fm, path, relative, suite, duration_ms);
+    }
+    if let Some(rest) = prints.split_once("Test262:AsyncTestFailure:") {
+        let failure_text = rest.1.trim();
+        let thrown = if failure_text.is_empty() {
+            "Test262Error: async test failed".to_string()
+        } else {
+            format!("Test262Error: {failure_text}")
+        };
+        return handle_thrown(fm, thrown, path, relative, suite, duration_ms);
+    }
+    TestOutcome {
+        path: path.to_path_buf(),
+        relative,
+        suite,
+        status: Status::Fail,
+        message: "async test did not complete ($DONE not called)".to_string(),
+        skip_reason: None,
+        duration_ms,
+        frontmatter: fm.clone(),
+    }
+}
+
 /// Returns `Some(reason)` if the test should be skipped before execution.
 fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     // Module tests are now wired for `language` (and generally via eval_module);
@@ -381,16 +450,11 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     if source.contains("agent.") || source.contains("$262.agent") {
         return Some("requires $262.agent (worker/Atomics harness)".to_string());
     }
-    // Async tests that call $DONE without the async flag (older style) —
-    // the async verdict path is not implemented yet (Promise reaction jobs
-    // are not scheduled by run_jobs), so keep the honest skip.
-    if source.contains("$DONE(") {
-        return Some("async harness not yet implemented ($DONE)".to_string());
-    }
-    // Other `$262` uses (`$262.global`, `detachArrayBuffer`, `gc`,
-    // `getReport`) now run via the TEST262_HOST_SHIM preamble. The `async`
-    // flag is handled at the verdict, not as a skip — once the async verdict
-    // lands.
+    // Async tests are no longer skipped: doneprintHandle.js is injected and
+    // the verdict is read from the `Test262:AsyncTest*` print markers (see
+    // `handle_async_ok`). Other `$262` uses (`$262.global`,
+    // `detachArrayBuffer`, `gc`, `getReport`) run via the TEST262_HOST_SHIM
+    // preamble.
     let _ = &fm;
     None
 }
@@ -852,12 +916,9 @@ mod tests {
         assert_eq!(suite_for("annexB/a.js"), "annexB");
     }
 
-    // GATE (plan Task 6 Step 3): FAILS — `Promise.resolve()` throws at eval,
-    // so Promise reaction jobs are not scheduled through `run_jobs()`.
-    // Kept `#[ignore]`d as recorded evidence; re-enable when the engine
-    // resolves thenables via the job queue, then narrow the async skip.
+    // GATE (async verdict path): Promise.resolve().then(...) runs via
+    // run_jobs() and the captured print surfaces the completion marker.
     #[test]
-    #[ignore = "Promise reaction jobs not wired: Promise.resolve().then(...) never runs (engine gap, see known-failures.md)"]
     fn async_doneprint_test_completes_via_captured_print() {
         // Arrange: a tiny async-shaped source; the real doneprintHandle.js
         // semantics are `$DONE()` → prints Test262:AsyncTestComplete.
