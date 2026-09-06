@@ -304,6 +304,20 @@ impl<'a> Ctx<'a> {
         // keeps the shape-bound suffix aligned.
         self.heap.get_mut(obj).properties.push(value);
         self.heap.get_mut(obj).property_keys.push(Some(key));
+        // Enforcement (plan §3.4): the fresh descriptor is present with the
+        // declared attrs. (Slot-vs-storage-index lockstep holds only on fresh
+        // objects; the global intrinsic prefix breaks it, so no index assert.)
+        let bound = self.heap.shape_of(obj);
+        let desc = self
+            .heap
+            .lookup_property(bound, key)
+            .copied()
+            .expect("freshly installed key must resolve");
+        debug_assert_eq!(
+            desc.attrs(),
+            attrs,
+            "installed attrs for `{name}` must match declaration"
+        );
     }
 
 #[allow(dead_code)]
@@ -358,6 +372,9 @@ impl<'a> Ctx<'a> {
                 Some(len),
                 "installed length must match declared arity"
             );
+            // Enforcement (plan §3.4): `length` own-prop present with spec
+            // attrs and the declared value.
+            self.assert_own_data_value(func, "length", len_v);
         }
         // name: { writable: false, enumerable: false, configurable: true }
         let name_h = self.heap.intern_text(name);
@@ -367,7 +384,39 @@ impl<'a> Ctx<'a> {
             JsValue::string(name_h),
             v12_heap::Attrs::new(false, false, true),
         );
+        // Enforcement (plan §3.4): `name` own-prop present with spec attrs
+        // and the installed value.
+        self.assert_own_data_value(func, "name", JsValue::string(name_h));
         self.define_data_prop(target, name, JsValue::object(func));
+    }
+
+    /// Debug-only check (plan §3.4): `obj` has an own data descriptor for
+    /// `name` whose stored value is `expected`. Fresh builtin function objects
+    /// are storage-lockstep (one push per descriptor), so the descriptor slot
+    /// indexes `properties` directly.
+    fn assert_own_data_value(
+        &mut self,
+        obj: Handle<JsObject>,
+        name: &str,
+        expected: JsValue,
+    ) {
+        use v12_heap::{PropKey, V12Str};
+        let probe = if name.is_ascii() {
+            self.heap.intern_string(V12Str::latin1_slice(name.as_bytes()))
+        } else {
+            self.heap
+                .intern_string(V12Str::utf16(name.encode_utf16().collect()))
+        };
+        let shape = self.heap.shape_of(obj);
+        let slot = match self.heap.lookup_property(shape, PropKey::from_string(probe)) {
+            Some(v12_heap::Descriptor::Data { slot, .. }) => *slot as usize,
+            other => panic!("expected own data prop `{name}`, found {other:?}"),
+        };
+        debug_assert_eq!(
+            self.heap.get(obj).properties.get(slot),
+            Some(&expected),
+            "installed `{name}` value must match declaration"
+        );
     }
 
     /// Constructor/prototype linkage for an already-materialized pair
@@ -408,12 +457,40 @@ impl<'a> Ctx<'a> {
             self.define_data_prop(proto, "constructor", JsValue::object(ctor));
         }
         debug_assert_eq!(self.heap.get(ctor).prototype, Some(proto));
+        // Enforcement (plan §3.4): `ctor.prototype` is spec non-writable,
+        // non-configurable; the `constructor` back-link is `BUILTIN`.
+        let ctor_shape = self.heap.shape_of(ctor);
+        let proto_key =
+            PropKey::from_string(self.heap.intern_string(V12Str::latin1_slice(b"prototype")));
+        let proto_desc = self
+            .heap
+            .lookup_property(ctor_shape, proto_key)
+            .copied()
+            .expect("ctor must carry an own `prototype` prop");
+        debug_assert_eq!(
+            proto_desc.attrs(),
+            v12_heap::Attrs::new(false, false, false),
+            "ctor `prototype` must be non-writable, non-configurable"
+        );
+        let back_shape = self.heap.shape_of(proto);
+        let back_key =
+            PropKey::from_string(self.heap.intern_string(V12Str::latin1_slice(b"constructor")));
+        let back_desc = self
+            .heap
+            .lookup_property(back_shape, back_key)
+            .copied()
+            .expect("prototype must carry an own `constructor` back-link");
+        debug_assert_eq!(
+            back_desc.attrs(),
+            v12_heap::Attrs::BUILTIN,
+            "`constructor` back-link must use BUILTIN attrs"
+        );
     }
 
     /// Realm helper for per-call rest-array identity (plan §5 step 4): today
     /// this only resolves the `Array` constructor value via the
-    /// `GLOBAL_INTRINSICS` slot reader, so call sites stop hardcoding
-    /// `properties.get(1)`. Full move-to-construction-time is deferred (see
+    /// `GLOBAL_INTRINSICS` slot reader, so call sites stop hardcoding the
+    /// raw slot-1 index read. Full move-to-construction-time is deferred (see
     /// `alloc_rest_array`): the own `constructor` install needs shape
     /// machinery owned by the interpreter.
     pub fn array_ctor_value(&self) -> Option<JsValue> {

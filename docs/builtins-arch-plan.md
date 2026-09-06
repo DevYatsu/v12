@@ -117,3 +117,37 @@ Shape descriptors are authoritative. The parallel `property_keys` vec is a mirro
 - Ctx today: NO `Ctx` struct — builtins take `(&mut Heap, this:JsValue, args:&[JsValue])`; stateful extras ad-hoc (promise `&pending` Rc, regexp/string `&regex_cache`); `JobCtx` only for microtasks, never builtins.
 - Props: `builtin_install_prop` (shape + `Attrs::BUILTIN`) / `install_native` (alloc fn + install) / `install_value` (dispatch-once constants); realm `wire_callable`/`wire_prototype`; interp `install_function_length` / `wire_rest_array_identity` / string length branch.
 - Sloppiness top 5: (a) dual install paths (descriptor-less intrinsic prefix vs shape-bound props + offset bias); (b) dead/placeholder installs (`ErrorProto`/`RegExp`/`Map`/`Set` → `None`, `u32::MAX` placeholders, ad-hoc `Function`); (c) stringly/key_is probe chains + hardcoded slot indexes (`properties[0/1/2/4]`, Promise `props[10]`); (d) callback split-brain (engine `callback_stub` unreachable + interp seam, `NativeHandler` lacks re-entry); (e) saturating/direct-heap hacks (arity clamps, direct `properties[]` I/O bypassing shapes, liberal `add_root`).
+
+## 8. Deferred / follow-ups (recorded in Phase 6, 2026-09-06)
+
+Enforcement (§5 step 6) is in place: `debug_assert` coverage for `length` +
+`name` + `prototype` on every installed builtin (`ctx.rs` install family +
+`realm.rs` push-order check), frozen idioms capped in
+`scripts/freeze-allowlist.txt`. The items below were explicitly deferred —
+no behavior change was made for them in this pass:
+
+- `wire_rest_array_identity` deletion (`crates/v12-interp/src/lib.rs:797`,
+  called from `call.rs:94`). Per-call rest-array identity wiring survives;
+  `Ctx::array_ctor_value` only centralizes the slot read. Full
+  move-to-construction-time needs interpreter-owned shape machinery.
+- Stub deletion (`eval_stub` / `function_stub` / `console_log`,
+  `builtins/mod.rs`). Kept as the `NativeRegistry::call_native` fallback for
+  direct registry callers; deleting the bare entries would turn those calls
+  into "not registered" throws. Revisit once direct callers are audited.
+- Regexp-cache carrier + 4 string methods (`registry.rs:32,162-168`:
+  `RegExpExec/Test/Compile`, `StringMatch/Replace/Search/Split` take
+  `&regex_cache` outside the `Ctx` seam). The cache must become a `Ctx`
+  capability or a rooted carrier before these bodies can migrate to
+  `BuiltinFn`.
+- Length-arity audit. `builtin_length` (`mod.rs:70-73`) returns `None` for
+  every id — no `define_builtins!` entry declares `(len)` yet, so no `length`
+  prop is installed anywhere. Auditing each builtin's ES arity and adding
+  `(len)` entries is a separate pass.
+- Real error objects (§4.2). `ctx.type_error/range_error/syntax_error/`
+  `reference_error` still route through `Throw::type_error` (plain strings);
+  the `json` plain-string-throw bucket (`(JsValue::string(handle)).into()` in
+  `mod.rs` stubs, `string.rs:248,264` paths) is grandfathered until `Ctx`
+  constructs real `Kind::Error` objects.
+- `call_accessor_with` reroute (`call_setup.rs:269`). Still a standalone
+  native path; funneling it through the single `dispatch_native` router is
+  deferred to the step-5 follow-up.

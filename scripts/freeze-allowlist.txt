@@ -11,9 +11,9 @@
 # Generated from the tree on 2026-09-06. Do not append without a plan reference.
 
 # --- PK_PUSH: direct `property_keys.push` (target: only the Ctx install family, §3) ---
-PK_PUSH crates/v12-engine/src/builtins/mod.rs:71 # builtin_install_prop — the canonical install path; collapses into ctx.define_data_prop in step 4
-PK_PUSH crates/v12-engine/src/builtins/object.rs:581 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
-PK_PUSH crates/v12-engine/src/builtins/json.rs:231 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
+PK_PUSH crates/v12-engine/src/builtins/ctx.rs:306 # Ctx install family (define_data_prop_with_attrs) — the canonical path; everything else funnels here
+PK_PUSH crates/v12-engine/src/builtins/object.rs:583 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
+PK_PUSH crates/v12-engine/src/builtins/json.rs:235 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
 PK_PUSH crates/v12-interp/src/property.rs:777 # generic set-property fallback; stays until the install family owns all writes (step 4)
 
 # --- PROP_GET1: hardcoded `properties.get(1)` slot reads (target: Ctx realm/intrinsic reader, §1.1) ---

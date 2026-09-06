@@ -86,6 +86,18 @@ impl Realm {
                 .expect("intrinsic must have been inserted");
             heap.get_mut(global).properties.push(value);
         }
+        // Enforcement (plan §3.4): global `properties[0..INTRINSIC_COUNT]`
+        // order == `GLOBAL_INTRINSICS` order (the `GLOBAL_VAR_OFFSET`
+        // slot contract). Complements the interpreter-side
+        // `intrinsic_slot_guard`.
+        for (i, &name) in INTRINSIC_NAMES.iter().enumerate() {
+            debug_assert_eq!(
+                heap.get(global).properties.get(i).copied(),
+                intrinsics.get(name).copied(),
+                "intrinsic push order must match GLOBAL_INTRINSICS"
+            );
+        }
+        debug_assert_eq!(heap.get(global).properties.len(), INTRINSIC_COUNT);
 
         // Minimal Promise wiring: the Promise constructor's `prototype` link
         // hosts `Promise.prototype` (an ordinary object). Promise instances
