@@ -143,13 +143,13 @@ mod internal_methods_tests {
 mod builtin_tests {
     use v12_heap::{GcPolicy, Heap, JsObject, JsValue, V12Str};
 
-    use crate::builtins::{array, object, string};
+    use crate::builtins::{array, ctx, object, string};
     use crate::engine::Engine;
 
     #[test]
     fn object_create_with_null_prototype() {
         let mut heap = Heap::new(GcPolicy::NoGC);
-        let obj = object::object_create(&mut heap, JsValue::undefined(), &[JsValue::null()])
+        let obj = ctx::call_ctx(object::object_create, &mut heap, JsValue::undefined(), &[JsValue::null()])
             .expect("create");
         let handle = obj.as_object().unwrap();
         assert!(heap.get(handle).prototype.is_none());
