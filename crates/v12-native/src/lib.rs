@@ -27,7 +27,7 @@ pub use convert::DecodeError;
 pub use id::{NativeId, UnknownNativeId};
 pub use methods::lookup_method;
 pub use registry::{EmptyNativeRegistry, NativeRegistry, ProgramTable};
-pub use throw::Throw;
+pub use throw::{Throw, error_object, parse_error_text};
 
 // Re-exported for the macros and downstream users.
 pub use v12_heap::{Heap, JsValue, Kind};

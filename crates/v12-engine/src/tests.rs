@@ -112,7 +112,8 @@ mod internal_methods_tests {
             PropKey::from_string(h)
         };
         let err = dispatch_get(&mut heap, obj, key, JsValue::undefined()).unwrap_err();
-        assert!(err.is_string());
+        assert!(err.is_object());
+        assert_eq!(heap.get(err.as_object().unwrap()).kind, Kind::Error);
         let kind = kind_of(&heap, obj);
         assert_eq!(kind, ObjectKind::Proxy);
         assert!(methods_for(kind).call.is_none());

@@ -1,6 +1,6 @@
 //! The [`Throw`] error type for native handlers.
 
-use v12_heap::{Heap, JsValue, V12Str};
+use v12_heap::{Heap, JsObject, JsValue};
 
 /// A value to throw.
 ///
@@ -8,28 +8,95 @@ use v12_heap::{Heap, JsValue, V12Str};
 /// a value or throw one" instead of two naked `JsValue`s. An `Err(Throw)`
 /// returned by a native is thrown inside JS.
 ///
-/// A `Throw` is either a ready-to-throw [`JsValue`] (built by a handler that
-/// holds the heap) or a not-yet-interned message (produced by the heap-free
-/// std [`TryFrom`] conversions). The dispatch boundary resolves
-/// [`Throw::Message`] into a real string value via [`Throw::into_js`].
+/// A `Throw` is either a ready-to-throw [`JsValue`] (a real `Kind::Error`
+/// object built with the heap) or a not-yet-interned message (produced by
+/// the heap-free std [`TryFrom`] conversions). The dispatch boundary resolves
+/// [`Throw::Message`] into a real error object via [`Throw::into_js`].
 #[derive(Clone, PartialEq, Eq)]
 pub enum Throw {
-    /// A ready-to-throw value (e.g. a `TypeError` string built with the heap).
+    /// A ready-to-throw value (a real `Kind::Error` object).
     Value(JsValue),
-    /// A message not yet interned; the throw boundary turns it into a string.
+    /// A message not yet interned; the throw boundary turns it into a real
+    /// error object via [`Throw::into_js`].
     Message(String),
 }
 
+/// Error kinds recognized in a `"Kind: message"` prefix. Kept in sync with
+/// the realm intrinsics (`Error`, `TypeError`, `RangeError`,
+/// `ReferenceError`, `SyntaxError` in `GLOBAL_INTRINSICS`) plus the
+/// conventional `URIError`/`InternalError` spellings.
+const KNOWN_KINDS: &[&str] = &[
+    "Error",
+    "TypeError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "URIError",
+    "InternalError",
+];
+
+/// Splits a `"Kind: message"` prefix, honoring the embedded kind when it is
+/// a known error kind and falling back to `default_kind` otherwise.
+///
+/// Lets long-standing `"TypeError: …"`-spelled call sites keep their text
+/// while the thrown value becomes a real object: the stored `message` never
+/// duplicates the `name` (display renders `"Name: message"`).
+pub fn parse_error_text<'a>(text: &'a str, default_kind: &'a str) -> (&'a str, &'a str) {
+    if let Some((kind, rest)) = text.split_once(": ")
+        && KNOWN_KINDS.contains(&kind)
+    {
+        return (kind, rest);
+    }
+    (default_kind, text)
+}
+
+/// Builds a real `Kind::Error` object with `properties = [name, message]`
+/// (the layout the display paths read directly). Heap-only: no realm is
+/// available here, so no `constructor` own-prop is wired — realm-backed
+/// callers (e.g. `Ctx`) wire it from the intrinsic slot instead.
+pub fn error_object(heap: &mut Heap, kind: &str, message: &str) -> JsValue {
+    let name_h = heap.intern_text(kind);
+    let msg_h = heap.intern_text(message);
+    let obj = heap.alloc(JsObject::error(name_h, msg_h));
+    heap.add_root(JsValue::object(obj));
+    JsValue::object(obj)
+}
+
 impl Throw {
-    /// Builds a ready-to-throw `TypeError: <msg>` value.
+    /// Builds a ready-to-throw real error object (`name` from the message's
+    /// `"Kind: …"` prefix when known, else `"TypeError"`).
     pub fn type_error(heap: &mut Heap, msg: impl AsRef<str>) -> Self {
-        Throw::Value(intern_error_string(heap, "TypeError", msg.as_ref()))
+        let text = msg.as_ref();
+        let (kind, message) = parse_error_text(text, "TypeError");
+        Throw::Value(error_object(heap, kind, message))
+    }
+
+    /// Builds a ready-to-throw real `RangeError` object.
+    pub fn range_error(heap: &mut Heap, msg: impl AsRef<str>) -> Self {
+        let text = msg.as_ref();
+        let (kind, message) = parse_error_text(text, "RangeError");
+        Throw::Value(error_object(heap, kind, message))
+    }
+
+    /// Builds a ready-to-throw real `SyntaxError` object.
+    pub fn syntax_error(heap: &mut Heap, msg: impl AsRef<str>) -> Self {
+        let text = msg.as_ref();
+        let (kind, message) = parse_error_text(text, "SyntaxError");
+        Throw::Value(error_object(heap, kind, message))
+    }
+
+    /// Builds a ready-to-throw real `ReferenceError` object.
+    pub fn reference_error(heap: &mut Heap, msg: impl AsRef<str>) -> Self {
+        let text = msg.as_ref();
+        let (kind, message) = parse_error_text(text, "ReferenceError");
+        Throw::Value(error_object(heap, kind, message))
     }
 
     /// Builds a not-yet-interned `TypeError: <msg>`.
     ///
     /// For conversions with no heap in hand ([`TryFrom<JsValue>`]); the
-    /// dispatch boundary resolves it via [`Throw::into_js`].
+    /// dispatch boundary resolves it into a real error object via
+    /// [`Throw::into_js`].
     pub fn type_error_msg(msg: impl Into<String>) -> Self {
         Throw::Message(format!("TypeError: {}", msg.into()))
     }
@@ -49,12 +116,15 @@ impl Throw {
         }
     }
 
-    /// Resolves the throw into a concrete `JsValue`, interning any pending
-    /// message against `heap`.
+    /// Resolves the throw into a concrete `JsValue`, building a real error
+    /// object for any pending message against `heap`.
     pub fn into_js(self, heap: &mut Heap) -> JsValue {
         match self {
             Throw::Value(v) => v,
-            Throw::Message(msg) => intern_error_string(heap, "TypeError", &msg),
+            Throw::Message(msg) => {
+                let (kind, message) = parse_error_text(&msg, "TypeError");
+                error_object(heap, kind, message)
+            }
         }
     }
 }
@@ -87,15 +157,4 @@ impl std::fmt::Debug for Throw {
             Throw::Message(m) => f.debug_tuple("Throw::Message").field(m).finish(),
         }
     }
-}
-
-/// Interns `kind: msg` as a heap string value.
-fn intern_error_string(heap: &mut Heap, kind: &str, msg: &str) -> JsValue {
-    let full = format!("{kind}: {msg}");
-    let h = if full.is_ascii() {
-        heap.intern_string(V12Str::latin1(full.as_bytes().to_vec()))
-    } else {
-        heap.intern_string(V12Str::utf16(full.encode_utf16().collect()))
-    };
-    JsValue::string(h)
 }

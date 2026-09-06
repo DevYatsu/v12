@@ -235,13 +235,17 @@ pub(crate) fn to_js_string(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>
         return Ok(heap.intern_text("[object Object]"));
     }
     if v.is_symbol() {
-        return Err(JSException(JsValue::string(heap.intern_text(
+        let (kind, msg) = v12_native::parse_error_text(
             "TypeError: Cannot convert a Symbol value to a string",
-        ))));
+            "TypeError",
+        );
+        return Err(JSException(v12_native::error_object(heap, kind, msg)));
     }
-    Err(JSException(JsValue::string(heap.intern_text(
+    let (kind, msg) = v12_native::parse_error_text(
         "InternalError: BigInt ToString is not supported yet",
-    ))))
+        "TypeError",
+    );
+    Err(JSException(v12_native::error_object(heap, kind, msg)))
 }
 
 /// Comma-joined element text of a real array (`undefined`/`null`/holes

@@ -96,26 +96,44 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    // -- errors (stubs delegating to `Throw` for now) ----------------------
+    // -- errors (real `Kind::Error` objects, plan §4.2) ---------------------
 
-    /// Real `TypeError` object once §4.2 lands; today `Throw::type_error`.
+    /// Real `TypeError` object: own `name`/`message` plus the realm
+    /// `TypeError` `constructor` link when a global is attached.
     pub fn type_error(&mut self, msg: impl AsRef<str>) -> Throw {
-        Throw::type_error(&mut *self.heap, msg)
+        self.make_error("TypeError", msg.as_ref())
     }
 
-    /// Stub: routes through `type_error` until §4.2 wires real error kinds.
+    /// Real `RangeError` object (same shape, `RangeError` intrinsic link).
     pub fn range_error(&mut self, msg: impl AsRef<str>) -> Throw {
-        Throw::type_error(&mut *self.heap, msg)
+        self.make_error("RangeError", msg.as_ref())
     }
 
-    /// Stub: routes through `type_error` until §4.2 wires real error kinds.
+    /// Real `SyntaxError` object (same shape, `SyntaxError` intrinsic link).
     pub fn syntax_error(&mut self, msg: impl AsRef<str>) -> Throw {
-        Throw::type_error(&mut *self.heap, msg)
+        self.make_error("SyntaxError", msg.as_ref())
     }
 
-    /// Stub: routes through `type_error` until §4.2 wires real error kinds.
+    /// Real `ReferenceError` object (same shape, `ReferenceError` link).
     pub fn reference_error(&mut self, msg: impl AsRef<str>) -> Throw {
-        Throw::type_error(&mut *self.heap, msg)
+        self.make_error("ReferenceError", msg.as_ref())
+    }
+
+    /// Shared error-object constructor: a `"Kind: …"` prefix in `text`
+    /// selects a known kind (so long-standing `"RangeError: …"`-spelled
+    /// sites keep their intent); otherwise `default_kind` applies. The
+    /// stored `message` never duplicates the `name`.
+    fn make_error(&mut self, default_kind: &str, text: &str) -> Throw {
+        let (kind, message) =
+            v12_native::parse_error_text(text, default_kind);
+        // Borrow the fields disjointly: the shape-bound builder needs both.
+        let global = self.global;
+        Throw::Value(super::registry::error_object(
+            &mut *self.heap,
+            global,
+            kind,
+            message,
+        ))
     }
 
     // -- conv (canonical implementations; `helpers` shims delegate here) -----
@@ -123,10 +141,7 @@ impl<'a> Ctx<'a> {
     /// Throws `TypeError` on `undefined`/`null`, else returns the value.
     pub fn require_object_coercible(&mut self, v: JsValue) -> Result<JsValue, Throw> {
         if v.is_undefined() || v.is_null() {
-            return Err(Throw::type_error(
-                &mut *self.heap,
-                "TypeError: value is not object-coercible",
-            ));
+            return Err(self.make_error("TypeError", "value is not object-coercible"));
         }
         Ok(v)
     }
@@ -140,18 +155,12 @@ impl<'a> Ctx<'a> {
         kind: Option<v12_heap::Kind>,
     ) -> Result<Handle<JsObject>, Throw> {
         let Some(obj) = v.as_object() else {
-            return Err(Throw::type_error(
-                &mut *self.heap,
-                format!("TypeError: {method} called on non-object"),
-            ));
+            return Err(self.make_error("TypeError", &format!("{method} called on non-object")));
         };
         if let Some(kind) = kind
             && self.heap.get(obj).kind != kind
         {
-            return Err(Throw::type_error(
-                &mut *self.heap,
-                format!("TypeError: {method} called on non-{kind:?}"),
-            ));
+            return Err(self.make_error("TypeError", &format!("{method} called on non-{kind:?}")));
         }
         Ok(obj)
     }

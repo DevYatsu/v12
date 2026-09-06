@@ -571,10 +571,6 @@ fn inherited_descriptor(
 }
 
 fn type_error(heap: &mut Heap, message: &str) -> JsValue {
-    let h = if message.is_ascii() {
-        heap.intern_string(v12_heap::V12Str::latin1(message.as_bytes().to_vec()))
-    } else {
-        heap.intern_string(v12_heap::V12Str::utf16(message.encode_utf16().collect()))
-    };
-    JsValue::string(h)
+    let (kind, msg) = v12_native::parse_error_text(message, "TypeError");
+    v12_native::error_object(heap, kind, msg)
 }

@@ -847,8 +847,3 @@ fn module_import(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<J
         other => Err(other),
     }
 }
-
-fn intern_type_error(heap: &mut Heap, msg: &str) -> JsValue {
-    let h = heap.intern_string(v12_heap::V12Str::latin1(msg.as_bytes().to_vec()));
-    JsValue::string(h)
-}

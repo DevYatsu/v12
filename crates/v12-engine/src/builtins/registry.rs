@@ -6,8 +6,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use v12_heap::{Heap, JsValue};
-use v12_native::{NativeId, Throw};
+use v12_heap::{Handle, Heap, JsObject, JsValue};
+use v12_native::{NativeId, Throw, parse_error_text};
 
 use super::{builtin_dispatch, ctx::Ctx, promise, regexp, string};
 use crate::job_queue::Job;
@@ -268,7 +268,10 @@ impl v12_native::NativeRegistry for NativeRegistry {
             body
         );
         let (program, strings) = v12_bccompiler::compile_source_with_strings(&src)
-            .map_err(|err| Throw::Message(err.message))?;
+            .map_err(|err| {
+                let (kind, message) = parse_error_text(&err.message, "SyntaxError");
+                Throw::Value(error_object(heap, None, kind, message))
+            })?;
         let fn_idx = program
             .functions
             .iter()
@@ -302,18 +305,20 @@ impl v12_native::NativeRegistry for NativeRegistry {
     }
 }
 
-/// Builds a real `SyntaxError` object for an `eval` compile failure.
+/// Builds a real error object of class `kind` carrying `message`.
 ///
+/// Generalization of the former `syntax_error_value` (plan §4.2): the error
+/// carries own `name` + `message` props plus an own `constructor` wired to
+/// the caller's realm intrinsic for `kind` (located by its
+/// `GLOBAL_INTRINSICS` slot). Kinds without a realm slot (`URIError`,
+/// `InternalError`) or calls without a global skip the `constructor` link.
 /// `assert.throws(SyntaxError, ...)` requires `typeof thrown === "object"`
 /// with `thrown.constructor === SyntaxError`; a plain string never
-/// satisfies it. The error carries `name = "SyntaxError"` plus the
-/// compiler message, and an own `constructor` property wired to the
-/// caller's realm `SyntaxError` intrinsic (located by its
-/// `GLOBAL_INTRINSICS` slot). Falls back to a plain string when no
-/// global or intrinsic is available.
-fn syntax_error_value(
+/// satisfies it.
+pub(crate) fn error_object(
     heap: &mut Heap,
-    global: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    global: Option<Handle<JsObject>>,
+    kind: &str,
     message: &str,
 ) -> JsValue {
     // Shape-aligned construction: `JsObject::error` pre-fills two
@@ -322,9 +327,9 @@ fn syntax_error_value(
     // `name`/`message`/`constructor` in order on an empty `Kind::Error`
     // keeps descriptors and storage aligned (and keeps `properties[0..2]`
     // as the name/message strings the display paths read directly).
-    let name_h = heap.intern_text("SyntaxError");
+    let name_h = heap.intern_text(kind);
     let msg_h = heap.intern_text(message);
-    let obj = heap.alloc(v12_heap::JsObject {
+    let obj = heap.alloc(JsObject {
         kind: v12_heap::Kind::Error,
         ..Default::default()
     });
@@ -334,7 +339,7 @@ fn syntax_error_value(
     let ctor = global.and_then(|g| {
         let idx = v12_bytecode::GLOBAL_INTRINSICS
             .iter()
-            .position(|&n| n == "SyntaxError")?;
+            .position(|&n| n == kind)?;
         heap.get(g).properties.get(idx).copied()
     });
     if let Some(ctor) = ctor
@@ -343,4 +348,14 @@ fn syntax_error_value(
         super::builtin_install_prop(heap, obj, "constructor", ctor);
     }
     JsValue::object(obj)
+}
+
+/// Builds a real `SyntaxError` object for an `eval` compile failure.
+fn syntax_error_value(
+    heap: &mut Heap,
+    global: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    message: &str,
+) -> JsValue {
+    let (kind, msg) = parse_error_text(message, "SyntaxError");
+    error_object(heap, global, kind, msg)
 }
