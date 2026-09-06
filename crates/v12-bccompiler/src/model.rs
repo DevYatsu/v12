@@ -212,6 +212,12 @@ pub struct UnitPlan {
     pub param_count: usize,
     /// `true` when the last parameter is a rest parameter.
     pub has_rest: bool,
+    /// `ExpectedArgumentCount`: formal parameters before the rest parameter
+    /// or the first parameter with an initializer (the function's `length`).
+    pub expected_args: usize,
+    /// The body references the unbound `arguments` identifier, so call
+    /// paths must materialize an arguments object for this unit.
+    pub needs_arguments: bool,
     /// Strict mode for this unit (inherited + directive).
     pub is_strict: bool,
     /// The method/constructor body references `super`; its unit must resolve
@@ -240,6 +246,8 @@ impl UnitPlan {
             env_slot_count: 0,
             param_count: 0,
             has_rest: false,
+            expected_args: 0,
+            needs_arguments: false,
             is_strict: false,
             uses_super: false,
             static_method: false,

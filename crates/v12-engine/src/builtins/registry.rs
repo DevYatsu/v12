@@ -164,13 +164,7 @@ impl v12_native::NativeRegistry for NativeRegistry {
     ) -> Result<JsValue, Throw> {
         let (program, strings) =
             v12_bccompiler::compile_source_with_strings(source).map_err(|err| {
-                let msg = err.message;
-                let h = if msg.is_ascii() {
-                    heap.intern_string(v12_heap::V12Str::latin1(msg.into_bytes()))
-                } else {
-                    heap.intern_string(v12_heap::V12Str::utf16(msg.encode_utf16().collect()))
-                };
-                Throw::Value(JsValue::string(h))
+                Throw::Value(syntax_error_value(heap, global, &err.message))
             })?;
         // Register the eval program so its closures can be invoked from the
         // caller's program afterwards. The nested interpreter also installs
@@ -257,4 +251,47 @@ impl v12_native::NativeRegistry for NativeRegistry {
         heap.add_root(JsValue::object(handle));
         Ok(JsValue::object(handle))
     }
+}
+
+/// Builds a real `SyntaxError` object for an `eval` compile failure.
+///
+/// `assert.throws(SyntaxError, ...)` requires `typeof thrown === "object"`
+/// with `thrown.constructor === SyntaxError`; a plain string never
+/// satisfies it. The error carries `name = "SyntaxError"` plus the
+/// compiler message, and an own `constructor` property wired to the
+/// caller's realm `SyntaxError` intrinsic (located by its
+/// `GLOBAL_INTRINSICS` slot). Falls back to a plain string when no
+/// global or intrinsic is available.
+fn syntax_error_value(
+    heap: &mut Heap,
+    global: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    message: &str,
+) -> JsValue {
+    // Shape-aligned construction: `JsObject::error` pre-fills two
+    // descriptor-less slots, so a later shape-bound install would land at
+    // storage index 2 while its descriptor claims slot 0. Installing
+    // `name`/`message`/`constructor` in order on an empty `Kind::Error`
+    // keeps descriptors and storage aligned (and keeps `properties[0..2]`
+    // as the name/message strings the display paths read directly).
+    let name_h = heap.intern_text("SyntaxError");
+    let msg_h = heap.intern_text(message);
+    let obj = heap.alloc(v12_heap::JsObject {
+        kind: v12_heap::Kind::Error,
+        ..Default::default()
+    });
+    heap.add_root(JsValue::object(obj));
+    super::builtin_install_prop(heap, obj, "name", JsValue::string(name_h));
+    super::builtin_install_prop(heap, obj, "message", JsValue::string(msg_h));
+    let ctor = global.and_then(|g| {
+        let idx = v12_bytecode::GLOBAL_INTRINSICS
+            .iter()
+            .position(|&n| n == "SyntaxError")?;
+        heap.get(g).properties.get(idx).copied()
+    });
+    if let Some(ctor) = ctor
+        && ctor.as_object().is_some()
+    {
+        super::builtin_install_prop(heap, obj, "constructor", ctor);
+    }
+    JsValue::object(obj)
 }

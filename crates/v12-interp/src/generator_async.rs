@@ -342,6 +342,7 @@ impl Interp<'_> {
             generator: Some(r#gen),
             yield_dst: None,
             new_target: None,
+            arguments: None,
         });
         self.top_result = None;
         let frames_before = self.frames.len();

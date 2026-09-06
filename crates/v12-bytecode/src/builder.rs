@@ -167,6 +167,8 @@ impl FunctionBuilder {
             fixed_params: 0,
             has_rest: false,
             rest_reg: 0,
+            expected_args: 0,
+            needs_arguments: false,
             is_generator: self.is_generator,
             is_async: self.is_async,
             is_arrow: self.is_arrow,

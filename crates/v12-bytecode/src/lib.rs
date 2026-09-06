@@ -173,6 +173,14 @@ pub struct FunctionBytecode {
     /// u16: rest parameters sit right after the fixed params, which can pass
     /// 255 in functions with many parameters (u16 register addressing).
     pub rest_reg: u16,
+    /// `ExpectedArgumentCount` (ES 14.1.6): the number of formal parameters
+    /// before the rest parameter or the first parameter with an initializer.
+    /// Read as the function's own `length` property at closure creation.
+    /// u16: bounded by the register file like `fixed_params`.
+    pub expected_args: u16,
+    /// The body references the `arguments` object (unbound identifier), so
+    /// call paths materialize it into the frame's arguments slot.
+    pub needs_arguments: bool,
     pub is_generator: bool,
     pub is_async: bool,
     /// Arrow functions lack a `prototype` property (they are not
@@ -197,6 +205,8 @@ impl FunctionBytecode {
             fixed_params: 0,
             has_rest: false,
             rest_reg: 0,
+            expected_args: 0,
+            needs_arguments: false,
             is_generator: false,
             is_async: false,
             is_arrow: false,

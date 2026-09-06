@@ -435,6 +435,7 @@ impl Interp<'_> {
         // Extending the stack never moves existing slots, so the caller-tail
         // arguments stay valid while being copied into r1..
         let arg_src = callee_slot + 2;
+        let passed: Vec<JsValue> = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
         self.stack.resize(window_end, JsValue::undefined());
         self.stack[new_base] = this_v;
         crate::call::fill_stack_call_window(
@@ -447,6 +448,7 @@ impl Interp<'_> {
             callee_fixed,
             callee_rest_reg,
         );
+        let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed);
 
         self.frames.push(Frame {
             fn_idx: target_idx,
@@ -458,6 +460,7 @@ impl Interp<'_> {
             generator: None,
             yield_dst: None,
             new_target: None,
+            arguments: frame_args,
         });
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
@@ -519,10 +522,20 @@ impl Interp<'_> {
                 let window_end = new_base + usize::from(callee_max_regs);
                 self.stack.resize(window_end, JsValue::undefined());
                 self.stack[new_base] = this;
-                let copied = args
-                    .len()
-                    .min(usize::from(callee_max_regs).saturating_sub(1));
-                self.stack[new_base + 1..new_base + 1 + copied].copy_from_slice(&args[..copied]);
+                let (callee_has_rest, callee_fixed, callee_rest_reg) = {
+                    let f = &funcs[fn_idx as usize];
+                    (f.has_rest, f.fixed_params, f.rest_reg)
+                };
+                crate::call::fill_stack_window_from_slice(
+                    self,
+                    new_base,
+                    args,
+                    callee_max_regs,
+                    callee_has_rest,
+                    callee_fixed,
+                    callee_rest_reg,
+                );
+                let frame_args = self.frame_arguments_for(fn_idx, func_program, args);
                 self.frames.push(Frame {
                     fn_idx,
                     program: func_program,
@@ -533,6 +546,7 @@ impl Interp<'_> {
                     generator: None,
                     yield_dst: None,
                     new_target: None,
+                    arguments: frame_args,
                 });
                 self.top_result = None;
                 // Stop the nested execute after the accessor frame completes,
@@ -678,10 +692,20 @@ impl Interp<'_> {
                 let window_end = new_base + usize::from(callee_max_regs);
                 self.stack.resize(window_end, JsValue::undefined());
                 self.stack[new_base] = this;
-                let copied = args
-                    .len()
-                    .min(usize::from(callee_max_regs).saturating_sub(1));
-                self.stack[new_base + 1..new_base + 1 + copied].copy_from_slice(&args[..copied]);
+                let (callee_has_rest, callee_fixed, callee_rest_reg) = {
+                    let f = &funcs[fn_idx as usize];
+                    (f.has_rest, f.fixed_params, f.rest_reg)
+                };
+                crate::call::fill_stack_window_from_slice(
+                    self,
+                    new_base,
+                    args,
+                    callee_max_regs,
+                    callee_has_rest,
+                    callee_fixed,
+                    callee_rest_reg,
+                );
+                let frame_args = self.frame_arguments_for(fn_idx, func_program, args);
                 self.frames.push(Frame {
                     fn_idx,
                     program: func_program,
@@ -692,6 +716,7 @@ impl Interp<'_> {
                     generator: None,
                     yield_dst: None,
                     new_target: None,
+                    arguments: frame_args,
                 });
                 self.top_result = None;
                 // Save/restore the prior boundary so a re-entrant accessor or
@@ -712,6 +737,7 @@ impl Interp<'_> {
     /// completed frame was the top-level script — the run is done.
     pub(crate) fn complete_frame(&mut self, result: JsValue) -> Result<bool, JSException> {
         let finished = self.frames.pop().expect("complete_frame requires a frame");
+        self.drop_frame_arguments(&finished);
         self.notify_tier_ups();
         // A re-entrant accessor call stops the nested execute here: the
         // accessor's frame is done, and the caller's frames must remain
@@ -925,6 +951,7 @@ impl Interp<'_> {
                 .is_some_and(|n| self.frames.len() == n + 1)
             {
                 let popped = self.frames.pop().expect("boundary frame exists");
+                self.drop_frame_arguments(&popped);
                 self.stack.truncate(popped.base);
                 self.notify_tier_ups();
                 return Err(JSException(exc));
@@ -932,6 +959,7 @@ impl Interp<'_> {
             let Some(popped) = self.frames.pop() else {
                 return Err(JSException(exc));
             };
+            self.drop_frame_arguments(&popped);
             self.stack.truncate(popped.base);
             self.notify_tier_ups();
             if self.frames.is_empty() {
@@ -1111,10 +1139,8 @@ impl Interp<'_> {
                 Vec::new()
             };
             self.gc_protect();
-            let shape = self.array_shape();
-            let h = self.heap.alloc(JsObject::array(rest_slice));
-            self.bind_shape(h, shape);
-            self.stack[new_base + rest_reg] = JsValue::object(h);
+            let rest_v = crate::call::alloc_rest_array(self, rest_slice);
+            self.stack[new_base + rest_reg] = rest_v;
             // Ensure any param registers beyond fixed+rest remain undefined (already).
         } else {
             let copied = (argc as usize).min(usize::from(callee_max_regs).saturating_sub(1));
@@ -1122,6 +1148,7 @@ impl Interp<'_> {
                 self.stack[new_base + 1 + i] = if v.is_hole() { JsValue::undefined() } else { v };
             }
         }
+        let frame_args = self.frame_arguments_for(target_idx, callee_program, &elements);
         self.frames.push(Frame {
             fn_idx: target_idx,
             program: callee_program,
@@ -1132,6 +1159,7 @@ impl Interp<'_> {
             generator: None,
             yield_dst: None,
             new_target: None,
+            arguments: frame_args,
         });
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
@@ -1307,6 +1335,7 @@ impl Interp<'_> {
         let window_end = new_base + usize::from(callee_max_regs);
 
         let arg_src = callee_slot + 2;
+        let passed: Vec<JsValue> = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
         self.stack.resize(window_end, JsValue::undefined());
         self.stack[new_base] = instance_v;
         if callee_has_rest {
@@ -1326,11 +1355,9 @@ impl Interp<'_> {
                 Vec::new()
             };
             self.gc_protect();
-            let shape = self.array_shape();
-            let h = self.heap.alloc(JsObject::array(rest_slice));
-            self.bind_shape(h, shape);
+            let rest_v = crate::call::alloc_rest_array(self, rest_slice);
             if rest_reg < usize::from(callee_max_regs) {
-                self.stack[new_base + rest_reg] = JsValue::object(h);
+                self.stack[new_base + rest_reg] = rest_v;
             }
         } else {
             let copied = usize::from(argc).min(usize::from(callee_max_regs).saturating_sub(1));
@@ -1339,6 +1366,7 @@ impl Interp<'_> {
             }
         }
 
+        let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed);
         self.frames.push(Frame {
             fn_idx: target_idx,
             program: callee_program,
@@ -1349,6 +1377,7 @@ impl Interp<'_> {
             generator: None,
             yield_dst: None,
             new_target: Some(callee_v),
+            arguments: frame_args,
         });
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)

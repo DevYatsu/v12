@@ -113,6 +113,15 @@ impl Interp<'_> {
             .get(str_id as usize)
             .map(String::as_str)
             .unwrap_or("");
+        // The `arguments` binding resolves to the current activation's
+        // materialized object, not the global. Falls through when no frame
+        // on the stack carries one (top-level code, functions that never
+        // reference it), preserving ordinary global reads.
+        if text == "arguments"
+            && let Some(v) = self.frame_arguments_value()
+        {
+            return Ok(v);
+        }
         if let Some(v) = self.global_intrinsic_value(global, text) {
             return Ok(v);
         }
@@ -136,6 +145,12 @@ impl Interp<'_> {
         self.gc_protect();
         let strings = self.strings_for_program(program);
         let text = strings.get(str_id as usize).cloned().unwrap_or_default();
+        // Writes to the `arguments` binding land on the current activation
+        // when one carries a materialized object, mirroring the read path.
+        if text == "arguments" && self.frame_arguments_value().is_some() {
+            self.set_frame_arguments(val);
+            return Ok(());
+        }
         if let Some(idx) = intrinsic_slot(&text)
             && idx < self.heap.get(global).properties.len()
         {

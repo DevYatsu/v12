@@ -91,5 +91,42 @@ pub(crate) fn alloc_rest_array(interp: &mut Interp<'_>, elements: Vec<JsValue>) 
     let shape = interp.array_shape();
     let h = interp.heap_mut().alloc(JsObject::array(elements));
     interp.bind_shape(h, shape);
+    interp.wire_rest_array_identity(h);
     JsValue::object(h)
+}
+
+/// Fill the callee stack window at `new_base` from a caller-side arg slice
+/// (for entries whose args are not already on the stack: inline accessor
+/// and iterator calls). Mirrors [`fill_stack_call_window`] including the
+/// rest-parameter tail array.
+pub(crate) fn fill_stack_window_from_slice(
+    interp: &mut Interp<'_>,
+    new_base: usize,
+    args: &[JsValue],
+    callee_max_regs: u16,
+    has_rest: bool,
+    fixed: u16,
+    rest_reg: u16,
+) {
+    let window_len = callee_max_regs as usize;
+    if has_rest {
+        let fixed_usize = fixed as usize;
+        let to_copy = fixed_usize
+            .min(args.len())
+            .min(window_len.saturating_sub(1));
+        interp.stack[new_base + 1..new_base + 1 + to_copy].copy_from_slice(&args[..to_copy]);
+        let slice = if args.len() > fixed_usize {
+            args[fixed_usize..].to_vec()
+        } else {
+            Vec::new()
+        };
+        interp.gc_protect();
+        let arr = alloc_rest_array(interp, slice);
+        if (rest_reg as usize) < window_len {
+            interp.stack[new_base + rest_reg as usize] = arr;
+        }
+    } else {
+        let copied = args.len().min(window_len.saturating_sub(1));
+        interp.stack[new_base + 1..new_base + 1 + copied].copy_from_slice(&args[..copied]);
+    }
 }

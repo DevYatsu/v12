@@ -135,6 +135,16 @@ pub fn compile_unit(
     }
     match node {
         UnitNode::Main(p) => {
+            // Directive prologue (`p.directives`) holds leading string
+            // literals separately from `p.body`; without this they are
+            // dropped and a lone-string eval (`eval("'...'")`) completes
+            // with `undefined` instead of the string. Re-emit each
+            // directive as a string load so completion values survive.
+            for d in &p.directives {
+                let dst = cx.new_temp();
+                cx.load_str(dst, d.expression.value.as_str(), d.span())?;
+                cx.last_expr_reg = Some(dst);
+            }
             cx.stmt_list(&p.body)?;
             // Spec-compliant script completion: the value of the
             // last expression statement is the script's completion. Emit it
@@ -198,6 +208,8 @@ pub fn compile_unit(
     fb.is_strict = strict;
     let plan = &comp.plans.units[idx];
     fb.has_rest = plan.has_rest;
+    fb.expected_args = u16::try_from(plan.expected_args).unwrap_or(u16::MAX);
+    fb.needs_arguments = plan.needs_arguments;
     fb.fixed_params = if plan.has_rest {
         plan.param_count.saturating_sub(1) as u16
     } else {

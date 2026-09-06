@@ -76,7 +76,7 @@ use std::time::Instant;
 use v12_bytecode::{FunctionBytecode, Opcode};
 use v12_bytecode::{GLOBAL_INTRINSICS as GLOBAL_INTRINSIC_NAMES, GLOBAL_VAR_OFFSET};
 use v12_heap::{
-    Attrs, Handle, Heap, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
+    Attrs, Descriptor, Handle, Heap, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
 };
 
 #[cfg(test)]
@@ -330,6 +330,11 @@ struct Frame {
     /// The `new.target` value for this frame's function activation.
     /// `Some` for constructor calls, `None` for regular calls and arrow functions.
     new_target: Option<JsValue>,
+    /// The materialized `arguments` object for this activation (`None` when
+    /// the function never references it). Stored here — rather than in a
+    /// register the compiler did not reserve — and surfaced through the
+    /// `GetGlobal`/`SetGlobal` `arguments` binding.
+    arguments: Option<JsValue>,
 }
 
 pub mod generator;
@@ -630,13 +635,16 @@ impl<'a> Interp<'a> {
     /// Arrow functions are not constructible and have no `prototype`.
     fn alloc_closure(&mut self, fn_idx: u32, env: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let funcs = self.functions_for_program(self.program_id);
-        let is_arrow = funcs
+        let (is_arrow, expected_args) = funcs
             .get(fn_idx as usize)
-            .map(|f| f.is_arrow)
-            .unwrap_or(false);
+            .map(|f| (f.is_arrow, f.expected_args))
+            .unwrap_or((false, 0));
         let mut obj = JsObject::function(v12_heap::FunctionTarget::Bytecode(fn_idx), env);
         obj.program_id = self.program_id;
         let h = self.heap.alloc(obj);
+        // Every closure carries its own `length` (ExpectedArgumentCount), so
+        // `f.length` reads never depend on the property surfaces.
+        self.install_function_length(h, expected_args);
         if !is_arrow {
             // Park the fresh closure on the stack: materialization allocates
             // (prototype object, shape transitions) and the collector can run
@@ -681,6 +689,150 @@ impl<'a> Interp<'a> {
         self.stack.pop();
         self.stack.pop();
         result
+    }
+
+    /// Installs the function's own `length` property from its
+    /// `ExpectedArgumentCount` (stops at the rest parameter or the first
+    /// parameter with an initializer). Stored as an own data property at
+    /// creation so reads never reach the property surfaces.
+    fn install_function_length(&mut self, h: Handle<JsObject>, expected: u16) {
+        let len_v = JsValue::from_i32_smi(i32::from(expected)).expect("param count fits Smi");
+        // Park the closure on the stack: interning `length` and the shape
+        // transition below can allocate and collect before the caller stores
+        // `h` into its register.
+        self.stack.push(JsValue::object(h));
+        self.gc_protect();
+        let key = JsValue::string(self.heap.intern_text("length"));
+        let installed = self.set_property(JsValue::object(h), key, len_v);
+        debug_assert!(installed.is_ok(), "length install on a fresh closure cannot fail");
+        let _ = installed;
+        self.stack.pop();
+    }
+
+    /// Builds an unmapped arguments exotic object over `args` (holes read as
+    /// `undefined`). Functions with a rest parameter — and every other
+    /// function whose `arguments` never aliases parameters here — observe
+    /// this unmapped form, so element writes never touch parameter registers.
+    pub(crate) fn make_arguments_object(&mut self, args: &[JsValue]) -> JsValue {
+        self.gc_protect();
+        let elements: Vec<JsValue> = args
+            .iter()
+            .map(|&v| if v.is_hole() { JsValue::undefined() } else { v })
+            .collect();
+        let len = elements.len();
+        let shape = self.array_shape();
+        let h = self.heap.alloc(JsObject::arguments(
+            smallvec::smallvec![
+                JsValue::from_i32_smi(len as i32).expect("arguments length fits Smi"),
+            ],
+            elements,
+            None,
+        ));
+        self.bind_shape(h, shape);
+        JsValue::object(h)
+    }
+
+    /// Materializes the frame's `arguments` object when the callee's body
+    /// references it. Returns `None` for functions that do not, keeping
+    /// their activations allocation-free. The object is rooted for the
+    /// frame's lifetime; pop paths drop the root via
+    /// [`Self::drop_frame_arguments`].
+    pub(crate) fn frame_arguments_for(
+        &mut self,
+        fn_idx: u32,
+        program: u32,
+        args: &[JsValue],
+    ) -> Option<JsValue> {
+        let needs = self
+            .functions_for_program(program)
+            .get(fn_idx as usize)
+            .is_some_and(|f| f.needs_arguments);
+        if !needs {
+            return None;
+        }
+        let obj = self.make_arguments_object(args);
+        self.heap.add_root(obj);
+        Some(obj)
+    }
+
+    /// Drops the root pinning a popped frame's `arguments` object, if any.
+    /// The object stays alive through ordinary reachability afterwards.
+    pub(crate) fn drop_frame_arguments(&mut self, frame: &Frame) {
+        if let Some(a) = frame.arguments {
+            self.heap.remove_root(a);
+        }
+    }
+
+    /// The visible `arguments` binding for the current activation: the
+    /// nearest frame on the stack with a materialized object. `None` at the
+    /// top level or inside functions that never reference it.
+    pub(crate) fn frame_arguments_value(&self) -> Option<JsValue> {
+        self.frames.iter().rev().find_map(|f| f.arguments)
+    }
+
+    /// Binds `val` as the current activation's `arguments` (the `arguments
+    /// = v` write path). Overwrites the nearest materialized slot;
+    /// otherwise parks it on the top frame so subsequent reads observe it.
+    pub(crate) fn set_frame_arguments(&mut self, val: JsValue) {
+        for fr in self.frames.iter_mut().rev() {
+            if fr.arguments.is_some() {
+                if let Some(old) = fr.arguments {
+                    self.heap.remove_root(old);
+                }
+                self.heap.add_root(val);
+                fr.arguments = Some(val);
+                return;
+            }
+        }
+        if let Some(fr) = self.frames.last_mut() {
+            self.heap.add_root(val);
+            fr.arguments = Some(val);
+        }
+    }
+
+    /// Gives a freshly built rest array its `Array` identity without
+    /// touching the general property surfaces: links `[[Prototype]]` to
+    /// `Array.prototype` when resolvable, and installs an own `constructor`
+    /// pointing at the `Array` constructor so `rest.constructor === Array`.
+    pub(crate) fn wire_rest_array_identity(&mut self, h: Handle<JsObject>) {
+        let Some(global) = self.global else { return };
+        let arr_ctor_v = match self.heap.get(global).properties.get(1).copied() {
+            Some(v) if v.as_object().is_some() => v,
+            _ => return,
+        };
+        let Some(arr_ctor) = arr_ctor_v.as_object() else {
+            return;
+        };
+        let array_proto = {
+            let shape = self.shape_of(arr_ctor);
+            let proto_key = self.prototype_key();
+            match self.heap.lookup_property(shape, proto_key) {
+                Some(Descriptor::Data { slot, .. }) => self
+                    .heap
+                    .get(arr_ctor)
+                    .properties
+                    .get(*slot as usize)
+                    .copied()
+                    .and_then(|v| v.as_object()),
+                _ => None,
+            }
+        };
+        if let Some(p) = array_proto {
+            self.heap.get_mut(h).prototype = Some(p);
+        }
+        // Park the array on the stack: interning `constructor` and the shape
+        // transition below can allocate and collect while `h` is otherwise
+        // unanchored (callers store it only after this returns).
+        self.stack.push(JsValue::object(h));
+        self.gc_protect();
+        let key = JsValue::string(self.heap.intern_text("constructor"));
+        let installed = self.set_property(JsValue::object(h), key, arr_ctor_v);
+        debug_assert!(
+            installed.is_ok(),
+            "constructor install on a fresh rest array cannot fail"
+        );
+        let _ = installed;
+        self.stack.pop();
     }
 
     /// Installs tier-transition hooks invoked between frame completions.
@@ -848,6 +1000,7 @@ impl<'a> Interp<'a> {
             generator: None,
             yield_dst: None,
             new_target: None,
+            arguments: None,
         });
         self.note_entry(self.main);
         self.execute()

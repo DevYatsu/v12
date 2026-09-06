@@ -125,6 +125,25 @@ impl<'s> Collector<'s> {
         rid.and_then(|rid| self.scoping.get_reference(rid).symbol_id())
     }
 
+    /// Marks the nearest non-arrow function unit as needing an `arguments`
+    /// object when `name` is an unbound `arguments` reference. Arrows inherit
+    /// their outer function's `arguments`, mirroring the `this` handling
+    /// above; the main unit has none, so top-level references stay global.
+    fn mark_arguments(&mut self, name: &str, rid: Option<oxc_semantic::ReferenceId>) {
+        if name != "arguments" || self.ref_symbol(rid).is_some() {
+            return;
+        }
+        let mut owner = self.cur_unit();
+        while self.plans.units[owner].is_arrow {
+            owner = self.plans.units[owner]
+                .parent
+                .expect("arrow below main unit");
+        }
+        if owner != 0 {
+            self.plans.units[owner].needs_arguments = true;
+        }
+    }
+
     /// Registers a non-arrow function unit and walks params + body inside it.
     ///
     /// `declare_name_here` is `Some(())` for declarations (name binds in the
@@ -172,6 +191,7 @@ impl<'s> Collector<'s> {
         let param_count = self.plans.units[idx].decl_order.len();
         self.plans.units[idx].param_count = param_count;
         self.plans.units[idx].has_rest = f.params.rest.is_some();
+        self.plans.units[idx].expected_args = expected_args(&f.params.items);
 
         // Named function *expressions* bind their own name inside themselves,
         // after the params (it is an ordinary local of the body).
@@ -217,6 +237,7 @@ impl<'s> Collector<'s> {
         let param_count = self.plans.units[idx].decl_order.len();
         self.plans.units[idx].param_count = param_count;
         self.plans.units[idx].has_rest = a.params.rest.is_some();
+        self.plans.units[idx].expected_args = expected_args(&a.params.items);
         match a.get_function_body() {
             Some(body) => self.stmt_list(&body.statements),
             None => {
@@ -307,6 +328,7 @@ impl<'s> Collector<'s> {
                         if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
                             self.note_ref(sym);
                         }
+                        self.mark_arguments(id.name.as_str(), id.reference_id.get());
                     }
                     _ => {}
                 }
@@ -332,6 +354,7 @@ impl<'s> Collector<'s> {
                         if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
                             self.note_ref(sym);
                         }
+                        self.mark_arguments(id.name.as_str(), id.reference_id.get());
                     }
                     _ => {}
                 }
@@ -441,6 +464,7 @@ impl<'s> Collector<'s> {
             let param_count = self.plans.units[idx].decl_order.len();
             self.plans.units[idx].param_count = param_count;
             self.plans.units[idx].has_rest = m.value.params.rest.is_some();
+            self.plans.units[idx].expected_args = expected_args(&m.value.params.items);
             if let Some(body) = m.value.body.as_deref() {
                 self.stmt_list(&body.statements);
             }
@@ -492,6 +516,7 @@ impl<'s> Collector<'s> {
                 let param_count = self.plans.units[midx].decl_order.len();
                 self.plans.units[midx].param_count = param_count;
                 self.plans.units[midx].has_rest = m.value.params.rest.is_some();
+                self.plans.units[midx].expected_args = expected_args(&m.value.params.items);
                 if let Some(body) = m.value.body.as_deref() {
                     self.stmt_list(&body.statements);
                 }
@@ -830,6 +855,7 @@ impl<'s> Collector<'s> {
                 if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
                     self.note_ref(sym);
                 }
+                self.mark_arguments(id.name.as_str(), id.reference_id.get());
             }
             Expression::ThisExpression(_) => {
                 // Arrows observe the nearest non-arrow unit's `this`; that
@@ -1002,6 +1028,10 @@ impl<'s> Collector<'s> {
                             if let Some(sym) = self.ref_symbol(id.binding.reference_id.get()) {
                                 self.note_ref(sym);
                             }
+                            self.mark_arguments(
+                                id.binding.name.as_str(),
+                                id.binding.reference_id.get(),
+                            );
                             if let Some(init) = &id.init {
                                 self.expr(init);
                             }
@@ -1027,6 +1057,7 @@ impl<'s> Collector<'s> {
                 if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
                     self.note_ref(sym);
                 }
+                self.mark_arguments(id.name.as_str(), id.reference_id.get());
             }
             SimpleAssignmentTarget::ComputedMemberExpression(c) => {
                 self.expr(&c.object);
@@ -1071,6 +1102,24 @@ fn binding_symbol(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<SymbolId> {
         oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
         _ => None,
     }
+}
+
+/// `ExpectedArgumentCount` (ES 14.1.6): the number of formal parameters up
+/// to the rest parameter or the first parameter with an initializer. Only a
+/// top-level `AssignmentPattern` (`a = 1`) stops the count; a bare
+/// destructuring pattern without a default does not.
+fn expected_args(items: &[oxc_ast::ast::FormalParameter<'_>]) -> usize {
+    let mut count = 0;
+    for p in items {
+        if matches!(
+            p.pattern,
+            oxc_ast::ast::BindingPattern::AssignmentPattern(_)
+        ) {
+            break;
+        }
+        count += 1;
+    }
+    count
 }
 
 fn ident_name_of_binding(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<String> {
