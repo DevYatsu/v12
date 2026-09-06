@@ -1,9 +1,14 @@
 //! Array built-ins: push, pop, and length handling.
+//!
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): non-callback
+//! bodies take `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them
+//! through `ctx::call_ctx`. Callback-taking methods stay at the interpreter
+//! seam (`Interp::run_callback_builtin`) and are untouched here.
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey, V12Str};
 use v12_native::Throw;
 
-use super::{helpers, intern_type_error};
+use super::{ctx::Ctx, helpers};
 
 /// Maximum array length (2^32 - 1).
 const MAX_ARRAY_LENGTH: u32 = u32::MAX;
@@ -15,12 +20,13 @@ fn length_prop(heap: &mut Heap) -> v12_heap::PropKey {
 }
 
 /// `Array.prototype.push(...items)` – appends elements and updates `length`.
-pub fn array_push(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.push", None)?;
-    let len = array_length(heap, obj);
+pub fn array_push(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.push", None)?;
+    let len = array_length(&mut *ctx.heap, obj);
     if len as usize + args.len() > MAX_ARRAY_LENGTH as usize {
-        return Err((intern_type_error(heap, "RangeError: invalid array length")).into());
+        return Err(ctx.range_error("RangeError: invalid array length"));
     }
+    let heap = &mut *ctx.heap;
     for &item in args {
         heap.get_mut(obj).push_element(item);
     }
@@ -30,8 +36,9 @@ pub fn array_push(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<Js
 }
 
 /// `Array.prototype.pop()` – removes the last element.
-pub fn array_pop(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.pop", None)?;
+pub fn array_pop(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.pop", None)?;
+    let heap = &mut *ctx.heap;
     let popped = heap.get_mut(obj).pop_element().unwrap_or(JsValue::undefined());
     let value = if popped.is_hole() {
         JsValue::undefined()
@@ -74,16 +81,17 @@ fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> u32 {
 }
 
 /// `Array.isArray(value)` – true if value is an Array exotic object.
-pub fn array_is_array(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn array_is_array(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let is = v
         .as_object()
-        .is_some_and(|h| _heap.get(h).kind == v12_heap::Kind::Array);
+        .is_some_and(|h| ctx.heap.get(h).kind == v12_heap::Kind::Array);
     Ok(JsValue::from_bool(is))
 }
 
-pub fn array_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.slice", None)?;
+pub fn array_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.slice", None)?;
+    let heap = &mut *ctx.heap;
     let elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     let len = elems.len() as i64;
     let to_idx = |v: JsValue| -> i64 {
@@ -99,8 +107,9 @@ pub fn array_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<J
     Ok(JsValue::object(arr))
 }
 
-pub fn array_sort(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.sort", None)?;
+pub fn array_sort(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.sort", None)?;
+    let heap = &mut *ctx.heap;
     let mut elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     // Filter holes (undefined) to end per spec simplified: keep order for undefined.
     elems.retain(|v| !v.is_undefined() && !v.is_hole());
@@ -277,8 +286,9 @@ fn new_array(heap: &mut Heap, elements: Vec<JsValue>) -> JsValue {
 
 /// `Array.prototype.indexOf(search, fromIndex?)` – strict-equality scan;
 /// holes are skipped (they never match, even `undefined`).
-pub fn array_index_of(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.indexOf", None)?;
+pub fn array_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.indexOf", None)?;
+    let heap = &mut *ctx.heap;
     let search = args.first().copied().unwrap_or(JsValue::undefined());
     let len = i64::from(array_len(heap, obj));
     // Real arrays scan present entries only: the element store can be far
@@ -317,11 +327,12 @@ pub fn array_index_of(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Resul
 
 /// `Array.prototype.lastIndexOf(search, fromIndex?)` – backwards scan.
 pub fn array_last_index_of(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.lastIndexOf", None)?;
+    let obj = ctx.this_object(this, "Array.prototype.lastIndexOf", None)?;
+    let heap = &mut *ctx.heap;
     let search = args.first().copied().unwrap_or(JsValue::undefined());
     let len = i64::from(array_len(heap, obj));
     // Entry scan like `indexOf`: only present elements can match, so a
@@ -367,8 +378,9 @@ pub fn array_last_index_of(
 
 /// `Array.prototype.includes(search, fromIndex?)` – `SameValueZero` scan
 /// (NaN matches NaN); holes compare as `undefined`.
-pub fn array_includes(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.includes", None)?;
+pub fn array_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.includes", None)?;
+    let heap = &mut *ctx.heap;
     let search = args.first().copied().unwrap_or(JsValue::undefined());
     let len = i64::from(array_len(heap, obj));
     // Entry scan: present elements compare by value; any hole in
@@ -415,7 +427,8 @@ pub fn array_includes(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Resul
 
 /// `Array.prototype.concat(...items)` – array arguments contribute their
 /// elements (holes preserved), everything else is appended as-is.
-pub fn array_concat(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn array_concat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let heap = &mut *ctx.heap;
     let mut out: Vec<JsValue> = Vec::new();
     let this_obj = this.as_object();
     if let Some(obj) = this_obj {
@@ -436,8 +449,9 @@ pub fn array_concat(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<
 }
 
 /// `Array.prototype.at(index)` – relative indexing, out-of-range → undefined.
-pub fn array_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.at", None)?;
+pub fn array_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.at", None)?;
+    let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
     let idx = relative_index(args.first().copied(), len, 0);
     if idx < 0 || idx >= len {
@@ -447,8 +461,9 @@ pub fn array_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsVa
 }
 
 /// `Array.prototype.reverse()` – in place, returns the receiver.
-pub fn array_reverse(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.reverse", None)?;
+pub fn array_reverse(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.reverse", None)?;
+    let heap = &mut *ctx.heap;
     let mut elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     elems.reverse();
     heap.get_mut(obj).replace_elements(elems);
@@ -456,8 +471,9 @@ pub fn array_reverse(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Resul
 }
 
 /// `Array.prototype.shift()` – removes and returns the first element.
-pub fn array_shift(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.shift", None)?;
+pub fn array_shift(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.shift", None)?;
+    let heap = &mut *ctx.heap;
     let len = array_len(heap, obj);
     if len == 0 {
         return Ok(JsValue::undefined());
@@ -475,8 +491,9 @@ pub fn array_shift(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<
 }
 
 /// `Array.prototype.unshift(...items)` – prepends, returns the new length.
-pub fn array_unshift(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.unshift", None)?;
+pub fn array_unshift(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.unshift", None)?;
+    let heap = &mut *ctx.heap;
     let mut elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     elems.splice(0..0, args.iter().copied());
     let len = elems.len();
@@ -489,8 +506,9 @@ pub fn array_unshift(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result
 
 /// `Array.prototype.splice(start, deleteCount?, ...items)` – removes and
 /// inserts, returning the removed elements.
-pub fn array_splice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.splice", None)?;
+pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.splice", None)?;
+    let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
     let start = relative_index(args.first().copied(), len, 0).max(0);
     let delete_count = match args.get(1).copied() {
@@ -525,8 +543,9 @@ pub fn array_splice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<
 const MAX_WRITE_SPAN: i64 = 1_000_000;
 
 /// `Array.prototype.fill(value, start?, end?)`.
-pub fn array_fill(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.fill", None)?;
+pub fn array_fill(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.fill", None)?;
+    let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
     let start = relative_index(args.get(1).copied(), len, 0).max(0);
     let end = relative_index(args.get(2).copied(), len, len).max(0);
@@ -551,11 +570,12 @@ pub fn array_fill(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<Js
 
 /// `Array.prototype.copyWithin(target, start, end?)` – interior memmove.
 pub fn array_copy_within(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.copyWithin", None)?;
+    let obj = ctx.this_object(this, "Array.prototype.copyWithin", None)?;
+    let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
     let target = relative_index(args.first().copied(), len, 0).max(0);
     let start = relative_index(args.get(1).copied(), len, 0).max(0);
@@ -591,13 +611,14 @@ pub fn array_copy_within(
 
 /// `Array.prototype.flat(depth?)` – flattens nested arrays to `depth`
 /// (default 1); holes read as `undefined`.
-pub fn array_flat(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(heap, this, "Array.prototype.flat", None)?;
+pub fn array_flat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "Array.prototype.flat", None)?;
     let depth = match args.first().copied() {
         None => 1.0,
         Some(v) if v.is_undefined() => 1.0,
-        Some(v) => helpers::to_number(heap, v),
+        Some(v) => ctx.to_number(v),
     };
+    let heap = &mut *ctx.heap;
     let mut out: Vec<JsValue> = Vec::new();
     flatten_into(heap, obj, depth, &mut out);
     Ok(new_array(heap, out))
@@ -621,19 +642,20 @@ fn flatten_into(heap: &mut Heap, obj: Handle<JsObject>, depth: f64, out: &mut Ve
 }
 
 /// `Array.prototype.toString()` – `join()` with the default separator.
-pub fn array_to_string(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    super::array_join(heap, this, &[])
+pub fn array_to_string(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    super::array_join(ctx, this, &[])
 }
 
 /// `Array.of(...items)` – a new array from the argument list.
-pub fn array_of(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    Ok(new_array(heap, args.to_vec()))
+pub fn array_of(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    Ok(new_array(&mut *ctx.heap, args.to_vec()))
 }
 
 /// `Array.from(arrayLike)` – array-likes (via `length` + indexed reads) and
 /// strings (per code point). Iterable objects need the interpreter's
 /// iterator protocol and are not supported by this native path.
-pub fn array_from(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let heap = &mut *ctx.heap;
     let Some(&source) = args.first() else {
         return Ok(new_array(heap, Vec::new()));
     };

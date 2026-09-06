@@ -353,30 +353,30 @@ define_builtins! {
         "valueOf" => NumberProtoValueOf => |heap, this, args| call_ctx(number::number_proto_value_of, heap, this, args),
     },
     Array {
-        "isArray" => ArrayIsArray => array::array_is_array,
+        "isArray" => ArrayIsArray => |heap, this, args| call_ctx(array::array_is_array, heap, this, args),
     },
     ArrayProto {
-        "push" => ArrayPush => array::array_push,
-        "pop" => ArrayPop => array::array_pop,
-        "join" => ArrayJoin => array_join,
-        "slice" => ArraySlice => array::array_slice,
-        "sort" => ArraySort => array::array_sort,
+        "push" => ArrayPush => |heap, this, args| call_ctx(array::array_push, heap, this, args),
+        "pop" => ArrayPop => |heap, this, args| call_ctx(array::array_pop, heap, this, args),
+        "join" => ArrayJoin => |heap, this, args| call_ctx(array_join, heap, this, args),
+        "slice" => ArraySlice => |heap, this, args| call_ctx(array::array_slice, heap, this, args),
+        "sort" => ArraySort => |heap, this, args| call_ctx(array::array_sort, heap, this, args),
         "entries" => ArrayIteratorEntries => iterator::array_iterator_entries,
         "keys" => ArrayIteratorKeys => iterator::array_iterator_keys,
         "values" => ArrayIterator => iterator::array_iterator,
-        "indexOf" => ArrayIndexOf => array::array_index_of,
-        "lastIndexOf" => ArrayLastIndexOf => array::array_last_index_of,
-        "includes" => ArrayIncludes => array::array_includes,
-        "concat" => ArrayConcat => array::array_concat,
-        "at" => ArrayAt => array::array_at,
-        "reverse" => ArrayReverse => array::array_reverse,
-        "shift" => ArrayShift => array::array_shift,
-        "unshift" => ArrayUnshift => array::array_unshift,
-        "splice" => ArraySplice => array::array_splice,
-        "fill" => ArrayFill => array::array_fill,
-        "copyWithin" => ArrayCopyWithin => array::array_copy_within,
-        "flat" => ArrayFlat => array::array_flat,
-        "toString" => ArrayToString => array::array_to_string,
+        "indexOf" => ArrayIndexOf => |heap, this, args| call_ctx(array::array_index_of, heap, this, args),
+        "lastIndexOf" => ArrayLastIndexOf => |heap, this, args| call_ctx(array::array_last_index_of, heap, this, args),
+        "includes" => ArrayIncludes => |heap, this, args| call_ctx(array::array_includes, heap, this, args),
+        "concat" => ArrayConcat => |heap, this, args| call_ctx(array::array_concat, heap, this, args),
+        "at" => ArrayAt => |heap, this, args| call_ctx(array::array_at, heap, this, args),
+        "reverse" => ArrayReverse => |heap, this, args| call_ctx(array::array_reverse, heap, this, args),
+        "shift" => ArrayShift => |heap, this, args| call_ctx(array::array_shift, heap, this, args),
+        "unshift" => ArrayUnshift => |heap, this, args| call_ctx(array::array_unshift, heap, this, args),
+        "splice" => ArraySplice => |heap, this, args| call_ctx(array::array_splice, heap, this, args),
+        "fill" => ArrayFill => |heap, this, args| call_ctx(array::array_fill, heap, this, args),
+        "copyWithin" => ArrayCopyWithin => |heap, this, args| call_ctx(array::array_copy_within, heap, this, args),
+        "flat" => ArrayFlat => |heap, this, args| call_ctx(array::array_flat, heap, this, args),
+        "toString" => ArrayToString => |heap, this, args| call_ctx(array::array_to_string, heap, this, args),
         // Callback-taking methods run at the interpreter seam
         // (`Interp::run_callback_builtin`); these stubs are never dispatched
         // from JS but carry the install.
@@ -394,8 +394,8 @@ define_builtins! {
         "flatMap" => ArrayFlatMap => callback_stub,
     },
     Array {
-        "of" => ArrayOf => array::array_of,
-        "from" => ArrayFrom => array::array_from,
+        "of" => ArrayOf => |heap, this, args| call_ctx(array::array_of, heap, this, args),
+        "from" => ArrayFrom => |heap, this, args| call_ctx(array::array_from, heap, this, args),
     },
     Object {
         "assign" => ObjectAssign => |heap, this, args| call_ctx(object::object_assign, heap, this, args),
@@ -554,18 +554,17 @@ fn string_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result
 /// `Array.prototype.join(separator?)`: element display strings joined by
 /// `separator` (default `","`). `undefined`/`null` elements render empty,
 /// matching ES `Array.prototype.join`.
-fn array_join(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+fn array_join(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let Some(arr) = this.as_object() else {
-        return Err(
-            (intern_type_error(heap, "TypeError: Array.prototype.join requires an array")).into(),
-        );
+        return Err(ctx.type_error("TypeError: Array.prototype.join requires an array"));
     };
     let sep = match args.first() {
-        Some(&v) if !v.is_undefined() => helpers::value_text(heap, v),
+        Some(&v) if !v.is_undefined() => ctx.to_string(v),
         _ => ",".to_string(),
     };
     // Snapshot before formatting: the display helpers may allocate (and thus
     // collect), invalidating a live borrow of the element store.
+    let heap = &mut *ctx.heap;
     let elements: Vec<JsValue> = heap.get(arr).elements_snapshot();
     let mut parts = Vec::with_capacity(elements.len());
     for &v in &elements {

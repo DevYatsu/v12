@@ -177,10 +177,10 @@ mod builtin_tests {
         heap.add_root(JsValue::object(arr));
         let one = JsValue::from_i32_smi(1).unwrap();
         let two = JsValue::from_i32_smi(2).unwrap();
-        let len = array::array_push(&mut heap, JsValue::object(arr), &[one, two]).expect("push");
+        let len = ctx::call_ctx(array::array_push, &mut heap, JsValue::object(arr), &[one, two]).expect("push");
         assert_eq!(len.as_smi(), Some(2));
         assert_eq!(heap.get(arr).elements_array.len(), 2);
-        let popped = array::array_pop(&mut heap, JsValue::object(arr), &[]).expect("pop");
+        let popped = ctx::call_ctx(array::array_pop, &mut heap, JsValue::object(arr), &[]).expect("pop");
         assert_eq!(popped.as_smi(), Some(2));
         assert_eq!(heap.get(arr).elements_array.len(), 1);
     }
