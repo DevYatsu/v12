@@ -1,5 +1,9 @@
 //! Symbol built-in.
 //!
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
+//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
+//! `ctx::call_ctx`, so dispatch IDs and install paths are unchanged.
+//!
 //! v1: symbols are fresh heap handles (`V12Symbol` is an opaque unit —
 //! identity is the handle). Descriptions and the `Symbol.for` registry are
 //! not modeled.
@@ -15,36 +19,42 @@
 //! a per-name cache itself — per-name singletons belong to the
 //! install/dispatch layer (`install_value`-style installs), not here.
 
-use v12_heap::{Heap, JsValue};
+use v12_heap::JsValue;
 use v12_native::Throw;
+
+use super::ctx::Ctx;
+
+/// Allocates a fresh rooted symbol (v1: no description, no registry).
+fn fresh_symbol(ctx: &mut Ctx) -> JsValue {
+    let h = ctx.heap.alloc(v12_heap::V12Symbol);
+    let v = JsValue::symbol(h);
+    ctx.add_root(v);
+    v
+}
 
 /// `Symbol(description?)` — returns a fresh symbol. `new Symbol()` throws
 /// (construct path passes the constructor as `this`, a Function object).
 pub fn symbol_construct(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     if let Some(o) = this.as_object()
-        && heap.get(o).kind == v12_heap::Kind::Function
+        && ctx.heap.get(o).kind == v12_heap::Kind::Function
     {
-        return Err(Throw::type_error(heap, "TypeError: Symbol is not a constructor"));
+        return Err(ctx.type_error("TypeError: Symbol is not a constructor"));
     }
-    let h = heap.alloc(v12_heap::V12Symbol);
-    heap.add_root(JsValue::symbol(h));
-    Ok(JsValue::symbol(h))
+    Ok(fresh_symbol(ctx))
 }
 
 /// `Symbol.for(key)` — v1 returns a fresh symbol (no global registry yet).
-pub fn symbol_for(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let h = heap.alloc(v12_heap::V12Symbol);
-    heap.add_root(JsValue::symbol(h));
-    Ok(JsValue::symbol(h))
+pub fn symbol_for(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    Ok(fresh_symbol(ctx))
 }
 
 /// `Symbol.keyFor(sym)` — v1 always `undefined` (no registry).
 pub fn symbol_key_for(
-    _heap: &mut Heap,
+    _ctx: &mut Ctx,
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
@@ -53,45 +63,38 @@ pub fn symbol_key_for(
 
 /// `Symbol.prototype.toString` — `"Symbol()"` (descriptions not modeled).
 pub fn symbol_proto_to_string(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     if this.as_symbol().is_none() {
-        return Err(Throw::type_error(
-            heap,
-            "TypeError: Symbol.prototype.toString requires a Symbol",
-        ));
+        return Err(ctx.type_error("TypeError: Symbol.prototype.toString requires a Symbol"));
     }
-    Ok(JsValue::string(heap.intern_text("Symbol()")))
+    Ok(JsValue::string(ctx.heap.intern_text("Symbol()")))
 }
 
 /// `Symbol.prototype.valueOf` — the symbol itself.
 pub fn symbol_proto_value_of(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     if this.as_symbol().is_none() {
-        return Err(Throw::type_error(
-            heap,
-            "TypeError: Symbol.prototype.valueOf requires a Symbol",
-        ));
+        return Err(ctx.type_error("TypeError: Symbol.prototype.valueOf requires a Symbol"));
     }
     Ok(this)
 }
 
 /// `Symbol.prototype.description` — v1 `undefined` (opaque symbols).
 pub fn symbol_proto_description(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     if this.as_symbol().is_none() {
-        return Err(Throw::type_error(
-            heap,
-            "TypeError: Symbol.prototype.description requires a Symbol",
-        ));
+        return Err(
+            ctx.type_error("TypeError: Symbol.prototype.description requires a Symbol"),
+        );
     }
     Ok(JsValue::undefined())
 }
@@ -103,11 +106,9 @@ pub fn symbol_proto_description(
 /// `===` identity holds at the JS level). Shared by all well-known ids, so
 /// per-name singleton caching must live in the install/dispatch layer.
 pub fn symbol_well_known(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     _this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let h = heap.alloc(v12_heap::V12Symbol);
-    heap.add_root(JsValue::symbol(h));
-    Ok(JsValue::symbol(h))
+    Ok(fresh_symbol(ctx))
 }

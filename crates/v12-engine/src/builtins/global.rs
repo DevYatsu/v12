@@ -1,9 +1,13 @@
 //! Global URI built-ins: `encodeURI`/`decodeURI` and the Component variants.
+//!
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
+//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
+//! `ctx::call_ctx`, so dispatch IDs and install paths are unchanged.
 
-use v12_heap::{Heap, JsValue};
+use v12_heap::JsValue;
 use v12_native::Throw;
 
-use super::helpers;
+use super::ctx::Ctx;
 
 /// Unreserved characters (RFC 2396 §2.3) plus the mark set — never encoded
 /// by `encodeURIComponent`.
@@ -17,7 +21,7 @@ fn is_uri_reserved(b: u8) -> bool {
     matches!(b, b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#')
 }
 
-fn encode(heap: &mut Heap, text: &str, keep_reserved: bool, what: &str) -> Result<JsValue, Throw> {
+fn encode(ctx: &mut Ctx, text: &str, keep_reserved: bool) -> Result<JsValue, Throw> {
     // JS URIs are byte sequences over UTF-8; astral characters split into
     // percent-encoded UTF-8 octets.
     let bytes = text.as_bytes();
@@ -30,11 +34,15 @@ fn encode(heap: &mut Heap, text: &str, keep_reserved: bool, what: &str) -> Resul
             out.push_str(&format!("{b:02X}"));
         }
     }
-    let _ = what;
-    Ok(JsValue::string(heap.intern_text(&out)))
+    Ok(JsValue::string(ctx.heap.intern_text(&out)))
 }
 
-fn decode(heap: &mut Heap, text: &str, component_only: bool, what: &str) -> Result<JsValue, Throw> {
+fn decode(
+    ctx: &mut Ctx,
+    text: &str,
+    component_only: bool,
+    what: &str,
+) -> Result<JsValue, Throw> {
     let bytes = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -56,7 +64,7 @@ fn decode(heap: &mut Heap, text: &str, component_only: bool, what: &str) -> Resu
                 hi.zip(lo).map(|(h, l)| (h * 16 + l) as u8)
             });
         let Some(decoded) = hex else {
-            return Err(Throw::type_error(heap, format!("URIError: {what} malformed percent-encoding")));
+            return Err(ctx.type_error(format!("URIError: {what} malformed percent-encoding")));
         };
         if !component_only {
             // decodeURI must not decode escapes for characters that
@@ -75,34 +83,42 @@ fn decode(heap: &mut Heap, text: &str, component_only: bool, what: &str) -> Resu
         i += 3;
     }
     match String::from_utf8(out) {
-        Ok(text) => Ok(JsValue::string(heap.intern_text(&text))),
-        Err(_) => Err(Throw::type_error(heap, format!("URIError: {what} invalid UTF-8 sequence"))),
+        Ok(text) => Ok(JsValue::string(ctx.heap.intern_text(&text))),
+        Err(_) => Err(ctx.type_error(format!("URIError: {what} invalid UTF-8 sequence"))),
     }
 }
 
-fn arg_string(heap: &mut Heap, args: &[JsValue], what: &str) -> Result<String, Throw> {
+fn arg_string(ctx: &mut Ctx, args: &[JsValue], what: &str) -> Result<String, Throw> {
     match args.first().copied() {
-        Some(v) => Ok(helpers::value_text(heap, v)),
-        None => Err(Throw::type_error(heap, format!("TypeError: {what} requires an argument"))),
+        Some(v) => Ok(ctx.to_string(v)),
+        None => Err(ctx.type_error(format!("TypeError: {what} requires an argument"))),
     }
 }
 
-pub fn global_encode_uri(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = arg_string(heap, args, "encodeURI")?;
-    encode(heap, &text, true, "encodeURI")
+pub fn global_encode_uri(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = arg_string(ctx, args, "encodeURI")?;
+    encode(ctx, &text, true)
 }
 
-pub fn global_encode_uri_component(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = arg_string(heap, args, "encodeURIComponent")?;
-    encode(heap, &text, false, "encodeURIComponent")
+pub fn global_encode_uri_component(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let text = arg_string(ctx, args, "encodeURIComponent")?;
+    encode(ctx, &text, false)
 }
 
-pub fn global_decode_uri(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = arg_string(heap, args, "decodeURI")?;
-    decode(heap, &text, false, "decodeURI")
+pub fn global_decode_uri(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = arg_string(ctx, args, "decodeURI")?;
+    decode(ctx, &text, false, "decodeURI")
 }
 
-pub fn global_decode_uri_component(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = arg_string(heap, args, "decodeURIComponent")?;
-    decode(heap, &text, true, "decodeURIComponent")
+pub fn global_decode_uri_component(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let text = arg_string(ctx, args, "decodeURIComponent")?;
+    decode(ctx, &text, true, "decodeURIComponent")
 }
