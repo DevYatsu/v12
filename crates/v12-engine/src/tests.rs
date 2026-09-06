@@ -230,11 +230,11 @@ mod builtin_tests {
     fn number_and_math_builtins() {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let nan = JsValue::from_f64(f64::NAN);
+        let mut ctx = crate::builtins::Ctx::new(&mut heap, None, None);
         let is_nan =
-            crate::builtins::number::number_is_nan(&mut heap, JsValue::undefined(), &[nan])
+            crate::builtins::number::number_is_nan(&mut ctx, JsValue::undefined(), &[nan])
                 .unwrap();
         assert_eq!(is_nan.as_bool(), Some(true));
-        let mut ctx = crate::builtins::Ctx::new(&mut heap, None, None);
         let abs = crate::builtins::math::math_abs(
             &mut ctx,
             JsValue::undefined(),

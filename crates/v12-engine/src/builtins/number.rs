@@ -1,15 +1,18 @@
 //! Number built-ins.
+//!
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
+//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
+//! `ctx::call_ctx`, so dispatch IDs and install paths are unchanged.
 
-use std::borrow::Cow;
-
-use v12_heap::{Heap, JsValue};
+use v12_heap::JsValue;
 use v12_native::Throw;
 
+use super::ctx::Ctx;
 use super::helpers;
 
 /// `Number.isNaN(value)` – true only for NaN. No coercion: `Number.isNaN("x")`
 /// is `false` (only an actual number value that is NaN answers true).
-pub fn number_is_nan(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn number_is_nan(_ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let is_nan = if let Some(n) = v.as_f64() {
         n.is_nan()
@@ -24,7 +27,7 @@ pub fn number_is_nan(_heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Resu
 /// number that is finite (a Smi, or a finite double). `Number.isFinite("1")`
 /// is `false`.
 pub fn number_is_finite(
-    _heap: &mut Heap,
+    _ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
@@ -41,21 +44,21 @@ pub fn number_is_finite(
 
 /// Global `isNaN(value)` – COERCES via `ToNumber`, then tests for NaN. So
 /// `isNaN("x")` is `true` (the string coerces to NaN).
-pub fn global_is_nan(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn global_is_nan(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
-    let n = helpers::to_number(heap, v);
+    let n = ctx.to_number(v);
     Ok(JsValue::from_bool(n.is_nan()))
 }
 
 /// Global `isFinite(value)` – COERCES via `ToNumber`, then requires a finite
 /// number (NaN and ±Infinity yield `false`).
 pub fn global_is_finite(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
-    let n = helpers::to_number(heap, v);
+    let n = ctx.to_number(v);
     Ok(JsValue::from_bool(n.is_finite()))
 }
 
@@ -79,23 +82,22 @@ fn scan_int_digits(digits: &str, radix: u32, sign: f64) -> f64 {
 
 /// Global `parseInt(string, radix?)` (also `Number.parseInt`).
 pub fn global_parse_int(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    // Resolve the radix before extracting the text: the borrowed text holds
-    // the heap until it is dropped, so the radix coercion must run first
-    // (unobservable here — `to_number` never runs user code).
+    // Owned text via `ctx.to_string`: no heap borrow is held, so the radix
+    // coercion order is unobservable (`to_number` never runs user code).
     let radix_arg = args.get(1).copied();
     let mut radix = match radix_arg {
-        Some(v) => helpers::to_number(heap, v) as i32,
+        Some(v) => ctx.to_number(v) as i32,
         None => 0,
     };
 
     // ToString the first argument; default empty string stays NaN.
     let text = match args.first() {
-        Some(v) => helpers::value_text_cow(heap, *v),
-        None => Cow::Borrowed(""),
+        Some(v) => ctx.to_string(*v),
+        None => String::new(),
     };
     let mut s = text.trim();
 
@@ -130,13 +132,13 @@ pub fn global_parse_int(
 /// Global `parseFloat(string)` (also `Number.parseFloat`). Returns a double
 /// per spec (never a Smi).
 pub fn global_parse_float(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let text = match args.first() {
-        Some(v) => helpers::value_text_cow(heap, *v),
-        None => Cow::Borrowed(""),
+        Some(v) => ctx.to_string(*v),
+        None => String::new(),
     };
     let trimmed = text.trim_start();
 
@@ -190,14 +192,14 @@ pub fn global_parse_float(
 /// `Number()` → 0; `Number(undefined)` → NaN; `Number(null)` → 0;
 /// `Number(true)` → 1; strings are parsed; objects → NaN (subset).
 pub fn number_construct(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let Some(&v) = args.first() else {
         return Ok(helpers::js_number(0.0));
     };
-    let n = helpers::to_number(heap, v);
+    let n = ctx.to_number(v);
     Ok(helpers::js_number(n))
 }
 
@@ -266,48 +268,48 @@ pub fn number_to_string(n: f64) -> String {
 
 /// The `this` receiver as a primitive number (`ToNumber` subset: primitives
 /// pass through, wrapper objects are not modeled).
-fn this_number(heap: &mut Heap, this: JsValue, method: &str) -> Result<f64, Throw> {
+fn this_number(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<f64, Throw> {
     if let Some(n) = this.as_smi().map(f64::from) {
         return Ok(n);
     }
     if let Some(n) = this.as_f64() {
         return Ok(n);
     }
-    Err(Throw::type_error(
-        heap,
-        format!("TypeError: Number.prototype.{method} requires that 'this' be a Number"),
-    ))
+    Err(ctx.type_error(format!(
+        "TypeError: Number.prototype.{method} requires that 'this' be a Number"
+    )))
 }
 
 /// `Number.prototype.toString(radix?)` – shortest form in radix 2-36;
 /// fractional/ irrational values approximate with 14 significant fraction
 /// digits (spec-exact for integral values, which is what tests exercise).
 pub fn number_proto_to_string(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let n = this_number(heap, this, "toString")?;
+    let n = this_number(ctx, this, "toString")?;
     let radix = match args.first().copied() {
         None => 10,
         Some(v) if v.is_undefined() => 10,
         Some(v) => {
-            let r = helpers::to_number(heap, v);
+            let r = ctx.to_number(v);
             if !(2.0..=36.0).contains(&r) || r.fract() != 0.0 {
-                return Err(Throw::type_error(heap, "RangeError: toString() radix must be between 2 and 36"));
+                return Err(ctx.range_error("RangeError: toString() radix must be between 2 and 36"));
             }
             r as u32
         }
     };
     if radix == 10 || n.is_nan() || n.is_infinite() {
-        return Ok(JsValue::string(heap.intern_text(&number_to_string(n))));
+        let text = number_to_string(n);
+        return Ok(JsValue::string(ctx.heap.intern_text(&text)));
     }
     // NaN/Infinity spell the same in every radix.
     if n.is_nan() {
-        return Ok(JsValue::string(heap.intern_text("NaN")));
+        return Ok(JsValue::string(ctx.heap.intern_text("NaN")));
     }
     if n.is_infinite() {
-        return Ok(JsValue::string(heap.intern_text(if n > 0.0 { "Infinity" } else { "-Infinity" })));
+        return Ok(JsValue::string(ctx.heap.intern_text(if n > 0.0 { "Infinity" } else { "-Infinity" })));
     }
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let negative = n < 0.0;
@@ -341,19 +343,19 @@ pub fn number_proto_to_string(
     if negative {
         out.insert(0, '-');
     }
-    Ok(JsValue::string(heap.intern_text(&out)))
+    Ok(JsValue::string(ctx.heap.intern_text(&out)))
 }
 
 /// `Number.prototype.toFixed(digits?)` – fixed-point with 0-100 fraction
 /// digits; |x| ≥ 1e21 falls back to normal `ToString`.
-pub fn number_to_fixed(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = this_number(heap, this, "toFixed")?;
+pub fn number_to_fixed(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = this_number(ctx, this, "toFixed")?;
     let digits = match args.first() {
         None => 0usize,
         Some(&v) => {
-            let d = helpers::to_number(heap, v);
+            let d = ctx.to_number(v);
             if !(0.0..=100.0).contains(&d) {
-                return Err(Throw::type_error(heap, "RangeError: toFixed() digits argument must be between 0 and 100"));
+                return Err(ctx.range_error("RangeError: toFixed() digits argument must be between 0 and 100"));
             }
             d as usize
         }
@@ -367,26 +369,28 @@ pub fn number_to_fixed(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Resu
     } else {
         format!("{:.*}", digits, n)
     };
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
 /// `Number.prototype.toPrecision(precision?)` – `undefined` → `ToString`;
 /// else fixed or exponential with `precision` significant digits.
 pub fn number_to_precision(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let n = this_number(heap, this, "toPrecision")?;
+    let n = this_number(ctx, this, "toPrecision")?;
     let Some(&p_v) = args.first() else {
-        return Ok(JsValue::string(heap.intern_text(&number_to_string(n))));
+        let text = number_to_string(n);
+        return Ok(JsValue::string(ctx.heap.intern_text(&text)));
     };
     if p_v.is_undefined() {
-        return Ok(JsValue::string(heap.intern_text(&number_to_string(n))));
+        let text = number_to_string(n);
+        return Ok(JsValue::string(ctx.heap.intern_text(&text)));
     }
-    let p = helpers::to_number(heap, p_v);
+    let p = ctx.to_number(p_v);
     if !(1.0..=100.0).contains(&p) {
-        return Err(Throw::type_error(heap, "RangeError: toPrecision() argument must be between 1 and 100"));
+        return Err(ctx.range_error("RangeError: toPrecision() argument must be between 1 and 100"));
     }
     let p = p as usize;
     let text = if n.is_nan() {
@@ -410,35 +414,35 @@ pub fn number_to_precision(
             format!("{:.*}", frac, n)
         }
     };
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
 /// `Number.prototype.toExponential(fractionDigits?)` – exponential notation;
 /// `undefined` digit count uses the shortest round-trip form.
 pub fn number_to_exponential(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let n = this_number(heap, this, "toExponential")?;
+    let n = this_number(ctx, this, "toExponential")?;
     if n.is_nan() {
-        return Ok(JsValue::string(heap.intern_text("NaN")));
+        return Ok(JsValue::string(ctx.heap.intern_text("NaN")));
     }
     if n.is_infinite() {
         let text = if n > 0.0 { "Infinity" } else { "-Infinity" };
-        return Ok(JsValue::string(heap.intern_text(text)));
+        return Ok(JsValue::string(ctx.heap.intern_text(text)));
     }
     let text = match args.first() {
         Some(&v) if !v.is_undefined() => {
-            let f = helpers::to_number(heap, v);
+            let f = ctx.to_number(v);
             if !(0.0..=100.0).contains(&f) {
-                return Err(Throw::type_error(heap, "RangeError: toExponential() argument must be between 0 and 100"));
+                return Err(ctx.range_error("RangeError: toExponential() argument must be between 0 and 100"));
             }
             format_scientific(n, Some(f as usize))
         }
         _ => format_scientific(n, None),
     };
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
 /// Renders `n` as JS scientific notation (`1.5e+21`, `1e-7`), with
@@ -458,17 +462,17 @@ fn format_scientific(n: f64, fraction_digits: Option<usize>) -> String {
 /// objects are not modeled). A non-Number receiver throws (no unchecked
 /// `this` passthrough).
 pub fn number_proto_value_of(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    this_number(heap, this, "valueOf")?;
+    this_number(ctx, this, "valueOf")?;
     Ok(this)
 }
 
 /// `Number.isInteger(value)` – no coercion; integral numbers only.
 pub fn number_is_integer(
-    _heap: &mut Heap,
+    _ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
@@ -483,7 +487,7 @@ pub fn number_is_integer(
 
 /// `Number.isSafeInteger(value)` – integral, finite, and within ±(2^53−1).
 pub fn number_is_safe_integer(
-    _heap: &mut Heap,
+    _ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
@@ -500,7 +504,7 @@ macro_rules! number_const {
     ( $( $name:ident => $method:ident => $value:expr ),* $(,)? ) => {
         $(
             #[doc = concat!("`Number.", stringify!($method), "` – the constant, installed as a data property via `install_value`.")]
-            pub fn $name(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+            pub fn $name(_ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
                 Ok($value)
             }
         )*

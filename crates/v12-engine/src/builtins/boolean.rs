@@ -1,21 +1,26 @@
 //! Boolean built-in.
+//!
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
+//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
+//! `ctx::call_ctx`, so dispatch IDs and install paths are unchanged.
 
-use v12_heap::{Heap, JsValue};
+use v12_heap::JsValue;
 use v12_native::Throw;
+
+use super::ctx::Ctx;
 
 /// `Boolean(value)` – converts value to boolean following ToBoolean.
 pub fn boolean_construct(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
-    let truthy = to_boolean(heap, v);
+    let truthy = to_boolean(ctx, v);
     Ok(JsValue::from_bool(truthy))
 }
 
-fn to_boolean(heap: &Heap, v: JsValue) -> bool {
-    let _ = heap;
+fn to_boolean(ctx: &Ctx, v: JsValue) -> bool {
     if v.is_true() {
         return true;
     }
@@ -26,7 +31,7 @@ fn to_boolean(heap: &Heap, v: JsValue) -> bool {
         return n != 0.0 && !n.is_nan();
     }
     if let Some(h) = v.as_string() {
-        return !heap.get(h).is_empty();
+        return !ctx.heap.get(h).is_empty();
     }
     // Objects are truthy.
     if v.is_object() {
@@ -38,7 +43,7 @@ fn to_boolean(heap: &Heap, v: JsValue) -> bool {
 /// `Boolean.prototype.toString` – `"true"`/`"false"` for the primitive
 /// receiver (wrapper objects are not modeled).
 pub fn boolean_proto_to_string(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
@@ -47,26 +52,24 @@ pub fn boolean_proto_to_string(
     } else if this.is_false() {
         "false"
     } else {
-        return Err(Throw::type_error(
-            heap,
+        return Err(ctx.type_error(
             "TypeError: Boolean.prototype.toString requires that 'this' be a Boolean",
         ));
     };
-    Ok(JsValue::string(heap.intern_text(text)))
+    Ok(JsValue::string(ctx.heap.intern_text(text)))
 }
 
 /// `Boolean.prototype.valueOf` – the primitive receiver itself. A
 /// non-Boolean receiver throws (no unchecked `this` passthrough).
 pub fn boolean_proto_value_of(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     if this.is_true() || this.is_false() {
         Ok(this)
     } else {
-        Err(Throw::type_error(
-            heap,
+        Err(ctx.type_error(
             "TypeError: Boolean.prototype.valueOf requires that 'this' be a Boolean",
         ))
     }
