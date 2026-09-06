@@ -89,225 +89,12 @@ impl Interp<'_> {
         let callee_funcs = self.functions_for_program(callee_program);
         if (target_idx as usize) >= callee_funcs.len() {
             if let Ok(native_fn) = NativeId::try_from(target_idx) {
-                let arg = if (callee_slot + 2) < self.stack.len() && argc > 0 {
-                    self.stack[callee_slot + 2]
-                } else {
-                    JsValue::undefined()
-                };
                 let args_start = callee_slot + 2;
                 let args_end = args_start + usize::from(argc);
                 let args_slice = self.stack[args_start..args_end].to_vec();
-                return match native_fn {
-                    NativeId::GeneratorNext => {
-                        Ok(CallOutcome::Value(self.generator_next(this_v, arg)?))
-                    }
-                    NativeId::GeneratorReturn => {
-                        Ok(CallOutcome::Value(self.generator_return(this_v, arg)?))
-                    }
-                    NativeId::GeneratorThrow => {
-                        Ok(CallOutcome::Value(self.generator_throw(this_v, arg)?))
-                    }
-                    NativeId::ArrayJoin => Ok(CallOutcome::Value(
-                        self.array_join_fallback(this_v, &args_slice)?,
-                    )),
-                    NativeId::ArrayPush => Ok(CallOutcome::Value(
-                        self.array_push_fallback(this_v, &args_slice)?,
-                    )),
-                    NativeId::ConsoleLog => {
-                        let mut parts = Vec::with_capacity(args_slice.len());
-                        for &v in &args_slice {
-                            parts.push(self.to_display_string(v));
-                        }
-                        println!("{}", parts.join(" "));
-                        Ok(CallOutcome::Value(JsValue::undefined()))
-                    }
-                    // Promise natives route through the registry seam so the
-                    // engine's promise builtins run; the interp fallback is
-                    // only used standalone. The registry is keyed by the
-                    // engine's native constants, so translate the selector.
-                    NativeId::PromiseResolve => {
-                        self.gc_protect();
-                        let result = self.natives.call_native(
-                            self.heap,
-                            this_v,
-                            &args_slice,
-                            NativeId::PromiseResolve,
-                        );
-                        result
-                            .map(CallOutcome::Value)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    }
-                    NativeId::PromiseReject => {
-                        self.gc_protect();
-                        let result = self.natives.call_native(
-                            self.heap,
-                            this_v,
-                            &args_slice,
-                            NativeId::PromiseReject,
-                        );
-                        result
-                            .map(CallOutcome::Value)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    }
-                    NativeId::PromiseThen => {
-                        self.gc_protect();
-                        let result = self.natives.call_native(
-                            self.heap,
-                            this_v,
-                            &args_slice,
-                            NativeId::PromiseThen,
-                        );
-                        result
-                            .map(CallOutcome::Value)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    }
-                    NativeId::ObjectEnumerableOwnKeys => {
-                        self.gc_protect();
-                        let result = self.natives.call_native(
-                            self.heap,
-                            this_v,
-                            &args_slice,
-                            NativeId::ObjectEnumerableOwnKeys,
-                        );
-                        result
-                            .map(CallOutcome::Value)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    }
-                    NativeId::FunctionCall => {
-                        let Some(target) = this_v.as_object() else {
-                            return Err(JSException(self.error_value(
-                                "TypeError: Function.prototype.call called on non-function",
-                            )));
-                        };
-                        if self.heap.get(target).kind != Kind::Function {
-                            return Err(JSException(self.error_value(
-                                "TypeError: Function.prototype.call called on non-function",
-                            )));
-                        }
-                        let this_arg = args_slice.first().copied().unwrap_or(JsValue::undefined());
-                        let fwd = if args_slice.len() > 1 {
-                            &args_slice[1..]
-                        } else {
-                            &[] as &[JsValue]
-                        };
-                        let res = self.call_object(target, this_arg, fwd)?;
-                        return Ok(CallOutcome::Value(res));
-                    }
-                    NativeId::FunctionApply => {
-                        let Some(target) = this_v.as_object() else {
-                            return Err(JSException(self.error_value(
-                                "TypeError: Function.prototype.apply called on non-function",
-                            )));
-                        };
-                        if self.heap.get(target).kind != Kind::Function {
-                            return Err(JSException(self.error_value(
-                                "TypeError: Function.prototype.apply called on non-function",
-                            )));
-                        }
-                        let this_arg = args_slice.first().copied().unwrap_or(JsValue::undefined());
-                        let fwd: Vec<JsValue> = if let Some(arr_v) = args_slice.get(1) {
-                            if arr_v.is_null() || arr_v.is_undefined() {
-                                Vec::new()
-                            } else if let Some(arr_obj) = arr_v.as_object() {
-                                // Collect array elements (holes read as undefined)
-                                let len = self.heap.get(arr_obj).element_len();
-                                let mut v = Vec::with_capacity(len);
-                                for i in 0..len as u32 {
-                                    v.push(
-                                        self.heap
-                                            .get(arr_obj)
-                                            .get_element(i)
-                                            .unwrap_or(JsValue::undefined()),
-                                    );
-                                }
-                                v
-                            } else {
-                                Vec::new()
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let res = self.call_object(target, this_arg, &fwd)?;
-                        return Ok(CallOutcome::Value(res));
-                    }
-                    NativeId::FunctionBind => {
-                        let Some(target) = this_v.as_object() else {
-                            return Err(JSException(self.error_value(
-                                "TypeError: Function.prototype.bind called on non-function",
-                            )));
-                        };
-                        // Minimal bind: capture target, thisArg and prefix args in a closure-like function.
-                        // For step 3b we return a thin bound function that re-dispatches via call_object.
-                        // Allocate a bound function object storing target in captured_env? Use native placeholder
-                        // and handle via future branch - for now return target (preserves callee is function).
-                        // Proper bound semantics require storing state; stub to target keeps tests that only
-                        // check `typeof f.bind(x) === 'function'` passing and defers full application.
-                        let _ = args_slice;
-                        return Ok(CallOutcome::Value(JsValue::object(target)));
-                    }
-                    NativeId::Eval => {
-                        // Direct eval: hand the source, shared global, and
-                        // the cross-program registry to the engine's eval
-                        // implementation, which compiles and runs a nested
-                        // interpreter against this heap. The registry lets
-                        // eval-created closures be invoked from this program
-                        // afterwards. (The compile-time table's `eval_stub`
-                        // is only a syntax check — real execution needs the
-                        // registry seam.)
-                        let source = self
-                            .stack
-                            .get(callee_slot + 2)
-                            .and_then(|v| v.as_string())
-                            .map(|h| self.string_text(h))
-                            .unwrap_or_default();
-                        let global = self.global;
-                        let programs = self.programs();
-                        self.gc_protect();
-                        let result = self.natives.eval(
-                            self.heap,
-                            &source,
-                            this_v,
-                            global,
-                            programs,
-                        );
-                        result
-                            .map(CallOutcome::Value)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    }
-                    NativeId::Function => {
-                        // Function(params…, body): compile the body into a
-                        // program registered in this interpreter's
-                        // cross-program table and return a real closure
-                        // stamped with that program's id (the compile-time
-                        // table's stub cannot do the registration).
-                        let programs = self.programs();
-                        self.gc_protect();
-                        let result = self
-                            .natives
-                            .function_construct(self.heap, &args_slice, programs);
-                        result
-                            .map(CallOutcome::Value)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    }
-                    // Any other native id: callback-taking built-ins
-                    // re-enter the machine and cannot run as registry
-                    // natives, so try the interp seam first; everything
-                    // else routes through the registry seam.
-                    _ => {
-                        if let Some(result) =
-                            self.run_callback_builtin(native_fn, this_v, &args_slice)
-                        {
-                            return result.map(CallOutcome::Value);
-                        }
-                        self.gc_protect();
-                        let result =
-                            self.natives
-                                .call_native(self.heap, this_v, &args_slice, native_fn);
-                        result
-                            .map(CallOutcome::Value)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    }
-                };
+                return self
+                    .dispatch_native(native_fn, this_v, &args_slice)
+                    .map(CallOutcome::Value);
             }
             let args_start = callee_slot + 2;
             let args_end = args_start + usize::from(argc);
@@ -602,90 +389,19 @@ impl Interp<'_> {
                 // console.log, promise fallbacks) dispatch through the
                 // `NativeFn` seam before any registry lookup.
                 if let Ok(native_fn) = NativeId::try_from(fn_idx) {
-                    return match native_fn {
-                        NativeId::GeneratorNext => self.generator_next(
-                            this,
-                            args.first().copied().unwrap_or(JsValue::undefined()),
-                        ),
-                        NativeId::GeneratorReturn => self.generator_return(
-                            this,
-                            args.first().copied().unwrap_or(JsValue::undefined()),
-                        ),
-                        NativeId::GeneratorThrow => self.generator_throw(
-                            this,
-                            args.first().copied().unwrap_or(JsValue::undefined()),
-                        ),
-                        NativeId::ConsoleLog => {
-                            let mut parts = Vec::with_capacity(args.len());
-                            for &v in args {
-                                parts.push(self.to_display_string(v));
-                            }
-                            println!("{}", parts.join(" "));
-                            Ok(JsValue::undefined())
-                        }
-                        NativeId::ArrayJoin => self.array_join_fallback(this, args),
-                        NativeId::ArrayPush => self.array_push_fallback(this, args),
-                        // Promise/keys natives translate to the engine's
-                        // native indices before the registry lookup.
-                        NativeId::PromiseResolve => {
-                            self.gc_protect();
-                            let result = self.natives.call_native(
-                                self.heap,
-                                this,
-                                args,
-                                NativeId::PromiseResolve,
-                            );
-                            result.map_err(|t| JSException::from_throw(self.heap, t))
-                        }
-                        NativeId::PromiseReject => {
-                            self.gc_protect();
-                            let result = self.natives.call_native(
-                                self.heap,
-                                this,
-                                args,
-                                NativeId::PromiseReject,
-                            );
-                            result.map_err(|t| JSException::from_throw(self.heap, t))
-                        }
-                        NativeId::PromiseThen => {
-                            self.gc_protect();
-                            let result = self.natives.call_native(
-                                self.heap,
-                                this,
-                                args,
-                                NativeId::PromiseThen,
-                            );
-                            result.map_err(|t| JSException::from_throw(self.heap, t))
-                        }
-                        NativeId::ObjectEnumerableOwnKeys => {
-                            self.gc_protect();
-                            let result = self.natives.call_native(
-                                self.heap,
-                                this,
-                                args,
-                                NativeId::ObjectEnumerableOwnKeys,
-                            );
-                            result.map_err(|t| JSException::from_throw(self.heap, t))
-                        }
-                        // Any other native id: the interpreter has no internal
-                        // fallback for it — route through the registry seam.
-                        _ => {
-                            self.gc_protect();
-                            let result = self.natives.call_native(self.heap, this, args, native_fn);
-                            result.map_err(|t| JSException::from_throw(self.heap, t))
-                        }
-                    };
+                    // One router: explicit arms run before the callback
+                    // seam + registry fallback (adds callback-taking
+                    // builtins + eval/Function routing to this path).
+                    return self.dispatch_native(native_fn, this, args);
                 }
                 let funcs = self.functions_for_program(func_program);
                 if (fn_idx as usize) >= funcs.len() {
                     // Out-of-range bytecode index: the native seam (engine
                     // iterator creators, Map/Set methods, console, …).
+                    // One router: callback seam first, then registry.
                     self.gc_protect();
                     let id = self.native_id_for(fn_idx)?;
-                    return self
-                        .natives
-                        .call_native(self.heap, this, args, id)
-                        .map_err(|t| JSException::from_throw(self.heap, t));
+                    return self.dispatch_native(id, this, args);
                 }
                 let callee_max_regs = funcs[fn_idx as usize].max_regs;
                 let new_base = self.stack.len();
@@ -1085,15 +801,11 @@ impl Interp<'_> {
         if (target_idx as usize) >= callee_funcs.len() {
             self.gc_protect();
             let id = self.native_id_for(target_idx)?;
-            // Callback-taking built-ins re-enter the machine; try the interp
-            // seam before the registry.
-            if let Some(result) = self.run_callback_builtin(id, this_v, &args_vec) {
-                return result.map(CallOutcome::Value);
-            }
-            let result = self.natives.call_native(self.heap, this_v, &args_vec, id);
-            return result
-                .map(CallOutcome::Value)
-                .map_err(|t| JSException::from_throw(self.heap, t));
+            // One router: explicit arms (eval/Function/generators/call/apply)
+            // run before the callback seam + registry fallback.
+            return self
+                .dispatch_native(id, this_v, &args_vec)
+                .map(CallOutcome::Value);
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(JSException(
@@ -1215,29 +927,15 @@ impl Interp<'_> {
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
                     let id = self.native_id_for(idx)?;
-                    // `new Function(params…, body)` must compile the body
-                    // into a real registered program; the compile-time stub
-                    // can only validate syntax and return a placeholder.
-                    if id == NativeId::Function {
-                        let args_slice = self.stack[args_start..args_end].to_vec();
-                        let programs = self.programs();
-                        let result = self
-                            .natives
-                            .function_construct(self.heap, &args_slice, programs)
-                            .map_err(|t| JSException::from_throw(self.heap, t))?;
-                        return Ok(CallOutcome::Value(result));
-                    }
-                    // The constructor is passed as `this`: spec-undefined is
-                    // useless to these handlers, and the identity read lets
-                    // e.g. `new Promise` link instances to `Promise.prototype`.
-                    // Every construct handler ignores `this` except for that.
-                    let result = {
-                        let args = &self.stack[args_start..args_end];
-                        self.natives
-                            .call_native(self.heap, callee_v, args, id)
-                            .map_err(|t| JSException::from_throw(self.heap, t))
-                    };
-                    return result.map(CallOutcome::Value);
+                    // One router: `new Function(params…, body)` compiles via
+                    // the Function arm; constructor-shaped natives ignore the
+                    // receiver per spec except for the identity read below
+                    // (`callee_v` as `this`, e.g. `new Promise` linking
+                    // instances to `Promise.prototype`).
+                    let args_slice = self.stack[args_start..args_end].to_vec();
+                    return self
+                        .dispatch_native(id, callee_v, &args_slice)
+                        .map(CallOutcome::Value);
                 }
                 idx
             }
@@ -1411,6 +1109,160 @@ impl Interp<'_> {
             Vec::new()
         };
         crate::call::fill_call_window(self, window, &args_slice, has_rest, fixed, rest_reg)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified native dispatch (arch plan §2 + §5 step 5)
+// ---------------------------------------------------------------------------
+
+impl Interp<'_> {
+    /// Single normalization point for every `NativeId` call. Explicit router
+    /// arms (generator control, `ArrayJoin`/`ArrayPush` fallbacks,
+    /// `ConsoleLog`, `Function.prototype.call/apply/bind`, direct `eval`,
+    /// `Function` construction) run first — they need stack/program tables
+    /// and are NOT builtins. Everything else tries `run_callback_builtin`
+    /// (re-entrant, needs the machine) before `NativeRegistry::call_native`.
+    ///
+    /// `RealmEval` never reaches here: it is a `FunctionTarget` variant
+    /// matched at each call site before id decoding.
+    pub(crate) fn dispatch_native(
+        &mut self,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        match id {
+            NativeId::GeneratorNext => {
+                let arg = args.first().copied().unwrap_or(JsValue::undefined());
+                self.generator_next(this_v, arg)
+            }
+            NativeId::GeneratorReturn => {
+                let arg = args.first().copied().unwrap_or(JsValue::undefined());
+                self.generator_return(this_v, arg)
+            }
+            NativeId::GeneratorThrow => {
+                let arg = args.first().copied().unwrap_or(JsValue::undefined());
+                self.generator_throw(this_v, arg)
+            }
+            NativeId::ArrayJoin => self.array_join_fallback(this_v, args),
+            NativeId::ArrayPush => self.array_push_fallback(this_v, args),
+            NativeId::ConsoleLog => {
+                let mut parts = Vec::with_capacity(args.len());
+                for &v in args {
+                    parts.push(self.to_display_string(v));
+                }
+                println!("{}", parts.join(" "));
+                Ok(JsValue::undefined())
+            }
+            NativeId::FunctionCall => {
+                let Some(target) = this_v.as_object() else {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.call called on non-function",
+                    )));
+                };
+                if self.heap.get(target).kind != Kind::Function {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.call called on non-function",
+                    )));
+                }
+                let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
+                let fwd = if args.len() > 1 { &args[1..] } else { &[] as &[JsValue] };
+                self.call_object(target, this_arg, fwd)
+            }
+            NativeId::FunctionApply => {
+                let Some(target) = this_v.as_object() else {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.apply called on non-function",
+                    )));
+                };
+                if self.heap.get(target).kind != Kind::Function {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.apply called on non-function",
+                    )));
+                }
+                let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
+                let fwd: Vec<JsValue> = if let Some(arr_v) = args.get(1) {
+                    if arr_v.is_null() || arr_v.is_undefined() {
+                        Vec::new()
+                    } else if let Some(arr_obj) = arr_v.as_object() {
+                        // Collect array elements (holes read as undefined)
+                        let len = self.heap.get(arr_obj).element_len();
+                        let mut v = Vec::with_capacity(len);
+                        for i in 0..len as u32 {
+                            v.push(
+                                self.heap
+                                    .get(arr_obj)
+                                    .get_element(i)
+                                    .unwrap_or(JsValue::undefined()),
+                            );
+                        }
+                        v
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                self.call_object(target, this_arg, &fwd)
+            }
+            NativeId::FunctionBind => {
+                let Some(target) = this_v.as_object() else {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.bind called on non-function",
+                    )));
+                };
+                // Minimal bind: capture target, thisArg and prefix args in a closure-like function.
+                // For step 3b we return a thin bound function that re-dispatches via call_object.
+                // Allocate a bound function object storing target in captured_env? Use native placeholder
+                // and handle via future branch - for now return target (preserves callee is function).
+                // Proper bound semantics require storing state; stub to target keeps tests that only
+                // check `typeof f.bind(x) === 'function'` passing and defers full application.
+                let _ = args;
+                Ok(JsValue::object(target))
+            }
+            NativeId::Eval => {
+                // Direct eval: hand the source, shared global, and the
+                // cross-program registry to the engine's eval implementation,
+                // which compiles and runs a nested interpreter against this
+                // heap. (The compile-time table's `eval_stub` is only a
+                // syntax check — real execution needs the registry seam.)
+                let source = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|h| self.string_text(h))
+                    .unwrap_or_default();
+                let global = self.global;
+                let programs = self.programs();
+                self.gc_protect();
+                self.natives
+                    .eval(self.heap, &source, this_v, global, programs)
+                    .map_err(|t| JSException::from_throw(self.heap, t))
+            }
+            NativeId::Function => {
+                // Function(params…, body): compile the body into a program
+                // registered in this interpreter's cross-program table and
+                // return a real closure stamped with that program's id (the
+                // compile-time table's stub cannot do the registration).
+                let programs = self.programs();
+                self.gc_protect();
+                self.natives
+                    .function_construct(self.heap, args, programs)
+                    .map_err(|t| JSException::from_throw(self.heap, t))
+            }
+            // Any other native id: callback-taking built-ins re-enter the
+            // machine and cannot run as registry natives, so try the interp
+            // seam first; everything else routes through the registry seam.
+            _ => {
+                if let Some(result) = self.run_callback_builtin(id, this_v, args) {
+                    return result;
+                }
+                self.gc_protect();
+                self.natives
+                    .call_native(self.heap, this_v, args, id)
+                    .map_err(|t| JSException::from_throw(self.heap, t))
+            }
+        }
     }
 }
 

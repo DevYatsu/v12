@@ -670,7 +670,8 @@ fn array_join(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue,
 
 /// Placeholder handler for the callback-taking built-ins (`map`, `forEach`,
 /// …). Calls from JS are intercepted at the interpreter seam
-/// (`Interp::run_callback_builtin`) before any dispatch happens, so this is
+/// (`Interp::run_callback_builtin`, reached via the single
+/// `Interp::dispatch_native` router) before any dispatch happens, so this is
 /// unreachable in practice — it exists only so `define_builtins!` can carry
 /// the install.
 fn callback_stub(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
@@ -680,6 +681,15 @@ fn callback_stub(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<J
     ))
 }
 
+/// Phase 5 note (arch plan §2 + §5 step 5): the router
+/// (`Interp::dispatch_native`) owns the REAL `eval` / `Function` /
+/// `console.log` paths as explicit arms, so these stubs are shadowed on
+/// every interpreter path. They are KEPT (not deleted) as the
+/// `NativeRegistry::call_native` fallback for direct registry callers —
+/// deleting the `Eval`/`Function`/`ConsoleLog` bare entries would turn those
+/// direct calls from stub values into "not registered" throws, which is a
+/// behavior change beyond the gate. Revisit once direct registry callers
+/// are audited.
 fn eval_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     // v1 stub: non-string args return as-is; string args are syntax-checked
     // via the compiler and return `undefined` on success. The full
