@@ -202,13 +202,16 @@ pub const TRANSITIONS_INLINE_CAP: usize = 8;
 
 /// Child shapes reachable by adding one property. Inline stack array below
 /// the cap, hash map above (see module docs for why the split exists).
+/// Edges are keyed by `(key, attrs)`: the same key installed with different
+/// attributes (e.g. spec `length` vs ordinary assignment) forks the tree
+/// instead of silently inheriting the first writer's descriptor.
 #[derive(Clone, Debug)]
 pub enum Transitions {
     Inline {
-        entries: [Option<(PropKey, ShapeHandle)>; TRANSITIONS_INLINE_CAP],
+        entries: [Option<(PropKey, Attrs, ShapeHandle)>; TRANSITIONS_INLINE_CAP],
         len: u8,
     },
-    Map(Box<rustc_hash::FxHashMap<PropKey, ShapeHandle>>),
+    Map(Box<rustc_hash::FxHashMap<(PropKey, Attrs), ShapeHandle>>),
 }
 
 impl Default for Transitions {
@@ -234,23 +237,24 @@ impl Transitions {
         self.len() == 0
     }
 
-    /// Child for `key`, if a transition on that key exists.
-    pub fn get(&self, key: PropKey) -> Option<ShapeHandle> {
+    /// Child for `(key, attrs)`, if a transition on that pair exists.
+    pub fn get(&self, key: PropKey, attrs: Attrs) -> Option<ShapeHandle> {
         match self {
             Transitions::Inline { entries, .. } => entries
                 .iter()
                 .flatten()
-                .find(|(k, _)| *k == key)
-                .map(|&(_, h)| h),
-            Transitions::Map(map) => map.get(&key).copied(),
+                .find(|(k, a, _)| *k == key && *a == attrs)
+                .map(|&(_, _, h)| h),
+            Transitions::Map(map) => map.get(&(key, attrs)).copied(),
         }
     }
 
-    /// Records `key -> child`, replacing any previous edge on `key`. Upgrades
+    /// Records `(key, attrs) -> child`, replacing any previous edge on the
+    /// pair. Upgrades
     /// the inline array to a hash map when the cap is exceeded; the upgrade
     /// is one-way (shapes are immutable once published, so nothing ever
     /// shrinks back).
-    pub fn insert(&mut self, key: PropKey, child: ShapeHandle) {
+    pub fn insert(&mut self, key: PropKey, attrs: Attrs, child: ShapeHandle) {
         // Invariant: the inline tier never holds more than
         // TRANSITIONS_INLINE_CAP live edges (the append path below upgrades
         // to the map tier at the cap instead of overflowing).
@@ -261,26 +265,26 @@ impl Transitions {
             ),
             "inline transition count exceeds the inline cap"
         );
-        if self.get(key).is_some() {
+        if self.get(key, attrs).is_some() {
             // Replacement never changes the count, so neither tier needs its
             // append path.
             if let Transitions::Inline { entries, .. } = self {
-                for (k, h) in entries.iter_mut().flatten() {
-                    if *k == key {
+                for (k, a, h) in entries.iter_mut().flatten() {
+                    if *k == key && *a == attrs {
                         *h = child;
                         return;
                     }
                 }
             }
             if let Transitions::Map(map) = self {
-                map.insert(key, child);
+                map.insert((key, attrs), child);
             }
             return;
         }
         match self {
             Transitions::Inline { entries, len } => {
                 if (*len as usize) < TRANSITIONS_INLINE_CAP {
-                    entries[*len as usize] = Some((key, child));
+                    entries[*len as usize] = Some((key, attrs, child));
                     *len += 1;
                     return;
                 }
@@ -288,21 +292,21 @@ impl Transitions {
                     TRANSITIONS_INLINE_CAP + 1,
                     rustc_hash::FxBuildHasher,
                 );
-                for (k, h) in entries.iter_mut().flatten() {
-                    map.insert(*k, *h);
+                for (k, a, h) in entries.iter_mut().flatten() {
+                    map.insert((*k, *a), *h);
                 }
-                map.insert(key, child);
+                map.insert((key, attrs), child);
                 *self = Transitions::Map(Box::new(map));
             }
             Transitions::Map(map) => {
-                map.insert(key, child);
+                map.insert((key, attrs), child);
             }
         }
     }
 
     /// Drops every edge whose target does not satisfy `keep`. Used by the
     /// collector to prune entries naming reclaimed child shapes.
-    pub fn retain(&mut self, keep: impl Fn(PropKey, ShapeHandle) -> bool) {
+    pub fn retain(&mut self, keep: impl Fn(PropKey, Attrs, ShapeHandle) -> bool) {
         match self {
             Transitions::Inline { entries, len } => {
                 let n = *len as usize;
@@ -310,10 +314,10 @@ impl Transitions {
                 // Index loop rather than iter_mut: compaction writes back
                 // into the same array being read.
                 for i in 0..n {
-                    if let Some((k, h)) = entries[i]
-                        && keep(k, h)
+                    if let Some((k, a, h)) = entries[i]
+                        && keep(k, a, h)
                     {
-                        entries[kept] = Some((k, h));
+                        entries[kept] = Some((k, a, h));
                         kept += 1;
                     }
                 }
@@ -323,16 +327,19 @@ impl Transitions {
                 *len = kept as u8;
             }
             Transitions::Map(map) => {
-                map.retain(|k, h| keep(*k, *h));
+                map.retain(|k, h| {
+                    let (pk, at) = *k;
+                    keep(pk, at, *h)
+                });
             }
         }
     }
 
-    /// Iterates `(key, child)` pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (PropKey, ShapeHandle)> + '_ {
+    /// Iterates `(key, attrs, child)` triples.
+    pub fn iter(&self) -> impl Iterator<Item = (PropKey, Attrs, ShapeHandle)> + '_ {
         match self {
             Transitions::Inline { entries, len } => {
-                let items: Vec<(PropKey, ShapeHandle)> = entries
+                let items: Vec<(PropKey, Attrs, ShapeHandle)> = entries
                     .iter()
                     .take(*len as usize)
                     .flatten()
@@ -341,7 +348,7 @@ impl Transitions {
                 Box::new(items.into_iter()) as Box<dyn Iterator<Item = _>>
             }
             Transitions::Map(map) => {
-                Box::new(map.iter().map(|(k, h)| (*k, *h))) as Box<dyn Iterator<Item = _>>
+                Box::new(map.iter().map(|(k, h)| (k.0, k.1, *h))) as Box<dyn Iterator<Item = _>>
             }
         }
     }
@@ -349,7 +356,7 @@ impl Transitions {
     /// Rough heap bytes retained beyond the struct itself (size accounting
     /// for the GC growth trigger).
     pub(crate) fn retained_bytes(&self) -> usize {
-        const ENTRY: usize = core::mem::size_of::<(PropKey, ShapeHandle)>();
+        const ENTRY: usize = core::mem::size_of::<(PropKey, Attrs, ShapeHandle)>();
         match self {
             Transitions::Inline { .. } => TRANSITIONS_INLINE_CAP * (ENTRY + 1),
             Transitions::Map(map) => map.capacity() * (ENTRY + 1),
@@ -726,7 +733,7 @@ mod tests {
         // …with every edge still resolvable, including the early ones that
         // migrated during the upgrade.
         for (&k, &child) in keys.iter().zip(&children) {
-            assert_eq!(heap.get(s0).transitions.get(k), Some(child));
+            assert_eq!(heap.get(s0).transitions.get(k, Attrs::DEFAULT), Some(child));
         }
         assert_eq!(heap.get(s0).transitions.len(), TRANSITIONS_INLINE_CAP + 3);
     }
@@ -794,7 +801,7 @@ mod tests {
 
         // Dead branch: z. Linked from the base's transition table only.
         let sz = heap.add_property(base, kz, Attrs::DEFAULT);
-        assert_eq!(heap.get(base).transitions.get(kz), Some(sz));
+        assert_eq!(heap.get(base).transitions.get(kz, Attrs::DEFAULT), Some(sz));
 
         // Stress cadence has been collecting throughout; one explicit cycle
         // settles the final state.
@@ -807,9 +814,9 @@ mod tests {
             "expected root + two live-branch shapes"
         );
         // …and its stale transition entry was pruned from the live base.
-        assert_eq!(heap.get(base).transitions.get(kz), None);
-        assert_eq!(heap.get(base).transitions.get(kx), Some(sx));
-        assert_eq!(heap.get(sx).transitions.get(ky), Some(sxy));
+        assert_eq!(heap.get(base).transitions.get(kz, Attrs::DEFAULT), None);
+        assert_eq!(heap.get(base).transitions.get(kx, Attrs::DEFAULT), Some(sx));
+        assert_eq!(heap.get(sx).transitions.get(ky, Attrs::DEFAULT), Some(sxy));
 
         // Live branch data is intact after all the churn.
         assert_eq!(
@@ -826,7 +833,7 @@ mod tests {
         // matters is that the edge names a live shape with fresh contents.
         let sz2 = heap.add_property(base, kz, Attrs::DEFAULT);
         heap.add_shape_root(sz2);
-        assert_eq!(heap.get(base).transitions.get(kz), Some(sz2));
+        assert_eq!(heap.get(base).transitions.get(kz, Attrs::DEFAULT), Some(sz2));
         assert_eq!(heap.get(sz2).num_own, 1);
         assert_eq!(heap.get(sz2).parent, Some(base));
     }

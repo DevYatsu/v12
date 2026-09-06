@@ -524,11 +524,10 @@ impl Interp<'_> {
                 NativeId::SetSize
             };
             self.gc_protect();
-            let result = self
-                .natives
-                .call_native(self.heap, JsValue::object(obj), &[], size_const)
-                .map_err(|t| JSException::from_throw(self.heap, t));
-            return Some(result);
+            // Single router: `MapSize`/`SetSize` fall through the callback
+            // seam (`None`) to the same registry call, so this matches the
+            // previous direct `call_native` result.
+            return Some(self.dispatch_native(size_const, JsValue::object(obj), &[]));
         }
         let constant = if kind == Kind::Map {
             if self.key_is(key_v, "get") {

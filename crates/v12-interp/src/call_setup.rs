@@ -122,15 +122,15 @@ impl Interp<'_> {
             }
             self.gc_protect();
             let id = self.native_id_for(target_idx)?;
-            let result = {
-                let args = &self.stack[args_start..args_end];
-                // Disjoint field borrows: heap + natives mut, stack immut.
-                // Borrow checker allows distinct fields in 2024 edition.
-                self.natives
-                    .call_native(self.heap, this_v, args, id)
-                    .map_err(|t| JSException::from_throw(self.heap, t))
-            };
-            return result.map(CallOutcome::Value);
+            // Single router: explicit arms (eval/Function/console.log/…)
+            // run before the callback seam + registry fallback, so the
+            // compile-time table fallbacks stay shadowed on this path too.
+            // (`args` is copied: `dispatch_native` takes `&mut self` while
+            // the stack borrow would otherwise conflict.)
+            let args_vec = self.stack[args_start..args_end].to_vec();
+            return self
+                .dispatch_native(id, this_v, &args_vec)
+                .map(CallOutcome::Value);
         }
 
         // Generator function: calling it returns a generator object without executing body.
@@ -1231,8 +1231,9 @@ impl Interp<'_> {
                 // Direct eval: hand the source, shared global, and the
                 // cross-program registry to the engine's eval implementation,
                 // which compiles and runs a nested interpreter against this
-                // heap. (The compile-time table's `eval_stub` is only a
-                // syntax check — real execution needs the registry seam.)
+                // heap-sharing `eval` needs the registry seam (compile +
+                // run a nested interpreter), which only the router can
+                // provide.
                 let source = args
                     .first()
                     .and_then(|v| v.as_string())

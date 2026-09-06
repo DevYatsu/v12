@@ -523,7 +523,7 @@ impl Heap {
     /// anchor it with [`Heap::add_shape_root`] before the next allocation,
     /// or a collection may reclaim it — transition edges are not traced.
     pub fn add_property(&mut self, parent: ShapeHandle, key: PropKey, attrs: Attrs) -> ShapeHandle {
-        if let Some(existing) = self.get(parent).transitions.get(key) {
+        if let Some(existing) = self.get(parent).transitions.get(key, attrs) {
             return existing;
         }
         let (slot, proto_cell, mut descriptors) = {
@@ -542,7 +542,7 @@ impl Heap {
             proto_cell,
             num_own: slot + 1,
         });
-        self.get_mut(parent).transitions.insert(key, child_handle);
+        self.get_mut(parent).transitions.insert(key, attrs, child_handle);
         child_handle
     }
 
@@ -565,7 +565,7 @@ impl Heap {
         // object is already bound to `parent` (the first call's child), so
         // the merge target is `parent`'s own descriptor for `key`, not a
         // transition of it.
-        if let Some(existing) = self.get(parent).transitions.get(key) {
+        if let Some(existing) = self.get(parent).transitions.get(key, attrs) {
             let merged = match self.get(existing).descriptors.find(key) {
                 Some(Descriptor::Accessor {
                     getter: g,
@@ -668,7 +668,7 @@ impl Heap {
             proto_cell,
             num_own: slot + 1,
         });
-        self.get_mut(parent).transitions.insert(key, child_handle);
+        self.get_mut(parent).transitions.insert(key, attrs, child_handle);
         child_handle
     }
 
@@ -1105,7 +1105,7 @@ impl Heap {
             if !marked[i] {
                 continue; // dead shapes are about to be released wholesale
             }
-            shape.transitions.retain(|_, child| marked[child.slot()]);
+            shape.transitions.retain(|_, _, child| marked[child.slot()]);
         }
     }
 

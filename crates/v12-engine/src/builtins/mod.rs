@@ -68,8 +68,158 @@ pub(crate) fn builtin_install_prop(
 /// preserving current observable behavior. Entries that gain `(len)` in the
 /// macro get `Some(len)` here and the install family stamps the prop.
 pub fn builtin_length(id: NativeId) -> Option<u32> {
-    let _ = id;
-    None
+    match id {
+        NativeId::ArrayAt => Some(1),
+        NativeId::ArrayConcat => Some(1),
+        NativeId::ArrayCopyWithin => Some(2),
+        NativeId::ArrayEvery => Some(1),
+        NativeId::ArrayFill => Some(1),
+        NativeId::ArrayFilter => Some(1),
+        NativeId::ArrayFind => Some(1),
+        NativeId::ArrayFindIndex => Some(1),
+        NativeId::ArrayFindLast => Some(1),
+        NativeId::ArrayFindLastIndex => Some(1),
+        NativeId::ArrayFlat => Some(0),
+        NativeId::ArrayFlatMap => Some(1),
+        NativeId::ArrayForEach => Some(1),
+        NativeId::ArrayFrom => Some(1),
+        NativeId::ArrayIncludes => Some(1),
+        NativeId::ArrayIndexOf => Some(1),
+        NativeId::ArrayIsArray => Some(1),
+        NativeId::ArrayIterator => Some(0),
+        NativeId::ArrayIteratorEntries => Some(0),
+        NativeId::ArrayIteratorKeys => Some(0),
+        NativeId::ArrayJoin => Some(1),
+        NativeId::ArrayLastIndexOf => Some(1),
+        NativeId::ArrayMap => Some(1),
+        NativeId::ArrayOf => Some(0),
+        NativeId::ArrayPop => Some(0),
+        NativeId::ArrayPush => Some(1),
+        NativeId::ArrayReduce => Some(1),
+        NativeId::ArrayReduceRight => Some(1),
+        NativeId::ArrayReverse => Some(0),
+        NativeId::ArrayShift => Some(0),
+        NativeId::ArraySlice => Some(2),
+        NativeId::ArraySome => Some(1),
+        NativeId::ArraySort => Some(1),
+        NativeId::ArraySplice => Some(2),
+        NativeId::ArrayToString => Some(0),
+        NativeId::ArrayUnshift => Some(1),
+        NativeId::BooleanProtoToString => Some(0),
+        NativeId::BooleanProtoValueOf => Some(0),
+        NativeId::FunctionProtoToString => Some(0),
+        NativeId::GlobalDecodeUri => Some(1),
+        NativeId::GlobalDecodeUriComponent => Some(1),
+        NativeId::GlobalEncodeUri => Some(1),
+        NativeId::GlobalEncodeUriComponent => Some(1),
+        NativeId::GlobalIsFinite => Some(1),
+        NativeId::GlobalIsNaN => Some(1),
+        NativeId::GlobalParseFloat => Some(1),
+        NativeId::GlobalParseInt => Some(2),
+        NativeId::JsonParse => Some(2),
+        NativeId::JsonStringify => Some(3),
+        NativeId::MathAbs => Some(1),
+        NativeId::MathAcos => Some(1),
+        NativeId::MathAcosh => Some(1),
+        NativeId::MathAsin => Some(1),
+        NativeId::MathAsinh => Some(1),
+        NativeId::MathAtan => Some(1),
+        NativeId::MathAtan2 => Some(2),
+        NativeId::MathAtanh => Some(1),
+        NativeId::MathCbrt => Some(1),
+        NativeId::MathCeil => Some(1),
+        NativeId::MathClz32 => Some(1),
+        NativeId::MathCos => Some(1),
+        NativeId::MathCosh => Some(1),
+        NativeId::MathExp => Some(1),
+        NativeId::MathExpm1 => Some(1),
+        NativeId::MathFloor => Some(1),
+        NativeId::MathFround => Some(1),
+        NativeId::MathHypot => Some(2),
+        NativeId::MathImul => Some(2),
+        NativeId::MathLog => Some(1),
+        NativeId::MathLog10 => Some(1),
+        NativeId::MathLog1p => Some(1),
+        NativeId::MathLog2 => Some(1),
+        NativeId::MathMax => Some(2),
+        NativeId::MathMin => Some(2),
+        NativeId::MathPow => Some(2),
+        NativeId::MathRandom => Some(0),
+        NativeId::MathRound => Some(1),
+        NativeId::MathSign => Some(1),
+        NativeId::MathSin => Some(1),
+        NativeId::MathSinh => Some(1),
+        NativeId::MathSqrt => Some(1),
+        NativeId::MathTan => Some(1),
+        NativeId::MathTanh => Some(1),
+        NativeId::MathTrunc => Some(1),
+        NativeId::NumberIsFinite => Some(1),
+        NativeId::NumberIsInteger => Some(1),
+        NativeId::NumberIsNan => Some(1),
+        NativeId::NumberIsSafeInteger => Some(1),
+        NativeId::NumberParseFloat => Some(1),
+        NativeId::NumberParseInt => Some(2),
+        NativeId::NumberProtoToString => Some(1),
+        NativeId::NumberProtoValueOf => Some(0),
+        NativeId::NumberToExponential => Some(1),
+        NativeId::NumberToFixed => Some(1),
+        NativeId::NumberToPrecision => Some(1),
+        NativeId::ObjectAssign => Some(2),
+        NativeId::ObjectCreate => Some(1),
+        NativeId::ObjectDefineProperty => Some(3),
+        NativeId::ObjectEntries => Some(1),
+        NativeId::ObjectFreeze => Some(1),
+        NativeId::ObjectFromEntries => Some(1),
+        NativeId::ObjectGetOwnPropertyDescriptor => Some(2),
+        NativeId::ObjectGetOwnPropertyNames => Some(1),
+        NativeId::ObjectGetOwnPropertySymbols => Some(1),
+        NativeId::ObjectGetPrototypeOf => Some(1),
+        NativeId::ObjectHasOwn => Some(2),
+        NativeId::ObjectHasOwnProperty => Some(1),
+        NativeId::ObjectIs => Some(2),
+        NativeId::ObjectIsExtensible => Some(1),
+        NativeId::ObjectIsFrozen => Some(1),
+        NativeId::ObjectIsSealed => Some(1),
+        NativeId::ObjectKeys => Some(1),
+        NativeId::ObjectPreventExtensions => Some(1),
+        NativeId::ObjectProtoToString => Some(0),
+        NativeId::ObjectProtoValueOf => Some(0),
+        NativeId::ObjectSeal => Some(1),
+        NativeId::ObjectSetPrototypeOf => Some(2),
+        NativeId::ObjectValues => Some(1),
+        NativeId::StringAt => Some(1),
+        NativeId::StringCharAt => Some(1),
+        NativeId::StringCharCodeAt => Some(1),
+        NativeId::StringCodePointAt => Some(1),
+        NativeId::StringConcat => Some(1),
+        NativeId::StringEndsWith => Some(1),
+        NativeId::StringFromCharCode => Some(1),
+        NativeId::StringFromCodePoint => Some(1),
+        NativeId::StringIncludes => Some(1),
+        NativeId::StringIndexOf => Some(1),
+        NativeId::StringLastIndexOf => Some(1),
+        NativeId::StringLocaleCompare => Some(1),
+        NativeId::StringPadEnd => Some(1),
+        NativeId::StringPadStart => Some(1),
+        NativeId::StringRepeat => Some(1),
+        NativeId::StringReplaceAll => Some(2),
+        NativeId::StringSlice => Some(2),
+        NativeId::StringStartsWith => Some(1),
+        NativeId::StringSubstr => Some(2),
+        NativeId::StringSubstring => Some(2),
+        NativeId::StringToLowerCase => Some(0),
+        NativeId::StringToString => Some(0),
+        NativeId::StringToUpperCase => Some(0),
+        NativeId::StringTrim => Some(0),
+        NativeId::StringTrimEnd => Some(0),
+        NativeId::StringTrimStart => Some(0),
+        NativeId::StringValueOf => Some(0),
+        NativeId::SymbolFor => Some(1),
+        NativeId::SymbolKeyFor => Some(1),
+        NativeId::SymbolProtoToString => Some(0),
+        NativeId::SymbolProtoValueOf => Some(0),
+        _ => None,
+    }
 }
 
 /// Unified install: single canonical path for every builtin function
@@ -304,8 +454,8 @@ macro_rules! __builtin_emit_install {
 /// No intermediate `BUILTIN_INSTALLS` array is stored — the macro expands to
 /// direct `install_prop` calls (zero rodata, no iteration).
 /// *Bare* entries `Variant => handler` (after `;`) emit only a dispatch arm
-/// for truly internal / non-JS-visible natives (e.g. `Eval`, `ModuleImport`,
-/// `ConsoleLog`). They are not installed on any JS object.
+/// for truly internal / non-JS-visible natives (e.g. `ModuleImport`,
+/// `MapSize`, `IteratorNext`). They are not installed on any JS object.
 ///
 /// Example:
 /// ```ignore
@@ -314,7 +464,7 @@ macro_rules! __builtin_emit_install {
 ///     Math { "floor" => MathFloor => math::math_floor },
 ///     Array { "isArray" => ArrayIsArray => array::array_is_array },
 ///     ArrayProto { "push" => ArrayPush => array::array_push };
-///     Eval => eval_stub,
+///     ModuleImport => module_import,
 /// }
 /// ```
 macro_rules! define_builtins {
@@ -361,51 +511,51 @@ macro_rules! define_builtins {
 
 define_builtins! {
     Global {
-        "isNaN" => GlobalIsNaN => |heap, this, args| call_ctx(number::global_is_nan, heap, this, args),
-        "isFinite" => GlobalIsFinite => |heap, this, args| call_ctx(number::global_is_finite, heap, this, args),
-        "parseInt" => GlobalParseInt => |heap, this, args| call_ctx(number::global_parse_int, heap, this, args),
-        "parseFloat" => GlobalParseFloat => |heap, this, args| call_ctx(number::global_parse_float, heap, this, args),
-        "encodeURI" => GlobalEncodeUri => |heap, this, args| call_ctx(global::global_encode_uri, heap, this, args),
-        "decodeURI" => GlobalDecodeUri => |heap, this, args| call_ctx(global::global_decode_uri, heap, this, args),
-        "encodeURIComponent" => GlobalEncodeUriComponent => |heap, this, args| call_ctx(global::global_encode_uri_component, heap, this, args),
-        "decodeURIComponent" => GlobalDecodeUriComponent => |heap, this, args| call_ctx(global::global_decode_uri_component, heap, this, args),
+        "isNaN" (1) => GlobalIsNaN => |heap, this, args| call_ctx(number::global_is_nan, heap, this, args),
+        "isFinite" (1) => GlobalIsFinite => |heap, this, args| call_ctx(number::global_is_finite, heap, this, args),
+        "parseInt" (2) => GlobalParseInt => |heap, this, args| call_ctx(number::global_parse_int, heap, this, args),
+        "parseFloat" (1) => GlobalParseFloat => |heap, this, args| call_ctx(number::global_parse_float, heap, this, args),
+        "encodeURI" (1) => GlobalEncodeUri => |heap, this, args| call_ctx(global::global_encode_uri, heap, this, args),
+        "decodeURI" (1) => GlobalDecodeUri => |heap, this, args| call_ctx(global::global_decode_uri, heap, this, args),
+        "encodeURIComponent" (1) => GlobalEncodeUriComponent => |heap, this, args| call_ctx(global::global_encode_uri_component, heap, this, args),
+        "decodeURIComponent" (1) => GlobalDecodeUriComponent => |heap, this, args| call_ctx(global::global_decode_uri_component, heap, this, args),
     },
     Math {
-        "abs" => MathAbs => |heap, this, args| call_ctx(math::math_abs, heap, this, args),
-        "floor" => MathFloor => |heap, this, args| call_ctx(math::math_floor, heap, this, args),
-        "ceil" => MathCeil => |heap, this, args| call_ctx(math::math_ceil, heap, this, args),
-        "trunc" => MathTrunc => |heap, this, args| call_ctx(math::math_trunc, heap, this, args),
-        "pow" => MathPow => |heap, this, args| call_ctx(math::math_pow, heap, this, args),
-        "max" => MathMax => |heap, this, args| call_ctx(math::math_max, heap, this, args),
-        "min" => MathMin => |heap, this, args| call_ctx(math::math_min, heap, this, args),
-        "random" => MathRandom => |heap, this, args| call_ctx(math::math_random, heap, this, args),
-        "round" => MathRound => |heap, this, args| call_ctx(math::math_round, heap, this, args),
-        "sqrt" => MathSqrt => |heap, this, args| call_ctx(math::math_sqrt, heap, this, args),
-        "sign" => MathSign => |heap, this, args| call_ctx(math::math_sign, heap, this, args),
-        "cbrt" => MathCbrt => |heap, this, args| call_ctx(math::math_cbrt, heap, this, args),
-        "exp" => MathExp => |heap, this, args| call_ctx(math::math_exp, heap, this, args),
-        "expm1" => MathExpm1 => |heap, this, args| call_ctx(math::math_expm1, heap, this, args),
-        "log" => MathLog => |heap, this, args| call_ctx(math::math_log, heap, this, args),
-        "log1p" => MathLog1p => |heap, this, args| call_ctx(math::math_log1p, heap, this, args),
-        "log2" => MathLog2 => |heap, this, args| call_ctx(math::math_log2, heap, this, args),
-        "log10" => MathLog10 => |heap, this, args| call_ctx(math::math_log10, heap, this, args),
-        "sin" => MathSin => |heap, this, args| call_ctx(math::math_sin, heap, this, args),
-        "cos" => MathCos => |heap, this, args| call_ctx(math::math_cos, heap, this, args),
-        "tan" => MathTan => |heap, this, args| call_ctx(math::math_tan, heap, this, args),
-        "asin" => MathAsin => |heap, this, args| call_ctx(math::math_asin, heap, this, args),
-        "acos" => MathAcos => |heap, this, args| call_ctx(math::math_acos, heap, this, args),
-        "atan" => MathAtan => |heap, this, args| call_ctx(math::math_atan, heap, this, args),
-        "atan2" => MathAtan2 => |heap, this, args| call_ctx(math::math_atan2, heap, this, args),
-        "sinh" => MathSinh => |heap, this, args| call_ctx(math::math_sinh, heap, this, args),
-        "cosh" => MathCosh => |heap, this, args| call_ctx(math::math_cosh, heap, this, args),
-        "tanh" => MathTanh => |heap, this, args| call_ctx(math::math_tanh, heap, this, args),
-        "asinh" => MathAsinh => |heap, this, args| call_ctx(math::math_asinh, heap, this, args),
-        "acosh" => MathAcosh => |heap, this, args| call_ctx(math::math_acosh, heap, this, args),
-        "atanh" => MathAtanh => |heap, this, args| call_ctx(math::math_atanh, heap, this, args),
-        "hypot" => MathHypot => |heap, this, args| call_ctx(math::math_hypot, heap, this, args),
-        "clz32" => MathClz32 => |heap, this, args| call_ctx(math::math_clz32, heap, this, args),
-        "imul" => MathImul => |heap, this, args| call_ctx(math::math_imul, heap, this, args),
-        "fround" => MathFround => |heap, this, args| call_ctx(math::math_fround, heap, this, args),
+        "abs" (1) => MathAbs => |heap, this, args| call_ctx(math::math_abs, heap, this, args),
+        "floor" (1) => MathFloor => |heap, this, args| call_ctx(math::math_floor, heap, this, args),
+        "ceil" (1) => MathCeil => |heap, this, args| call_ctx(math::math_ceil, heap, this, args),
+        "trunc" (1) => MathTrunc => |heap, this, args| call_ctx(math::math_trunc, heap, this, args),
+        "pow" (2) => MathPow => |heap, this, args| call_ctx(math::math_pow, heap, this, args),
+        "max" (2) => MathMax => |heap, this, args| call_ctx(math::math_max, heap, this, args),
+        "min" (2) => MathMin => |heap, this, args| call_ctx(math::math_min, heap, this, args),
+        "random" (0) => MathRandom => |heap, this, args| call_ctx(math::math_random, heap, this, args),
+        "round" (1) => MathRound => |heap, this, args| call_ctx(math::math_round, heap, this, args),
+        "sqrt" (1) => MathSqrt => |heap, this, args| call_ctx(math::math_sqrt, heap, this, args),
+        "sign" (1) => MathSign => |heap, this, args| call_ctx(math::math_sign, heap, this, args),
+        "cbrt" (1) => MathCbrt => |heap, this, args| call_ctx(math::math_cbrt, heap, this, args),
+        "exp" (1) => MathExp => |heap, this, args| call_ctx(math::math_exp, heap, this, args),
+        "expm1" (1) => MathExpm1 => |heap, this, args| call_ctx(math::math_expm1, heap, this, args),
+        "log" (1) => MathLog => |heap, this, args| call_ctx(math::math_log, heap, this, args),
+        "log1p" (1) => MathLog1p => |heap, this, args| call_ctx(math::math_log1p, heap, this, args),
+        "log2" (1) => MathLog2 => |heap, this, args| call_ctx(math::math_log2, heap, this, args),
+        "log10" (1) => MathLog10 => |heap, this, args| call_ctx(math::math_log10, heap, this, args),
+        "sin" (1) => MathSin => |heap, this, args| call_ctx(math::math_sin, heap, this, args),
+        "cos" (1) => MathCos => |heap, this, args| call_ctx(math::math_cos, heap, this, args),
+        "tan" (1) => MathTan => |heap, this, args| call_ctx(math::math_tan, heap, this, args),
+        "asin" (1) => MathAsin => |heap, this, args| call_ctx(math::math_asin, heap, this, args),
+        "acos" (1) => MathAcos => |heap, this, args| call_ctx(math::math_acos, heap, this, args),
+        "atan" (1) => MathAtan => |heap, this, args| call_ctx(math::math_atan, heap, this, args),
+        "atan2" (2) => MathAtan2 => |heap, this, args| call_ctx(math::math_atan2, heap, this, args),
+        "sinh" (1) => MathSinh => |heap, this, args| call_ctx(math::math_sinh, heap, this, args),
+        "cosh" (1) => MathCosh => |heap, this, args| call_ctx(math::math_cosh, heap, this, args),
+        "tanh" (1) => MathTanh => |heap, this, args| call_ctx(math::math_tanh, heap, this, args),
+        "asinh" (1) => MathAsinh => |heap, this, args| call_ctx(math::math_asinh, heap, this, args),
+        "acosh" (1) => MathAcosh => |heap, this, args| call_ctx(math::math_acosh, heap, this, args),
+        "atanh" (1) => MathAtanh => |heap, this, args| call_ctx(math::math_atanh, heap, this, args),
+        "hypot" (2) => MathHypot => |heap, this, args| call_ctx(math::math_hypot, heap, this, args),
+        "clz32" (1) => MathClz32 => |heap, this, args| call_ctx(math::math_clz32, heap, this, args),
+        "imul" (2) => MathImul => |heap, this, args| call_ctx(math::math_imul, heap, this, args),
+        "fround" (1) => MathFround => |heap, this, args| call_ctx(math::math_fround, heap, this, args),
     },
     MathValue {
         "E" => MathConstE => |heap, this, args| call_ctx(math::math_const_e, heap, this, args),
@@ -418,12 +568,12 @@ define_builtins! {
         "SQRT2" => MathConstSqrt2 => |heap, this, args| call_ctx(math::math_const_sqrt2, heap, this, args),
     },
     Number {
-        "isNaN" => NumberIsNan => |heap, this, args| call_ctx(number::number_is_nan, heap, this, args),
-        "isFinite" => NumberIsFinite => |heap, this, args| call_ctx(number::number_is_finite, heap, this, args),
-        "parseInt" => NumberParseInt => |heap, this, args| call_ctx(number::global_parse_int, heap, this, args),
-        "parseFloat" => NumberParseFloat => |heap, this, args| call_ctx(number::global_parse_float, heap, this, args),
-        "isInteger" => NumberIsInteger => |heap, this, args| call_ctx(number::number_is_integer, heap, this, args),
-        "isSafeInteger" => NumberIsSafeInteger => |heap, this, args| call_ctx(number::number_is_safe_integer, heap, this, args),
+        "isNaN" (1) => NumberIsNan => |heap, this, args| call_ctx(number::number_is_nan, heap, this, args),
+        "isFinite" (1) => NumberIsFinite => |heap, this, args| call_ctx(number::number_is_finite, heap, this, args),
+        "parseInt" (2) => NumberParseInt => |heap, this, args| call_ctx(number::global_parse_int, heap, this, args),
+        "parseFloat" (1) => NumberParseFloat => |heap, this, args| call_ctx(number::global_parse_float, heap, this, args),
+        "isInteger" (1) => NumberIsInteger => |heap, this, args| call_ctx(number::number_is_integer, heap, this, args),
+        "isSafeInteger" (1) => NumberIsSafeInteger => |heap, this, args| call_ctx(number::number_is_safe_integer, heap, this, args),
     },
     NumberValue {
         "MAX_SAFE_INTEGER" => NumberConstMaxSafeInteger => |heap, this, args| call_ctx(number::number_const_max_safe_integer, heap, this, args),
@@ -436,129 +586,129 @@ define_builtins! {
         "NaN" => NumberConstNaN => |heap, this, args| call_ctx(number::number_const_nan, heap, this, args),
     },
     NumberProto {
-        "toString" => NumberProtoToString => |heap, this, args| call_ctx(number::number_proto_to_string, heap, this, args),
-        "toFixed" => NumberToFixed => |heap, this, args| call_ctx(number::number_to_fixed, heap, this, args),
-        "toPrecision" => NumberToPrecision => |heap, this, args| call_ctx(number::number_to_precision, heap, this, args),
-        "toExponential" => NumberToExponential => |heap, this, args| call_ctx(number::number_to_exponential, heap, this, args),
-        "valueOf" => NumberProtoValueOf => |heap, this, args| call_ctx(number::number_proto_value_of, heap, this, args),
+        "toString" (1) => NumberProtoToString => |heap, this, args| call_ctx(number::number_proto_to_string, heap, this, args),
+        "toFixed" (1) => NumberToFixed => |heap, this, args| call_ctx(number::number_to_fixed, heap, this, args),
+        "toPrecision" (1) => NumberToPrecision => |heap, this, args| call_ctx(number::number_to_precision, heap, this, args),
+        "toExponential" (1) => NumberToExponential => |heap, this, args| call_ctx(number::number_to_exponential, heap, this, args),
+        "valueOf" (0) => NumberProtoValueOf => |heap, this, args| call_ctx(number::number_proto_value_of, heap, this, args),
     },
     Array {
-        "isArray" => ArrayIsArray => |heap, this, args| call_ctx(array::array_is_array, heap, this, args),
+        "isArray" (1) => ArrayIsArray => |heap, this, args| call_ctx(array::array_is_array, heap, this, args),
     },
     ArrayProto {
-        "push" => ArrayPush => |heap, this, args| call_ctx(array::array_push, heap, this, args),
-        "pop" => ArrayPop => |heap, this, args| call_ctx(array::array_pop, heap, this, args),
-        "join" => ArrayJoin => |heap, this, args| call_ctx(array_join, heap, this, args),
-        "slice" => ArraySlice => |heap, this, args| call_ctx(array::array_slice, heap, this, args),
-        "sort" => ArraySort => |heap, this, args| call_ctx(array::array_sort, heap, this, args),
-        "entries" => ArrayIteratorEntries => |heap, this, args| call_ctx(iterator::array_iterator_entries, heap, this, args),
-        "keys" => ArrayIteratorKeys => |heap, this, args| call_ctx(iterator::array_iterator_keys, heap, this, args),
-        "values" => ArrayIterator => |heap, this, args| call_ctx(iterator::array_iterator, heap, this, args),
-        "indexOf" => ArrayIndexOf => |heap, this, args| call_ctx(array::array_index_of, heap, this, args),
-        "lastIndexOf" => ArrayLastIndexOf => |heap, this, args| call_ctx(array::array_last_index_of, heap, this, args),
-        "includes" => ArrayIncludes => |heap, this, args| call_ctx(array::array_includes, heap, this, args),
-        "concat" => ArrayConcat => |heap, this, args| call_ctx(array::array_concat, heap, this, args),
-        "at" => ArrayAt => |heap, this, args| call_ctx(array::array_at, heap, this, args),
-        "reverse" => ArrayReverse => |heap, this, args| call_ctx(array::array_reverse, heap, this, args),
-        "shift" => ArrayShift => |heap, this, args| call_ctx(array::array_shift, heap, this, args),
-        "unshift" => ArrayUnshift => |heap, this, args| call_ctx(array::array_unshift, heap, this, args),
-        "splice" => ArraySplice => |heap, this, args| call_ctx(array::array_splice, heap, this, args),
-        "fill" => ArrayFill => |heap, this, args| call_ctx(array::array_fill, heap, this, args),
-        "copyWithin" => ArrayCopyWithin => |heap, this, args| call_ctx(array::array_copy_within, heap, this, args),
-        "flat" => ArrayFlat => |heap, this, args| call_ctx(array::array_flat, heap, this, args),
-        "toString" => ArrayToString => |heap, this, args| call_ctx(array::array_to_string, heap, this, args),
+        "push" (1) => ArrayPush => |heap, this, args| call_ctx(array::array_push, heap, this, args),
+        "pop" (0) => ArrayPop => |heap, this, args| call_ctx(array::array_pop, heap, this, args),
+        "join" (1) => ArrayJoin => |heap, this, args| call_ctx(array_join, heap, this, args),
+        "slice" (2) => ArraySlice => |heap, this, args| call_ctx(array::array_slice, heap, this, args),
+        "sort" (1) => ArraySort => |heap, this, args| call_ctx(array::array_sort, heap, this, args),
+        "entries" (0) => ArrayIteratorEntries => |heap, this, args| call_ctx(iterator::array_iterator_entries, heap, this, args),
+        "keys" (0) => ArrayIteratorKeys => |heap, this, args| call_ctx(iterator::array_iterator_keys, heap, this, args),
+        "values" (0) => ArrayIterator => |heap, this, args| call_ctx(iterator::array_iterator, heap, this, args),
+        "indexOf" (1) => ArrayIndexOf => |heap, this, args| call_ctx(array::array_index_of, heap, this, args),
+        "lastIndexOf" (1) => ArrayLastIndexOf => |heap, this, args| call_ctx(array::array_last_index_of, heap, this, args),
+        "includes" (1) => ArrayIncludes => |heap, this, args| call_ctx(array::array_includes, heap, this, args),
+        "concat" (1) => ArrayConcat => |heap, this, args| call_ctx(array::array_concat, heap, this, args),
+        "at" (1) => ArrayAt => |heap, this, args| call_ctx(array::array_at, heap, this, args),
+        "reverse" (0) => ArrayReverse => |heap, this, args| call_ctx(array::array_reverse, heap, this, args),
+        "shift" (0) => ArrayShift => |heap, this, args| call_ctx(array::array_shift, heap, this, args),
+        "unshift" (1) => ArrayUnshift => |heap, this, args| call_ctx(array::array_unshift, heap, this, args),
+        "splice" (2) => ArraySplice => |heap, this, args| call_ctx(array::array_splice, heap, this, args),
+        "fill" (1) => ArrayFill => |heap, this, args| call_ctx(array::array_fill, heap, this, args),
+        "copyWithin" (2) => ArrayCopyWithin => |heap, this, args| call_ctx(array::array_copy_within, heap, this, args),
+        "flat" (0) => ArrayFlat => |heap, this, args| call_ctx(array::array_flat, heap, this, args),
+        "toString" (0) => ArrayToString => |heap, this, args| call_ctx(array::array_to_string, heap, this, args),
         // Callback-taking methods run at the interpreter seam
         // (`Interp::run_callback_builtin`); these stubs are never dispatched
         // from JS but carry the install.
-        "forEach" => ArrayForEach => callback_stub,
-        "map" => ArrayMap => callback_stub,
-        "filter" => ArrayFilter => callback_stub,
-        "some" => ArraySome => callback_stub,
-        "every" => ArrayEvery => callback_stub,
-        "find" => ArrayFind => callback_stub,
-        "findIndex" => ArrayFindIndex => callback_stub,
-        "findLast" => ArrayFindLast => callback_stub,
-        "findLastIndex" => ArrayFindLastIndex => callback_stub,
-        "reduce" => ArrayReduce => callback_stub,
-        "reduceRight" => ArrayReduceRight => callback_stub,
-        "flatMap" => ArrayFlatMap => callback_stub,
+        "forEach" (1) => ArrayForEach => callback_stub,
+        "map" (1) => ArrayMap => callback_stub,
+        "filter" (1) => ArrayFilter => callback_stub,
+        "some" (1) => ArraySome => callback_stub,
+        "every" (1) => ArrayEvery => callback_stub,
+        "find" (1) => ArrayFind => callback_stub,
+        "findIndex" (1) => ArrayFindIndex => callback_stub,
+        "findLast" (1) => ArrayFindLast => callback_stub,
+        "findLastIndex" (1) => ArrayFindLastIndex => callback_stub,
+        "reduce" (1) => ArrayReduce => callback_stub,
+        "reduceRight" (1) => ArrayReduceRight => callback_stub,
+        "flatMap" (1) => ArrayFlatMap => callback_stub,
     },
     Array {
-        "of" => ArrayOf => |heap, this, args| call_ctx(array::array_of, heap, this, args),
-        "from" => ArrayFrom => |heap, this, args| call_ctx(array::array_from, heap, this, args),
+        "of" (0) => ArrayOf => |heap, this, args| call_ctx(array::array_of, heap, this, args),
+        "from" (1) => ArrayFrom => |heap, this, args| call_ctx(array::array_from, heap, this, args),
     },
     Object {
-        "assign" => ObjectAssign => |heap, this, args| call_ctx(object::object_assign, heap, this, args),
-        "is" => ObjectIs => |heap, this, args| call_ctx(object::object_is, heap, this, args),
-        "hasOwn" => ObjectHasOwn => |heap, this, args| call_ctx(object::object_has_own, heap, this, args),
-        "freeze" => ObjectFreeze => |heap, this, args| call_ctx(object::object_freeze, heap, this, args),
-        "isFrozen" => ObjectIsFrozen => |heap, this, args| call_ctx(object::object_is_frozen, heap, this, args),
-        "seal" => ObjectSeal => |heap, this, args| call_ctx(object::object_seal, heap, this, args),
-        "isSealed" => ObjectIsSealed => |heap, this, args| call_ctx(object::object_is_sealed, heap, this, args),
-        "preventExtensions" => ObjectPreventExtensions => |heap, this, args| call_ctx(object::object_prevent_extensions, heap, this, args),
-        "isExtensible" => ObjectIsExtensible => |heap, this, args| call_ctx(object::object_is_extensible, heap, this, args),
-        "fromEntries" => ObjectFromEntries => |heap, this, args| call_ctx(object::object_from_entries, heap, this, args),
-        "getOwnPropertyNames" => ObjectGetOwnPropertyNames => |heap, this, args| call_ctx(object::object_get_own_property_names, heap, this, args),
-        "getOwnPropertySymbols" => ObjectGetOwnPropertySymbols => |heap, this, args| call_ctx(object::object_get_own_property_symbols, heap, this, args),
-        "getOwnPropertyDescriptor" => ObjectGetOwnPropertyDescriptor => |heap, this, args| call_ctx(object::object_get_own_property_descriptor, heap, this, args),
-        "setPrototypeOf" => ObjectSetPrototypeOf => |heap, this, args| call_ctx(object::object_set_prototype_of, heap, this, args),
-        "create" => ObjectCreate => |heap, this, args| call_ctx(object::object_create, heap, this, args),
-        "getPrototypeOf" => ObjectGetPrototypeOf => |heap, this, args| call_ctx(object::object_get_prototype_of, heap, this, args),
-        "defineProperty" => ObjectDefineProperty => |heap, this, args| call_ctx(object::object_define_property, heap, this, args),
-        "keys" => ObjectKeys => |heap, this, args| call_ctx(object::object_keys, heap, this, args),
-        "values" => ObjectValues => |heap, this, args| call_ctx(object::object_values, heap, this, args),
-        "entries" => ObjectEntries => |heap, this, args| call_ctx(object::object_entries, heap, this, args),
+        "assign" (2) => ObjectAssign => |heap, this, args| call_ctx(object::object_assign, heap, this, args),
+        "is" (2) => ObjectIs => |heap, this, args| call_ctx(object::object_is, heap, this, args),
+        "hasOwn" (2) => ObjectHasOwn => |heap, this, args| call_ctx(object::object_has_own, heap, this, args),
+        "freeze" (1) => ObjectFreeze => |heap, this, args| call_ctx(object::object_freeze, heap, this, args),
+        "isFrozen" (1) => ObjectIsFrozen => |heap, this, args| call_ctx(object::object_is_frozen, heap, this, args),
+        "seal" (1) => ObjectSeal => |heap, this, args| call_ctx(object::object_seal, heap, this, args),
+        "isSealed" (1) => ObjectIsSealed => |heap, this, args| call_ctx(object::object_is_sealed, heap, this, args),
+        "preventExtensions" (1) => ObjectPreventExtensions => |heap, this, args| call_ctx(object::object_prevent_extensions, heap, this, args),
+        "isExtensible" (1) => ObjectIsExtensible => |heap, this, args| call_ctx(object::object_is_extensible, heap, this, args),
+        "fromEntries" (1) => ObjectFromEntries => |heap, this, args| call_ctx(object::object_from_entries, heap, this, args),
+        "getOwnPropertyNames" (1) => ObjectGetOwnPropertyNames => |heap, this, args| call_ctx(object::object_get_own_property_names, heap, this, args),
+        "getOwnPropertySymbols" (1) => ObjectGetOwnPropertySymbols => |heap, this, args| call_ctx(object::object_get_own_property_symbols, heap, this, args),
+        "getOwnPropertyDescriptor" (2) => ObjectGetOwnPropertyDescriptor => |heap, this, args| call_ctx(object::object_get_own_property_descriptor, heap, this, args),
+        "setPrototypeOf" (2) => ObjectSetPrototypeOf => |heap, this, args| call_ctx(object::object_set_prototype_of, heap, this, args),
+        "create" (1) => ObjectCreate => |heap, this, args| call_ctx(object::object_create, heap, this, args),
+        "getPrototypeOf" (1) => ObjectGetPrototypeOf => |heap, this, args| call_ctx(object::object_get_prototype_of, heap, this, args),
+        "defineProperty" (3) => ObjectDefineProperty => |heap, this, args| call_ctx(object::object_define_property, heap, this, args),
+        "keys" (1) => ObjectKeys => |heap, this, args| call_ctx(object::object_keys, heap, this, args),
+        "values" (1) => ObjectValues => |heap, this, args| call_ctx(object::object_values, heap, this, args),
+        "entries" (1) => ObjectEntries => |heap, this, args| call_ctx(object::object_entries, heap, this, args),
     },
     ObjectProto {
-        "hasOwnProperty" => ObjectHasOwnProperty => |heap, this, args| call_ctx(object::object_has_own_property, heap, this, args),
-        "toString" => ObjectProtoToString => |heap, this, args| call_ctx(object::object_proto_to_string, heap, this, args),
-        "valueOf" => ObjectProtoValueOf => |heap, this, args| call_ctx(object::object_proto_value_of, heap, this, args),
+        "hasOwnProperty" (1) => ObjectHasOwnProperty => |heap, this, args| call_ctx(object::object_has_own_property, heap, this, args),
+        "toString" (0) => ObjectProtoToString => |heap, this, args| call_ctx(object::object_proto_to_string, heap, this, args),
+        "valueOf" (0) => ObjectProtoValueOf => |heap, this, args| call_ctx(object::object_proto_value_of, heap, this, args),
     },
     FunctionProto {
-        "toString" => FunctionProtoToString => |heap, this, args| call_ctx(object::function_proto_to_string, heap, this, args),
+        "toString" (0) => FunctionProtoToString => |heap, this, args| call_ctx(object::function_proto_to_string, heap, this, args),
     },
     StringProto {
-        "charAt" => StringCharAt => |heap, this, args| call_ctx(string::string_char_at, heap, this, args),
-        "slice" => StringSlice => |heap, this, args| call_ctx(string::string_slice, heap, this, args),
-        "charCodeAt" => StringCharCodeAt => |heap, this, args| call_ctx(string::string_char_code_at, heap, this, args),
-        "codePointAt" => StringCodePointAt => |heap, this, args| call_ctx(string::string_code_point_at, heap, this, args),
-        "at" => StringAt => |heap, this, args| call_ctx(string::string_at, heap, this, args),
-        "indexOf" => StringIndexOf => |heap, this, args| call_ctx(string::string_index_of, heap, this, args),
-        "lastIndexOf" => StringLastIndexOf => |heap, this, args| call_ctx(string::string_last_index_of, heap, this, args),
-        "includes" => StringIncludes => |heap, this, args| call_ctx(string::string_includes, heap, this, args),
-        "startsWith" => StringStartsWith => |heap, this, args| call_ctx(string::string_starts_with, heap, this, args),
-        "endsWith" => StringEndsWith => |heap, this, args| call_ctx(string::string_ends_with, heap, this, args),
-        "concat" => StringConcat => |heap, this, args| call_ctx(string::string_concat, heap, this, args),
-        "repeat" => StringRepeat => |heap, this, args| call_ctx(string::string_repeat, heap, this, args),
-        "padStart" => StringPadStart => |heap, this, args| call_ctx(string::string_pad_start, heap, this, args),
-        "padEnd" => StringPadEnd => |heap, this, args| call_ctx(string::string_pad_end, heap, this, args),
-        "trim" => StringTrim => |heap, this, args| call_ctx(string::string_trim, heap, this, args),
-        "trimStart" => StringTrimStart => |heap, this, args| call_ctx(string::string_trim_start, heap, this, args),
-        "trimEnd" => StringTrimEnd => |heap, this, args| call_ctx(string::string_trim_end, heap, this, args),
-        "toLowerCase" => StringToLowerCase => |heap, this, args| call_ctx(string::string_to_lower_case, heap, this, args),
-        "toUpperCase" => StringToUpperCase => |heap, this, args| call_ctx(string::string_to_upper_case, heap, this, args),
-        "substring" => StringSubstring => |heap, this, args| call_ctx(string::string_substring, heap, this, args),
-        "substr" => StringSubstr => |heap, this, args| call_ctx(string::string_substr, heap, this, args),
-        "toString" => StringToString => |heap, this, args| call_ctx(string::string_to_string, heap, this, args),
-        "valueOf" => StringValueOf => |heap, this, args| call_ctx(string::string_value_of, heap, this, args),
-        "localeCompare" => StringLocaleCompare => |heap, this, args| call_ctx(string::string_locale_compare, heap, this, args),
-        "replaceAll" => StringReplaceAll => |heap, this, args| call_ctx(string::string_replace_all, heap, this, args),
+        "charAt" (1) => StringCharAt => |heap, this, args| call_ctx(string::string_char_at, heap, this, args),
+        "slice" (2) => StringSlice => |heap, this, args| call_ctx(string::string_slice, heap, this, args),
+        "charCodeAt" (1) => StringCharCodeAt => |heap, this, args| call_ctx(string::string_char_code_at, heap, this, args),
+        "codePointAt" (1) => StringCodePointAt => |heap, this, args| call_ctx(string::string_code_point_at, heap, this, args),
+        "at" (1) => StringAt => |heap, this, args| call_ctx(string::string_at, heap, this, args),
+        "indexOf" (1) => StringIndexOf => |heap, this, args| call_ctx(string::string_index_of, heap, this, args),
+        "lastIndexOf" (1) => StringLastIndexOf => |heap, this, args| call_ctx(string::string_last_index_of, heap, this, args),
+        "includes" (1) => StringIncludes => |heap, this, args| call_ctx(string::string_includes, heap, this, args),
+        "startsWith" (1) => StringStartsWith => |heap, this, args| call_ctx(string::string_starts_with, heap, this, args),
+        "endsWith" (1) => StringEndsWith => |heap, this, args| call_ctx(string::string_ends_with, heap, this, args),
+        "concat" (1) => StringConcat => |heap, this, args| call_ctx(string::string_concat, heap, this, args),
+        "repeat" (1) => StringRepeat => |heap, this, args| call_ctx(string::string_repeat, heap, this, args),
+        "padStart" (1) => StringPadStart => |heap, this, args| call_ctx(string::string_pad_start, heap, this, args),
+        "padEnd" (1) => StringPadEnd => |heap, this, args| call_ctx(string::string_pad_end, heap, this, args),
+        "trim" (0) => StringTrim => |heap, this, args| call_ctx(string::string_trim, heap, this, args),
+        "trimStart" (0) => StringTrimStart => |heap, this, args| call_ctx(string::string_trim_start, heap, this, args),
+        "trimEnd" (0) => StringTrimEnd => |heap, this, args| call_ctx(string::string_trim_end, heap, this, args),
+        "toLowerCase" (0) => StringToLowerCase => |heap, this, args| call_ctx(string::string_to_lower_case, heap, this, args),
+        "toUpperCase" (0) => StringToUpperCase => |heap, this, args| call_ctx(string::string_to_upper_case, heap, this, args),
+        "substring" (2) => StringSubstring => |heap, this, args| call_ctx(string::string_substring, heap, this, args),
+        "substr" (2) => StringSubstr => |heap, this, args| call_ctx(string::string_substr, heap, this, args),
+        "toString" (0) => StringToString => |heap, this, args| call_ctx(string::string_to_string, heap, this, args),
+        "valueOf" (0) => StringValueOf => |heap, this, args| call_ctx(string::string_value_of, heap, this, args),
+        "localeCompare" (1) => StringLocaleCompare => |heap, this, args| call_ctx(string::string_locale_compare, heap, this, args),
+        "replaceAll" (2) => StringReplaceAll => |heap, this, args| call_ctx(string::string_replace_all, heap, this, args),
     },
     StringCtor {
-        "fromCharCode" => StringFromCharCode => |heap, this, args| call_ctx(string::string_from_char_code, heap, this, args),
-        "fromCodePoint" => StringFromCodePoint => |heap, this, args| call_ctx(string::string_from_code_point, heap, this, args),
+        "fromCharCode" (1) => StringFromCharCode => |heap, this, args| call_ctx(string::string_from_char_code, heap, this, args),
+        "fromCodePoint" (1) => StringFromCodePoint => |heap, this, args| call_ctx(string::string_from_code_point, heap, this, args),
     },
     Json {
-        "parse" => JsonParse => |heap, this, args| call_ctx(json::json_parse, heap, this, args),
-        "stringify" => JsonStringify => |heap, this, args| call_ctx(json::json_stringify, heap, this, args),
+        "parse" (2) => JsonParse => |heap, this, args| call_ctx(json::json_parse, heap, this, args),
+        "stringify" (3) => JsonStringify => |heap, this, args| call_ctx(json::json_stringify, heap, this, args),
     },
     BooleanProto {
-        "toString" => BooleanProtoToString => |heap, this, args| call_ctx(boolean::boolean_proto_to_string, heap, this, args),
-        "valueOf" => BooleanProtoValueOf => |heap, this, args| call_ctx(boolean::boolean_proto_value_of, heap, this, args),
+        "toString" (0) => BooleanProtoToString => |heap, this, args| call_ctx(boolean::boolean_proto_to_string, heap, this, args),
+        "valueOf" (0) => BooleanProtoValueOf => |heap, this, args| call_ctx(boolean::boolean_proto_value_of, heap, this, args),
     },
     Symbol {
-        "for" => SymbolFor => |heap, this, args| call_ctx(symbol::symbol_for, heap, this, args),
-        "keyFor" => SymbolKeyFor => |heap, this, args| call_ctx(symbol::symbol_key_for, heap, this, args),
+        "for" (1) => SymbolFor => |heap, this, args| call_ctx(symbol::symbol_for, heap, this, args),
+        "keyFor" (1) => SymbolKeyFor => |heap, this, args| call_ctx(symbol::symbol_key_for, heap, this, args),
         "iterator" => SymbolWellKnownIterator => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
         "asyncIterator" => SymbolWellKnownAsyncIterator => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
         "hasInstance" => SymbolWellKnownHasInstance => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
@@ -573,8 +723,8 @@ define_builtins! {
         "unscopables" => SymbolWellKnownUnscopables => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
     },
     SymbolProto {
-        "toString" => SymbolProtoToString => |heap, this, args| call_ctx(symbol::symbol_proto_to_string, heap, this, args),
-        "valueOf" => SymbolProtoValueOf => |heap, this, args| call_ctx(symbol::symbol_proto_value_of, heap, this, args),
+        "toString" (0) => SymbolProtoToString => |heap, this, args| call_ctx(symbol::symbol_proto_to_string, heap, this, args),
+        "valueOf" (0) => SymbolProtoValueOf => |heap, this, args| call_ctx(symbol::symbol_proto_value_of, heap, this, args),
         "description" => SymbolProtoDescription => |heap, this, args| call_ctx(symbol::symbol_proto_description, heap, this, args),
     };
     // Truly internal / non-JS-visible dispatch-only natives (not installed).
@@ -582,9 +732,6 @@ define_builtins! {
     NumberConstruct => |heap, this, args| call_ctx(number::number_construct, heap, this, args),
     BooleanConstruct => |heap, this, args| call_ctx(boolean::boolean_construct, heap, this, args),
     ErrorCreate => |heap, this, args| call_ctx(error::error_create, heap, this, args),
-    Eval => eval_stub,
-    Function => function_stub,
-    ConsoleLog => console_log,
     MapConstruct => |heap, this, args| call_ctx(map::map_construct, heap, this, args),
     MapGet => |heap, this, args| call_ctx(map::map_get, heap, this, args),
     MapSet => |heap, this, args| call_ctx(map::map_set, heap, this, args),
@@ -681,80 +828,14 @@ fn callback_stub(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<J
     ))
 }
 
-/// Phase 5 note (arch plan §2 + §5 step 5): the router
-/// (`Interp::dispatch_native`) owns the REAL `eval` / `Function` /
-/// `console.log` paths as explicit arms, so these stubs are shadowed on
-/// every interpreter path. They are KEPT (not deleted) as the
-/// `NativeRegistry::call_native` fallback for direct registry callers —
-/// deleting the `Eval`/`Function`/`ConsoleLog` bare entries would turn those
-/// direct calls from stub values into "not registered" throws, which is a
-/// behavior change beyond the gate. Revisit once direct registry callers
-/// are audited.
-fn eval_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    // v1 stub: non-string args return as-is; string args are syntax-checked
-    // via the compiler and return `undefined` on success. The full
-    // heap-sharing `eval` path is exercised via `Engine::eval_direct`.
-    if let Some(first) = args.first() {
-        if let Some(h) = first.as_string() {
-            let text = helpers::string_text(heap, h);
-            if let Err(err) = v12_bccompiler::compile_source_with_strings(&text) {
-                let msg = err.message;
-                let handle = heap.intern_text(&msg);
-                return Err((JsValue::string(handle)).into());
-            }
-            Ok(JsValue::undefined())
-        } else {
-            Ok(*first)
-        }
-    } else {
-        Ok(JsValue::undefined())
-    }
-}
-
-fn function_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    // v1 stub for `new Function`: validate syntax and return a placeholder
-    // function object. Full compilation is via `Engine::create_function`.
-    if args.is_empty() {
-        let func = helpers::alloc_obj(
-            heap,
-            v12_heap::JsObject::function(v12_heap::FunctionTarget::Bytecode(0), None),
-        );
-        return Ok(JsValue::object(func));
-    }
-    let mut param_parts = Vec::new();
-    for &arg in &args[..args.len() - 1] {
-        if let Some(h) = arg.as_string() {
-            param_parts.push(helpers::string_text(heap, h));
-        }
-    }
-    let param_str = param_parts.join(",");
-    let body = args
-        .last()
-        .and_then(|v| v.as_string())
-        .map(|h| helpers::string_text(heap, h))
-        .unwrap_or_default();
-    let src = format!("function __f({param_str}){{{body}}}");
-    if let Err(err) = v12_bccompiler::compile_source_with_strings(&src) {
-        let msg = err.message;
-        let handle = heap.intern_text(&msg);
-        return Err((JsValue::string(handle)).into());
-    }
-    let func = helpers::alloc_obj(
-        heap,
-        v12_heap::JsObject::function(v12_heap::FunctionTarget::Bytecode(1), None),
-    );
-    Ok(JsValue::object(func))
-}
-
-fn console_log(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let mut parts = Vec::with_capacity(args.len());
-    for &v in args {
-        parts.push(helpers::value_text(heap, v));
-    }
-    println!("{}", parts.join(" "));
-    Ok(JsValue::undefined())
-}
-
+/// The interpreter router (`Interp::dispatch_native`) owns the REAL `eval` /
+/// `Function` / `console.log` paths as explicit arms, and every interpreter
+/// call site now funnels through it (`prepare_call`, `call_inline`,
+/// `prepare_construct`, the `size` getter) before the registry fallback.
+/// The former `eval_stub` / `function_stub` / `console_log` duplicates were
+/// therefore unreachable from JS and are deleted: a direct
+/// `NativeRegistry::call_native(Eval|Function|ConsoleLog)` now reports "not
+/// registered", which no in-tree caller does.
 fn module_import(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     // Spec shape: `import()` returns a promise. There is no module loader
     // yet (ModuleMap/resolve/link/evaluate are v1 work-in-progress), so the
