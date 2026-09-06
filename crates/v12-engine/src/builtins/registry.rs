@@ -135,12 +135,30 @@ impl v12_native::NativeRegistry for NativeRegistry {
         //    RegExp natives need the per-registry compiled-pattern cache.
         //    They are intercepted here instead of registered as handlers.
         match id {
-            NativeId::PromiseResolve => promise::promise_resolve(heap, this, args),
-            NativeId::PromiseReject => promise::promise_reject(heap, this, args),
-            NativeId::PromiseThen => promise::promise_then(heap, this, args, &self.pending),
-            NativeId::PromiseCatch => promise::promise_catch(heap, this, args, &self.pending),
-            NativeId::PromiseConstruct => promise::promise_construct(heap, &self.pending, this, args),
-            NativeId::QueueMicrotask => promise::queue_microtask(heap, args, &self.pending),
+            NativeId::PromiseResolve => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_resolve(&mut ctx, this, args)
+            }
+            NativeId::PromiseReject => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_reject(&mut ctx, this, args)
+            }
+            NativeId::PromiseThen => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_then(&mut ctx, this, args)
+            }
+            NativeId::PromiseCatch => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_catch(&mut ctx, this, args)
+            }
+            NativeId::PromiseConstruct => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_construct(&mut ctx, this, args)
+            }
+            NativeId::QueueMicrotask => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::queue_microtask(&mut ctx, this, args)
+            }
             NativeId::RegExpExec => regexp::regexp_exec(heap, &self.regex_cache, this, args),
             NativeId::RegExpTest => regexp::regexp_test(heap, &self.regex_cache, this, args),
             NativeId::RegExpCompile => regexp::regexp_compile(heap, &self.regex_cache, this, args),

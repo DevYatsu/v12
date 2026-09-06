@@ -29,6 +29,7 @@ use std::rc::Rc;
 use v12_heap::{Heap, JsObject, JsValue, Kind};
 use v12_native::Throw;
 
+use super::ctx::Ctx;
 use crate::job_queue::{Job, JobCtx};
 use v12_interp::JSException;
 
@@ -82,9 +83,13 @@ fn create_promise(
 
 /// `Promise.resolve(x)`: identity for promises; otherwise a fulfilled promise
 /// carrying `x` (`undefined` when the argument is missing).
-pub fn promise_resolve(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn promise_resolve(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-    if is_promise(heap, value) {
+    if is_promise(ctx.heap, value) {
         return Ok(value);
     }
     // Called as a method, `this` is the Promise constructor whose `prototype`
@@ -92,9 +97,9 @@ pub fn promise_resolve(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Resu
     // recognizes instances by that identity. Unbound calls (e.g. a destructured
     // `const r = Promise.resolve`) degrade gracefully: the promise works but
     // its `then` is unreachable from script.
-    let prototype = this.as_object().and_then(|ctor| heap.get(ctor).prototype);
+    let prototype = this.as_object().and_then(|ctor| ctx.heap.get(ctor).prototype);
     Ok(JsValue::object(create_promise(
-        heap,
+        ctx.heap,
         prototype,
         STATE_FULFILLED,
         value,
@@ -102,11 +107,15 @@ pub fn promise_resolve(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Resu
 }
 
 /// `Promise.reject(x)`: a rejected promise carrying `x`.
-pub fn promise_reject(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn promise_reject(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-    let prototype = this.as_object().and_then(|ctor| heap.get(ctor).prototype);
+    let prototype = this.as_object().and_then(|ctor| ctx.heap.get(ctor).prototype);
     Ok(JsValue::object(create_promise(
-        heap,
+        ctx.heap,
         prototype,
         STATE_REJECTED,
         value,
@@ -125,26 +134,28 @@ pub(crate) fn make_rejected_promise(heap: &mut Heap, reason: JsValue) -> JsValue
 /// On a pending promise: appends a reaction record. On a settled promise:
 /// enqueues the reaction job immediately (the job runs at the next
 /// checkpoint and settles the derived promise).
+///
+/// The pending-job sink comes from `Ctx::pending` (Phase 2 carrier); the
+/// registry intercept always supplies it, so no separate stateful signature
+/// is needed. A detached `Ctx` without a sink falls back to an ephemeral
+/// queue (jobs are dropped) rather than failing the `then`.
 pub fn promise_then(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
-    sink: &Rc<RefCell<Vec<Job>>>,
 ) -> Result<JsValue, Throw> {
-    if !is_promise(heap, this) {
-        return Err(Throw::type_error(
-            heap,
-            "Promise.prototype.then requires a promise",
-        ));
+    if !is_promise(ctx.heap, this) {
+        return Err(ctx.type_error("Promise.prototype.then requires a promise"));
     }
     let promise = this.as_object().expect("checked above");
     let handler = args.first().copied().unwrap_or_else(JsValue::undefined);
     let on_rejected = args.get(1).copied().unwrap_or_else(JsValue::undefined);
-    let prototype = heap.get(promise).prototype;
-    let derived = create_promise(heap, prototype, STATE_PENDING, JsValue::undefined());
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let prototype = ctx.heap.get(promise).prototype;
+    let derived = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
 
     let (state, payload) = {
-        let p = heap.get(promise);
+        let p = ctx.heap.get(promise);
         (
             p.properties[0].as_smi().unwrap_or(STATE_PENDING),
             p.properties[1],
@@ -152,15 +163,15 @@ pub fn promise_then(
     };
     match state {
         STATE_PENDING => {
-            let reactions = heap.get(promise).properties[2]
+            let reactions = ctx.heap.get(promise).properties[2]
                 .as_object()
                 .expect("promise carries a reactions array");
-            let record = heap.alloc(JsObject::ordinary(
+            let record = ctx.heap.alloc(JsObject::ordinary(
                 smallvec::smallvec![handler, on_rejected, JsValue::object(derived)],
                 smallvec::smallvec![None; 3],
             ));
-            heap.add_root(JsValue::object(record));
-            heap.get_mut(reactions)
+            ctx.heap.add_root(JsValue::object(record));
+            ctx.heap.get_mut(reactions)
                 .elements
                 .push(JsValue::object(record));
         }
@@ -186,20 +197,18 @@ pub fn promise_then(
 /// Throw completions from the callback are swallowed (Tier-0 reporting
 /// substrate does not exist yet).
 pub fn queue_microtask(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
+    _this: JsValue,
     args: &[JsValue],
-    sink: &Rc<RefCell<Vec<Job>>>,
 ) -> Result<JsValue, Throw> {
     let cb = args.first().copied().unwrap_or_else(JsValue::undefined);
     if cb.as_object().is_none() {
-        return Err(Throw::type_error(
-            heap,
-            "queueMicrotask requires a function",
-        ));
+        return Err(ctx.type_error("queueMicrotask requires a function"));
     }
     // Root the callback: the job outlives the program stack that referenced it.
-    heap.add_root(cb);
+    ctx.heap.add_root(cb);
     let cb_obj = cb.as_object().expect("checked above");
+    let sink = ctx.pending.clone().unwrap_or_default();
     sink.borrow_mut().push(Box::new(move |ctx| {
         let _ = ctx.call_object(cb_obj, JsValue::undefined(), &[]);
     }));
@@ -379,17 +388,16 @@ fn capability_settle(
 /// throws per spec (prepare_construct passes the constructor as `this`; a
 /// plain call's receiver never carries the construct target).
 pub fn promise_construct(
-    heap: &mut Heap,
-    pending: &Rc<RefCell<Vec<Job>>>,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let executor = args.first().copied().unwrap_or_else(JsValue::undefined);
     if !executor
         .as_object()
-        .is_some_and(|o| heap.get(o).kind == Kind::Function)
+        .is_some_and(|o| ctx.heap.get(o).kind == Kind::Function)
     {
-        return Err(Throw::type_error(heap, "Promise executor must be a function"));
+        return Err(ctx.type_error("Promise executor must be a function"));
     }
     let is_ctor = |heap: &Heap, v: JsValue| {
         v.as_object().is_some_and(|o| {
@@ -400,15 +408,12 @@ pub fn promise_construct(
             )
         })
     };
-    if !is_ctor(heap, this) {
-        return Err(Throw::type_error(
-            heap,
-            "Promise constructor requires 'new'",
-        ));
+    if !is_ctor(ctx.heap, this) {
+        return Err(ctx.type_error("Promise constructor requires 'new'"));
     }
     let ctor = this.as_object().expect("checked above");
-    let prototype = heap.get(ctor).prototype;
-    let promise = create_promise(heap, prototype, STATE_PENDING, JsValue::undefined());
+    let prototype = ctx.heap.get(ctor).prototype;
+    let promise = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
     let promise_v = JsValue::object(promise);
 
     // Capability: the resolve/reject function objects handed to the executor.
@@ -426,12 +431,13 @@ pub fn promise_construct(
         heap.add_root(JsValue::object(func));
         func
     };
-    let resolve_obj = alloc_capability(heap);
-    let reject_obj = alloc_capability(heap);
+    let resolve_obj = alloc_capability(ctx.heap);
+    let reject_obj = alloc_capability(ctx.heap);
     let resolve_v = JsValue::object(resolve_obj);
     let reject_v = JsValue::object(reject_obj);
+    let pending: Rc<RefCell<Vec<Job>>> = ctx.pending.clone().unwrap_or_default();
 
-    let sink = Rc::clone(pending);
+    let sink = Rc::clone(&pending);
     let p = promise_v;
     let rv = resolve_v;
     let jv = reject_v;
@@ -447,9 +453,9 @@ pub fn promise_construct(
             false,
         )
     });
-    heap.get_mut(resolve_obj).callable = v12_heap::FunctionTarget::Host(resolve_closure);
+    ctx.heap.get_mut(resolve_obj).callable = v12_heap::FunctionTarget::Host(resolve_closure);
 
-    let sink = Rc::clone(pending);
+    let sink = Rc::clone(&pending);
     let p = promise_v;
     let rv = resolve_v;
     let jv = reject_v;
@@ -465,14 +471,14 @@ pub fn promise_construct(
             true,
         )
     });
-    heap.get_mut(reject_obj).callable = v12_heap::FunctionTarget::Host(reject_closure);
+    ctx.heap.get_mut(reject_obj).callable = v12_heap::FunctionTarget::Host(reject_closure);
 
     // The executor joins the pending sink: it runs at the next checkpoint
     // (see the divergence note above). A throw from the executor rejects the
     // promise.
-    heap.add_root(executor);
+    ctx.heap.add_root(executor);
     let executor_obj = executor.as_object().expect("checked above");
-    let sink = Rc::clone(pending);
+    let sink = Rc::clone(&pending);
     pending.borrow_mut().push(Box::new(move |ctx: &mut JobCtx<'_, '_>| {
         match ctx.call_object(executor_obj, JsValue::undefined(), &[resolve_v, reject_v]) {
             Ok(_) => {}
@@ -494,11 +500,10 @@ pub fn promise_construct(
 
 /// `Promise.prototype.catch(on_rejected)`: `then(undefined, on_rejected)`.
 pub fn promise_catch(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
-    sink: &Rc<RefCell<Vec<Job>>>,
 ) -> Result<JsValue, Throw> {
     let on_rejected = args.first().copied().unwrap_or_else(JsValue::undefined);
-    promise_then(heap, this, &[JsValue::undefined(), on_rejected], sink)
+    promise_then(ctx, this, &[JsValue::undefined(), on_rejected])
 }
