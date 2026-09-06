@@ -864,7 +864,7 @@ mod tests {
         let heap = Heap::new(v12_heap::GcPolicy::NoGC);
         let shape = heap.root_shape();
         let mut ic = v12_interp::feedback::PolyIc::default();
-        ic.record(shape, 0);
+        ic.record(shape, v12_heap::PropKey::from_parts(false, 0), 0);
         fv.ics.insert(hdr + 2, ic);
         let mut p = Pipeline::new().unwrap();
         let (_c, deopt) = p.compile_with_feedback(&fb, Some(&fv)).unwrap();

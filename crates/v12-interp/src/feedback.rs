@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use v12_heap::{JsValue, ShapeHandle};
+use v12_heap::{JsValue, PropKey, ShapeHandle};
 
 /// Loop-iteration / function-entry count at which a function is reported as
 /// hot. 1024 iterations is the classic "this loop is worth compiling" signal:
@@ -23,11 +23,12 @@ use v12_heap::{JsValue, ShapeHandle};
 /// driver, low enough to fire within milliseconds of sustained heat.
 pub(crate) const FEEDBACK_TIER_UP_THRESHOLD: u16 = 1024;
 
-/// One inline-cache entry: the shape seen at the access and the slot its
-/// descriptor names. Every hit re-validates before trusting `slot`.
+/// One inline-cache entry: the shape and key seen at the access and the
+/// slot its descriptor names. Every hit re-validates before trusting `slot`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IcEntry {
     pub shape: ShapeHandle,
+    pub key: PropKey,
     pub slot: u32,
 }
 
@@ -47,35 +48,38 @@ pub struct PolyIc {
 }
 
 impl PolyIc {
-    /// Looks up `shape`; returns the cached slot on a hit.
+    /// Looks up `(shape, key)`; returns the cached slot on a hit. The key
+    /// check matters: one site can see many keys for one shape
+    /// (`obj[k]` with varying `k`), and a shape-only hit would return a
+    /// sibling property's slot.
     #[inline]
-    pub fn get(&self, shape: ShapeHandle) -> Option<u32> {
+    pub fn get(&self, shape: ShapeHandle, key: PropKey) -> Option<u32> {
         for e in self.entries.iter().flatten() {
-            if e.shape == shape {
+            if e.shape == shape && e.key == key {
                 return Some(e.slot);
             }
         }
         None
     }
 
-    /// Records a `(shape, slot)` observation. Monomorphic first entry, append
-    /// up to the cap, reset past it.
-    pub fn record(&mut self, shape: ShapeHandle, slot: u32) {
+    /// Records a `(shape, key, slot)` observation. Monomorphic first entry,
+    /// append up to the cap, reset past it.
+    pub fn record(&mut self, shape: ShapeHandle, key: PropKey, slot: u32) {
         // Refresh an existing entry (keeps the most recent slot for a shape).
         for e in self.entries.iter_mut().flatten() {
-            if e.shape == shape {
+            if e.shape == shape && e.key == key {
                 e.slot = slot;
                 return;
             }
         }
         for slot_opt in self.entries.iter_mut() {
             if slot_opt.is_none() {
-                *slot_opt = Some(IcEntry { shape, slot });
+                *slot_opt = Some(IcEntry { shape, key, slot });
                 return;
             }
         }
         // Full: reset to the newest observation only.
-        self.entries = [Some(IcEntry { shape, slot }), None, None];
+        self.entries = [Some(IcEntry { shape, key, slot }), None, None];
     }
 
     /// Number of populated entries.
@@ -614,22 +618,28 @@ mod tests {
 
         let mut ic = PolyIc::default();
         assert!(ic.is_empty());
-        assert_eq!(ic.get(s0), None);
+        let ka = v12_heap::PropKey::from_parts(false, 1);
+        let kb = v12_heap::PropKey::from_parts(false, 2);
+        let kc = v12_heap::PropKey::from_parts(false, 3);
+        let kd = v12_heap::PropKey::from_parts(false, 4);
+        assert_eq!(ic.get(s0, ka), None);
 
         // Monomorphic first entry.
-        ic.record(s0, 7);
-        assert_eq!(ic.get(s0), Some(7));
+        ic.record(s0, ka, 7);
+        assert_eq!(ic.get(s0, ka), Some(7));
+        // Same shape, different key: miss (sibling slot must not leak).
+        assert_eq!(ic.get(s0, kb), None);
         assert_eq!(ic.len(), 1);
 
         // Second distinct shape appends.
-        ic.record(s1, 9);
-        assert_eq!(ic.get(s0), Some(7));
-        assert_eq!(ic.get(s1), Some(9));
+        ic.record(s1, kb, 9);
+        assert_eq!(ic.get(s0, ka), Some(7));
+        assert_eq!(ic.get(s1, kb), Some(9));
         assert_eq!(ic.len(), 2);
 
         // Third distinct shape appends.
-        ic.record(s2, 11);
-        assert_eq!(ic.get(s2), Some(11));
+        ic.record(s2, kc, 11);
+        assert_eq!(ic.get(s2, kc), Some(11));
         assert_eq!(ic.len(), 3);
 
         // A fourth distinct shape resets to the newest entry only.
@@ -638,14 +648,14 @@ mod tests {
             v12_heap::PropKey::from_parts(false, 3),
             v12_heap::Attrs::DEFAULT,
         );
-        ic.record(s3, 13);
+        ic.record(s3, kd, 13);
         assert_eq!(ic.len(), 1);
-        assert_eq!(ic.get(s3), Some(13));
-        assert_eq!(ic.get(s0), None);
+        assert_eq!(ic.get(s3, kd), Some(13));
+        assert_eq!(ic.get(s0, ka), None);
 
         // Refreshing an existing shape keeps the entry count.
-        ic.record(s3, 14);
+        ic.record(s3, kd, 14);
         assert_eq!(ic.len(), 1);
-        assert_eq!(ic.get(s3), Some(14));
+        assert_eq!(ic.get(s3, kd), Some(14));
     }
 }

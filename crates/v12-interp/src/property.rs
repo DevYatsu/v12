@@ -592,7 +592,7 @@ impl Interp<'_> {
             .feedback
             .get(&site_fn)
             .and_then(|fv| fv.ics.get(&site_pc))
-            .and_then(|ic| ic.get(shape));
+            .and_then(|ic| ic.get(shape, key));
         if let Some(slot) = cached_slot
             && let Some(v) = self
                 .heap
@@ -626,7 +626,7 @@ impl Interp<'_> {
                             .ics
                             .entry(site_pc)
                             .or_default()
-                            .record(shape, slot);
+                            .record(shape, key, slot);
                     }
                     Ok(value)
                 }
