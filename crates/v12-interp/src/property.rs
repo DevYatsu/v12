@@ -105,6 +105,14 @@ impl Interp<'_> {
         {
             return Ok(self.map_set_method(id));
         }
+        // `String.prototype.length`: UTF-16 code-unit count, so an astral
+        // character (surrogate pair) contributes 2. `V12Str::len` already
+        // counts units, not code points — read it directly.
+        if kind == Kind::StringPrim && self.key_is(key_v, "length") {
+            let h = obj_v.as_string().expect("string primitive has a handle");
+            let len = self.heap.get(h).len();
+            return Ok(ops::box_number(len as f64));
+        }
         Ok(JsValue::undefined())
     }
 
