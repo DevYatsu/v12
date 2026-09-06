@@ -459,8 +459,8 @@ define_builtins! {
         "fromCodePoint" => StringFromCodePoint => |heap, this, args| call_ctx(string::string_from_code_point, heap, this, args),
     },
     Json {
-        "parse" => JsonParse => json::json_parse,
-        "stringify" => JsonStringify => json::json_stringify,
+        "parse" => JsonParse => |heap, this, args| call_ctx(json::json_parse, heap, this, args),
+        "stringify" => JsonStringify => |heap, this, args| call_ctx(json::json_stringify, heap, this, args),
     },
     BooleanProto {
         "toString" => BooleanProtoToString => |heap, this, args| call_ctx(boolean::boolean_proto_to_string, heap, this, args),

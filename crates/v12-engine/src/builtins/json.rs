@@ -1,8 +1,9 @@
 //! `JSON.parse` / `JSON.stringify`.
 
-use v12_heap::{Heap, JsObject, JsValue};
+use v12_heap::{Handle, JsObject, JsValue};
 use v12_native::Throw;
 
+use super::ctx::Ctx;
 use super::helpers;
 
 // -- parse --------------------------------------------------------------------
@@ -41,14 +42,14 @@ impl<'p> Parser<'p> {
         }
     }
 
-    fn value(&mut self, heap: &mut Heap) -> Result<JsValue, String> {
+    fn value(&mut self, ctx: &mut Ctx) -> Result<JsValue, String> {
         self.ws();
         match self.peek() {
-            Some(b'{') => self.object(heap),
-            Some(b'[') => self.array(heap),
+            Some(b'{') => self.object(ctx),
+            Some(b'[') => self.array(ctx),
             Some(b'"') => {
                 let s = self.string()?;
-                Ok(JsValue::string(heap.intern_text(&s)))
+                Ok(JsValue::string(ctx.heap.intern_text(&s)))
             }
             Some(b't') => self.literal("true", JsValue::from_bool(true)),
             Some(b'f') => self.literal("false", JsValue::from_bool(false)),
@@ -58,10 +59,9 @@ impl<'p> Parser<'p> {
         }
     }
 
-    fn object(&mut self, heap: &mut Heap) -> Result<JsValue, String> {
+    fn object(&mut self, ctx: &mut Ctx) -> Result<JsValue, String> {
         self.expect(b'{')?;
-        let obj = heap.alloc(JsObject::default());
-        heap.add_root(JsValue::object(obj));
+        let obj = ctx.alloc_obj(JsObject::default());
         self.ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -72,8 +72,8 @@ impl<'p> Parser<'p> {
             let key = self.string()?;
             self.ws();
             self.expect(b':')?;
-            let value = self.value(heap)?;
-            define_json_prop(heap, obj, &key, value);
+            let value = self.value(ctx)?;
+            define_json_prop(ctx, obj, &key, value);
             self.ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -86,20 +86,19 @@ impl<'p> Parser<'p> {
         }
     }
 
-    fn array(&mut self, heap: &mut Heap) -> Result<JsValue, String> {
+    fn array(&mut self, ctx: &mut Ctx) -> Result<JsValue, String> {
         self.expect(b'[')?;
         let items: Vec<JsValue> = Vec::new();
-        let arr = heap.alloc(JsObject::array(items));
-        heap.add_root(JsValue::object(arr));
+        let arr = ctx.alloc_obj(JsObject::array(items));
         self.ws();
         if self.peek() == Some(b']') {
             self.pos += 1;
             return Ok(JsValue::object(arr));
         }
         loop {
-            let value = self.value(heap)?;
-            let len = heap.get(arr).element_len() as u32;
-            heap.get_mut(arr).set_element(len, value);
+            let value = self.value(ctx)?;
+            let len = ctx.heap.get(arr).element_len() as u32;
+            ctx.heap.get_mut(arr).set_element(len, value);
             self.ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -211,13 +210,18 @@ impl<'p> Parser<'p> {
         }
         let text = std::str::from_utf8(&self.chars[start..self.pos]).map_err(|_| "Invalid number")?;
         text.parse::<f64>()
-            .map(super::helpers::js_number)
+            .map(helpers::js_number)
             .map_err(|_| "Invalid number".to_string())
     }
 }
 
 /// Defines a parsed property on a JSON object (plain shape transition).
-fn define_json_prop(heap: &mut Heap, obj: v12_heap::Handle<JsObject>, name: &str, value: JsValue) {
+///
+/// Keeps `Attrs::DEFAULT` (enumerable, writable, configurable): parsed
+/// properties are ordinary own properties, unlike `BUILTIN`-attr installs,
+/// so this deliberately does not route through `Ctx::define_data_prop`.
+fn define_json_prop(ctx: &mut Ctx, obj: Handle<JsObject>, name: &str, value: JsValue) {
+    let heap = &mut *ctx.heap;
     let h = if name.is_ascii() {
         heap.intern_string(v12_heap::V12Str::latin1_slice(name.as_bytes()))
     } else {
@@ -233,22 +237,24 @@ fn define_json_prop(heap: &mut Heap, obj: v12_heap::Handle<JsObject>, name: &str
 
 /// `JSON.parse(text)` – recursive-descent JSON to heap values. The `reviver`
 /// argument is not supported (it needs callback re-entry).
-pub fn json_parse(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn json_parse(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let text = match args.first() {
-        Some(&v) => helpers::value_text(heap, v),
+        Some(&v) => ctx.to_string(v),
         None => "undefined".to_string(),
     };
     let mut parser = Parser {
         chars: text.as_bytes(),
         pos: 0,
     };
-    let result = parser.value(heap).map_err(|msg| Throw::type_error(heap, format!("SyntaxError: {msg}")))?;
+    let result = parser
+        .value(ctx)
+        .map_err(|msg| ctx.syntax_error(format!("SyntaxError: {msg}")))?;
     parser.ws();
     if parser.pos != parser.chars.len() {
-        return Err(Throw::type_error(
-            heap,
-            format!("SyntaxError: Unexpected token at position {}", parser.pos),
-        ));
+        return Err(ctx.syntax_error(format!(
+            "SyntaxError: Unexpected token at position {}",
+            parser.pos
+        )));
     }
     Ok(result)
 }
@@ -278,14 +284,14 @@ fn quote(text: &str) -> String {
 
 /// Indent unit: `space` is either a string (truncated to 10) or a number of
 /// spaces (clamped to 10).
-fn indent_unit(space: Option<JsValue>, heap: &mut Heap) -> String {
+fn indent_unit(space: Option<JsValue>, ctx: &mut Ctx) -> String {
     match space {
         Some(v) if v.as_string().is_some() => {
-            let s = helpers::string_text(heap, v.as_string().expect("checked"));
-            s.chars().take(10).collect()
+            let h = v.as_string().expect("checked");
+            ctx.string_text(h).chars().take(10).collect()
         }
         Some(v) => {
-            let n = helpers::to_number(heap, v);
+            let n = ctx.to_number(v);
             if n.is_finite() && n > 0.0 {
                 " ".repeat((n as usize).min(10))
             } else {
@@ -296,18 +302,15 @@ fn indent_unit(space: Option<JsValue>, heap: &mut Heap) -> String {
     }
 }
 
-pub fn json_stringify(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn json_stringify(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or(JsValue::undefined());
-    let unit = indent_unit(args.get(2).copied(), heap);
+    let unit = indent_unit(args.get(2).copied(), ctx);
     let mut out = String::new();
-    let mut seen: Vec<v12_heap::Handle<JsObject>> = Vec::new();
-    match write_value(heap, value, &unit, 0, &mut out, &mut seen) {
-        Ok(true) => Ok(JsValue::string(heap.intern_text(&out))),
+    let mut seen: Vec<Handle<JsObject>> = Vec::new();
+    match write_value(ctx, value, &unit, 0, &mut out, &mut seen) {
+        Ok(true) => Ok(JsValue::string(ctx.heap.intern_text(&out))),
         Ok(false) => Ok(JsValue::undefined()),
-        Err(Cyclic) => Err(Throw::type_error(
-            heap,
-            "TypeError: Converting circular structure to JSON",
-        )),
+        Err(Cyclic) => Err(ctx.type_error("TypeError: Converting circular structure to JSON")),
     }
 }
 
@@ -323,15 +326,15 @@ struct Cyclic;
 /// not representable (functions, undefined — top-level or as an object
 /// property), `Err(Cyclic)` when `value` is already on the ancestor stack.
 fn write_value(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     value: JsValue,
     unit: &str,
     depth: usize,
     out: &mut String,
-    seen: &mut Vec<v12_heap::Handle<JsObject>>,
+    seen: &mut Vec<Handle<JsObject>>,
 ) -> Result<bool, Cyclic> {
     if let Some(h) = value.as_string() {
-        let text = helpers::string_text(heap, h);
+        let text = ctx.string_text(h);
         out.push_str(&quote(&text));
         return Ok(true);
     }
@@ -366,9 +369,11 @@ fn write_value(
         return Err(Cyclic);
     }
     seen.push(obj);
-    let result = match heap.get(obj).kind {
-        v12_heap::Kind::Array => write_array(heap, obj, unit, depth, out, seen),
-        _ => write_object(heap, obj, unit, depth, out, seen),
+    let is_array = ctx.heap.get(obj).kind == v12_heap::Kind::Array;
+    let result = if is_array {
+        write_array(ctx, obj, unit, depth, out, seen)
+    } else {
+        write_object(ctx, obj, unit, depth, out, seen)
     };
     seen.pop();
     result
@@ -382,14 +387,14 @@ fn newline_indent(unit: &str, depth: usize, out: &mut String) {
 }
 
 fn write_array(
-    heap: &mut Heap,
-    arr: v12_heap::Handle<JsObject>,
+    ctx: &mut Ctx,
+    arr: Handle<JsObject>,
     unit: &str,
     depth: usize,
     out: &mut String,
-    seen: &mut Vec<v12_heap::Handle<JsObject>>,
+    seen: &mut Vec<Handle<JsObject>>,
 ) -> Result<bool, Cyclic> {
-    let elems = heap.get(arr).elements_snapshot();
+    let elems = ctx.heap.get(arr).elements_snapshot();
     if elems.is_empty() {
         out.push_str("[]");
         return Ok(true);
@@ -404,7 +409,7 @@ fn write_array(
         // Arrays represent holes/undefined/functions as null; a cycle
         // still throws (propagated, not nulled).
         let mut buf = String::new();
-        match write_value(heap, v, unit, depth + 1, &mut buf, seen) {
+        match write_value(ctx, v, unit, depth + 1, &mut buf, seen) {
             Ok(true) => out.push_str(&buf),
             Ok(false) => out.push_str("null"),
             Err(cyclic) => return Err(cyclic),
@@ -416,30 +421,30 @@ fn write_array(
 }
 
 fn write_object(
-    heap: &mut Heap,
-    obj: v12_heap::Handle<JsObject>,
+    ctx: &mut Ctx,
+    obj: Handle<JsObject>,
     unit: &str,
     depth: usize,
     out: &mut String,
-    seen: &mut Vec<v12_heap::Handle<JsObject>>,
+    seen: &mut Vec<Handle<JsObject>>,
 ) -> Result<bool, Cyclic> {
     // Snapshot enumerable own string-keyed properties (handles first — the
     // conversion to text needs the heap mutably).
-    let shape = heap.shape_of(obj);
-    let mut pairs: Vec<(v12_heap::Handle<v12_heap::V12Str>, JsValue)> = Vec::new();
-    for desc in heap.get(shape).descriptors.as_slice() {
+    let shape = ctx.heap.shape_of(obj);
+    let mut pairs: Vec<(Handle<v12_heap::V12Str>, JsValue)> = Vec::new();
+    for desc in ctx.heap.get(shape).descriptors.as_slice() {
         if let Some(h) = desc.key().string()
             && desc.attrs().enumerable()
             && let Some(slot) = desc.slot()
-            && let Some(&v) = heap.get(obj).properties.get(slot as usize)
+            && let Some(&v) = ctx.heap.get(obj).properties.get(slot as usize)
         {
             pairs.push((h, v));
         }
     }
-    let mut entries: Vec<(String, JsValue)> = pairs
-        .into_iter()
-        .map(|(h, v)| (helpers::string_text(heap, h), v))
-        .collect();
+    let mut entries: Vec<(String, JsValue)> = Vec::with_capacity(pairs.len());
+    for (h, v) in pairs {
+        entries.push((ctx.string_text(h), v));
+    }
     if entries.is_empty() {
         out.push_str("{}");
         return Ok(true);
@@ -450,7 +455,7 @@ fn write_object(
         let mut buf = String::new();
         // undefined/function properties are skipped; a cycle throws
         // (propagated, not skipped).
-        match write_value(heap, v, unit, depth + 1, &mut buf, seen) {
+        match write_value(ctx, v, unit, depth + 1, &mut buf, seen) {
             Err(cyclic) => return Err(cyclic),
             Ok(false) => continue,
             Ok(true) => {}
