@@ -159,13 +159,41 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
                 promise::queue_microtask(&mut ctx, this, args)
             }
-            NativeId::RegExpExec => regexp::regexp_exec(heap, &self.regex_cache, this, args),
-            NativeId::RegExpTest => regexp::regexp_test(heap, &self.regex_cache, this, args),
-            NativeId::RegExpCompile => regexp::regexp_compile(heap, &self.regex_cache, this, args),
-            NativeId::StringMatch => string::string_match(heap, &self.regex_cache, this, args),
-            NativeId::StringReplace => string::string_replace(heap, &self.regex_cache, this, args),
-            NativeId::StringSearch => string::string_search(heap, &self.regex_cache, this, args),
-            NativeId::StringSplit => string::string_split(heap, &self.regex_cache, this, args),
+            NativeId::RegExpExec => {
+                let mut ctx =
+                    Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_exec(&mut ctx, this, args)
+            }
+            NativeId::RegExpTest => {
+                let mut ctx =
+                    Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_test(&mut ctx, this, args)
+            }
+            NativeId::RegExpCompile => {
+                let mut ctx =
+                    Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_compile(&mut ctx, this, args)
+            }
+            NativeId::StringMatch => {
+                let mut ctx =
+                    Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                string::string_match(&mut ctx, this, args)
+            }
+            NativeId::StringReplace => {
+                let mut ctx =
+                    Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                string::string_replace(&mut ctx, this, args)
+            }
+            NativeId::StringSearch => {
+                let mut ctx =
+                    Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                string::string_search(&mut ctx, this, args)
+            }
+            NativeId::StringSplit => {
+                let mut ctx =
+                    Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                string::string_split(&mut ctx, this, args)
+            }
             // 3. Runtime map (host functions) or "not registered".
             _ => self.dispatch(heap, this, args, id),
         }

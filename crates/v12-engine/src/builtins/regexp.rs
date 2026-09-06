@@ -1,14 +1,9 @@
 //! RegExp built-ins over the [`v12_regex`] wrapper (which wraps `regress`).
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): pure bodies
-//! (`regexp_construct`, `regexp_to_string`) take `&mut Ctx` and are reached
-//! through `ctx::call_ctx`. The stateful methods (`regexp_exec`,
-//! `regexp_test`, `regexp_compile`) keep the `(&mut Heap, &RegexCache, …)`
-//! shape — the per-registry compiled-pattern cache has no `Ctx` carrier yet,
-//! exactly like the pending-job side channel in `promise.rs` and the four
-//! deferred string regexp-cache methods in `string.rs`. Threading the cache
-//! through `Ctx` would force `string.rs`'s callers onto `Ctx` too; that
-//! reconciliation is left for the install/dispatch-collapse steps.
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3 + §8): all
+//! bodies take `&mut Ctx`. The per-registry compiled-pattern cache travels
+//! as a `Ctx` capability (`Ctx::with_regex_cache`, fed by the registry at
+//! dispatch); bodies clone the `Rc` out of the context.
 //!
 //! A RegExp object is a `Kind::RegExp` with `properties =
 //! [source, flags, lastIndex]`:
@@ -31,7 +26,7 @@ use std::rc::Rc;
 use v12_heap::{Handle, Heap, JsObject, JsValue, V12Str};
 use v12_native::Throw;
 
-use super::{ctx::Ctx, helpers, intern_type_error};
+use super::{ctx::Ctx, helpers};
 
 /// Compiled-regexp cache: object handle → compiled pattern. Owned by the
 /// registry so it survives GC (objects are traced strongly via the cache's
@@ -104,15 +99,6 @@ fn stringify_arg(ctx: &mut Ctx, v: JsValue) -> String {
         return String::new();
     }
     ctx.to_string(v)
-}
-
-/// `stringify_arg` for the stateful `(&mut Heap, &RegexCache, …)` path
-/// (`regexp_compile`), which cannot build a `Ctx` carrying the cache.
-fn stringify_heap(heap: &mut Heap, v: JsValue) -> String {
-    if v.is_undefined() {
-        return String::new();
-    }
-    helpers::value_text(heap, v)
 }
 
 /// Validates and canonicalizes a flag string into `"dgimsuvy"` order.
@@ -220,52 +206,55 @@ pub fn set_last_index(heap: &mut Heap, obj: Handle<JsObject>, v: f64) {
 /// (`[0]` = whole match, `[1..n]` = capture groups, plus `index`, `input`,
 /// and `groups` properties).
 pub fn regexp_exec(
-    heap: &mut Heap,
-    cache: &RegexCache,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(
-        heap,
+    let obj = ctx.this_object(
         this,
         "RegExp.prototype.exec",
         Some(v12_heap::Kind::RegExp),
     )?;
     let input_text = args
         .first()
-        .map(|v| helpers::value_text(heap, *v))
+        .map(|v| ctx.to_string(*v))
         .unwrap_or_default();
     let input_units: Vec<u16> = input_text.encode_utf16().collect();
 
-    let (source, flags) = regexp_source_flags(heap, obj);
+    let (source, flags) = regexp_source_flags(ctx.heap, obj);
     let _ = source;
     let is_global = flags.contains('g');
     let is_sticky = flags.contains('y');
-    let mut start = last_index(heap, obj);
+    let mut start = last_index(ctx.heap, obj);
     if !is_global && !is_sticky {
         start = 0.0;
     }
     // Spec: lastIndex beyond the input length fails immediately.
     if start > input_units.len() as f64 {
         if is_global || is_sticky {
-            set_last_index(heap, obj, 0.0);
+            set_last_index(ctx.heap, obj, 0.0);
         }
         return Ok(JsValue::null());
     }
-    let compiled = compile_for(cache, heap, obj)
-        .map_err(|e| intern_type_error(heap, &format!("SyntaxError: {e}")))?;
+    let cache = ctx
+        .regex_cache()
+        .expect("registry feeds the regex cache at dispatch");
+    let compiled = compile_for(&cache, ctx.heap, obj).map_err(|e| {
+        let h = ctx.heap.intern_text(&format!("SyntaxError: {e}"));
+        JsValue::string(h)
+    })?;
     let m = compiled.exec(&input_units, start as usize);
     match m {
         None => {
             if is_global || is_sticky {
-                set_last_index(heap, obj, 0.0);
+                set_last_index(ctx.heap, obj, 0.0);
             }
             Ok(JsValue::null())
         }
         Some(m) => {
             // Sticky: the match must start exactly at `lastIndex`.
             if is_sticky && m.start() != start as usize {
-                set_last_index(heap, obj, 0.0);
+                set_last_index(ctx.heap, obj, 0.0);
                 return Ok(JsValue::null());
             }
             if is_global || is_sticky {
@@ -276,9 +265,9 @@ pub fn regexp_exec(
                 } else {
                     m.end() as f64
                 };
-                set_last_index(heap, obj, next);
+                set_last_index(ctx.heap, obj, next);
             }
-            Ok(match_result(heap, &m, &input_units, &input_text))
+            Ok(match_result(ctx, &m, &input_units, &input_text))
         }
     }
 }
@@ -286,7 +275,7 @@ pub fn regexp_exec(
 /// Builds the `exec` result array: `[whole, ...groups]` with `index`,
 /// `input`, and `groups` (named captures) properties.
 fn match_result(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     m: &v12_regex::Match,
     input_units: &[u16],
     input_text: &str,
@@ -300,55 +289,55 @@ fn match_result(
                     .iter()
                     .map(|&u| char::from_u32(u32::from(u)).unwrap_or('\u{FFFD}'))
                     .collect();
-                elements.push(JsValue::string(heap.intern_text(&text)));
+                elements.push(JsValue::string(ctx.heap.intern_text(&text)));
             }
             None => elements.push(JsValue::undefined()),
         }
     }
-    let arr = helpers::alloc_obj(heap, JsObject::array(elements));
+    let arr = ctx.alloc_obj(JsObject::array(elements));
     // `index`, `input` named properties via shape transitions. Build the
     // shape as root → length → index → input so the array's `length` stays at
     // physical slot 0 (the interpreter's array fast path reads
     // `properties[0]` for length) and the named props land at slots 1/2.
-    let length_key = heap.intern_text("length");
-    let index_key = heap.intern_text("index");
-    let input_key = heap.intern_text("input");
-    let shape0 = heap.root_shape();
-    let shape_len = heap.add_property(
+    let length_key = ctx.heap.intern_text("length");
+    let index_key = ctx.heap.intern_text("index");
+    let input_key = ctx.heap.intern_text("input");
+    let shape0 = ctx.heap.root_shape();
+    let shape_len = ctx.heap.add_property(
         shape0,
         v12_heap::PropKey::from_string(length_key),
         v12_heap::Attrs::DEFAULT,
     );
-    let shape_idx = heap.add_property(
+    let shape_idx = ctx.heap.add_property(
         shape_len,
         v12_heap::PropKey::from_string(index_key),
         v12_heap::Attrs::DEFAULT,
     );
-    let shape_in = heap.add_property(
+    let shape_in = ctx.heap.add_property(
         shape_idx,
         v12_heap::PropKey::from_string(input_key),
         v12_heap::Attrs::DEFAULT,
     );
-    heap.bind_shape(arr, shape_in);
+    ctx.heap.bind_shape(arr, shape_in);
     // `properties[0]` is the length Smi (from `JsObject::array`); slots 1/2
     // get index/input.
-    if heap.get(arr).properties.len() < 3 {
-        heap.get_mut(arr).properties.resize(3, JsValue::undefined());
-        heap.get_mut(arr).property_keys.resize(3, None);
+    if ctx.heap.get(arr).properties.len() < 3 {
+        ctx.heap.get_mut(arr).properties.resize(3, JsValue::undefined());
+        ctx.heap.get_mut(arr).property_keys.resize(3, None);
     }
-    heap.get_mut(arr).properties[1] = helpers::smi_or_f64(m.start() as i64);
-    heap.get_mut(arr).properties[2] = JsValue::string(heap.intern_text(input_text));
+    ctx.heap.get_mut(arr).properties[1] = helpers::smi_or_f64(m.start() as i64);
+    let input_h = ctx.heap.intern_text(input_text);
+    ctx.heap.get_mut(arr).properties[2] = JsValue::string(input_h);
     JsValue::object(arr)
 }
 
 /// `RegExp.prototype.test(string)` — `Boolean(exec(string))`.
 pub fn regexp_test(
-    heap: &mut Heap,
-    cache: &RegexCache,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    match regexp_exec(heap, cache, this, args)? {
+    match regexp_exec(ctx, this, args)? {
         v if v.is_null() => Ok(JsValue::false_()),
         _ => Ok(JsValue::true_()),
     }
@@ -372,13 +361,11 @@ pub fn regexp_to_string(
 
 /// `RegExp.prototype.compile` — legacy recompile-in-place (Annex B).
 pub fn regexp_compile(
-    heap: &mut Heap,
-    cache: &RegexCache,
+    ctx: &mut Ctx,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(
-        heap,
+    let obj = ctx.this_object(
         this,
         "RegExp.prototype.compile",
         Some(v12_heap::Kind::RegExp),
@@ -386,15 +373,15 @@ pub fn regexp_compile(
     let (source_text, flags_text) = match (args.first(), args.get(1)) {
         (Some(first), None) => {
             if let Some(src_obj) = first.as_object()
-                && heap.get(src_obj).kind == v12_heap::Kind::RegExp
+                && ctx.heap.get(src_obj).kind == v12_heap::Kind::RegExp
             {
-                let (s, f) = regexp_source_flags(heap, src_obj);
+                let (s, f) = regexp_source_flags(ctx.heap, src_obj);
                 (s, f)
             } else {
-                (stringify_heap(heap, *first), String::new())
+                (stringify_arg(ctx, *first), String::new())
             }
         }
-        (Some(first), Some(flags)) => (stringify_heap(heap, *first), stringify_heap(heap, *flags)),
+        (Some(first), Some(flags)) => (stringify_arg(ctx, *first), stringify_arg(ctx, *flags)),
         _ => (String::new(), String::new()),
     };
     let source_text = if source_text.is_empty() {
@@ -402,14 +389,18 @@ pub fn regexp_compile(
     } else {
         source_text
     };
-    let flags_text = canonicalize_flags(&flags_text)
-        .map_err(|e| intern_type_error(heap, &format!("SyntaxError: {e}")))?;
-    let source_h = heap.intern_text(&source_text);
-    let flags_h = heap.intern_text(&flags_text);
-    heap.get_mut(obj).properties[SLOT_SOURCE] = JsValue::string(source_h);
-    heap.get_mut(obj).properties[SLOT_FLAGS] = JsValue::string(flags_h);
-    heap.get_mut(obj).properties[SLOT_LAST_INDEX] = JsValue::from_i32_smi(0).expect("0 fits Smi");
+    let flags_text = canonicalize_flags(&flags_text).map_err(|e| {
+        let h = ctx.heap.intern_text(&format!("SyntaxError: {e}"));
+        JsValue::string(h)
+    })?;
+    let source_h = ctx.heap.intern_text(&source_text);
+    let flags_h = ctx.heap.intern_text(&flags_text);
+    ctx.heap.get_mut(obj).properties[SLOT_SOURCE] = JsValue::string(source_h);
+    ctx.heap.get_mut(obj).properties[SLOT_FLAGS] = JsValue::string(flags_h);
+    ctx.heap.get_mut(obj).properties[SLOT_LAST_INDEX] = JsValue::from_i32_smi(0).expect("0 fits Smi");
     // Drop any cached compilation for this object.
-    cache.borrow_mut().remove(&obj.index());
+    if let Some(cache) = ctx.regex_cache() {
+        cache.borrow_mut().remove(&obj.index());
+    }
     Ok(this)
 }

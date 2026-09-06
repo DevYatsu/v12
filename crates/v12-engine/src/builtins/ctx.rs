@@ -25,6 +25,10 @@ pub struct Ctx<'a> {
     pub global: Option<Handle<JsObject>>,
     /// Job-enqueue side channel shared with the engine's job queue.
     pub pending: Option<Rc<RefCell<Vec<Job>>>>,
+    /// Compiled-regexp cache (per-registry). `None` for pure builtins that
+    /// never touch RegExp; the registry feeds its cache in at dispatch for
+    /// the 7 regexp-backed methods (plan §8).
+    pub regex_cache: Option<super::regexp::RegexCache>,
 }
 
 impl<'a> Ctx<'a> {
@@ -38,7 +42,20 @@ impl<'a> Ctx<'a> {
             heap,
             global,
             pending,
+            regex_cache: None,
         }
+    }
+
+    /// Feeds the per-registry compiled-regexp cache (builder; plan §8).
+    pub fn with_regex_cache(mut self, cache: super::regexp::RegexCache) -> Self {
+        self.regex_cache = Some(cache);
+        self
+    }
+
+    /// Cloned compiled-regexp cache, when the dispatcher supplied one.
+    #[must_use]
+    pub fn regex_cache(&self) -> Option<super::regexp::RegexCache> {
+        self.regex_cache.clone()
     }
 
     // -- realm / intrinsic readers ---------------------------------------
@@ -487,12 +504,9 @@ impl<'a> Ctx<'a> {
         );
     }
 
-    /// Realm helper for per-call rest-array identity (plan §5 step 4): today
-    /// this only resolves the `Array` constructor value via the
-    /// `GLOBAL_INTRINSICS` slot reader, so call sites stop hardcoding the
-    /// raw slot-1 index read. Full move-to-construction-time is deferred (see
-    /// `alloc_rest_array`): the own `constructor` install needs shape
-    /// machinery owned by the interpreter.
+    /// Realm helper resolving the `Array` constructor value via the
+    /// `GLOBAL_INTRINSICS` slot reader (centralized here so call sites never
+    /// hardcode the raw slot index).
     pub fn array_ctor_value(&self) -> Option<JsValue> {
         self.intrinsic("Array")
     }

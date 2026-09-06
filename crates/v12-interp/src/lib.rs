@@ -76,7 +76,7 @@ use std::time::Instant;
 use v12_bytecode::{FunctionBytecode, Opcode};
 use v12_bytecode::{GLOBAL_INTRINSICS as GLOBAL_INTRINSIC_NAMES, GLOBAL_VAR_OFFSET};
 use v12_heap::{
-    Attrs, Descriptor, Handle, Heap, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
+    Attrs, Handle, Heap, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
 };
 
 #[cfg(test)]
@@ -788,51 +788,6 @@ impl<'a> Interp<'a> {
             self.heap.add_root(val);
             fr.arguments = Some(val);
         }
-    }
-
-    /// Gives a freshly built rest array its `Array` identity without
-    /// touching the general property surfaces: links `[[Prototype]]` to
-    /// `Array.prototype` when resolvable, and installs an own `constructor`
-    /// pointing at the `Array` constructor so `rest.constructor === Array`.
-    pub(crate) fn wire_rest_array_identity(&mut self, h: Handle<JsObject>) {
-        let Some(global) = self.global else { return };
-        let arr_ctor_v = match self.heap.get(global).properties.get(1).copied() {
-            Some(v) if v.as_object().is_some() => v,
-            _ => return,
-        };
-        let Some(arr_ctor) = arr_ctor_v.as_object() else {
-            return;
-        };
-        let array_proto = {
-            let shape = self.shape_of(arr_ctor);
-            let proto_key = self.prototype_key();
-            match self.heap.lookup_property(shape, proto_key) {
-                Some(Descriptor::Data { slot, .. }) => self
-                    .heap
-                    .get(arr_ctor)
-                    .properties
-                    .get(*slot as usize)
-                    .copied()
-                    .and_then(|v| v.as_object()),
-                _ => None,
-            }
-        };
-        if let Some(p) = array_proto {
-            self.heap.get_mut(h).prototype = Some(p);
-        }
-        // Park the array on the stack: interning `constructor` and the shape
-        // transition below can allocate and collect while `h` is otherwise
-        // unanchored (callers store it only after this returns).
-        self.stack.push(JsValue::object(h));
-        self.gc_protect();
-        let key = JsValue::string(self.heap.intern_text("constructor"));
-        let installed = self.set_property(JsValue::object(h), key, arr_ctor_v);
-        debug_assert!(
-            installed.is_ok(),
-            "constructor install on a fresh rest array cannot fail"
-        );
-        let _ = installed;
-        self.stack.pop();
     }
 
     /// Installs tier-transition hooks invoked between frame completions.

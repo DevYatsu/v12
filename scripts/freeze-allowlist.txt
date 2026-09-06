@@ -19,7 +19,6 @@ PK_PUSH crates/v12-interp/src/property.rs:777 # generic set-property fallback; s
 # --- PROP_GET1: hardcoded `properties.get(1)` slot reads (target: Ctx realm/intrinsic reader, §1.1) ---
 PROP_GET1 crates/v12-heap/src/object.rs:585 # promise_value helper reading the value slot; centralize into Ctx in step 2
 PROP_GET1 crates/v12-engine/src/builtins/string.rs:320 # match-index read in string builtin; replace with Ctx accessor in step 3
-PROP_GET1 crates/v12-interp/src/lib.rs:799 # Array-constructor slot read at realm setup; centralize into Ctx in step 2
 PROP_GET1 crates/v12-interp/src/call_setup.rs:1773 # iterator-result `done` slot read; replace with Ctx accessor in step 3
 
 # --- ERR_VAL: stringly `error_value("` construction (target: ctx.{type,range,syntax,reference}_error, §4.2) ---
