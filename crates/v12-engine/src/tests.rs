@@ -234,8 +234,9 @@ mod builtin_tests {
             crate::builtins::number::number_is_nan(&mut heap, JsValue::undefined(), &[nan])
                 .unwrap();
         assert_eq!(is_nan.as_bool(), Some(true));
+        let mut ctx = crate::builtins::Ctx::new(&mut heap, None, None);
         let abs = crate::builtins::math::math_abs(
-            &mut heap,
+            &mut ctx,
             JsValue::undefined(),
             &[JsValue::from_i32_smi(-5).unwrap()],
         )

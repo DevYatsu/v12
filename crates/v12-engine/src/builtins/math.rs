@@ -1,48 +1,54 @@
 //! Math built-ins.
+//!
+//! Phase 3 step 2 migration (`docs/builtins-arch-plan.md` §5.3): pure
+//! builtins that ignore `this`. Bodies take `&mut Ctx`; the legacy
+//! `&mut Heap` dispatch site reaches them through `ctx::call_ctx`, so
+//! dispatch IDs and install paths are unchanged.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use v12_heap::{Heap, JsValue};
+use v12_heap::JsValue;
 use v12_native::Throw;
 
+use super::ctx::Ctx;
 use super::helpers;
 
 /// Fast-forward the first argument's `f64` (defaulting absent to `undefined`,
 /// i.e. NaN via `to_number`), feeding every math built-in a single input.
-fn one_arg(heap: &mut Heap, args: &[JsValue]) -> f64 {
+fn one_arg(ctx: &mut Ctx, args: &[JsValue]) -> f64 {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
-    helpers::to_number(heap, v)
+    ctx.to_number(v)
 }
 
 /// `Math.abs(x)` – absolute value; `Math.abs(NaN)` is NaN.
-pub fn math_abs(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = one_arg(heap, args);
+pub fn math_abs(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = one_arg(ctx, args);
     Ok(helpers::js_number(n.abs()))
 }
 
 /// `Math.floor(x)` – greatest integer ≤ x.
-pub fn math_floor(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = one_arg(heap, args);
+pub fn math_floor(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = one_arg(ctx, args);
     Ok(helpers::js_number(n.floor()))
 }
 
 /// `Math.ceil(x)` – smallest integer ≥ x.
-pub fn math_ceil(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = one_arg(heap, args);
+pub fn math_ceil(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = one_arg(ctx, args);
     Ok(helpers::js_number(n.ceil()))
 }
 
 /// `Math.trunc(x)` – integral part, toward zero.
-pub fn math_trunc(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = one_arg(heap, args);
+pub fn math_trunc(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = one_arg(ctx, args);
     Ok(helpers::js_number(n.trunc()))
 }
 
 /// `Math.round(x)` – round toward +∞ on the half (ES: `Math.round(-0.5)` is
 /// `-0`, `Math.round(0.5)` is `1`). Rust's `f64::round` rounds half away from
 /// zero, so floor(x + 0.5) is used instead; the 0.0 early-return preserves ±0.
-pub fn math_round(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let x = one_arg(heap, args);
+pub fn math_round(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let x = one_arg(ctx, args);
     Ok(helpers::js_number(round_half_up(x)))
 }
 
@@ -59,8 +65,8 @@ fn round_half_up(x: f64) -> f64 {
 }
 
 /// `Math.sqrt(x)` – non-negative square root; negative input → NaN.
-pub fn math_sqrt(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = one_arg(heap, args);
+pub fn math_sqrt(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = one_arg(ctx, args);
     if n < 0.0 {
         return Ok(JsValue::from_f64(f64::NAN));
     }
@@ -69,21 +75,21 @@ pub fn math_sqrt(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<Js
 
 /// `Math.pow(x, y)` – x raised to the y-th power. Rust's `powf` follows IEEE
 /// 754, which matches ES (including `Math.pow(NaN, 0) === 1`).
-pub fn math_pow(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let x = one_arg(heap, args);
+pub fn math_pow(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let x = one_arg(ctx, args);
     let y = args.get(1).copied().unwrap_or(JsValue::undefined());
-    let y = helpers::to_number(heap, y);
+    let y = ctx.to_number(y);
     Ok(JsValue::from_f64(x.powf(y)))
 }
 
 /// `Math.max(...)` – largest argument; no args → -Infinity; any NaN → NaN.
-pub fn math_max(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn math_max(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     if args.is_empty() {
         return Ok(JsValue::from_f64(f64::NEG_INFINITY));
     }
     let mut max = f64::NEG_INFINITY;
     for &a in args {
-        let n = helpers::to_number(heap, a);
+        let n = ctx.to_number(a);
         if n.is_nan() {
             return Ok(JsValue::from_f64(f64::NAN));
         }
@@ -95,13 +101,13 @@ pub fn math_max(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsV
 }
 
 /// `Math.min(...)` – smallest argument; no args → +Infinity; any NaN → NaN.
-pub fn math_min(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn math_min(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     if args.is_empty() {
         return Ok(JsValue::from_f64(f64::INFINITY));
     }
     let mut min = f64::INFINITY;
     for &a in args {
-        let n = helpers::to_number(heap, a);
+        let n = ctx.to_number(a);
         if n.is_nan() {
             return Ok(JsValue::from_f64(f64::NAN));
         }
@@ -119,7 +125,11 @@ static RNG_STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
 /// `Math.random()` – a deterministic, seeded number in [0, 1). A xorshift step
 /// advances the state on every call.
-pub fn math_random(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn math_random(
+    _ctx: &mut Ctx,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let mut x = RNG_STATE.load(Ordering::Relaxed);
     // xorshift: three inline shifts cover the state space, no final multiply.
     x ^= x << 13;
@@ -139,8 +149,8 @@ macro_rules! unary_math {
     ( $( $name:ident => $method:ident => $op:expr ),* $(,)? ) => {
         $(
             #[doc = concat!("`Math.", stringify!($method), "(x)` – the Rust `f64::", stringify!($op), "` subset of ES `Math.", stringify!($method), "`.")]
-            pub fn $name(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-                let n = one_arg(heap, args);
+            pub fn $name(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+                let n = one_arg(ctx, args);
                 let f: fn(f64) -> f64 = $op;
                 Ok(helpers::js_number(f(n)))
             }
@@ -172,22 +182,22 @@ unary_math! {
 }
 
 /// `Math.atan2(y, x)` – two-argument arc tangent, NaN-propagating.
-pub fn math_atan2(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let y = one_arg(heap, args);
+pub fn math_atan2(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let y = one_arg(ctx, args);
     let x = args
         .get(1)
         .copied()
-        .map(|v| helpers::to_number(heap, v))
+        .map(|v| ctx.to_number(v))
         .unwrap_or(f64::NAN);
     Ok(helpers::js_number(y.atan2(x)))
 }
 
 /// `Math.hypot(...values)` – `ToNumber` each argument, then the Euclidean
 /// norm; `Math.hypot()` is `+0` and any NaN/±∞ dominates per IEEE.
-pub fn math_hypot(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn math_hypot(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let mut sum = 0.0f64;
     for &v in args {
-        let n = helpers::to_number(heap, v);
+        let n = ctx.to_number(v);
         if n.is_infinite() {
             return Ok(JsValue::from_f64(f64::INFINITY));
         }
@@ -197,26 +207,26 @@ pub fn math_hypot(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<J
 }
 
 /// `Math.clz32(x)` – count leading zero bits of `ToUint32(x)`.
-pub fn math_clz32(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = one_arg(heap, args);
+pub fn math_clz32(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = one_arg(ctx, args);
     Ok(helpers::js_number(f64::from((n as u32).leading_zeros())))
 }
 
 /// `Math.imul(x, y)` – 32-bit integer multiply (wrapping).
-pub fn math_imul(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let a = one_arg(heap, args);
+pub fn math_imul(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let a = one_arg(ctx, args);
     let b = args
         .get(1)
         .copied()
-        .map(|v| helpers::to_number(heap, v))
+        .map(|v| ctx.to_number(v))
         .unwrap_or(f64::NAN);
     let product = (a as i32).wrapping_mul(b as i32);
     Ok(helpers::js_number(f64::from(product)))
 }
 
 /// `Math.fround(x)` – round to the nearest IEEE binary32 value.
-pub fn math_fround(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let n = one_arg(heap, args);
+pub fn math_fround(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = one_arg(ctx, args);
     Ok(helpers::js_number(f64::from(n as f32)))
 }
 
@@ -230,7 +240,7 @@ macro_rules! math_const {
     ( $( $name:ident => $method:ident => $value:expr ),* $(,)? ) => {
         $(
             #[doc = concat!("`Math.", stringify!($method), "` – the constant, installed as a data property via `install_value`.")]
-            pub fn $name(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+            pub fn $name(_ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
                 Ok(JsValue::from_f64($value))
             }
         )*
