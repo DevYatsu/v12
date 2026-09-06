@@ -302,6 +302,12 @@ impl Interp<'_> {
                 // program.
                 let funcs = self.functions_for_program(func_program);
                 if (fn_idx as usize) >= funcs.len() {
+                    // Out-of-range accessor target: route known natives
+                    // through the single `dispatch_native` router; unknown
+                    // indices keep the historical `undefined` result.
+                    if let Ok(native_fn) = NativeId::try_from(fn_idx) {
+                        return self.dispatch_native(native_fn, this, args);
+                    }
                     return Ok(JsValue::undefined());
                 }
                 let callee_max_regs = funcs[fn_idx as usize].max_regs;
