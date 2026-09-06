@@ -186,7 +186,7 @@ fn dense_bound(heap: &mut Heap, obj: Handle<JsObject>, len: i64) -> i64 {
             if text.len() <= 10 && !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
             {
                 if let Ok(n) = text.parse::<i64>() {
-                    bound = bound.max(n + 1);
+                    bound = bound.max(n.saturating_add(1));
                 }
             }
         }
@@ -240,6 +240,18 @@ fn set_array_len(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
     // must not materialize the flat store toward a huge `length` (a single
     // `resize` toward 2^32 entries OOMs the runner). Only touch the store
     // near actually-stored data.
+    // A zero length clears the view without materializing index 0.
+    if len == 0 {
+        let key = length_prop(heap);
+        let shape = heap.shape_of(obj);
+        if let Some(desc) = heap.lookup_property(shape, key)
+            && let Some(slot) = desc.slot()
+            && let Some(cell) = heap.get_mut(obj).properties.get_mut(slot as usize)
+        {
+            *cell = helpers::smi_or_f64(0);
+        }
+        return;
+    }
     let store_len = heap.get(obj).element_len() as u64;
     if u64::from(len) <= store_len + MAX_WRITE_SPAN as u64 {
         write_index(heap, obj, len.saturating_sub(1), JsValue::undefined());
@@ -334,6 +346,9 @@ pub fn array_last_index_of(
         return Ok(JsValue::from_i32_smi(-1).unwrap_or_else(|| JsValue::from_f64(-1.0)));
     }
     let dense = dense_bound(heap, obj, len);
+    if len <= 0 || dense <= 0 {
+        return Ok(JsValue::from_i32_smi(-1).unwrap_or_else(|| JsValue::from_f64(-1.0)));
+    }
     let mut from = relative_index(args.get(1).copied(), len, len - 1).min(dense - 1);
     if from >= dense {
         from = dense - 1;
@@ -497,7 +512,9 @@ pub fn array_splice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<
     next.extend(args.iter().skip(2).copied());
     next.extend_from_slice(&elems[start + delete_count..]);
     heap.get_mut(obj).replace_elements(next);
-    set_array_len(heap, obj, (len - delete_count as i64 + args.len().saturating_sub(2) as i64) as u32);
+    let new_len = (len - delete_count as i64 + args.len().saturating_sub(2) as i64)
+        .clamp(0, i64::from(u32::MAX)) as u32;
+    set_array_len(heap, obj, new_len);
     Ok(new_array(heap, removed))
 }
 

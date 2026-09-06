@@ -2,8 +2,18 @@
 //!
 //! v1: symbols are fresh heap handles (`V12Symbol` is an opaque unit —
 //! identity is the handle). Descriptions and the `Symbol.for` registry are
-//! not modeled; well-known symbols return fresh symbols (still `typeof`
-/// `"symbol"`, which is what the conformance slices probe first).
+//! not modeled.
+//!
+//! Well-known singleton contract: the JS-visible identity of
+//! `Symbol.iterator` is owned by the interpreter realm — its
+//! `symbol_iterator_surface` answers the read with the realm's
+//! lazily-allocated, rooted handle *before* shape lookup, so
+//! `Symbol.iterator === Symbol.iterator` holds without engine caching.
+//! The engine-side [`symbol_well_known`] handler below only runs if the
+//! installed native is explicitly *called* (normal property reads never
+//! invoke it); it is shared by all twelve well-known ids, so it cannot key
+//! a per-name cache itself — per-name singletons belong to the
+//! install/dispatch layer (`install_value`-style installs), not here.
 
 use v12_heap::{Heap, JsValue};
 use v12_native::Throw;
@@ -86,8 +96,12 @@ pub fn symbol_proto_description(
     Ok(JsValue::undefined())
 }
 
-/// Well-known symbols: each returns a fresh symbol (v1 — `typeof` correct,
-/// identity singletons deferred).
+/// Well-known symbols: each call mints a fresh symbol. This handler only
+/// runs if the installed native is explicitly called — normal
+/// `Symbol.<name>` reads never reach it (`Symbol.iterator` is answered by
+/// the interpreter realm's singleton surface before shape lookup, so
+/// `===` identity holds at the JS level). Shared by all well-known ids, so
+/// per-name singleton caching must live in the install/dispatch layer.
 pub fn symbol_well_known(
     heap: &mut Heap,
     _this: JsValue,

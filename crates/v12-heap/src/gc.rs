@@ -286,9 +286,9 @@ pub struct Heap {
     /// `Realm::new`, including the primary realm's global). The interpreter
     /// treats these like its own global: their var slots share the
     /// `GLOBAL_VAR_OFFSET` bias and their intrinsic reads fall back to the
-    /// fixed prefix slots. Pure metadata — the handles are kept alive by
-    /// their owning realm's roots, not by this vec. Documented behavior for
-    /// now: the vec grows without bound (no deregistration on realm drop).
+    /// fixed prefix slots. Traced as roots at every collection start so the
+    /// handles stay live; remove entries with
+    /// [`Heap::deregister_realm_global`] when a realm is destroyed.
     realm_globals: Vec<Handle<JsObject>>,
 
     policy: GcPolicy,
@@ -352,16 +352,25 @@ impl Heap {
 
     /// Registers a realm global created on this heap (see
     /// [`Heap::realm_globals`]). Called for every [`Realm::new`], including
-    /// the primary realm. No deregistration: entries accumulate for the
-    /// heap's lifetime (documented behavior for now).
+    /// the primary realm. Entries are traced as GC roots; call
+    /// [`Heap::deregister_realm_global`] when a realm is destroyed so the
+    /// vec does not grow without bound.
     pub fn register_realm_global(&mut self, global: Handle<JsObject>) {
         if !self.realm_globals.contains(&global) {
             self.realm_globals.push(global);
         }
     }
 
+    /// Removes a realm global from the registry (realm teardown). No-op
+    /// when the handle is not registered.
+    pub fn deregister_realm_global(&mut self, global: Handle<JsObject>) {
+        if let Some(pos) = self.realm_globals.iter().position(|&g| g == global) {
+            self.realm_globals.remove(pos);
+        }
+    }
+
     /// The realm globals registered on this heap (every `Realm::new`,
-    /// primary included; unbounded, no deregistration — see
+    /// primary included; traced as roots — see
     /// [`Heap::realm_globals`] field docs).
     pub fn realm_globals(&self) -> &[Handle<JsObject>] {
         &self.realm_globals
@@ -1043,6 +1052,12 @@ impl Heap {
         for &shape_root in &self.shape_roots {
             collector.mark(Space::Shapes, shape_root.index());
         }
+        // Realm globals are GC roots: destroying a realm must go through
+        // `deregister_realm_global`, otherwise a collected global's slot
+        // could be reused while this vec still names it (stale handle).
+        for &global in &self.realm_globals {
+            collector.mark(Space::Objects, global.index());
+        }
         // Canonical string instances are permanent roots: the interning
         // table promises deduplication for the heap's whole lifetime, so a
         // canonical instance can never be reclaimed while the table stands.
@@ -1677,5 +1692,20 @@ mod tests {
         let q = heap.alloc(JsObject::default());
         assert_eq!(heap.get(q).flags, 0);
         assert_eq!(heap.get(q).validity_cell, ValidityCellId::NONE);
+    }
+
+    #[test]
+    fn realm_globals_survive_collection_until_deregistered() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let g = heap.alloc(JsObject::default());
+        heap.register_realm_global(g);
+        heap.force_collect();
+        // Traced as a root: still live without an explicit `add_root`.
+        assert!(heap.alive[crate::handle::Space::Objects.as_index()][g.slot()]);
+        heap.deregister_realm_global(g);
+        assert!(heap.realm_globals().is_empty());
+        heap.force_collect();
+        // No longer rooted: reclaimed.
+        assert!(!heap.alive[crate::handle::Space::Objects.as_index()][g.slot()]);
     }
 }

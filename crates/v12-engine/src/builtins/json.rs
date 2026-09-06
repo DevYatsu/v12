@@ -301,15 +301,27 @@ pub fn json_stringify(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Resu
     let unit = indent_unit(args.get(2).copied(), heap);
     let mut out = String::new();
     let mut seen: Vec<v12_heap::Handle<JsObject>> = Vec::new();
-    if write_value(heap, value, &unit, 0, &mut out, &mut seen) {
-        Ok(JsValue::string(heap.intern_text(&out)))
-    } else {
-        Ok(JsValue::undefined())
+    match write_value(heap, value, &unit, 0, &mut out, &mut seen) {
+        Ok(true) => Ok(JsValue::string(heap.intern_text(&out))),
+        Ok(false) => Ok(JsValue::undefined()),
+        Err(Cyclic) => Err(Throw::type_error(
+            heap,
+            "TypeError: Converting circular structure to JSON",
+        )),
     }
 }
 
-/// Writes `value`; returns false when the value is not representable
-/// (functions, undefined — top-level or as an object property).
+/// Cycle marker, distinct from "not representable" (`Ok(false)`).
+/// A cyclic input must `Throw` a TypeError (the spec's
+/// `SerializeJSONProperty` stack check), not stringify as `undefined` /
+/// `null` or skip the property. `write_*` propagate `Err(Cyclic)` outward;
+/// only the top-level `json_stringify` converts it to a `Throw` (the
+/// partial `out` buffer is discarded).
+struct Cyclic;
+
+/// Writes `value`; `Ok(true)` when written, `Ok(false)` when the value is
+/// not representable (functions, undefined — top-level or as an object
+/// property), `Err(Cyclic)` when `value` is already on the ancestor stack.
 fn write_value(
     heap: &mut Heap,
     value: JsValue,
@@ -317,11 +329,11 @@ fn write_value(
     depth: usize,
     out: &mut String,
     seen: &mut Vec<v12_heap::Handle<JsObject>>,
-) -> bool {
+) -> Result<bool, Cyclic> {
     if let Some(h) = value.as_string() {
         let text = helpers::string_text(heap, h);
         out.push_str(&quote(&text));
-        return true;
+        return Ok(true);
     }
     if let Some(n) = value.as_smi().map(f64::from).or(value.as_f64()) {
         if n.is_finite() {
@@ -330,27 +342,28 @@ fn write_value(
             out.push('n');
             out.push_str("ull");
         }
-        return true;
+        return Ok(true);
     }
     if value.is_true() {
         out.push_str("true");
-        return true;
+        return Ok(true);
     }
     if value.is_false() {
         out.push_str("false");
-        return true;
+        return Ok(true);
     }
     if value.is_null() {
         out.push_str("null");
-        return true;
+        return Ok(true);
     }
     let Some(obj) = value.as_object() else {
         // undefined, symbols, functions: not representable.
-        return false;
+        return Ok(false);
     };
-    // Cycle detection: an object being written must not re-enter.
+    // Cycle detection: an object already on the ancestor stack re-entering
+    // is a circular structure (a `Throw`), not a skip.
     if seen.contains(&obj) {
-        return false;
+        return Err(Cyclic);
     }
     seen.push(obj);
     let result = match heap.get(obj).kind {
@@ -375,11 +388,11 @@ fn write_array(
     depth: usize,
     out: &mut String,
     seen: &mut Vec<v12_heap::Handle<JsObject>>,
-) -> bool {
+) -> Result<bool, Cyclic> {
     let elems = heap.get(arr).elements_snapshot();
     if elems.is_empty() {
         out.push_str("[]");
-        return true;
+        return Ok(true);
     }
     out.push('[');
     for (i, &v) in elems.iter().enumerate() {
@@ -388,17 +401,18 @@ fn write_array(
         }
         newline_indent(unit, depth + 1, out);
         let v = if v.is_hole() { JsValue::null() } else { v };
-        // Arrays represent holes/undefined/functions as null.
+        // Arrays represent holes/undefined/functions as null; a cycle
+        // still throws (propagated, not nulled).
         let mut buf = String::new();
-        if write_value(heap, v, unit, depth + 1, &mut buf, seen) {
-            out.push_str(&buf);
-        } else {
-            out.push_str("null");
+        match write_value(heap, v, unit, depth + 1, &mut buf, seen) {
+            Ok(true) => out.push_str(&buf),
+            Ok(false) => out.push_str("null"),
+            Err(cyclic) => return Err(cyclic),
         }
     }
     newline_indent(unit, depth, out);
     out.push(']');
-    true
+    Ok(true)
 }
 
 fn write_object(
@@ -408,7 +422,7 @@ fn write_object(
     depth: usize,
     out: &mut String,
     seen: &mut Vec<v12_heap::Handle<JsObject>>,
-) -> bool {
+) -> Result<bool, Cyclic> {
     // Snapshot enumerable own string-keyed properties (handles first — the
     // conversion to text needs the heap mutably).
     let shape = heap.shape_of(obj);
@@ -428,14 +442,18 @@ fn write_object(
         .collect();
     if entries.is_empty() {
         out.push_str("{}");
-        return true;
+        return Ok(true);
     }
     out.push('{');
     let mut first = true;
     for (name, v) in entries {
         let mut buf = String::new();
-        if !write_value(heap, v, unit, depth + 1, &mut buf, seen) {
-            continue; // undefined/function properties are skipped
+        // undefined/function properties are skipped; a cycle throws
+        // (propagated, not skipped).
+        match write_value(heap, v, unit, depth + 1, &mut buf, seen) {
+            Err(cyclic) => return Err(cyclic),
+            Ok(false) => continue,
+            Ok(true) => {}
         }
         if !first {
             out.push(',');
@@ -452,9 +470,9 @@ fn write_object(
     if first {
         out.clear();
         out.push_str("{}");
-        return true;
+        return Ok(true);
     }
     newline_indent(unit, depth, out);
     out.push('}');
-    true
+    Ok(true)
 }

@@ -55,11 +55,19 @@ pub fn boolean_proto_to_string(
     Ok(JsValue::string(heap.intern_text(text)))
 }
 
-/// `Boolean.prototype.valueOf` – the primitive receiver itself.
+/// `Boolean.prototype.valueOf` – the primitive receiver itself. A
+/// non-Boolean receiver throws (no unchecked `this` passthrough).
 pub fn boolean_proto_value_of(
-    _heap: &mut Heap,
+    heap: &mut Heap,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    Ok(this)
+    if this.is_true() || this.is_false() {
+        Ok(this)
+    } else {
+        Err(Throw::type_error(
+            heap,
+            "TypeError: Boolean.prototype.valueOf requires that 'this' be a Boolean",
+        ))
+    }
 }

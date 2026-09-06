@@ -74,24 +74,9 @@ impl Interp<'_> {
                 // the nested program registers into this interpreter's
                 // cross-program table and its closures stay callable here.
                 let args_start = callee_slot + 2;
-                let source = self
-                    .stack
-                    .get(args_start)
-                    .and_then(|v| v.as_string())
-                    .map(|h| self.string_text(h))
-                    .unwrap_or_default();
-                let programs = self.programs();
-                self.gc_protect();
-                let result = self.natives.eval(
-                    self.heap,
-                    &source,
-                    this_v,
-                    Some(target_global),
-                    programs,
-                );
-                return result
-                    .map(CallOutcome::Value)
-                    .map_err(|t| JSException::from_throw(self.heap, t));
+                let source = self.realm_eval_source(self.stack.get(args_start).copied());
+                let result = self.run_realm_eval(&source, this_v, target_global);
+                return result.map(CallOutcome::Value);
             }
         };
 
@@ -513,16 +498,8 @@ impl Interp<'_> {
             v12_heap::FunctionTarget::RealmEval(target_global) => {
                 // Cross-realm eval invoked as an accessor: run the source
                 // argument against the captured realm's global.
-                let source = args
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|h| self.string_text(h))
-                    .unwrap_or_default();
-                let programs = self.programs();
-                self.gc_protect();
-                self.natives
-                    .eval(self.heap, &source, this, Some(target_global), programs)
-                    .map_err(|t| JSException::from_throw(self.heap, t))
+                let source = self.realm_eval_source(args.first().copied());
+                self.run_realm_eval(&source, this, target_global)
             }
             v12_heap::FunctionTarget::Bytecode(fn_idx) => {
                 // A compiled accessor body: push a frame directly (this runs
@@ -603,16 +580,8 @@ impl Interp<'_> {
             }
             v12_heap::FunctionTarget::RealmEval(target_global) => {
                 // Cross-realm eval invoked via the inline-call path.
-                let source = args
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|h| self.string_text(h))
-                    .unwrap_or_default();
-                let programs = self.programs();
-                self.gc_protect();
-                self.natives
-                    .eval(self.heap, &source, this, Some(target_global), programs)
-                    .map_err(|t| JSException::from_throw(self.heap, t))
+                let source = self.realm_eval_source(args.first().copied());
+                self.run_realm_eval(&source, this, target_global)
             }
             v12_heap::FunctionTarget::Bytecode(fn_idx) => {
                 // Interpreter-internal natives (generator next/return/throw,
@@ -976,8 +945,32 @@ impl Interp<'_> {
     /// `text` conventionally follows the `"TypeError: msg"` spelling; the part
     /// before the first `": "` becomes the error `name`, the rest the
     /// `message`. A plain text with no separator gets name `"Error"`.
-    pub(crate) fn error_value(&mut self, text: &str) -> JsValue {
-        let (name, message) = match text.split_once(": ") {
+    /// Extracts the eval source from an optional first argument (non-string
+    /// or missing reads as empty, matching the direct-eval seam).
+    pub(crate) fn realm_eval_source(&mut self, first_arg: Option<JsValue>) -> String {
+        first_arg
+            .and_then(|v| v.as_string())
+            .map(|h| self.string_text(h))
+            .unwrap_or_default()
+    }
+
+    /// Runs cross-realm eval (`FunctionTarget::RealmEval`): compiles and runs
+    /// `source` against `target_global` via the shared eval seam so the
+    /// nested program registers into this interpreter's cross-program table.
+    pub(crate) fn run_realm_eval(
+        &mut self,
+        source: &str,
+        this: JsValue,
+        target_global: Handle<JsObject>,
+    ) -> Result<JsValue, JSException> {
+        let programs = self.programs();
+        self.gc_protect();
+        self.natives
+            .eval(self.heap, source, this, Some(target_global), programs)
+            .map_err(|t| JSException::from_throw(self.heap, t))
+    }
+
+    pub(crate) fn error_value(&mut self, text: &str) -> JsValue {        let (name, message) = match text.split_once(": ") {
             Some((n, m)) => (n, m),
             None => ("Error", text),
         };
@@ -1055,23 +1048,9 @@ impl Interp<'_> {
             v12_heap::FunctionTarget::RealmEval(target_global) => {
                 // Cross-realm eval invoked via call/apply: run the source
                 // argument against the captured realm's global.
-                let source = args_vec
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|h| self.string_text(h))
-                    .unwrap_or_default();
-                let programs = self.programs();
-                self.gc_protect();
-                let result = self.natives.eval(
-                    self.heap,
-                    &source,
-                    this_v,
-                    Some(target_global),
-                    programs,
-                );
-                return result
-                    .map(CallOutcome::Value)
-                    .map_err(|t| JSException::from_throw(self.heap, t));
+                let source = self.realm_eval_source(args_vec.first().copied());
+                let result = self.run_realm_eval(&source, this_v, target_global);
+                return result.map(CallOutcome::Value);
             }
         };
         let callee_funcs = self.functions_for_program(callee_program);
@@ -1501,7 +1480,7 @@ impl Interp<'_> {
                 let text = self.string_text(h);
                 if !text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit()) {
                     if let Ok(n) = text.parse::<u64>() {
-                        bound = bound.max(n + 1);
+                        bound = bound.max(n.saturating_add(1));
                     }
                 }
             }
@@ -1753,11 +1732,9 @@ impl Interp<'_> {
             args.get(1).copied().unwrap_or(JsValue::undefined())
         };
         // Drain via the registry `next` (reads/publishes iterator state).
-        let next_fn = self.map_set_method(NativeId::IteratorNext);
-        let Some(next_obj) = next_fn.as_object() else {
-            return Err(JSException(self.error_value("InternalError: missing next")));
-        };
-        self.stack.push(JsValue::object(next_obj));
+        // A bounded drain: an unbounded iterator is a RangeError rather
+        // than a silent truncation.
+        const MAX_ITERATOR_DRAIN: usize = 1_000_000;
         let mut values: Vec<JsValue> = Vec::new();
         loop {
             self.gc_protect();
@@ -1770,11 +1747,12 @@ impl Interp<'_> {
             }
             let v = self.heap.get(ro).properties.first().copied().unwrap_or(JsValue::undefined());
             values.push(v);
-            if values.len() > 1_000_000 {
-                break;
+            if values.len() > MAX_ITERATOR_DRAIN {
+                return Err(JSException(
+                    self.error_value("RangeError: iterator drain exceeds 1,000,000 values"),
+                ));
             }
         }
-        self.stack.pop();
         let mut mapped: Vec<JsValue> = Vec::new();
         let mut acc: Option<JsValue> = if id == NativeId::IteratorReduce {
             match args.get(1).copied() {

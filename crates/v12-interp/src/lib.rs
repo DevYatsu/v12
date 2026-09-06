@@ -155,6 +155,8 @@ fn intrinsic_slot(text: &str) -> Option<usize> {
         "Error" => Some(intrinsic_idx("Error").expect("intrinsic 'Error' present")),
         "TypeError" => Some(intrinsic_idx("TypeError").expect("intrinsic 'TypeError' present")),
         "RangeError" => Some(intrinsic_idx("RangeError").expect("intrinsic 'RangeError' present")),
+        "ReferenceError" => Some(intrinsic_idx("ReferenceError").expect("intrinsic 'ReferenceError' present")),
+        "SyntaxError" => Some(intrinsic_idx("SyntaxError").expect("intrinsic 'SyntaxError' present")),
         "Promise" => Some(PROMISE_IDX.expect("intrinsic 'Promise' present")),
         "Symbol" => Some(SYMBOL_IDX.expect("intrinsic 'Symbol' present")),
         "Map" => Some(intrinsic_idx("Map").expect("intrinsic 'Map' present")),

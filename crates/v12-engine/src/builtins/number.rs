@@ -455,12 +455,14 @@ fn format_scientific(n: f64, fraction_digits: Option<usize>) -> String {
 }
 
 /// `Number.prototype.valueOf` – the primitive receiver itself (wrapper
-/// objects are not modeled; plain numbers return unchanged).
+/// objects are not modeled). A non-Number receiver throws (no unchecked
+/// `this` passthrough).
 pub fn number_proto_value_of(
-    _heap: &mut Heap,
+    heap: &mut Heap,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    this_number(heap, this, "valueOf")?;
     Ok(this)
 }
 

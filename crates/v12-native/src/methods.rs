@@ -94,6 +94,11 @@ crate::builtin_methods! {
         pop => ArrayPop,
         join => ArrayJoin,
         slice => ArraySlice,
+        // `sort` is the live install path (the interpreter's
+        // `array_instance_surface` resolves it via this table): JS calls
+        // dispatch to the interpreter's comparator-capable
+        // `array_sort_callback` seam first; the engine registry function is
+        // only the non-callback fallback for direct registry calls.
         sort => ArraySort,
         entries => ArrayIteratorEntries,
         keys => ArrayIteratorKeys,

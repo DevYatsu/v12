@@ -58,8 +58,8 @@ pub const NATIVE_IMPORT_INDEX: u16 = 254;
 pub const NATIVE_IMPORT_INDEX_U32: u32 = NATIVE_IMPORT_INDEX as u32;
 
 /// Native index for `Object.enumerableOwnKeys` - returns array of own enumerable property keys.
-/// Must match the index registered in `v12_engine::builtins::mod.rs` (1901).
-pub const NATIVE_OBJECT_ENUMERABLE_OWN_KEYS: u32 = 1901;
+/// Must match `v12_native::NativeId::ObjectEnumerableOwnKeys` (1003).
+pub const NATIVE_OBJECT_ENUMERABLE_OWN_KEYS: u32 = 1003;
 
 // ---------------------------------------------------------------------------
 // Interner

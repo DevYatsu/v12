@@ -109,6 +109,57 @@ pub fn object_entries(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Resu
     Ok(JsValue::object(arr))
 }
 
+/// Internal `for-in` helper: own *enumerable* string keys in spec order
+/// (array indices ascending, then named keys in insertion order).
+/// `null`/`undefined` yield an empty array (the loop body never runs).
+/// Dispatch-only (never installed on a JS object); see the bare entries in
+/// `define_builtins!`.
+pub fn object_enumerable_own_keys(
+    heap: &mut Heap,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let Some(obj) = args.first().and_then(|v| v.as_object()) else {
+        return Ok(array_value(heap, Vec::new()));
+    };
+    let mut items: Vec<JsValue> = Vec::new();
+    // Integer-indexed elements (array indices come first, ascending).
+    let o = heap.get(obj);
+    if o.kind == v12_heap::Kind::Array {
+        let len = o.element_len() as u32;
+        for i in 0..len {
+            items.push(JsValue::string(heap.intern_text(&i.to_string())));
+        }
+    } else {
+        let elems = o.elements.clone();
+        for (i, v) in elems.iter().enumerate() {
+            if !v.is_hole() {
+                items.push(JsValue::string(heap.intern_text(&(i as u32).to_string())));
+            }
+        }
+    }
+    // Named string keys, enumerable only (data or accessor alike).
+    // Arrays carry a `length` shape descriptor (installed with default
+    // attrs); per spec `length` is non-enumerable, so skip it here.
+    let shape = heap.shape_of(obj);
+    let is_array = heap.get(obj).kind == v12_heap::Kind::Array;
+    let handles: Vec<v12_heap::Handle<v12_heap::V12Str>> = heap
+        .get(shape)
+        .descriptors
+        .as_slice()
+        .iter()
+        .filter(|d| d.attrs().enumerable())
+        .filter_map(|d| d.key().string())
+        .collect();
+    for h in handles {
+        if is_array && helpers::string_text(heap, h) == "length" {
+            continue;
+        }
+        items.push(JsValue::string(h));
+    }
+    Ok(array_value(heap, items))
+}
+
 pub fn object_has_own_property(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let this_obj = this.as_object().ok_or_else(|| Throw::type_error(heap, "Object.prototype.hasOwnProperty called on non-object"))?;
     let key = args.first().copied().unwrap_or(JsValue::undefined());
@@ -239,19 +290,23 @@ pub fn object_assign(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Resul
                 }
             }
         }
-        // Named properties: snapshot first (defines may allocate), copying
-        // only the enumerable ones.
+        // Named properties: snapshot from the shape descriptors (the shape
+        // is authoritative — values defined via [[DefineOwnProperty]] never
+        // touch the parallel `property_keys` vec), copying only the
+        // enumerable ones. Snapshot first: defines may allocate.
         let shape = heap.shape_of(src);
-        let mut pairs: Vec<(PropKey, JsValue)> = Vec::new();
-        {
-            let o = heap.get(src);
-            for (k, v) in o.property_keys.iter().zip(o.properties.iter()) {
-                if let Some(pk) = k
-                    && let Some(desc) = heap.lookup_property(shape, *pk)
-                    && desc.attrs().enumerable()
-                {
-                    pairs.push((*pk, *v));
-                }
+        let slots: Vec<(PropKey, u32)> = heap
+            .get(shape)
+            .descriptors
+            .as_slice()
+            .iter()
+            .filter(|d| d.attrs().enumerable())
+            .filter_map(|d| d.slot().map(|slot| (d.key(), slot)))
+            .collect();
+        let mut pairs: Vec<(PropKey, JsValue)> = Vec::with_capacity(slots.len());
+        for (pk, slot) in slots {
+            if let Some(&v) = heap.get(src).properties.get(slot as usize) {
+                pairs.push((pk, v));
             }
         }
         for (pk, value) in pairs {

@@ -534,6 +534,7 @@ define_builtins! {
     RegExpConstruct => regexp::regexp_construct,
     RegExpToString => regexp::regexp_to_string,
     ModuleImport => module_import,
+    ObjectEnumerableOwnKeys => object::object_enumerable_own_keys,
 }
 
 /// Installs the core built-ins into `registry`.

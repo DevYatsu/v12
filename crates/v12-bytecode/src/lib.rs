@@ -306,6 +306,8 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
     "Error",
     "TypeError",
     "RangeError",
+    "ReferenceError",
+    "SyntaxError",
     "Promise",
     "Symbol",
     "Map",

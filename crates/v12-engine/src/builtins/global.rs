@@ -59,12 +59,16 @@ fn decode(heap: &mut Heap, text: &str, component_only: bool, what: &str) -> Resu
             return Err(Throw::type_error(heap, format!("URIError: {what} malformed percent-encoding")));
         };
         if !component_only {
-            // decodeURI must not decode characters that encodeURI keeps:
-            // reserved (';/?:@&=+$,#') and '#' (already in the reserved set).
+            // decodeURI must not decode escapes for characters that
+            // encodeURI leaves unencoded (reserved `;/?:@&=+$,#`): the
+            // original `%XX` passes through verbatim (original case kept),
+            // per spec — it is not a URIError.
             if matches!(decoded,
                 b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#')
             {
-                return Err(Throw::type_error(heap, format!("URIError: {what} reserved character")));
+                out.extend_from_slice(&bytes[i..i + 3]);
+                i += 3;
+                continue;
             }
         }
         out.push(decoded);
