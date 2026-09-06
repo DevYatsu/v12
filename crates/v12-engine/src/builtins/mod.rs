@@ -428,35 +428,35 @@ define_builtins! {
         "toString" => FunctionProtoToString => |heap, this, args| call_ctx(object::function_proto_to_string, heap, this, args),
     },
     StringProto {
-        "charAt" => StringCharAt => string::string_char_at,
-        "slice" => StringSlice => string::string_slice,
-        "charCodeAt" => StringCharCodeAt => string::string_char_code_at,
-        "codePointAt" => StringCodePointAt => string::string_code_point_at,
-        "at" => StringAt => string::string_at,
-        "indexOf" => StringIndexOf => string::string_index_of,
-        "lastIndexOf" => StringLastIndexOf => string::string_last_index_of,
-        "includes" => StringIncludes => string::string_includes,
-        "startsWith" => StringStartsWith => string::string_starts_with,
-        "endsWith" => StringEndsWith => string::string_ends_with,
-        "concat" => StringConcat => string::string_concat,
-        "repeat" => StringRepeat => string::string_repeat,
-        "padStart" => StringPadStart => string::string_pad_start,
-        "padEnd" => StringPadEnd => string::string_pad_end,
-        "trim" => StringTrim => string::string_trim,
-        "trimStart" => StringTrimStart => string::string_trim_start,
-        "trimEnd" => StringTrimEnd => string::string_trim_end,
-        "toLowerCase" => StringToLowerCase => string::string_to_lower_case,
-        "toUpperCase" => StringToUpperCase => string::string_to_upper_case,
-        "substring" => StringSubstring => string::string_substring,
-        "substr" => StringSubstr => string::string_substr,
-        "toString" => StringToString => string::string_to_string,
-        "valueOf" => StringValueOf => string::string_value_of,
-        "localeCompare" => StringLocaleCompare => string::string_locale_compare,
-        "replaceAll" => StringReplaceAll => string::string_replace_all,
+        "charAt" => StringCharAt => |heap, this, args| call_ctx(string::string_char_at, heap, this, args),
+        "slice" => StringSlice => |heap, this, args| call_ctx(string::string_slice, heap, this, args),
+        "charCodeAt" => StringCharCodeAt => |heap, this, args| call_ctx(string::string_char_code_at, heap, this, args),
+        "codePointAt" => StringCodePointAt => |heap, this, args| call_ctx(string::string_code_point_at, heap, this, args),
+        "at" => StringAt => |heap, this, args| call_ctx(string::string_at, heap, this, args),
+        "indexOf" => StringIndexOf => |heap, this, args| call_ctx(string::string_index_of, heap, this, args),
+        "lastIndexOf" => StringLastIndexOf => |heap, this, args| call_ctx(string::string_last_index_of, heap, this, args),
+        "includes" => StringIncludes => |heap, this, args| call_ctx(string::string_includes, heap, this, args),
+        "startsWith" => StringStartsWith => |heap, this, args| call_ctx(string::string_starts_with, heap, this, args),
+        "endsWith" => StringEndsWith => |heap, this, args| call_ctx(string::string_ends_with, heap, this, args),
+        "concat" => StringConcat => |heap, this, args| call_ctx(string::string_concat, heap, this, args),
+        "repeat" => StringRepeat => |heap, this, args| call_ctx(string::string_repeat, heap, this, args),
+        "padStart" => StringPadStart => |heap, this, args| call_ctx(string::string_pad_start, heap, this, args),
+        "padEnd" => StringPadEnd => |heap, this, args| call_ctx(string::string_pad_end, heap, this, args),
+        "trim" => StringTrim => |heap, this, args| call_ctx(string::string_trim, heap, this, args),
+        "trimStart" => StringTrimStart => |heap, this, args| call_ctx(string::string_trim_start, heap, this, args),
+        "trimEnd" => StringTrimEnd => |heap, this, args| call_ctx(string::string_trim_end, heap, this, args),
+        "toLowerCase" => StringToLowerCase => |heap, this, args| call_ctx(string::string_to_lower_case, heap, this, args),
+        "toUpperCase" => StringToUpperCase => |heap, this, args| call_ctx(string::string_to_upper_case, heap, this, args),
+        "substring" => StringSubstring => |heap, this, args| call_ctx(string::string_substring, heap, this, args),
+        "substr" => StringSubstr => |heap, this, args| call_ctx(string::string_substr, heap, this, args),
+        "toString" => StringToString => |heap, this, args| call_ctx(string::string_to_string, heap, this, args),
+        "valueOf" => StringValueOf => |heap, this, args| call_ctx(string::string_value_of, heap, this, args),
+        "localeCompare" => StringLocaleCompare => |heap, this, args| call_ctx(string::string_locale_compare, heap, this, args),
+        "replaceAll" => StringReplaceAll => |heap, this, args| call_ctx(string::string_replace_all, heap, this, args),
     },
     StringCtor {
-        "fromCharCode" => StringFromCharCode => string::string_from_char_code,
-        "fromCodePoint" => StringFromCodePoint => string::string_from_code_point,
+        "fromCharCode" => StringFromCharCode => |heap, this, args| call_ctx(string::string_from_char_code, heap, this, args),
+        "fromCodePoint" => StringFromCodePoint => |heap, this, args| call_ctx(string::string_from_code_point, heap, this, args),
     },
     Json {
         "parse" => JsonParse => json::json_parse,
@@ -488,7 +488,7 @@ define_builtins! {
         "description" => SymbolProtoDescription => symbol::symbol_proto_description,
     };
     // Truly internal / non-JS-visible dispatch-only natives (not installed).
-    StringConstruct => string_construct,
+    StringConstruct => |heap, this, args| call_ctx(string_construct, heap, this, args),
     NumberConstruct => |heap, this, args| call_ctx(number::number_construct, heap, this, args),
     BooleanConstruct => |heap, this, args| call_ctx(boolean::boolean_construct, heap, this, args),
     ErrorCreate => error::error_create,
@@ -543,12 +543,12 @@ define_builtins! {
 ///
 /// `String(x)`: ES ToString subset for the callable `String` intrinsic.
 /// The realm points the `String` placeholder's `elements[0]` at this index.
-fn string_construct(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+fn string_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let text = match args.first() {
-        Some(&v) => helpers::value_text(heap, v),
+        Some(&v) => ctx.to_string(v),
         None => "undefined".to_string(),
     };
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
 /// `Array.prototype.join(separator?)`: element display strings joined by

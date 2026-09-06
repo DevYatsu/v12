@@ -1,16 +1,29 @@
 //! String built-ins.
+//!
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): pure bodies
+//! take `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
+//! `ctx::call_ctx`. The regexp-backed methods (`match`, `replace`, `search`,
+//! `split`) keep the stateful `(&mut Heap, &RegexCache, …)` shape — the
+//! per-registry compiled-pattern cache has no `Ctx` carrier yet, exactly like
+//! the pending-job side channel in `promise.rs` — and are untouched here.
 
 use v12_heap::{Handle, Heap, JsValue, V12Str};
 use v12_native::Throw;
 
-use super::{helpers, regexp};
+use super::{ctx::Ctx, helpers, regexp};
 
 /// The `this` string primitive, or a `TypeError` naming `method`.
-fn this_string(heap: &mut Heap, this: JsValue, method: &str) -> Result<Handle<V12Str>, Throw> {
+fn this_string(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<Handle<V12Str>, Throw> {
+    this.as_string()
+        .ok_or_else(|| ctx.type_error(format!("{method} called on non-string")))
+}
+
+/// The `this` string primitive for the stateful regexp-backed methods below,
+/// which keep the `(&mut Heap, &RegexCache, …)` shape (see module docs).
+fn this_string_heap(heap: &mut Heap, this: JsValue, method: &str) -> Result<Handle<V12Str>, Throw> {
     this.as_string()
         .ok_or_else(|| Throw::type_error(heap, format!("{method} called on non-string")))
 }
-
 /// The regexp argument as a compiled-regexp object, or `None` when the
 /// argument is not an object of `Kind::RegExp` (callers fall back to plain
 /// text matching).
@@ -20,28 +33,29 @@ fn as_regexp(heap: &Heap, v: Option<&JsValue>) -> Option<Handle<v12_heap::JsObje
 }
 
 /// `String.prototype.charAt(index)` – returns a single-character string.
-pub fn string_char_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let handle = this_string(heap, this, "String.prototype.charAt")?;
+pub fn string_char_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let handle = this_string(ctx, this, "String.prototype.charAt")?;
     let index = args.first().and_then(to_index).unwrap_or(0);
-    let units = string_units(heap, handle);
+    let units = string_units(&mut *ctx.heap, handle);
     let unit = match units.get(index as usize) {
         Some(&unit) => vec![unit],
         None => Vec::new(),
     };
-    let h = heap.intern_string(v12_heap::V12Str::utf16(unit));
+    let h = ctx.heap.intern_string(v12_heap::V12Str::utf16(unit));
     Ok(JsValue::string(h))
 }
 
 /// `String.prototype.slice(start, end)` – returns a sliced view.
-pub fn string_slice(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let handle = this_string(heap, this, "String.prototype.slice")?;
-    let len = heap.get(handle).len() as i64;
+pub fn string_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let handle = this_string(ctx, this, "String.prototype.slice")?;
+    let len = ctx.heap.get(handle).len() as i64;
     let start = args.first().and_then(to_integer).unwrap_or(0);
     let end = args.get(1).and_then(to_integer).unwrap_or(len);
     let from = clamp_index(start, len) as u32;
     let to = clamp_index(end, len) as u32;
     let (from, to) = if from > to { (to, to) } else { (from, to) };
     let slice_len = to.saturating_sub(from);
+    let heap = &mut *ctx.heap;
     let Some(sliced) = heap.slice_string(handle, from, slice_len) else {
         let h = heap.intern_string(v12_heap::V12Str::latin1(Vec::new()));
         return Ok(JsValue::string(h));
@@ -184,7 +198,7 @@ pub fn string_match(
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let handle = this_string(heap, this, "String.prototype.match")?;
+    let handle = this_string_heap(heap, this, "String.prototype.match")?;
     let text = helpers::string_text(heap, handle);
     let Some(re) = as_regexp(heap, args.first()) else {
         // Non-regexp argument: ToString and return a single-match array.
@@ -228,7 +242,7 @@ pub fn string_replace(
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let handle = this_string(heap, this, "String.prototype.replace")?;
+    let handle = this_string_heap(heap, this, "String.prototype.replace")?;
     let text = helpers::string_text(heap, handle);
     let Some(search) = args.first().copied() else {
         return Ok(JsValue::string(handle));
@@ -299,7 +313,7 @@ pub fn string_search(
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let handle = this_string(heap, this, "String.prototype.search")?;
+    let handle = this_string_heap(heap, this, "String.prototype.search")?;
     let text = helpers::string_text(heap, handle);
     let Some(search) = args.first().copied() else {
         return Ok(helpers::smi_or_f64(0));
@@ -334,7 +348,7 @@ pub fn string_split(
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let handle = this_string(heap, this, "String.prototype.split")?;
+    let handle = this_string_heap(heap, this, "String.prototype.split")?;
     let text = helpers::string_text(heap, handle);
     let limit = args
         .get(1)
@@ -445,23 +459,22 @@ fn expand_replacement(template: &str, whole: &str, groups: &[&str]) -> String {
 
 /// The `this` receiver's text (string primitives only; wrapper objects are
 /// not modeled).
-fn this_text(heap: &mut Heap, this: JsValue, method: &str) -> Result<String, Throw> {
+fn this_text(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<String, Throw> {
     match this.as_string() {
-        Some(h) => Ok(helpers::string_text(heap, h)),
-        None => Err(Throw::type_error(
-            heap,
-            format!("TypeError: String.prototype.{method} requires that 'this' be a String"),
-        )),
+        Some(h) => Ok(ctx.string_text(h)),
+        None => Err(ctx.type_error(format!(
+            "TypeError: String.prototype.{method} requires that 'this' be a String"
+        ))),
     }
 }
 
 /// Integer coercion shared by the index arguments (NaN → 0, truncation).
-fn to_int(heap: &mut Heap, v: Option<JsValue>) -> i64 {
+fn to_int(ctx: &mut Ctx, v: Option<JsValue>) -> i64 {
     let Some(v) = v else { return 0 };
     if v.is_undefined() {
         return 0;
     }
-    let n = helpers::to_number(heap, v);
+    let n = ctx.to_number(v);
     if n.is_nan() {
         0
     } else {
@@ -488,24 +501,24 @@ fn utf16_find(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
         .position(|w| w == needle)
 }
 
-fn arg_text(heap: &mut Heap, v: JsValue) -> String {
-    helpers::value_text(heap, v)
+fn arg_text(ctx: &mut Ctx, v: JsValue) -> String {
+    ctx.to_string(v)
 }
 
-pub fn string_char_code_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "charCodeAt")?;
+pub fn string_char_code_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "charCodeAt")?;
     let units = utf16(&text);
-    let i = to_int(heap, args.first().copied());
+    let i = to_int(ctx, args.first().copied());
     match units.get(i as usize) {
         Some(&u) => Ok(helpers::js_number(f64::from(u))),
         None => Ok(JsValue::from_f64(f64::NAN)),
     }
 }
 
-pub fn string_code_point_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "codePointAt")?;
+pub fn string_code_point_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "codePointAt")?;
     let units = utf16(&text);
-    let i = to_int(heap, args.first().copied());
+    let i = to_int(ctx, args.first().copied());
     if i < 0 || i as usize >= units.len() {
         return Ok(JsValue::undefined());
     }
@@ -521,15 +534,15 @@ pub fn string_code_point_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) ->
     Ok(helpers::js_number(f64::from(cp)))
 }
 
-pub fn string_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "at")?;
+pub fn string_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "at")?;
     let units = utf16(&text);
     let len = units.len() as i64;
     let i = match args.first().copied() {
         None => 0,
         Some(v) if v.is_undefined() => 0,
         Some(v) => {
-            let n = helpers::to_number(heap, v).trunc() as i64;
+            let n = ctx.to_number(v).trunc() as i64;
             if n < 0 { len + n } else { n }
         }
     };
@@ -537,24 +550,24 @@ pub fn string_at(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsV
         return Ok(JsValue::undefined());
     }
     let unit = units[i as usize];
-    Ok(JsValue::string(heap.intern_text(&(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')).to_string())))
+    Ok(JsValue::string(ctx.heap.intern_text(&(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')).to_string())))
 }
 
-pub fn string_index_of(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "indexOf")?;
+pub fn string_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "indexOf")?;
     let search = match args.first().copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
-    let from = to_int(heap, args.get(1).copied()).max(0) as usize;
+    let from = to_int(ctx, args.get(1).copied()).max(0) as usize;
     let result = utf16_find(&utf16(&text), &utf16(&search), from);
     Ok(helpers::js_number(result.map_or(-1.0, |i| f64::from(i as u32))))
 }
 
-pub fn string_last_index_of(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "lastIndexOf")?;
+pub fn string_last_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "lastIndexOf")?;
     let search = match args.first().copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
     let units = utf16(&text);
@@ -564,7 +577,7 @@ pub fn string_last_index_of(heap: &mut Heap, this: JsValue, args: &[JsValue]) ->
         None => units.len(),
         Some(v) if v.is_undefined() => units.len(),
         Some(v) => {
-            let n = helpers::to_number(heap, v);
+            let n = ctx.to_number(v);
             if n.is_nan() {
                 units.len()
             } else {
@@ -582,23 +595,23 @@ pub fn string_last_index_of(heap: &mut Heap, this: JsValue, args: &[JsValue]) ->
     Ok(helpers::js_number(result.map_or(-1.0, |i| f64::from(i as u32))))
 }
 
-pub fn string_includes(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "includes")?;
+pub fn string_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "includes")?;
     let search = match args.first().copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
-    let from = to_int(heap, args.get(1).copied()).max(0) as usize;
+    let from = to_int(ctx, args.get(1).copied()).max(0) as usize;
     Ok(JsValue::from_bool(utf16_find(&utf16(&text), &utf16(&search), from).is_some()))
 }
 
-pub fn string_starts_with(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "startsWith")?;
+pub fn string_starts_with(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "startsWith")?;
     let search = match args.first().copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
-    let from = to_int(heap, args.get(1).copied()).max(0) as usize;
+    let from = to_int(ctx, args.get(1).copied()).max(0) as usize;
     let units = utf16(&text);
     let needle = utf16(&search);
     Ok(JsValue::from_bool(
@@ -608,10 +621,10 @@ pub fn string_starts_with(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> R
     ))
 }
 
-pub fn string_ends_with(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "endsWith")?;
+pub fn string_ends_with(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "endsWith")?;
     let search = match args.first().copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
     let units = utf16(&text);
@@ -619,71 +632,70 @@ pub fn string_ends_with(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Res
     let end = match args.get(1).copied() {
         None => units.len(),
         Some(v) if v.is_undefined() => units.len(),
-        Some(v) => (helpers::to_number(heap, v).trunc().max(0.0) as usize).min(units.len()),
+        Some(v) => (ctx.to_number(v).trunc().max(0.0) as usize).min(units.len()),
     };
     Ok(JsValue::from_bool(
         end >= needle.len() && units[end - needle.len()..end] == needle[..],
     ))
 }
 
-pub fn string_concat(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let mut text = this_text(heap, this, "concat")?;
+pub fn string_concat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let mut text = this_text(ctx, this, "concat")?;
     for &v in args {
-        text.push_str(&arg_text(heap, v));
+        text.push_str(&arg_text(ctx, v));
     }
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
-pub fn string_repeat(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "repeat")?;
+pub fn string_repeat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "repeat")?;
     let n = match args.first().copied() {
         None => 0.0,
-        Some(v) => helpers::to_number(heap, v),
+        Some(v) => ctx.to_number(v),
     };
     if n.is_nan() {
-        return Ok(JsValue::string(heap.intern_text("")));
+        return Ok(JsValue::string(ctx.heap.intern_text("")));
     }
     if n < 0.0 || n.is_infinite() {
-        return Err(Throw::type_error(heap, "RangeError: Invalid count value"));
+        return Err(ctx.type_error("RangeError: Invalid count value"));
     }
     let n = n.trunc() as usize;
-    Ok(JsValue::string(heap.intern_text(&text.repeat(n))))
+    Ok(JsValue::string(ctx.heap.intern_text(&text.repeat(n))))
 }
 
-pub fn string_pad_start(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "padStart")?;
-    pad(heap, text, args, true, "padStart")
+pub fn string_pad_start(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "padStart")?;
+    pad(ctx, text, args, true)
 }
 
-pub fn string_pad_end(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "padEnd")?;
-    pad(heap, text, args, false, "padEnd")
+pub fn string_pad_end(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "padEnd")?;
+    pad(ctx, text, args, false)
 }
 
 fn pad(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     text: String,
     args: &[JsValue],
     start: bool,
-    method: &str,
 ) -> Result<JsValue, Throw> {
     let target = match args.first().copied() {
         None => 0,
-        Some(v) => helpers::to_number(heap, v).clamp(0.0, f64::from(u32::MAX)) as usize,
+        Some(v) => ctx.to_number(v).clamp(0.0, f64::from(u32::MAX)) as usize,
     };
     let fill = match args.get(1).copied() {
         None => " ".to_string(),
         Some(v) if v.is_undefined() => " ".to_string(),
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
     };
     let units = utf16(&text);
     if target <= units.len() {
-        return Ok(JsValue::string(heap.intern_text(&text)));
+        return Ok(JsValue::string(ctx.heap.intern_text(&text)));
     }
     let fill_units = utf16(&fill);
     let mut pad_units: Vec<u16> = Vec::new();
     if fill_units.is_empty() {
-        return Ok(JsValue::string(heap.intern_text(&text)));
+        return Ok(JsValue::string(ctx.heap.intern_text(&text)));
     }
     while pad_units.len() < target - units.len() {
         pad_units.extend_from_slice(&fill_units);
@@ -699,8 +711,7 @@ fn pad(
         p
     };
     let result: String = String::from_utf16_lossy(&padded);
-    let _ = method;
-    Ok(JsValue::string(heap.intern_text(&result)))
+    Ok(JsValue::string(ctx.heap.intern_text(&result)))
 }
 
 /// ES `TrimString` whitespace set (includes NBSP, line separators, BOM).
@@ -724,87 +735,87 @@ fn is_js_whitespace(c: char) -> bool {
     )
 }
 
-pub fn string_trim(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "trim")?;
+pub fn string_trim(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "trim")?;
     Ok(JsValue::string(
-        heap.intern_text(text.trim_matches(is_js_whitespace)),
+        ctx.heap.intern_text(text.trim_matches(is_js_whitespace)),
     ))
 }
 
-pub fn string_trim_start(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "trimStart")?;
+pub fn string_trim_start(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "trimStart")?;
     Ok(JsValue::string(
-        heap.intern_text(text.trim_start_matches(is_js_whitespace)),
+        ctx.heap.intern_text(text.trim_start_matches(is_js_whitespace)),
     ))
 }
 
-pub fn string_trim_end(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "trimEnd")?;
+pub fn string_trim_end(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "trimEnd")?;
     Ok(JsValue::string(
-        heap.intern_text(text.trim_end_matches(is_js_whitespace)),
+        ctx.heap.intern_text(text.trim_end_matches(is_js_whitespace)),
     ))
 }
 
-pub fn string_to_lower_case(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "toLowerCase")?;
-    Ok(JsValue::string(heap.intern_text(&text.to_lowercase())))
+pub fn string_to_lower_case(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "toLowerCase")?;
+    Ok(JsValue::string(ctx.heap.intern_text(&text.to_lowercase())))
 }
 
-pub fn string_to_upper_case(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "toUpperCase")?;
-    Ok(JsValue::string(heap.intern_text(&text.to_uppercase())))
+pub fn string_to_upper_case(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "toUpperCase")?;
+    Ok(JsValue::string(ctx.heap.intern_text(&text.to_uppercase())))
 }
 
-pub fn string_substring(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "substring")?;
+pub fn string_substring(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "substring")?;
     let units = utf16(&text);
     let len = units.len() as i64;
-    let mut start = to_int(heap, args.first().copied()).clamp(0, len);
+    let mut start = to_int(ctx, args.first().copied()).clamp(0, len);
     let mut end = match args.get(1).copied() {
         None => len,
         Some(v) if v.is_undefined() => len,
-        Some(v) => to_int(heap, Some(v)).clamp(0, len),
+        Some(v) => to_int(ctx, Some(v)).clamp(0, len),
     };
     if start > end {
         std::mem::swap(&mut start, &mut end);
     }
     let result = String::from_utf16_lossy(&units[start as usize..end as usize]);
-    Ok(JsValue::string(heap.intern_text(&result)))
+    Ok(JsValue::string(ctx.heap.intern_text(&result)))
 }
 
-pub fn string_substr(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "substr")?;
+pub fn string_substr(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "substr")?;
     let units = utf16(&text);
     let len = units.len() as i64;
     let start = match args.first().copied() {
         None => 0,
         Some(v) => {
-            let n = to_int(heap, Some(v));
+            let n = to_int(ctx, Some(v));
             if n < 0 { (len + n).max(0) } else { n.min(len) }
         }
     };
     let length = match args.get(1).copied() {
         None => len - start,
         Some(v) if v.is_undefined() => len - start,
-        Some(v) => to_int(heap, Some(v)).max(0).min(len - start),
+        Some(v) => to_int(ctx, Some(v)).max(0).min(len - start),
     };
     let result = String::from_utf16_lossy(&units[start as usize..(start + length) as usize]);
-    Ok(JsValue::string(heap.intern_text(&result)))
+    Ok(JsValue::string(ctx.heap.intern_text(&result)))
 }
 
-pub fn string_to_string(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_to_string(_ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     Ok(this)
 }
 
-pub fn string_value_of(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_value_of(_ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     Ok(this)
 }
 
 /// Approximate `localeCompare`: UTF-16 code-unit lexicographic order.
-pub fn string_locale_compare(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let a = this_text(heap, this, "localeCompare")?;
+pub fn string_locale_compare(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let a = this_text(ctx, this, "localeCompare")?;
     let b = match args.first().copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
     let (au, bu) = (utf16(&a), utf16(&b));
@@ -816,52 +827,52 @@ pub fn string_locale_compare(heap: &mut Heap, this: JsValue, args: &[JsValue]) -
     Ok(helpers::js_number(f64::from(ord)))
 }
 
-pub fn string_from_char_code(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_from_char_code(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for &v in args {
-        let n = helpers::to_number(heap, v);
+        let n = ctx.to_number(v);
         units.push(if n.is_nan() { 0 } else { n as u16 });
     }
-    Ok(JsValue::string(heap.intern_text(&String::from_utf16_lossy(&units))))
+    Ok(JsValue::string(ctx.heap.intern_text(&String::from_utf16_lossy(&units))))
 }
 
-pub fn string_from_code_point(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_from_code_point(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let mut text = String::new();
     for &v in args {
-        let n = helpers::to_number(heap, v);
+        let n = ctx.to_number(v);
         if !n.is_finite() || n < 0.0 || n > 0x10FFFFu32 as f64 || n.fract() != 0.0 {
-            return Err(Throw::type_error(heap, "RangeError: Invalid code point"));
+            return Err(ctx.type_error("RangeError: Invalid code point"));
         }
         let Some(cp) = char::from_u32(n as u32) else {
-            return Err(Throw::type_error(heap, "RangeError: Invalid code point"));
+            return Err(ctx.type_error("RangeError: Invalid code point"));
         };
         text.push(cp);
     }
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
 /// `String.prototype.replaceAll` for string search values (regex search
 /// values remain on the registry's regex path).
-pub fn string_replace_all(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = this_text(heap, this, "replaceAll")?;
+pub fn string_replace_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "replaceAll")?;
     let search = match args.first().copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
     if search.is_empty() {
         let replacement = match args.get(1).copied() {
-            Some(v) => arg_text(heap, v),
+            Some(v) => arg_text(ctx, v),
             None => "undefined".to_string(),
         };
         let mut out = replacement.clone();
         out.push_str(&text);
-        return Ok(JsValue::string(heap.intern_text(&out)));
+        return Ok(JsValue::string(ctx.heap.intern_text(&out)));
     }
     let replacement = match args.get(1).copied() {
-        Some(v) => arg_text(heap, v),
+        Some(v) => arg_text(ctx, v),
         None => "undefined".to_string(),
     };
     Ok(JsValue::string(
-        heap.intern_text(&text.replace(&search, &replacement)),
+        ctx.heap.intern_text(&text.replace(&search, &replacement)),
     ))
 }

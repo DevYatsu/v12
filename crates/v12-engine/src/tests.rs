@@ -190,7 +190,7 @@ mod builtin_tests {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let h = heap.intern_string(V12Str::latin1(b"hello".to_vec()));
         let s = JsValue::string(h);
-        let ch = string::string_char_at(&mut heap, s, &[JsValue::from_i32_smi(1).unwrap()])
+        let ch = ctx::call_ctx(string::string_char_at, &mut heap, s, &[JsValue::from_i32_smi(1).unwrap()])
             .expect("charAt");
         assert!(ch.is_string());
         let tmp = crate::engine::Engine::new();
@@ -206,7 +206,8 @@ mod builtin_tests {
             }
         };
         assert_eq!(text, "e");
-        let sliced = string::string_slice(
+        let sliced = ctx::call_ctx(
+            string::string_slice,
             &mut heap,
             s,
             &[
