@@ -6,6 +6,7 @@
 
 pub mod array;
 pub mod boolean;
+pub mod ctx;
 pub mod error;
 pub mod global;
 pub mod helpers;
@@ -21,6 +22,7 @@ pub mod regexp;
 pub mod string;
 pub mod symbol;
 
+pub use ctx::{BuiltinFn, Ctx, call_legacy};
 pub use registry::{HostClosure, HostFn, NativeHandler, NativeRegistry};
 
 use v12_heap::{Heap, JsValue};

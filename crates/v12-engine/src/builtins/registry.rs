@@ -9,7 +9,7 @@ use std::rc::Rc;
 use v12_heap::{Heap, JsValue};
 use v12_native::{NativeId, Throw};
 
-use super::{builtin_dispatch, promise, regexp, string};
+use super::{builtin_dispatch, ctx::Ctx, promise, regexp, string};
 use crate::job_queue::Job;
 
 /// Registry of native function indices. Indices beyond the compiled program
@@ -105,7 +105,10 @@ impl NativeRegistry {
             return result;
         }
         if let Some(handler) = self.handlers.get(&id).copied() {
-            handler(heap, this, args)
+            // Phase 2 shim: every legacy handler runs through the `Ctx`
+            // adapter seam (bodies still take `&mut Heap`; no migration yet).
+            let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+            super::ctx::call_legacy(handler, &mut ctx, this, args)
         } else {
             Err(Throw::type_error(
                 heap,
