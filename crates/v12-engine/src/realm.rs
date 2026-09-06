@@ -346,3 +346,16 @@ pub fn build_realm_object(heap: &mut Heap) -> Handle<JsObject> {
 
     obj
 }
+
+/// Links an intrinsic constructor's `prototype` field to `proto`.
+#[allow(dead_code)]
+fn wire_prototype(
+    heap: &mut Heap,
+    intrinsics: &HashMap<String, JsValue>,
+    name: &str,
+    proto: Handle<JsObject>,
+) {
+    if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
+        heap.get_mut(o).prototype = Some(proto);
+    }
+}
