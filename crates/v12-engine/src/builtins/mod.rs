@@ -533,8 +533,8 @@ define_builtins! {
     MapIterator => |heap, this, args| call_ctx(iterator::map_iterator, heap, this, args),
     SetIterator => |heap, this, args| call_ctx(iterator::set_iterator, heap, this, args),
     IteratorSelf => |heap, this, args| call_ctx(iterator::iterator_self, heap, this, args),
-    RegExpConstruct => regexp::regexp_construct,
-    RegExpToString => regexp::regexp_to_string,
+    RegExpConstruct => |heap, this, args| call_ctx(regexp::regexp_construct, heap, this, args),
+    RegExpToString => |heap, this, args| call_ctx(regexp::regexp_to_string, heap, this, args),
     ModuleImport => module_import,
     ObjectEnumerableOwnKeys => |heap, this, args| call_ctx(object::object_enumerable_own_keys, heap, this, args),
 }

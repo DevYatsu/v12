@@ -1,5 +1,15 @@
 //! RegExp built-ins over the [`v12_regex`] wrapper (which wraps `regress`).
 //!
+//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): pure bodies
+//! (`regexp_construct`, `regexp_to_string`) take `&mut Ctx` and are reached
+//! through `ctx::call_ctx`. The stateful methods (`regexp_exec`,
+//! `regexp_test`, `regexp_compile`) keep the `(&mut Heap, &RegexCache, …)`
+//! shape — the per-registry compiled-pattern cache has no `Ctx` carrier yet,
+//! exactly like the pending-job side channel in `promise.rs` and the four
+//! deferred string regexp-cache methods in `string.rs`. Threading the cache
+//! through `Ctx` would force `string.rs`'s callers onto `Ctx` too; that
+//! reconciliation is left for the install/dispatch-collapse steps.
+//!
 //! A RegExp object is a `Kind::RegExp` with `properties =
 //! [source, flags, lastIndex]`:
 //!
@@ -21,7 +31,7 @@ use std::rc::Rc;
 use v12_heap::{Handle, Heap, JsObject, JsValue, V12Str};
 use v12_native::Throw;
 
-use super::{helpers, intern_type_error};
+use super::{ctx::Ctx, helpers, intern_type_error};
 
 /// Compiled-regexp cache: object handle → compiled pattern. Owned by the
 /// registry so it survives GC (objects are traced strongly via the cache's
@@ -41,7 +51,7 @@ const SLOT_LAST_INDEX: usize = 2;
 /// Otherwise `pattern` is coerced to a string (with `undefined` → `""` and
 /// `null` → `"null"` per ToString). Invalid flags are a SyntaxError.
 pub fn regexp_construct(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
@@ -49,15 +59,16 @@ pub fn regexp_construct(
         (Some(first), None) => {
             // Copy-from-regexp fast path.
             if let Some(obj) = first.as_object()
-                && heap.get(obj).kind == v12_heap::Kind::RegExp
+                && ctx.heap.get(obj).kind == v12_heap::Kind::RegExp
             {
-                let source = heap.get(obj).properties[SLOT_SOURCE];
-                let flags = heap.get(obj).properties[SLOT_FLAGS];
-                return Ok(JsValue::object(alloc_regexp(heap, source, flags)));
+                let source = ctx.heap.get(obj).properties[SLOT_SOURCE];
+                let flags = ctx.heap.get(obj).properties[SLOT_FLAGS];
+                let handle = alloc_regexp(ctx, source, flags);
+                return Ok(JsValue::object(handle));
             }
-            (stringify_arg(heap, *first), String::new())
+            (stringify_arg(ctx, *first), String::new())
         }
-        (Some(first), Some(flags)) => (stringify_arg(heap, *first), stringify_arg(heap, *flags)),
+        (Some(first), Some(flags)) => (stringify_arg(ctx, *first), stringify_arg(ctx, *flags)),
         _ => (String::new(), String::new()),
     };
     let source_text = if source_text.is_empty() {
@@ -66,21 +77,19 @@ pub fn regexp_construct(
         source_text
     };
     let flags_text = canonicalize_flags(&flags_text)
-        .map_err(|e| intern_type_error(heap, &format!("SyntaxError: {e}")))?;
-    let source_h = heap.intern_text(&source_text);
-    let flags_h = heap.intern_text(&flags_text);
-    Ok(JsValue::object(alloc_regexp(
-        heap,
+        .map_err(|e| ctx.syntax_error(format!("SyntaxError: {e}")))?;
+    let source_h = ctx.heap.intern_text(&source_text);
+    let flags_h = ctx.heap.intern_text(&flags_text);
+    let handle = alloc_regexp(
+        ctx,
         JsValue::string(source_h),
         JsValue::string(flags_h),
-    )))
+    );
+    Ok(JsValue::object(handle))
 }
 
-fn alloc_regexp(heap: &mut Heap, source: JsValue, flags: JsValue) -> Handle<JsObject> {
-    
-    helpers::alloc_obj(
-        heap,
-        JsObject::regexp(
+fn alloc_regexp(ctx: &mut Ctx, source: JsValue, flags: JsValue) -> Handle<JsObject> {
+    ctx.alloc_obj(JsObject::regexp(
             source.as_string().expect("source is a string"),
             flags.as_string().expect("flags is a string"),
         ),
@@ -88,13 +97,20 @@ fn alloc_regexp(heap: &mut Heap, source: JsValue, flags: JsValue) -> Handle<JsOb
 }
 
 /// ES ToString for the RegExp constructor's pattern/flags arguments.
-/// `undefined` → `""`, `null` → `"null"`, everything else via display text.
-fn stringify_arg(heap: &mut Heap, v: JsValue) -> String {
+/// `undefined` → `""`, everything else via `ctx.to_string` (`null` renders
+/// `"null"` through the display subset).
+fn stringify_arg(ctx: &mut Ctx, v: JsValue) -> String {
     if v.is_undefined() {
         return String::new();
     }
-    if v.is_null() {
-        return "null".to_string();
+    ctx.to_string(v)
+}
+
+/// `stringify_arg` for the stateful `(&mut Heap, &RegexCache, …)` path
+/// (`regexp_compile`), which cannot build a `Ctx` carrying the cache.
+fn stringify_heap(heap: &mut Heap, v: JsValue) -> String {
+    if v.is_undefined() {
+        return String::new();
     }
     helpers::value_text(heap, v)
 }
@@ -340,19 +356,18 @@ pub fn regexp_test(
 
 /// `RegExp.prototype.toString()` — `"/" + source + "/" + flags`.
 pub fn regexp_to_string(
-    heap: &mut Heap,
+    ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = helpers::as_object(
-        heap,
+    let obj = ctx.this_object(
         this,
         "RegExp.prototype.toString",
         Some(v12_heap::Kind::RegExp),
     )?;
-    let (source, flags) = regexp_source_flags(heap, obj);
+    let (source, flags) = regexp_source_flags(ctx.heap, obj);
     let text = format!("/{source}/{flags}");
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
 /// `RegExp.prototype.compile` — legacy recompile-in-place (Annex B).
@@ -376,10 +391,10 @@ pub fn regexp_compile(
                 let (s, f) = regexp_source_flags(heap, src_obj);
                 (s, f)
             } else {
-                (stringify_arg(heap, *first), String::new())
+                (stringify_heap(heap, *first), String::new())
             }
         }
-        (Some(first), Some(flags)) => (stringify_arg(heap, *first), stringify_arg(heap, *flags)),
+        (Some(first), Some(flags)) => (stringify_heap(heap, *first), stringify_heap(heap, *flags)),
         _ => (String::new(), String::new()),
     };
     let source_text = if source_text.is_empty() {
