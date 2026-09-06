@@ -270,27 +270,154 @@ impl<'a> Ctx<'a> {
         "<unprintable>".to_string()
     }
 
-    // -- props (stubs delegating to the install helpers for now) -----------
+    // -- props (unified install family, plan §3) ---------------------------
 
-    /// Shape-descriptor install of one data property (delegates to
-    /// `builtin_install_prop`).
+    /// Shape-descriptor install of one data property with explicit attrs.
+    /// Single canonical path: every install in the workspace funnels here.
+    pub fn define_data_prop_with_attrs(
+        &mut self,
+        obj: Handle<JsObject>,
+        name: &str,
+        value: JsValue,
+        attrs: v12_heap::Attrs,
+    ) {
+        use v12_heap::{PropKey, V12Str};
+        let h = if name.is_ascii() {
+            self.heap.intern_string(V12Str::latin1_slice(name.as_bytes()))
+        } else {
+            self.heap
+                .intern_string(V12Str::utf16(name.encode_utf16().collect()))
+        };
+        let key = PropKey::from_string(h);
+        let shape = self.heap.shape_of_mut(obj);
+        debug_assert!(
+            self.heap.lookup_property(shape, key).is_none(),
+            "duplicate install of `{name}`"
+        );
+        let child = self.heap.add_property(shape, key, attrs);
+        self.heap.bind_shape(obj, child);
+        // NOTE: no `properties.len() == property_keys.len()` assert here. The
+        // global's intrinsic prefix (`realm.rs`: 18 values pushed with no
+        // shape/keys) means the two vecs are NOT in lockstep on pre-existing
+        // objects — documented drift (plan §7(a)), not something installs may
+        // assume. `add_property` assigns the descriptor slot; the push below
+        // keeps the shape-bound suffix aligned.
+        self.heap.get_mut(obj).properties.push(value);
+        self.heap.get_mut(obj).property_keys.push(Some(key));
+    }
+
+#[allow(dead_code)]
+    /// Duplicate-install guard helper (kept for callers; the live check is
+    /// the `lookup_property` debug_assert above).
+    fn has_own_key(heap: &Heap, obj: Handle<JsObject>, _name: &str) -> bool {
+        let _ = (heap, obj);
+        false
+    }
+
+    /// Shape-descriptor install of one data property (spec `BUILTIN` attrs).
     pub fn define_data_prop(
         &mut self,
         obj: Handle<JsObject>,
         name: &str,
         value: JsValue,
     ) {
-        super::builtin_install_prop(self.heap, obj, name, value);
+        self.define_data_prop_with_attrs(obj, name, value, v12_heap::Attrs::BUILTIN);
     }
 
-    /// Allocates a `Kind::Function` for `id` and installs it as `name`.
+    /// Allocates a `Kind::Function` for `id`, stamps spec `length` + `name`
+    /// own props, and installs it as `name` on `obj`.
+    ///
+    /// `length` is `None` for legacy entries that have not declared an arity
+    /// yet (no `length` prop installed — current observable behavior). Once
+    /// an entry declares `(len)` in `define_builtins!`, the prop is installed
+    /// with `{ writable: false, enumerable: false, configurable: true }`.
     pub fn define_method(
         &mut self,
         obj: Option<Handle<JsObject>>,
         name: &str,
         id: v12_native::NativeId,
+        length: Option<u32>,
     ) {
-        super::install_native(self.heap, obj, name, id);
+        let Some(target) = obj else { return };
+        let func = self.alloc_obj(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+            ..Default::default()
+        });
+        if let Some(len) = length {
+            let len_v = JsValue::from_i32_smi(len as i32).expect("arity fits Smi");
+            // length: { writable: false, enumerable: false, configurable: true }
+            self.define_data_prop_with_attrs(
+                func,
+                "length",
+                len_v,
+                v12_heap::Attrs::new(false, false, true),
+            );
+            debug_assert_eq!(
+                super::builtin_length(id),
+                Some(len),
+                "installed length must match declared arity"
+            );
+        }
+        // name: { writable: false, enumerable: false, configurable: true }
+        let name_h = self.heap.intern_text(name);
+        self.define_data_prop_with_attrs(
+            func,
+            "name",
+            JsValue::string(name_h),
+            v12_heap::Attrs::new(false, false, true),
+        );
+        self.define_data_prop(target, name, JsValue::object(func));
+    }
+
+    /// Constructor/prototype linkage for an already-materialized pair
+    /// (realm placeholders): sets the `prototype` field, installs
+    /// `ctor.prototype` (non-writable, non-configurable) and the
+    /// `proto.constructor` back-link (`BUILTIN` attrs). Both directions are
+    /// expected rooted by the caller (realm roots hold them).
+    pub fn install_ctor_link(
+        &mut self,
+        ctor: Handle<JsObject>,
+        proto: Handle<JsObject>,
+    ) {
+        use v12_heap::{PropKey, V12Str};
+        self.heap.get_mut(ctor).prototype = Some(proto);
+        // Idempotent: the Promise path wires before the generic loop, so
+        // skip the `prototype` install when already present.
+        let probe = self.heap.intern_string(V12Str::latin1_slice(b"prototype"));
+        let shape = self.heap.shape_of_mut(ctor);
+        if self
+            .heap
+            .lookup_property(shape, PropKey::from_string(probe))
+            .is_none()
+        {
+            self.define_data_prop_with_attrs(
+                ctor,
+                "prototype",
+                JsValue::object(proto),
+                v12_heap::Attrs::new(false, false, false),
+            );
+        }
+        let proto_shape = self.heap.shape_of_mut(proto);
+        let ctor_probe = self.heap.intern_string(V12Str::latin1_slice(b"constructor"));
+        if self
+            .heap
+            .lookup_property(proto_shape, PropKey::from_string(ctor_probe))
+            .is_none()
+        {
+            self.define_data_prop(proto, "constructor", JsValue::object(ctor));
+        }
+        debug_assert_eq!(self.heap.get(ctor).prototype, Some(proto));
+    }
+
+    /// Realm helper for per-call rest-array identity (plan §5 step 4): today
+    /// this only resolves the `Array` constructor value via the
+    /// `GLOBAL_INTRINSICS` slot reader, so call sites stop hardcoding
+    /// `properties.get(1)`. Full move-to-construction-time is deferred (see
+    /// `alloc_rest_array`): the own `constructor` install needs shape
+    /// machinery owned by the interpreter.
+    pub fn array_ctor_value(&self) -> Option<JsValue> {
+        self.intrinsic("Array")
     }
 }
 

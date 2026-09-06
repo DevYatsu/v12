@@ -59,18 +59,32 @@ pub(crate) fn builtin_install_prop(
     name: &str,
     value: JsValue,
 ) {
-    use v12_heap::{Attrs, PropKey, V12Str};
-    let h = if name.is_ascii() {
-        heap.intern_string(V12Str::latin1_slice(name.as_bytes()))
-    } else {
-        heap.intern_string(V12Str::utf16(name.encode_utf16().collect()))
-    };
-    let key = PropKey::from_string(h);
-    let shape = heap.shape_of_mut(obj);
-    let child = heap.add_property(shape, key, Attrs::BUILTIN);
-    heap.bind_shape(obj, child);
-    heap.get_mut(obj).properties.push(value);
-    heap.get_mut(obj).property_keys.push(Some(key));
+    let mut ctx = Ctx::new(heap, None, None);
+    ctx.define_data_prop(obj, name, value);
+}
+
+/// Declared arity table for `define_builtins!` entries. `None` = legacy
+/// entry without an explicit `(len)` yet: no `length` prop is installed,
+/// preserving current observable behavior. Entries that gain `(len)` in the
+/// macro get `Some(len)` here and the install family stamps the prop.
+pub fn builtin_length(id: NativeId) -> Option<u32> {
+    let _ = id;
+    None
+}
+
+/// Unified install: single canonical path for every builtin function
+/// property. `install_native` (legacy name) delegates here with
+/// `length = builtin_length(id)` so grouped installs and hand-rolled sites
+/// share one code path.
+pub(crate) fn install_native_with_length(
+    heap: &mut Heap,
+    target: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    name: &str,
+    id: NativeId,
+    length: Option<u32>,
+) {
+    let mut ctx = Ctx::new(heap, None, None);
+    ctx.define_method(target, name, id, length);
 }
 
 /// Allocates the native function object for `id` and installs it as a
@@ -78,22 +92,31 @@ pub(crate) fn builtin_install_prop(
 ///
 /// A `None` target installs nothing: optional constructors that this realm
 /// has not materialized, and the reserved future hosts (`Json`, `Map`, …)
-/// whose target fields do not exist yet. This is the one install shape —
-/// every `__builtin_emit_install!` arm routes through it.
+/// whose target fields do not exist yet. Retired as the canonical path —
+/// it now delegates to the unified [`Ctx::define_method`] family so there
+/// is exactly one install shape; kept (not deleted) because `realm.rs` and
+/// hand-rolled sites still call it.
 pub(crate) fn install_native(
     heap: &mut Heap,
     target: Option<v12_heap::Handle<v12_heap::JsObject>>,
     name: &str,
     id: NativeId,
 ) {
-    let Some(obj) = target else { return };
-    let func = heap.alloc(v12_heap::JsObject {
-        kind: v12_heap::Kind::Function,
-        callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
-        ..Default::default()
-    });
-    heap.add_root(JsValue::object(func));
-    builtin_install_prop(heap, obj, name, JsValue::object(func));
+    let length = builtin_length(id);
+    install_native_with_length(heap, target, name, id, length);
+}
+
+/// Constructor/prototype linkage for an already-materialized pair (realm
+/// placeholders). Thin wrapper over [`Ctx::install_ctor_link`] so realm
+/// construction routes through the install family instead of per-site
+/// `builtin_install_prop("prototype", …)` calls.
+pub(crate) fn install_ctor(
+    heap: &mut Heap,
+    ctor: v12_heap::Handle<v12_heap::JsObject>,
+    proto: v12_heap::Handle<v12_heap::JsObject>,
+) {
+    let mut ctx = Ctx::new(heap, None, None);
+    ctx.install_ctor_link(ctor, proto);
 }
 
 /// Installs the *value* a handler produces (a `Math.PI` constant, a
@@ -204,12 +227,77 @@ macro_rules! __builtin_emit_install {
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, Some($targets.symbol_proto), $name, $id)
     };
+    // Explicit-length forms (plan §5 step 4): `define_builtins!` entries may
+    // declare `"name" (len) => Id => handler`. These route through
+    // `install_native_with_length` with `Some(len)` so `length` is stamped at
+    // install time; entries without `(len)` keep the 5-arg form (no `length`
+    // prop — current observable behavior) until their arity is audited.
+    (Global, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.global), $name, $id, Some($len))
+    };
+    (NumberProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.number_proto), $name, $id, Some($len))
+    };
+    (StringProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.string_proto), $name, $id, Some($len))
+    };
+    (ArrayProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.array_proto), $name, $id, Some($len))
+    };
+    (ObjectProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.object_proto), $name, $id, Some($len))
+    };
+    (FunctionProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.function_proto), $name, $id, Some($len))
+    };
+    (Math, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.math, $name, $id, Some($len))
+    };
+    (Number, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.number, $name, $id, Some($len))
+    };
+    (Array, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.array, $name, $id, Some($len))
+    };
+    (Object, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.object, $name, $id, Some($len))
+    };
+    (Json, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.json, $name, $id, Some($len))
+    };
+    (BooleanProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.boolean_proto), $name, $id, Some($len))
+    };
+    (StringCtor, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.string, $name, $id, Some($len))
+    };
+    (Symbol, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.symbol, $name, $id, Some($len))
+    };
+    (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, Some($targets.symbol_proto), $name, $id, Some($len))
+    };
+    // Value-constant groups ignore length (constants, not functions).
+    (GlobalValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        { let _ = $len; $crate::builtins::install_value($heap, Some($targets.global), $name, $id) }
+    };
+    (MathValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        { let _ = $len; $crate::builtins::install_value($heap, $targets.math, $name, $id) }
+    };
+    (NumberValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        { let _ = $len; $crate::builtins::install_value($heap, $targets.number, $name, $id) }
+    };
 }
 
 /// Unified builtin declaration: single source of truth for dispatch + install.
 ///
-/// *Grouped* entries `Target { "jsName" => Variant => handler }` emit both a
-/// `builtin_dispatch` match arm and a straight-line `install_builtins` call.
+/// *Grouped* entries `Target { "jsName" [(len)] => Variant => handler }`
+/// emit both a `builtin_dispatch` match arm and a straight-line install call.
+/// The optional `(len)` declares the ES `length` arity: entries carrying it
+/// route through `install_native_with_length` with `Some(len)` (the install
+/// family stamps spec-attr `length` + `name` on the function object);
+/// entries without it install no `length` prop until their arity is audited
+/// (current observable behavior preserved).
 /// Grouped targets distinguish **static** (constructor) vs **dynamic**
 /// (prototype) installs: `Array { "isArray" => ... }` installs on the `Array`
 /// constructor, `ArrayProto { "push" => ... }` installs on `Array.prototype`.
@@ -231,7 +319,7 @@ macro_rules! __builtin_emit_install {
 /// ```
 macro_rules! define_builtins {
     (
-        $( $target:ident { $($name:literal => $id:ident => $handler:expr),* $(,)? } ),* $(,)? ;
+        $( $target:ident { $($name:literal $(($len:literal))? => $id:ident => $handler:expr),* $(,)? } ),* $(,)? ;
         $( $bare_id:ident => $bare_handler:expr ),* $(,)?
     ) => {
         /// Compile-time dispatch over every builtin. `None` means "not a
@@ -259,10 +347,12 @@ macro_rules! define_builtins {
 
         /// Installs all grouped built-ins as shape-bound properties. This is
         /// the only install path — there is no `BUILTIN_INSTALLS` array. Each
-        /// grouped entry expands to a straight-line [`install_native`] call,
-        /// so the compiler can inline and no rodata table is emitted.
+        /// grouped entry expands to a straight-line install call through the
+        /// unified [`Ctx::define_method`] family (`install_native` for legacy
+        /// entries, `install_native_with_length` for `(len)` entries), so the
+        /// compiler can inline and no rodata table is emitted.
         pub fn install_builtins(heap: &mut Heap, targets: &BuiltinTargets) {
-            $( $( $crate::__builtin_emit_install!($target, heap, targets, $name, NativeId::$id); )* )*
+            $( $( $crate::__builtin_emit_install!($target, heap, targets, $name, NativeId::$id $(, $len)?); )* )*
             // Bare ids are dispatch-only; silence unused warnings.
             $( let _ = NativeId::$bare_id; )*
         }

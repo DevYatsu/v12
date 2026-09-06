@@ -98,15 +98,11 @@ impl Realm {
         let promise_proto = alloc_root(heap);
         let promise_ctor = intrinsics.get("Promise").and_then(|v| v.as_object());
         if let Some(promise_ctor) = promise_ctor {
-            heap.get_mut(promise_ctor).prototype = Some(promise_proto);
-            // Shape-bound `prototype` property so `Promise.prototype` reads
-            // (and `instanceof`) work like on the other constructors.
-            crate::builtins::builtin_install_prop(
-                heap,
-                promise_ctor,
-                "prototype",
-                JsValue::object(promise_proto),
-            );
+            // Unified install family: field link + spec-attr `prototype` prop
+            // + `constructor` back-link (plan §3). The back-link is new
+            // observable surface (`Promise.prototype.constructor === Promise`,
+            // spec-mandated); the intrinsic order above is untouched.
+            crate::builtins::install_ctor(heap, promise_ctor, promise_proto);
         }
         // The Promise constructor itself: `new Promise(executor)` routes to
         // the stateful native seam (the capability needs the job sink).
@@ -150,34 +146,24 @@ impl Realm {
         let boolean_proto = alloc_root(heap);
         let symbol_proto = alloc_root(heap);
 
-        // Link the intrinsic constructors to their prototypes and make
-        // `Number(x)` callable.
-        wire_prototype(heap, &intrinsics, "Object", object_proto);
-        wire_prototype(heap, &intrinsics, "Array", array_proto);
-        wire_prototype(heap, &intrinsics, "String", string_proto);
-        wire_prototype(heap, &intrinsics, "Number", number_proto);
-        wire_prototype(heap, &intrinsics, "Boolean", boolean_proto);
-        wire_prototype(heap, &intrinsics, "Symbol", symbol_proto);
-        // `Constructor.prototype` must also be a readable property (code
-        // like `Array.prototype.map.call(...)` reads it); the field alone is
-        // invisible to property lookups.
-        if let Some(o) = intrinsics.get("Object").and_then(|v| v.as_object()) {
-            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(object_proto));
-        }
-        if let Some(o) = intrinsics.get("Array").and_then(|v| v.as_object()) {
-            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(array_proto));
-        }
-        if let Some(o) = intrinsics.get("String").and_then(|v| v.as_object()) {
-            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(string_proto));
-        }
-        if let Some(o) = intrinsics.get("Number").and_then(|v| v.as_object()) {
-            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(number_proto));
-        }
-        if let Some(o) = intrinsics.get("Boolean").and_then(|v| v.as_object()) {
-            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(boolean_proto));
-        }
-        if let Some(o) = intrinsics.get("Symbol").and_then(|v| v.as_object()) {
-            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(symbol_proto));
+        // Link the intrinsic constructors to their prototypes through the
+        // unified install family (`install_ctor`: `prototype` field +
+        // spec-attr `prototype` prop + `constructor` back-link). This retires
+        // the per-site `builtin_install_prop("prototype", …)` installs: every
+        // ctor/prototype pair funnels through one helper. `Constructor.prototype`
+        // stays a readable property (code like `Array.prototype.map.call(...)`
+        // reads it); the field alone is invisible to property lookups.
+        for (name, proto) in [
+            ("Object", object_proto),
+            ("Array", array_proto),
+            ("String", string_proto),
+            ("Number", number_proto),
+            ("Boolean", boolean_proto),
+            ("Symbol", symbol_proto),
+        ] {
+            if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
+                crate::builtins::install_ctor(heap, o, proto);
+            }
         }
         wire_callable(heap, &intrinsics, "Number", NativeId::NumberConstruct);
 
@@ -254,18 +240,6 @@ fn alloc_root(heap: &mut Heap) -> Handle<JsObject> {
 fn wire_callable(heap: &mut Heap, intrinsics: &HashMap<String, JsValue>, name: &str, native: NativeId) {
     if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
         heap.get_mut(o).callable = v12_heap::FunctionTarget::Bytecode(u32::from(native));
-    }
-}
-
-/// Links an intrinsic constructor's `prototype` field to `proto`.
-fn wire_prototype(
-    heap: &mut Heap,
-    intrinsics: &HashMap<String, JsValue>,
-    name: &str,
-    proto: Handle<JsObject>,
-) {
-    if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
-        heap.get_mut(o).prototype = Some(proto);
     }
 }
 
