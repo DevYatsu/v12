@@ -828,6 +828,16 @@ impl<'a> Interp<'a> {
         self.stack.clear();
         self.stack
             .resize(usize::from(main_regs), JsValue::undefined());
+        // Sloppy-mode top-level `this` is the global object (ES
+        // GetThisBinding for global code). Without this, `this.x = ...`
+        // at the top level reads `undefined` from r0 and the
+        // `SetProperty` null/undefined guard throws a TypeError.
+        self.ensure_default_global();
+        if let Some(g) = self.global
+            && !self.stack.is_empty()
+        {
+            self.stack[0] = JsValue::object(g);
+        }
         self.frames.push(Frame {
             fn_idx: self.main,
             program: self.program_id,
