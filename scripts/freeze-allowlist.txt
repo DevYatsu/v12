@@ -1,0 +1,87 @@
+# Phase 1 (Freeze) grandfather list — docs/builtins-arch-plan.md §5 step 1.
+#
+# Format: one entry per grandfathered site: "<TAG> <file>:<line> # <reason>".
+# TAG is one of: PK_PUSH | PROP_GET1 | ERR_VAL (see scripts/freeze-lint.sh).
+#
+# Matching rule (see script header): a file listed for a TAG stays legal for
+# that TAG, but its hit COUNT must not grow past the number of entries below.
+# :line numbers are documentary (they drift with edits); enforcement is
+# file-membership + per-file count cap. Any hit in an unlisted file fails.
+#
+# Generated from the tree on 2026-09-06. Do not append without a plan reference.
+
+# --- PK_PUSH: direct `property_keys.push` (target: only the Ctx install family, §3) ---
+PK_PUSH crates/v12-engine/src/builtins/mod.rs:71 # builtin_install_prop — the canonical install path; collapses into ctx.define_data_prop in step 4
+PK_PUSH crates/v12-engine/src/builtins/object.rs:581 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
+PK_PUSH crates/v12-engine/src/builtins/json.rs:231 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
+PK_PUSH crates/v12-interp/src/property.rs:777 # generic set-property fallback; stays until the install family owns all writes (step 4)
+
+# --- PROP_GET1: hardcoded `properties.get(1)` slot reads (target: Ctx realm/intrinsic reader, §1.1) ---
+PROP_GET1 crates/v12-heap/src/object.rs:585 # promise_value helper reading the value slot; centralize into Ctx in step 2
+PROP_GET1 crates/v12-engine/src/builtins/string.rs:320 # match-index read in string builtin; replace with Ctx accessor in step 3
+PROP_GET1 crates/v12-interp/src/lib.rs:799 # Array-constructor slot read at realm setup; centralize into Ctx in step 2
+PROP_GET1 crates/v12-interp/src/call_setup.rs:1773 # iterator-result `done` slot read; replace with Ctx accessor in step 3
+
+# --- ERR_VAL: stringly `error_value("` construction (target: ctx.{type,range,syntax,reference}_error, §4.2) ---
+# Counts per file on 2026-09-06: call_setup.rs 27, object_ops.rs 15,
+# generator_async.rs 7, lib.rs 7, execute.rs 4 (60 total). One entry per site.
+ERR_VAL crates/v12-interp/src/call_setup.rs:29 # call-arity/constructor guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:34 # call-arity/constructor guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:358 # stack-overflow guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/call_setup.rs:860 # corrupt-call-header guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/call_setup.rs:868 # corrupt-call-header guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/call_setup.rs:1028 # callee/args guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1033 # callee/args guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1048 # callee/args guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1053 # callee/args guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1100 # stack-overflow guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/call_setup.rs:1195 # not-a-constructor guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1200 # not-a-constructor guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1256 # not-a-constructor guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1262 # not-a-constructor guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1297 # not-a-constructor guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1303 # stack-overflow guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/call_setup.rs:1533 # Array-method receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1541 # non-function callback guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1663 # Reduce empty-array guard; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1699 # forEach receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1706 # forEach receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1711 # non-function callback guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1744 # Iterator-method guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1749 # Iterator-method guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1754 # non-function callback guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1781 # iterator-drain limit guard; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/call_setup.rs:1872 # Reduce empty-iterator guard; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:13 # destructure/spread guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:19 # destructure/spread guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:203 # accessor/prototype guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:230 # accessor/prototype guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:244 # accessor/prototype guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:255 # cyclic-prototype guard; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:332 # iterator-protocol guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:339 # iterator-protocol guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:386 # spread/destination guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:391 # spread/destination guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:400 # spread/destination guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:405 # spread/destination guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:410 # spread/destination guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:415 # spread/destination guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/object_ops.rs:459 # Array join receiver guard; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/generator_async.rs:87 # generator-receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/generator_async.rs:91 # generator-receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/generator_async.rs:145 # generator-receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/generator_async.rs:149 # generator-receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/generator_async.rs:174 # generator-receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/generator_async.rs:178 # generator-receiver guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/generator_async.rs:283 # stack-overflow guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/lib.rs:1085 # call-completed-without-result guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/lib.rs:1108 # private-member guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/lib.rs:1112 # private-member guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/lib.rs:1149 # private-member guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/lib.rs:1166 # private-member guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/lib.rs:1171 # private-member guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/lib.rs:1469 # not-a-function guard; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/execute.rs:170 # execution-deadline guard; Ctx errors in step 2
+ERR_VAL crates/v12-interp/src/execute.rs:883 # yield-outside-generator guard; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/execute.rs:902 # await-outside-async guards; Ctx errors in step 3
+ERR_VAL crates/v12-interp/src/execute.rs:907 # await-outside-async guards; Ctx errors in step 3

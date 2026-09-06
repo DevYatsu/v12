@@ -24,6 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Phase 1 (Freeze) guard: no new property_keys.push /
+      # properties.get(1) / error_value(" sites (builtins-arch-plan §5.1).
+      - run: ./scripts/freeze-lint.sh
       # Design-boundary guardrails: unsafe/thread_local/String-error/unwrap
       # discipline for the engine-core crates (plan phase A).
       - run: ./scripts/check-architecture.sh
