@@ -7,8 +7,10 @@
 pub mod array;
 pub mod boolean;
 pub mod error;
+pub mod global;
 pub mod helpers;
 pub mod iterator;
+pub mod json;
 pub mod map;
 pub mod math;
 pub mod number;
@@ -17,6 +19,7 @@ pub mod promise;
 pub mod registry;
 pub mod regexp;
 pub mod string;
+pub mod symbol;
 
 pub use registry::{HostClosure, HostFn, NativeHandler, NativeRegistry};
 
@@ -35,12 +38,17 @@ pub struct BuiltinTargets {
     pub math: Option<v12_heap::Handle<v12_heap::JsObject>>,
     pub number: Option<v12_heap::Handle<v12_heap::JsObject>>,
     pub number_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub string: Option<v12_heap::Handle<v12_heap::JsObject>>,
     pub string_proto: v12_heap::Handle<v12_heap::JsObject>,
     pub array: Option<v12_heap::Handle<v12_heap::JsObject>>,
     pub array_proto: v12_heap::Handle<v12_heap::JsObject>,
     pub object: Option<v12_heap::Handle<v12_heap::JsObject>>,
     pub object_proto: v12_heap::Handle<v12_heap::JsObject>,
     pub function_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub json: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub boolean_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub symbol: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub symbol_proto: v12_heap::Handle<v12_heap::JsObject>,
 }
 
 pub(crate) fn builtin_install_prop(
@@ -57,7 +65,7 @@ pub(crate) fn builtin_install_prop(
     };
     let key = PropKey::from_string(h);
     let shape = heap.shape_of_mut(obj);
-    let child = heap.add_property(shape, key, Attrs::DEFAULT);
+    let child = heap.add_property(shape, key, Attrs::BUILTIN);
     heap.bind_shape(obj, child);
     heap.get_mut(obj).properties.push(value);
     heap.get_mut(obj).property_keys.push(Some(key));
@@ -84,6 +92,25 @@ pub(crate) fn install_native(
     });
     heap.add_root(JsValue::object(func));
     builtin_install_prop(heap, obj, name, JsValue::object(func));
+}
+
+/// Installs the *value* a handler produces (a `Math.PI` constant, a
+/// well-known symbol, …) as a shape-bound property `name` on `target`.
+///
+/// The grouped entry still declares `name => id => handler`; the handler is
+/// evaluated once at install time through [`builtin_dispatch`], so constants
+/// stay single-source with their dispatch arm. `None`/unevaluatable targets
+/// install nothing.
+pub(crate) fn install_value(
+    heap: &mut Heap,
+    target: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    name: &str,
+    id: NativeId,
+) {
+    let Some(obj) = target else { return };
+    if let Some(Ok(value)) = builtin_dispatch(id, heap, JsValue::undefined(), &[]) {
+        builtin_install_prop(heap, obj, name, value);
+    }
 }
 
 #[doc(hidden)]
@@ -123,10 +150,10 @@ macro_rules! __builtin_emit_install {
     };
     // Reserved future hosts — no target field yet, nothing to install.
     (Json, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, $targets.json, $name, $id)
     };
     (BooleanProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, Some($targets.boolean_proto), $name, $id)
     };
     (ErrorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, None, $name, $id)
@@ -154,6 +181,26 @@ macro_rules! __builtin_emit_install {
     };
     (IteratorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, None, $name, $id)
+    };
+    // Value-constant groups: the handler is evaluated once at install time
+    // (see `install_value`) and the result is stored as a plain data property.
+    (GlobalValue, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_value($heap, Some($targets.global), $name, $id)
+    };
+    (MathValue, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_value($heap, $targets.math, $name, $id)
+    };
+    (NumberValue, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_value($heap, $targets.number, $name, $id)
+    };
+    (StringCtor, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.string, $name, $id)
+    };
+    (Symbol, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.symbol, $name, $id)
+    };
+    (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.symbol_proto), $name, $id)
     };
 }
 
@@ -226,6 +273,10 @@ define_builtins! {
         "isFinite" => GlobalIsFinite => number::global_is_finite,
         "parseInt" => GlobalParseInt => number::global_parse_int,
         "parseFloat" => GlobalParseFloat => number::global_parse_float,
+        "encodeURI" => GlobalEncodeUri => global::global_encode_uri,
+        "decodeURI" => GlobalDecodeUri => global::global_decode_uri,
+        "encodeURIComponent" => GlobalEncodeUriComponent => global::global_encode_uri_component,
+        "decodeURIComponent" => GlobalDecodeUriComponent => global::global_decode_uri_component,
     },
     Math {
         "abs" => MathAbs => math::math_abs,
@@ -238,12 +289,66 @@ define_builtins! {
         "random" => MathRandom => math::math_random,
         "round" => MathRound => math::math_round,
         "sqrt" => MathSqrt => math::math_sqrt,
+        "sign" => MathSign => math::math_sign,
+        "cbrt" => MathCbrt => math::math_cbrt,
+        "exp" => MathExp => math::math_exp,
+        "expm1" => MathExpm1 => math::math_expm1,
+        "log" => MathLog => math::math_log,
+        "log1p" => MathLog1p => math::math_log1p,
+        "log2" => MathLog2 => math::math_log2,
+        "log10" => MathLog10 => math::math_log10,
+        "sin" => MathSin => math::math_sin,
+        "cos" => MathCos => math::math_cos,
+        "tan" => MathTan => math::math_tan,
+        "asin" => MathAsin => math::math_asin,
+        "acos" => MathAcos => math::math_acos,
+        "atan" => MathAtan => math::math_atan,
+        "atan2" => MathAtan2 => math::math_atan2,
+        "sinh" => MathSinh => math::math_sinh,
+        "cosh" => MathCosh => math::math_cosh,
+        "tanh" => MathTanh => math::math_tanh,
+        "asinh" => MathAsinh => math::math_asinh,
+        "acosh" => MathAcosh => math::math_acosh,
+        "atanh" => MathAtanh => math::math_atanh,
+        "hypot" => MathHypot => math::math_hypot,
+        "clz32" => MathClz32 => math::math_clz32,
+        "imul" => MathImul => math::math_imul,
+        "fround" => MathFround => math::math_fround,
+    },
+    MathValue {
+        "E" => MathConstE => math::math_const_e,
+        "LN2" => MathConstLn2 => math::math_const_ln2,
+        "LN10" => MathConstLn10 => math::math_const_ln10,
+        "LOG2E" => MathConstLog2e => math::math_const_log2e,
+        "LOG10E" => MathConstLog10e => math::math_const_log10e,
+        "PI" => MathConstPi => math::math_const_pi,
+        "SQRT1_2" => MathConstSqrt1_2 => math::math_const_sqrt1_2,
+        "SQRT2" => MathConstSqrt2 => math::math_const_sqrt2,
     },
     Number {
         "isNaN" => NumberIsNan => number::number_is_nan,
         "isFinite" => NumberIsFinite => number::number_is_finite,
         "parseInt" => NumberParseInt => number::global_parse_int,
         "parseFloat" => NumberParseFloat => number::global_parse_float,
+        "isInteger" => NumberIsInteger => number::number_is_integer,
+        "isSafeInteger" => NumberIsSafeInteger => number::number_is_safe_integer,
+    },
+    NumberValue {
+        "MAX_SAFE_INTEGER" => NumberConstMaxSafeInteger => number::number_const_max_safe_integer,
+        "MIN_SAFE_INTEGER" => NumberConstMinSafeInteger => number::number_const_min_safe_integer,
+        "EPSILON" => NumberConstEpsilon => number::number_const_epsilon,
+        "MAX_VALUE" => NumberConstMaxValue => number::number_const_max_value,
+        "MIN_VALUE" => NumberConstMinValue => number::number_const_min_value,
+        "POSITIVE_INFINITY" => NumberConstPositiveInfinity => number::number_const_positive_infinity,
+        "NEGATIVE_INFINITY" => NumberConstNegativeInfinity => number::number_const_negative_infinity,
+        "NaN" => NumberConstNaN => number::number_const_nan,
+    },
+    NumberProto {
+        "toString" => NumberProtoToString => number::number_proto_to_string,
+        "toFixed" => NumberToFixed => number::number_to_fixed,
+        "toPrecision" => NumberToPrecision => number::number_to_precision,
+        "toExponential" => NumberToExponential => number::number_to_exponential,
+        "valueOf" => NumberProtoValueOf => number::number_proto_value_of,
     },
     Array {
         "isArray" => ArrayIsArray => array::array_is_array,
@@ -257,8 +362,54 @@ define_builtins! {
         "entries" => ArrayIteratorEntries => iterator::array_iterator_entries,
         "keys" => ArrayIteratorKeys => iterator::array_iterator_keys,
         "values" => ArrayIterator => iterator::array_iterator,
+        "indexOf" => ArrayIndexOf => array::array_index_of,
+        "lastIndexOf" => ArrayLastIndexOf => array::array_last_index_of,
+        "includes" => ArrayIncludes => array::array_includes,
+        "concat" => ArrayConcat => array::array_concat,
+        "at" => ArrayAt => array::array_at,
+        "reverse" => ArrayReverse => array::array_reverse,
+        "shift" => ArrayShift => array::array_shift,
+        "unshift" => ArrayUnshift => array::array_unshift,
+        "splice" => ArraySplice => array::array_splice,
+        "fill" => ArrayFill => array::array_fill,
+        "copyWithin" => ArrayCopyWithin => array::array_copy_within,
+        "flat" => ArrayFlat => array::array_flat,
+        "toString" => ArrayToString => array::array_to_string,
+        // Callback-taking methods run at the interpreter seam
+        // (`Interp::run_callback_builtin`); these stubs are never dispatched
+        // from JS but carry the install.
+        "forEach" => ArrayForEach => callback_stub,
+        "map" => ArrayMap => callback_stub,
+        "filter" => ArrayFilter => callback_stub,
+        "some" => ArraySome => callback_stub,
+        "every" => ArrayEvery => callback_stub,
+        "find" => ArrayFind => callback_stub,
+        "findIndex" => ArrayFindIndex => callback_stub,
+        "findLast" => ArrayFindLast => callback_stub,
+        "findLastIndex" => ArrayFindLastIndex => callback_stub,
+        "reduce" => ArrayReduce => callback_stub,
+        "reduceRight" => ArrayReduceRight => callback_stub,
+        "flatMap" => ArrayFlatMap => callback_stub,
+    },
+    Array {
+        "of" => ArrayOf => array::array_of,
+        "from" => ArrayFrom => array::array_from,
     },
     Object {
+        "assign" => ObjectAssign => object::object_assign,
+        "is" => ObjectIs => object::object_is,
+        "hasOwn" => ObjectHasOwn => object::object_has_own,
+        "freeze" => ObjectFreeze => object::object_freeze,
+        "isFrozen" => ObjectIsFrozen => object::object_is_frozen,
+        "seal" => ObjectSeal => object::object_seal,
+        "isSealed" => ObjectIsSealed => object::object_is_sealed,
+        "preventExtensions" => ObjectPreventExtensions => object::object_prevent_extensions,
+        "isExtensible" => ObjectIsExtensible => object::object_is_extensible,
+        "fromEntries" => ObjectFromEntries => object::object_from_entries,
+        "getOwnPropertyNames" => ObjectGetOwnPropertyNames => object::object_get_own_property_names,
+        "getOwnPropertySymbols" => ObjectGetOwnPropertySymbols => object::object_get_own_property_symbols,
+        "getOwnPropertyDescriptor" => ObjectGetOwnPropertyDescriptor => object::object_get_own_property_descriptor,
+        "setPrototypeOf" => ObjectSetPrototypeOf => object::object_set_prototype_of,
         "create" => ObjectCreate => object::object_create,
         "getPrototypeOf" => ObjectGetPrototypeOf => object::object_get_prototype_of,
         "defineProperty" => ObjectDefineProperty => object::object_define_property,
@@ -277,6 +428,62 @@ define_builtins! {
     StringProto {
         "charAt" => StringCharAt => string::string_char_at,
         "slice" => StringSlice => string::string_slice,
+        "charCodeAt" => StringCharCodeAt => string::string_char_code_at,
+        "codePointAt" => StringCodePointAt => string::string_code_point_at,
+        "at" => StringAt => string::string_at,
+        "indexOf" => StringIndexOf => string::string_index_of,
+        "lastIndexOf" => StringLastIndexOf => string::string_last_index_of,
+        "includes" => StringIncludes => string::string_includes,
+        "startsWith" => StringStartsWith => string::string_starts_with,
+        "endsWith" => StringEndsWith => string::string_ends_with,
+        "concat" => StringConcat => string::string_concat,
+        "repeat" => StringRepeat => string::string_repeat,
+        "padStart" => StringPadStart => string::string_pad_start,
+        "padEnd" => StringPadEnd => string::string_pad_end,
+        "trim" => StringTrim => string::string_trim,
+        "trimStart" => StringTrimStart => string::string_trim_start,
+        "trimEnd" => StringTrimEnd => string::string_trim_end,
+        "toLowerCase" => StringToLowerCase => string::string_to_lower_case,
+        "toUpperCase" => StringToUpperCase => string::string_to_upper_case,
+        "substring" => StringSubstring => string::string_substring,
+        "substr" => StringSubstr => string::string_substr,
+        "toString" => StringToString => string::string_to_string,
+        "valueOf" => StringValueOf => string::string_value_of,
+        "localeCompare" => StringLocaleCompare => string::string_locale_compare,
+        "replaceAll" => StringReplaceAll => string::string_replace_all,
+    },
+    StringCtor {
+        "fromCharCode" => StringFromCharCode => string::string_from_char_code,
+        "fromCodePoint" => StringFromCodePoint => string::string_from_code_point,
+    },
+    Json {
+        "parse" => JsonParse => json::json_parse,
+        "stringify" => JsonStringify => json::json_stringify,
+    },
+    BooleanProto {
+        "toString" => BooleanProtoToString => boolean::boolean_proto_to_string,
+        "valueOf" => BooleanProtoValueOf => boolean::boolean_proto_value_of,
+    },
+    Symbol {
+        "for" => SymbolFor => symbol::symbol_for,
+        "keyFor" => SymbolKeyFor => symbol::symbol_key_for,
+        "iterator" => SymbolWellKnownIterator => symbol::symbol_well_known,
+        "asyncIterator" => SymbolWellKnownAsyncIterator => symbol::symbol_well_known,
+        "hasInstance" => SymbolWellKnownHasInstance => symbol::symbol_well_known,
+        "isConcatSpreadable" => SymbolWellKnownIsConcatSpreadable => symbol::symbol_well_known,
+        "match" => SymbolWellKnownMatch => symbol::symbol_well_known,
+        "replace" => SymbolWellKnownReplace => symbol::symbol_well_known,
+        "search" => SymbolWellKnownSearch => symbol::symbol_well_known,
+        "species" => SymbolWellKnownSpecies => symbol::symbol_well_known,
+        "split" => SymbolWellKnownSplit => symbol::symbol_well_known,
+        "toPrimitive" => SymbolWellKnownToPrimitive => symbol::symbol_well_known,
+        "toStringTag" => SymbolWellKnownToStringTag => symbol::symbol_well_known,
+        "unscopables" => SymbolWellKnownUnscopables => symbol::symbol_well_known,
+    },
+    SymbolProto {
+        "toString" => SymbolProtoToString => symbol::symbol_proto_to_string,
+        "valueOf" => SymbolProtoValueOf => symbol::symbol_proto_value_of,
+        "description" => SymbolProtoDescription => symbol::symbol_proto_description,
     };
     // Truly internal / non-JS-visible dispatch-only natives (not installed).
     StringConstruct => string_construct,
@@ -292,12 +499,35 @@ define_builtins! {
     MapHas => map::map_has,
     MapDelete => map::map_delete,
     MapSize => map::map_size,
+    MapClear => map::map_clear,
+    MapEntries => map::map_entries,
+    MapKeys => map::map_keys,
+    MapValues => map::map_values,
+    MapForEach => callback_stub,
     SetConstruct => map::set_construct,
     SetAdd => map::set_add,
     SetHas => map::set_has,
     SetDelete => map::set_delete,
     SetSize => map::set_size,
+    SetClear => map::set_clear,
+    SetEntries => map::set_entries,
+    SetKeys => map::set_keys,
+    SetValues => map::set_values,
+    SetForEach => callback_stub,
     IteratorNext => iterator::iterator_next,
+    IteratorToArray => iterator::iterator_to_array,
+    IteratorTake => iterator::iterator_take,
+    IteratorDrop => iterator::iterator_drop,
+    IteratorFrom => iterator::iterator_from,
+    IteratorMap => callback_stub,
+    IteratorFilter => callback_stub,
+    IteratorFlatMap => callback_stub,
+    IteratorReduce => callback_stub,
+    IteratorForEach => callback_stub,
+    IteratorSome => callback_stub,
+    IteratorEvery => callback_stub,
+    IteratorFind => callback_stub,
+    SymbolConstruct => symbol::symbol_construct,
     MapIterator => iterator::map_iterator,
     SetIterator => iterator::set_iterator,
     IteratorSelf => iterator::iterator_self,
@@ -344,6 +574,18 @@ fn array_join(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValu
     }
     let text = parts.join(&sep);
     Ok(JsValue::string(heap.intern_text(&text)))
+}
+
+/// Placeholder handler for the callback-taking built-ins (`map`, `forEach`,
+/// …). Calls from JS are intercepted at the interpreter seam
+/// (`Interp::run_callback_builtin`) before any dispatch happens, so this is
+/// unreachable in practice — it exists only so `define_builtins!` can carry
+/// the install.
+fn callback_stub(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    Err(Throw::type_error(
+        heap,
+        "TypeError: built-in method must be invoked through the interpreter",
+    ))
 }
 
 fn eval_stub(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {

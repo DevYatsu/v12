@@ -81,14 +81,27 @@ impl Interp<'_> {
 
     /// String primitives synthesize the regexp method surface (`match`/
     /// `replace`/`search`/`split`) from the const method table (the
-    /// `StringPrim` pseudo-kind); other primitives read `undefined`.
+    /// `StringPrim` pseudo-kind); numbers and booleans get their own
+    /// pseudo-kinds (`NumberPrim`/`BooleanPrim`); other primitives read
+    /// `undefined`.
     pub(crate) fn string_prim_surface(
         &mut self,
         obj_v: JsValue,
         key_v: JsValue,
     ) -> Result<JsValue, JSException> {
-        if obj_v.is_string()
-            && let Some(id) = self.method_native(Kind::StringPrim, key_v)
+        let kind = if obj_v.is_string() {
+            Kind::StringPrim
+        } else if obj_v.as_smi().is_some() || obj_v.as_f64().is_some() {
+            Kind::NumberPrim
+        } else if obj_v.is_true() || obj_v.is_false() {
+            Kind::BooleanPrim
+        } else if obj_v.as_symbol().is_some() {
+            Kind::SymbolPrim
+        } else {
+            Kind::Ordinary
+        };
+        if kind != Kind::Ordinary
+            && let Some(id) = self.method_native(kind, key_v)
         {
             return Ok(self.map_set_method(id));
         }
@@ -518,6 +531,16 @@ impl Interp<'_> {
                 NativeId::MapHas
             } else if self.key_is(key_v, "delete") {
                 NativeId::MapDelete
+            } else if self.key_is(key_v, "clear") {
+                NativeId::MapClear
+            } else if self.key_is(key_v, "forEach") {
+                NativeId::MapForEach
+            } else if self.key_is(key_v, "entries") {
+                NativeId::MapEntries
+            } else if self.key_is(key_v, "keys") {
+                NativeId::MapKeys
+            } else if self.key_is(key_v, "values") {
+                NativeId::MapValues
             } else {
                 return None;
             }
@@ -527,6 +550,16 @@ impl Interp<'_> {
             NativeId::SetHas
         } else if self.key_is(key_v, "delete") {
             NativeId::SetDelete
+        } else if self.key_is(key_v, "clear") {
+            NativeId::SetClear
+        } else if self.key_is(key_v, "forEach") {
+            NativeId::SetForEach
+        } else if self.key_is(key_v, "entries") {
+            NativeId::SetEntries
+        } else if self.key_is(key_v, "keys") {
+            NativeId::SetKeys
+        } else if self.key_is(key_v, "values") {
+            NativeId::SetValues
         } else {
             return None;
         };
@@ -599,7 +632,16 @@ impl Interp<'_> {
                     }
                 }
             },
-            None => Ok(JsValue::undefined()),
+            None => {
+                // Realm-global intrinsic fallback: the descriptor-less
+                // intrinsic prefix of a global object is invisible to the
+                // shape walk, so `other.eval` / `globalThis.Math` would read
+                // `undefined`. Answer it from the prefix slots.
+                if let Some(v) = self.realm_global_intrinsic_read(obj, key_v) {
+                    return Ok(v);
+                }
+                Ok(JsValue::undefined())
+            }
         }
     }
 
@@ -704,7 +746,7 @@ impl Interp<'_> {
         self.gc_protect();
         let child = self.heap.add_property(shape, key, Attrs::DEFAULT);
         self.bind_shape(obj, child);
-        if Some(obj) == self.global {
+        if self.is_realm_global(obj) {
             // Global storage keeps the intrinsic prefix; slot numbering from
             // the shared shape chain must not overlap it. The invariant
             // `properties.len() == GLOBAL_VAR_OFFSET + num_own` restores

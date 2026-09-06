@@ -36,6 +36,11 @@ impl Realm {
         // Rooted immediately: the global must survive collection before the
         // engine publishes its heap roots.
         let global = alloc_root(heap);
+        // Publish this global on the heap's realm registry: multiple realms
+        // share one heap, and the interpreter consults the registry to serve
+        // intrinsic-prefix reads and biased var slots on non-primary globals
+        // (cross-realm `$262.createRealm().global` access).
+        heap.register_realm_global(global);
 
         let mut intrinsics = HashMap::with_capacity(MAX_INTRINSICS);
 
@@ -113,10 +118,25 @@ impl Realm {
         wire_callable(heap, &intrinsics, "Boolean", NativeId::BooleanConstruct);
         wire_callable(heap, &intrinsics, "Map", NativeId::MapConstruct);
         wire_callable(heap, &intrinsics, "Set", NativeId::SetConstruct);
+        wire_callable(heap, &intrinsics, "Symbol", NativeId::SymbolConstruct);
         wire_callable(heap, &intrinsics, "RegExp", NativeId::RegExpConstruct);
-        // `eval` routes through the native registry (the interpreter
-        // special-cases NativeId::Eval to run the source re-entrantly).
-        wire_callable(heap, &intrinsics, "eval", NativeId::Eval);
+        // `eval` is realm-bound: a `RealmEval` function carrying THIS realm's
+        // global, so eval'd code — direct or detached like
+        // `$262.createRealm().global.eval` — executes against this realm's
+        // global object and intrinsic slots. (The `NativeId::Eval` registry
+        // seam remains as the fallback for embedder globals without realms.)
+        let eval_idx = INTRINSIC_NAMES
+            .iter()
+            .position(|&n| n == "eval")
+            .expect("eval intrinsic present");
+        let eval_fn = crate::builtins::helpers::alloc_obj(
+            heap,
+            JsObject::function(v12_heap::FunctionTarget::RealmEval(global), None),
+        );
+        heap.get_mut(global).properties[eval_idx] = JsValue::object(eval_fn);
+        if let Some(slot) = intrinsics.get_mut("eval") {
+            *slot = JsValue::object(eval_fn);
+        }
         // `Number(x)` is callable too (wired below with the prototype links).
 
         // Materialize the standard prototypes the built-in installs target.
@@ -127,6 +147,8 @@ impl Realm {
         let string_proto = alloc_root(heap);
         let number_proto = alloc_root(heap);
         let function_proto = alloc_root(heap);
+        let boolean_proto = alloc_root(heap);
+        let symbol_proto = alloc_root(heap);
 
         // Link the intrinsic constructors to their prototypes and make
         // `Number(x)` callable.
@@ -134,6 +156,29 @@ impl Realm {
         wire_prototype(heap, &intrinsics, "Array", array_proto);
         wire_prototype(heap, &intrinsics, "String", string_proto);
         wire_prototype(heap, &intrinsics, "Number", number_proto);
+        wire_prototype(heap, &intrinsics, "Boolean", boolean_proto);
+        wire_prototype(heap, &intrinsics, "Symbol", symbol_proto);
+        // `Constructor.prototype` must also be a readable property (code
+        // like `Array.prototype.map.call(...)` reads it); the field alone is
+        // invisible to property lookups.
+        if let Some(o) = intrinsics.get("Object").and_then(|v| v.as_object()) {
+            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(object_proto));
+        }
+        if let Some(o) = intrinsics.get("Array").and_then(|v| v.as_object()) {
+            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(array_proto));
+        }
+        if let Some(o) = intrinsics.get("String").and_then(|v| v.as_object()) {
+            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(string_proto));
+        }
+        if let Some(o) = intrinsics.get("Number").and_then(|v| v.as_object()) {
+            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(number_proto));
+        }
+        if let Some(o) = intrinsics.get("Boolean").and_then(|v| v.as_object()) {
+            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(boolean_proto));
+        }
+        if let Some(o) = intrinsics.get("Symbol").and_then(|v| v.as_object()) {
+            crate::builtins::builtin_install_prop(heap, o, "prototype", JsValue::object(symbol_proto));
+        }
         wire_callable(heap, &intrinsics, "Number", NativeId::NumberConstruct);
 
         // Install the compile-time builtin table (isNaN, Math.floor, Array.push,
@@ -145,14 +190,27 @@ impl Realm {
             math: intrinsics.get("Math").and_then(|v| v.as_object()),
             number: intrinsics.get("Number").and_then(|v| v.as_object()),
             number_proto,
+            string: intrinsics.get("String").and_then(|v| v.as_object()),
             string_proto,
             array: intrinsics.get("Array").and_then(|v| v.as_object()),
             array_proto,
             object: intrinsics.get("Object").and_then(|v| v.as_object()),
             object_proto,
             function_proto,
+            json: intrinsics.get("JSON").and_then(|v| v.as_object()),
+            boolean_proto,
+            symbol: intrinsics.get("Symbol").and_then(|v| v.as_object()),
+            symbol_proto,
         };
         crate::builtins::install_builtins(heap, &targets);
+
+        // The `Function` constructor: not a `GLOBAL_INTRINSICS` slot (so the
+        // compiler still refuses a bare `Function` identifier), but installed
+        // as an ordinary global property so `globalThis.Function` and member
+        // reads resolve. The interpreter intercepts `NativeId::Function` and
+        // routes it through the registry's `function_construct` seam, which
+        // compiles a real program (see `builtins/registry.rs`).
+        crate::builtins::install_native(heap, Some(global), "Function", NativeId::Function);
 
         Self { global, intrinsics }
     }
@@ -209,4 +267,96 @@ fn wire_prototype(
     if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
         heap.get_mut(o).prototype = Some(proto);
     }
+}
+
+/// Builds the `$262`-shaped object for a freshly created realm: a new
+/// [`Realm`] allocated in `heap` (the same heap as the creating realm — all
+/// values are shared, so cross-realm property access and identity checks
+/// work through the ordinary object machinery) plus the host methods the
+/// Test262 agent API exposes:
+///
+/// - `global` — the new realm's global object itself;
+/// - `eval(source)` — compiles and runs `source` bound to the new realm's
+///   global (a `FunctionTarget::RealmEval` function; the interpreter routes
+///   it through the eval seam so its program registers in the caller's
+///   cross-program table);
+/// - `createRealm()` — recursive, same builder;
+/// - `destroy`/`gc`/`getReport`/`detachArrayBuffer` — single-realm no-ops.
+///
+/// Every allocated object is rooted, so the realm outlives the call.
+#[must_use]
+pub fn build_realm_object(heap: &mut Heap) -> Handle<JsObject> {
+    let realm = Realm::new(heap);
+    let global = realm.global();
+
+    let obj = crate::builtins::helpers::alloc_obj(heap, JsObject::default());
+    let eval_fn = crate::builtins::helpers::alloc_obj(
+        heap,
+        JsObject::function(v12_heap::FunctionTarget::RealmEval(global), None),
+    );
+    let create_realm_fn = crate::builtins::helpers::alloc_obj(
+        heap,
+        JsObject::function(
+            v12_heap::FunctionTarget::Host(v12_heap::HostClosure::new(|heap, _this, _args| {
+                Ok(JsValue::object(build_realm_object(heap)))
+            })),
+            None,
+        ),
+    );
+    let destroy_fn = crate::builtins::helpers::alloc_obj(
+        heap,
+        JsObject::function(
+            v12_heap::FunctionTarget::Host(v12_heap::HostClosure::new(|_heap, _this, _args| {
+                Ok(JsValue::undefined())
+            })),
+            None,
+        ),
+    );
+    let detach_fn = crate::builtins::helpers::alloc_obj(
+        heap,
+        JsObject::function(
+            v12_heap::FunctionTarget::Host(v12_heap::HostClosure::new(|_heap, _this, args| {
+                Ok(args.first().copied().unwrap_or_else(JsValue::undefined))
+            })),
+            None,
+        ),
+    );
+    let gc_fn = crate::builtins::helpers::alloc_obj(
+        heap,
+        JsObject::function(
+            v12_heap::FunctionTarget::Host(v12_heap::HostClosure::new(|_heap, _this, _args| {
+                Ok(JsValue::undefined())
+            })),
+            None,
+        ),
+    );
+    let get_report_fn = crate::builtins::helpers::alloc_obj(
+        heap,
+        JsObject::function(
+            v12_heap::FunctionTarget::Host(v12_heap::HostClosure::new(|_heap, _this, _args| {
+                Ok(JsValue::null())
+            })),
+            None,
+        ),
+    );
+
+    crate::builtins::builtin_install_prop(heap, obj, "global", JsValue::object(global));
+    crate::builtins::builtin_install_prop(heap, obj, "eval", JsValue::object(eval_fn));
+    crate::builtins::builtin_install_prop(
+        heap,
+        obj,
+        "createRealm",
+        JsValue::object(create_realm_fn),
+    );
+    crate::builtins::builtin_install_prop(heap, obj, "destroy", JsValue::object(destroy_fn));
+    crate::builtins::builtin_install_prop(
+        heap,
+        obj,
+        "detachArrayBuffer",
+        JsValue::object(detach_fn),
+    );
+    crate::builtins::builtin_install_prop(heap, obj, "gc", JsValue::object(gc_fn));
+    crate::builtins::builtin_install_prop(heap, obj, "getReport", JsValue::object(get_report_fn));
+
+    obj
 }

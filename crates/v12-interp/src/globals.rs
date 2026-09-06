@@ -8,11 +8,41 @@ use super::{intrinsic_slot, Interp, JSException, GLOBAL_VAR_OFFSET};
 
 impl Interp<'_> {
     pub(crate) fn global_slot_index(&self, obj: Handle<JsObject>, slot: usize) -> usize {
-        if Some(obj) == self.global {
+        if self.is_realm_global(obj) {
             GLOBAL_VAR_OFFSET + slot
         } else {
             slot
         }
+    }
+
+    /// True when `obj` is a realm global: the interpreter's own global or a
+    /// secondary realm's global created on the same heap (via
+    /// `$262.createRealm`). All realm globals carry the descriptor-less
+    /// intrinsic prefix, so their var slots share the `GLOBAL_VAR_OFFSET`
+    /// bias and their intrinsic reads fall back to the fixed prefix slots.
+    pub(crate) fn is_realm_global(&self, obj: Handle<JsObject>) -> bool {
+        Some(obj) == self.global || self.heap.realm_globals().contains(&obj)
+    }
+
+    /// Member-read fallback for a realm global: the intrinsic prefix slots
+    /// have no shape descriptors, so a generic read like `other.eval` or
+    /// `globalThis.Math` misses the shape walk. When the receiver is a realm
+    /// global and the key names an intrinsic, answer from the prefix.
+    /// Returns `None` to defer to the ordinary (undefined) miss path.
+    pub(crate) fn realm_global_intrinsic_read(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Option<JsValue> {
+        if !self.is_realm_global(obj) {
+            return None;
+        }
+        for &name in v12_bytecode::GLOBAL_INTRINSICS {
+            if self.key_is(key_v, name) {
+                return self.global_intrinsic_value(obj, name);
+            }
+        }
+        None
     }
 
     /// The value of a populated global slot: `None` for out-of-range and

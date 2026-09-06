@@ -73,6 +73,10 @@ impl Attrs {
     /// All three attributes set: what plain assignment produces.
     pub const DEFAULT: Attrs = Attrs(Self::WRITABLE | Self::ENUMERABLE | Self::CONFIGURABLE);
 
+    /// Spec shape for built-in properties (methods, constants, `prototype`
+    /// links): writable + configurable but **not** enumerable.
+    pub const BUILTIN: Attrs = Attrs(Self::WRITABLE | Self::CONFIGURABLE);
+
     /// From explicit flags.
     pub const fn new(writable: bool, enumerable: bool, configurable: bool) -> Attrs {
         let mut bits = 0;

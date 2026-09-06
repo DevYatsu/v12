@@ -204,7 +204,7 @@ impl ElementsDictionary {
                 value,
             },
         );
-        self.length = self.length.max(index + 1);
+        self.length = self.length.max(index.saturating_add(1));
     }
 
     /// Value at `index`, or `None` when absent.
@@ -360,7 +360,7 @@ impl ElementsArray {
                 let last = dict.length() - 1;
                 let v = dict.entries.remove(&last).map(|e| e.value);
                 // Recompute the length view: highest remaining index + 1.
-                dict.length = dict.entries.keys().max().map_or(0, |&k| k + 1);
+                dict.length = dict.entries.keys().max().map_or(0, |&k| k.saturating_add(1));
                 v
             }
         }
@@ -539,6 +539,46 @@ impl ElementsArray {
                 | ElementsStorage::HoleyDouble(v)
                 | ElementsStorage::HoleyObject(v) => v.push(JsValue::hole()),
                 _ => break,
+            }
+        }
+    }
+
+    /// Present `(index, value)` pairs in ascending index order.
+    ///
+    /// Dictionary storage walks its map sorted by key; fast kinds walk the
+    /// backing vector skipping holes. Bounded by stored data, never by the
+    /// length view — huge-length scans build on this instead of ranging over
+    /// `0..array_len()`, which would visit billions of holes.
+    pub fn dense_entries(&self) -> Vec<(u32, JsValue)> {
+        match &self.storage {
+            ElementsStorage::PackedSmi(v) => v
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (i as u32, smi_value(n)))
+                .collect(),
+            ElementsStorage::PackedDouble(v) => v
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| (i as u32, JsValue::from_f64(d)))
+                .collect(),
+            ElementsStorage::PackedObject(v) => v
+                .iter()
+                .enumerate()
+                .map(|(i, &u)| (i as u32, u))
+                .collect(),
+            ElementsStorage::HoleySmi(v)
+            | ElementsStorage::HoleyDouble(v)
+            | ElementsStorage::HoleyObject(v) => v
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| !u.is_hole())
+                .map(|(i, &u)| (i as u32, u))
+                .collect(),
+            ElementsStorage::Dictionary(dict) => {
+                let mut entries: Vec<(u32, JsValue)> =
+                    dict.iter().map(|(k, e)| (k, e.value)).collect();
+                entries.sort_by_key(|&(k, _)| k);
+                entries
             }
         }
     }

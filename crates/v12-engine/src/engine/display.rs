@@ -82,6 +82,14 @@ impl Engine {
             return "null".to_string();
         }
         if value.is_object() {
+            // Real arrays render as their comma-joined elements (so `map`
+            // results don't display as `[object Object]`); other objects
+            // keep the error-message lookup below.
+            if let Some(obj) = value.as_object()
+                && self.heap.get(obj).kind == v12_heap::Kind::Array
+            {
+                return self.array_join_text(obj, 0);
+            }
             // Plain-object errors (e.g. Test262Error) are not Kind::Error but
             // carry a `message` property. Render them usefully instead of
             // opaque "[object Object]" so the runner bucket becomes actionable.
@@ -117,6 +125,32 @@ impl Engine {
             return "[object Object]".to_string();
         }
         "<unprintable>".to_string()
+    }
+
+    /// Comma-joined element text of a real array (`undefined`/`null`/holes
+    /// render empty, matching `Array.prototype.join`). Nested arrays
+    /// recurse; `depth` caps the recursion so cyclic arrays terminate.
+    fn array_join_text(&mut self, obj: v12_heap::Handle<v12_heap::JsObject>, depth: usize) -> String {
+        if depth > 8 {
+            return String::new();
+        }
+        // Snapshot before formatting: rendering an element may allocate
+        // (and thus collect), invalidating a live borrow of the store.
+        let elements: Vec<JsValue> = self.heap.get(obj).elements_snapshot();
+        let mut parts = Vec::with_capacity(elements.len());
+        for v in elements {
+            if v.is_undefined() || v.is_null() || v.is_hole() {
+                parts.push(String::new());
+            } else if let Some(nested) = v
+                .as_object()
+                .filter(|h| self.heap.get(*h).kind == v12_heap::Kind::Array)
+            {
+                parts.push(self.array_join_text(nested, depth + 1));
+            } else {
+                parts.push(self.to_display_string(v));
+            }
+        }
+        parts.join(",")
     }
 }
 

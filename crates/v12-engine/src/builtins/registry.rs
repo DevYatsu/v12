@@ -173,18 +173,21 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 Throw::Value(JsValue::string(h))
             })?;
         // Register the eval program so its closures can be invoked from the
-        // caller's program afterwards.
+        // caller's program afterwards. The nested interpreter also installs
+        // the eval function table locally: direct `self.functions` indexing
+        // elsewhere would otherwise panic on the empty table (len 0).
+        let funcs = std::rc::Rc::from(program.functions.into_boxed_slice());
         let program_id = {
             let mut table = programs.borrow_mut();
             let id = table.len() as u32;
             table.push((
-                std::rc::Rc::from(program.functions.into_boxed_slice()),
+                std::rc::Rc::clone(&funcs),
                 std::rc::Rc::from(strings.clone().into_boxed_slice()),
             ));
             id
         };
         let mut interp =
-            v12_interp::Interp::new_with_heap(heap, global, Vec::new(), program.main, strings);
+            v12_interp::Interp::new_with_heap(heap, global, funcs, program.main, strings);
         interp.set_program_id(program_id);
         interp.set_programs(programs);
         interp.set_natives(Box::new(self.clone()));
@@ -192,5 +195,66 @@ impl v12_native::NativeRegistry for NativeRegistry {
             Ok(()) => Ok(interp.completion_value().unwrap_or_else(JsValue::undefined)),
             Err(v12_interp::JSException(thrown)) => Err(Throw::Value(thrown)),
         }
+    }
+
+    /// `Function(params…, body)`: compile the body into a program, register
+    /// it in the caller's cross-program table, and return a real closure
+    /// stamped with the program id — so the result is callable and
+    /// constructible from the caller's interpreter (unlike the compile-time
+    /// `function_stub`, whose placeholder has no registered program).
+    fn function_construct(
+        &mut self,
+        heap: &mut Heap,
+        args: &[JsValue],
+        programs: Rc<RefCell<Vec<v12_native::ProgramTable>>>,
+    ) -> Result<JsValue, Throw> {
+        let mut param_parts = Vec::new();
+        for &arg in args[..args.len().saturating_sub(1)].iter() {
+            if let Some(h) = arg.as_string() {
+                param_parts.push(super::helpers::string_text(heap, h));
+            }
+        }
+        let body = args
+            .last()
+            .and_then(|v| v.as_string())
+            .map(|h| super::helpers::string_text(heap, h))
+            .unwrap_or_default();
+        let src = format!(
+            "function __f({}){{{}}}",
+            param_parts.join(","),
+            body
+        );
+        let (program, strings) = v12_bccompiler::compile_source_with_strings(&src)
+            .map_err(|err| Throw::Message(err.message))?;
+        let fn_idx = program
+            .functions
+            .iter()
+            .position(|f| f.name_hint.as_deref() == Some("__f"))
+            .or_else(|| {
+                // The compiler prefixes declared names with "<fn>:"; accept
+                // that spelling before falling back.
+                program
+                    .functions
+                    .iter()
+                    .position(|f| f.name_hint.as_deref() == Some("<fn>:__f"))
+            })
+            .unwrap_or(1) as u32;
+        let program_id = {
+            let mut table = programs.borrow_mut();
+            let id = table.len() as u32;
+            table.push((
+                Rc::from(program.functions.into_boxed_slice()),
+                Rc::from(strings.into_boxed_slice()),
+            ));
+            id
+        };
+        let mut func = v12_heap::JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(fn_idx),
+            None,
+        );
+        func.program_id = program_id;
+        let handle = heap.alloc(func);
+        heap.add_root(JsValue::object(handle));
+        Ok(JsValue::object(handle))
     }
 }

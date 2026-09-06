@@ -200,3 +200,318 @@ pub fn number_construct(
     let n = helpers::to_number(heap, v);
     Ok(helpers::js_number(n))
 }
+
+/// ECMAScript `Number::toString`: shortest round-trip digits re-rendered per
+/// the spec's decimal/exponential branch rules (`1e21` prints `1e+21`,
+/// `1e-7` prints `1e-7`, everything between prints decimal).
+pub fn number_to_string(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    if n == 0.0 {
+        return "0".to_string(); // covers -0: ToString(-0) is "0"
+    }
+    // `{:e}` yields the shortest round-trip form: `d.ddd…e<exp>`.
+    let sci = format!("{:e}", n);
+    let (mantissa, exp) = sci.split_once('e').expect("LowerExp always emits 'e'");
+    let exp: i32 = exp.parse().expect("LowerExp exponent is an integer");
+    let negative = mantissa.starts_with('-');
+    let digits: String = mantissa
+        .trim_start_matches('-')
+        .chars()
+        .filter(|c| *c != '.')
+        .collect();
+    // Trim trailing zeros that `{:e}` may keep for integral doubles (it does
+    // not, but the filter above could reassemble `10` → `10`); canonical
+    // shortest form from `{:e}` has no trailing zeros past the first digit.
+    let k = digits.len() as i32;
+    let n10 = exp + 1; // value = 0.digits × 10^n10
+
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if k <= n10 && n10 <= 21 {
+        // Digits followed by (n10 - k) zeros.
+        out.push_str(&digits);
+        for _ in 0..(n10 - k) {
+            out.push('0');
+        }
+    } else if 0 < n10 && n10 <= 21 {
+        // Dot after n10 digits.
+        out.push_str(&digits[..n10 as usize]);
+        out.push('.');
+        out.push_str(&digits[n10 as usize..]);
+    } else if -6 < n10 && n10 <= 0 {
+        out.push_str("0.");
+        for _ in 0..(-n10) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+    } else {
+        out.push_str(&digits[..1]);
+        if k > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        out.push(if n10 - 1 >= 0 { '+' } else { '-' });
+        out.push_str(&(n10 - 1).abs().to_string());
+    }
+    out
+}
+
+/// The `this` receiver as a primitive number (`ToNumber` subset: primitives
+/// pass through, wrapper objects are not modeled).
+fn this_number(heap: &mut Heap, this: JsValue, method: &str) -> Result<f64, Throw> {
+    if let Some(n) = this.as_smi().map(f64::from) {
+        return Ok(n);
+    }
+    if let Some(n) = this.as_f64() {
+        return Ok(n);
+    }
+    Err(Throw::type_error(
+        heap,
+        format!("TypeError: Number.prototype.{method} requires that 'this' be a Number"),
+    ))
+}
+
+/// `Number.prototype.toString(radix?)` – shortest form in radix 2-36;
+/// fractional/ irrational values approximate with 14 significant fraction
+/// digits (spec-exact for integral values, which is what tests exercise).
+pub fn number_proto_to_string(
+    heap: &mut Heap,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let n = this_number(heap, this, "toString")?;
+    let radix = match args.first().copied() {
+        None => 10,
+        Some(v) if v.is_undefined() => 10,
+        Some(v) => {
+            let r = helpers::to_number(heap, v);
+            if !(2.0..=36.0).contains(&r) || r.fract() != 0.0 {
+                return Err(Throw::type_error(heap, "RangeError: toString() radix must be between 2 and 36"));
+            }
+            r as u32
+        }
+    };
+    if radix == 10 || n.is_nan() || n.is_infinite() {
+        return Ok(JsValue::string(heap.intern_text(&number_to_string(n))));
+    }
+    // NaN/Infinity spell the same in every radix.
+    if n.is_nan() {
+        return Ok(JsValue::string(heap.intern_text("NaN")));
+    }
+    if n.is_infinite() {
+        return Ok(JsValue::string(heap.intern_text(if n > 0.0 { "Infinity" } else { "-Infinity" })));
+    }
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let negative = n < 0.0;
+    let mag = n.abs();
+    let mut int_part = mag.trunc();
+    let frac_part = mag.fract();
+    let mut out = String::new();
+    if int_part == 0.0 {
+        out.push('0');
+    } else {
+        let mut chunks = Vec::new();
+        while int_part >= 1.0 {
+            chunks.push(DIGITS[(int_part % radix as f64) as usize]);
+            int_part = (int_part / radix as f64).trunc();
+        }
+        out.extend(chunks.iter().rev().copied().map(|b| b as char));
+    }
+    if frac_part > 0.0 {
+        out.push('.');
+        let mut f = frac_part;
+        for _ in 0..14 {
+            f *= f64::from(radix);
+            let d = f.trunc();
+            out.push(DIGITS[d as usize] as char);
+            f -= d;
+            if f <= 0.0 {
+                break;
+            }
+        }
+    }
+    if negative {
+        out.insert(0, '-');
+    }
+    Ok(JsValue::string(heap.intern_text(&out)))
+}
+
+/// `Number.prototype.toFixed(digits?)` – fixed-point with 0-100 fraction
+/// digits; |x| ≥ 1e21 falls back to normal `ToString`.
+pub fn number_to_fixed(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let n = this_number(heap, this, "toFixed")?;
+    let digits = match args.first() {
+        None => 0usize,
+        Some(&v) => {
+            let d = helpers::to_number(heap, v);
+            if !(0.0..=100.0).contains(&d) {
+                return Err(Throw::type_error(heap, "RangeError: toFixed() digits argument must be between 0 and 100"));
+            }
+            d as usize
+        }
+    };
+    let text = if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else if n.abs() >= 1e21 {
+        number_to_string(n)
+    } else {
+        format!("{:.*}", digits, n)
+    };
+    Ok(JsValue::string(heap.intern_text(&text)))
+}
+
+/// `Number.prototype.toPrecision(precision?)` – `undefined` → `ToString`;
+/// else fixed or exponential with `precision` significant digits.
+pub fn number_to_precision(
+    heap: &mut Heap,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let n = this_number(heap, this, "toPrecision")?;
+    let Some(&p_v) = args.first() else {
+        return Ok(JsValue::string(heap.intern_text(&number_to_string(n))));
+    };
+    if p_v.is_undefined() {
+        return Ok(JsValue::string(heap.intern_text(&number_to_string(n))));
+    }
+    let p = helpers::to_number(heap, p_v);
+    if !(1.0..=100.0).contains(&p) {
+        return Err(Throw::type_error(heap, "RangeError: toPrecision() argument must be between 1 and 100"));
+    }
+    let p = p as usize;
+    let text = if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else {
+        let sci = format!("{:.*e}", p.saturating_sub(1), n);
+        let (mantissa, exp) = sci.split_once('e').expect("LowerExp always emits 'e'");
+        let exp: i32 = exp.parse().expect("LowerExp exponent is an integer");
+        if exp + 1 > p as i32 || exp < -6 {
+            // Exponential: mantissa already carries p-1 fraction digits;
+            // normalize the exponent spelling to JS (`e+5`, `e-7`).
+            let sign = if exp >= 0 { '+' } else { '-' };
+            format!("{mantissa}e{sign}{}", exp.abs())
+        } else if exp + 1 == p as i32 {
+            mantissa.to_string()
+        } else {
+            // Fixed with (p - 1 - exp) fraction digits.
+            let frac = (p as i32 - 1 - exp).max(0) as usize;
+            format!("{:.*}", frac, n)
+        }
+    };
+    Ok(JsValue::string(heap.intern_text(&text)))
+}
+
+/// `Number.prototype.toExponential(fractionDigits?)` – exponential notation;
+/// `undefined` digit count uses the shortest round-trip form.
+pub fn number_to_exponential(
+    heap: &mut Heap,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let n = this_number(heap, this, "toExponential")?;
+    if n.is_nan() {
+        return Ok(JsValue::string(heap.intern_text("NaN")));
+    }
+    if n.is_infinite() {
+        let text = if n > 0.0 { "Infinity" } else { "-Infinity" };
+        return Ok(JsValue::string(heap.intern_text(text)));
+    }
+    let text = match args.first() {
+        Some(&v) if !v.is_undefined() => {
+            let f = helpers::to_number(heap, v);
+            if !(0.0..=100.0).contains(&f) {
+                return Err(Throw::type_error(heap, "RangeError: toExponential() argument must be between 0 and 100"));
+            }
+            format_scientific(n, Some(f as usize))
+        }
+        _ => format_scientific(n, None),
+    };
+    Ok(JsValue::string(heap.intern_text(&text)))
+}
+
+/// Renders `n` as JS scientific notation (`1.5e+21`, `1e-7`), with
+/// `fraction_digits` fraction digits or the shortest round-trip form.
+fn format_scientific(n: f64, fraction_digits: Option<usize>) -> String {
+    let sci = match fraction_digits {
+        Some(d) => format!("{:.*e}", d, n),
+        None => format!("{:e}", n),
+    };
+    let (mantissa, exp) = sci.split_once('e').expect("LowerExp always emits 'e'");
+    let exp: i32 = exp.parse().expect("LowerExp exponent is an integer");
+    let sign = if exp >= 0 { '+' } else { '-' };
+    format!("{mantissa}e{sign}{}", exp.abs())
+}
+
+/// `Number.prototype.valueOf` – the primitive receiver itself (wrapper
+/// objects are not modeled; plain numbers return unchanged).
+pub fn number_proto_value_of(
+    _heap: &mut Heap,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    Ok(this)
+}
+
+/// `Number.isInteger(value)` – no coercion; integral numbers only.
+pub fn number_is_integer(
+    _heap: &mut Heap,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let v = args.first().copied().unwrap_or(JsValue::undefined());
+    let is = if let Some(n) = v.as_smi().map(f64::from).or(v.as_f64()) {
+        n.is_finite() && n.fract() == 0.0
+    } else {
+        false
+    };
+    Ok(JsValue::from_bool(is))
+}
+
+/// `Number.isSafeInteger(value)` – integral, finite, and within ±(2^53−1).
+pub fn number_is_safe_integer(
+    _heap: &mut Heap,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let v = args.first().copied().unwrap_or(JsValue::undefined());
+    let is = if let Some(n) = v.as_smi().map(f64::from).or(v.as_f64()) {
+        n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0
+    } else {
+        false
+    };
+    Ok(JsValue::from_bool(is))
+}
+
+macro_rules! number_const {
+    ( $( $name:ident => $method:ident => $value:expr ),* $(,)? ) => {
+        $(
+            #[doc = concat!("`Number.", stringify!($method), "` – the constant, installed as a data property via `install_value`.")]
+            pub fn $name(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+                Ok($value)
+            }
+        )*
+    };
+}
+
+number_const! {
+    number_const_max_safe_integer => MAX_SAFE_INTEGER => helpers::js_number(9_007_199_254_740_991.0),
+    number_const_min_safe_integer => MIN_SAFE_INTEGER => helpers::js_number(-9_007_199_254_740_991.0),
+    number_const_epsilon => EPSILON => JsValue::from_f64(f64::EPSILON),
+    number_const_max_value => MAX_VALUE => JsValue::from_f64(f64::MAX),
+    number_const_min_value => MIN_VALUE => JsValue::from_f64(5e-324),
+    number_const_positive_infinity => POSITIVE_INFINITY => JsValue::from_f64(f64::INFINITY),
+    number_const_negative_infinity => NEGATIVE_INFINITY => JsValue::from_f64(f64::NEG_INFINITY),
+    number_const_nan => NaN => JsValue::from_f64(f64::NAN),
+}

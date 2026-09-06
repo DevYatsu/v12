@@ -65,6 +65,15 @@ pub enum Kind {
     /// table. Never stored on a `JsObject`; used only to key `methods!`
     /// tables.
     StringPrim = 0xFF,
+    /// Receiver pseudo-kind for primitive numbers, same contract as
+    /// [`Kind::StringPrim`].
+    NumberPrim = 0xFE,
+    /// Receiver pseudo-kind for primitive booleans, same contract as
+    /// [`Kind::StringPrim`].
+    BooleanPrim = 0xFD,
+    /// Receiver pseudo-kind for primitive symbols, same contract as
+    /// [`Kind::StringPrim`].
+    SymbolPrim = 0xFC,
 }
 
 /// The raw `u8` discriminant of a kind (for the `JsObject.kind` field and

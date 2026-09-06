@@ -282,6 +282,15 @@ pub struct Heap {
     /// hold hash-colliding candidates; textual equality decides hits.
     interned_strings: rustc_hash::FxHashMap<u32, Vec<Handle<V12Str>>>,
 
+    /// Handles of every realm global created on this heap (via
+    /// `Realm::new`, including the primary realm's global). The interpreter
+    /// treats these like its own global: their var slots share the
+    /// `GLOBAL_VAR_OFFSET` bias and their intrinsic reads fall back to the
+    /// fixed prefix slots. Pure metadata — the handles are kept alive by
+    /// their owning realm's roots, not by this vec. Documented behavior for
+    /// now: the vec grows without bound (no deregistration on realm drop).
+    realm_globals: Vec<Handle<JsObject>>,
+
     policy: GcPolicy,
     allocated_since_gc: usize,
     live_after_gc: usize,
@@ -323,6 +332,7 @@ impl Heap {
             root_shape: Handle::new(0),
             validity_cells: Vec::new(),
             interned_strings: rustc_hash::FxHashMap::default(),
+            realm_globals: Vec::new(),
             policy,
             allocated_since_gc: 0,
             live_after_gc: 0,
@@ -338,6 +348,23 @@ impl Heap {
     /// all transition trees descend from it (or from other anchored roots).
     pub fn root_shape(&self) -> ShapeHandle {
         self.root_shape
+    }
+
+    /// Registers a realm global created on this heap (see
+    /// [`Heap::realm_globals`]). Called for every [`Realm::new`], including
+    /// the primary realm. No deregistration: entries accumulate for the
+    /// heap's lifetime (documented behavior for now).
+    pub fn register_realm_global(&mut self, global: Handle<JsObject>) {
+        if !self.realm_globals.contains(&global) {
+            self.realm_globals.push(global);
+        }
+    }
+
+    /// The realm globals registered on this heap (every `Realm::new`,
+    /// primary included; unbounded, no deregistration — see
+    /// [`Heap::realm_globals`] field docs).
+    pub fn realm_globals(&self) -> &[Handle<JsObject>] {
+        &self.realm_globals
     }
 
     // ------------------------------------------------------------------

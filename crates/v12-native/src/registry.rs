@@ -40,6 +40,23 @@ pub trait NativeRegistry {
     ) -> Result<JsValue, Throw> {
         Err(Throw::Message("TypeError: eval is not supported".into()))
     }
+
+    /// `Function(params…, body)`: compile `params`/`body` into a program and
+    /// return a genuinely callable closure for it. `programs` is the caller's
+    /// cross-program registry — the compiled program is registered there and
+    /// the returned closure stamped with its id, so the result executes (and
+    /// its inner closures resolve) in the caller's interpreter. The default
+    /// implementation refuses (no runtime compilation).
+    fn function_construct(
+        &mut self,
+        _heap: &mut Heap,
+        _args: &[JsValue],
+        _programs: std::rc::Rc<std::cell::RefCell<Vec<ProgramTable>>>,
+    ) -> Result<JsValue, Throw> {
+        Err(Throw::Message(
+            "TypeError: Function constructor is not supported".into(),
+        ))
+    }
 }
 
 /// A registered program: its function table plus the interned string table.

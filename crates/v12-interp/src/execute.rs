@@ -732,9 +732,11 @@ impl Interp<'_> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::CallApply => {
-                    let callee = instr.b();
-                    let dst = instr.a();
-                    let args_reg = instr.c();
+                    // RegExt-merged operands; `instr.a()` would read the wide
+                    // header's mask byte for prefixed sites.
+                    let callee = rb;
+                    let dst = ra;
+                    let args_reg = rc;
                     let this_v = self.stack[base + usize::from(callee) + 1];
                     let callee_v = self.stack[base + usize::from(callee)];
                     let args_v = self.stack[base + usize::from(args_reg)];
@@ -753,7 +755,7 @@ impl Interp<'_> {
                 Opcode::CopyObjectRest => {
                     // Narrow form with single excluded key in c (or 0).
                     let src_v = self.stack[base + usize::from(rb)];
-                    let excl_vec = if instr.c() == 0 {
+                    let excl_vec = if rc == 0 {
                         Vec::new()
                     } else {
                         let start = base + usize::from(rc);
@@ -793,14 +795,16 @@ impl Interp<'_> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::GetGlobal => {
-                    let dst = instr.a();
+                    // `ra` is the RegExt-merged destination; `instr.a()` would
+                    // read the wide header's mask byte for prefixed sites.
+                    let dst = ra;
                     let const_id = u32::from(narrow.imm16());
                     let val = attempt!(self.op_get_global(const_id, program));
                     self.stack[base + usize::from(dst)] = val;
                     self.set_pc(pc + op_width);
                 }
                 Opcode::SetGlobal => {
-                    let src = instr.a();
+                    let src = ra;
                     let const_id = u32::from(narrow.imm16());
                     let val = self.stack[base + usize::from(src)];
                     // Guard: global base must be an object (invariant; defensive).
@@ -819,8 +823,8 @@ impl Interp<'_> {
                 Opcode::CreateGenerator => {
                     // No longer emitted by compiler; generator creation is handled in prepare_call.
                     // Keep stub for manual bytecode: create dormant generator capturing current frame state after this pc.
-                    let dst = instr.a();
-                    let src = instr.b();
+                    let dst = ra;
+                    let src = rb;
                     // Bounds-checked: OOB stack read yields undefined (JS semantics for array OOB is undefined; for register window treat OOB as undefined rather than panic)
                     let func_idx = self
                         .stack
@@ -868,7 +872,7 @@ impl Interp<'_> {
                     // yield* delegation is lowered by the compiler to a generic iterator loop of SuspendYield
                     // (see crates/v12-bccompiler/src/expr.rs YieldExpression delegate path).
                     self.gc_protect();
-                    let dst = instr.a();
+                    let dst = ra;
                     let yielded = self
                         .stack
                         .get(base + usize::from(dst))
@@ -880,13 +884,13 @@ impl Interp<'_> {
                         ));
                     }
                     let resume_pc = pc + op_width;
-                    self.suspend(u16::from(dst), yielded, resume_pc)?;
+                    self.suspend(dst, yielded, resume_pc)?;
                     return Ok(());
                 }
                 Opcode::Await => {
                     self.gc_protect();
-                    let src = instr.b();
-                    let dst = instr.a();
+                    let src = rb;
+                    let dst = ra;
                     // Bounds-checked stack read: OOB array element is undefined in JS semantics
                     let arg = self
                         .stack

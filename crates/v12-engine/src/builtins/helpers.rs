@@ -73,7 +73,42 @@ pub fn value_text_cow<'a>(heap: &'a mut Heap, v: JsValue) -> Cow<'a, str> {
 /// The text of a value: strings render their text, everything else renders
 /// the way `console.log` observes it (Tier-0 display subset).
 pub fn value_text(heap: &mut Heap, v: JsValue) -> String {
+    // Real arrays render as their comma-joined elements (so `map` results
+    // don't display as `[object Object]` in `console.log`).
+    if let Some(obj) = v.as_object()
+        && heap.get(obj).kind == v12_heap::Kind::Array
+    {
+        return array_join_text(heap, obj, 0);
+    }
     value_text_cow(heap, v).into_owned()
+}
+
+/// Comma-joined element text of a real array (`undefined`/`null`/holes
+/// render empty, matching `Array.prototype.join`). Nested arrays recurse;
+/// `depth` caps the recursion so cyclic arrays terminate.
+fn array_join_text(heap: &mut Heap, obj: Handle<JsObject>, depth: usize) -> String {
+    if depth > 8 {
+        return String::new();
+    }
+    // Snapshot before formatting: rendering an element may allocate (and
+    // thus collect), invalidating a live borrow of the element store.
+    let elements: Vec<JsValue> = heap.get(obj).elements_snapshot();
+    let mut parts = Vec::with_capacity(elements.len());
+    for v in elements {
+        if v.is_undefined() || v.is_null() || v.is_hole() {
+            parts.push(String::new());
+        } else if let Some(nested) = v
+            .as_object()
+            .filter(|h| heap.get(*h).kind == v12_heap::Kind::Array)
+        {
+            parts.push(array_join_text(heap, nested, depth + 1));
+        } else if let Some(h) = v.as_string() {
+            parts.push(string_text(heap, h));
+        } else {
+            parts.push(display_text(v));
+        }
+    }
+    parts.join(",")
 }
 
 /// A number value: a Smi when integral and in Smi range, a double otherwise.
@@ -160,4 +195,42 @@ pub fn js_number(n: f64) -> JsValue {
         return smi;
     }
     JsValue::from_f64(n)
+}
+
+/// ES `IsStrictlyEqual` subset (no user code): same-type numeric, string
+/// (interned-identity/textual), boolean, bigint, symbol, and object-identity
+/// comparison; special values compare by bit identity.
+pub fn strict_equals(heap: &Heap, a: JsValue, b: JsValue) -> bool {
+    if let (Some(x), Some(y)) = (a.as_smi().map(f64::from).or(a.as_f64()), b.as_smi().map(f64::from).or(b.as_f64())) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
+        return heap.strings_equal(x, y);
+    }
+    if let (Some(x), Some(y)) = (a.as_bool(), b.as_bool()) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (a.as_bigint(), b.as_bigint()) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (a.as_symbol(), b.as_symbol()) {
+        return x == y;
+    }
+    if let (Some(x), Some(y)) = (a.as_object(), b.as_object()) {
+        return x == y;
+    }
+    a.bits() == b.bits() && (a.is_undefined() || a.is_null())
+}
+
+/// ES `SameValueZero`: like [`strict_equals`] but `NaN` equals `NaN`.
+pub fn same_value_zero(heap: &Heap, a: JsValue, b: JsValue) -> bool {
+    if a.as_smi().is_none()
+        && a.as_f64().is_some()
+        && b.as_f64().is_some()
+        && a.as_f64().map(f64::is_nan).unwrap_or(false)
+        && b.as_f64().map(f64::is_nan).unwrap_or(false)
+    {
+        return true;
+    }
+    strict_equals(heap, a, b)
 }

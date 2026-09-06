@@ -11,7 +11,9 @@
 //! spare bits (size 1); `Host(HostClosure)` carries the one-word closure
 //! handle inline.
 
+use crate::Handle;
 use crate::Heap;
+use crate::JsObject;
 use crate::JsValue;
 use crate::gc::{MarkSink, Trace};
 
@@ -132,6 +134,11 @@ pub enum FunctionTarget {
     Native(NativeFn),
     /// An embedder-registered host closure.
     Host(HostClosure),
+    /// Cross-realm eval: calling this function compiles and runs its source
+    /// argument in the realm whose global object is carried here (see the
+    /// interpreter's `prepare_call`, which routes it through the eval seam).
+    /// The handle must be traced — it keeps the other realm's global alive.
+    RealmEval(Handle<JsObject>),
 }
 
 impl std::fmt::Debug for FunctionTarget {
@@ -140,14 +147,19 @@ impl std::fmt::Debug for FunctionTarget {
             FunctionTarget::Bytecode(idx) => write!(f, "Bytecode({idx})"),
             FunctionTarget::Native(_) => write!(f, "Native(fn)"),
             FunctionTarget::Host(_) => write!(f, "Host(closure)"),
+            FunctionTarget::RealmEval(g) => write!(f, "RealmEval({g:?})"),
         }
     }
 }
 
 impl Trace for FunctionTarget {
-    fn trace(&self, _sink: &mut MarkSink<'_>) {
-        // No heap handles inside; the captured environment lives in the
-        // function object's `prototype` field, which is traced separately.
+    fn trace(&self, sink: &mut MarkSink<'_>) {
+        // The captured environment lives in the function object's
+        // `prototype` field, which is traced separately; only RealmEval
+        // carries a heap handle inside the target itself.
+        if let FunctionTarget::RealmEval(global) = self {
+            global.trace(sink);
+        }
     }
 }
 

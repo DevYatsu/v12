@@ -27,12 +27,17 @@ const TEST_TIMEOUT_MS: u128 = 5_000;
 /// Test262 harness files expect. Output is captured in a global array that
 /// the runner can re-read with a second `engine.eval` on the same engine;
 /// nothing touches process stdout (the runner is parallel).
+///
+/// `$262.createRealm` delegates to `globalThis.__v12CreateRealm__`, a host
+/// function the runner installs on the engine before this preamble evaluates
+/// (see `install_create_realm_function`): it builds a fresh realm on the
+/// shared heap and returns its `$262`-shaped API object.
 const TEST262_HOST_SHIM: &str = r#"
 globalThis.__test262Prints = [];
 function __consolePrintHandle__(s) { globalThis.__test262Prints.push(String(s)); }
 function print(s) { globalThis.__test262Prints.push(String(s)); }
 var $262 = {
-    createRealm: function () { throw new Error('$262.createRealm: not implemented'); },
+    createRealm: function () { return globalThis.__v12CreateRealm__(); },
     detachArrayBuffer: function (b) { return b; },
     getReport: function () { return null; },
     destroy: function () {},
@@ -304,6 +309,11 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     let exec_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = v12_engine::Engine::new();
         engine.set_deadline(Some(deadline));
+        // Multi-realm support: `$262.createRealm` (see TEST262_HOST_SHIM)
+        // resolves to this host function, which builds a fresh realm on the
+        // shared heap. Install failure is impossible on a fresh engine's
+        // global; ignore the result either way — createRealm then throws.
+        let _ = engine.install_create_realm_function("__v12CreateRealm__");
         let res = if is_module {
             engine.eval_module_source(&combined, base_path)
         } else {
@@ -442,12 +452,13 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     // keep the skip only for non-language suites if needed. For the language
     // gate we want them executable, so do not skip here — `run_single_test`
     // will dispatch to `eval_module` when the flag is present.
-    // Multi-realm and agent API remain unsupported: tests that actually call
-    // them would fail, so keep an honest skip instead of a guaranteed red.
-    if source.contains("createRealm(") {
-        return Some("requires $262.createRealm (multi-realm)".to_string());
-    }
-    if source.contains("agent.") || source.contains("$262.agent") {
+    // Multi-realm is wired: `$262.createRealm` is a host function installed by
+    // the runner (`install_create_realm_function`) that builds a second realm
+    // on the shared heap, so tests using it execute for real. The agent API
+    // (workers/Atomics coordination) remains unsupported — skip only tests
+    // that actually call `$262.agent`, not ones that merely mention "agent."
+    // in a comment.
+    if source.contains("$262.agent") {
         return Some("requires $262.agent (worker/Atomics harness)".to_string());
     }
     // Async tests are no longer skipped: doneprintHandle.js is injected and

@@ -158,3 +158,48 @@ pub fn set_size(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsV
     let n = entries(heap, obj, Kind::Set).unwrap_or_default().len() as i64;
     Ok(helpers::smi_or_f64(n))
 }
+
+/// `Map.prototype.clear()` — removes all entries.
+pub fn map_clear(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "Map.prototype.clear", Some(Kind::Map))?;
+    heap.get_mut(obj).elements.clear();
+    Ok(JsValue::undefined())
+}
+
+/// `Set.prototype.clear()` — removes all values.
+pub fn set_clear(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = helpers::as_object(heap, this, "Set.prototype.clear", Some(Kind::Set))?;
+    heap.get_mut(obj).elements.clear();
+    Ok(JsValue::undefined())
+}
+
+/// `Map.prototype.entries()` — entries iterator over `this`.
+pub fn map_entries(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    super::iterator::iterator_for(heap, this, super::iterator::ITER_KIND_MAP_ENTRIES)
+}
+
+/// `Map.prototype.keys()` — keys iterator over `this`.
+pub fn map_keys(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    super::iterator::iterator_for(heap, this, super::iterator::ITER_KIND_MAP_KEYS)
+}
+
+/// `Map.prototype.values()` — values iterator over `this`.
+pub fn map_values(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    super::iterator::iterator_for(heap, this, super::iterator::ITER_KIND_MAP_VALUES)
+}
+
+/// `Set.prototype.entries()` — `[value, value]` pairs per spec; v1 reuses
+/// values iteration (entries surface present, pair shape deferred).
+pub fn set_entries(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    super::iterator::iterator_for(heap, this, super::iterator::ITER_KIND_SET_VALUES)
+}
+
+/// `Set.prototype.keys()` — alias of values per spec.
+pub fn set_keys(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    super::iterator::iterator_for(heap, this, super::iterator::ITER_KIND_SET_VALUES)
+}
+
+/// `Set.prototype.values()` — values iterator over `this`.
+pub fn set_values(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    super::iterator::iterator_for(heap, this, super::iterator::ITER_KIND_SET_VALUES)
+}

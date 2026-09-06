@@ -788,25 +788,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn typeof_(&mut self, arg: &Expression<'_>, span: Span) -> Res<u16> {
-        // `typeof undeclared` is specified not to throw. For v1 `GetGlobal`
-        // on a missing global already yields `undefined`, so the early return
-        // is just an optimisation. It must not fire for well-known globals
-        // like `Object`/`Array` where `typeof Object` should be `"function"` /
-        // `"object"` rather than `"undefined"`. The same applies to the
-        // non-writable globals `undefined`/`NaN`/`Infinity` which have
-        // dedicated value materialisation in `read_identifier`.
-        if let Expression::Identifier(id) = arg
-            && self.comp.symbol_of(id.reference_id.get()).is_none()
-        {
-            let name = id.name.as_str();
-            let is_global_intrinsic = crate::model::GLOBAL_INTRINSICS.contains(&name);
-            let is_special = matches!(name, "undefined" | "NaN" | "Infinity");
-            if !is_global_intrinsic && !is_special {
-                let dst = self.new_temp();
-                self.load_str(dst, "undefined", span)?;
-                return Ok(dst);
-            }
-        }
+        // `typeof undeclared` is specified not to throw. `GetGlobal` on a
+        // missing global already yields `undefined`, which `TypeOf` renders
+        // as `"undefined"` — so identifiers compile like any other operand.
+        // (Constant-folding unknown identifiers to `"undefined"` here was
+        // wrong once globals could appear dynamically via `eval`.) The
+        // non-writable globals `undefined`/`NaN`/`Infinity` have dedicated
+        // value materialisation in `read_identifier` and need no special
+        // casing either.
         let v = self.expr(arg)?;
         let dst = self.new_temp();
         self.emit_reg3(Opcode::TypeOf, dst, v, 0, span);

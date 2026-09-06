@@ -221,3 +221,85 @@ pub fn array_iterator_keys(
 ) -> Result<JsValue, Throw> {
     iterator_for(heap, this, ITER_KIND_ARRAY_KEYS)
 }
+
+/// Collects all remaining `next()` values of `this` iterator into a Vec.
+fn drain_iterator(heap: &mut Heap, this: JsValue) -> Result<Vec<JsValue>, Throw> {
+    let mut out = Vec::new();
+    loop {
+        let r = iterator_next(heap, this, &[])?;
+        let Some(o) = r.as_object() else { break };
+        let done = heap
+            .get(o)
+            .properties
+            .get(1)
+            .copied()
+            .unwrap_or(JsValue::undefined());
+        if done.is_true() {
+            break;
+        }
+        let v = heap
+            .get(o)
+            .properties
+            .first()
+            .copied()
+            .unwrap_or(JsValue::undefined());
+        out.push(v);
+        if out.len() > 1_000_000 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Builds an array iterator (kind values) over `values`.
+fn array_values_iterator(heap: &mut Heap, values: Vec<JsValue>) -> Result<JsValue, Throw> {
+    let arr = helpers::alloc_obj(heap, JsObject::array(values));
+    let h = arr;
+    Ok(JsValue::object(create_iterator(heap, h, ITER_KIND_ARRAY_VALUES)))
+}
+
+/// `Iterator.prototype.toArray()` — drains `this` into an array.
+pub fn iterator_to_array(heap: &mut Heap, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    let _ = helpers::as_object(heap, this, "Iterator.prototype.toArray", Some(v12_heap::Kind::Iterator))?;
+    let values = drain_iterator(heap, this)?;
+    let arr = helpers::alloc_obj(heap, JsObject::array(values));
+    Ok(JsValue::object(arr))
+}
+
+/// `Iterator.prototype.take(limit)` — first `limit` values as an iterator.
+pub fn iterator_take(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let _ = helpers::as_object(heap, this, "Iterator.prototype.take", Some(v12_heap::Kind::Iterator))?;
+    let limit = args.first().copied().and_then(|v| {
+        v.as_smi()
+            .map(i64::from)
+            .or(v.as_f64().map(|f| f as i64))
+    }).unwrap_or(0).max(0) as usize;
+    let mut values = drain_iterator(heap, this)?;
+    values.truncate(limit.min(values.len()));
+    array_values_iterator(heap, values)
+}
+
+/// `Iterator.prototype.drop(limit)` — values after the first `limit`.
+pub fn iterator_drop(heap: &mut Heap, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let _ = helpers::as_object(heap, this, "Iterator.prototype.drop", Some(v12_heap::Kind::Iterator))?;
+    let limit = args.first().copied().and_then(|v| {
+        v.as_smi()
+            .map(i64::from)
+            .or(v.as_f64().map(|f| f as i64))
+    }).unwrap_or(0).max(0) as usize;
+    let values = drain_iterator(heap, this)?;
+    let rest = if limit < values.len() { values[limit..].to_vec() } else { Vec::new() };
+    array_values_iterator(heap, rest)
+}
+
+/// `Iterator.from(value)` — if already an iterator return it, else wrap an
+/// array-like's values (v1 subset).
+pub fn iterator_from(heap: &mut Heap, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let v = args.first().copied().unwrap_or(JsValue::undefined());
+    if let Some(o) = v.as_object()
+        && heap.get(o).kind == v12_heap::Kind::Iterator
+    {
+        return Ok(v);
+    }
+    iterator_for(heap, v, ITER_KIND_ARRAY_VALUES)
+}

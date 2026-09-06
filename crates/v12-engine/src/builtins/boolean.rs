@@ -34,3 +34,32 @@ fn to_boolean(heap: &Heap, v: JsValue) -> bool {
     }
     false
 }
+
+/// `Boolean.prototype.toString` – `"true"`/`"false"` for the primitive
+/// receiver (wrapper objects are not modeled).
+pub fn boolean_proto_to_string(
+    heap: &mut Heap,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let text = if this.is_true() {
+        "true"
+    } else if this.is_false() {
+        "false"
+    } else {
+        return Err(Throw::type_error(
+            heap,
+            "TypeError: Boolean.prototype.toString requires that 'this' be a Boolean",
+        ));
+    };
+    Ok(JsValue::string(heap.intern_text(text)))
+}
+
+/// `Boolean.prototype.valueOf` – the primitive receiver itself.
+pub fn boolean_proto_value_of(
+    _heap: &mut Heap,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    Ok(this)
+}

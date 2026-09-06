@@ -7,7 +7,7 @@
 //! the Smi range become Smis, everything else stays a raw double — with the
 //! deliberate exception of negative zero, whose sign a Smi cannot carry.
 
-use v12_heap::{Handle, Heap, JsValue, Kind, V12Str};
+use v12_heap::{Handle, Heap, JsObject, JsValue, Kind, V12Str};
 
 use crate::JSException;
 
@@ -222,12 +222,17 @@ pub(crate) fn to_js_string(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>
     }
     if v.is_object() {
         let o = v.as_object().expect("object tag");
-        let text = if heap.get(o).kind == Kind::Function {
-            "function"
-        } else {
-            "[object Object]"
-        };
-        return Ok(heap.intern_text(text));
+        if heap.get(o).kind == Kind::Function {
+            return Ok(heap.intern_text("function"));
+        }
+        // Real arrays render as their comma-joined elements (so `map`
+        // results don't display as `[object Object]`); every other object
+        // keeps the reference behavior.
+        if heap.get(o).kind == Kind::Array {
+            let text = array_join_text(heap, o, 0);
+            return Ok(heap.intern_text(&text));
+        }
+        return Ok(heap.intern_text("[object Object]"));
     }
     if v.is_symbol() {
         return Err(JSException(JsValue::string(heap.intern_text(
@@ -237,6 +242,33 @@ pub(crate) fn to_js_string(heap: &mut Heap, v: JsValue) -> Result<Handle<V12Str>
     Err(JSException(JsValue::string(heap.intern_text(
         "InternalError: BigInt ToString is not supported yet",
     ))))
+}
+
+/// Comma-joined element text of a real array (`undefined`/`null`/holes
+/// render empty, matching `Array.prototype.join`). Nested arrays recurse;
+/// anything unrenderable renders empty so display never throws. `depth`
+/// caps the recursion so cyclic arrays terminate.
+fn array_join_text(heap: &mut Heap, obj: Handle<JsObject>, depth: usize) -> String {
+    if depth > 8 {
+        return String::new();
+    }
+    // Snapshot before formatting: rendering an element may allocate (and
+    // thus collect), invalidating a live borrow of the element store.
+    let elements: Vec<JsValue> = heap.get(obj).elements_snapshot();
+    let mut parts = Vec::with_capacity(elements.len());
+    for v in elements {
+        if v.is_undefined() || v.is_null() || v.is_hole() {
+            parts.push(String::new());
+        } else if let Some(nested) = v.as_object().filter(|h| heap.get(*h).kind == Kind::Array) {
+            parts.push(array_join_text(heap, nested, depth + 1));
+        } else {
+            match to_js_string(heap, v) {
+                Ok(h) => parts.push(String::from_utf16_lossy(&string_units(heap, h))),
+                Err(_) => parts.push(String::new()),
+            }
+        }
+    }
+    parts.join(",")
 }
 
 // ---------------------------------------------------------------------------

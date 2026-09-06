@@ -67,6 +67,32 @@ impl Interp<'_> {
                 };
                 return result.map(CallOutcome::Value).map_err(JSException);
             }
+            v12_heap::FunctionTarget::RealmEval(target_global) => {
+                // Cross-realm eval ($262.createRealm().eval): compile and run
+                // the source argument against the captured realm's global via
+                // the same eval seam the interpreter uses for direct eval, so
+                // the nested program registers into this interpreter's
+                // cross-program table and its closures stay callable here.
+                let args_start = callee_slot + 2;
+                let source = self
+                    .stack
+                    .get(args_start)
+                    .and_then(|v| v.as_string())
+                    .map(|h| self.string_text(h))
+                    .unwrap_or_default();
+                let programs = self.programs();
+                self.gc_protect();
+                let result = self.natives.eval(
+                    self.heap,
+                    &source,
+                    this_v,
+                    Some(target_global),
+                    programs,
+                );
+                return result
+                    .map(CallOutcome::Value)
+                    .map_err(|t| JSException::from_throw(self.heap, t));
+            }
         };
 
         // Indices beyond the compiled program route to the native seam. The
@@ -234,8 +260,60 @@ impl Interp<'_> {
                         let _ = args_slice;
                         return Ok(CallOutcome::Value(JsValue::object(target)));
                     }
-                    // Any other native id: route through the registry seam.
+                    NativeId::Eval => {
+                        // Direct eval: hand the source, shared global, and
+                        // the cross-program registry to the engine's eval
+                        // implementation, which compiles and runs a nested
+                        // interpreter against this heap. The registry lets
+                        // eval-created closures be invoked from this program
+                        // afterwards. (The compile-time table's `eval_stub`
+                        // is only a syntax check — real execution needs the
+                        // registry seam.)
+                        let source = self
+                            .stack
+                            .get(callee_slot + 2)
+                            .and_then(|v| v.as_string())
+                            .map(|h| self.string_text(h))
+                            .unwrap_or_default();
+                        let global = self.global;
+                        let programs = self.programs();
+                        self.gc_protect();
+                        let result = self.natives.eval(
+                            self.heap,
+                            &source,
+                            this_v,
+                            global,
+                            programs,
+                        );
+                        result
+                            .map(CallOutcome::Value)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
+                    }
+                    NativeId::Function => {
+                        // Function(params…, body): compile the body into a
+                        // program registered in this interpreter's
+                        // cross-program table and return a real closure
+                        // stamped with that program's id (the compile-time
+                        // table's stub cannot do the registration).
+                        let programs = self.programs();
+                        self.gc_protect();
+                        let result = self
+                            .natives
+                            .function_construct(self.heap, &args_slice, programs);
+                        result
+                            .map(CallOutcome::Value)
+                            .map_err(|t| JSException::from_throw(self.heap, t))
+                    }
+                    // Any other native id: callback-taking built-ins
+                    // re-enter the machine and cannot run as registry
+                    // natives, so try the interp seam first; everything
+                    // else routes through the registry seam.
                     _ => {
+                        if let Some(result) =
+                            self.run_callback_builtin(native_fn, this_v, &args_slice)
+                        {
+                            return result.map(CallOutcome::Value);
+                        }
                         self.gc_protect();
                         let result =
                             self.natives
@@ -432,6 +510,20 @@ impl Interp<'_> {
                 self.gc_protect();
                 closure.call(self.heap, this, args).map_err(JSException)
             }
+            v12_heap::FunctionTarget::RealmEval(target_global) => {
+                // Cross-realm eval invoked as an accessor: run the source
+                // argument against the captured realm's global.
+                let source = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|h| self.string_text(h))
+                    .unwrap_or_default();
+                let programs = self.programs();
+                self.gc_protect();
+                self.natives
+                    .eval(self.heap, &source, this, Some(target_global), programs)
+                    .map_err(|t| JSException::from_throw(self.heap, t))
+            }
             v12_heap::FunctionTarget::Bytecode(fn_idx) => {
                 // A compiled accessor body: push a frame directly (this runs
                 // inside the dispatch loop, so `call_object` — which requires
@@ -508,6 +600,19 @@ impl Interp<'_> {
             v12_heap::FunctionTarget::Host(closure) => {
                 self.gc_protect();
                 closure.call(self.heap, this, args).map_err(JSException)
+            }
+            v12_heap::FunctionTarget::RealmEval(target_global) => {
+                // Cross-realm eval invoked via the inline-call path.
+                let source = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|h| self.string_text(h))
+                    .unwrap_or_default();
+                let programs = self.programs();
+                self.gc_protect();
+                self.natives
+                    .eval(self.heap, &source, this, Some(target_global), programs)
+                    .map_err(|t| JSException::from_throw(self.heap, t))
             }
             v12_heap::FunctionTarget::Bytecode(fn_idx) => {
                 // Interpreter-internal natives (generator next/return/throw,
@@ -659,7 +764,8 @@ impl Interp<'_> {
         }
         if let Some(r#gen) = finished.generator {
             // Async completion: settle stored promise and don't overwrite caller dst (promise already delivered)
-            let is_async = self.is_async_fn(finished.fn_idx);
+            // Program-aware: the finished frame may belong to an eval program.
+            let is_async = self.is_async_fn_for(finished.fn_idx, finished.program);
             let has_promise_slot = self.heap.get(r#gen).properties.len() > 4;
             if is_async && has_promise_slot {
                 if let Some(ph) = self.heap.get(r#gen).properties[4].as_object() {
@@ -680,17 +786,32 @@ impl Interp<'_> {
             if is_async && has_promise_slot {
                 // If this was a direct call without prior await suspension (no caller advancement),
                 // ensure caller gets the promise
-                if let Some(caller) = self.frames.last_mut() {
-                    let pc = caller.pc;
-                    if let Some(&instr) = self.functions[caller.fn_idx as usize].instrs.get(pc)
-                        && (instr.op() == Some(v12_bytecode::Opcode::Call)
-                            || instr.op() == Some(v12_bytecode::Opcode::Wide))
-                    {
-                        let instrs = &self.functions[caller.fn_idx as usize].instrs;
+                // Snapshot the caller's identity before any program-table
+                // lookup: the caller may live in another program (eval), so
+                // its bytecode resolves through its own program table — never
+                // `self.functions` (which can be empty for a nested eval
+                // interpreter whose main lives in the shared registry).
+                let (caller_fn_idx, caller_program, caller_pc0) = match self.frames.last() {
+                    Some(c) => (c.fn_idx, c.program, c.pc),
+                    None => (0, 0, 0),
+                };
+                let has_caller = !self.frames.is_empty();
+                if has_caller {
+                    let pc = caller_pc0;
+                    let caller_funcs = self.functions_for_program(caller_program);
+                    let is_parked_call = caller_funcs
+                        .get(caller_fn_idx as usize)
+                        .and_then(|f| f.instrs.get(pc))
+                        .is_some_and(|instr| {
+                            instr.op() == Some(v12_bytecode::Opcode::Call)
+                                || instr.op() == Some(v12_bytecode::Opcode::Wide)
+                        });
+                    if is_parked_call {
+                        let instrs = caller_funcs[caller_fn_idx as usize].instrs.clone();
                         if let Some(ph) = self.heap.get(r#gen).properties.get(4).copied()
-                            && let Ok((_, dst, width)) = decode_parked_call(instrs, pc)
+                            && let Ok((_, dst, width)) = decode_parked_call(&instrs, pc)
                         {
-                            let caller_base = caller.base;
+                            let caller_base = self.frames.last().map(|c| c.base).unwrap_or(0);
                             let idx = caller_base + usize::from(dst);
                             let is_undef = self.stack.get(idx).is_some_and(|v| v.is_undefined());
                             if is_undef {
@@ -698,7 +819,9 @@ impl Interp<'_> {
                                     self.stack.resize(idx + 1, JsValue::undefined());
                                 }
                                 self.stack[idx] = ph;
-                                caller.pc += width;
+                                if let Some(c) = self.frames.last_mut() {
+                                    c.pc += width;
+                                }
                                 return Ok(false);
                             }
                         }
@@ -727,10 +850,23 @@ impl Interp<'_> {
         // Construct adds the spec's return-value adjustment: a body that
         // returns an object replaces the instance, otherwise the newly
         // allocated instance (still sitting in the callee's r0) is returned.
-        let instrs = &self.functions[caller.fn_idx as usize].instrs;
-        let caller_base = caller.base;
-        let caller_pc = caller.pc;
-        let Ok((is_construct, dst, width)) = decode_parked_call(instrs, caller_pc) else {
+        // Program-aware: the caller may live in another program (eval), so
+        // its bytecode resolves through its own table — never `self.functions`
+        // (which is empty for a nested eval interpreter whose main lives in
+        // the shared registry). A missing entry is a JS TypeError, not a panic.
+        let (caller_fn_idx, caller_program, caller_base, caller_pc) = {
+            let c = caller;
+            (c.fn_idx, c.program, c.base, c.pc)
+        };
+        let caller_funcs = self.functions_for_program(caller_program);
+        let Some(caller_fn) = caller_funcs.get(caller_fn_idx as usize) else {
+            self.stack.truncate(finished.base);
+            return Err(JSException(
+                self.error_value("TypeError: corrupt call header"),
+            ));
+        };
+        let instrs = caller_fn.instrs.clone();
+        let Ok((is_construct, dst, width)) = decode_parked_call(&instrs, caller_pc) else {
             // Corrupt call header: treat as JS TypeError rather than native panic
             self.stack.truncate(finished.base);
             return Err(JSException(
@@ -774,17 +910,25 @@ impl Interp<'_> {
     /// `Err` propagates through `call_inline`'s `exec_result?`.
     pub(crate) fn unwind(&mut self, exc: JsValue) -> Result<(), JSException> {
         loop {
-            let covering = self.frames.last().and_then(|frame| {
-                self.functions[frame.fn_idx as usize]
-                    .handlers
+            // Program-aware handler lookup; a frame whose function is
+            // absent from its program table covers nothing (it unwinds).
+            // (The table `Rc` is bound per iteration so handler refs cannot
+            // outlive it.)
+            let covering = self.frames.last().map(|frame| {
+                (frame.fn_idx, frame.program, frame.pc)
+            }).and_then(|(fn_idx, program, pc)| {
+                let funcs = self.functions_for_program(program);
+                let f = funcs.get(fn_idx as usize)?;
+                f.handlers
                     .iter()
                     .filter(|h| {
-                        usize::try_from(h.start).expect("handler pc fits usize") <= frame.pc
-                            && frame.pc < usize::try_from(h.end).expect("handler pc fits usize")
+                        usize::try_from(h.start).expect("handler pc fits usize") <= pc
+                            && pc < usize::try_from(h.end).expect("handler pc fits usize")
                     })
                     .max_by_key(|h| h.start)
+                    .map(|h| (h.target, h.stack_depth))
             });
-            if let Some(h) = covering {
+            if let Some((target, stack_depth)) = covering {
                 let fr = self.frames.last_mut().expect("a frame was just inspected");
                 // Truncate the register window to the handler depth, then
                 // deliver the exception into register `stack_depth`. The
@@ -792,13 +936,13 @@ impl Interp<'_> {
                 // handler temporaries beyond the delivery register remain
                 // addressable.
                 let base = fr.base;
-                let depth = h.stack_depth as usize;
+                let depth = stack_depth as usize;
                 let max_regs = fr.max_regs as usize;
                 self.stack.truncate(base + depth);
                 self.stack.push(exc);
                 self.stack.resize(base + max_regs, JsValue::undefined());
                 self.stack[base + depth] = exc;
-                fr.pc = h.target as usize;
+                fr.pc = target as usize;
                 return Ok(());
             }
             // Never pop the frame `stop_at_frames` names — it belongs to the
@@ -908,11 +1052,37 @@ impl Interp<'_> {
                 let result = closure.call(self.heap, this_v, &args_vec);
                 return result.map(CallOutcome::Value).map_err(JSException);
             }
+            v12_heap::FunctionTarget::RealmEval(target_global) => {
+                // Cross-realm eval invoked via call/apply: run the source
+                // argument against the captured realm's global.
+                let source = args_vec
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|h| self.string_text(h))
+                    .unwrap_or_default();
+                let programs = self.programs();
+                self.gc_protect();
+                let result = self.natives.eval(
+                    self.heap,
+                    &source,
+                    this_v,
+                    Some(target_global),
+                    programs,
+                );
+                return result
+                    .map(CallOutcome::Value)
+                    .map_err(|t| JSException::from_throw(self.heap, t));
+            }
         };
         let callee_funcs = self.functions_for_program(callee_program);
         if (target_idx as usize) >= callee_funcs.len() {
             self.gc_protect();
             let id = self.native_id_for(target_idx)?;
+            // Callback-taking built-ins re-enter the machine; try the interp
+            // seam before the registry.
+            if let Some(result) = self.run_callback_builtin(id, this_v, &args_vec) {
+                return result.map(CallOutcome::Value);
+            }
             let result = self.natives.call_native(self.heap, this_v, &args_vec, id);
             return result
                 .map(CallOutcome::Value)
@@ -924,7 +1094,9 @@ impl Interp<'_> {
             ));
         }
         let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
-            let f = &self.functions[target_idx as usize];
+            // Program-aware: the callee may belong to an eval program, and
+            // range was already checked against `callee_funcs` above.
+            let f = &callee_funcs[target_idx as usize];
             (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
         };
         // Check rest param handling for callee? prepare_call also handles rest, but we duplicate here.
@@ -1036,6 +1208,18 @@ impl Interp<'_> {
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
                     let id = self.native_id_for(idx)?;
+                    // `new Function(params…, body)` must compile the body
+                    // into a real registered program; the compile-time stub
+                    // can only validate syntax and return a placeholder.
+                    if id == NativeId::Function {
+                        let args_slice = self.stack[args_start..args_end].to_vec();
+                        let programs = self.programs();
+                        let result = self
+                            .natives
+                            .function_construct(self.heap, &args_slice, programs)
+                            .map_err(|t| JSException::from_throw(self.heap, t))?;
+                        return Ok(CallOutcome::Value(result));
+                    }
                     // The constructor is passed as `this`: spec-undefined is
                     // useless to these handlers, and the identity read lets
                     // e.g. `new Promise` link instances to `Promise.prototype`.
@@ -1061,6 +1245,12 @@ impl Interp<'_> {
                 return result.map(CallOutcome::Value).map_err(JSException);
             }
             v12_heap::FunctionTarget::Host(_) => {
+                return Err(JSException(
+                    self.error_value("TypeError: value is not a constructor"),
+                ));
+            }
+            v12_heap::FunctionTarget::RealmEval(_) => {
+                // Realm-bound eval functions are not constructors.
                 return Err(JSException(
                     self.error_value("TypeError: value is not a constructor"),
                 ));
@@ -1129,7 +1319,9 @@ impl Interp<'_> {
         let instance_v = JsValue::object(instance);
 
         let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
-            let f = &self.functions[target_idx as usize];
+            // Program-aware: the callee was range-checked against its own
+            // program's table at the top of `prepare_construct`.
+            let f = &self.functions_for_program(callee_program)[target_idx as usize];
             (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
         };
         let new_base = base + usize::from(caller_max_regs);
@@ -1211,5 +1403,518 @@ impl Interp<'_> {
             Vec::new()
         };
         crate::call::fill_call_window(self, window, &args_slice, has_rest, fixed, rest_reg)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Callback-taking built-ins
+// ---------------------------------------------------------------------------
+
+impl Interp<'_> {
+    /// The built-ins whose spec algorithms take a user callback: they must
+    /// re-enter the machine, so they cannot run as registry natives (the
+    /// `NativeHandler` signature is a pure `&mut Heap` fn). Returns `None`
+    /// for every other id so the caller falls back to the registry seam.
+    pub(crate) fn run_callback_builtin(
+        &mut self,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Option<Result<JsValue, JSException>> {
+        match id {
+            NativeId::ArrayForEach
+            | NativeId::ArrayMap
+            | NativeId::ArrayFilter
+            | NativeId::ArraySome
+            | NativeId::ArrayEvery
+            | NativeId::ArrayFind
+            | NativeId::ArrayFindIndex
+            | NativeId::ArrayFindLast
+            | NativeId::ArrayFindLastIndex
+            | NativeId::ArrayReduce
+            | NativeId::ArrayReduceRight
+            | NativeId::ArrayFlatMap
+            | NativeId::ArraySort => Some(self.run_array_callback(id, this_v, args)),
+            NativeId::MapForEach | NativeId::SetForEach => {
+                Some(self.run_collection_for_each(id, this_v, args))
+            }
+            NativeId::IteratorMap
+            | NativeId::IteratorFilter
+            | NativeId::IteratorFlatMap
+            | NativeId::IteratorReduce
+            | NativeId::IteratorForEach
+            | NativeId::IteratorSome
+            | NativeId::IteratorEvery
+            | NativeId::IteratorFind => Some(self.run_iterator_callback(id, this_v, args)),
+            _ => None,
+        }
+    }
+
+    /// The receiver's length (array slot or element count for array-likes).
+    fn callback_len(&self, obj: Handle<JsObject>) -> u32 {
+        let o = self.heap.get(obj);
+        if o.kind == Kind::Array {
+            if let Some(&v) = o.properties.first() {
+                if let Some(n) = v.as_smi() {
+                    return n as u32;
+                }
+                if let Some(n) = v.as_f64()
+                    && n.is_finite()
+                    && n >= 0.0
+                {
+                    return n as u32;
+                }
+            }
+        }
+        o.element_len() as u32
+    }
+
+    /// The receiver's element at `i` (`None` when absent: hole or out of
+    /// range; ordinary array-likes read the flat `elements` vec, then
+    /// integer-indexed *shape* properties — `{0: 5}` binds `"0"` through
+    /// the shape, not the element store).
+    fn callback_elem(&mut self, obj: Handle<JsObject>, i: u32) -> Option<JsValue> {
+        let o = self.heap.get(obj);
+        if o.kind == Kind::Array {
+            return o.get_element(i);
+        }
+        if let Some(v) = o.elements.get(i as usize).filter(|v| !v.is_hole()).copied() {
+            return Some(v);
+        }
+        let h = self.heap.intern_text(&i.to_string());
+        let key = v12_heap::PropKey::from_string(h);
+        let shape = self.heap.shape_of(obj);
+        let slot = self.heap.lookup_property(shape, key)?.slot()?;
+        self.heap.get(obj).properties.get(slot as usize).copied()
+    }
+
+    /// The highest index an element read can return data for, clamped to
+    /// `len` (mirrors the engine's `dense_bound`: the element store plus
+    /// shape-bound integer keys on non-arrays). Everything at or beyond it
+    /// reads as a hole, which the callback methods all skip.
+    fn callback_dense_bound(&mut self, obj: Handle<JsObject>, len: u32) -> u32 {
+        let mut bound = self.heap.get(obj).element_len() as u64;
+        if self.heap.get(obj).kind != Kind::Array {
+            let shape = self.heap.shape_of(obj);
+            let keys: Vec<_> = self.heap.get(shape).descriptors.as_slice().iter().filter_map(|d| d.key().string()).collect();
+            for h in keys {
+                let text = self.string_text(h);
+                if !text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(n) = text.parse::<u64>() {
+                        bound = bound.max(n + 1);
+                    }
+                }
+            }
+        }
+        bound.min(u64::from(len)) as u32
+    }
+
+    fn callback_is_callable(&self, v: JsValue) -> Option<Handle<JsObject>> {
+        v.as_object().filter(|h| self.heap.get(*h).kind == Kind::Function)
+    }
+
+    /// Shared iteration engine for the callback methods.
+    fn run_array_callback(
+        &mut self,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let Some(obj) = this_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: Array method called on non-object"),
+            ));
+        };
+        if id == NativeId::ArraySort {
+            return self.array_sort_callback(obj, args);
+        }
+        let Some(cb) = args.first().copied().and_then(|v| self.callback_is_callable(v)) else {
+            return Err(JSException(
+                self.error_value("TypeError: callback is not a function"),
+            ));
+        };
+        // The callback outlives the argument window across nested executions;
+        // root it so a collection during a nested call cannot free it.
+        self.heap.add_root(JsValue::object(cb));
+        let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
+        // A huge `length` property on a sparse receiver describes mostly
+        // holes, which every one of these methods skips — so iterating only
+        // the dense bound (stored elements + shape-bound integer keys) is
+        // exact and keeps `0..len` from spinning billions of iterations
+        // outside the cooperative deadline's reach.
+        let len = self.callback_dense_bound(obj, self.callback_len(obj));
+
+        // `reduce`/`reduceRight` pass the accumulator; everything else passes
+        // a `thisArg`. Visited calls carry (element, index, receiver).
+        let is_reduce = matches!(id, NativeId::ArrayReduce | NativeId::ArrayReduceRight);
+        let mut accumulator: Option<JsValue> = if is_reduce {
+            match args.get(1).copied() {
+                Some(v) if !v.is_undefined() => Some(v),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let indices: Box<dyn Iterator<Item = u32>> = if id == NativeId::ArrayReduceRight {
+            Box::new((0..len).rev())
+        } else {
+            Box::new(0..len)
+        };
+
+        let mut mapped: Vec<JsValue> = Vec::new();
+        let mut found: Option<(JsValue, u32)> = None;
+        for i in indices {
+            let Some(elem) = self.callback_elem(obj, i) else {
+                continue; // holes are skipped by every one of these methods
+            };
+            // Non-reduce calls carry (element, index, receiver); reduce
+            // carries (accumulator, element, index).
+            let (first_arg, second_arg) = if is_reduce {
+                match accumulator {
+                    Some(acc) => (acc, elem),
+                    // The first present element becomes the accumulator.
+                    None => {
+                        accumulator = Some(elem);
+                        continue;
+                    }
+                }
+            } else {
+                (elem, JsValue::from_f64(f64::from(i)))
+            };
+            let call_args: [JsValue; 3] = [first_arg, second_arg, this_v];
+            let result = self.call_object(cb, this_arg, &call_args)?;
+            // Results collected across calls must survive the next call's
+            // collection safepoint; the engine roots liberally by design.
+            self.heap.add_root(result);
+            if is_reduce {
+                accumulator = Some(result);
+            }
+            match id {
+                NativeId::ArrayMap | NativeId::ArrayFlatMap => mapped.push(result),
+                NativeId::ArrayFilter => {
+                    if result.is_true() {
+                        mapped.push(elem);
+                    }
+                }
+                NativeId::ArraySome => {
+                    if result.is_true() {
+                        return Ok(JsValue::from_bool(true));
+                    }
+                }
+                NativeId::ArrayEvery => {
+                    if !result.is_true() {
+                        return Ok(JsValue::from_bool(false));
+                    }
+                }
+                NativeId::ArrayFind | NativeId::ArrayFindLast => {
+                    if result.is_true() {
+                        found = Some((elem, i));
+                        if id == NativeId::ArrayFind {
+                            break;
+                        }
+                    }
+                }
+                NativeId::ArrayFindIndex | NativeId::ArrayFindLastIndex => {
+                    if result.is_true() {
+                        found = Some((JsValue::from_f64(f64::from(i)), i));
+                        if id == NativeId::ArrayFindIndex {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match id {
+            NativeId::ArrayMap => {
+                self.gc_protect();
+                let arr = self.heap.alloc(JsObject::array(mapped));
+                self.heap.add_root(JsValue::object(arr));
+                Ok(JsValue::object(arr))
+            }
+            NativeId::ArrayFilter => {
+                self.gc_protect();
+                let arr = self.heap.alloc(JsObject::array(mapped));
+                self.heap.add_root(JsValue::object(arr));
+                Ok(JsValue::object(arr))
+            }
+            NativeId::ArraySome => Ok(JsValue::from_bool(false)),
+            NativeId::ArrayEvery => Ok(JsValue::from_bool(true)),
+            NativeId::ArrayFind | NativeId::ArrayFindLast => {
+                Ok(found.map(|(v, _)| v).unwrap_or(JsValue::undefined()))
+            }
+            NativeId::ArrayFindIndex | NativeId::ArrayFindLastIndex => Ok(match found {
+                Some((_, i)) => JsValue::from_f64(f64::from(i)),
+                None => JsValue::from_f64(-1.0),
+            }),
+            NativeId::ArrayReduce | NativeId::ArrayReduceRight => match accumulator {
+                Some(v) => Ok(v),
+                None => Err(JSException(
+                    self.error_value("TypeError: Reduce of empty array with no initial value"),
+                )),
+            },
+            NativeId::ArrayFlatMap => {
+                // flatMap: flatten one level of array results into the output.
+                self.gc_protect();
+                let mut flat: Vec<JsValue> = Vec::with_capacity(mapped.len());
+                for v in &mapped {
+                    let nested = v
+                        .as_object()
+                        .filter(|h| self.heap.get(*h).kind == Kind::Array);
+                    if let Some(h) = nested {
+                        let items = self.heap.get(h).elements_snapshot();
+                        flat.extend(items.iter().map(|x| if x.is_hole() { JsValue::undefined() } else { *x }));
+                    } else {
+                        flat.push(*v);
+                    }
+                }
+                let arr = self.heap.alloc(JsObject::array(flat));
+                self.heap.add_root(JsValue::object(arr));
+                Ok(JsValue::object(arr))
+            }
+            _ => Ok(JsValue::undefined()),
+        }
+    }
+
+    /// `Map.prototype.forEach` / `Set.prototype.forEach` — re-entrant
+    /// callback over a snapshot of the entries.
+    fn run_collection_for_each(
+        &mut self,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let Some(obj) = this_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: forEach called on non-object"),
+            ));
+        };
+        let want_map = id == NativeId::MapForEach;
+        let kind = self.heap.get(obj).kind;
+        if (want_map && kind != Kind::Map) || (!want_map && kind != Kind::Set) {
+            return Err(JSException(
+                self.error_value("TypeError: forEach called on incompatible receiver"),
+            ));
+        }
+        let Some(cb) = args.first().copied().and_then(|v| self.callback_is_callable(v)) else {
+            return Err(JSException(
+                self.error_value("TypeError: callback is not a function"),
+            ));
+        };
+        self.heap.add_root(JsValue::object(cb));
+        let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
+        let snapshot: Vec<JsValue> = self.heap.get(obj).elements.clone();
+        if want_map {
+            for pair in snapshot.chunks_exact(2) {
+                let call_args = [pair[1], pair[0], this_v];
+                let r = self.call_object(cb, this_arg, &call_args)?;
+                self.heap.add_root(r);
+            }
+        } else {
+            for v in &snapshot {
+                let call_args = [*v, *v, this_v];
+                let r = self.call_object(cb, this_arg, &call_args)?;
+                self.heap.add_root(r);
+            }
+        }
+        Ok(JsValue::undefined())
+    }
+
+    /// `Iterator.prototype` callback helpers. Each pulls values by calling
+    /// the iterator's `next` through the native seam, then invokes the user
+    /// callback via `call_object`.
+    fn run_iterator_callback(
+        &mut self,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let Some(obj) = this_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: Iterator method called on non-object"),
+            ));
+        };
+        if self.heap.get(obj).kind != Kind::Iterator {
+            return Err(JSException(
+                self.error_value("TypeError: Iterator method called on non-iterator"),
+            ));
+        }
+        let Some(cb) = args.first().copied().and_then(|v| self.callback_is_callable(v)) else {
+            return Err(JSException(
+                self.error_value("TypeError: callback is not a function"),
+            ));
+        };
+        self.heap.add_root(JsValue::object(cb));
+        let this_arg = if id == NativeId::IteratorReduce {
+            args.get(2).copied().unwrap_or(JsValue::undefined())
+        } else {
+            args.get(1).copied().unwrap_or(JsValue::undefined())
+        };
+        // Drain via the registry `next` (reads/publishes iterator state).
+        let next_fn = self.map_set_method(NativeId::IteratorNext);
+        let Some(next_obj) = next_fn.as_object() else {
+            return Err(JSException(self.error_value("InternalError: missing next")));
+        };
+        self.stack.push(JsValue::object(next_obj));
+        let mut values: Vec<JsValue> = Vec::new();
+        loop {
+            self.gc_protect();
+            let r = self.natives.call_native(self.heap, this_v, &[], NativeId::IteratorNext);
+            let r = r.map_err(|t| JSException::from_throw(self.heap, t))?;
+            let Some(ro) = r.as_object() else { break };
+            let done = self.heap.get(ro).properties.get(1).copied().unwrap_or(JsValue::undefined());
+            if done.is_true() {
+                break;
+            }
+            let v = self.heap.get(ro).properties.first().copied().unwrap_or(JsValue::undefined());
+            values.push(v);
+            if values.len() > 1_000_000 {
+                break;
+            }
+        }
+        self.stack.pop();
+        let mut mapped: Vec<JsValue> = Vec::new();
+        let mut acc: Option<JsValue> = if id == NativeId::IteratorReduce {
+            match args.get(1).copied() {
+                Some(v) if !v.is_undefined() => Some(v),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        for (i, v) in values.iter().enumerate() {
+            let idx = JsValue::from_f64(i as f64);
+            let result = if id == NativeId::IteratorReduce {
+                match acc {
+                    Some(a) => {
+                        let call_args = [a, *v, idx];
+                        let r = self.call_object(cb, this_arg, &call_args)?;
+                        self.heap.add_root(r);
+                        acc = Some(r);
+                        continue;
+                    }
+                    None => {
+                        acc = Some(*v);
+                        continue;
+                    }
+                }
+            } else {
+                let call_args = [*v, idx, this_v];
+                let r = self.call_object(cb, this_arg, &call_args)?;
+                self.heap.add_root(r);
+                r
+            };
+            match id {
+                NativeId::IteratorMap | NativeId::IteratorFlatMap => mapped.push(result),
+                NativeId::IteratorFilter => {
+                    if result.is_true() {
+                        mapped.push(*v);
+                    }
+                }
+                NativeId::IteratorSome => {
+                    if result.is_true() {
+                        return Ok(JsValue::from_bool(true));
+                    }
+                }
+                NativeId::IteratorEvery => {
+                    if !result.is_true() {
+                        return Ok(JsValue::from_bool(false));
+                    }
+                }
+                NativeId::IteratorFind => {
+                    if result.is_true() {
+                        return Ok(*v);
+                    }
+                }
+                NativeId::IteratorForEach => {}
+                _ => {}
+            }
+        }
+        match id {
+            NativeId::IteratorMap => {
+                self.gc_protect();
+                let arr = self.heap.alloc(JsObject::array(mapped));
+                self.heap.add_root(JsValue::object(arr));
+                Ok(JsValue::object(arr))
+            }
+            NativeId::IteratorFilter => {
+                self.gc_protect();
+                let arr = self.heap.alloc(JsObject::array(mapped));
+                self.heap.add_root(JsValue::object(arr));
+                Ok(JsValue::object(arr))
+            }
+            NativeId::IteratorFlatMap => {
+                self.gc_protect();
+                let mut flat: Vec<JsValue> = Vec::with_capacity(mapped.len());
+                for v in &mapped {
+                    if let Some(h) = v.as_object().filter(|h| self.heap.get(*h).kind == Kind::Array) {
+                        flat.extend(self.heap.get(h).elements_snapshot());
+                    } else {
+                        flat.push(*v);
+                    }
+                }
+                let arr = self.heap.alloc(JsObject::array(flat));
+                self.heap.add_root(JsValue::object(arr));
+                Ok(JsValue::object(arr))
+            }
+            NativeId::IteratorReduce => match acc {
+                Some(v) => Ok(v),
+                None => Err(JSException(
+                    self.error_value("TypeError: Reduce of empty iterator with no initial value"),
+                )),
+            },
+            NativeId::IteratorSome => Ok(JsValue::from_bool(false)),
+            NativeId::IteratorEvery => Ok(JsValue::from_bool(true)),
+            NativeId::IteratorFind => Ok(JsValue::undefined()),
+            _ => Ok(JsValue::undefined()),
+        }
+    }
+
+    /// `Array.prototype.sort(comparefn?)` — the comparator needs re-entry, so
+    /// sort runs here; holes and `undefined` sort to the end per spec.
+    fn array_sort_callback(
+        &mut self,
+        obj: Handle<JsObject>,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let comparator = args.first().copied().and_then(|v| self.callback_is_callable(v));
+        let mut elems: Vec<JsValue> = self.heap.get(obj).elements_snapshot();
+        // Undefined sorts last; holes after undefined. Sort the defined part.
+        let undefined_count = elems.iter().filter(|v| v.is_undefined()).count();
+        elems.retain(|v| !v.is_undefined() && !v.is_hole());
+        // Pre-transduce through strings? No — comparators are user code or
+        // default ToString ordering. Rust's sort is stable (spec requires it).
+        if let Some(cb) = comparator {
+            // Insertion into a comparator-ordered vec via sort_by with a
+            // stateful closure is unsound under re-entry; collect and
+            // insertion-sort instead (arrays here are small).
+            let mut sorted: Vec<JsValue> = Vec::with_capacity(elems.len());
+            for v in elems {
+                let mut lo = 0usize;
+                let mut hi = sorted.len();
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let a: [JsValue; 2] = [sorted[mid], v];
+                    let r = self.call_object(cb, JsValue::undefined(), &a)?;
+                    let n = r.as_smi().map(i64::from).or(r.as_f64().map(|f| f as i64)).unwrap_or(0);
+                    // comparefn(sorted[mid], v) <= 0 → v sorts after mid.
+                    if n <= 0 {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                sorted.insert(lo, v);
+            }
+            elems = sorted;
+        } else {
+            elems.sort_by_cached_key(|v| self.to_display_string(*v));
+        }
+        let undefineds = vec![JsValue::undefined(); undefined_count];
+        elems.extend(undefineds);
+        self.heap.get_mut(obj).replace_elements(elems);
+        Ok(JsValue::object(obj))
     }
 }

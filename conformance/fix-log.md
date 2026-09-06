@@ -24,6 +24,18 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-06 — Built-ins expansion: Math/Number/Array/Object/String/JSON/Boolean/global + Symbol/MapSet/Iterator
+
+- **Filter:** `built-ins/Array|Math|Number|Object|String|JSON|Boolean|global` (8 slices, 8 jobs each)
+- **Before:** Math 10.1 %, Number 18.6 %, JSON 11.7 %, Boolean 22 %, String 7.7 %, Object 1.7 %; Array hung the runner (no completion)
+- **After:** Array 712/3 332 (21.4 %), Math 95/327 (29.1 %), Number 137/340 (40.3 %), Object 552/3 414 (16.2 %), String 346/1 341 (25.8 %), JSON 28/165 (17.0 %), Boolean 13/51 (25.5 %), global 14/29 (48.3 %)
+- **Delta:** Math +19.0 pts, Number +21.7 pts, Object +14.5 pts, String +18.1 pts, JSON +5.3 pts, Boolean +3.5 pts; Array now completes
+- **Engine change:** pure natives via `define_builtins!` + callback methods via `Interp::run_callback_builtin` interp seam (both call seams); RegExt merged-operand fix in `execute.rs` (arms read `instr.a()` instead of merged `ra`/`rb`/`rc` past 255 registers); `dense_bound` array-hang hardening (element-store len vs shape-bound integer keys, clamped); realm-global bias (`is_realm_global`/`realm_global_intrinsic_read`, `realm_globals` in gc.rs, ic_lookup intrinsic fallback, RealmEval ×5, Eval/Function seams); elements-overflow clamp; Symbol ctor + statics; Map/Set forEach/clear/entries/keys/values; Iterator toArray/take/drop/from
+- **Files:** `crates/v12-engine/src/builtins/{array,math,number,object,string,json,boolean,global,symbol,iterator,mod,registry}.rs`, `crates/v12-engine/src/realm.rs`, `crates/v12-engine/src/gc.rs`, `crates/v12-interp/src/{execute,call_setup,globals}.rs`, `crates/v12-native/src/{id,methods}.rs`, `docs/builtins-plan.md`
+- **Bucket:** built-ins coverage — shrank across all 8 slices (remaining: callback-semantics gaps, `callee is not a function` on Math length/name/prop-desc tests, display-string `[object Object]` for map results)
+- **Runner:** `./conformance/run.sh --filter built-ins/X --jobs 8` (default `--format human`), gate `cargo nextest run --workspace` 569/569
+- **Notes:** docs-only close-out; no code changes in this entry. Reconstructed concurrent-session cross-realm work included in gate count; `git diff` review of that re-implementation still pending before commit.
+
 ### 2026-09-05 — Async verdict path + Promise constructor + `import()` rejection promise
 
 - **Filter:** `language/expressions` (11 190 files, 4 jobs) + `async` slice (6 252 files)

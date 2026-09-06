@@ -8,6 +8,19 @@ use v12_heap::JsValue;
 use super::{string_value, Engine};
 
 impl Engine {
+    /// Installs `name` on the global as a host function that creates a fresh
+    /// realm and returns its `$262`-shaped API object (see
+    /// [`crate::realm::build_realm_object`]). The Test262 runner binds this
+    /// as `$262.createRealm`.
+    pub fn install_create_realm_function(&mut self, name: &str) -> Result<(), JsValue> {
+        self.create_host_function(
+            name,
+            crate::builtins::HostClosure::new(|heap, _this, _args| {
+                Ok(JsValue::object(crate::realm::build_realm_object(heap)))
+            }),
+        )
+    }
+
     pub fn create_function(&mut self, params: &str, body: &str) -> Result<JsValue, JsValue> {
         let src = format!("function __f({params}){{{body}}}");
         let (program, _strings) =
