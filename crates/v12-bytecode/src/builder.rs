@@ -157,6 +157,7 @@ impl FunctionBuilder {
 
         FunctionBytecode {
             name_hint: self.name_hint,
+            function_name: None,
             max_regs: self.max_regs,
             instrs: self.instrs,
             consts: self.consts,

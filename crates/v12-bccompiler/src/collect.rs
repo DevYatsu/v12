@@ -440,6 +440,9 @@ impl<'s> Collector<'s> {
                 self.stmt_list(&body.statements);
             }
         }
+        if let Some(id) = &c.id {
+            self.plans.units[idx].function_name = Some(id.name.to_string());
+        }
         self.unit_stack.pop();
         // Walk field initializers for `this`/`super`/captures (e.g. `#x = () => this.#y`).
         for el in &c.body.body {
@@ -465,6 +468,13 @@ impl<'s> Collector<'s> {
                     false,
                     format!("<method>{}", Self::static_key_or_default(&m.key)),
                 );
+                let prefix = match m.kind {
+                    oxc_ast::ast::MethodDefinitionKind::Get => "get ",
+                    oxc_ast::ast::MethodDefinitionKind::Set => "set ",
+                    _ => "",
+                };
+                mplan.function_name = crate::expr::static_key_text(&m.key)
+                    .map(|k| format!("{prefix}{k}"));
                 let parent_strict = *self.strict_stack.last().unwrap_or(&false);
                 let own_strict = m.value.body.as_deref().is_some_and(|b| {
                     b.directives

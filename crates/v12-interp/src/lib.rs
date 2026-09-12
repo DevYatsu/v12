@@ -635,16 +635,31 @@ impl<'a> Interp<'a> {
     /// Arrow functions are not constructible and have no `prototype`.
     fn alloc_closure(&mut self, fn_idx: u32, env: Option<Handle<JsObject>>) -> Handle<JsObject> {
         let funcs = self.functions_for_program(self.program_id);
-        let (is_arrow, expected_args) = funcs
+        let (is_arrow, expected_args, function_name) = funcs
             .get(fn_idx as usize)
-            .map(|f| (f.is_arrow, f.expected_args))
-            .unwrap_or((false, 0));
+            .map(|f| (f.is_arrow, f.expected_args, f.function_name.clone()))
+            .unwrap_or((false, 0, None));
         let mut obj = JsObject::function(v12_heap::FunctionTarget::Bytecode(fn_idx), env);
         obj.program_id = self.program_id;
         let h = self.heap.alloc(obj);
         // Every closure carries its own `length` (ExpectedArgumentCount), so
         // `f.length` reads never depend on the property surfaces.
         self.install_function_length(h, expected_args);
+        if let Some(name) = function_name {
+            let frame = self.stack.len();
+            self.stack.push(JsValue::object(h));
+            self.gc_protect();
+            let name_handle = self.heap.intern_text(&name);
+            let key = JsValue::string(self.heap.intern_text("name"));
+            let installed = self.define_own_data_attrs(
+                JsValue::object(h),
+                key,
+                JsValue::string(name_handle),
+                Attrs::new(false, false, true),
+            );
+            debug_assert!(installed.is_ok(), "name install cannot fail");
+            self.stack.truncate(frame);
+        }
         if !is_arrow {
             // Park the fresh closure on the stack: materialization allocates
             // (prototype object, shape transitions) and the collector can run

@@ -254,6 +254,7 @@ pub fn compile_unit(
     }
     let mut fb = cx.finish()?;
     fb.name_hint = Some(comp.plans.units[idx].name_hint.clone());
+    fb.function_name = comp.plans.units[idx].function_name.clone();
     fb.is_strict = strict;
     let plan = &comp.plans.units[idx];
     fb.has_rest = plan.has_rest;

@@ -195,6 +195,8 @@ pub struct UnitPlan {
     /// Arrow functions inherit `this`; see `this_depth_to`.
     pub is_arrow: bool,
     pub name_hint: String,
+    /// Statically-known `SetFunctionName` value for the unit's closure.
+    pub function_name: Option<String>,
     /// Every declared symbol in the unit (any nesting depth) → storage.
     pub vars: HashMap<SymbolId, VarLoc>,
     /// Symbols in declaration order (params first), driving register and env
@@ -245,6 +247,7 @@ impl UnitPlan {
             parent,
             is_arrow,
             name_hint,
+            function_name: None,
             vars: HashMap::new(),
             decl_order: Vec::new(),
             has_env: false,

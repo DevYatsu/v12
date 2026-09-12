@@ -156,6 +156,9 @@ pub struct PcMapEntry {
 #[derive(Debug, Clone, Default)]
 pub struct FunctionBytecode {
     pub name_hint: Option<String>,
+    /// The spec `SetFunctionName` value for this closure, when statically
+    /// known (methods, class constructors). `None` for anonymous/arrow fns.
+    pub function_name: Option<String>,
     pub max_regs: u16,
     pub instrs: Vec<Instr>,
     pub consts: ConstantPool,
@@ -195,6 +198,7 @@ impl FunctionBytecode {
         let n = instrs.len();
         Self {
             name_hint: None,
+            function_name: None,
             max_regs,
             spans: vec![(0, 0); n],
             instrs,
