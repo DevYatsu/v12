@@ -24,6 +24,23 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-12 — Step A2: parameter defaults & destructuring in the prologue
+
+- **Filter:** `language/expressions/function/dflt-params*`, `arrow-function/dflt-params*`, `object/method-definition`, `function`, `arrow-function`, then full `language` (24 873 files, 8 jobs)
+- **Before:** function 74/264, arrow-function 156/343, object/method-definition 149/303, `function/dflt-params*` 3/9, `arrow-function/dflt-params*` 3/9, `*/dflt-params-ref-prior.js` 0/13
+- **After:** function **141/264**, arrow-function **225/343**, object/method-definition **155/303**, `function/dflt-params*` **6/9**, `arrow-function/dflt-params*` **6/9**; `--filter dflt-params-ref-prior` 15/32
+- **After (full `language`):** 10 998 pass / 13 875 fail / 0 skip, **44.2 %** (prior completed full-language score after A1: 9 722 / 24 873, 39.1 %)
+- **Delta:** +1 276 pass on `language`, +5.1 pts. `language/expressions` slice 4 112/11 190 (36.8 %) → **5 128/11 190 (45.8 %)**.
+- **Root cause:** formal parameters were never lowered (`compile_unit` emitted only the body); `UnitPlan.param_count` counted pattern leaves, so pattern-inner symbols collided with the incoming argument registers `r1..`.
+- **Fix:** `register_formals` records top-level `arity`/`formal_idents`/`rest_ident` (walking every leaf and each `FormalParameter::initializer`); `finalize` reserves the incoming window (`r1..r{arity}`, rest at `r{arity+1}`) before assigning pattern leaves and body locals; `emit_prologue` runs the shared `lower_default`/`lower_binding_pattern` against each incoming register.
+- **Accepted gap:** no parameter TDZ (`(a = b, b = 2)` reads `b`'s register instead of throwing).
+- **Deviation from plan:** oxc 0.147 stores a top-level parameter default on `FormalParameter::initializer` (pattern stays bare), not as a `BindingPattern::AssignmentPattern`; `expected_args`, `register_formals`, and `emit_prologue` were adapted accordingly. All other steps match.
+- **Engine change:** `8e03d93` — bccompiler prologue lowering + incoming-window reservation
+- **Files:** `crates/v12-bccompiler/src/{model,collect,stmt,unit,tests}.rs`
+- **Bucket:** `known-failures.md` §2 A2 — closed (defaults, patterns, ABI collision)
+- **Gate:** `cargo nextest run --workspace` **576 passed**, 0 skipped
+- **Runner:** `./conformance/run.sh --filter language --jobs 8` (human)
+
 ### 2026-09-12 — A1: `Function.prototype` callable + real `bind`
 
 - **Filter:** `language/expressions/class/elements` (1 428 files, 8 jobs), then full `language` (24 873 files, 8 jobs)
