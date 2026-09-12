@@ -411,14 +411,20 @@ impl Interp<'_> {
         };
         let return_key = self.new_temp_key("return");
         let return_v = self.get_property(0, 0, iter_v, return_key)?;
-        let Some(return_obj) = return_v.as_object() else {
+        // Spec 7.4.11: `return` may be null/undefined (no close), but any
+        // other non-callable value is a TypeError.
+        if return_v.is_null() || return_v.is_undefined() {
             return Ok(());
+        }
+        let Some(return_obj) = return_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: iterator.return is not a function"),
+            ));
         };
         self.stack.push(JsValue::object(return_obj));
         self.gc_protect();
-        let result = self.call_inline(return_obj, iter_v, &[]);
+        self.call_inline(return_obj, iter_v, &[])?;
         self.stack.pop();
-        let _ = result;
         Ok(())
     }
 

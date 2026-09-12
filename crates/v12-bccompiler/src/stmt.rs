@@ -1004,9 +1004,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         };
         // Finalizers of regions entered inside the loop run before leaving.
         self.run_finally_copies(base)?;
-        if !is_continue {
-            // Abrupt `break` completion out of `for-of` closes each exited
-            // loop's iterator, innermost first (spec 14.7.4.9).
+        // Leaving a `for-of` closes each exited loop's iterator, innermost
+        // first (spec 14.7.4.9). The target loop itself stays open only for
+        // an unlabeled-style `continue` aimed at it; a labeled `continue`
+        // past it (or a `break`) closes it.
+        if is_continue {
+            self.emit_iterator_closes(pos + 1);
+        } else {
             self.emit_iterator_closes(pos);
         }
         self.emit_jump(Opcode::Jump, 0, target);

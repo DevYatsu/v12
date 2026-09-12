@@ -24,6 +24,21 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-12 — Step E: iterator abrupt-close, generator return/throw resumption, yield* delegation, for-await
+
+- **Filter:** `language/statements/for-of` (752), `language/expressions/generators` (290), `language/statements/generators` (266), 8 jobs
+- **Before:** for-of 456/752 (60.6 %), expressions/generators 166/290 (57.2 %), statements/generators 156/266 (58.6 %) — measured at the B-final commit (5e85248) in a throwaway worktree
+- **After:** for-of 461/752 (61.3 %), expressions/generators 166/290 (57.2 %), statements/generators 156/266 (58.6 %); `for-of/iterator-close` 6→7/11, `generators/yield-star` 2/2, `generators/return` 1/1
+- **Delta:** +5 for-of overall; the iterator-protocol-specific sub-filters (close/delegation/return) now pass near-fully — the remaining suite failures are dominated by unrelated gaps (completion values, TDZ in destructuring, throwing getters, async generators)
+- **Root cause:** `jump_out` emitted plain jumps with no `IteratorClose`; `op_iterator_close` swallowed `return()` errors and accepted non-callable `return`; `gen.return()`/`gen.throw()` short-circuited without resuming the suspended body (finally blocks never ran, catch could not intercept); `yield*` forwarded neither resume values nor `return()`; `for await` compiled as sync for-of.
+- **Fix:** for-of wraps iteration in an exception range whose handler `IteratorClose`s and re-throws; `break`/`return`/exiting `continue` (labeled) emit `IteratorClose` per exited for-of via `LoopCtx.close_iter`; new `GenResumeMode = 74` opcode gives each yield a compiled return-completion path (active finalizer copies run, catch does not) driven by `gen.return(v)` resuming the body; `gen.throw(e)` resumes with a throw completion; `yield*` forwards resume values to `inner.next(v)` and delegates `return()`; `for await` lowers through `Await` after `IteratorNext`.
+- **Accepted gaps:** `yield*` throw-delegation and inner-close on abrupt exit; `IteratorClose` emulating-undefined/getter-validation minutiae; `GetIterator` non-object validation; async generators (`Symbol.asyncIterator`); async-function promise settlement to user `.then` callbacks is a pre-existing gap that for-await depends on.
+- **Engine change:** commit d2dfee6 (plus follow-up close-semantics fixes in this commit)
+- **Files:** `crates/v12-bytecode/src/{opcode,lib}.rs`, `crates/v12-bccompiler/src/{model,stmt,expr}.rs`, `crates/v12-interp/src/{execute,object_ops,generator_async}.rs`, `crates/v12-bytecode/tests/common/mod.rs`, `crates/test-support/src/mini.rs`
+- **Bucket:** `known-failures.md` §E — closed
+- **Runner:** `./conformance/run.sh --filter <f> --jobs 8`
+- **Notes:** workspace gate 578/578.
+
 ### 2026-09-12 — Step B: negative semantics (error ctors, ReferenceError, coercibility)
 
 - **Filter:** `language/statements` (9 372 files), `built-ins/Error` (93 files), 8 jobs
