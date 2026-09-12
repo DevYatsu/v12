@@ -24,6 +24,21 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-12 — Step D: coercion (ToPrimitive, loose equals, number formatting)
+
+- **Filter:** `language/expressions` (11 190 files, 8 jobs); spot filters `built-ins/Object/is`, `language/expressions/equality` unchanged (already passing)
+- **Before:** `language/expressions` 5 885/11 190 (52.6 %) — measured at the E-final commit (c4e1b87) in a throwaway worktree
+- **After:** `language/expressions` 5 950/11 190 (53.2 %)
+- **Delta:** +65
+- **Root cause:** `to_number` mapped objects to NaN (no `valueOf`/`toString` conversion); `object_proto_surface` unconditionally served `Object.prototype.valueOf/toString`, shadowing user overrides — so even direct `obj.valueOf()` calls returned the receiver; arrays' `toString` rendered `[object Array]` instead of `join(",")`; loose equality returned false for object↔primitive; `Number::toString` never switched to exponential notation (1e21 → "1000000000000000000000").
+- **Fix:** `to_primitive_default` (valueOf → toString, TypeError on no primitive) routed into `Add`, arithmetic, bitwise/shift, `Neg`/`ToNumber`, relational comparison, and loose equality (object↔object still identity-compares); the proto surface defers to own properties; array `toString` serves the join native; `Number::toString` implements the spec's k/n decimal-vs-exponential selection.
+- **Accepted gaps:** `ToString` of objects with user `toString` still renders `[object Object]` (template literals, string concat of objects); `Symbol.toPrimitive` not consulted; hint-specific (string) ToPrimitive ordering unused.
+- **Engine change:** commit 9f5f442
+- **Files:** `crates/v12-interp/src/{ops,execute,property}.rs`
+- **Bucket:** `known-failures.md` §D — closed
+- **Runner:** `./conformance/run.sh --filter <f> --jobs 8`
+- **Notes:** workspace gate 578/578. Object.is / SameValue was already correct (NaN/±0 handling).
+
 ### 2026-09-12 — Step E: iterator abrupt-close, generator return/throw resumption, yield* delegation, for-await
 
 - **Filter:** `language/statements/for-of` (752), `language/expressions/generators` (290), `language/statements/generators` (266), 8 jobs
