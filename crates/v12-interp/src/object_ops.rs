@@ -221,6 +221,55 @@ impl Interp<'_> {
         Ok(())
     }
 
+    /// `DefineMethod`: defines an own data property on `obj` at `key` with
+    /// spec method attributes. Never walks the prototype chain, never invokes
+    /// a setter. If the key already exists as own data, the value is
+    /// overwritten and attrs are re-stamped to `BUILTIN` (later duplicate wins).
+    pub(crate) fn op_define_method(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+        value_v: JsValue,
+    ) -> Result<(), JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: cannot define method on non-object"),
+            ));
+        };
+        let key = self.property_key(key_v)?;
+        self.gc_protect();
+        let shape = self.shape_of(obj);
+        match self.heap.get(shape).descriptors.find(key).copied() {
+            Some(existing @ v12_heap::Descriptor::Data { slot, .. }) => {
+                let idx = self.global_slot_index(obj, slot as usize);
+                let props = &mut self.heap.get_mut(obj).properties;
+                if props.len() <= idx {
+                    props.resize(idx + 1, JsValue::hole());
+                }
+                props[idx] = value_v;
+                if existing.attrs() != Attrs::BUILTIN {
+                    let child = self.heap.update_data_attrs(shape, key, Attrs::BUILTIN);
+                    self.bind_shape(obj, child);
+                }
+            }
+            Some(v12_heap::Descriptor::Accessor { .. }) => {
+                // A duplicate accessor/method name in one class body is a
+                // SyntaxError, so this is unreachable from compiled classes.
+                return Err(JSException(
+                    self.error_value("TypeError: cannot redefine accessor as method"),
+                ));
+            }
+            None => {
+                let child = self.heap.add_property(shape, key, Attrs::BUILTIN);
+                self.bind_shape(obj, child);
+                let settings = &mut self.heap.get_mut(obj);
+                settings.properties.push(value_v);
+                settings.property_keys.push(Some(key));
+            }
+        }
+        Ok(())
+    }
+
     /// `SetPrototype`: sets `obj`'s `[[Prototype]]` to `proto` (the class
     /// `extends` wiring). `proto` may be an object or `null`; primitive
     /// prototypes are rejected per ES `OrdinarySetPrototypeOf`.

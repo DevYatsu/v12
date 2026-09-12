@@ -436,6 +436,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::GetIterator => "get_iterator",
         Opcode::IteratorNext => "iterator_next",
         Opcode::IteratorClose => "iterator_close",
+        Opcode::DefineMethod => "define_method",
         Opcode::GetNewTarget => "get_new_target",
     }
 }
@@ -486,6 +487,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::Return | Opcode::Throw => write!(f, " r{a}"),
         Opcode::GetProperty | Opcode::DeleteProperty => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::SetProperty => write!(f, " r{a}, r{b}, r{c}"),
+        Opcode::DefineMethod => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::NewObject => write!(f, " r{a}"),
         Opcode::NewArray => write!(f, " r{a}, r{b}, len={c}"),
         Opcode::Closure => write!(f, " r{a}, fn#{b}"),

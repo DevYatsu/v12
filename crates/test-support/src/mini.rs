@@ -394,11 +394,12 @@ impl<'p> Mini<'p> {
                 | Opcode::ArrayAppend
                 | Opcode::MergeObject
                 | Opcode::DefineAccessor
+                | Opcode::DefineMethod
                 | Opcode::GetIterator
                 | Opcode::IteratorNext
                 | Opcode::IteratorClose
                 | Opcode::GetNewTarget => {
-                    panic!("generator/async/copy opcodes not expected in tier-1 mini programs")
+                    panic!("generator/async/copy/define opcodes not expected in tier-1 mini programs")
                 }
                 Opcode::Construct => {
                     // `new F(args)`: fresh instance object as receiver; the

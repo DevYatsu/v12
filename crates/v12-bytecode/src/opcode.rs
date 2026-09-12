@@ -129,6 +129,11 @@ pub enum Opcode {
     /// `"return"` method (if any) when the loop exits abruptly (break /
     /// throw). `r{b}` and `r{c}` are unused.
     IteratorClose = 71,
+    /// Defines an own method property: `r{a}[r{b}] = r{c}` with spec method
+    /// attributes (writable + configurable, non-enumerable). Unlike
+    /// `SetProperty` this never walks the prototype chain and never invokes a
+    /// setter.
+    DefineMethod = 72,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -203,6 +208,7 @@ impl TryFrom<u8> for Opcode {
             69 => Ok(Self::GetIterator),
             70 => Ok(Self::IteratorNext),
             71 => Ok(Self::IteratorClose),
+            72 => Ok(Self::DefineMethod),
             other => Err(other),
         }
     }
@@ -378,6 +384,7 @@ mod encoding_tests {
         Opcode::GetIterator,
         Opcode::IteratorNext,
         Opcode::IteratorClose,
+        Opcode::DefineMethod,
     ];
 
     #[test]

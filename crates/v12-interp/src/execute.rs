@@ -629,6 +629,14 @@ impl Interp<'_> {
                     attempt!(self.set_property(obj_v, key_v, value));
                     self.set_pc(pc + op_width);
                 }
+                Opcode::DefineMethod => {
+                    let obj_v = self.stack[base + usize::from(ra)];
+                    let key_v = self.stack[base + usize::from(rb)];
+                    let value = self.stack[base + usize::from(rc)];
+                    self.gc_protect();
+                    attempt!(self.op_define_method(obj_v, key_v, value));
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::DeleteProperty => {
                     let obj_v = self.stack[base + usize::from(rb)];
                     let key_v = self.stack[base + usize::from(rc)];
