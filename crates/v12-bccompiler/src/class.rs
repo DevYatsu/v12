@@ -70,9 +70,9 @@ pub(crate) fn class_expression(
     let proto_key = cx.load_str_key("prototype", span)?;
     let ctor_key = cx.load_str_key("constructor", span)?;
     // constructor.prototype = proto
-    cx.emit_reg3(Opcode::SetProperty, ctor, proto_key, proto, span);
+    cx.emit_reg3(Opcode::DefineMethod, ctor, proto_key, proto, span);
     // proto.constructor = constructor
-    cx.emit_reg3(Opcode::SetProperty, proto, ctor_key, ctor, span);
+    cx.emit_reg3(Opcode::DefineMethod, proto, ctor_key, ctor, span);
 
     // 5. Wire `extends` prototype chains.
     if has_super {
@@ -156,7 +156,7 @@ fn define_elements(
                         // redefine it on the prototype.
                         if !is_ctor {
                             let fn_reg = method_fn(cx, m)?;
-                            cx.emit_reg3(Opcode::SetProperty, target, key_reg, fn_reg, m.span);
+                            cx.emit_reg3(Opcode::DefineMethod, target, key_reg, fn_reg, m.span);
                         }
                     }
                 }
