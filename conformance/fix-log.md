@@ -24,6 +24,21 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-12 — Step B: negative semantics (error ctors, ReferenceError, coercibility)
+
+- **Filter:** `language/statements` (9 372 files), `built-ins/Error` (93 files), 8 jobs
+- **Before:** language/statements 3 747/9 372 (40.0 %), built-ins/Error 1/93 (1.1 %) — measured at the A3-final commit (03aadbe) in a throwaway worktree
+- **After:** language/statements 4 250/9 372 (45.3 %), built-ins/Error 13/93 (14.0 %)
+- **Delta:** +503 language/statements, +12 built-ins/Error
+- **Root cause:** the `TypeError`…`SyntaxError` globals were uncallable placeholders (`new TypeError("m")` → "not a function"); runtime throws built positional error objects whose `name`/`message`/`constructor` were unreadable as properties; undeclared global reads silently yielded `undefined`; property reads on `null`/`undefined` (incl. destructuring) silently yielded `undefined`.
+- **Fix:** error constructors wired to native seams with real class prototypes (`Error.prototype` chain with class `name`); error instances — user constructed and internally thrown — carry shape-bound `name`/`message`/`constructor` and a `[[Prototype]]` link to the class prototype; `GetGlobal` on a missing binding throws `ReferenceError` with a new `GetGlobalLenient = 73` opcode serving spec `typeof`; top-level `var` slots are declared `undefined` in the main prologue; property reads on `null`/`undefined` throw `TypeError`.
+- **Accepted gaps:** `EvalError`/`URIError` not installed as globals; `Error.cause`, `Error.isError`, `Proxy` still missing (remaining built-ins/Error failures); `let`/`const` at top level also prologue-initialized (no TDZ); cross-realm `new otherRealm.TypeError()` links to the primary realm's class.
+- **Engine change:** commit 5e85248
+- **Files:** `crates/v12-{bytecode,bccompiler,interp,engine,native}/src/**` (opcode.rs, lib.rs, model.rs, expr.rs, unit.rs, globals.rs, execute.rs, call_setup.rs, property.rs, error.rs, registry.rs, realm.rs, mod.rs, id.rs), `crates/test-support/src/mini.rs`, engine tests
+- **Bucket:** `known-failures.md` §B — closed
+- **Runner:** `./conformance/run.sh --filter <f> --jobs 8`
+- **Notes:** workspace gate 578/578. The "Expected a … to be thrown but no exception was thrown" bucket (975 at reclassification) is the primary casualty: negative tests now observe real `TypeError`/`ReferenceError` objects.
+
 ### 2026-09-12 — Step A3: class element attrs, delete semantics, Function.name
 
 - **Filter:** `language/expressions/class/elements`, `language/expressions/object/method-definition`, `built-ins/Object/getOwnPropertyDescriptor`, then `language/expressions` (11 190 files, 8 jobs)
