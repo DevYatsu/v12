@@ -210,7 +210,7 @@ impl Interp<'_> {
         let shape = self.shape_of(obj);
         let child = self
             .heap
-            .define_accessor(shape, key, getter, setter, Attrs::DEFAULT);
+            .define_accessor(shape, key, getter, setter, Attrs::BUILTIN);
         self.bind_shape(obj, child);
         // Accessor slots hold a hole in `properties`; ensure one exists.
         let slot = child_slot(self.heap, child);

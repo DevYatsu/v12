@@ -684,8 +684,15 @@ impl<'a> Interp<'a> {
         let ctor_key = JsValue::string(self.heap.intern_text("constructor"));
         let proto_key_v = JsValue::string(self.heap.intern_text("prototype"));
         let result = self
-            .set_property(proto_v, ctor_key, f_v)
-            .and_then(|()| self.set_property(f_v, proto_key_v, proto_v));
+            .define_own_data_attrs(proto_v, ctor_key, f_v, Attrs::BUILTIN)
+            .and_then(|()| {
+                self.define_own_data_attrs(
+                    f_v,
+                    proto_key_v,
+                    proto_v,
+                    Attrs::FUNCTION_PROTOTYPE,
+                )
+            });
         self.stack.pop();
         self.stack.pop();
         result
@@ -697,16 +704,18 @@ impl<'a> Interp<'a> {
     /// creation so reads never reach the property surfaces.
     fn install_function_length(&mut self, h: Handle<JsObject>, expected: u16) {
         let len_v = JsValue::from_i32_smi(i32::from(expected)).expect("param count fits Smi");
-        // Park the closure on the stack: interning `length` and the shape
-        // transition below can allocate and collect before the caller stores
-        // `h` into its register.
+        let frame = self.stack.len();
         self.stack.push(JsValue::object(h));
         self.gc_protect();
         let key = JsValue::string(self.heap.intern_text("length"));
-        let installed = self.set_property(JsValue::object(h), key, len_v);
-        debug_assert!(installed.is_ok(), "length install on a fresh closure cannot fail");
-        let _ = installed;
-        self.stack.pop();
+        let installed = self.define_own_data_attrs(
+            JsValue::object(h),
+            key,
+            len_v,
+            Attrs::new(false, false, true),
+        );
+        debug_assert!(installed.is_ok(), "length install cannot fail");
+        self.stack.truncate(frame);
     }
 
     /// Builds an unmapped arguments exotic object over `args` (holes read as

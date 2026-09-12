@@ -7,8 +7,8 @@ use v12_heap::{
 };
 
 use super::{
-    Interp, JSException, RegExpSlot, ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET, OBJECT_IDX,
-    PROMISE_IDX, REGEXP_IDX, SYMBOL_IDX,
+    child_slot, Interp, JSException, RegExpSlot, ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET,
+    OBJECT_IDX, PROMISE_IDX, REGEXP_IDX, SYMBOL_IDX,
 };
 use v12_native::NativeId;
 use crate::ops;
@@ -775,6 +775,40 @@ impl Interp<'_> {
             self.heap.get_mut(obj).properties.push(value);
             self.heap.get_mut(obj).property_keys.push(Some(key));
         }
+        Ok(())
+    }
+
+    /// Defines an own data property with explicit attributes, bypassing the
+    /// setter/prototype walk of [`Self::set_property`]. Used for fresh
+    /// function-intrinsic properties (`length`, `prototype`, `constructor`)
+    /// whose attributes the spec fixes.
+    pub(crate) fn define_own_data_attrs(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+        value: JsValue,
+        attrs: Attrs,
+    ) -> Result<(), JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: cannot define property on non-object"),
+            ));
+        };
+        let key = self.property_key(key_v)?;
+        self.gc_protect();
+        let shape = self.shape_of(obj);
+        let child = self.heap.add_property(shape, key, attrs);
+        self.bind_shape(obj, child);
+        let slot = child_slot(self.heap, child);
+        let settings = &mut self.heap.get_mut(obj);
+        if settings.properties.len() <= slot {
+            settings.properties.resize(slot + 1, JsValue::hole());
+        }
+        settings.properties[slot] = value;
+        if settings.property_keys.len() <= slot {
+            settings.property_keys.resize(slot + 1, None);
+        }
+        settings.property_keys[slot] = Some(key);
         Ok(())
     }
 
