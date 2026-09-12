@@ -381,6 +381,10 @@ impl<'p> Mini<'p> {
                     regs[instr.a() as usize] = Val::Undefined;
                     pc += 1;
                 }
+                Opcode::GetGlobalLenient => {
+                    regs[instr.a() as usize] = Val::Undefined;
+                    pc += 1;
+                }
                 Opcode::SetGlobal => {
                     pc += 1;
                 }

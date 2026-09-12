@@ -140,14 +140,18 @@ fn debug_isolate_eval_write_target() {
     engine
         .install_create_realm_function("__v12CreateRealm__")
         .expect("install");
-    let out = eval_ok(
-        &mut engine,
+    // Cross-realm isolation is real: the other realm's `x` is undeclared in
+    // this realm, so `String(x)` throws `ReferenceError` (spec 8.1.1.2.1).
+    // `y` is declared by this realm's own eval and reads fine.
+    let result = engine.eval(
         r#"
         var otherEval = __v12CreateRealm__().global.eval;
         otherEval('var x = 23;');
         eval('var y = 23;');
-        [typeof x, typeof y, String(x), String(y)].join('|');
+        [typeof x, typeof y, String(y)].join('|');
     "#,
     );
+    let out = to_text(&mut engine, result);
     eprintln!("DEBUG: {out}");
+    assert_eq!(out, "undefined|number|23");
 }

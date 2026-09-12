@@ -871,6 +871,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_regs(Opcode::GetGlobal, dst, k >> 8, k & 0xFF, 0b0001, span);
     }
 
+    /// `GetGlobalLenient dst, name_id` — a global read that never throws:
+    /// missing bindings yield `undefined` (spec `typeof` semantics).
+    pub fn emit_get_global_lenient(&mut self, dst: u16, name_id: u32, span: oxc_span::Span) {
+        let k = u16::try_from(name_id).expect("global name id fits u16");
+        self.emit_regs(Opcode::GetGlobalLenient, dst, k >> 8, k & 0xFF, 0b0001, span);
+    }
+
     /// `SetGlobal name_id, src` — same `Spur`-derived string table id as
     /// `GetGlobal`.
     // Global-name table ids fit u16 in this subset; audited invariant.

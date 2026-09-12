@@ -788,14 +788,39 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn typeof_(&mut self, arg: &Expression<'_>, span: Span) -> Res<u16> {
-        // `typeof undeclared` is specified not to throw. `GetGlobal` on a
-        // missing global already yields `undefined`, which `TypeOf` renders
-        // as `"undefined"` — so identifiers compile like any other operand.
-        // (Constant-folding unknown identifiers to `"undefined"` here was
-        // wrong once globals could appear dynamically via `eval`.) The
-        // non-writable globals `undefined`/`NaN`/`Infinity` have dedicated
-        // value materialisation in `read_identifier` and need no special
-        // casing either.
+        // `typeof undeclared` is specified not to throw. Identifier operands
+        // that resolve to global bindings read through `GetGlobalLenient`
+        // (missing binding → `undefined`), everything else evaluates
+        // normally. (Constant-folding unknown identifiers to `"undefined"`
+        // here was wrong once globals could appear dynamically via `eval`.)
+        // The non-writable globals `undefined`/`NaN`/`Infinity` have
+        // dedicated value materialisation in `read_identifier` and need no
+        // special casing either.
+        if let Expression::Identifier(id) = arg {
+            if let Some(sym) = self.comp.symbol_of(id.reference_id.get()) {
+                if matches!(self.access(sym), crate::model::VarAccess::Global { .. }) {
+                    let name = self.comp.scoping.symbol_name(sym).to_string();
+                    let gid = self.global_name_id(&name);
+                    let dst = self.new_temp();
+                    self.emit_get_global_lenient(dst, gid, span);
+                    let out = self.new_temp();
+                    self.emit_reg3(Opcode::TypeOf, out, dst, 0, span);
+                    return Ok(out);
+                }
+            } else {
+                match id.name.as_str() {
+                    "undefined" | "NaN" | "Infinity" => {}
+                    other => {
+                        let gid = self.global_name_id(other);
+                        let dst = self.new_temp();
+                        self.emit_get_global_lenient(dst, gid, span);
+                        let out = self.new_temp();
+                        self.emit_reg3(Opcode::TypeOf, out, dst, 0, span);
+                        return Ok(out);
+                    }
+                }
+            }
+        }
         let v = self.expr(arg)?;
         let dst = self.new_temp();
         self.emit_reg3(Opcode::TypeOf, dst, v, 0, span);

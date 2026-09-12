@@ -1825,14 +1825,17 @@ fn global_intrinsics_compile_to_get_global() {
             fb.instrs.iter().any(|i| i.op() == Some(Opcode::GetGlobal)),
             "expected GetGlobal for {name} in:\n{fb}"
         );
-        // Also ensure `typeof` on the intrinsic does not early-return to "undefined"
-        // but goes through GetGlobal + TypeOf.
+        // `typeof` on a global identifier lowers to `GetGlobalLenient` +
+        // `TypeOf` (spec: `typeof` never throws a ReferenceError; for
+        // intrinsics the binding exists so the value is identical).
         let src2 = format!("let y = typeof {name};");
         let (prog2, _) = compile_source_with_strings(&src2).expect("typeof global should compile");
         let fb2 = &prog2.functions[prog2.main as usize];
         assert!(
-            fb2.instrs.iter().any(|i| i.op() == Some(Opcode::GetGlobal)),
-            "typeof {name} should still use GetGlobal in:\n{fb2}"
+            fb2.instrs
+                .iter()
+                .any(|i| i.op() == Some(Opcode::GetGlobal) || i.op() == Some(Opcode::GetGlobalLenient)),
+            "typeof {name} should still read the global in:\n{fb2}"
         );
         assert!(
             fb2.instrs.iter().any(|i| i.op() == Some(Opcode::TypeOf)),

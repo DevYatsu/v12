@@ -346,6 +346,13 @@ pub(crate) fn error_object(
         && ctor.as_object().is_some()
     {
         super::builtin_install_prop(heap, obj, "constructor", ctor);
+        // Link the instance's [[Prototype]] to the class prototype object
+        // (installed by the realm via `install_ctor`), so `instanceof`
+        // walks to the right class and prototype `name` reads resolve.
+        let ctor_obj = ctor.as_object().unwrap();
+        if let Some(proto) = heap.get(ctor_obj).prototype {
+            heap.get_mut(obj).prototype = Some(proto);
+        }
     }
     JsValue::object(obj)
 }

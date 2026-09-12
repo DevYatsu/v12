@@ -82,6 +82,28 @@ pub fn compile_unit(
         _ => None,
     };
 
+    // Top-level `var` bindings alias the global object; their names are
+    // interned up front (needs `&mut comp.strings`, so it happens before the
+    // `FnCtx` borrows `comp`) and the slots are declared `undefined` in the
+    // main unit's prologue. Keeps reads of declared-but-unassigned globals
+    // `undefined` now that missing global reads throw `ReferenceError`.
+    let global_var_init_ids: Vec<u32> = if idx == 0 && !comp.plans.is_module {
+        let mut ids = Vec::new();
+        for sym in comp.plans.units[idx].decl_order.clone() {
+            if comp.plans.units[idx].vars.get(&sym) != Some(&VarLoc::Global) {
+                continue;
+            }
+            let name = comp.scoping.symbol_name(sym).to_string();
+            if v12_bytecode::GLOBAL_INTRINSICS.contains(&name.as_str()) {
+                continue;
+            }
+            ids.push(crate::model::str_id_of(comp.strings.get_or_intern(&name)));
+        }
+        ids
+    } else {
+        Vec::new()
+    };
+
     let mut cx = FnCtx::new(comp, idx);
     // Flag generator/async on the underlying FunctionBuilder before emission.
     match &node {
@@ -154,6 +176,14 @@ pub fn compile_unit(
     }
     match node {
         UnitNode::Main(p) => {
+            // Declare top-level `var` slots on the global object (names were
+            // gathered before the `FnCtx` borrow); hoisted function/class
+            // stores below override these in order.
+            for gid in &global_var_init_ids {
+                let tmp = cx.new_temp();
+                cx.load_undefined(tmp, oxc_span::Span::default());
+                cx.emit_set_global(*gid, tmp, oxc_span::Span::default());
+            }
             // Directive prologue (`p.directives`) holds leading string
             // literals separately from `p.body`; without this they are
             // dropped and a lone-string eval (`eval("'...'")`) completes

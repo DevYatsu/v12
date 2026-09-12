@@ -715,8 +715,9 @@ fn global_var_alias_for_captured_var() {
     // Also verify the global holds the var value. Under shape-descriptor
     // slot numbering every top-level binding gets a descriptor slot in
     // declaration order, physically stored at `GLOBAL_VAR_OFFSET + slot`;
-    // the hoisted function declaration takes slot 0, so `x` occupies slot 1.
-    let val = heap.get(global).properties[crate::GLOBAL_VAR_OFFSET + 1];
+    // the prologue declares bindings in source order (`x` first), so `x`
+    // occupies slot 0 and the hoisted `f` slot 1.
+    let val = heap.get(global).properties[crate::GLOBAL_VAR_OFFSET];
     assert_eq!(val.as_smi(), Some(123));
 }
 

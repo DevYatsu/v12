@@ -23,7 +23,19 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         // Primitives have no wrappers yet: reads yield undefined, matching
         // real JS minus the built-ins that would populate the wrappers
-        // (string primitives do get the regexp method surface).
+        // (string primitives do get the regexp method surface). Null and
+        // undefined throw per spec — this is what makes destructuring
+        // null/undefined and `null.x` observe TypeError.
+        if obj_v.is_null() || obj_v.is_undefined() {
+            let key_text = key_v
+                .as_string()
+                .map(|h| self.string_text(h))
+                .unwrap_or_default();
+            let base = if obj_v.is_null() { "null" } else { "undefined" };
+            return Err(JSException(self.error_value(&format!(
+                "TypeError: Cannot read properties of {base} (reading '{key_text}')"
+            ))));
+        }
         let Some(obj) = obj_v.as_object() else {
             return self.string_prim_surface(obj_v, key_v);
         };

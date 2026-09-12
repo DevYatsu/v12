@@ -430,6 +430,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::CopyObjectRest => "copy_object_rest",
         Opcode::ArrayAppend => "array_append",
         Opcode::GetGlobal => "get_global",
+        Opcode::GetGlobalLenient => "get_global_lenient",
         Opcode::SetGlobal => "set_global",
         Opcode::Construct => "construct",
         Opcode::ToNumber => "to_number",
@@ -508,6 +509,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::CopyObjectRest => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::ArrayAppend => write!(f, " r{a}, r{b}"),
         Opcode::GetGlobal => write!(f, " r{a}, k{}", i.imm16()),
+        Opcode::GetGlobalLenient => write!(f, " r{a}, k{}", i.imm16()),
         Opcode::SetGlobal => write!(f, " k{}, r{a}", i.imm16()),
         Opcode::GetNewTarget => write!(f, " r{a}"),
     }

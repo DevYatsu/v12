@@ -3,7 +3,7 @@
 //! exception unwinding.
 
 
-use v12_heap::{Descriptor, Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
+use v12_heap::{Attrs, Descriptor, Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 
 use super::{CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH};
 use v12_native::NativeId;
@@ -770,15 +770,60 @@ impl Interp<'_> {
             .map_err(|t| JSException::from_throw(self.heap, t))
     }
 
-    pub(crate) fn error_value(&mut self, text: &str) -> JsValue {        let (name, message) = match text.split_once(": ") {
+    pub(crate) fn error_value(&mut self, text: &str) -> JsValue {
+        let (kind, message) = match text.split_once(": ") {
             Some((n, m)) => (n, m),
             None => ("Error", text),
         };
         self.gc_protect();
-        let name_h = self.heap.intern_text(name);
-        let msg_h = self.heap.intern_text(message);
-        let obj = self.heap.alloc(JsObject::error(name_h, msg_h));
+        let obj = self
+            .heap
+            .alloc(JsObject {
+                kind: Kind::Error,
+                ..Default::default()
+            });
         self.heap.add_root(JsValue::object(obj));
+        // Shape-bound installs in display order: `properties[0]`/`[1]` stay
+        // the name/message strings the display paths read positionally, with
+        // descriptors that make the props observable (`e.name`, `e.message`).
+        // Spec attrs: writable + configurable, non-enumerable.
+        self.gc_protect();
+        let name_v = JsValue::string(self.heap.intern_text(kind));
+        let msg_v = JsValue::string(self.heap.intern_text(message));
+        let name_key = JsValue::string(self.heap.intern_text("name"));
+        let msg_key = JsValue::string(self.heap.intern_text("message"));
+        let obj_v = JsValue::object(obj);
+        let _ = self.define_own_data_attrs(obj_v, name_key, name_v, Attrs::BUILTIN);
+        let _ = self.define_own_data_attrs(obj_v, msg_key, msg_v, Attrs::BUILTIN);
+        // `constructor` link + [[Prototype]] → class prototype object, when
+        // the class has a global intrinsic slot with a wired prototype.
+        let global = self
+            .global
+            .or_else(|| self.heap.realm_globals().first().copied());
+        if let Some(global) = global {
+            let slot = v12_bytecode::GLOBAL_INTRINSICS
+                .iter()
+                .position(|&n| n == kind);
+            if let Some(idx) = slot {
+                let ctor_v = self
+                    .heap
+                    .get(global)
+                    .properties
+                    .get(idx)
+                    .copied()
+                    .unwrap_or_else(JsValue::undefined);
+                if let Some(ctor) = ctor_v.as_object() {
+                    let proto = self.heap.get(ctor).prototype;
+                    if let Some(p) = proto {
+                        self.heap.get_mut(obj).prototype = Some(p);
+                    }
+                    self.gc_protect();
+                    let ctor_key = JsValue::string(self.heap.intern_text("constructor"));
+                    let _ =
+                        self.define_own_data_attrs(obj_v, ctor_key, ctor_v, Attrs::BUILTIN);
+                }
+            }
+        }
         JsValue::object(obj)
     }
 

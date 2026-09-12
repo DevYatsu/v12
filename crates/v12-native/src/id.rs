@@ -178,6 +178,10 @@ pub enum NativeId {
     BooleanProtoToString = 1501,
     BooleanProtoValueOf = 1502,
     ErrorCreate = 1600,
+    TypeErrorCreate = 1601,
+    RangeErrorCreate = 1602,
+    ReferenceErrorCreate = 1603,
+    SyntaxErrorCreate = 1604,
     // JSON
     JsonParse = 2600,
     JsonStringify = 2601,

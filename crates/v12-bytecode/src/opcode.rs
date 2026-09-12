@@ -134,6 +134,11 @@ pub enum Opcode {
     /// `SetProperty` this never walks the prototype chain and never invokes a
     /// setter.
     DefineMethod = 72,
+    /// Lenient global read: like `GetGlobal` but a missing binding yields
+    /// `undefined` instead of a `ReferenceError`. Emitted only where the spec
+    /// mandates it (`typeof undeclared_global`). Same operand layout as
+    /// `GetGlobal`.
+    GetGlobalLenient = 73,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -209,6 +214,7 @@ impl TryFrom<u8> for Opcode {
             70 => Ok(Self::IteratorNext),
             71 => Ok(Self::IteratorClose),
             72 => Ok(Self::DefineMethod),
+            73 => Ok(Self::GetGlobalLenient),
             other => Err(other),
         }
     }
@@ -385,6 +391,7 @@ mod encoding_tests {
         Opcode::IteratorNext,
         Opcode::IteratorClose,
         Opcode::DefineMethod,
+        Opcode::GetGlobalLenient,
     ];
 
     #[test]

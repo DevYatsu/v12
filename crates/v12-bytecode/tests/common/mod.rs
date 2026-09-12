@@ -26,9 +26,10 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     // CopyArrayRest .. Construct, GetNewTarget, ToNumber, MergeObject, DefineAccessor, JumpIfNullish, SetPrototype
     69, 70, 71, // GetIterator, IteratorNext, IteratorClose
     72, // DefineMethod
+    73, // GetGlobalLenient
 ];
 
-pub const EXPECTED_OPCODE_COUNT: usize = 67;
+pub const EXPECTED_OPCODE_COUNT: usize = 68;
 
 /// Seeded splitmix64. Deterministic across platforms and runs.
 pub struct Rng(u64);

@@ -811,6 +811,13 @@ impl Interp<'_> {
                     self.stack[base + usize::from(dst)] = val;
                     self.set_pc(pc + op_width);
                 }
+                Opcode::GetGlobalLenient => {
+                    let dst = ra;
+                    let const_id = u32::from(narrow.imm16());
+                    let val = attempt!(self.op_get_global_lenient(const_id, program));
+                    self.stack[base + usize::from(dst)] = val;
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::SetGlobal => {
                     let src = ra;
                     let const_id = u32::from(narrow.imm16());

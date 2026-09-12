@@ -97,9 +97,35 @@ impl Interp<'_> {
     }
 
     pub(crate) fn op_get_global(&mut self, str_id: u32, program: u32) -> Result<JsValue, JSException> {
-        let Some(global) = self.global else {
-            return Ok(JsValue::undefined());
+        let Some(v) = self.resolve_global(str_id, program) else {
+            // Missing binding: the compiler only emits `GetGlobal` for
+            // declared variables, hoisted names, and intrinsics, so an
+            // unresolved read here is a genuine undeclared reference.
+            let text = self.global_name_text(str_id, program);
+            return Err(JSException(
+                self.error_value(&format!("ReferenceError: {text} is not defined")),
+            ));
         };
+        Ok(v)
+    }
+
+    /// `GetGlobalLenient`: same resolution as `GetGlobal`, but a missing
+    /// binding yields `undefined` (spec: `typeof undeclared` never throws).
+    pub(crate) fn op_get_global_lenient(&mut self, str_id: u32, program: u32) -> Result<JsValue, JSException> {
+        Ok(self.resolve_global(str_id, program).unwrap_or_else(JsValue::undefined))
+    }
+
+    fn global_name_text(&mut self, str_id: u32, program: u32) -> String {
+        self.strings_for_program(program)
+            .get(str_id as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Common resolution path for `GetGlobal`/`GetGlobalLenient`: `None` when
+    /// no binding of the name exists.
+    fn resolve_global(&mut self, str_id: u32, program: u32) -> Option<JsValue> {
+        let global = self.global?;
         // The fast path allocates only when interning an unseen key, but any
         // `Heap::alloc` can collect — publish roots first so values written
         // since the last opcode-level protect stay reachable.
@@ -120,15 +146,15 @@ impl Interp<'_> {
         if text == "arguments"
             && let Some(v) = self.frame_arguments_value()
         {
-            return Ok(v);
+            return Some(v);
         }
         if let Some(v) = self.global_intrinsic_value(global, text) {
-            return Ok(v);
+            return Some(v);
         }
         if let Some(v) = self.global_property_value(global, text) {
-            return Ok(v);
+            return Some(v);
         }
-        Ok(JsValue::undefined())
+        None
     }
 
     pub(crate) fn op_set_global(

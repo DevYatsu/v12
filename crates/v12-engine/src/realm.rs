@@ -120,10 +120,40 @@ impl Realm {
         // The Promise constructor itself: `new Promise(executor)` routes to
         // the stateful native seam (the capability needs the job sink).
         wire_callable(heap, &intrinsics, "Promise", NativeId::PromiseConstruct);
+        // Error class prototypes: `Error.prototype` carries `name: "Error"`
+        // (and the spec's own `message: ""`); each subclass prototype chains
+        // to it and carries its class `name`. Every error instance (user
+        // constructed or internally thrown) links to its class prototype via
+        // the constructor's `prototype` field, so `instanceof` and `name`
+        // reads resolve per spec.
+        let error_proto = alloc_root(heap);
+        let error_name_h = heap.intern_text("Error");
+        crate::builtins::builtin_install_prop(heap, error_proto, "name", JsValue::string(error_name_h));
+        let empty_msg_h = heap.intern_text("");
+        crate::builtins::builtin_install_prop(heap, error_proto, "message", JsValue::string(empty_msg_h));
+        if let Some(e) = intrinsics.get("Error").and_then(|v| v.as_object()) {
+            crate::builtins::install_ctor(heap, e, error_proto);
+        }
+        wire_callable(heap, &intrinsics, "Error", NativeId::ErrorCreate);
+        for (name, native) in [
+            ("TypeError", NativeId::TypeErrorCreate),
+            ("RangeError", NativeId::RangeErrorCreate),
+            ("ReferenceError", NativeId::ReferenceErrorCreate),
+            ("SyntaxError", NativeId::SyntaxErrorCreate),
+        ] {
+            let Some(ctor) = intrinsics.get(name).and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let proto = alloc_root(heap);
+            heap.get_mut(proto).prototype = Some(error_proto);
+            let name_h = heap.intern_text(name);
+            crate::builtins::builtin_install_prop(heap, proto, "name", JsValue::string(name_h));
+            crate::builtins::install_ctor(heap, ctor, proto);
+            wire_callable(heap, &intrinsics, name, native);
+        }
         // Point the placeholder constructors that are already callable at
         // their native seam (out-of-range bytecode → native registry).
         wire_callable(heap, &intrinsics, "String", NativeId::StringConstruct);
-        wire_callable(heap, &intrinsics, "Error", NativeId::ErrorCreate);
         wire_callable(heap, &intrinsics, "Boolean", NativeId::BooleanConstruct);
         wire_callable(heap, &intrinsics, "Map", NativeId::MapConstruct);
         wire_callable(heap, &intrinsics, "Set", NativeId::SetConstruct);
