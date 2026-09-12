@@ -289,7 +289,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         self.emit_reg3(Opcode::GetProperty, elem, iterable, idx, y.span);
                         let ydst = self.new_temp();
                         self.move_reg(ydst, elem, y.span);
-                        self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, y.span);
+                        self.emit_suspend_yield(ydst, None, y.span)?;
                         let one = self.new_temp();
                         self.load_int(one, 1, y.span);
                         let nxt = self.new_temp();
@@ -336,7 +336,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     self.emit_reg3(Opcode::GetProperty, yielded, result, value_key, y.span);
                     let ydst = self.new_temp();
                     self.move_reg(ydst, yielded, y.span);
+                    // Resume value forwarding: after the first inner next(),
+                    // the value sent to the delegating yield flows to
+                    // `inner.next(v)`.
                     self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, y.span);
+                    // Return-completion dispatch runs first (it must not fall
+                    // through to the next(v) call below).
+                    self.emit_delegate_return_path(ydst, iter, y.span)?;
+                    let fwd_block = self.new_temps(CALL_HEADER_REGS + 1);
+                    self.emit_reg3(Opcode::GetProperty, fwd_block, iter, next_key, y.span);
+                    self.move_reg(fwd_block + 1, iter, y.span);
+                    self.move_reg(fwd_block + 2, ydst, y.span);
+                    self.emit_call(fwd_block, fwd_block, 1, y.span);
+                    self.move_reg(result, fwd_block, y.span);
                     self.emit_jump(Opcode::Jump, 0, loop_start);
                     self.bind(loop_end);
                     self.emit_reg3(Opcode::GetProperty, ret, result, value_key, y.span);
@@ -352,7 +364,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 };
                 let dst = self.new_temp();
                 self.move_reg(dst, arg, y.span);
-                self.emit_reg3(Opcode::SuspendYield, dst, 0, 0, y.span);
+                self.emit_suspend_yield(dst, None, y.span)?;
                 Ok(dst)
             }
             Expression::AwaitExpression(a) => {
@@ -785,6 +797,51 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let dst = self.new_temp();
         self.emit_reg2(opcode, dst, v, span);
         Ok(dst)
+    }
+
+    /// `SuspendYield` plus the generator return-completion dispatch: on
+    /// resume, `GenResumeMode` reports whether `gen.return(v)` injected a
+    /// return completion. The return path runs the active finalizer copies
+    /// (without consuming them — normal resumes fall through here too) and
+    /// returns the resume value.
+    fn emit_suspend_yield(&mut self, ydst: u16, iter: Option<u16>, span: Span) -> Res<()> {
+        self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, span);
+        let mode = self.new_temp();
+        self.emit_reg2(Opcode::GenResumeMode, mode, 0, span);
+        let resume_ok = self.label();
+        self.emit_jump(Opcode::JumpIfFalse, mode, resume_ok);
+        self.emit_yield_return_finally_copies()?;
+        self.emit_reg3(Opcode::Return, ydst, 0, 0, span);
+        self.bind(resume_ok);
+        Ok(())
+    }
+
+    /// `yield*` return delegation: a return completion at the delegated
+    /// yield first calls `inner.return(v)` and returns its result value
+    /// (spec 14.4.14, steps 8.d–e). A missing `return` surfaces as the
+    /// TypeError of calling a non-function.
+    fn emit_delegate_return_path(&mut self, ydst: u16, iter: u16, span: Span) -> Res<()> {
+        let mode = self.new_temp();
+        self.emit_reg2(Opcode::GenResumeMode, mode, 0, span);
+        let resume_ok = self.label();
+        self.emit_jump(Opcode::JumpIfFalse, mode, resume_ok);
+        let ret_key = self.new_temp();
+        self.load_str(ret_key, "return", span)?;
+        let rfn = self.new_temp();
+        self.emit_reg3(Opcode::GetProperty, rfn, iter, ret_key, span);
+        let block = self.new_temps(CALL_HEADER_REGS + 1);
+        self.move_reg(block, rfn, span);
+        self.move_reg(block + 1, iter, span);
+        self.move_reg(block + 2, ydst, span);
+        self.emit_call(block, block, 1, span);
+        let value_key = self.new_temp();
+        self.load_str(value_key, "value", span)?;
+        let rvalue = self.new_temp();
+        self.emit_reg3(Opcode::GetProperty, rvalue, block, value_key, span);
+        self.emit_yield_return_finally_copies()?;
+        self.emit_reg3(Opcode::Return, rvalue, 0, 0, span);
+        self.bind(resume_ok);
+        Ok(())
     }
 
     fn typeof_(&mut self, arg: &Expression<'_>, span: Span) -> Res<u16> {

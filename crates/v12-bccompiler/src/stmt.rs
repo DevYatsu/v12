@@ -112,6 +112,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     }
                 };
                 self.run_finally_copies(0)?;
+                // Returning out of `for-of` bodies closes their iterators,
+                // innermost first (spec 14.7.4.9).
+                self.emit_iterator_closes(0);
                 self.emit_reg3(Opcode::Return, v, 0, 0, r.span);
                 Ok(())
             }
@@ -434,7 +437,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), test.span());
         let cond = self.expr(test)?;
         self.emit_jump(Opcode::JumpIfFalse, cond, end);
-        self.with_loop(end, Some(cont), name, |s| s.stmt(body))?;
+        self.with_loop(end, Some(cont), name, None, |s| s.stmt(body))?;
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
         self.bind(end);
@@ -452,7 +455,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let end = self.label();
         self.bind(top);
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), body.span());
-        self.with_loop(end, Some(cont), name, |s| s.stmt(body))?;
+        self.with_loop(end, Some(cont), name, None, |s| s.stmt(body))?;
         self.bind(cont);
         let cond = self.expr(test)?;
         self.emit_jump(Opcode::JumpIfTrue, cond, top);
@@ -472,10 +475,22 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let top = self.label();
         let cont = self.label();
         let end = self.label();
+        // Abrupt completions from inside the loop must IteratorClose: an
+        // exception range covers the whole iteration; its handler closes the
+        // iterator and re-throws (spec 14.7.4.9).
+        let exc = self.new_temp();
+        let try_start = self.pc();
         self.bind(top);
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), span);
-        // 2. IteratorNext(iter) → result object.
+        // 2. IteratorNext(iter) → result object. `for await` observes the
+        //    result through `Await` (async iteration; sync iterators are the
+        //    spec's async-from-sync fallback).
         self.emit_reg3(Opcode::IteratorNext, result, iter, 0, span);
+        if f.r#await {
+            let awaited = self.new_temp();
+            self.emit_reg3(Opcode::Await, awaited, result, 0, span);
+            self.move_reg(result, awaited, span);
+        }
         // 3. `result.done` → exit (leaving the iterator open, per spec: a
         //    normal completion of a for-of body does NOT IteratorClose).
         let done_key = self.new_temp();
@@ -520,11 +535,22 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 }
             }
         }
-        // 5. Body with break → IteratorClose. `continue` skips the close.
-        self.with_loop(end, Some(cont), name, |s| s.stmt(&f.body))?;
+        // 5. Body: `break` closes the iterator (via the loop ctx); the
+        //    exception range closes it when a throw escapes the body.
+        self.with_loop(end, Some(cont), name, Some(iter), |s| s.stmt(&f.body))?;
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
+        // Normal completion exits here WITHOUT closing (spec 14.7.4.8) —
+        // jump over the close handler.
         self.bind(end);
+        let over_handler = self.label();
+        self.emit_jump(Opcode::Jump, 0, over_handler);
+        let try_end = self.pc();
+        let handler_start = self.pc();
+        self.emit_reg3(Opcode::IteratorClose, iter, 0, 0, span);
+        self.emit_reg3(Opcode::Throw, exc, 0, 0, span);
+        self.bind(over_handler);
+        self.push_range(try_start, try_end, handler_start, exc);
         Ok(())
     }
 
@@ -798,7 +824,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
         self.lower_binding_pattern(pattern, key_reg)?;
 
-        self.with_loop(end, Some(cont), name, |s| s.stmt(&f.body))?;
+        self.with_loop(end, Some(cont), name, None, |s| s.stmt(&f.body))?;
 
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
@@ -832,7 +858,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             let cond = self.expr(test)?;
             self.emit_jump(Opcode::JumpIfFalse, cond, end);
         }
-        self.with_loop(end, Some(cont), name, |s| s.stmt(&f.body))?;
+        self.with_loop(end, Some(cont), name, None, |s| s.stmt(&f.body))?;
         self.bind(cont); // `continue` re-runs the update expression
         if let Some(update) = &f.update {
             self.expr(update)?;
@@ -852,7 +878,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             // Labeled non-loop statement: break-only target.
             body => {
                 let end = self.label();
-                self.with_loop(end, None, Some(name), |s| s.stmt(body))?;
+                self.with_loop(end, None, Some(name), None, |s| s.stmt(body))?;
                 self.bind(end);
                 Ok(())
             }
@@ -918,7 +944,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
 
         // Phase 2: bodies in source order (fallthrough = straight-line flow).
-        self.with_loop(end, None, name, |cx| {
+        self.with_loop(end, None, name, None, |cx| {
             let mut bound_default = false;
             for (case, entry) in s.cases.iter().zip(entries) {
                 match entry {
@@ -978,6 +1004,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         };
         // Finalizers of regions entered inside the loop run before leaving.
         self.run_finally_copies(base)?;
+        if !is_continue {
+            // Abrupt `break` completion out of `for-of` closes each exited
+            // loop's iterator, innermost first (spec 14.7.4.9).
+            self.emit_iterator_closes(pos);
+        }
         self.emit_jump(Opcode::Jump, 0, target);
         Ok(())
     }

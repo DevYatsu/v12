@@ -713,6 +713,21 @@ impl Interp<'_> {
                     self.stack[base + usize::from(ra)] = iter;
                     self.set_pc(pc + op_width);
                 }
+                Opcode::GenResumeMode => {
+                    // Loads the resumed generator's pending-mode slot: 0 =
+                    // normal `next()` resume, 1 = `return(v)` completion (the
+                    // resume value is the return value). Reads the generator
+                    // attached to the current frame.
+                    let dst = ra;
+                    let v = self
+                        .frames
+                        .last()
+                        .and_then(|f| f.generator)
+                        .and_then(|g| self.heap.get(g).properties.get(5).copied())
+                        .unwrap_or_else(JsValue::undefined);
+                    self.stack[base + usize::from(dst)] = v;
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::IteratorNext => {
                     // ES IteratorNext: `result = iter.next()`.
                     let iter_v = self.stack[base + usize::from(rb)];

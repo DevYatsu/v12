@@ -159,13 +159,32 @@ impl Interp<'_> {
         if done {
             return Ok(self.make_iterator_result(arg, true));
         }
-        // Mark done and unwind any suspended frame.
-        if self.heap.get(r#gen).properties.len() >= 3 {
-            self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+        // Spec 27.5.3.4: resume the suspended body with a *return*
+        // completion — active `finally` blocks must run (compiled per-yield
+        // return paths keyed off the generator's mode slot), while `catch`
+        // blocks must not. The compiled `GenResumeMode` check after each
+        // yield branches to its finalizer-copy + `Return` trampoline.
+        // Slot contract: properties[5] is the pending-completion mode. Sync
+        // generators allocate only 4 slots (async_promise absent), so resize
+        // before writing — the slot index is fixed, never appended.
+        {
+            let o = self.heap.get_mut(r#gen);
+            if o.properties.len() < 6 {
+                o.properties.resize(6, JsValue::undefined());
+                o.property_keys.resize(6, None);
+            }
+            o.properties[5] = ops::box_number(1.0);
         }
-        self.heap.get_mut(r#gen).elements.clear();
-        self.gc_protect();
-        Ok(self.make_iterator_result(arg, true))
+        match self.resume_generator(r#gen, arg, false)? {
+            // The return trampoline completed the body.
+            Some(ret) => Ok(self.make_iterator_result(ret, true)),
+            // The body suspended again (finalizer yields); report the new
+            // yield as a normal, still-open iteration result.
+            None => {
+                let yielded = self.top_result.take().unwrap_or(JsValue::undefined());
+                Ok(self.make_iterator_result(yielded, false))
+            }
+        }
     }
 
     pub(crate) fn generator_throw(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
@@ -188,11 +207,17 @@ impl Interp<'_> {
         if done {
             return Err(JSException(arg));
         }
-        if self.heap.get(r#gen).properties.len() >= 3 {
-            self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+        // Spec 27.5.3.5: resume the suspended body with a throw completion —
+        // the exception surfaces at the suspended yield, so `catch` can
+        // intercept it and `finally` runs on the unwind path.
+        match self.resume_generator(r#gen, arg, true) {
+            Ok(Some(ret)) => Ok(self.make_iterator_result(ret, true)),
+            Ok(None) => {
+                let yielded = self.top_result.take().unwrap_or(JsValue::undefined());
+                Ok(self.make_iterator_result(yielded, false))
+            }
+            Err(e) => Err(e),
         }
-        self.heap.get_mut(r#gen).elements.clear();
-        Err(JSException(arg))
     }
 
 
@@ -365,6 +390,15 @@ impl Interp<'_> {
         };
         match exec_res {
             Ok(()) => {
+                // The pending return-completion mode is consumed by the
+                // compiled `GenResumeMode` check; reset it so later resumes
+                // are normal `next()` payloads.
+                {
+                    let o = self.heap.get_mut(r#gen);
+                    if o.properties.len() >= 6 {
+                        o.properties[5] = ops::box_number(0.0);
+                    }
+                }
                 // Discriminate suspend (done==2.0, frames popped) vs
                 // completion (done==1.0).
                 let done_val = self

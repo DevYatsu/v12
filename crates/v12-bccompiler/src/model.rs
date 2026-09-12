@@ -424,6 +424,9 @@ pub struct LoopCtx {
     /// `continue` leaving the loop runs inline copies of the finallies pushed
     /// since then.
     pub finally_base: usize,
+    /// Register holding the loop's iterator (`for-of` only): an abrupt exit
+    /// (`break`/`return`) emits `IteratorClose` on it, innermost loop first.
+    pub close_iter: Option<u16>,
 }
 
 /// One active `try … finally` region; intercepted exits (`return`, crossing
@@ -669,6 +672,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         break_label: Label,
         continue_label: Option<Label>,
         name: Option<String>,
+        close_iter: Option<u16>,
         f: impl FnOnce(&mut Self) -> Result<R, CompileError>,
     ) -> Result<R, CompileError> {
         self.loops.push(LoopCtx {
@@ -676,10 +680,42 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             continue_label,
             name,
             finally_base: self.finallies.len(),
+            close_iter,
         });
         let out = f(self);
         self.loops.pop();
         out
+    }
+
+    /// Emits `IteratorClose r{iter}` for every loop being exited, innermost
+    /// first (`for-of` abrupt completion; spec 14.7.4.9). `until` is the
+    /// loop-stack index of the break target: loops above it are exited.
+    pub fn emit_iterator_closes(&mut self, until: usize) {
+        let iters: Vec<u16> = self.loops[until..]
+            .iter()
+            .rev()
+            .filter_map(|ctx| ctx.close_iter)
+            .collect();
+        for iter in iters {
+            self.emit_reg3(Opcode::IteratorClose, iter, 0, 0, oxc_span::Span::default());
+        }
+    }
+
+    /// Emits inline copies of every active finalizer (innermost first) while
+    /// *keeping* the compile-time finally stack: the generator return path
+    /// after a yield may also be fallen through by a normal resume, which
+    /// must still see those finallies as active. Mirrors the emission shape
+    /// of [`Self::run_finally_copies`] with a restored stack.
+    pub fn emit_yield_return_finally_copies(&mut self) -> Result<(), CompileError> {
+        let bodies: Vec<&'a BlockStatement<'a>> =
+            self.finallies.iter().map(|c| c.body).collect();
+        for body in bodies.into_iter().rev() {
+            let saved = std::mem::take(&mut self.finallies);
+            let r = self.stmt_list(&body.body);
+            self.finallies = saved;
+            r?;
+        }
+        Ok(())
     }
 
     /// `src === undefined ? default : src` — the ES destructuring-default

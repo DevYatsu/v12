@@ -399,6 +399,7 @@ impl<'p> Mini<'p> {
                 | Opcode::MergeObject
                 | Opcode::DefineAccessor
                 | Opcode::DefineMethod
+            | Opcode::GenResumeMode
                 | Opcode::GetIterator
                 | Opcode::IteratorNext
                 | Opcode::IteratorClose

@@ -431,6 +431,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::ArrayAppend => "array_append",
         Opcode::GetGlobal => "get_global",
         Opcode::GetGlobalLenient => "get_global_lenient",
+        Opcode::GenResumeMode => "gen_resume_mode",
         Opcode::SetGlobal => "set_global",
         Opcode::Construct => "construct",
         Opcode::ToNumber => "to_number",
@@ -478,6 +479,7 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         Opcode::Neg | Opcode::BitNot | Opcode::Not | Opcode::TypeOf | Opcode::ToNumber => {
             write!(f, " r{a}, r{b}")
         }
+        Opcode::GenResumeMode => write!(f, " r{a}"),
         Opcode::MergeObject => write!(f, " r{b}, r{c}"),
         Opcode::DefineAccessor => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::SetPrototype => write!(f, " r{b}, r{c}"),

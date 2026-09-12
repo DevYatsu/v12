@@ -139,6 +139,12 @@ pub enum Opcode {
     /// mandates it (`typeof undeclared_global`). Same operand layout as
     /// `GetGlobal`.
     GetGlobalLenient = 73,
+    /// Loads the current frame's generator pending-mode slot: `0` = normal
+    /// resume (the value is a `next()` payload), `1` = return completion
+    /// (`gen.return(v)` — the resume value is the return value). Emitted
+    /// right after `SuspendYield` in generator bodies so the compiled return
+    /// path can run the active finalizer copies before returning.
+    GenResumeMode = 74,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -215,6 +221,7 @@ impl TryFrom<u8> for Opcode {
             71 => Ok(Self::IteratorClose),
             72 => Ok(Self::DefineMethod),
             73 => Ok(Self::GetGlobalLenient),
+            74 => Ok(Self::GenResumeMode),
             other => Err(other),
         }
     }
@@ -392,6 +399,7 @@ mod encoding_tests {
         Opcode::IteratorClose,
         Opcode::DefineMethod,
         Opcode::GetGlobalLenient,
+        Opcode::GenResumeMode,
     ];
 
     #[test]
