@@ -77,6 +77,11 @@ impl Attrs {
     /// links): writable + configurable but **not** enumerable.
     pub const BUILTIN: Attrs = Attrs(Self::WRITABLE | Self::CONFIGURABLE);
 
+    /// A function's own `prototype` property: writable, non-enumerable,
+    /// non-configurable (ES 10.2.5 / 15.7.3.1). Not `BUILTIN`, which is
+    /// writable+configurable.
+    pub const FUNCTION_PROTOTYPE: Attrs = Attrs::new(true, false, false);
+
     /// From explicit flags.
     pub const fn new(writable: bool, enumerable: bool, configurable: bool) -> Attrs {
         let mut bits = 0;

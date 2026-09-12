@@ -546,6 +546,56 @@ impl Heap {
         child_handle
     }
 
+    /// Reconfigures an existing own property's attributes, returning the child
+    /// shape bound to `parent`'s `(key, attrs)` edge.
+    ///
+    /// Unlike [`Self::add_property`] this never appends a duplicate descriptor:
+    /// the key's existing descriptor is replaced in the cloned list. Data and
+    /// accessor descriptors both become a data descriptor. The descriptor's
+    /// slot is preserved for data properties; a fresh slot is allocated only
+    /// when the key is absent.
+    pub fn update_data_attrs(&mut self, parent: ShapeHandle, key: PropKey, attrs: Attrs) -> ShapeHandle {
+        if let Some(existing) = self.get(parent).transitions.get(key, attrs) {
+            return existing;
+        }
+        let (proto_cell, num_own) = {
+            let parent_shape = self.get(parent);
+            (parent_shape.proto_cell, parent_shape.num_own)
+        };
+        let mut list = self.get(parent).descriptors.as_slice().to_vec();
+        let mut replaced = false;
+        let mut next_num_own = num_own;
+        for d in list.iter_mut() {
+            if d.key() == key {
+                let slot = d.slot().unwrap_or(num_own);
+                *d = Descriptor::Data { key, slot, attrs };
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            list.push(Descriptor::Data {
+                key,
+                slot: num_own,
+                attrs,
+            });
+            next_num_own = num_own + 1;
+        }
+        let mut descriptors = crate::shape::Descriptors::default();
+        for d in list {
+            descriptors.push(d);
+        }
+        let child_handle = self.alloc(Shape {
+            parent: Some(parent),
+            transitions: Transitions::default(),
+            descriptors,
+            proto_cell,
+            num_own: next_num_own,
+        });
+        self.get_mut(parent).transitions.insert(key, attrs, child_handle);
+        child_handle
+    }
+
     /// Defines an accessor property (getter/setter) on `parent`.
     ///
     /// Like [`Self::add_property`], but creates an [`Descriptor::Accessor`]
@@ -1707,5 +1757,21 @@ mod tests {
         heap.force_collect();
         // No longer rooted: reclaimed.
         assert!(!heap.alive[crate::handle::Space::Objects.as_index()][g.slot()]);
+    }
+
+    #[test]
+    fn update_data_attrs_replaces_without_appending() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let key = PropKey::from_string(heap.intern_text("x"));
+        let root = heap.root_shape();
+        let with_x = heap.add_property(root, key, Attrs::DEFAULT);
+        assert_eq!(heap.get(with_x).num_own, 1);
+        let reconfigured = heap.update_data_attrs(with_x, key, Attrs::BUILTIN);
+        assert_eq!(heap.get(reconfigured).num_own, 1, "no duplicate descriptor");
+        let desc = heap.get(reconfigured).descriptors.find(key).expect("present");
+        assert_eq!(desc.attrs(), Attrs::BUILTIN);
+        // A second call with the same attrs returns the same cached child.
+        let again = heap.update_data_attrs(with_x, key, Attrs::BUILTIN);
+        assert_eq!(again, reconfigured);
     }
 }
