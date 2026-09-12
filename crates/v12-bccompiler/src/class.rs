@@ -175,7 +175,7 @@ fn define_elements(
                     cx.emit_words(words, p.span);
                     continue;
                 }
-                let target = if p.r#static { ctor } else { proto };
+                let target = if p.r#static { ctor } else { continue };
                 let key_reg = property_key_reg(cx, &p.key, p.computed, p.span)?;
                 let value_reg = if let Some(v) = &p.value {
                     cx.expr(v)?
@@ -220,7 +220,7 @@ fn method_fn(
 
 /// Evaluates a property key into a register: static keys load the interned
 /// text; computed keys evaluate the expression.
-fn property_key_reg(
+pub(crate) fn property_key_reg(
     cx: &mut FnCtx<'_, '_, '_, '_>,
     key: &PropertyKey<'_>,
     computed: bool,

@@ -4,7 +4,7 @@
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, BindingPattern, Class, FormalParameters, Function, FunctionType,
-    MethodDefinitionKind, Program,
+    MethodDefinitionKind, Program, PropertyKey,
 };
 use oxc_semantic::SymbolId;
 use oxc_span::GetSpan;
@@ -197,6 +197,36 @@ pub fn compile_unit(
             }
         },
         UnitNode::Class(c) => {
+            // Base-class instance fields initialize on `this` at the top of the
+            // constructor, before the body. Derived classes must wait until
+            // after `super()`; that ordering is not modeled yet, so derived
+            // fields are skipped rather than initialized too early.
+            if c.heritage.is_none() {
+                for el in &c.body.body {
+                    let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el else {
+                        continue;
+                    };
+                    if p.r#static {
+                        continue;
+                    }
+                    if matches!(&p.key, PropertyKey::PrivateIdentifier(_)) {
+                        continue;
+                    }
+                    let Some(value) = &p.value else {
+                        continue;
+                    };
+                    let value_reg = cx.expr(value)?;
+                    let key_reg =
+                        crate::class::property_key_reg(&mut cx, &p.key, p.computed, p.span)?;
+                    cx.emit_reg3(
+                        Opcode::SetProperty,
+                        crate::model::REG_THIS,
+                        key_reg,
+                        value_reg,
+                        p.span,
+                    );
+                }
+            }
             // Find the explicit `constructor` element; compile its body, or
             // emit a default empty constructor when absent.
             let ctor = c.body.body.iter().find_map(|el| match el {
@@ -213,7 +243,7 @@ pub fn compile_unit(
                 };
                 cx.stmt_list(&body.statements)?;
             }
-            // Default constructor: empty body; `return undefined`.
+            // Default constructor: field initializers above, then `return undefined`.
         }
         UnitNode::Method(f) => {
             let Some(body) = f.body.as_deref() else {

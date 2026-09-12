@@ -2149,3 +2149,12 @@ fn literals_null_equality_and_strict_equality() {
         compile_source_with_strings("null === null;").expect("null strict eq should compile");
     assert!(prog.functions[prog.main as usize].validate().is_ok());
 }
+
+#[test]
+fn base_class_instance_field_initializes_on_this() {
+    let (prog, _strings) =
+        compile_source_with_strings("class C { a = 1; b; } var c = new C();").expect("compiles");
+    for f in &prog.functions {
+        f.validate().expect("valid bytecode");
+    }
+}
