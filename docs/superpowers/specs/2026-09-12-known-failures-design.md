@@ -13,11 +13,16 @@ Lift-ordered vertical slices: A1 → A2 → B → E → D → F sweep → C last
 
 ## Phases
 
-### 1. A1 Function global (~800)
+### 1. A1 Function.prototype + real bind (~718 in class/elements)
 
-- Problem: `Function` absent from `GLOBAL_INTRINSICS` and `GLOBAL_ACCESS_INTRINSICS` (`v12-bytecode/src/lib.rs:308`), no `intrinsic_slot` arm (`v12-interp/src/lib.rs:146`). Bare `Function` (incl. `typeof Function`, `propertyHelper.js` line 3) is a `CompileError`. `globalThis.Function` resolves via shape path only.
-- Change: add `Function` slot, bump `GLOBAL_VAR_OFFSET`, materialize ctor in `realm.rs:47-88` with prototype/length/name links (reuse `function_construct` seam).
-- Gate: `class/elements` filter + propertyHelper standalone + nextest.
+- Correction (2026-09-12 recon): the original premise is stale. `Function` already works as a global (`typeof Function === "function"`, `Function("a","return a+1")(1) === 2`, `globalThis.Function === Function`); it is installed via `install_native(heap, Some(global), "Function", NativeId::Function)` at `realm.rs:211`, not as an intrinsic slot. Adding an intrinsic slot is NOT the fix.
+- Real problem: `Function.prototype` is `undefined`. `function_proto` is allocated ordinary at `realm.rs:157` and never linked to the Function constructor (the `install_ctor` loop at `realm.rs:168-179` covers only Object/Array/String/Number/Boolean/Symbol). So `function_method_surface` (`property.rs:375`, gated on `Kind::Function`) never fires for it, `Function.prototype.call` reads `undefined`, and `propertyHelper.js` line 31 `Function.prototype.call.bind(Array.prototype.join)` throws `TypeError: callee is not a function`. 718 of 1015 `class/elements` failures carry exactly that message.
+- Second gap: `NativeId::FunctionBind` (`call_setup.rs:1215`) is a stub that returns the receiver unchanged. `propertyHelper.js` binds a *curried* call (`Function.prototype.call.bind(Object.prototype.hasOwnProperty)`), so `__hasOwnProperty(obj, name)` must dispatch through the bound target with a bound `this`. A stub cannot satisfy this.
+- Change:
+  1. Allocate `function_proto` as a `Kind::Function` object (callable returning `undefined`), and link the Function constructor to it via `install_ctor` after `realm.rs:211` (the constructor handle must be captured at install time).
+  2. Add `FunctionTarget::Bound(Handle<JsObject>)` referencing a state object whose `elements` hold `[target, thisArg, boundArgs..]`; trace it in `FunctionTarget::trace` and update every exhaustive match site.
+  3. Implement `FunctionBind` to allocate that state object plus a bound function object, and dispatch `Bound` in `prepare_call` and `prepare_call_apply` by delegating to `call_object(target, thisArg, bound ++ actual)`.
+- Gate: `class/elements` filter (718 → near 0 for `callee`), propertyHelper standalone, nextest.
 
 ### 2. A2 param-default registers (~600)
 
