@@ -24,6 +24,19 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-12 — A1: `Function.prototype` callable + real `bind`
+
+- **Filter:** `language/expressions/class/elements` (1 428 files, 8 jobs), then full `language` (24 873 files, 8 jobs)
+- **Before (class/elements):** 413 pass / 1 015 fail / 0 skip, 28.9 %; 718 failures were `TypeError: callee is not a function` (propertyHelper.js failed to load)
+- **After (class/elements):** 413 pass / 1 015 fail / 0 skip, 28.9 %; `callee is not a function` 718 → **90**; top message is now `m descriptor should not be enumerable; m descriptor should be configurable` (560)
+- **After (full `language`):** 9 722 pass / 15 151 fail / 0 skip, **39.1 %** (prior completed full-language score: 8 919 / 24 446 / 427 skip, 36.5 %)
+- **Delta:** class/elements pass count flat — `propertyHelper.js` now *loads* (`.call.bind` resolves), so the 718 tests advance past the load error and fail later on descriptor-attribute checks; the A1 bug is closed but those tests are gated by a separate gap (own-property descriptor enumerable/configurable). Full `language` +2.6 pts.
+- **Engine change:** `b18c160` — `Function.prototype` allocated as `Kind::Function` (placeholder `Bytecode(u32::MAX)`) and the `Function` ctor linked via `install_ctor`; `Ctx::define_method` now returns the allocated handle (`Option<Handle<JsObject>>`). `76f6436` — `FunctionTarget::Bound(Handle<JsObject>)` state object `[target, thisArg, boundArgs..]` with GC trace; `FunctionBind` builds state + bound function and installs spec `length`/`name`; `Bound` dispatched in `prepare_call`, `call_accessor_with`, `call_inline`, `prepare_call_apply`; `prepare_construct` rejects bounds (A1 scope). Also fixed a site the plan did not list: `JsObject::trace` did not trace `self.callable`, so the `FunctionTarget::Trace` impl (Bound state, RealmEval global) never ran — GC stress reproduced a use-after-free; tracing `callable` fixes it.
+- **Files:** `crates/v12-engine/src/realm.rs`, `crates/v12-engine/src/builtins/{ctx,mod}.rs`, `crates/v12-heap/src/{function,object}.rs`, `crates/v12-interp/src/{call_setup,internal_methods}.rs` (internal_methods is in v12-engine)
+- **Bucket:** `known-failures.md` A1 — closed (the `Function` global half was stale in the doc; the real fix was the callable `Function.prototype` + ctor link + real `bind`)
+- **Runner:** `./conformance/run.sh --filter language --jobs 8` (human) + `cargo nextest run --workspace` 570 pass / 0 skip
+- **Notes:** `print` is not a CLI global (only the test262 harness defines it); scratch `t1.js`/`t2.js` use `console.log`. Verified under `--expose-gc` (stress collect on every alloc): t2 and a 100-iteration bound-alloc loop stay correct. Remaining 90 `callee` cases are async-generator `yield*`/private-field contexts, not propertyHelper.
+
 ### 2026-09-06 — Built-ins expansion: Math/Number/Array/Object/String/JSON/Boolean/global + Symbol/MapSet/Iterator
 
 - **Filter:** `built-ins/Array|Math|Number|Object|String|JSON|Boolean|global` (8 slices, 8 jobs each)
