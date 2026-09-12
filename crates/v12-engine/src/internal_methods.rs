@@ -188,11 +188,23 @@ pub(crate) fn ordinary_define_own_property(
             v12_heap::Descriptor::Data { slot, attrs, .. } => {
                 let idx = slot as usize;
                 if let Some(v) = descriptor.value {
-                    if attrs.writable() {
-                        heap.get_mut(obj).properties[idx] = v;
-                    } else {
+                    if !attrs.writable() {
                         return Ok(false);
                     }
+                    let obj_mut = heap.get_mut(obj);
+                    if obj_mut.properties.len() <= idx {
+                        obj_mut.properties.resize(idx + 1, JsValue::hole());
+                    }
+                    obj_mut.properties[idx] = v;
+                }
+                let new_attrs = v12_heap::Attrs::new(
+                    descriptor.writable,
+                    descriptor.enumerable,
+                    descriptor.configurable,
+                );
+                if new_attrs != attrs {
+                    let next_shape = heap.update_data_attrs(shape, key, new_attrs);
+                    bind_shape(heap, obj, next_shape);
                 }
                 return Ok(true);
             }
@@ -207,7 +219,15 @@ pub(crate) fn ordinary_define_own_property(
         return Ok(false);
     }
     // Extend shape: allocate new shape and publish it onto the object.
-    let next_shape = heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
+    let next_shape = heap.add_property(
+        shape,
+        key,
+        v12_heap::Attrs::new(
+            descriptor.writable,
+            descriptor.enumerable,
+            descriptor.configurable,
+        ),
+    );
     bind_shape(heap, obj, next_shape);
     let value = descriptor.value.unwrap_or(JsValue::undefined());
     heap.get_mut(obj).properties.push(value);

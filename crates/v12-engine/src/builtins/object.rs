@@ -41,9 +41,50 @@ pub fn object_get_prototype_of(
     }
 }
 
+/// Minimal `ToPropertyDescriptor` for data descriptors: reads `value`,
+/// `writable`, `enumerable`, `configurable` with spec-default `false` for
+/// absent flags. `PropertyDescriptor::default()` is all-`true`, so it is
+/// deliberately not used here.
+fn parse_data_descriptor(ctx: &mut Ctx, v: JsValue) -> Result<crate::internal_methods::PropertyDescriptor, Throw> {
+    let mut desc = crate::internal_methods::PropertyDescriptor {
+        value: None,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+    };
+    let Some(obj) = v.as_object() else {
+        return Err(ctx.type_error("TypeError: Property description must be an object"));
+    };
+    for name in ["value", "writable", "enumerable", "configurable"] {
+        let key = ctx.heap.intern_text(name);
+        let present = {
+            let shape = ctx.heap.shape_of(obj);
+            ctx.heap.lookup_property(shape, PropKey::from_string(key)).is_some()
+        };
+        if !present {
+            continue;
+        }
+        let got = crate::internal_methods::dispatch_get(
+            &mut *ctx.heap,
+            obj,
+            PropKey::from_string(key),
+            JsValue::object(obj),
+        )
+        .map_err(Throw::Value)?;
+        match name {
+            "value" => desc.value = Some(got),
+            "writable" => desc.writable = super::boolean::to_boolean(ctx, got),
+            "enumerable" => desc.enumerable = super::boolean::to_boolean(ctx, got),
+            "configurable" => desc.configurable = super::boolean::to_boolean(ctx, got),
+            _ => unreachable!(),
+        }
+    }
+    Ok(desc)
+}
+
 /// `Object.defineProperty(obj, key, descriptor)` – defines a property via
-/// shape. The descriptor is simplified to a single value argument for this
-/// stage; it creates a writable configurable enumerable data property.
+/// shape, honoring the descriptor's `value`/`writable`/`enumerable`/
+/// `configurable` flags (absent flags default to `false`).
 pub fn object_define_property(
     ctx: &mut Ctx,
     _this: JsValue,
@@ -56,22 +97,32 @@ pub fn object_define_property(
         .as_object()
         .ok_or_else(|| ctx.type_error("TypeError: Object.defineProperty called on non-object"))?;
     let key = property_key(ctx, args[1]).map_err(Throw::Value)?;
-    let value = args.get(2).copied().unwrap_or(JsValue::undefined());
 
     // Delegate to the ordinary [[DefineOwnProperty]] implementation: it
     // dispatches on object kind (arrays, arguments exotics) and handles the
-    // shape extension + binding for new keys. A missing value argument
-    // defines a writable/enumerable/configurable data property.
-    crate::internal_methods::ordinary_define_own_property(
+    // shape extension + binding for new keys.
+    let descriptor = if args.len() >= 3 {
+        parse_data_descriptor(ctx, args[2])?
+    } else {
+        crate::internal_methods::PropertyDescriptor {
+            value: Some(JsValue::undefined()),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        }
+    };
+    let defined = crate::internal_methods::ordinary_define_own_property(
         &mut *ctx.heap,
         obj,
         key,
-        crate::internal_methods::PropertyDescriptor {
-            value: Some(value),
-            ..Default::default()
-        },
+        descriptor,
     )
     .map_err(Throw::Value)?;
+    if !defined {
+        return Err(ctx.type_error(
+            "TypeError: Cannot redefine property: Invalid property definition",
+        ));
+    }
     Ok(JsValue::object(obj))
 }
 
