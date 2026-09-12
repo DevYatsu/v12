@@ -371,14 +371,18 @@ impl<'a> Ctx<'a> {
     /// yet (no `length` prop installed — current observable behavior). Once
     /// an entry declares `(len)` in `define_builtins!`, the prop is installed
     /// with `{ writable: false, enumerable: false, configurable: true }`.
+    ///
+    /// Returns the allocated `Kind::Function` handle (`None` when `obj` is
+    /// `None`), so callers that need to link it — e.g. the realm linking the
+    /// `Function` constructor to `Function.prototype` — can capture it.
     pub fn define_method(
         &mut self,
         obj: Option<Handle<JsObject>>,
         name: &str,
         id: v12_native::NativeId,
         length: Option<u32>,
-    ) {
-        let Some(target) = obj else { return };
+    ) -> Option<Handle<JsObject>> {
+        let Some(target) = obj else { return None };
         let func = self.alloc_obj(v12_heap::JsObject {
             kind: v12_heap::Kind::Function,
             callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
@@ -414,6 +418,7 @@ impl<'a> Ctx<'a> {
         // and the installed value.
         self.assert_own_data_value(func, "name", JsValue::string(name_h));
         self.define_data_prop(target, name, JsValue::object(func));
+        Some(func)
     }
 
     /// Debug-only check (plan §3.4): `obj` has an own data descriptor for

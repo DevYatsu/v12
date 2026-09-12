@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue};
+use v12_heap::FunctionTarget;
 use v12_native::NativeId;
 
 /// Maximum number of intrinsics a realm may host.
@@ -154,7 +155,16 @@ impl Realm {
         let array_proto = alloc_root(heap);
         let string_proto = alloc_root(heap);
         let number_proto = alloc_root(heap);
-        let function_proto = alloc_root(heap);
+        // `Function.prototype` is itself a callable function object (spec:
+        // `%Function.prototype%` is a built-in function). Its callable is the
+        // native-seam placeholder `u32::MAX` — calling it does nothing and
+        // returns `undefined`. Allocating it as `Kind::Function` is what makes
+        // the interpreter's `function_method_surface` (gated on that kind)
+        // serve `call`/`apply`/`bind`/`toString` for it.
+        let function_proto = crate::builtins::helpers::alloc_obj(
+            heap,
+            JsObject::function(FunctionTarget::Bytecode(u32::MAX), None),
+        );
         let boolean_proto = alloc_root(heap);
         let symbol_proto = alloc_root(heap);
 
@@ -208,7 +218,15 @@ impl Realm {
         // reads resolve. The interpreter intercepts `NativeId::Function` and
         // routes it through the registry's `function_construct` seam, which
         // compiles a real program (see `builtins/registry.rs`).
-        crate::builtins::install_native(heap, Some(global), "Function", NativeId::Function);
+        // Capture the installed handle to link it to the callable
+        // `Function.prototype` allocated above: field link + spec-attr
+        // `prototype` property + `constructor` back-link (so
+        // `Function.prototype.constructor === Function`).
+        if let Some(ctor) =
+            crate::builtins::install_native(heap, Some(global), "Function", NativeId::Function)
+        {
+            crate::builtins::install_ctor(heap, ctor, function_proto);
+        }
 
         Self { global, intrinsics }
     }

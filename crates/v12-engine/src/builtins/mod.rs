@@ -232,9 +232,9 @@ pub(crate) fn install_native_with_length(
     name: &str,
     id: NativeId,
     length: Option<u32>,
-) {
+) -> Option<v12_heap::Handle<v12_heap::JsObject>> {
     let mut ctx = Ctx::new(heap, None, None);
-    ctx.define_method(target, name, id, length);
+    ctx.define_method(target, name, id, length)
 }
 
 /// Allocates the native function object for `id` and installs it as a
@@ -251,9 +251,9 @@ pub(crate) fn install_native(
     target: Option<v12_heap::Handle<v12_heap::JsObject>>,
     name: &str,
     id: NativeId,
-) {
+) -> Option<v12_heap::Handle<v12_heap::JsObject>> {
     let length = builtin_length(id);
-    install_native_with_length(heap, target, name, id, length);
+    install_native_with_length(heap, target, name, id, length)
 }
 
 /// Constructor/prototype linkage for an already-materialized pair (realm
