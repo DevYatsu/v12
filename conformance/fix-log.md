@@ -24,6 +24,21 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-12 — Step A3: class element attrs, delete semantics, Function.name
+
+- **Filter:** `language/expressions/class/elements`, `language/expressions/object/method-definition`, `built-ins/Object/getOwnPropertyDescriptor`, then `language/expressions` (11 190 files, 8 jobs)
+- **Before:** class/elements 413/1428, object/method-definition 155/303, getOwnPropertyDescriptor 136/328, `language/expressions` 5 128/11 190 (45.8 %)
+- **After:** class/elements 541/1428 (37.9 %), object/method-definition 161/303 (53.1 %), getOwnPropertyDescriptor 140/328 (42.7 %), `language/expressions` 5 306/11 190 (47.4 %)
+- **Delta:** +128 class/elements, +6 method-definition, +4 getOwnPropertyDescriptor, +178 `language/expressions`
+- **Root cause:** class method/accessor installs lowered to attributeless `SetProperty`/`DefineAccessor` stamping `Attrs::DEFAULT`; `delete` holed the value but left the shared shape descriptor readable; `Object.defineProperty` ignored descriptor flags; instance fields installed on the prototype; no `SetFunctionName`.
+- **Fix:** new `DefineMethod = 72` opcode installing own data properties with `Attrs::BUILTIN`; `op_define_accessor` → `BUILTIN`; explicit attrs for function `length`/`prototype`/`constructor`; `descriptor_is_live` filters holed data descriptors from own-property queries; `Object.defineProperty` parses descriptor flags (and throws TypeError on rejected redefinition per spec); instance fields initialize on `this` in the constructor; `function_name` threaded to `alloc_closure`.
+- **Accepted gaps:** derived-class field ordering after `super()`; static blocks; accessor `defineProperty` (`get`/`set`); computed/symbol method `name`; full holed-descriptor reader sweep; array indexed elements are invisible to own-property queries (pre-existing, engine-wide).
+- **Engine change:** commits d39deea, 1a28bde, 17ea7fa, b6a637f, 89d6d5e, a836af0, 03aadbe
+- **Files:** `crates/v12-heap/src/{shape,gc}.rs`, `crates/v12-bytecode/src/{opcode,lib,builder}.rs`, `crates/v12-interp/src/{object_ops,execute,property,lib}.rs`, `crates/v12-bccompiler/src/{class,unit,collect,model}.rs`, `crates/v12-engine/src/{internal_methods,builtins/object,builtins/mod,builtins/boolean}.rs`, `crates/v12-native/src/id.rs`, `crates/test-support/src/mini.rs`
+- **Bucket:** `known-failures.md` §A3 — closed
+- **Runner:** `./conformance/run.sh --filter <f> --jobs 8`
+- **Notes:** workspace gate 578 passed / 0 skipped after the step. The plan's expected `9 false` for a non-writable-but-configurable value redefinition was spec-incorrect; the engine now throws TypeError and keeps the original value (matching V8).
+
 ### 2026-09-12 — Step A2: parameter defaults & destructuring in the prologue
 
 - **Filter:** `language/expressions/function/dflt-params*`, `arrow-function/dflt-params*`, `object/method-definition`, `function`, `arrow-function`, then full `language` (24 873 files, 8 jobs)
