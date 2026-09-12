@@ -208,8 +208,16 @@ pub struct UnitPlan {
     pub env_slots: HashMap<SymbolId, u16>,
     pub this_slot: Option<u16>,
     pub env_slot_count: u16,
-    /// Declarations at the head of `decl_order` that are function parameters.
-    pub param_count: usize,
+    /// Number of top-level formal parameters (excluding a rest parameter).
+    /// `r{i+1}` receives formal `i` by the call ABI (`r0` is `this`).
+    pub arity: usize,
+    /// For each formal (`len() == arity`): the top-level binding identifier,
+    /// or `None` when the formal is a destructuring pattern whose incoming
+    /// register is reserved as scratch for the prologue destructure.
+    pub formal_idents: Vec<Option<SymbolId>>,
+    /// The rest parameter's top-level binding identifier when it is a simple
+    /// identifier (`...a`). `None` for a pattern rest or no rest.
+    pub rest_ident: Option<SymbolId>,
     /// `true` when the last parameter is a rest parameter.
     pub has_rest: bool,
     /// `ExpectedArgumentCount`: formal parameters before the rest parameter
@@ -244,7 +252,9 @@ impl UnitPlan {
             env_slots: HashMap::new(),
             this_slot: None,
             env_slot_count: 0,
-            param_count: 0,
+            arity: 0,
+            formal_idents: Vec::new(),
+            rest_ident: None,
             has_rest: false,
             expected_args: 0,
             needs_arguments: false,

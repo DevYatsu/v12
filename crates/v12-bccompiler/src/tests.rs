@@ -1630,6 +1630,87 @@ fn spread_call_and_array_compile() {
 }
 
 // ---------------------------------------------------------------------------
+// Bucket 7 — Parameter defaults & destructuring in the prologue
+// ---------------------------------------------------------------------------
+
+/// The bytecode text of the first non-main function in `src`.
+fn fn0_text(src: &str) -> String {
+    let (prog, _) = compile_source_with_strings(src).expect("compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    format!("{}", prog.functions[1])
+}
+
+#[test]
+fn param_default_lowers_in_prologue() {
+    // `function k(a = 1){ return a; }` must test `a` against undefined
+    // in the prologue and select the default when it is.
+    let text = fn0_text("function k(a = 1){ return a; }");
+    assert!(text.contains("strict_eq"), "expected default test in:\n{text}");
+    assert!(
+        text.contains("jump_if_false"),
+        "expected default branch in:\n{text}"
+    );
+}
+
+#[test]
+fn param_pattern_destructures_in_prologue() {
+    // `function d([a]){ return a; }` must read element 0 off the incoming
+    // array register (GetProperty), not alias it.
+    let text = fn0_text("function d([a]){ return a; }");
+    assert!(
+        text.contains("get_property"),
+        "expected pattern read in:\n{text}"
+    );
+}
+
+#[test]
+fn simple_params_layout_is_unchanged() {
+    // The all-simple-identifier fast path must not grow the prologue.
+    let (prog, _) = compile_source_with_strings("function f(a, b){ return a + b; }").expect("compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    let text = format!("{}", prog.functions[1]);
+    assert!(
+        !text.contains("strict_eq"),
+        "no default test expected in:\n{text}"
+    );
+    assert_eq!(prog.functions[1].fixed_params, 2);
+    assert_eq!(prog.functions[1].rest_reg, 0);
+}
+
+#[test]
+fn pattern_formal_then_rest_register_abi() {
+    // Formal 0 is the pattern (incoming r1, reserved as scratch); the rest
+    // array therefore lands at r2, NOT r3.
+    let (prog, _) = compile_source_with_strings("function f([a], ...r){ return r.length; }")
+        .expect("compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    assert_eq!(prog.functions[1].fixed_params, 1);
+    assert!(prog.functions[1].has_rest);
+    assert_eq!(prog.functions[1].rest_reg, 2);
+}
+
+#[test]
+fn dflt_params_length_stops_at_first_default() {
+    let (prog, _) = compile_source_with_strings("function f(a, b = 1, c){}").expect("compile");
+    assert_eq!(prog.functions[1].expected_args, 1);
+}
+
+#[test]
+fn generator_with_default_compiles() {
+    let (prog, _) = compile_source_with_strings("function* g(a = 1){ yield a; }").expect("compile");
+    for f in &prog.functions {
+        f.validate().expect("validate");
+    }
+    assert!(format!("{}", prog.functions[1]).contains("strict_eq"));
+}
+
+// ---------------------------------------------------------------------------
 // Bucket 9 — function-code strict & Annex B
 // ---------------------------------------------------------------------------
 

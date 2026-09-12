@@ -3,7 +3,8 @@
 //! assembly into [`Compiler::functions`].
 
 use oxc_ast::ast::{
-    ArrowFunctionExpression, Class, Function, FunctionType, MethodDefinitionKind, Program,
+    ArrowFunctionExpression, BindingPattern, Class, FormalParameters, Function, FunctionType,
+    MethodDefinitionKind, Program,
 };
 use oxc_semantic::SymbolId;
 use oxc_span::GetSpan;
@@ -115,7 +116,25 @@ pub fn compile_unit(
             cx.b.is_arrow = false;
         }
     }
-    emit_prologue(&mut cx, idx, self_symbol)?;
+    let params: Option<&FormalParameters<'_>> = match &node {
+        UnitNode::Fn(f) => Some(&f.params),
+        UnitNode::Arrow(a) => Some(&a.params),
+        UnitNode::Method(f) => Some(&f.params),
+        UnitNode::Class(c) => c
+            .body
+            .body
+            .iter()
+            .find_map(|el| match el {
+                oxc_ast::ast::ClassElement::MethodDefinition(m)
+                    if m.kind == MethodDefinitionKind::Constructor =>
+                {
+                    Some(&*m.value.params)
+                }
+                _ => None,
+            }),
+        UnitNode::Main(_) => None,
+    };
+    emit_prologue(&mut cx, idx, params, self_symbol)?;
     if cx.b.is_generator {
         let dst = cx.new_temp();
         let func_idx = u16::try_from(idx).map_err(|_| CompileError {
@@ -210,13 +229,9 @@ pub fn compile_unit(
     fb.has_rest = plan.has_rest;
     fb.expected_args = u16::try_from(plan.expected_args).unwrap_or(u16::MAX);
     fb.needs_arguments = plan.needs_arguments;
-    fb.fixed_params = if plan.has_rest {
-        plan.param_count.saturating_sub(1) as u16
-    } else {
-        plan.param_count as u16
-    };
+    fb.fixed_params = plan.arity as u16;
     fb.rest_reg = if plan.has_rest {
-        fb.fixed_params + 1
+        plan.arity as u16 + 1
     } else {
         0
     };
@@ -236,16 +251,12 @@ pub fn compile_unit(
 fn emit_prologue(
     cx: &mut FnCtx<'_, '_, '_, '_>,
     idx: usize,
+    params: Option<&FormalParameters<'_>>,
     self_symbol: Option<SymbolId>,
 ) -> Result<(), CompileError> {
-    let (has_env, env_slots, this_slot, param_count) = {
+    let (has_env, env_slots, this_slot, arity) = {
         let plan = &cx.comp.plans.units[cx.unit];
-        (
-            plan.has_env,
-            plan.env_slot_count,
-            plan.this_slot,
-            plan.param_count,
-        )
+        (plan.has_env, plan.env_slot_count, plan.this_slot, plan.arity)
     };
 
     if has_env {
@@ -255,19 +266,67 @@ fn emit_prologue(
             cx.comp.plans.env_depth_between(cx.unit, 0)
         };
         cx.emit_new_env(ancestor_envs, env_slots, oxc_span::Span::default());
+    }
 
-        for pi in 0..param_count {
-            let Some(sym) = cx.comp.plans.units[cx.unit].decl_order.get(pi).copied() else {
+    if let Some(ps) = params {
+        // Formal `i` arrives in `r{i+1}` (`r0` is `this`). A simple identifier
+        // is already in place unless captured (then copy into the env); a
+        // pattern runs the shared destructuring lowerer against its incoming
+        // register.
+        for (i, p) in ps.items.iter().enumerate() {
+            let incoming = i as u16 + 1;
+            // oxc stores a top-level default (`a = 1`, `[a] = []`) on the
+            // `FormalParameter`; the binding pattern stays bare. Apply the
+            // default first, then bind the (possibly destructuring) pattern
+            // against the chosen value.
+            if let Some(init) = &p.initializer {
+                let chosen = cx.lower_default(incoming, init, p.span)?;
+                match &p.pattern {
+                    BindingPattern::BindingIdentifier(id) => {
+                        if let Some(sym) = id.symbol_id.get() {
+                            let access = cx.access(sym);
+                            cx.store_access(access, chosen, p.span);
+                        }
+                    }
+                    pat => cx.lower_binding_pattern(pat, chosen)?,
+                }
                 continue;
+            }
+            let loc = match &p.pattern {
+                BindingPattern::BindingIdentifier(id) => id
+                    .symbol_id
+                    .get()
+                    .and_then(|sym| cx.comp.plans.units[cx.unit].vars.get(&sym).copied()),
+                _ => {
+                    cx.lower_binding_pattern(&p.pattern, incoming)?;
+                    None
+                }
             };
-            if let VarLoc::Env(slot) = cx.comp.plans.units[cx.unit].vars[&sym] {
-                let incoming = pi as u16 + 1; // r0 is `this`
+            if let Some(VarLoc::Env(slot)) = loc {
                 cx.emit_set_env(0, slot, incoming, oxc_span::Span::default());
             }
         }
-        if let Some(slot) = this_slot {
-            cx.emit_set_env(0, slot, REG_THIS, oxc_span::Span::default());
+
+        if let Some(rest) = &ps.rest {
+            let rest_reg = arity as u16 + 1;
+            let loc = match &rest.rest.argument {
+                BindingPattern::BindingIdentifier(id) => id
+                    .symbol_id
+                    .get()
+                    .and_then(|sym| cx.comp.plans.units[cx.unit].vars.get(&sym).copied()),
+                pattern => {
+                    cx.lower_binding_pattern(pattern, rest_reg)?;
+                    None
+                }
+            };
+            if let Some(VarLoc::Env(slot)) = loc {
+                cx.emit_set_env(0, slot, rest_reg, oxc_span::Span::default());
+            }
         }
+    }
+
+    if let Some(slot) = this_slot {
+        cx.emit_set_env(0, slot, REG_THIS, oxc_span::Span::default());
     }
 
     if let Some(sym) = self_symbol {

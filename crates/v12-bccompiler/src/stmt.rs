@@ -385,7 +385,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// Recursively lowers any binding pattern against `src`.
-    fn lower_binding_pattern(&mut self, pat: &BindingPattern<'_>, src: u16) -> Res<()> {
+    pub(crate) fn lower_binding_pattern(&mut self, pat: &BindingPattern<'_>, src: u16) -> Res<()> {
         match pat {
             BindingPattern::BindingIdentifier(id) => {
                 let Some(sym) = id.symbol_id.get() else {

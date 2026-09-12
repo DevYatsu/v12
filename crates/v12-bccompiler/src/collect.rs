@@ -22,8 +22,8 @@
 
 use oxc_ast::ast::{
     ArrayExpressionElement, ArrowFunctionExpression, BindingPattern, Expression, ForStatementInit,
-    Function, ModuleDeclaration, ModuleExportName, Program, PropertyKey, SimpleAssignmentTarget,
-    Statement, VariableDeclaration,
+    FormalParameters, Function, ModuleDeclaration, ModuleExportName, Program, PropertyKey,
+    SimpleAssignmentTarget, Statement, VariableDeclaration,
 };
 use oxc_semantic::{Scoping, SymbolId};
 use oxc_span::GetSpan;
@@ -179,19 +179,8 @@ impl<'s> Collector<'s> {
         self.unit_stack.push(idx);
         self.strict_stack.push(is_strict);
 
-        // Params register first so `decl_order[..param_count]` really is the
-        // parameter list; the named-function-expression's own name follows.
-        for p in &f.params.items {
-            self.binding_pattern(&p.pattern);
-        }
-        if let Some(rest) = &f.params.rest {
-            self.binding_pattern(&rest.rest.argument);
-        }
-        // Params are exactly the declarations registered so far in this unit.
-        let param_count = self.plans.units[idx].decl_order.len();
-        self.plans.units[idx].param_count = param_count;
-        self.plans.units[idx].has_rest = f.params.rest.is_some();
-        self.plans.units[idx].expected_args = expected_args(&f.params.items);
+        // Params register first; they occupy the incoming-argument window.
+        self.register_formals(idx, &f.params);
 
         // Named function *expressions* bind their own name inside themselves,
         // after the params (it is an ordinary local of the body).
@@ -228,16 +217,7 @@ impl<'s> Collector<'s> {
         self.plans.fn_index.insert(a.span(), idx);
         self.unit_stack.push(idx);
         self.strict_stack.push(is_strict);
-        for p in &a.params.items {
-            self.binding_pattern(&p.pattern);
-        }
-        if let Some(rest) = &a.params.rest {
-            self.binding_pattern(&rest.rest.argument);
-        }
-        let param_count = self.plans.units[idx].decl_order.len();
-        self.plans.units[idx].param_count = param_count;
-        self.plans.units[idx].has_rest = a.params.rest.is_some();
-        self.plans.units[idx].expected_args = expected_args(&a.params.items);
+        self.register_formals(idx, &a.params);
         match a.get_function_body() {
             Some(body) => self.stmt_list(&body.statements),
             None => {
@@ -455,16 +435,7 @@ impl<'s> Collector<'s> {
         if let Some(m) = ctor_el {
             // The explicit constructor is a Function; register its params and
             // walk its body, and note references inside it.
-            for p in &m.value.params.items {
-                self.binding_pattern(&p.pattern);
-            }
-            if let Some(rest) = &m.value.params.rest {
-                self.binding_pattern(&rest.rest.argument);
-            }
-            let param_count = self.plans.units[idx].decl_order.len();
-            self.plans.units[idx].param_count = param_count;
-            self.plans.units[idx].has_rest = m.value.params.rest.is_some();
-            self.plans.units[idx].expected_args = expected_args(&m.value.params.items);
+            self.register_formals(idx, &m.value.params);
             if let Some(body) = m.value.body.as_deref() {
                 self.stmt_list(&body.statements);
             }
@@ -507,16 +478,7 @@ impl<'s> Collector<'s> {
                 self.plans.fn_index.insert(m.value.span, midx);
                 self.unit_stack.push(midx);
                 self.strict_stack.push(m_strict);
-                for p in &m.value.params.items {
-                    self.binding_pattern(&p.pattern);
-                }
-                if let Some(rest) = &m.value.params.rest {
-                    self.binding_pattern(&rest.rest.argument);
-                }
-                let param_count = self.plans.units[midx].decl_order.len();
-                self.plans.units[midx].param_count = param_count;
-                self.plans.units[midx].has_rest = m.value.params.rest.is_some();
-                self.plans.units[midx].expected_args = expected_args(&m.value.params.items);
+                self.register_formals(midx, &m.value.params);
                 if let Some(body) = m.value.body.as_deref() {
                     self.stmt_list(&body.statements);
                 }
@@ -846,6 +808,38 @@ impl<'s> Collector<'s> {
         }
     }
 
+    /// Registers one function's formal parameters: walks every binding leaf
+    /// (so captures and default-RHS references are collected) and records the
+    /// top-level arity separately from the leaf count.
+    fn register_formals(&mut self, idx: usize, params: &FormalParameters<'_>) {
+        for p in &params.items {
+            self.binding_pattern(&p.pattern);
+            // oxc stores a top-level default (`a = 1`, `[a] = []`) on the
+            // `FormalParameter`, not inside the binding pattern, so walk the
+            // initializer to collect its references/captures too.
+            if let Some(init) = &p.initializer {
+                self.expr(init);
+            }
+        }
+        if let Some(rest) = &params.rest {
+            self.binding_pattern(&rest.rest.argument);
+        }
+        let formal_idents = params
+            .items
+            .iter()
+            .map(|p| binding_symbol(&p.pattern))
+            .collect();
+        let rest_ident = params
+            .rest
+            .as_ref()
+            .and_then(|r| binding_symbol(&r.rest.argument));
+        self.plans.units[idx].arity = params.items.len();
+        self.plans.units[idx].formal_idents = formal_idents;
+        self.plans.units[idx].rest_ident = rest_ident;
+        self.plans.units[idx].has_rest = params.rest.is_some();
+        self.plans.units[idx].expected_args = expected_args(&params.items);
+    }
+
     // Arrow units always have a parent (the compiler guarantees a non-arrow
     // main unit exists); audited invariant.
     #[allow(clippy::expect_used)]
@@ -1105,16 +1099,14 @@ fn binding_symbol(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<SymbolId> {
 }
 
 /// `ExpectedArgumentCount` (ES 14.1.6): the number of formal parameters up
-/// to the rest parameter or the first parameter with an initializer. Only a
-/// top-level `AssignmentPattern` (`a = 1`) stops the count; a bare
-/// destructuring pattern without a default does not.
+/// to the rest parameter or the first parameter with an initializer. A
+/// top-level default lives on `FormalParameter::initializer` in oxc (the
+/// pattern stays bare); a destructuring default nested inside a pattern does
+/// not stop the count.
 fn expected_args(items: &[oxc_ast::ast::FormalParameter<'_>]) -> usize {
     let mut count = 0;
     for p in items {
-        if matches!(
-            p.pattern,
-            oxc_ast::ast::BindingPattern::AssignmentPattern(_)
-        ) {
+        if p.initializer.is_some() {
             break;
         }
         count += 1;
@@ -1171,9 +1163,69 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
             message: "too many functions/constants".into(),
             span: Some((0, 0)),
         })?;
+        let (arity, has_rest, rest_ident) = {
+            let u = &plans.units[ui];
+            (u.arity, u.has_rest, u.rest_ident)
+        };
+        // 1. Reserve the incoming formal window unconditionally: `r{i+1}`
+        //    carries formal `i` from the call ABI. A simple-identifier formal
+        //    takes that register (or an env slot when captured — the register
+        //    is still consumed because the ABI writes it). A pattern formal
+        //    leaves it as scratch for the prologue destructure.
+        for i in 0..arity {
+            let this_reg = reg;
+            reg = reg.checked_add(1).ok_or_else(|| CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            })?;
+            let Some(sym) = plans.units[ui].formal_idents.get(i).copied().flatten() else {
+                continue;
+            };
+            if !homes.get(&sym).is_some_and(|h| *h == ui) {
+                continue;
+            }
+            if plans.captured.contains(&sym) {
+                plans.units[ui].env_slots.insert(sym, slot);
+                plans.units[ui].vars.insert(sym, VarLoc::Env(slot));
+                slot = slot.checked_add(1).ok_or_else(|| CompileError {
+                    message: "too many functions/constants".into(),
+                    span: Some((0, 0)),
+                })?;
+            } else {
+                plans.units[ui].vars.insert(sym, VarLoc::Reg(this_reg));
+            }
+        }
+        // 2. Reserve the rest register at `r{arity+1}` (the ABI tail).
+        if has_rest {
+            let rest_reg = reg;
+            reg = reg.checked_add(1).ok_or_else(|| CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            })?;
+            if let Some(sym) = rest_ident
+                && homes.get(&sym).is_some_and(|h| *h == ui)
+            {
+                if plans.captured.contains(&sym) {
+                    plans.units[ui].env_slots.insert(sym, slot);
+                    plans.units[ui].vars.insert(sym, VarLoc::Env(slot));
+                    slot = slot.checked_add(1).ok_or_else(|| CompileError {
+                        message: "too many functions/constants".into(),
+                        span: Some((0, 0)),
+                    })?;
+                } else {
+                    plans.units[ui].vars.insert(sym, VarLoc::Reg(rest_reg));
+                }
+            }
+        }
+        // 3. Everything else (pattern leaves, body declarations, named
+        //    function-expression self-bindings) above the reserved window.
         let decl_count = plans.units[ui].decl_order.len();
         for i in 0..decl_count {
             let sym = plans.units[ui].decl_order[i];
+            // Formals/rest already placed above.
+            if plans.units[ui].vars.contains_key(&sym) {
+                continue;
+            }
             let is_home = homes.get(&sym).is_some_and(|h| *h == ui);
             if !is_home {
                 continue;
