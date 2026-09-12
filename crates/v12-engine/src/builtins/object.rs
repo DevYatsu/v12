@@ -158,12 +158,30 @@ pub fn object_enumerable_own_keys(
     Ok(array_value(ctx, items))
 }
 
+/// Whether `desc` is a live own property of `obj`. `delete` stores `hole` in a
+/// data property's slot while leaving the shared shape descriptor in place, so
+/// a holed data descriptor is not observable. Accessors have no slot and are
+/// always live.
+fn descriptor_is_live(heap: &v12_heap::Heap, obj: Handle<v12_heap::JsObject>, desc: &v12_heap::Descriptor) -> bool {
+    match desc {
+        v12_heap::Descriptor::Data { slot, .. } => heap
+            .get(obj)
+            .properties
+            .get(*slot as usize)
+            .is_some_and(|v| !v.is_hole()),
+        v12_heap::Descriptor::Accessor { .. } => true,
+    }
+}
+
 pub fn object_has_own_property(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let this_obj = this.as_object().ok_or_else(|| ctx.type_error("TypeError: Object.prototype.hasOwnProperty called on non-object"))?;
     let key = args.first().copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key).map_err(Throw::Value)?;
     let shape = ctx.heap.shape_of(this_obj);
-    let found = ctx.heap.lookup_property(shape, pk).is_some();
+    let found = ctx
+        .heap
+        .lookup_property(shape, pk)
+        .is_some_and(|d| descriptor_is_live(ctx.heap, this_obj, d));
     Ok(JsValue::from_bool(found))
 }
 
@@ -287,7 +305,11 @@ pub fn object_has_own(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result
     let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v).map_err(Throw::Value)?;
     let shape = ctx.heap.shape_of(obj);
-    Ok(JsValue::from_bool(ctx.heap.lookup_property(shape, pk).is_some()))
+    Ok(JsValue::from_bool(
+        ctx.heap
+            .lookup_property(shape, pk)
+            .is_some_and(|d| descriptor_is_live(ctx.heap, obj, d)),
+    ))
 }
 
 /// `Object.assign(target, ...sources)` – copies own *enumerable* properties
@@ -550,7 +572,11 @@ pub fn object_get_own_property_descriptor(
         Data { slot: u32, writable: bool, enumerable: bool, configurable: bool },
         Accessor { get: Option<v12_heap::Handle<v12_heap::JsObject>>, set: Option<v12_heap::Handle<v12_heap::JsObject>>, enumerable: bool, configurable: bool },
     }
-    let Some(desc) = ctx.heap.lookup_property(shape, pk) else {
+    let Some(desc) = ctx
+        .heap
+        .lookup_property(shape, pk)
+        .filter(|d| descriptor_is_live(ctx.heap, obj, d))
+    else {
         return Ok(JsValue::undefined());
     };
     // Copy the descriptor out before any allocation (heap borrows nest).
