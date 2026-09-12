@@ -374,8 +374,8 @@ impl Interp<'_> {
                 // Arithmetic
                 // ------------------------------------------------------
                 Opcode::Add => {
-                    let l = self.stack[base + usize::from(rb)];
-                    let r = self.stack[base + usize::from(rc)];
+                    let l = attempt!(self.to_primitive_default(self.stack[base + usize::from(rb)]));
+                    let r = attempt!(self.to_primitive_default(self.stack[base + usize::from(rc)]));
                     self.gc_protect();
                     let v = attempt!(ops::add(self.heap, l, r));
                     self.stack[base + usize::from(ra)] = v;
@@ -387,9 +387,9 @@ impl Interp<'_> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Sub => {
-                    let l = self.stack[base + usize::from(rb)];
-                    let r = self.stack[base + usize::from(rc)];
-                    let v = ops::sub(self.heap, l, r);
+                    let ln = attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
+                    let rn = attempt!(self.to_number_value(self.stack[base + usize::from(rc)]));
+                    let v = ops::box_number(ln - rn);
                     self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
@@ -399,9 +399,9 @@ impl Interp<'_> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Mul => {
-                    let l = self.stack[base + usize::from(rb)];
-                    let r = self.stack[base + usize::from(rc)];
-                    let v = ops::mul(self.heap, l, r);
+                    let ln = attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
+                    let rn = attempt!(self.to_number_value(self.stack[base + usize::from(rc)]));
+                    let v = ops::box_number(ln * rn);
                     self.stack[base + usize::from(ra)] = v;
                     let lat = Lattice::from_value(v, None);
                     self.feedback
@@ -413,10 +413,12 @@ impl Interp<'_> {
                 Opcode::Div | Opcode::Mod | Opcode::Pow => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
+                    let ln = attempt!(self.to_number_value(l));
+                    let rn = attempt!(self.to_number_value(r));
                     let n = match op {
-                        Opcode::Div => ops::div(self.heap, l, r),
-                        Opcode::Mod => ops::modulo(self.heap, l, r),
-                        _ => ops::js_pow(self.heap, l, r),
+                        Opcode::Div => ops::box_number(ln / rn),
+                        Opcode::Mod => ops::box_number(ln % rn),
+                        _ => ops::js_pow(ln, rn),
                     };
                     self.stack[base + usize::from(ra)] = n;
                     let lat = Lattice::from_value(n, None);
@@ -431,8 +433,8 @@ impl Interp<'_> {
                 // Bitwise operations and shifts (ES ToInt32/ToUint32)
                 // ------------------------------------------------------
                 Opcode::BitAnd | Opcode::BitOr | Opcode::BitXor => {
-                    let ln = ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
-                    let rn = ops::to_number(self.heap, self.stack[base + usize::from(rc)]);
+                    let ln = attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
+                    let rn = attempt!(self.to_number_value(self.stack[base + usize::from(rc)]));
                     let (a, b) = (ops::to_int32(ln), ops::to_int32(rn));
                     let n = match op {
                         Opcode::BitAnd => a & b,
@@ -443,8 +445,8 @@ impl Interp<'_> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Shl | Opcode::Shr | Opcode::UShr => {
-                    let ln = ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
-                    let rn = ops::to_number(self.heap, self.stack[base + usize::from(rc)]);
+                    let ln = attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
+                    let rn = attempt!(self.to_number_value(self.stack[base + usize::from(rc)]));
                     let shift = ops::to_uint32(rn) & 31;
                     let n = match op {
                         Opcode::Shl => ops::to_int32(ln) << shift,
@@ -462,7 +464,7 @@ impl Interp<'_> {
                 Opcode::Eq | Opcode::Ne => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
-                    let eq = ops::loose_equals(self.heap, l, r);
+                    let eq = attempt!(self.loose_equals(l, r));
                     self.write_bool(base, ra, eq ^ (op == Opcode::Ne));
                     self.set_pc(pc + op_width);
                 }
@@ -476,23 +478,23 @@ impl Interp<'_> {
                 Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
                     let l = self.stack[base + usize::from(rb)];
                     let r = self.stack[base + usize::from(rc)];
-                    let ord = ops::compare(op, self.heap, l, r);
+                    let ord = attempt!(self.compare(op, l, r));
                     self.write_bool(base, ra, ord);
                     self.set_pc(pc + op_width);
                 }
                 Opcode::Neg => {
-                    let n = -ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
+                    let n = -attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
                     self.stack[base + usize::from(ra)] = ops::box_number(n);
                     self.set_pc(pc + op_width);
                 }
                 Opcode::ToNumber => {
                     // ES ToNumber (unary `+`): result is a number value.
-                    let n = ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
+                    let n = attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
                     self.stack[base + usize::from(ra)] = ops::box_number(n);
                     self.set_pc(pc + op_width);
                 }
                 Opcode::BitNot => {
-                    let n = ops::to_number(self.heap, self.stack[base + usize::from(rb)]);
+                    let n = attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
                     self.stack[base + usize::from(ra)] =
                         ops::box_number(f64::from(!ops::to_int32(n)));
                     self.set_pc(pc + op_width);

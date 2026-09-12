@@ -9,7 +9,7 @@
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, Kind, V12Str};
 
-use crate::JSException;
+use crate::{Interp, JSException};
 
 /// UTF-16 code units of a heap string, materializing composites first.
 pub(crate) fn string_units(heap: &mut Heap, h: Handle<V12Str>) -> Vec<u16> {
@@ -183,21 +183,64 @@ fn valid_decimal(s: &str) -> bool {
     i == bytes.len()
 }
 
-/// ES Number::toString(10) for the common cases. Formatting follows Rust's
-/// shortest-round-trip `Display`, which matches JS for every value with an
-/// exponent in `[−6, 21)`; beyond that range JS switches to exponential
-/// notation and this formatter does not — a documented divergence that
-/// Tier-1 programs do not observe.
+/// ES Number::toString(10). Uses Rust's shortest-round-trip `{:e}`
+/// formatting for the digit string, then applies the spec's decimal vs
+/// exponential selection (`k ≤ n ≤ 21` decimal, `-6 < n ≤ 0` small decimal,
+/// otherwise exponential with an explicit `+`/`-` exponent sign).
 pub(crate) fn number_to_string(n: f64) -> String {
     if n.is_nan() {
-        "NaN".into()
-    } else if n == f64::INFINITY {
-        "Infinity".into()
-    } else if n == f64::NEG_INFINITY {
-        "-Infinity".into()
-    } else {
-        format!("{n}")
+        return "NaN".into();
     }
+    if n == f64::INFINITY {
+        return "Infinity".into();
+    }
+    if n == f64::NEG_INFINITY {
+        return "-Infinity".into();
+    }
+    if n == 0.0 {
+        return if n.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    // `{:e}` yields shortest digits: `d[.ddd]e±X` (no leading zeros, no
+    // trailing zeros in the fraction).
+    let sci = format!("{:e}", n);
+    let (mantissa, exp_text) = sci.split_once('e').expect("scientific form");
+    let exp: i32 = exp_text.parse().expect("decimal exponent");
+    let neg = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let k = digits.len() as i32; // digit count (spec's `k`)
+    let ni = exp + 1; // spec's `n`: decimal point position
+    let sign = if neg { "-" } else { "" };
+    let body = if k <= ni && ni <= 21 {
+        // digits followed by ni-k zeros
+        let mut t = digits.clone();
+        for _ in 0..(ni - k) {
+            t.push('0');
+        }
+        t
+    } else if 0 < ni && ni <= 21 {
+        // dot after ni digits
+        let (head, tail) = digits.split_at(ni as usize);
+        format!("{head}.{tail}")
+    } else if -6 < ni && ni <= 0 {
+        // 0.000ddd
+        let mut t = String::from("0.");
+        for _ in 0..(-ni) {
+            t.push('0');
+        }
+        t.push_str(&digits);
+        t
+    } else {
+        // exponential: d[.ddd]e±(n-1)
+        let e = ni - 1;
+        let (esign, emag) = if e < 0 { ('-', -e) } else { ('+', e) };
+        if k == 1 {
+            format!("{digits}e{esign}{emag}")
+        } else {
+            let (head, tail) = digits.split_at(1);
+            format!("{head}.{tail}e{esign}{emag}")
+        }
+    };
+    format!("{sign}{body}")
 }
 
 /// ES ToString. Strings return themselves; numbers/booleans/specials intern
@@ -469,8 +512,7 @@ pub(crate) fn modulo(heap: &mut Heap, l: JsValue, r: JsValue) -> JsValue {
 
 /// ES `**`. `f64::powf` agrees with JS except when `|base| == 1` and the
 /// exponent is infinite: IEEE says ±1, the spec says NaN. Patch that case.
-pub(crate) fn js_pow(heap: &mut Heap, l: JsValue, r: JsValue) -> JsValue {
-    let (ln, rn) = (to_number(heap, l), to_number(heap, r));
+pub(crate) fn js_pow(ln: f64, rn: f64) -> JsValue {
     let result = if ln.abs() == 1.0 && rn.is_infinite() {
         f64::NAN
     } else {
@@ -507,4 +549,71 @@ pub(crate) fn to_uint32(n: f64) -> u32 {
 /// ES ToInt32: the signed view of [`to_uint32`].
 pub(crate) fn to_int32(n: f64) -> i32 {
     to_uint32(n) as i32
+}
+
+impl Interp<'_> {
+    /// ES IsLooseEqual with object operands converted through
+    /// [`Self::to_primitive_default`] first. Object↔object compares the
+    /// original objects by identity (no conversion).
+    pub(crate) fn loose_equals(&mut self, a: JsValue, b: JsValue) -> Result<bool, JSException> {
+        if a.is_object() && !b.is_object() {
+            let prim = self.to_primitive_default(a)?;
+            return Ok(loose_equals(self.heap, prim, b));
+        }
+        if b.is_object() && !a.is_object() {
+            let prim = self.to_primitive_default(b)?;
+            return Ok(loose_equals(self.heap, a, prim));
+        }
+        Ok(loose_equals(self.heap, a, b))
+    }
+
+    /// ES abstract relational comparison with object operands converted
+    /// through [`Self::to_primitive_default`] first.
+    pub(crate) fn compare(&mut self, op: crate::Opcode, l: JsValue, r: JsValue) -> Result<bool, JSException> {
+        if l.is_object() {
+            let prim = self.to_primitive_default(l)?;
+            return self.compare(op, prim, r);
+        }
+        if r.is_object() {
+            let prim = self.to_primitive_default(r)?;
+            return self.compare(op, l, prim);
+        }
+        Ok(compare(op, self.heap, l, r))
+    }
+
+    /// ES ToPrimitive with the default (no) hint: `valueOf` first, then
+    /// `toString`. Primitives pass through unchanged; an object whose
+    /// methods yield no primitive is a TypeError.
+    pub(crate) fn to_primitive_default(&mut self, v: JsValue) -> Result<JsValue, JSException> {
+        if !v.is_object() {
+            return Ok(v);
+        }
+        for name in ["valueOf", "toString"] {
+            let key = self.new_temp_key(name);
+            let m = self.get_property(0, 0, v, key)?;
+            if let Some(f) = m.as_object() {
+                self.stack.push(JsValue::object(f));
+                self.gc_protect();
+                let r = self.call_inline(f, v, &[]);
+                self.stack.pop();
+                let r = r?;
+                if !r.is_object() {
+                    return Ok(r);
+                }
+            }
+        }
+        Err(JSException(
+            self.error_value("TypeError: Cannot convert object to primitive value"),
+        ))
+    }
+
+    /// ES ToNumber, routing objects through [`Self::to_primitive_default`]
+    /// first (user `valueOf`/`toString` conversions).
+    pub(crate) fn to_number_value(&mut self, v: JsValue) -> Result<f64, JSException> {
+        if v.is_object() {
+            let prim = self.to_primitive_default(v)?;
+            return Ok(to_number(self.heap, prim));
+        }
+        Ok(to_number(self.heap, v))
+    }
 }

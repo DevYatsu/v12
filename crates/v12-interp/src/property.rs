@@ -417,14 +417,28 @@ impl Interp<'_> {
         obj: Handle<JsObject>,
         key_v: JsValue,
     ) -> Option<Result<JsValue, JSException>> {
+        // Only serve the prototype methods when the receiver does not shadow
+        // them with an own property (user `valueOf`/`toString` overrides).
+        if let Some(h) = key_v.as_string() {
+            let shape = self.shape_of(obj);
+            if self
+                .heap
+                .lookup_property(shape, PropKey::from_string(h))
+                .is_some()
+            {
+                return None;
+            }
+        }
         let constant = if self.key_is(key_v, "hasOwnProperty") {
             NativeId::ObjectHasOwnProperty
         } else if self.key_is(key_v, "valueOf") {
             NativeId::ObjectProtoValueOf
         } else if self.key_is(key_v, "toString") {
-            // Functions already handled above; this covers ordinary objects and arrays.
             if self.heap.get(obj).kind == Kind::Function {
                 NativeId::FunctionProtoToString
+            } else if self.heap.get(obj).kind == Kind::Array {
+                // Array.prototype.toString === Array.prototype.join(",")
+                NativeId::ArrayJoin
             } else {
                 NativeId::ObjectProtoToString
             }
