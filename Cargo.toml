@@ -88,3 +88,13 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The test262 runner must survive engine panics: `catch_unwind` in the
+# per-test execution path is the harness's isolation mechanism, which
+# `panic = "abort"` defeats. Runner builds use this profile instead of
+# `release` (`conformance/run.sh`), keeping the abort optimization for
+# everything else.
+[profile.runner]
+inherits = "release"
+panic = "unwind"
+strip = true

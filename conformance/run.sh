@@ -59,5 +59,5 @@ fi
 
 # --- Run -------------------------------------------------------------------
 
-echo "Running: cargo run -r -p test262-runner -- $*" >&2
-exec cargo run -r -p test262-runner -- "$@"
+echo "Running: cargo run --profile runner -p test262-runner -- $*" >&2
+exec cargo run --profile runner -p test262-runner -- "$@"
