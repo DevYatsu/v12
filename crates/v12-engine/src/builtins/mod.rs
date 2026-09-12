@@ -173,6 +173,7 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::ObjectGetOwnPropertyDescriptor => Some(2),
         NativeId::ObjectGetOwnPropertyNames => Some(1),
         NativeId::ObjectGetOwnPropertySymbols => Some(1),
+        NativeId::ObjectProtoPropertyIsEnumerable => Some(1),
         NativeId::ObjectGetPrototypeOf => Some(1),
         NativeId::ObjectHasOwn => Some(2),
         NativeId::ObjectHasOwnProperty => Some(1),
@@ -661,6 +662,7 @@ define_builtins! {
     },
     ObjectProto {
         "hasOwnProperty" (1) => ObjectHasOwnProperty => |heap, this, args| call_ctx(object::object_has_own_property, heap, this, args),
+        "propertyIsEnumerable" (1) => ObjectProtoPropertyIsEnumerable => |heap, this, args| call_ctx(object::object_proto_property_is_enumerable, heap, this, args),
         "toString" (0) => ObjectProtoToString => |heap, this, args| call_ctx(object::object_proto_to_string, heap, this, args),
         "valueOf" (0) => ObjectProtoValueOf => |heap, this, args| call_ctx(object::object_proto_value_of, heap, this, args),
     },

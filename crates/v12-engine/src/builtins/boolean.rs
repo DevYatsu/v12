@@ -20,7 +20,7 @@ pub fn boolean_construct(
     Ok(JsValue::from_bool(truthy))
 }
 
-fn to_boolean(ctx: &Ctx, v: JsValue) -> bool {
+pub(crate) fn to_boolean(ctx: &Ctx, v: JsValue) -> bool {
     if v.is_true() {
         return true;
     }

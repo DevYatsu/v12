@@ -38,6 +38,8 @@ pub enum NativeId {
     ObjectGetOwnPropertyDescriptor = 1021,
     ObjectSetPrototypeOf = 1022,
     ObjectGetOwnPropertySymbols = 1023,
+    /// `Object.prototype.propertyIsEnumerable(key)`.
+    ObjectProtoPropertyIsEnumerable = 1024,
     // Array
     ArrayPush = 1100,
     ArrayPop = 1101,

@@ -167,6 +167,33 @@ pub fn object_has_own_property(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -
     Ok(JsValue::from_bool(found))
 }
 
+/// `Object.prototype.propertyIsEnumerable(key)` – whether `key` is an own
+/// enumerable data property of `this`.
+pub fn object_proto_property_is_enumerable(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let obj = this.as_object().ok_or_else(|| {
+        ctx.type_error("TypeError: Object.prototype.propertyIsEnumerable called on non-object")
+    })?;
+    let key_v = args.first().copied().unwrap_or(JsValue::undefined());
+    let pk = property_key(ctx, key_v).map_err(Throw::Value)?;
+    let shape = ctx.heap.shape_of(obj);
+    let enumerable = match ctx.heap.lookup_property(shape, pk) {
+        Some(desc) if desc.is_data() => {
+            let populated = desc
+                .slot()
+                .and_then(|slot| ctx.heap.get(obj).properties.get(slot as usize))
+                .is_some_and(|v| !v.is_hole());
+            populated && desc.attrs().enumerable()
+        }
+        Some(desc) => desc.attrs().enumerable(),
+        None => false,
+    };
+    Ok(JsValue::from_bool(enumerable))
+}
+
 pub fn object_proto_to_string(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let text = if this.is_object() && ctx.heap.get(this.as_object().unwrap()).kind == v12_heap::Kind::Array { "[object Array]" } else { "[object Object]" };
     Ok(JsValue::string(ctx.heap.intern_text(text)))
