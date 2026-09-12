@@ -3,7 +3,7 @@
 //! exception unwinding.
 
 
-use v12_heap::{Descriptor, Handle, HeapExt, JsObject, JsValue, Kind};
+use v12_heap::{Descriptor, Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 
 use super::{CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH};
 use v12_native::NativeId;
@@ -77,6 +77,26 @@ impl Interp<'_> {
                 let source = self.realm_eval_source(self.stack.get(args_start).copied());
                 let result = self.run_realm_eval(&source, this_v, target_global);
                 return result.map(CallOutcome::Value);
+            }
+            v12_heap::FunctionTarget::Bound(state_h) => {
+                // A bound function: the state object's `elements` are
+                // `[target_fn, this_arg, prefix..]`. Delegate to the inner
+                // target with the bound `this` and the prefix prepended to
+                // the actual arguments, ignoring the passed `this_v` (spec).
+                let (target_fn, this_arg, prefix) = {
+                    let st = self.heap.get(state_h);
+                    let target_fn = st.elements[0].as_object().expect("bound target is an object");
+                    let this_arg = st.elements[1];
+                    let prefix: Vec<JsValue> = st.elements[2..].to_vec();
+                    (target_fn, this_arg, prefix)
+                };
+                let args_start = callee_slot + 2;
+                let args_end = args_start + usize::from(argc);
+                let mut call_args = prefix;
+                call_args.extend_from_slice(&self.stack[args_start..args_end]);
+                return self
+                    .call_object(target_fn, this_arg, &call_args)
+                    .map(CallOutcome::Value);
             }
         };
 
@@ -291,6 +311,21 @@ impl Interp<'_> {
                 let source = self.realm_eval_source(args.first().copied());
                 self.run_realm_eval(&source, this, target_global)
             }
+            v12_heap::FunctionTarget::Bound(state_h) => {
+                // A bound function used as an accessor: delegate to the inner
+                // target with the bound `this` and prefix.
+                let (target_fn, this_arg, prefix) = {
+                    let st = self.heap.get(state_h);
+                    (
+                        st.elements[0].as_object().expect("bound target is an object"),
+                        st.elements[1],
+                        st.elements[2..].to_vec(),
+                    )
+                };
+                let mut call_args = prefix;
+                call_args.extend_from_slice(args);
+                self.call_object(target_fn, this_arg, &call_args)
+            }
             v12_heap::FunctionTarget::Bytecode(fn_idx) => {
                 // A compiled accessor body: push a frame directly (this runs
                 // inside the dispatch loop, so `call_object` — which requires
@@ -389,6 +424,21 @@ impl Interp<'_> {
                 // Cross-realm eval invoked via the inline-call path.
                 let source = self.realm_eval_source(args.first().copied());
                 self.run_realm_eval(&source, this, target_global)
+            }
+            v12_heap::FunctionTarget::Bound(state_h) => {
+                // A bound function invoked via the inline-call path: delegate
+                // to the inner target with the bound `this` and prefix.
+                let (target_fn, this_arg, prefix) = {
+                    let st = self.heap.get(state_h);
+                    (
+                        st.elements[0].as_object().expect("bound target is an object"),
+                        st.elements[1],
+                        st.elements[2..].to_vec(),
+                    )
+                };
+                let mut call_args = prefix;
+                call_args.extend_from_slice(args);
+                self.call_object(target_fn, this_arg, &call_args)
             }
             v12_heap::FunctionTarget::Bytecode(fn_idx) => {
                 // Interpreter-internal natives (generator next/return/throw,
@@ -802,6 +852,23 @@ impl Interp<'_> {
                 let result = self.run_realm_eval(&source, this_v, target_global);
                 return result.map(CallOutcome::Value);
             }
+            v12_heap::FunctionTarget::Bound(state_h) => {
+                // A bound function invoked via call/apply: delegate to the
+                // inner target with the bound `this` and prefix prepended to
+                // the forwarded args (which already came from the args array).
+                let (target_fn, this_arg, prefix) = {
+                    let st = self.heap.get(state_h);
+                    (
+                        st.elements[0].as_object().expect("bound target is an object"),
+                        st.elements[1],
+                        st.elements[2..].to_vec(),
+                    )
+                };
+                let mut call_args = prefix;
+                call_args.extend_from_slice(&args_vec);
+                let result = self.call_object(target_fn, this_arg, &call_args);
+                return result.map(CallOutcome::Value);
+            }
         };
         let callee_funcs = self.functions_for_program(callee_program);
         if (target_idx as usize) >= callee_funcs.len() {
@@ -962,6 +1029,16 @@ impl Interp<'_> {
             }
             v12_heap::FunctionTarget::RealmEval(_) => {
                 // Realm-bound eval functions are not constructors.
+                return Err(JSException(
+                    self.error_value("TypeError: value is not a constructor"),
+                ));
+            }
+            v12_heap::FunctionTarget::Bound(_) => {
+                // A bound function is constructible only if its target is.
+                // The A1 scope treats every bound function as non-constructible
+                // (`new (f.bind(x))()` is rare in the target slice); the full
+                // [[Construct]] forwarding (clear bound `this`, concat prefix,
+                // construct the target) is deferred.
                 return Err(JSException(
                     self.error_value("TypeError: value is not a constructor"),
                 ));
@@ -1218,14 +1295,84 @@ impl Interp<'_> {
                         "TypeError: Function.prototype.bind called on non-function",
                     )));
                 };
-                // Minimal bind: capture target, thisArg and prefix args in a closure-like function.
-                // For step 3b we return a thin bound function that re-dispatches via call_object.
-                // Allocate a bound function object storing target in captured_env? Use native placeholder
-                // and handle via future branch - for now return target (preserves callee is function).
-                // Proper bound semantics require storing state; stub to target keeps tests that only
-                // check `typeof f.bind(x) === 'function'` passing and defers full application.
-                let _ = args;
-                Ok(JsValue::object(target))
+                if self.heap.get(target).kind != Kind::Function {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.bind called on non-function",
+                    )));
+                }
+                // `args[0]` is the bound `this`; `args[1..]` are the bound
+                // prefix arguments. Both are captured in a state object the
+                // bound function's `FunctionTarget::Bound` handle points at.
+                let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
+                let bound_args: Vec<JsValue> =
+                    if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                // GC discipline: root long-lived interpreter state before the
+                // allocation. The bound state is kept reachable by the bound
+                // function's `Bound` target (traced in `FunctionTarget::trace`).
+                self.gc_protect();
+                let mut state = JsObject::default();
+                state.elements.push(JsValue::object(target));
+                state.elements.push(this_arg);
+                state.elements.extend_from_slice(&bound_args);
+                let state_h = self.heap.alloc(state);
+                let bound = self.heap.alloc(JsObject::function(
+                    v12_heap::FunctionTarget::Bound(state_h),
+                    None,
+                ));
+                // Spec: the bound function's `length` is
+                // max(0, target.length - boundArgCount) and its `name` is
+                // `"bound " + target.name`. Read the target's own props
+                // before mutating `bound`; install both as own data props.
+                let (target_len, target_name) = {
+                    let shape = self.shape_of(target);
+                    let len_key = self.heap.intern_text("length");
+                    let target_len = match self.heap.lookup_property(shape, PropKey::from_string(len_key)) {
+                        Some(Descriptor::Data { slot, .. }) => self
+                            .heap
+                            .get(target)
+                            .properties
+                            .get(*slot as usize)
+                            .copied()
+                            .and_then(|v| v.as_smi())
+                            .map_or(0, |n| n.max(0) as usize),
+                        _ => 0,
+                    };
+                    let name_key = self.heap.intern_text("name");
+                    let target_name =
+                        match self.heap.lookup_property(shape, PropKey::from_string(name_key)) {
+                            Some(Descriptor::Data { slot, .. }) => self
+                                .heap
+                                .get(target)
+                                .properties
+                                .get(*slot as usize)
+                                .copied()
+                                .and_then(|v| v.as_string()),
+                            _ => None,
+                        };
+                    (target_len, target_name)
+                };
+                let bound_len = target_len.saturating_sub(bound_args.len());
+                let bound_name = match target_name {
+                    Some(h) => format!("bound {}", self.string_text(h)),
+                    None => "bound".to_string(),
+                };
+                // Park `bound` on the value stack: the two `set_property`
+                // calls below allocate (interning + shape transition) and
+                // `gc_protect` clears/repopulates the root vector.
+                self.stack.push(JsValue::object(bound));
+                self.gc_protect();
+                let len_key = JsValue::string(self.heap.intern_text("length"));
+                let len_v = JsValue::from_i32_smi(bound_len as i32).expect("bound arity fits Smi");
+                let _ = self.set_property(JsValue::object(bound), len_key, len_v);
+                let name_key = JsValue::string(self.heap.intern_text("name"));
+                let name_h = self.heap.intern_text(&bound_name);
+                let _ = self.set_property(
+                    JsValue::object(bound),
+                    name_key,
+                    JsValue::string(name_h),
+                );
+                self.stack.pop();
+                Ok(JsValue::object(bound))
             }
             NativeId::Eval => {
                 // Direct eval: hand the source, shared global, and the

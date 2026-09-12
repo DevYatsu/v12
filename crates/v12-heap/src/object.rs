@@ -765,6 +765,9 @@ impl Trace for JsObject {
         self.elements_array.trace(sink);
         self.prototype.trace(sink);
         self.captured_env.trace(sink);
+        // The callable target can itself carry heap handles (`RealmEval`
+        // global, `Bound` state object); trace it so those stay reachable.
+        self.callable.trace(sink);
         if let Some(m) = &self.private_fields {
             for v in m.values() {
                 v.trace(sink);

@@ -139,6 +139,14 @@ pub enum FunctionTarget {
     /// interpreter's `prepare_call`, which routes it through the eval seam).
     /// The handle must be traced — it keeps the other realm's global alive.
     RealmEval(Handle<JsObject>),
+    /// A bound function (`Function.prototype.bind`): calling it invokes an
+    /// inner target with a fixed `this` and a prepended argument list. The
+    /// handle points at a state object whose `elements` are
+    /// `[target_fn: JsValue, this_arg: JsValue, bound_args..: JsValue]`.
+    /// The handle must be traced — the state object holds the inner function
+    /// and the bound values, which are otherwise unreachable from the bound
+    /// function object.
+    Bound(Handle<JsObject>),
 }
 
 impl std::fmt::Debug for FunctionTarget {
@@ -148,6 +156,7 @@ impl std::fmt::Debug for FunctionTarget {
             FunctionTarget::Native(_) => write!(f, "Native(fn)"),
             FunctionTarget::Host(_) => write!(f, "Host(closure)"),
             FunctionTarget::RealmEval(g) => write!(f, "RealmEval({g:?})"),
+            FunctionTarget::Bound(_) => write!(f, "FunctionTarget::Bound"),
         }
     }
 }
@@ -155,10 +164,16 @@ impl std::fmt::Debug for FunctionTarget {
 impl Trace for FunctionTarget {
     fn trace(&self, sink: &mut MarkSink<'_>) {
         // The captured environment lives in the function object's
-        // `prototype` field, which is traced separately; only RealmEval
-        // carries a heap handle inside the target itself.
-        if let FunctionTarget::RealmEval(global) = self {
-            global.trace(sink);
+        // `prototype` field, which is traced separately; only RealmEval and
+        // Bound carry a heap handle inside the target itself.
+        match self {
+            FunctionTarget::RealmEval(global) => global.trace(sink),
+            FunctionTarget::Bound(state) => {
+                // The state object's `elements` hold the inner function and
+                // bound values; tracing the object marks its element vec.
+                state.trace(sink);
+            }
+            _ => {}
         }
     }
 }

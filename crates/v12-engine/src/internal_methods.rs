@@ -294,7 +294,9 @@ fn ordinary_get(
                             v12_heap::FunctionTarget::Host(c) => {
                                 return c.call(heap, JsValue::object(o), &[]);
                             }
-                            v12_heap::FunctionTarget::Bytecode(_) | v12_heap::FunctionTarget::RealmEval(_) => {
+                            v12_heap::FunctionTarget::Bytecode(_)
+                            | v12_heap::FunctionTarget::RealmEval(_)
+                            | v12_heap::FunctionTarget::Bound(_) => {
                                 return Ok(JsValue::undefined());
                             }
                         }
