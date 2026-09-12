@@ -685,3 +685,26 @@ pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsV
     }
     Ok(arr_v)
 }
+
+/// `Array([length|elem, ...])` – callable/constructible form: one numeric
+/// argument sets the length; otherwise the arguments become the elements.
+pub fn array_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let items: Vec<JsValue> = if args.len() == 1 {
+        let n = args[0].as_smi().map(f64::from).or(args[0].as_f64());
+        match n {
+            Some(len) if len.trunc() == len && (0.0..=4294967295.0).contains(&len) => {
+                let arr = ctx
+                    .heap
+                    .alloc(JsObject::array(vec![JsValue::undefined(); len as usize]));
+                ctx.add_root(JsValue::object(arr));
+                return Ok(JsValue::object(arr));
+            }
+            _ => args.to_vec(),
+        }
+    } else {
+        args.to_vec()
+    };
+    let arr = ctx.heap.alloc(JsObject::array(items));
+    ctx.add_root(JsValue::object(arr));
+    Ok(JsValue::object(arr))
+}

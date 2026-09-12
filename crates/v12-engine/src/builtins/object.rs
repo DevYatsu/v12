@@ -25,6 +25,19 @@ pub fn object_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<
     Ok(JsValue::object(obj))
 }
 
+/// `Object([value])` – callable/constructible form: `undefined`/`null`
+/// produce a fresh ordinary object; a primitive wraps into its kind object
+/// (v1: a plain object carrying the primitive as storage is not modeled, so
+/// primitives return a fresh object); an object passes through.
+pub fn object_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let value = args.first().copied().unwrap_or(JsValue::undefined());
+    if let Some(obj) = value.as_object() {
+        return Ok(JsValue::object(obj));
+    }
+    let obj = ctx.heap.alloc(JsObject::default());
+    Ok(JsValue::object(obj))
+}
+
 /// `Object.getPrototypeOf(obj)` – returns the prototype.
 pub fn object_get_prototype_of(
     ctx: &mut Ctx,

@@ -182,6 +182,8 @@ pub enum NativeId {
     RangeErrorCreate = 1602,
     ReferenceErrorCreate = 1603,
     SyntaxErrorCreate = 1604,
+    ObjectConstruct = 1605,
+    ArrayConstruct = 1606,
     // JSON
     JsonParse = 2600,
     JsonStringify = 2601,

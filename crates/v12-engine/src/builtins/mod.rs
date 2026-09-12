@@ -738,6 +738,8 @@ define_builtins! {
     RangeErrorCreate => |heap, this, args| call_ctx(error::range_error_create, heap, this, args),
     ReferenceErrorCreate => |heap, this, args| call_ctx(error::reference_error_create, heap, this, args),
     SyntaxErrorCreate => |heap, this, args| call_ctx(error::syntax_error_create, heap, this, args),
+    ObjectConstruct => |heap, this, args| call_ctx(object::object_construct, heap, this, args),
+    ArrayConstruct => |heap, this, args| call_ctx(array::array_construct, heap, this, args),
     MapConstruct => |heap, this, args| call_ctx(map::map_construct, heap, this, args),
     MapGet => |heap, this, args| call_ctx(map::map_get, heap, this, args),
     MapSet => |heap, this, args| call_ctx(map::map_set, heap, this, args),

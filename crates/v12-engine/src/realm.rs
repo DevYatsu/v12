@@ -153,6 +153,8 @@ impl Realm {
         }
         // Point the placeholder constructors that are already callable at
         // their native seam (out-of-range bytecode → native registry).
+        wire_callable(heap, &intrinsics, "Object", NativeId::ObjectConstruct);
+        wire_callable(heap, &intrinsics, "Array", NativeId::ArrayConstruct);
         wire_callable(heap, &intrinsics, "String", NativeId::StringConstruct);
         wire_callable(heap, &intrinsics, "Boolean", NativeId::BooleanConstruct);
         wire_callable(heap, &intrinsics, "Map", NativeId::MapConstruct);
