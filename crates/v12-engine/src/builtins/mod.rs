@@ -780,7 +780,6 @@ define_builtins! {
     IteratorSelf => |heap, this, args| call_ctx(iterator::iterator_self, heap, this, args),
     RegExpConstruct => |heap, this, args| call_ctx(regexp::regexp_construct, heap, this, args),
     RegExpToString => |heap, this, args| call_ctx(regexp::regexp_to_string, heap, this, args),
-    ModuleImport => module_import,
     ObjectEnumerableOwnKeys => |heap, this, args| call_ctx(object::object_enumerable_own_keys, heap, this, args),
 }
 
@@ -844,11 +843,15 @@ fn callback_stub(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<J
 /// therefore unreachable from JS and are deleted: a direct
 /// `NativeRegistry::call_native(Eval|Function|ConsoleLog)` now reports "not
 /// registered", which no in-tree caller does.
-fn module_import(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    // Spec shape: `import()` returns a promise. There is no module loader
-    // yet (ModuleMap/resolve/link/evaluate are v1 work-in-progress), so the
-    // promise rejects — `import(x).catch(...)` observes a real rejection
-    // instead of a synchronous throw.
+/// No-loader `ModuleImport` fallback: spec shape (`import()` returns a
+/// promise) with a rejection reason, so `.catch` observes a real rejection.
+/// The loader-equipped path lives in `module_loader::handle_import` and is
+/// intercepted in `NativeRegistry::call_native` before this fallback.
+pub(crate) fn module_import(
+    heap: &mut Heap,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let err = Throw::type_error(heap, "dynamic import: no module loader in this context");
     match err {
         Throw::Value(v) => Ok(promise::make_rejected_promise(heap, v)),

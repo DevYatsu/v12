@@ -309,6 +309,9 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     let exec_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut engine = v12_engine::Engine::new();
         engine.set_deadline(Some(deadline));
+        // Dynamic `import()` and module-file imports resolve relative to the
+        // test file's directory.
+        engine.set_module_base(base_path.to_path_buf());
         // Multi-realm support: `$262.createRealm` (see TEST262_HOST_SHIM)
         // resolves to this host function, which builds a fresh realm on the
         // shared heap. Install failure is impossible on a fresh engine's
@@ -729,6 +732,16 @@ pub fn discover_tests(test262_root: &Path, filter: Option<&str>) -> Vec<PathBuf>
         }
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("js") {
+            continue;
+        }
+        // Test262 convention: `*_FIXTURE.js` files are shared module fixtures
+        // for other tests, not standalone tests (they typically carry no
+        // frontmatter and fail to compile as scripts).
+        if path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.ends_with("_FIXTURE"))
+        {
             continue;
         }
 

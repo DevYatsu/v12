@@ -431,6 +431,14 @@ pub struct Interp<'a> {
     top_result: Option<JsValue>,
     /// Pending async resumes as FIFO microtask queue: (generator, value, is_reject).
     pending_awaits: std::collections::VecDeque<(Handle<JsObject>, JsValue, bool)>,
+    /// Async-function completions awaiting promise settlement:
+    /// (completion promise, value, rejecting).
+    ///
+    /// The interpreter cannot schedule reaction jobs (the job machinery lives
+    /// in the engine), so an async body's completion pushes here and the
+    /// engine's checkpoint drain settles the promise through the full
+    /// capability/reaction path (`promise::settle_async_completion`).
+    pending_settlements: Vec<(Handle<JsObject>, JsValue, bool)>,
     /// Cooperative execution deadline for Test262 conformance runs. When set,
     /// the dispatch loop aborts with a catchable timeout error as soon as the
     /// budget elapses, so a runaway test can never block the harness. `None`
@@ -513,6 +521,7 @@ impl<'a> Interp<'a> {
             symbol_iterator: None,
             top_result: None,
             pending_awaits: std::collections::VecDeque::new(),
+            pending_settlements: Vec::new(),
             deadline: None,
             deadline_ticks: 0,
             deadline_exceeded: false,
@@ -1075,6 +1084,30 @@ impl<'a> Interp<'a> {
         // CallOutcome::Value paths leave the window untouched).
         self.stack.truncate(base);
         result
+    }
+
+    /// Registers a compiled program in the cross-program table and runs its
+    /// main function on this interpreter, returning its completion value.
+    ///
+    /// This is the module-evaluation seam: the engine loads a dependency
+    /// module's bytecode while the importing program's interpreter is live and
+    /// executes the module body through the normal call machinery. The
+    /// registered program id stamps the synthetic main closure, so functions
+    /// exported by the module (closures created inside it) later called from
+    /// any program sharing this interpreter's program table resolve against
+    /// the module's own function/string tables.
+    pub fn call_program_main(
+        &mut self,
+        functions: impl Into<Rc<[FunctionBytecode]>>,
+        strings: impl Into<Rc<[String]>>,
+        main: u32,
+    ) -> Result<JsValue, JSException> {
+        let id = self.register_program(functions, strings);
+        let callee = self
+            .heap
+            .alloc(JsObject::function(v12_heap::FunctionTarget::Bytecode(main), None));
+        self.heap.get_mut(callee).program_id = id;
+        self.call_object(callee, JsValue::undefined(), &[])
     }
 
     fn private_get(
@@ -1711,7 +1744,12 @@ impl<'a> Interp<'a> {
                 } else {
                     self.resume_async(r#gen, resume_val)
                 };
-                let _ = res;
+                if let Err(JSException(e)) = res {
+                    // A resumed async body that throws must *reject* its
+                    // completion promise, not surface the throw to the drain
+                    // driver (spec 27.5.3.6: the error rides the promise).
+                    self.pending_settlements.push((r#gen, e, true));
+                }
             }
         }
         // A deadline can fire *during* the resume above; latch so the drain
@@ -1725,6 +1763,18 @@ impl<'a> Interp<'a> {
     /// True when any async/generator resume is pending.
     pub fn has_pending_awaits(&self) -> bool {
         !self.pending_awaits.is_empty()
+    }
+
+    /// True when async-function completions await promise settlement.
+    pub fn has_pending_settlements(&self) -> bool {
+        !self.pending_settlements.is_empty()
+    }
+
+    /// Takes all queued async-completion settlements: (promise, value,
+    /// rejecting). The engine's checkpoint drain feeds each into the full
+    /// capability/reaction settlement path.
+    pub fn take_pending_settlements(&mut self) -> Vec<(Handle<JsObject>, JsValue, bool)> {
+        std::mem::take(&mut self.pending_settlements)
     }
 
     /// Number of pending async jobs.
@@ -1783,6 +1833,12 @@ impl<'a> Interp<'a> {
         }
         for (g, v, _) in &self.pending_awaits {
             roots.push(JsValue::object(*g));
+            roots.push(*v);
+        }
+        // Async-completion settlements: the promise must survive until the
+        // engine's drain settles it (the value rides along).
+        for (ph, v, _) in &self.pending_settlements {
+            roots.push(JsValue::object(*ph));
             roots.push(*v);
         }
         if let Some(v) = self.top_result {

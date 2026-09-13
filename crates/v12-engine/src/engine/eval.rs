@@ -71,6 +71,10 @@ impl Engine {
         if source.len() > MAX_SOURCE_LEN {
             return Err(EngineError::Host("source too large".into()));
         }
+        // Top-level script: dynamic `import()` resolves against the engine's
+        // module base (the runner points it at the executing file's dir).
+        let base = self.module_base.clone();
+        self.prime_loader(base);
         let global = self.realm.global();
         self.heap.add_root(JsValue::object(global));
         let (program, strings) =
@@ -92,6 +96,28 @@ impl Engine {
             EngineError::Host(msg) => string_value(&mut self.heap, &msg),
             EngineError::Compile(err) => string_value(&mut self.heap, &err.message),
         }
+    }
+
+    /// Constructs the checkpoint interpreter shared by script eval and module
+    /// eval: installs natives (which carry the shared loader/pending state),
+    /// applies JIT hooks, and sets the cooperative deadline.
+    fn make_interp<'a>(
+        heap: &'a mut Heap,
+        global: Handle<JsObject>,
+        functions: Rc<[FunctionBytecode]>,
+        main: u32,
+        strings: Rc<[String]>,
+        natives: Box<dyn v12_interp::NativeRegistry>,
+        deadline: Option<std::time::Instant>,
+    ) -> Interp<'a> {
+        #[cfg(feature = "jit")]
+        let jit_program = Rc::clone(&functions);
+        let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
+        interp.set_natives(natives);
+        #[cfg(feature = "jit")]
+        jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
+        interp.set_deadline(deadline);
+        interp
     }
 
     /// Runs a compiled program in a fresh interpreter borrowing the engine
@@ -127,13 +153,8 @@ impl Engine {
             completion,
             ..
         } = self;
-        #[cfg(feature = "jit")]
-        let jit_program = Rc::clone(&functions);
-        let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
-        interp.set_natives(natives);
-        #[cfg(feature = "jit")]
-        jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
-        interp.set_deadline(deadline);
+        let mut interp =
+            Self::make_interp(heap, global, functions, main, strings, natives, deadline);
         let outcome = interp.run();
         // Drain the single microtask checkpoint against the still-live
         // interpreter: host jobs and async resumes alternate until empty.
@@ -224,10 +245,18 @@ impl Engine {
     }
 
     /// Evaluates `source` as a module with `base` for import resolution.
-    pub fn eval_module_source(&mut self, source: &str, _base: &Path) -> Result<JsValue, JsValue> {
+    ///
+    /// The static import graph is resolved, loaded, and evaluated *before*
+    /// this module's body runs (post-order DFS; see
+    /// [`crate::module_loader`]): each dependency's namespace snapshot lands
+    /// in the shared module map, so the lowered static-import native calls in
+    /// the body answer synchronously. Dynamic `import()` calls inside module
+    /// code go through the loader's promise/job path.
+    pub fn eval_module_source(&mut self, source: &str, base: &Path) -> Result<JsValue, JsValue> {
         if source.len() > MAX_SOURCE_LEN {
             return Err(string_value(&mut self.heap, "RangeError: source too large"));
         }
+        self.prime_loader(base.to_path_buf());
         let global = self.realm.global();
         self.heap.add_root(JsValue::object(global));
         // Compile as module.
@@ -241,43 +270,49 @@ impl Engine {
         let program = module.program;
         let functions: Rc<[FunctionBytecode]> = Rc::from(program.functions.into_boxed_slice());
         let strings: Rc<[String]> = Rc::from(strings.into_boxed_slice());
-        // Install module-aware natives: 254 returns empty namespace.
-        struct ModuleImportNatives {
-            inner: NativeRegistry,
-        }
-        impl v12_interp::NativeRegistry for ModuleImportNatives {
-            fn call_native(
-                &mut self,
-                heap: &mut Heap,
-                this: JsValue,
-                args: &[JsValue],
-                id: NativeId,
-            ) -> Result<JsValue, Throw> {
-                // The module-import seam is the shared `ModuleImport` native
-                // (discriminant 254). Static imports use the result for
-                // property reads only; dynamic `import()` must return a
-                // promise. A rejected promise satisfies both: reads yield
-                // `undefined` bindings (no linking yet) and `import()`
-                // observes a real rejection.
-                if id == NativeId::ModuleImport {
-                    let err = Throw::type_error(
-                        heap,
-                        "dynamic import: no module loader in this context",
-                    );
-                    let reason = match err {
-                        Throw::Value(v) => v,
-                        other => return Err(other),
-                    };
-                    return Ok(promise::make_rejected_promise(heap, reason));
+        self.retained = Some(RetainedProgram {
+            functions: Rc::clone(&functions),
+            main: program.main,
+            strings: Rc::clone(&strings),
+        });
+        let deadline = self.deadline;
+        let natives = Box::new(self.registry.clone());
+        let Engine {
+            heap,
+            jobs,
+            registry,
+            pending,
+            completion,
+            ..
+        } = self;
+        let mut interp =
+            Self::make_interp(heap, global, functions, program.main, strings, natives, deadline);
+        // Pre-evaluate the static import graph on this interpreter (the
+        // dynamic-import path is runtime-driven and does not need it).
+        if let Some(loader) = registry.loader() {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for entry in &module.imports {
+                if seen.insert(entry.specifier.clone()) {
+                    let child = crate::module_loader::resolve_specifier(base, &entry.specifier);
+                    if let Err(reason) =
+                        crate::module_loader::load_and_evaluate(&mut interp, &loader, &child)
+                    {
+                        drop(interp); // releases the `&mut heap` borrow
+                        return Err(reason);
+                    }
                 }
-                self.inner.call_native(heap, this, args, id)
             }
         }
-        let natives = ModuleImportNatives {
-            inner: self.registry.clone(),
-        };
-        self.run_compiled(global, functions, program.main, strings, Box::new(natives))
-            .map_err(|e| self.error_to_value(e))
+        let outcome = interp.run();
+        // Drain the single microtask checkpoint against the still-live
+        // interpreter: host jobs and async resumes alternate until empty.
+        let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
+        *completion = interp.completion_value();
+        drop(interp); // releases the `&mut heap` borrow
+        match outcome {
+            Ok(()) => Ok(completion.unwrap_or_else(JsValue::undefined)),
+            Err(JSException(thrown)) => Err(thrown),
+        }
     }
 
     /// Evaluates a module file at `path`, resolving imports relative to its directory.
@@ -317,6 +352,15 @@ impl Engine {
     ) -> usize {
         let mut count = 0usize;
         loop {
+            // Settle async-function completions queued by the interpreter:
+            // each one settles its completion promise through the full
+            // capability/reaction path (spec 27.7.5.1 / AsyncFunctionAwait).
+            // Reaction jobs join the shared sink and are adopted below.
+            let settlements = interp.take_pending_settlements();
+            count += settlements.len();
+            for (promise, value, rejecting) in settlements {
+                promise::settle_async_completion(interp.heap_mut(), pending, promise, value, rejecting);
+            }
             // Adopt follow-ups enqueued by natives/promises during the last
             // iteration, then run host jobs until the queue is empty.
             let follow_ups = registry.take_pending();
@@ -341,15 +385,21 @@ impl Engine {
             count += resumed;
 
             // Loop ends when neither host jobs nor awaits nor native
-            // follow-ups remain, when the deadline fired mid-drain (remaining
-            // microtask bodies can never complete within the budget; their
-            // `execute` will re-trip the deadline), or when the pass was
-            // quiescent: adopted nothing, drained nothing, resumed nothing —
-            // the only remaining awaits are parked on promises that (without
-            // timers or external resolution) can never settle.
+            // follow-ups nor async settlements remain, when the deadline
+            // fired mid-drain (remaining microtask bodies can never complete
+            // within the budget; their `execute` will re-trip the deadline),
+            // or when the pass was quiescent: adopted nothing, drained
+            // nothing, resumed nothing, settled nothing — the only remaining
+            // awaits are parked on promises that (without timers or external
+            // resolution) can never settle.
             if interp.is_deadline_exceeded()
-                || (jobs.is_empty() && !interp.has_pending_awaits())
-                || (adopted == 0 && drained == 0 && resumed == 0)
+                || (jobs.is_empty()
+                    && !interp.has_pending_awaits()
+                    && !interp.has_pending_settlements())
+                || (adopted == 0
+                    && drained == 0
+                    && resumed == 0
+                    && !interp.has_pending_settlements())
             {
                 break;
             }

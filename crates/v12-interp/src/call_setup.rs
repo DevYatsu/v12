@@ -530,14 +530,15 @@ impl Interp<'_> {
             return Ok(true);
         }
         if let Some(r#gen) = finished.generator {
-            // Async completion: settle stored promise and don't overwrite caller dst (promise already delivered)
-            // Program-aware: the finished frame may belong to an eval program.
+            // Async completion (synchronous path — the resumed path queues in
+            // `resume_generator_nested`): queue the completion promise for
+            // settlement; the engine's checkpoint drain settles it through
+            // the full capability/reaction path so `.then` observers run.
             let is_async = self.is_async_fn_for(finished.fn_idx, finished.program);
             let has_promise_slot = self.heap.get(r#gen).properties.len() > 4;
             if is_async && has_promise_slot {
                 if let Some(ph) = self.heap.get(r#gen).properties[4].as_object() {
-                    self.heap.get_mut(ph).properties[0] = JsValue::from_i32_smi(1).expect("fits");
-                    self.heap.get_mut(ph).properties[1] = result;
+                    self.pending_settlements.push((ph, result, false));
                 }
                 // Prevent Heap::roots leak: promise was roots-pinned at creation/await; after settling
                 // it remains reachable via generator properties[4] until GC, so drop the extra root.

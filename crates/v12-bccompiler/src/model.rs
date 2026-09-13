@@ -57,6 +57,17 @@ pub const MAX_ENV_SLOTS: u16 = 65_535;
 pub const NATIVE_IMPORT_INDEX: u16 = 254;
 pub const NATIVE_IMPORT_INDEX_U32: u32 = NATIVE_IMPORT_INDEX as u32;
 
+/// Hidden global slot capturing `export default <expr>` values.
+///
+/// The expression form of `export default` has no local binding to read in
+/// the module epilogue that assembles the exports object, so lowering stores
+/// the value into this global slot and the epilogue reads it back. The NUL
+/// prefix makes a collision with source-level identifiers impossible, and
+/// sequential module evaluation (one module body runs to completion before
+/// the next starts) means concurrent modules cannot clobber each other's
+/// capture within a synchronous evaluation.
+pub const DEFAULT_EXPORT_GLOBAL: &str = "\u{0}default";
+
 /// Native index for `Object.enumerableOwnKeys` - returns array of own enumerable property keys.
 /// Must match `v12_native::NativeId::ObjectEnumerableOwnKeys` (1003).
 pub const NATIVE_OBJECT_ENUMERABLE_OWN_KEYS: u32 = 1003;

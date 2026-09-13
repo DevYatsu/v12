@@ -29,6 +29,15 @@ pub struct JobCtx<'a, 'b> {
 }
 
 impl<'a, 'b> JobCtx<'a, 'b> {
+    /// Mutable interpreter access for the job.
+    ///
+    /// The module loader's dynamic-import jobs run through this: they
+    /// register the imported module's program on the draining interpreter
+    /// and execute its main via `call_program_main`.
+    pub fn interp_mut(&mut self) -> &mut Interp<'b> {
+        self.interp
+    }
+
     /// Mutable heap access for the job.
     pub fn heap_mut(&mut self) -> &mut Heap {
         self.interp.heap_mut()

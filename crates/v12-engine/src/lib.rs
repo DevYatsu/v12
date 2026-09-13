@@ -10,6 +10,7 @@ pub mod internal_methods;
 #[cfg(feature = "jit")]
 pub mod jit_tier;
 pub mod job_queue;
+pub(crate) mod module_loader;
 pub mod realm;
 pub mod value;
 

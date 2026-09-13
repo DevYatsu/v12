@@ -30,6 +30,10 @@ pub struct NativeRegistry {
     /// object-handle indexes never collide across engines. Single-threaded
     /// engine: an `Rc<RefCell>` (shared via clone), not a lock.
     regex_cache: regexp::RegexCache,
+    /// Module loader state (module map + referrer). Shared with the engine
+    /// and job-side loader driver via clone; `None` disables module loading
+    /// (the `ModuleImport` native then throws, as before the loader existed).
+    loader: Option<crate::module_loader::Loader>,
 }
 
 impl std::fmt::Debug for NativeRegistry {
@@ -82,6 +86,16 @@ impl NativeRegistry {
         self.pending = pending;
     }
 
+    /// Installs the module loader state (shared with the engine-side driver).
+    pub(crate) fn set_loader(&mut self, loader: crate::module_loader::Loader) {
+        self.loader = Some(loader);
+    }
+
+    /// The shared module loader state, if installed.
+    pub(crate) fn loader(&self) -> Option<crate::module_loader::Loader> {
+        self.loader.clone()
+    }
+
     /// Adopted follow-up jobs enqueued by natives since the last checkpoint.
     pub fn take_pending(&self) -> Vec<Job> {
         self.pending.borrow_mut().drain(..).collect()
@@ -103,6 +117,15 @@ impl NativeRegistry {
         // Compile-time table first (stateless builtins).
         if let Some(result) = builtin_dispatch(id, heap, this, args) {
             return result;
+        }
+        if id == NativeId::ModuleImport {
+            if let Some(loader) = self.loader.clone() {
+                let pending = Rc::clone(&self.pending);
+                let global = heap.realm_globals().first().copied();
+                let mut ctx = Ctx::new(heap, global, Some(pending));
+                return crate::module_loader::handle_import(&mut ctx, &loader, args);
+            }
+            return super::module_import(heap, this, args);
         }
         if let Some(handler) = self.handlers.get(&id).copied() {
             // Phase 2 shim: every legacy handler runs through the `Ctx`
@@ -193,6 +216,19 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx =
                     Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
                 string::string_split(&mut ctx, this, args)
+            }
+            // Module import seam: loader-aware when installed (static imports
+            // answer from the module map; dynamic `import()` returns a
+            // promise backed by a load job), otherwise the spec-shaped
+            // rejection fallback.
+            NativeId::ModuleImport => {
+                if let Some(loader) = self.loader.clone() {
+                    let pending = Rc::clone(&self.pending);
+                    let global = heap.realm_globals().first().copied();
+                    let mut ctx = Ctx::new(heap, global, Some(pending));
+                    return crate::module_loader::handle_import(&mut ctx, &loader, args);
+                }
+                super::module_import(heap, this, args)
             }
             // 3. Runtime map (host functions) or "not registered".
             _ => self.dispatch(heap, this, args, id),

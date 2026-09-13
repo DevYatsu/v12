@@ -417,15 +417,25 @@ impl Interp<'_> {
         obj: Handle<JsObject>,
         key_v: JsValue,
     ) -> Option<Result<JsValue, JSException>> {
-        // Only serve the prototype methods when the receiver does not shadow
-        // them with an own property (user `valueOf`/`toString` overrides).
+        // Only serve the prototype methods when neither the receiver nor any
+        // prototype in its chain shadows them with an own property (user
+        // `Array.prototype.toString = …` overrides included).
         if let Some(h) = key_v.as_string() {
-            let shape = self.shape_of(obj);
-            if self
-                .heap
-                .lookup_property(shape, PropKey::from_string(h))
-                .is_some()
-            {
+            let key = PropKey::from_string(h);
+            let mut cursor = Some(obj);
+            let mut shadowed = false;
+            while let Some(cur) = cursor {
+                let (shadow, shape) = {
+                    let o = self.heap.get(cur);
+                    (o.prototype, o.shape)
+                };
+                if self.heap.lookup_property(shape, key).is_some() {
+                    shadowed = true;
+                    break;
+                }
+                cursor = shadow;
+            }
+            if shadowed {
                 return None;
             }
         }

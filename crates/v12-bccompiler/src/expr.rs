@@ -402,16 +402,30 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(dst)
             }
             Expression::ImportExpression(i) => {
-                // Dynamic import: desugar to a call to the native import helper
-                // import(source) -> native_import(source)
+                // Dynamic import: desugar to `import('' + specifier, dyn)`.
+                // The ToString conversion rides the Add path, which routes
+                // through the interpreter's ToPrimitive — user `valueOf`/
+                // `toString` hooks on the specifier therefore work (a native
+                // cannot re-enter the interpreter, so the conversion must not
+                // happen inside the loader). The trailing argument marks the
+                // call dynamic — static imports (lowered in `unit.rs`) call
+                // the same native with argc=1 and expect the namespace object
+                // synchronously, while dynamic `import()` must return a
+                // promise.
                 let src = self.expr(&i.source)?;
+                let empty = self.new_temp();
+                self.load_str(empty, "", i.span)?;
+                let stringed = self.new_temp();
+                self.emit_reg3(Opcode::Add, stringed, empty, src, i.span);
+
                 let dst = self.new_temp();
-                let block = self.new_temps(crate::model::CALL_HEADER_REGS + 1);
+                let block = self.new_temps(crate::model::CALL_HEADER_REGS + 2);
                 let callee = block;
                 self.emit_closure(callee, crate::model::NATIVE_IMPORT_INDEX, i.span);
                 self.load_undefined(callee + 1, i.span);
-                self.move_reg(callee + 2, src, i.span);
-                self.emit_call(callee, callee, 1, i.span);
+                self.move_reg(callee + 2, stringed, i.span);
+                self.load_undefined(callee + 3, i.span);
+                self.emit_call(callee, callee, 2, i.span);
                 self.move_reg(dst, callee, i.span);
                 Ok(dst)
             }

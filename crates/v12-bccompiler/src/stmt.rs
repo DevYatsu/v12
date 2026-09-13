@@ -218,10 +218,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     Kind::TSInterfaceDeclaration(_) => Ok(()),
                     _ => {
                         if let Some(expr) = d.declaration.as_expression() {
-                            // `export default expr` evaluates the expression
-                            // but discards it (module evaluation has no
-                            // completion value).
-                            self.expr(expr)?;
+                            // `export default expr`: evaluate and capture the
+                            // value in the hidden default-export slot so the
+                            // module epilogue can read it into the exports
+                            // object (see `model::DEFAULT_EXPORT_GLOBAL`).
+                            let v = self.expr(expr)?;
+                            let name_id = crate::model::str_id_of(
+                                self.comp
+                                    .strings
+                                    .get_or_intern(crate::model::DEFAULT_EXPORT_GLOBAL),
+                            );
+                            self.emit_set_global(name_id, v, d.span);
                         }
                         Ok(())
                     }

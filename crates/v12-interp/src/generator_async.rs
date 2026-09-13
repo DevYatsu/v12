@@ -418,6 +418,15 @@ impl Interp<'_> {
                     if done_val != 1.0 && self.heap.get(r#gen).properties.len() >= 3 {
                         self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
                     }
+                    // Async-function completion on the resume path: queue the
+                    // completion promise for settlement (the engine drain
+                    // runs its reactions — see `pending_settlements`).
+                    if self.is_async_fn_for(fn_idx, gen_program)
+                        && let Some(ph) =
+                            self.heap.get(r#gen).properties.get(4).and_then(|v| v.as_object())
+                    {
+                        self.pending_settlements.push((ph, ret, false));
+                    }
                     Ok(Some(ret))
                 }
             }

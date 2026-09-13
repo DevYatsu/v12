@@ -195,11 +195,18 @@ pub fn compile_unit(
                 cx.last_expr_reg = Some(dst);
             }
             cx.stmt_list(&p.body)?;
-            // Spec-compliant script completion: the value of the
-            // last expression statement is the script's completion. Emit it
-            // as an explicit `Return` so the interpreter's bottom-frame
-            // completion captures it (`eval("1+1")` → 2).
-            if let Some(reg) = cx.last_expr_reg {
+            let is_module = cx.comp.plans.is_module;
+            if is_module {
+                // Module completion: the exports object. The engine's loader
+                // takes the module main's completion value as the namespace
+                // snapshot, so the epilogue materializes one object carrying
+                // every exported binding and returns it.
+                emit_exports_epilogue(&mut cx)?;
+            } else if let Some(reg) = cx.last_expr_reg {
+                // Spec-compliant script completion: the value of the
+                // last expression statement is the script's completion. Emit it
+                // as an explicit `Return` so the interpreter's bottom-frame
+                // completion captures it (`eval("1+1")` → 2).
                 cx.emit_reg1(
                     Opcode::Return,
                     reg,
@@ -403,8 +410,49 @@ fn emit_prologue(
     Ok(())
 }
 
-fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {
-    use std::collections::{HashMap, HashSet};
+/// Emits the module epilogue: materialize the exports object and return it.
+///
+/// Named exports read their local binding (register/env/global access —
+/// whatever `collect` assigned); `export default <expr>` reads the hidden
+/// capture slot written by the declaration lowering
+/// ([`crate::model::DEFAULT_EXPORT_GLOBAL`]); re-exports (`export ... from`)
+/// are skipped (their linkage is not modeled yet). The returned object is the
+/// module's completion value and doubles as its namespace snapshot in the
+/// engine's loader.
+fn emit_exports_epilogue(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {
+    let exports = cx.comp.plans.exports.clone();
+    let span = oxc_span::Span::default();
+    let obj = cx.new_temp();
+    cx.emit_reg3(Opcode::NewObject, obj, 0, 0, span);
+    for e in &exports {
+        if e.specifier.is_some() {
+            continue;
+        }
+        let value = if let Some(sym) = e.local {
+            let access = cx.access(sym);
+            let dst = cx.new_temp();
+            cx.read_access(access, dst, span);
+            dst
+        } else if e.exported == "default" {
+            let name_id = crate::model::str_id_of(
+                cx.comp
+                    .strings
+                    .get_or_intern(crate::model::DEFAULT_EXPORT_GLOBAL),
+            );
+            let dst = cx.new_temp();
+            cx.emit_get_global(dst, name_id, span);
+            dst
+        } else {
+            continue;
+        };
+        let key = cx.load_str_key(&e.exported, span)?;
+        cx.emit_reg3(Opcode::SetProperty, obj, key, value, span);
+    }
+    cx.emit_reg1(Opcode::Return, obj, span);
+    Ok(())
+}
+
+fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {    use std::collections::{HashMap, HashSet};
 
     if cx.comp.plans.imports.is_empty() {
         return Ok(());

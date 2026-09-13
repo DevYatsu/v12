@@ -34,11 +34,11 @@ use crate::job_queue::{Job, JobCtx};
 use v12_interp::JSException;
 
 /// `[[State]]`: pending.
-const STATE_PENDING: i32 = 0;
+pub(crate) const STATE_PENDING: i32 = 0;
 /// `[[State]]`: fulfilled.
-const STATE_FULFILLED: i32 = 1;
+pub(crate) const STATE_FULFILLED: i32 = 1;
 /// `[[State]]`: rejected.
-const STATE_REJECTED: i32 = 2;
+pub(crate) const STATE_REJECTED: i32 = 2;
 
 /// Number of internal slots a promise object carries.
 const PROMISE_SLOTS: usize = 3;
@@ -127,6 +127,16 @@ pub fn promise_reject(
 /// recognizes promises structurally, so `.then`/`.catch` still work.
 pub(crate) fn make_rejected_promise(heap: &mut Heap, reason: JsValue) -> JsValue {
     JsValue::object(create_promise(heap, None, STATE_REJECTED, reason))
+}
+
+/// A rooted pending promise carrying `prototype` as its `[[Prototype]]` —
+/// used by the dynamic-import path so `Object.getPrototypeOf(p)` observes
+/// `Promise.prototype` (ImportCall step 4: `NewPromiseCapability(%Promise%)`).
+pub(crate) fn make_pending_promise(
+    heap: &mut Heap,
+    prototype: Option<v12_heap::Handle<JsObject>>,
+) -> v12_heap::Handle<JsObject> {
+    create_promise(heap, prototype, STATE_PENDING, JsValue::undefined())
 }
 
 /// `Promise.prototype.then(on_fulfilled, on_rejected)`.
@@ -298,8 +308,9 @@ fn drain_reaction_jobs(
 
 /// Settles `promise` with `state`/`value` and schedules one job per queued
 /// reaction record (microtask checkpoint semantics: the jobs join the
-/// current drain via `ctx.enqueue`).
-fn settle(
+/// current drain via `ctx.enqueue`). Also used by the module loader's
+/// dynamic-import load jobs.
+pub(crate) fn settle(
     ctx: &mut JobCtx<'_, '_>,
     promise: v12_heap::Handle<JsObject>,
     state: i32,
@@ -416,62 +427,14 @@ pub fn promise_construct(
     let promise = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
     let promise_v = JsValue::object(promise);
 
+    let pending: Rc<RefCell<Vec<Job>>> = ctx.pending.clone().unwrap_or_default();
+
     // Capability: the resolve/reject function objects handed to the executor.
     // They are ordinary function objects whose targets are host closures
     // capturing the shared pending-jobs sink — host closures cannot touch the
     // interpreter, so reaction settling they trigger joins the same sink
     // `Promise#then` on a settled promise uses.
-    let alloc_capability = |heap: &mut Heap| -> v12_heap::Handle<JsObject> {
-        // Placeholder target replaced with the host closure after both
-        // capability objects exist (each closure needs both handles).
-        let func = heap.alloc(JsObject::function(
-            v12_heap::FunctionTarget::Bytecode(u32::MAX),
-            None,
-        ));
-        heap.add_root(JsValue::object(func));
-        func
-    };
-    let resolve_obj = alloc_capability(ctx.heap);
-    let reject_obj = alloc_capability(ctx.heap);
-    let resolve_v = JsValue::object(resolve_obj);
-    let reject_v = JsValue::object(reject_obj);
-    let pending: Rc<RefCell<Vec<Job>>> = ctx.pending.clone().unwrap_or_default();
-
-    let sink = Rc::clone(&pending);
-    let p = promise_v;
-    let rv = resolve_v;
-    let jv = reject_v;
-    let resolve_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
-        let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-        capability_settle(
-            heap,
-            &sink,
-            p.as_object().expect("capability promise is rooted"),
-            rv,
-            jv,
-            value,
-            false,
-        )
-    });
-    ctx.heap.get_mut(resolve_obj).callable = v12_heap::FunctionTarget::Host(resolve_closure);
-
-    let sink = Rc::clone(&pending);
-    let p = promise_v;
-    let rv = resolve_v;
-    let jv = reject_v;
-    let reject_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
-        let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
-        capability_settle(
-            heap,
-            &sink,
-            p.as_object().expect("capability promise is rooted"),
-            rv,
-            jv,
-            reason,
-            true,
-        )
-    });
-    ctx.heap.get_mut(reject_obj).callable = v12_heap::FunctionTarget::Host(reject_closure);
+    let (resolve_v, reject_v) = make_capability(ctx.heap, &pending, promise);
 
     // The executor joins the pending sink: it runs at the next checkpoint
     // (see the divergence note above). A throw from the executor rejects the
@@ -479,6 +442,9 @@ pub fn promise_construct(
     ctx.heap.add_root(executor);
     let executor_obj = executor.as_object().expect("checked above");
     let sink = Rc::clone(&pending);
+    let p = promise;
+    let rv = resolve_v;
+    let jv = reject_v;
     pending.borrow_mut().push(Box::new(move |ctx: &mut JobCtx<'_, '_>| {
         match ctx.call_object(executor_obj, JsValue::undefined(), &[resolve_v, reject_v]) {
             Ok(_) => {}
@@ -486,9 +452,9 @@ pub fn promise_construct(
                 let _ = capability_settle(
                     ctx.heap_mut(),
                     &sink,
-                    promise,
-                    resolve_v,
-                    reject_v,
+                    p,
+                    rv,
+                    jv,
                     e,
                     true,
                 );
@@ -496,6 +462,90 @@ pub fn promise_construct(
         }
     }));
     Ok(promise_v)
+}
+
+/// Builds the `[[Resolve]]`/`[[Reject]]` capability pair for `promise`:
+/// two rooted function objects whose host closures settle `promise` through
+/// [`capability_settle`], scheduling derived reactions on `sink`.
+pub(crate) fn make_capability(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+) -> (JsValue, JsValue) {
+    // Placeholder target replaced with the host closure after both
+    // capability objects exist (each closure needs both handles).
+    let alloc_capability = |heap: &mut Heap| -> v12_heap::Handle<JsObject> {
+        let func = heap.alloc(JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(u32::MAX),
+            None,
+        ));
+        heap.add_root(JsValue::object(func));
+        func
+    };
+    let resolve_obj = alloc_capability(heap);
+    let reject_obj = alloc_capability(heap);
+    let resolve_v = JsValue::object(resolve_obj);
+    let reject_v = JsValue::object(reject_obj);
+
+    let sink1 = Rc::clone(sink);
+    let p = promise;
+    let rv = resolve_v;
+    let jv = reject_v;
+    let resolve_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
+        let value = args.first().copied().unwrap_or_else(JsValue::undefined);
+        capability_settle(
+            heap,
+            &sink1,
+            p,
+            rv,
+            jv,
+            value,
+            false,
+        )
+    });
+    heap.get_mut(resolve_obj).callable = v12_heap::FunctionTarget::Host(resolve_closure);
+
+    let sink2 = Rc::clone(sink);
+    let p = promise;
+    let rv = resolve_v;
+    let jv = reject_v;
+    let reject_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
+        let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
+        capability_settle(
+            heap,
+            &sink2,
+            p,
+            rv,
+            jv,
+            reason,
+            true,
+        )
+    });
+    heap.get_mut(reject_obj).callable = v12_heap::FunctionTarget::Host(reject_closure);
+    (resolve_v, reject_v)
+}
+
+/// Settles an async function's completion promise and runs its reactions as
+/// jobs on `sink`.
+///
+/// The interpreter cannot build job closures (they live in this crate), so
+/// async-body completion pushes a settlement onto the interpreter's
+/// pending-settlements queue and the engine's checkpoint drain routes it
+/// here. First settlement wins (no-op once settled); a promise value is
+/// adopted through the normal capability path.
+pub(crate) fn settle_async_completion(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+    value: JsValue,
+    rejecting: bool,
+) {
+    let still_pending = heap.get(promise).properties[0].as_smi() == Some(STATE_PENDING);
+    if !still_pending {
+        return;
+    }
+    let (resolve_v, reject_v) = make_capability(heap, sink, promise);
+    let _ = capability_settle(heap, sink, promise, resolve_v, reject_v, value, rejecting);
 }
 
 /// `Promise.prototype.catch(on_rejected)`: `then(undefined, on_rejected)`.

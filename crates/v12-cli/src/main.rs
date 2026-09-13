@@ -208,6 +208,12 @@ fn run_script(path: &str, disasm: bool, expose_gc: bool) -> i32 {
     if expose_gc {
         engine.heap_mut().gc_stress(Some(1));
     }
+    // `import()` specifiers resolve relative to the script's directory.
+    let base = std::path::Path::new(path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    engine.set_module_base(base);
 
     match engine.eval(&source) {
         Ok(value) => {

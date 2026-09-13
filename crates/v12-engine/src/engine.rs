@@ -19,7 +19,7 @@ use crate::realm::Realm;
 
 /// Interns `text` in the heap and wraps it as a string `JsValue` — the shape
 /// of every compile/host error result in this file.
-fn string_value(heap: &mut Heap, text: &str) -> JsValue {
+pub(crate) fn string_value(heap: &mut Heap, text: &str) -> JsValue {
     JsValue::string(heap.intern_text(text))
 }
 
@@ -68,6 +68,10 @@ pub struct Engine {
     /// own budgeting); the Test262 runner sets a per-test budget so a runaway
     /// loop cannot stall the harness.
     deadline: Option<Instant>,
+    /// Directory dynamic/static imports resolve against when the executing
+    /// program is the top-level script (the module loader referrers to this;
+    /// the Test262 runner points it at the test file's directory).
+    module_base: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for Engine {
@@ -92,6 +96,9 @@ impl Engine {
         let pending: Rc<RefCell<Vec<Job>>> = Rc::new(RefCell::new(Vec::new()));
         let mut registry = NativeRegistry::new();
         registry.set_pending(Rc::clone(&pending));
+        registry.set_loader(Rc::new(RefCell::new(
+            crate::module_loader::LoaderState::default(),
+        )));
         Self {
             heap,
             realm,
@@ -102,6 +109,23 @@ impl Engine {
             completion: None,
             tier_policy: v12_codegen::TierPolicy::default(),
             deadline: None,
+            module_base: std::path::PathBuf::new(),
+        }
+    }
+
+    /// Points the module loader's referrer at `base` for the next top-level
+    /// program: `import()` specifiers resolve relative to it.
+    pub fn set_module_base(&mut self, base: std::path::PathBuf) {
+        self.module_base = base;
+    }
+
+    /// Applies `module_base` to the shared loader state (call before each
+    /// top-level run so the `ModuleImport` native resolves against it).
+    pub(crate) fn prime_loader(&mut self, base: std::path::PathBuf) {
+        if let Some(loader) = self.registry.loader() {
+            let mut s = loader.borrow_mut();
+            s.base = base.clone();
+            s.referrer = base;
         }
     }
 
@@ -572,13 +596,24 @@ mod tests {
         let src = "export const x = 42;";
         let result = engine.eval_module(src);
         assert!(result.is_ok(), "module should evaluate: {:?}", result);
-        // Module with import (dummy handler returns empty namespace).
-        let src2 = "import {x} from \"./dummy.js\"; export const y = 1;";
-        let result2 = engine.eval_module(src2);
+        // Module with a real file-based import: the loader resolves the
+        // specifier against `base`, loads/evaluates the dependency first,
+        // and answers the lowered static-import call with its namespace.
+        let dir = std::env::temp_dir().join("v12_module_import_test");
+        std::fs::create_dir_all(&dir).expect("create temp module dir");
+        let dep = dir.join("v12_dep.js");
+        std::fs::write(&dep, "export const x = 42; export default 7;").expect("write dep");
+        let main = dir.join("v12_main.js");
+        std::fs::write(
+            &main,
+            "import { x } from './v12_dep.js'; import dflt from './v12_dep.js'; export const y = x + dflt;",
+        )
+        .expect("write main");
+        let result2 = engine.eval_module_file(&main);
         assert!(
             result2.is_ok(),
-            "module with import should not panic: {:?}",
-            result2
+            "module with import should evaluate: {:?}",
+            result2.map(|v| engine.to_display_string(v))
         );
     }
 
