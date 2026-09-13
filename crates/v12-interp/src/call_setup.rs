@@ -155,8 +155,14 @@ impl Interp<'_> {
 
         // Generator function: calling it returns a generator object without executing body.
         if self.is_generator_fn_for(target_idx, callee_program) {
-            let r#gen =
-                self.create_generator_object(target_idx, captured_env, this_v, callee_slot, argc)?;
+            let r#gen = self.create_generator_object(
+                target_idx,
+                callee_program,
+                captured_env,
+                this_v,
+                callee_slot,
+                argc,
+            )?;
             return Ok(CallOutcome::Value(JsValue::object(r#gen)));
         }
 
@@ -697,20 +703,22 @@ impl Interp<'_> {
                     .map(|h| (h.target, h.stack_depth))
             });
             if let Some((target, stack_depth)) = covering {
-                let fr = self.frames.last_mut().expect("a frame was just inspected");
                 // Truncate the register window to the handler depth, then
                 // deliver the exception into register `stack_depth`. The
                 // stack must be restored to the full register window so
                 // handler temporaries beyond the delivery register remain
                 // addressable.
-                let base = fr.base;
-                let depth = stack_depth as usize;
-                let max_regs = fr.max_regs as usize;
+                let (base, depth, max_regs) = {
+                    let fr = self.frames.last_mut().expect("a frame was just inspected");
+                    (fr.base, stack_depth as usize, fr.max_regs as usize)
+                };
                 self.stack.truncate(base + depth);
                 self.stack.push(exc);
                 self.stack.resize(base + max_regs, JsValue::undefined());
                 self.stack[base + depth] = exc;
-                fr.pc = target as usize;
+                if let Some(fr) = self.frames.last_mut() {
+                    fr.pc = target as usize;
+                }
                 return Ok(());
             }
             // Never pop the frame `stop_at_frames` names — it belongs to the

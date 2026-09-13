@@ -622,10 +622,15 @@ impl Interp<'_> {
                     let key_v = self.stack[base + usize::from(rb)];
                     let value = self.stack[base + usize::from(rc)];
                     // Guard: null/undefined base throws TypeError per ES 9.1.9 / 13.14.3.
+                    // Thrown through the unwind path (not a bare `return Err`):
+                    // a bare return escapes `execute` leaving this frame live,
+                    // and callers that truncate the stack afterwards then
+                    // corrupt the machine (the register-window OOB class).
                     if obj_v.is_null() || obj_v.is_undefined() {
-                        return Err(JSException(self.error_value(
+                        let exc = self.error_value(
                             "TypeError: cannot set properties of null or undefined",
-                        )));
+                        );
+                        throw_js!(exc);
                     }
                     self.gc_protect();
                     attempt!(self.set_property(obj_v, key_v, value));
@@ -843,9 +848,10 @@ impl Interp<'_> {
                     if let Some(global) = self.global {
                         let global_v = JsValue::object(global);
                         if global_v.is_null() || global_v.is_undefined() {
-                            return Err(JSException(self.error_value(
+                            let exc = self.error_value(
                                 "TypeError: cannot set properties of null or undefined",
-                            )));
+                            );
+                            throw_js!(exc);
                         }
                     }
                     attempt!(self.op_set_global(const_id, val, program));
@@ -911,9 +917,8 @@ impl Interp<'_> {
                         .copied()
                         .unwrap_or(JsValue::undefined());
                     if self.frames.last().and_then(|f| f.generator).is_none() {
-                        return Err(JSException(
-                            self.error_value("SyntaxError: yield outside generator"),
-                        ));
+                        let exc = self.error_value("SyntaxError: yield outside generator");
+                        throw_js!(exc);
                     }
                     let resume_pc = pc + op_width;
                     self.suspend(dst, yielded, resume_pc)?;
@@ -929,16 +934,28 @@ impl Interp<'_> {
                         .get(base + usize::from(src))
                         .copied()
                         .unwrap_or(JsValue::undefined());
-                    let Some(frame) = self.frames.last() else {
-                        return Err(JSException(
-                            self.error_value("SyntaxError: await outside async"),
-                        ));
+                    // Both guards throw through the unwind path: a bare
+                    // `return Err` would escape `execute` leaving this frame
+                    // live, and a caller that then truncates the stack (e.g.
+                    // `call_object`) corrupts every later resume (the
+                    // register-window OOB class). Top-level await in a module
+                    // main hits the second guard until module mains compile
+                    // as async functions.
+                    if self
+                        .frames
+                        .last()
+                        .and_then(|f| f.generator)
+                        .is_none()
+                    {
+                        let exc = self.error_value("SyntaxError: await outside async");
+                        throw_js!(exc);
                     };
-                    let Some(r#gen) = frame.generator else {
-                        return Err(JSException(
-                            self.error_value("SyntaxError: await outside async"),
-                        ));
-                    };
+                    let r#gen = self
+                        .frames
+                        .last()
+                        .and_then(|f| f.generator)
+                        .expect("generator checked above");
+                    let fn_idx_of_frame = fn_idx;
                     // Async *functions* park their caller at the async-call
                     // header (the caller-advance below delivers the return
                     // promise there). Async *generators* resume through
@@ -946,9 +963,9 @@ impl Interp<'_> {
                     // the body frame, the frame below is NOT parked at a
                     // call, so decoding one there corrupts the caller's pc.
                     let frame_is_async_fn = {
-                        let funcs = self.functions_for_program(frame.program);
+                        let funcs = self.functions_for_program(fn_idx_of_frame);
                         funcs
-                            .get(frame.fn_idx as usize)
+                            .get(fn_idx_of_frame as usize)
                             .is_some_and(|f| f.is_async && !f.is_generator)
                     };
                     let async_promise = if self.heap.get(r#gen).properties.len() > 4 {
@@ -1155,3 +1172,4 @@ impl Interp<'_> {
     // Calls
     // ------------------------------------------------------------------
 }
+

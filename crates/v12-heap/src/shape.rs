@@ -547,23 +547,19 @@ impl Shape {
         Shape::default()
     }
 
-    /// Chain-aware property lookup: scans this shape's descriptors, then
-    /// walks parent links until found or the root is passed. Iterative by
-    /// construction — transition chains get as deep as object literals are
-    /// long, and native recursion over them would cost stack.
-    pub fn find_descriptor<'a>(
-        &'a self,
-        store: &'a [Shape],
-        key: PropKey,
-    ) -> Option<&'a Descriptor> {
-        let mut current = self;
-        loop {
-            if let Some(descriptor) = current.descriptors.find(key) {
-                return Some(descriptor);
-            }
-            let parent = current.parent?;
-            current = store.get(parent.index() as usize)?;
-        }
+    /// Property lookup over this shape's descriptors alone.
+    ///
+    /// Every way a shape comes into existence ([`crate::Heap::add_property`],
+    /// [`crate::Heap::update_data_attrs`], [`crate::Heap::define_accessor`])
+    /// derives its descriptor list from its parent's full list, and
+    /// descriptors are never removed — so a shape's own list already names
+    /// every property on its parent chain. The historical parent walk was
+    /// therefore pure redundancy, and worse: since each node repeats the whole
+    /// ancestor list, a miss re-scanned the same keys once per ancestor
+    /// (cubic in chain depth). A single scan of `self.descriptors` is
+    /// equivalent and linear.
+    pub fn find_descriptor<'a>(&'a self, key: PropKey) -> Option<&'a Descriptor> {
+        self.descriptors.find(key)
     }
 }
 

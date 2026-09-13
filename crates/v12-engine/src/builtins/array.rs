@@ -19,65 +19,164 @@ fn length_prop(heap: &mut Heap) -> v12_heap::PropKey {
     v12_heap::PropKey::from_string(h)
 }
 
+/// ES ToLength on a length-property value: NaN → 0, truncate, clamp to
+/// [0, 2^53-1]. The receiver's length is *not* a u32 quantity — array-like
+/// objects legally carry `length` up to 2^53-1, and a saturating u32 cast
+/// (`4294967296 as u32` → 4294967295) sent pop/push writing at index
+/// 2^32-2, which a flat element store answered with a multi-GB resize.
+fn to_length(v: JsValue) -> f64 {
+    let n = v
+        .as_smi()
+        .map(f64::from)
+        .or_else(|| v.as_f64())
+        .unwrap_or(f64::NAN);
+    if n.is_nan() {
+        return 0.0;
+    }
+    n.trunc().clamp(0.0, 9007199254740991.0)
+}
+
+/// The receiver's `length` (array-layout slot for arrays, shape property for
+/// generic receivers), through ToLength; falls back to the element store.
+fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> f64 {
+    let key = length_prop(heap);
+    // Look up through the object's own shape: a shape-bound array (literal,
+    // rest param, or the sparse `new Array(len)` form) has a `root
+    // --length--> child` chain whose descriptor names the length slot.
+    // Starting from the root shape would only walk *up* the chain and miss
+    // it. Unbound arrays fall back to the element store length, which
+    // matches their `length` because they are always created dense.
+    let shape = heap.shape_of(obj);
+    if let Some(desc) = heap.lookup_property(shape, key)
+        && let Some(slot) = desc.slot()
+    {
+        let v = heap
+            .get(obj)
+            .properties
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(JsValue::undefined());
+        if !v.is_undefined() {
+            return to_length(v);
+        }
+    }
+    // Fallback to elements length.
+    heap.get(obj).element_len() as f64
+}
+
 /// `Array.prototype.push(...items)` – appends elements and updates `length`.
 pub fn array_push(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.push", None)?;
     let len = array_length(&mut *ctx.heap, obj);
-    if len as usize + args.len() > MAX_ARRAY_LENGTH as usize {
+    if len + args.len() as f64 > f64::from(MAX_ARRAY_LENGTH) {
         return Err(ctx.range_error("RangeError: invalid array length"));
     }
     let heap = &mut *ctx.heap;
-    for &item in args {
-        heap.get_mut(obj).push_element(item);
+    // Index by the `length` property, not the element store end: for a
+    // sparse array (`new Array(len)`) the store is shorter than `length`,
+    // and spec places appended items at `length`-based indices. Indices
+    // beyond the element-store range (length > 2^32-2 cannot live in the
+    // store) skip the store write; the length property still records them.
+    for (i, &item) in args.iter().enumerate() {
+        let idx = len + i as f64;
+        if idx <= f64::from(MAX_ARRAY_LENGTH - 1) {
+            heap.get_mut(obj).set_element(idx as u32, item);
+        }
     }
-    let new_len = heap.get(obj).element_len() as u32;
+    let new_len = len + args.len() as f64;
     sync_length(heap, obj, new_len);
-    Ok(helpers::smi_or_f64(i64::from(new_len)))
+    Ok(helpers::smi_or_f64(new_len as i64))
+}
+
+/// Reads the receiver's element at `last` (f64: may exceed the element-store
+/// index range, in which case only a string-keyed shape property can hold
+/// it). Holes and absent indices read as `undefined`.
+fn pop_read(heap: &mut Heap, obj: Handle<JsObject>, last: f64) -> JsValue {
+    let generic_read = |heap: &mut Heap, key_text: &str| -> Option<JsValue> {
+        let h = heap.intern_string(V12Str::latin1(key_text.as_bytes().to_vec()));
+        let key = v12_heap::PropKey::from_string(h);
+        let shape = heap.shape_of(obj);
+        let slot = heap.lookup_property(shape, key)?.slot()?;
+        heap.get(obj).properties.get(slot as usize).copied()
+    };
+    if last <= f64::from(MAX_ARRAY_LENGTH - 1) {
+        let idx = last as u32;
+        if heap.get(obj).kind == v12_heap::Kind::Array {
+            return heap
+                .get(obj)
+                .get_element(idx)
+                .filter(|v| !v.is_hole())
+                .unwrap_or(JsValue::undefined());
+        }
+        // Generic receiver: flat store first, then shape-bound digit key.
+        if let Some(v) = heap
+            .get(obj)
+            .elements
+            .get(idx as usize)
+            .filter(|v| !v.is_hole())
+            .copied()
+        {
+            return v;
+        }
+        return generic_read(heap, &idx.to_string()).unwrap_or(JsValue::undefined());
+    }
+    generic_read(heap, &format!("{last:.0}")).unwrap_or(JsValue::undefined())
+}
+
+/// Removes the receiver's element at `last` (pop's DeletePropertyOrThrow):
+/// real arrays truncate/hole their lattice store; generic receivers hole the
+/// flat slot or the shape-bound digit-key slot. Absent indices are no-ops.
+fn pop_delete(heap: &mut Heap, obj: Handle<JsObject>, last: f64) {
+    if last > f64::from(MAX_ARRAY_LENGTH - 1) {
+        return; // beyond the element-store range: nothing stored to remove
+    }
+    let idx = last as u32;
+    if heap.get(obj).kind == v12_heap::Kind::Array {
+        // Dense store aligned with `length`: truncate it. Store longer than
+        // `length` (out-of-sync writes): mark the slot absent. Sparse (store
+        // shorter): the index is already absent — writing a hole at a far
+        // index would materialize the gap (dictionary escape) for nothing.
+        // Dense store aligned with `length` (store end == last + 1): truncate
+        // it. Store longer than `length` (out-of-sync writes): mark the slot
+        // absent. Sparse (store shorter): the index is already absent —
+        // writing a hole at a far index would materialize the gap (dictionary
+        // escape) for nothing.
+        let elen = heap.get(obj).element_len();
+        if elen == last as usize + 1 {
+            heap.get_mut(obj).pop_element();
+        } else if (idx as usize) < elen {
+            heap.get_mut(obj).set_element(idx, JsValue::hole());
+        }
+        return;
+    }
+    if let Some(slot) = heap.get_mut(obj).elements.get_mut(idx as usize) {
+        *slot = JsValue::hole();
+    }
+    let h = heap.intern_string(V12Str::latin1(idx.to_string().as_bytes().to_vec()));
+    let key = v12_heap::PropKey::from_string(h);
+    let shape = heap.shape_of(obj);
+    if let Some(desc) = heap.lookup_property(shape, key)
+        && let Some(slot) = desc.slot()
+        && let Some(cell) = heap.get_mut(obj).properties.get_mut(slot as usize)
+    {
+        *cell = JsValue::hole();
+    }
 }
 
 /// `Array.prototype.pop()` – removes the last element.
 pub fn array_pop(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.pop", None)?;
     let heap = &mut *ctx.heap;
-    let popped = heap.get_mut(obj).pop_element().unwrap_or(JsValue::undefined());
-    let value = if popped.is_hole() {
-        JsValue::undefined()
-    } else {
-        popped
-    };
-    let new_len = heap.get(obj).element_len() as u32;
-    sync_length(heap, obj, new_len);
-    Ok(value)
-}
-
-fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> u32 {
-    let key = length_prop(heap);
-    let shape = heap.root_shape();
-    if let Some(desc) = heap.lookup_property(shape, key)
-        && let Some(slot) = desc.slot()
-    {
-        let idx = slot as usize;
-        let v = heap
-            .get(obj)
-            .properties
-            .get(idx)
-            .copied()
-            .unwrap_or(JsValue::undefined());
-        if let Some(n) = v.as_smi()
-            && let Ok(u) = u32::try_from(n)
-        {
-            return u;
-        }
-        if let Some(n) = v.as_f64()
-            && n.is_finite()
-            && n >= 0.0
-            && n.fract() == 0.0
-        {
-            return n as u32;
-        }
+    let len = array_length(heap, obj);
+    if len < 1.0 {
+        sync_length(heap, obj, 0.0);
+        return Ok(JsValue::undefined());
     }
-    // Fallback to elements length.
-    heap.get(obj).element_len() as u32
+    let last = len - 1.0;
+    let value = pop_read(heap, obj, last);
+    pop_delete(heap, obj, last);
+    sync_length(heap, obj, last);
+    Ok(value)
 }
 
 /// `Array.isArray(value)` – true if value is an Array exotic object.
@@ -119,15 +218,18 @@ pub fn array_sort(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsV
     Ok(this)
 }
 
-fn sync_length(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
+fn sync_length(heap: &mut Heap, obj: Handle<JsObject>, len: f64) {
     let key = length_prop(heap);
-    let shape = heap.root_shape();
+    // Through the object's own shape (see `array_length`): the root shape
+    // only walks *up* the chain, so the length descriptor lives on the
+    // object's bound shape.
+    let shape = heap.shape_of(obj);
     if let Some(desc) = heap.lookup_property(shape, key)
         && let Some(slot) = desc.slot()
     {
         let idx = slot as usize;
         if idx < heap.get(obj).properties.len() {
-            heap.get_mut(obj).properties[idx] = JsValue::from_f64(f64::from(len));
+            heap.get_mut(obj).properties[idx] = JsValue::from_f64(len);
             return;
         }
     }
@@ -136,7 +238,7 @@ fn sync_length(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
         let _child = heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
         heap.get_mut(obj)
             .properties
-            .push(JsValue::from_f64(f64::from(len)));
+            .push(JsValue::from_f64(len));
     }
 }
 
@@ -693,9 +795,19 @@ pub fn array_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resul
         let n = args[0].as_smi().map(f64::from).or(args[0].as_f64());
         match n {
             Some(len) if len.trunc() == len && (0.0..=4294967295.0).contains(&len) => {
-                let arr = ctx
-                    .heap
-                    .alloc(JsObject::array(vec![JsValue::undefined(); len as usize]));
+                // Spec: only the "length" property is defined; no index
+                // properties are created. Materializing `len` elements would
+                // explode on huge lengths (test262 uses 2**32 - 1).
+                let arr = ctx.heap.alloc(JsObject::array_sparse(len as u32));
+                // Bind the canonical `root --length--> child` array shape so
+                // later `array_length`/`sync_length` lookups resolve the
+                // length slot (sparse arrays can't fall back to the store
+                // length, which stays empty).
+                let key = length_prop(&mut *ctx.heap);
+                let shape =
+                    ctx.heap
+                        .add_property(ctx.heap.root_shape(), key, v12_heap::Attrs::DEFAULT);
+                ctx.heap.bind_shape(arr, shape);
                 ctx.add_root(JsValue::object(arr));
                 return Ok(JsValue::object(arr));
             }

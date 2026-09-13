@@ -100,7 +100,9 @@ impl Engine {
 
     /// Constructs the checkpoint interpreter shared by script eval and module
     /// eval: installs natives (which carry the shared loader/pending state),
-    /// applies JIT hooks, and sets the cooperative deadline.
+    /// applies JIT hooks, sets the cooperative deadline, and adopts the
+    /// engine's shared cross-program table (registering this program into it
+    /// so its id survives interpreter rebuilds across checkpoint drains).
     fn make_interp<'a>(
         heap: &'a mut Heap,
         global: Handle<JsObject>,
@@ -109,11 +111,13 @@ impl Engine {
         strings: Rc<[String]>,
         natives: Box<dyn v12_interp::NativeRegistry>,
         deadline: Option<std::time::Instant>,
+        programs: Rc<RefCell<Vec<v12_native::ProgramTable>>>,
     ) -> Interp<'a> {
         #[cfg(feature = "jit")]
         let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(natives);
+        interp.adopt_shared_programs(programs);
         #[cfg(feature = "jit")]
         jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
         interp.set_deadline(deadline);
@@ -151,10 +155,19 @@ impl Engine {
             registry,
             pending,
             completion,
+            programs,
             ..
         } = self;
-        let mut interp =
-            Self::make_interp(heap, global, functions, main, strings, natives, deadline);
+        let mut interp = Self::make_interp(
+            heap,
+            global,
+            functions,
+            main,
+            strings,
+            natives,
+            deadline,
+            Rc::clone(programs),
+        );
         let outcome = interp.run();
         // Drain the single microtask checkpoint against the still-live
         // interpreter: host jobs and async resumes alternate until empty.
@@ -283,10 +296,19 @@ impl Engine {
             registry,
             pending,
             completion,
+            programs,
             ..
         } = self;
-        let mut interp =
-            Self::make_interp(heap, global, functions, program.main, strings, natives, deadline);
+        let mut interp = Self::make_interp(
+            heap,
+            global,
+            functions,
+            program.main,
+            strings,
+            natives,
+            deadline,
+            Rc::clone(programs),
+        );
         // Pre-evaluate the static import graph on this interpreter (the
         // dynamic-import path is runtime-driven and does not need it).
         if let Some(loader) = registry.loader() {
@@ -439,12 +461,20 @@ impl Engine {
             jobs,
             registry,
             pending,
+            programs,
             ..
         } = self;
         #[cfg(feature = "jit")]
         let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
+        // Adopt the engine's shared cross-program table and register the
+        // retained program under a fresh id: async resumes and reaction jobs
+        // may close over programs registered during earlier evals (imports,
+        // eval'd sources), which a fresh per-interp table would lose — the
+        // silent fallback then runs foreign bytecode in a wrong register
+        // window (register-window OOB panic class).
+        interp.adopt_shared_programs(Rc::clone(programs));
         #[cfg(feature = "jit")]
         jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
         interp.set_deadline(deadline);

@@ -1062,11 +1062,28 @@ impl<'a> Interp<'a> {
         // `complete_frame`/`unwind` stop when the frame count falls back to
         // this value (matching the accessor-call contract in `call_accessor_with`).
         self.stop_at_frames = Some(self.frames.len());
+        let boundary = self.stop_at_frames;
         self.top_result = None;
         let outcome = self.prepare_call(base, caller_max_regs, 0, argc);
         let result = match outcome {
             Ok(CallOutcome::Pushed) => {
                 let exec = self.execute();
+                // Some escape paths (the cooperative-deadline force-return;
+                // historically, bare `return Err` guards in the dispatch loop)
+                // leave frames live above the boundary. Shed them here so the
+                // stack truncation below cannot orphan a live register window —
+                // the corrupt machine state behind the register-window OOB
+                // panics.
+                if let Some(b) = boundary
+                    && self.frames.len() > b
+                {
+                    while self.frames.len() > b {
+                        if let Some(f) = self.frames.pop() {
+                            self.drop_frame_arguments(&f);
+                        }
+                    }
+                    self.stack.truncate(base);
+                }
                 exec.and_then(|()| {
                     self.top_result.take().ok_or_else(|| {
                         JSException(
@@ -1108,6 +1125,35 @@ impl<'a> Interp<'a> {
             .alloc(JsObject::function(v12_heap::FunctionTarget::Bytecode(main), None));
         self.heap.get_mut(callee).program_id = id;
         self.call_object(callee, JsValue::undefined(), &[])
+    }
+
+    /// Adopts a shared cross-program table and registers this interpreter's
+    /// own program into it, returning the assigned program id.
+    ///
+    /// Engine-created interpreters share one table for the engine's lifetime:
+    /// programs registered while one interpreter is live (eval'd sources,
+    /// imported modules) must still resolve after that interpreter is dropped
+    /// and a fresh one is rebuilt for `run_jobs`/`call_function`. Without the
+    /// shared table, `functions_for_program` silently falls back to the
+    /// rebuilt interpreter's own functions — foreign bytecode executed in a
+    /// wrong-sized register window (the register-window OOB panic class).
+    ///
+    /// Ids start at 1: the host table reserves a dummy slot at index 0
+    /// because id 0 means "the interpreter's own built-in table" in
+    /// standalone (non-adopted) use.
+    pub fn adopt_shared_programs(
+        &mut self,
+        programs: std::rc::Rc<std::cell::RefCell<std::vec::Vec<ProgramTable>>>,
+    ) -> u32 {
+        let id = {
+            let mut table = programs.borrow_mut();
+            let id = table.len() as u32;
+            table.push((Rc::clone(&self.functions), Rc::clone(&self.strings)));
+            id
+        };
+        self.programs = programs;
+        self.program_id = id;
+        id
     }
 
     fn private_get(

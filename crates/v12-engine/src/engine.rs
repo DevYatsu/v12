@@ -72,6 +72,14 @@ pub struct Engine {
     /// program is the top-level script (the module loader referrers to this;
     /// the Test262 runner points it at the test file's directory).
     module_base: std::path::PathBuf,
+    /// Cross-program function/string table shared by every interpreter this
+    /// engine creates (eval, module loads, `run_jobs`/`call_function`
+    /// rebuilds). Registered programs outlive the interpreter that
+    /// registered them, so async resumes and job drains on rebuilt
+    /// interpreters resolve closures against the right tables. Index 0 is a
+    /// reserved dummy: program id 0 means "the interpreter's own built-in
+    /// table" in standalone use, so registered ids start at 1.
+    programs: Rc<RefCell<Vec<v12_native::ProgramTable>>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -99,6 +107,11 @@ impl Engine {
         registry.set_loader(Rc::new(RefCell::new(
             crate::module_loader::LoaderState::default(),
         )));
+        let programs: Rc<RefCell<Vec<v12_native::ProgramTable>>> =
+            Rc::new(RefCell::new(vec![(
+                Rc::<[FunctionBytecode]>::from(Vec::new()),
+                Rc::<[String]>::from(Vec::new()),
+            )]));
         Self {
             heap,
             realm,
@@ -110,6 +123,7 @@ impl Engine {
             tier_policy: v12_codegen::TierPolicy::default(),
             deadline: None,
             module_base: std::path::PathBuf::new(),
+            programs,
         }
     }
 
@@ -250,12 +264,16 @@ impl Engine {
             jobs,
             registry,
             pending,
+            programs,
             ..
         } = self;
         #[cfg(feature = "jit")]
         let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
+        // Same shared-table adoption as `run_jobs`: the invoked callee may
+        // close over programs registered during earlier evals.
+        interp.adopt_shared_programs(Rc::clone(programs));
         #[cfg(feature = "jit")]
         jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
         let outcome = interp.call_object(callee, JsValue::undefined(), args);

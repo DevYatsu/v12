@@ -546,21 +546,43 @@ pub(crate) fn array_join_fallback(
                 "TypeError: Array.prototype.push called on non-object",
             )));
         };
-        for &item in args {
-            self.heap.get_mut(obj).push_element(item);
-        }
-        let new_len = self.heap.get(obj).element_len() as u32;
-        // Sync length if shape exists
+        // Spec: appended items land at `length`-based indices. For a sparse
+        // array (`new Array(len)`) the element store is shorter than the
+        // `length` property, so the store end is not the write index. The
+        // length is an f64 (ToLength): array-like receivers legally carry
+        // lengths up to 2^53-1, and indices beyond the element-store range
+        // skip the store write (the flat guard refuses huge-gap resizes).
         let key = self.length_key();
         let shape = self.shape_of(obj);
+        let mut len = self
+            .heap
+            .lookup_property(shape, key)
+            .and_then(|d| d.slot().map(|s| s as usize))
+            .filter(|&idx| idx < self.heap.get(obj).properties.len())
+            .and_then(|idx| {
+                let v = self.heap.get(obj).properties[idx];
+                v.as_smi()
+                    .map(|s| f64::from(s))
+                    .or_else(|| v.as_f64())
+                    .map(|n| if n.is_nan() { 0.0 } else { n.trunc().clamp(0.0, 9007199254740991.0) })
+            })
+            .unwrap_or_else(|| self.heap.get(obj).element_len() as f64);
+        for &item in args {
+            if len <= 4294967294.0 {
+                self.heap.get_mut(obj).set_element(len as u32, item);
+            }
+            len += 1.0;
+        }
+        let new_len = len;
+        // Sync length if shape exists
         if let Some(desc) = self
             .heap
             .lookup_property(shape, key)
             .and_then(|d| d.slot().map(|s| s as usize))
             && desc < self.heap.get(obj).properties.len()
         {
-            self.heap.get_mut(obj).properties[desc] = ops::box_number(f64::from(new_len));
+            self.heap.get_mut(obj).properties[desc] = ops::box_number(new_len);
         }
-        Ok(ops::box_number(f64::from(new_len)))
+        Ok(ops::box_number(new_len))
     }
 }

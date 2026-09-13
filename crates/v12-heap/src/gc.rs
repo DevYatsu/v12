@@ -722,11 +722,12 @@ impl Heap {
         child_handle
     }
 
-    /// Chain-aware descriptor lookup starting at `start`: checks each shape's
-    /// own records along the parent links until `key` surfaces. `None` means
-    /// no shape on the chain names the key.
+    /// Descriptor lookup for an object's current shape: `start`'s own list
+    /// already names every property on its parent chain (children are built
+    /// from the parent's full list and descriptors are never removed), so no
+    /// walk is needed. `None` means the object has no such own property.
     pub fn lookup_property(&self, start: ShapeHandle, key: PropKey) -> Option<&Descriptor> {
-        self.get(start).find_descriptor(&self.shapes, key)
+        self.get(start).find_descriptor(key)
     }
 
     // ------------------------------------------------------------------

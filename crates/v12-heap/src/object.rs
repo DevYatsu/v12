@@ -266,6 +266,31 @@ impl JsObject {
         }
     }
 
+    /// A sparse array: `length` is `len`, the element store is empty.
+    ///
+    /// The one-numeric-argument `new Array(len)` form must not materialize
+    /// `len` absent elements — the spec's constructor only defines the
+    /// "length" property, and a huge `len` (test262 goes up to 2**32 - 1)
+    /// would otherwise explode memory. Element reads observe `undefined`
+    /// through the ordinary out-of-bounds path.
+    pub fn array_sparse(len: u32) -> Self {
+        // Smi carries lengths up to 2**30 - 1; larger spec-legal lengths
+        // (up to 2**32 - 1) store as doubles, matching `sync_length`. The
+        // `as i32` must be guarded — a wrapping cast would re-enter Smi
+        // range with a negative value (4294967295 → -1).
+        let len_v = if len <= crate::JsValue::SMI_MAX as u32 {
+            crate::JsValue::from_i32_smi(len as i32).expect("len <= SMI_MAX fits Smi")
+        } else {
+            crate::JsValue::from_f64(f64::from(len))
+        };
+        Self {
+            kind: Kind::Array,
+            properties: smallvec::smallvec![len_v],
+            property_keys: smallvec::smallvec![Some(crate::PropKey::from_parts(false, 0))], // length property key (index 0 placeholder; caller should intern "length" when heap is available)
+            ..Self::default()
+        }
+    }
+
     // -- element access -----------------------------------------------------------------
     //
     // Two kinds keep integer-indexed data in an element store: arrays in the
@@ -312,6 +337,16 @@ impl JsObject {
         } else {
             let i = idx as usize;
             if i >= self.elements.len() {
+                // A write far above the stored region would resize the flat
+                // store toward the index (a multi-GB memset for `length`s
+                // near 2**32 on array-like receivers, the runner-killer
+                // class). Reads of that index are `None` (absent) either
+                // way, so refuse to materialize the gap — mirrors the
+                // dictionary escape policy of the array lattice.
+                if i - self.elements.len() > crate::elements::ELEMENTS_TO_DICTIONARY_INDEX as usize
+                {
+                    return;
+                }
                 self.elements.resize(i + 1, crate::JsValue::hole());
             }
             self.elements[i] = value;

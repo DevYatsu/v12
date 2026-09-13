@@ -22,7 +22,10 @@ use indicatif::{ParallelProgressIterator, ProgressBar, ProgressIterator, Progres
 use rayon::prelude::*;
 
 use crate::report::{Summary, emit_json, emit_summary, emit_tap};
-use crate::runner::{HarnessConfig, Status, TestOutcome, discover_tests, run_single_test};
+use crate::runner::{
+    HarnessConfig, Status, TestOutcome, discover_tests, encode_slim, run_single_test,
+    run_single_test_isolated,
+};
 
 /// Default parallelism: number of logical CPUs, capped at 16 to bound memory.
 const DEFAULT_JOBS: usize = 8;
@@ -111,10 +114,47 @@ struct Cli {
     /// List discovered tests and exit (dry run).
     #[arg(long)]
     list: bool,
+
+    /// Run each test in a killable child process (default). A test that has
+    /// not finished within the 5s hard-kill window is logged as stalled and
+    /// killed, and the run proceeds. A child crash (stack overflow, abort)
+    /// also costs only that test instead of the whole run.
+    #[arg(long)]
+    in_process: bool,
+
+    /// Hidden: execute one test file, print a single JSON outcome line on
+    /// stdout, and exit. Used by the parent runner for per-test process
+    /// isolation (`run_single_test_isolated`); not useful interactively.
+    #[arg(long, hide = true, value_name = "PATH")]
+    internal_exec: Option<PathBuf>,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // Child mode: run exactly one test, emit one JSON line, exit. Runs on a
+    // big-stack thread so deep recursion aborts only this child (the parent
+    // then reports that single test as crashed) instead of losing the sweep.
+    if let Some(path) = cli.internal_exec.clone() {
+        let root = cli.test262_root.clone();
+        let handle = std::thread::Builder::new()
+            .name("internal-exec".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let config = HarnessConfig::new(resolve_test262_root(root.as_deref()));
+                run_single_test(&path, &config)
+            });
+        let exec_path = cli.internal_exec.clone().expect("checked above");
+        let outcome = match handle {
+            Ok(h) => match h.join() {
+                Ok(o) => o,
+                Err(_) => panic_outcome(&exec_path),
+            },
+            Err(_) => panic_outcome(&exec_path),
+        };
+        println!("{}", encode_slim(&outcome));
+        std::process::exit(0);
+    }
 
     // Run the whole sweep on a thread with explicit stack headroom. The
     // dispatch loop itself is iterative, but pathological test262 sources
@@ -131,6 +171,24 @@ fn main() {
         // Propagate a panicking sweep as a failed exit (dev profile unwinds;
         // release builds abort before reaching this).
         std::process::exit(101);
+    }
+}
+
+/// Outcome used when the internal-exec child itself fails before/around
+/// running the test (thread spawn error, panic outside `catch_unwind`).
+fn panic_outcome(path: &Path) -> TestOutcome {
+    TestOutcome {
+        path: path.to_path_buf(),
+        relative: path.display().to_string(),
+        suite: path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        status: Status::Fail,
+        message: "internal-exec child failed before reporting".to_string(),
+        skip_reason: None,
+        duration_ms: 0,
+        frontmatter: crate::frontmatter::Frontmatter::default(),
     }
 }
 
@@ -203,12 +261,23 @@ fn run(cli: Cli) {
     // hidden when stdout is not a TTY so machine consumers see clean output.
     let pb = make_progress_bar(files.len(), stdout().is_terminal());
 
+    // Per-test execution: by default each test runs in a killable child
+    // process (`run_single_test_isolated`) so a stalled test is logged and
+    // killed after the hard-kill window instead of wedging the sweep.
+    let run_one = |p: &PathBuf| -> TestOutcome {
+        if cli.in_process {
+            run_single_test(p, &harness_config)
+        } else {
+            run_single_test_isolated(p, &harness_config)
+        }
+    };
+
     let outcomes: Vec<TestOutcome> = if jobs <= 1 {
         files
             .iter()
             .progress_with(pb.clone())
             .map(|p| {
-                let outcome = run_single_test(p, &harness_config);
+                let outcome = run_one(p);
                 pb.set_message(truncate_progress_msg(&outcome.relative));
                 outcome
             })
@@ -218,7 +287,7 @@ fn run(cli: Cli) {
             .par_iter()
             .progress_with(pb.clone())
             .map(|p| {
-                let outcome = run_single_test(p, &harness_config);
+                let outcome = run_one(p);
                 pb.set_message(truncate_progress_msg(&outcome.relative));
                 outcome
             })

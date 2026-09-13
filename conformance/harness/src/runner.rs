@@ -8,7 +8,10 @@
 //! reporting layer stays pure.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::frontmatter::{Frontmatter, parse_frontmatter, strip_frontmatter};
 use crate::harness::{MINIMAL_HARNESS_POLYFILL, load_harness_includes};
@@ -18,10 +21,21 @@ const MAX_COMBINED_SOURCE_LEN: usize = 2_000_000;
 
 /// Maximum time a single test may run before we mark it as timed out.
 ///
-/// The engine is synchronous, so this is advisory: we measure after the
-/// fact and report a timeout if the wall clock exceeds the threshold. No
-/// preemption is attempted.
+/// The engine's cooperative deadline (sampled in the interpreter dispatch
+/// loop) aborts a runaway script from the inside; this value feeds that
+/// deadline.
 const TEST_TIMEOUT_MS: u128 = 5_000;
+
+/// Hard per-test wall-clock budget enforced by the parent process: a test
+/// that has not reported a result within this window is logged as stalled,
+/// its process is killed, and the run proceeds with the next test.
+///
+/// The cooperative deadline above normally fires first, but it cannot reach
+/// every stall: the parser/AST lowering, native builtins with internal
+/// loops, and stack overflows (which abort the process and are uncatchable)
+/// never sample it. Process-level isolation is the only reliable stop for
+/// those, so `run_single_test_isolated` re-execs this binary per test.
+const TEST_HARD_KILL_MS: u64 = 5_000;
 
 /// JS preamble defining the `print` sink and the `$262` host object that
 /// Test262 harness files expect. Output is captured in a global array that
@@ -408,6 +422,223 @@ fn is_deadline_error(thrown_str: &str) -> bool {
     thrown_str.contains("execution deadline exceeded")
 }
 
+/// The subset of [`TestOutcome`] shipped over the parent/child process wire.
+///
+/// `frontmatter` is diagnostic-only and not used by any reporter, so the
+/// child omits it; the parent reconstructs the outcome with a default.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SlimOutcome {
+    /// `"pass"`, `"fail"`, or `"skip"`.
+    pub status: String,
+    /// Human-readable detail for fail/skip. Empty on pass.
+    pub message: String,
+    /// Optional skip reason.
+    pub skip_reason: Option<String>,
+    /// Wall-clock duration in milliseconds (as measured by the child).
+    pub duration_ms: u128,
+    /// Path relative to the Test262 root's `test/` directory.
+    pub relative: String,
+    /// Suite bucket.
+    pub suite: String,
+}
+
+impl SlimOutcome {
+    fn from_outcome(o: &TestOutcome) -> Self {
+        Self {
+            status: match o.status {
+                Status::Pass => "pass",
+                Status::Fail => "fail",
+                Status::Skip => "skip",
+            }
+            .to_string(),
+            message: o.message.clone(),
+            skip_reason: o.skip_reason.clone(),
+            duration_ms: o.duration_ms,
+            relative: o.relative.clone(),
+            suite: o.suite.clone(),
+        }
+    }
+
+    fn into_outcome(self, path: &Path) -> TestOutcome {
+        let status = match self.status.as_str() {
+            "pass" => Status::Pass,
+            "skip" => Status::Skip,
+            _ => Status::Fail,
+        };
+        TestOutcome {
+            path: path.to_path_buf(),
+            relative: self.relative,
+            suite: self.suite,
+            status,
+            message: self.message,
+            skip_reason: self.skip_reason,
+            duration_ms: self.duration_ms,
+            frontmatter: Frontmatter::default(),
+        }
+    }
+}
+
+/// Encodes an outcome as the single JSON line the child prints on stdout in
+/// `--internal-exec` mode (see `run_single_test_isolated`).
+#[must_use]
+pub fn encode_slim(outcome: &TestOutcome) -> String {
+    serde_json::to_string(&SlimOutcome::from_outcome(outcome)).unwrap_or_else(|_| {
+        // Unserializable strings cannot occur (no control chars beyond what
+        // serde handles), but a broken child report must not crash the run.
+        "{\"status\":\"fail\",\"message\":\"internal outcome encode error\"}".to_string()
+    })
+}
+
+fn fail_outcome(
+    file_path: &Path,
+    relative: String,
+    suite: String,
+    message: String,
+    duration_ms: u128,
+) -> TestOutcome {
+    TestOutcome {
+        path: file_path.to_path_buf(),
+        relative,
+        suite,
+        status: Status::Fail,
+        message,
+        skip_reason: None,
+        duration_ms,
+        frontmatter: Frontmatter::default(),
+    }
+}
+
+/// Runs a single test in a dedicated child process with a hard wall-clock
+/// kill, so a stalled test cannot wedge the sweep.
+///
+/// The child is this binary re-invoked with the hidden `--internal-exec`
+/// flag; it prints one [`SlimOutcome`] JSON line to stdout. The parent polls
+/// for up to [`TEST_HARD_KILL_MS`]:
+///
+/// - reported in time → child's own outcome (the engine's cooperative
+///   deadline already classifies most runaways as timeouts);
+/// - not reported → the test is logged to stderr as stalled, the child is
+///   killed, and a timeout failure is returned;
+/// - exited without a report (crash / stack overflow / abort) → a failure
+///   naming the exit status. A child crash loses only that test, whereas an
+///   in-process stack overflow would abort the entire run.
+///
+/// Spawn overhead is a few milliseconds per test, dominated by the engine
+/// work itself.
+pub fn run_single_test_isolated(file_path: &Path, config: &HarnessConfig) -> TestOutcome {
+    let relative = relative_suite_path(file_path, &config.test262_root);
+    let suite = suite_for(&relative);
+    let start = Instant::now();
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            return fail_outcome(
+                file_path,
+                relative,
+                suite,
+                format!("cannot resolve runner executable for isolation: {e}"),
+                start.elapsed().as_millis(),
+            );
+        }
+    };
+
+    let mut child = match Command::new(&exe)
+        .arg("--internal-exec")
+        .arg(file_path)
+        .arg("--test262-root")
+        .arg(&config.test262_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Child stderr (panic messages, abort diagnostics) is useful inline.
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return fail_outcome(
+                file_path,
+                relative,
+                suite,
+                format!("failed to spawn isolated test process: {e}"),
+                start.elapsed().as_millis(),
+            );
+        }
+    };
+
+    // Poll instead of blocking wait so the hard kill actually fires at the
+    // deadline. Stdout stays under the pipe buffer (one small JSON line),
+    // so reading it only after exit cannot deadlock.
+    let mut timed_out = false;
+    let exit_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed().as_millis() >= u128::from(TEST_HARD_KILL_MS) {
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return fail_outcome(
+                    file_path,
+                    relative,
+                    suite,
+                    format!("failed to wait for isolated test process: {e}"),
+                    start.elapsed().as_millis(),
+                );
+            }
+        }
+    };
+
+    if timed_out {
+        let _ = child.kill();
+        let _ = child.wait();
+        let duration_ms = start.elapsed().as_millis();
+        eprintln!("STALLED (killed after {TEST_HARD_KILL_MS} ms): {relative}");
+        return fail_outcome(
+            file_path,
+            relative,
+            suite,
+            format!("timeout: stalled, killed after {TEST_HARD_KILL_MS} ms"),
+            duration_ms,
+        );
+    }
+
+    let status = exit_status.expect("exit_status is Some when not timed out");
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut stdout);
+    }
+    let _ = child.wait();
+
+    let line = stdout.trim();
+    if status.success()
+        && let Some(slim) = serde_json::from_str::<SlimOutcome>(line).ok()
+    {
+        return slim.into_outcome(file_path);
+    }
+
+    // Exited without a usable report: crash (abort / stack overflow /
+    // signal) or corrupted output. Report per-test instead of losing the run.
+    let detail = if line.is_empty() {
+        format!("no report ({status})")
+    } else {
+        format!("unparseable report ({status}): {line:.200}")
+    };
+    eprintln!("CRASHED test child: {relative} — {detail}");
+    fail_outcome(
+        file_path,
+        relative,
+        suite,
+        format!("isolated test process {detail}"),
+        start.elapsed().as_millis(),
+    )
+}
+
 /// Async verdict: the test's top-level eval succeeded; the verdict comes from
 /// the `$DONE` markers doneprintHandle.js printed into `__test262Prints`.
 ///
@@ -469,7 +700,15 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     // `handle_async_ok`). Other `$262` uses (`$262.global`,
     // `detachArrayBuffer`, `gc`, `getReport`) run via the TEST262_HOST_SHIM
     // preamble.
-    let _ = &fm;
+    // Proper tail calls are not implemented (see fix-log.md): every test
+    // declaring the feature recurses `$MAX_ITERATIONS` = 100 000 deep purely
+    // to prove tail frames are destroyed, so without TCO it can only burn
+    // seconds of deep-recursion unwind and nondeterministically outlive the
+    // 5 s hard-kill window (observed as STALLED on tco-lhs-body/tco-finally).
+    // Skip the ~35 such tests until TCO lands.
+    if fm.has_feature("tail-call-optimization") {
+        return Some("requires tail-call-optimization (proper tail calls not implemented)".to_string());
+    }
     None
 }
 

@@ -45,13 +45,20 @@ impl Interp<'_> {
     pub(crate) fn create_generator_object(
         &mut self,
         fn_idx: u32,
+        callee_program: u32,
         captured_env: Option<Handle<JsObject>>,
         this_v: JsValue,
         callee_slot: usize,
         argc: u16,
     ) -> Result<Handle<JsObject>, JSException> {
+        // Program-aware: the generator's body resolves against its own
+        // program's function table (an eval/module/realm closure must not be
+        // indexed through this interpreter's main table — that reads the
+        // wrong `max_regs`, and resuming then executes foreign bytecode in a
+        // too-small register window, the register-window OOB class).
         let (max_regs, has_rest, fixed, rest_reg) = {
-            let f = &self.functions[fn_idx as usize];
+            let funcs = self.functions_for_program(callee_program);
+            let f = &funcs[fn_idx as usize];
             (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
         };
         // Build initial register window snapshot via shared helper (DRY #4).
@@ -68,7 +75,7 @@ impl Interp<'_> {
         );
         // Real suspension: store initial register window snapshot, not eager yields.
         self.gc_protect();
-        let r#gen = self.heap.alloc(JsObject::generator_with(
+        let mut g_obj = JsObject::generator_with(
             fn_idx,
             0,
             0.0,
@@ -76,7 +83,12 @@ impl Interp<'_> {
             window,
             captured_env,
             None,
-        ));
+        );
+        // The resume path (`resume_generator_nested`) reads the program id
+        // from the generator object; default 0 would resolve `fn_idx`
+        // against the main program's table (see above).
+        g_obj.program_id = callee_program;
+        let r#gen = self.heap.alloc(g_obj);
         self.heap.add_root(JsValue::object(r#gen));
         Ok(r#gen)
     }

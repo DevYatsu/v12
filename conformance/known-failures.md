@@ -1,15 +1,15 @@
-# Known failures — last scored 2026-09-05
+# Known failures — last scored 2026-09-14
 
-> Latest verified run: `./conformance/run.sh --filter language/expressions --jobs 4 --format json`
-> Totals: **11 190 tests, 4 054 pass / 6 953 fail / 183 skip, 36.8 % pass** over `language/expressions` (+ annexB).
+> Latest verified run: `./conformance/run.sh --filter language --jobs 8 --format json`
+> Totals: **24 590 tests, 13 348 pass / 11 208 fail / 34 skip, 54.4 % pass** over `language` (+ annexB, intl402) — first full-`language` run to complete with zero timeouts/stalls since the CI-timeout note below.
 > Treatment: `pass%` is over executable tests (`pass + fail`). Skips are not counted.
 > After Step 8 (Number/Math globals + static registry, `24e838f`), the harness
 > sta.js/assert.js always-prepend fix, the P0 commit (`1b0f73b`, incl. the
 > with-statement `CompileError` that honestly costs ~108 false passes on this
 > slice), and the P1 destructuring-default fix (2026-09-05). The full `language`
-> run still times out in CI; the last completed full-language score was
-> 8 919 / 24 446 / 427 skip, 36.5 % (Step 7b). Baseline was 19.9 % (4 858) on
-> 2026-08-29. See `fix-log.md` for the burn-down log.
+> run no longer times out (shape-lookup fix + TCO skip, 2026-09-14 — see `fix-log.md`);
+> the last completed full-language score before that was 8 919 / 24 446 / 427 skip,
+> 36.5 % (Step 7b). Baseline was 19.9 % (4 858) on 2026-08-29. See `fix-log.md` for the burn-down log.
 
 This file is the fix-it queue. Each bullet is a bucket — a single engine gap that, once closed, will flip a visible swath of red to green. Keep the buckets small and ordered by estimated lift.
 
@@ -40,11 +40,9 @@ This file is the fix-it queue. Each bullet is a bucket — a single engine gap t
 - **Symptom:** negative tests (early SyntaxError/TypeError violations) execute successfully instead of throwing. The engine lacks the corresponding early-error validations.
 - **Filter:** `cargo run -p test262-runner -- --filter language/expressions --jobs 4 --format json` then group by message; split by sub-suite (class/strict/eval-arguments…) before fixing.
 
-### C. `dynamic import not supported in this context` — 324 failures
+### C. ~~`dynamic import not supported in this context` — 324 failures~~ — **closed** (f06e71c loader: 68.1 % on dynamic-import)
 
-- **Symptom:** `import()` desugars to the registered `ModuleImport` native stub, which throws a proper TypeError. Needs the real dynamic-import path: module resolution + job-queue-backed promise.
-- **Filter:** `--filter language/expressions/dynamic-import --jobs 4`.
-- **Fix location:** `crates/v12-engine/src/builtins/mod.rs` (`ModuleImport` stub) + the ESM loader.
+- **Closed 2026-09-13:** real module loader (resolve/link/evaluate + job-backed `import()` promise) landed; see `fix-log.md` Step C. Remaining dynamic-import failures are `Array.prototype`-write/`import.meta`/missing-intrinsic gaps, not loader gaps.
 
 ### D. Assertion-detail mismatches (SameValue / boolean) — ~800 failures combined
 
@@ -59,6 +57,12 @@ This file is the fix-it queue. Each bullet is a bucket — a single engine gap t
 ### F. Remaining type errors — ~430 failures combined
 
 - **Symptom:** `TypeError: not a function` 174, `cannot set properties of null or undefined` 142, `right-hand side of 'instanceof' is not an object` 114. Mostly downstream of A/B gaps.
+
+### G. Top-level await in module bodies — `language/module-code/top-level-await/*`
+
+- **Symptom:** `await` at module top level throws `SyntaxError: await outside async` — module mains compile with `is_async=false` (`v12-bccompiler/src/unit.rs` `UnitNode::Main`), so TLA never reaches the async machinery. Import promises of TLA modules reject; `async test did not complete`.
+- **Fix location:** compile module mains as async (generator-backed) when the body contains await; `module_loader.rs::load_and_evaluate` must settle the module evaluation promise instead of taking the main's synchronous completion as the namespace. (The *crash* this used to cause — the live-frame leak + stack corruption — is fixed; see fix-log Step F.)
+- **Filter:** `--filter language/module-code/top-level-await --jobs 1`.
 
 ## Done (moved out of the queue)
 
