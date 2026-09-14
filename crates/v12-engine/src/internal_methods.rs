@@ -15,7 +15,7 @@
 //! (`JitExecFn` in `v12-codegen`); the engine's hot dispatch is always flat
 //! `match` over a concrete enum.
 
-use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey, ShapeHandle};
+use v12_heap::{DictEntry, Handle, Heap, JsObject, JsValue, PropKey, ShapeHandle};
 
 /// Object kinds understood by the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,8 +26,14 @@ pub enum ObjectKind {
     Proxy,
 }
 
+/// Own-property count past which growth spills from shapes to the
+/// per-object dictionary rung (the named-property mirror of
+/// `ElementsKind::Dictionary`): shapes stop growing, reads stay O(1)
+/// via the map. Well above the inline tier (8), well below the 1024
+/// cliff it replaces — growth past it is unbounded by design now.
+
 /// Maximum number of own properties per object before dictionary mode.
-const MAX_PROPERTIES: usize = 1024;
+const NAMED_DICT_THRESHOLD: usize = 128;
 
 /// Result of an internal method, either a value or a thrown value.
 pub type InternalResult<T> = Result<T, JsValue>;
@@ -106,6 +112,13 @@ fn ordinary_set_prototype_of(
     if heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
         return Ok(false);
     }
+    // Rewiring invalidates chain assumptions: bump the object's own cell
+    // and the heap proto epoch so stub-cache proto entries re-verify.
+    // (Entries additionally verify the recorded links, so rewiring through
+    // any other call site stays correct too.)
+    let cell = heap.validity_cell_of(obj);
+    heap.bump_validity(cell);
+    heap.bump_proto_generation();
     heap.get_mut(obj).prototype = proto;
     Ok(true)
 }
@@ -124,9 +137,6 @@ fn ordinary_get_own_property(
     obj: Handle<JsObject>,
     key: PropKey,
 ) -> InternalResult<Option<PropertyDescriptor>> {
-    if heap.get(obj).properties.len() > MAX_PROPERTIES {
-        return Ok(None);
-    }
     let kind = heap.get(obj).kind;
     if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
@@ -138,6 +148,12 @@ fn ordinary_get_own_property(
             enumerable: true,
             configurable: true,
         }));
+    }
+    // Dictionary rung first: overflow keys live only here (disjoint from
+    // the frozen base shape). Indexed shapes serve any size now, so the
+    // old length cliff is gone with them.
+    if let Some((entry, value)) = dict_lookup(heap, obj, key) {
+        return Ok(Some(dict_property_descriptor(value, entry)));
     }
     let shape = shape_of(heap, obj);
     let Some(desc) = heap.get(shape).descriptors.find(key).copied() else {
@@ -170,9 +186,9 @@ pub(crate) fn ordinary_define_own_property(
     key: PropKey,
     descriptor: PropertyDescriptor,
 ) -> InternalResult<bool> {
-    if heap.get(obj).properties.len() >= MAX_PROPERTIES {
-        return Err(type_error(heap, "Too many properties"));
-    }
+    // Growth past the spill threshold goes to the dictionary rung; the
+    // old 1024-throw cliff is gone by design (unbounded growth, O(1)
+    // reads throughout).
     let kind = heap.get(obj).kind;
     if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
         && let Some(idx) = prop_key_as_index(heap, key)
@@ -183,6 +199,44 @@ pub(crate) fn ordinary_define_own_property(
         return Ok(true);
     }
     let shape = shape_of(heap, obj);
+    // Dictionary hit: an existing overflow key updates in place — value
+    // and attributes stay per-object; shapes untouched.
+    if let Some(entry) = heap
+        .get(obj)
+        .dictionary
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .copied()
+    {
+        if entry.is_accessor {
+            // Redefining an accessor via data descriptor is a no-op for
+            // v1: preserve accessor shape.
+            return Ok(true);
+        }
+        if let Some(v) = descriptor.value {
+            if !entry.attrs.writable() {
+                return Ok(false);
+            }
+            let idx = entry.slot as usize;
+            let obj_mut = heap.get_mut(obj);
+            if obj_mut.properties.len() <= idx {
+                obj_mut.properties.resize(idx + 1, JsValue::hole());
+            }
+            obj_mut.properties[idx] = v;
+        }
+        let new_attrs = v12_heap::Attrs::new(
+            descriptor.writable,
+            descriptor.enumerable,
+            descriptor.configurable,
+        );
+        if new_attrs != entry.attrs
+            && let Some(map) = heap.get_mut(obj).dictionary.as_mut()
+            && let Some(slot_entry) = map.get_mut(&key)
+        {
+            slot_entry.attrs = new_attrs;
+        }
+        return Ok(true);
+    }
     if let Some(existing) = heap.get(shape).descriptors.find(key).copied() {
         match existing {
             v12_heap::Descriptor::Data { slot, attrs, .. } => {
@@ -218,18 +272,27 @@ pub(crate) fn ordinary_define_own_property(
     if heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
         return Ok(false);
     }
-    // Extend shape: allocate new shape and publish it onto the object.
-    let next_shape = heap.add_property(
-        shape,
-        key,
-        v12_heap::Attrs::new(
-            descriptor.writable,
-            descriptor.enumerable,
-            descriptor.configurable,
-        ),
-    );
-    bind_shape(heap, obj, next_shape);
+    // Extend: dictionary-rung objects absorb new keys into the map;
+    // shape-backed objects spill past the threshold (shapes stop
+    // growing); small objects extend the shape exactly as before.
     let value = descriptor.value.unwrap_or(JsValue::undefined());
+    let attrs = v12_heap::Attrs::new(
+        descriptor.writable,
+        descriptor.enumerable,
+        descriptor.configurable,
+    );
+    if heap.get(obj).dictionary.is_some() {
+        dict_insert(heap, obj, key, value, attrs);
+        return Ok(true);
+    }
+    if heap.get(shape).num_own as usize >= NAMED_DICT_THRESHOLD {
+        convert_to_dictionary(heap, obj);
+        dict_insert(heap, obj, key, value, attrs);
+        return Ok(true);
+    }
+    // Extend shape: allocate new shape and publish it onto the object.
+    let next_shape = heap.add_property(shape, key, attrs);
+    bind_shape(heap, obj, next_shape);
     heap.get_mut(obj).properties.push(value);
     Ok(true)
 }
@@ -254,6 +317,121 @@ fn prop_key_as_index(heap: &mut Heap, key: PropKey) -> Option<u32> {
     text.parse::<u32>().ok()
 }
 
+/// Dictionary-rung hit for an overflow key: the entry plus its current
+/// value (`undefined` when the slot runs past embedder-short storage,
+/// mirroring the shape path's OOB fallthrough). `None` in shape-backed
+/// mode or for base keys (which stay shape-addressed — the two stores
+/// never overlap). Shared by the internal methods and the builtins'
+/// shape-walk sites that must see overflow keys.
+pub(crate) fn dict_lookup(heap: &Heap, obj: Handle<JsObject>, key: PropKey) -> Option<(DictEntry, JsValue)> {
+    let entry = heap.get(obj).dictionary.as_ref()?.get(&key).copied()?;
+    let value = heap
+        .get(obj)
+        .properties
+        .get(entry.slot as usize)
+        .copied()
+        .unwrap_or(JsValue::undefined());
+    Some((entry, value))
+}
+
+/// Spills `obj` to dictionary mode: files an empty dictionary rung and
+/// seeds its insertion sequence past the frozen base shape. Base
+/// properties stay shape-addressed (their layout is frozen and indexed);
+/// only post-spill keys enter the map, so the two stores never overlap.
+/// Idempotent.
+fn convert_to_dictionary(heap: &mut Heap, obj: Handle<JsObject>) {
+    if heap.get(obj).dictionary.is_some() {
+        return;
+    }
+    let base = heap.get(heap.shape_of(obj)).num_own;
+    let o = heap.get_mut(obj);
+    o.dictionary = Some(Box::new(rustc_hash::FxHashMap::default()));
+    o.dict_seq = base;
+}
+
+/// Inserts a fresh data property into `obj`'s dictionary rung (the caller
+/// guarantees dict mode and a absent key): appends the value to storage
+/// and files the entry with the next insertion sequence. O(1).
+fn dict_insert(
+    heap: &mut Heap,
+    obj: Handle<JsObject>,
+    key: PropKey,
+    value: JsValue,
+    attrs: v12_heap::Attrs,
+) {
+    debug_assert!(heap.get(obj).dictionary.is_some());
+    let (slot, seq) = {
+        let o = heap.get(obj);
+        (o.properties.len() as u32, o.dict_seq)
+    };
+    heap.get_mut(obj).properties.push(value);
+    let entry = DictEntry {
+        slot,
+        attrs,
+        getter: None,
+        setter: None,
+        is_accessor: false,
+        seq,
+    };
+    if let Some(map) = heap.get_mut(obj).dictionary.as_mut() {
+        map.insert(key, entry);
+    }
+    heap.get_mut(obj).dict_seq = seq + 1;
+}
+
+/// `[[GetOwnProperty]]` report for a dictionary entry, mirroring the
+/// shape-descriptor arms exactly (accessors report no value and are
+/// never writable through this path).
+fn dict_property_descriptor(value: JsValue, entry: DictEntry) -> PropertyDescriptor {
+    if entry.is_accessor {
+        PropertyDescriptor {
+            value: None,
+            writable: false,
+            enumerable: entry.attrs.enumerable(),
+            configurable: entry.attrs.configurable(),
+        }
+    } else {
+        PropertyDescriptor {
+            value: Some(value),
+            writable: entry.attrs.writable(),
+            enumerable: entry.attrs.enumerable(),
+            configurable: entry.attrs.configurable(),
+        }
+    }
+}
+
+/// Invokes an accessor getter found on `owner` (shared by the shape walk
+/// and the dictionary rung): native/host callables run directly, bytecode
+/// bodies report `undefined` (the interpreter's `get_property` provides
+/// the eval path), and a missing getter reads `undefined`.
+fn invoke_accessor_getter(
+    heap: &mut Heap,
+    owner: Handle<JsObject>,
+    getter: Option<Handle<JsObject>>,
+) -> InternalResult<JsValue> {
+    if let Some(getter) = getter {
+        // The getter is a function object. Native/host handlers can be
+        // invoked directly with only the heap; a bytecode getter needs
+        // the interpreter, which the engine's `get_property` path
+        // provides — this internal-method fallback reports `undefined`
+        // for it.
+        match heap.get(getter).callable {
+            v12_heap::FunctionTarget::Native(f) => {
+                return f(heap, JsValue::object(owner), &[]);
+            }
+            v12_heap::FunctionTarget::Host(c) => {
+                return c.call(heap, JsValue::object(owner), &[]);
+            }
+            v12_heap::FunctionTarget::Bytecode(_)
+            | v12_heap::FunctionTarget::RealmEval(_)
+            | v12_heap::FunctionTarget::Bound(_) => {
+                return Ok(JsValue::undefined());
+            }
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
 fn ordinary_has_property(
     heap: &mut Heap,
     obj: Handle<JsObject>,
@@ -266,10 +444,37 @@ fn ordinary_has_property(
     {
         return Ok(true);
     }
+    let shape = shape_of(heap, obj);
+    // Guarded stub fast path: a recorded `Data` location answers `true`
+    // in O(1); anything else (including accessor-held keys, which stubs
+    // never record) falls through to the walk below.
+    if heap.stub_lookup_proto(obj, shape, key).is_some() {
+        return Ok(true);
+    }
     let mut cur = Some(obj);
     while let Some(o) = cur {
-        let shape = shape_of(heap, o);
-        if heap.get(shape).descriptors.find(key).is_some() {
+        let o_shape = shape_of(heap, o);
+        // Dictionary rung: overflow keys live only here. Data hits record
+        // for future O(1) probes (accessors have no servable slot and
+        // always re-walk, but still count as present).
+        if let Some(entry) = heap
+            .get(o)
+            .dictionary
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .copied()
+        {
+            if !entry.is_accessor {
+                heap.stub_record_proto(obj, shape, key, o, o_shape, entry.slot);
+            }
+            return Ok(true);
+        }
+        if let Some(d) = heap.get(o_shape).descriptors.find(key).copied() {
+            // Record `Data` locations for future O(1) probes (accessors
+            // have no servable slot and always re-walk).
+            if let v12_heap::Descriptor::Data { slot, .. } = d {
+                heap.stub_record_proto(obj, shape, key, o, o_shape, slot);
+            }
             return Ok(true);
         }
         cur = heap.get(o).prototype;
@@ -290,38 +495,50 @@ fn ordinary_get(
     {
         return Ok(v);
     }
+    let recv_shape = shape_of(heap, obj);
+    // Guarded stub fast path (O(1)): serves recorded `Data` locations —
+    // own and proto alike. OOB storage falls through to the walk, which
+    // resolves exactly as before (including continuing past holes).
+    if let Some((holder, hsl)) = heap.stub_lookup_proto(obj, recv_shape, key)
+        && let Some(v) = heap.get(holder).properties.get(hsl as usize)
+    {
+        return Ok(*v);
+    }
     let mut cur = Some(obj);
     while let Some(o) = cur {
-        let shape = shape_of(heap, o);
-        if let Some(d) = heap.get(shape).descriptors.find(key).copied() {
+        let o_shape = shape_of(heap, o);
+        // Dictionary rung: overflow keys live only here (disjoint from
+        // the frozen base shape). Data hits record like shape hits;
+        // accessor hits invoke through the shared helper below.
+        if let Some(entry) = heap
+            .get(o)
+            .dictionary
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .copied()
+        {
+            if entry.is_accessor {
+                return invoke_accessor_getter(heap, o, entry.getter);
+            }
+            heap.stub_record_proto(obj, recv_shape, key, o, o_shape, entry.slot);
+            if let Some(v) = heap.get(o).properties.get(entry.slot as usize) {
+                return Ok(*v);
+            }
+            // OOB storage (embedder-short object): fall through to the
+            // shape walk, mirroring the Data arm below.
+        }
+        if let Some(d) = heap.get(o_shape).descriptors.find(key).copied() {
             match d {
                 v12_heap::Descriptor::Data { slot, .. } => {
+                    // Record the location (own or proto, depth ≤ 2) for
+                    // future O(1) probes, then serve exactly as before.
+                    heap.stub_record_proto(obj, recv_shape, key, o, o_shape, slot);
                     if let Some(v) = heap.get(o).properties.get(slot as usize) {
                         return Ok(*v);
                     }
                 }
                 v12_heap::Descriptor::Accessor { getter, .. } => {
-                    if let Some(getter) = getter {
-                        // The getter is a function object. Native/host handlers
-                        // can be invoked directly with only the heap; a
-                        // bytecode getter needs the interpreter, which the
-                        // engine's `get_property` path provides — this
-                        // internal-method fallback reports `undefined` for it.
-                        match heap.get(getter).callable {
-                            v12_heap::FunctionTarget::Native(f) => {
-                                return f(heap, JsValue::object(o), &[]);
-                            }
-                            v12_heap::FunctionTarget::Host(c) => {
-                                return c.call(heap, JsValue::object(o), &[]);
-                            }
-                            v12_heap::FunctionTarget::Bytecode(_)
-                            | v12_heap::FunctionTarget::RealmEval(_)
-                            | v12_heap::FunctionTarget::Bound(_) => {
-                                return Ok(JsValue::undefined());
-                            }
-                        }
-                    }
-                    return Ok(JsValue::undefined());
+                    return invoke_accessor_getter(heap, o, getter);
                 }
             }
         }
@@ -345,6 +562,33 @@ fn ordinary_set(
         return Ok(true);
     }
     let shape = shape_of(heap, obj);
+    // Dictionary rung: overflow keys update in place (mirrors the shape
+    // Data/Accessor arms below, including the embedder-short resize).
+    if let Some(entry) = heap
+        .get(obj)
+        .dictionary
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .copied()
+    {
+        if entry.is_accessor {
+            if entry.setter.is_some() {
+                // v1: setter invocation is a no-op beyond acknowledgement.
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        if !entry.attrs.writable() {
+            return Ok(false);
+        }
+        let idx = entry.slot as usize;
+        let obj_mut = heap.get_mut(obj);
+        if obj_mut.properties.len() <= idx {
+            obj_mut.properties.resize(idx + 1, JsValue::hole());
+        }
+        obj_mut.properties[idx] = value;
+        return Ok(true);
+    }
     if let Some(d) = heap.get(shape).descriptors.find(key).copied() {
         match d {
             v12_heap::Descriptor::Data { slot, attrs, .. } => {
@@ -376,8 +620,16 @@ fn ordinary_set(
     if heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
         return Ok(false);
     }
-    if heap.get(obj).properties.len() >= MAX_PROPERTIES {
-        return Err(type_error(heap, "Too many properties"));
+    // Growth past the spill threshold goes to the dictionary rung (the
+    // old 1024-throw cliff is gone by design).
+    if heap.get(obj).dictionary.is_some() {
+        dict_insert(heap, obj, key, value, v12_heap::Attrs::DEFAULT);
+        return Ok(true);
+    }
+    if heap.get(shape).num_own as usize >= NAMED_DICT_THRESHOLD {
+        convert_to_dictionary(heap, obj);
+        dict_insert(heap, obj, key, value, v12_heap::Attrs::DEFAULT);
+        return Ok(true);
     }
     let child = heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
     bind_shape(heap, obj, child);
@@ -391,6 +643,32 @@ fn ordinary_delete(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey) -> Inte
         && let Some(idx) = prop_key_as_index(heap, key)
     {
         heap.get_mut(obj).delete_element(idx);
+        return Ok(true);
+    }
+    // Dictionary rung: remove the entry and hole its storage slot (slot
+    // numbering stays stable for live entries, mirroring the shape arm).
+    if let Some(entry) = heap
+        .get(obj)
+        .dictionary
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .copied()
+    {
+        if !entry.attrs.configurable() {
+            return Ok(false);
+        }
+        let slot = entry.slot as usize;
+        if let Some(map) = heap.get_mut(obj).dictionary.as_mut() {
+            map.remove(&key);
+        }
+        if let Some(v) = heap.get_mut(obj).properties.get_mut(slot) {
+            *v = JsValue::hole();
+        }
+        // Entry removal (unlike shape `delete`, which keeps the
+        // descriptor) changes what a walk resolves — bump the proto
+        // epoch so guarded stubs re-verify instead of serving the
+        // holed slot.
+        heap.bump_proto_generation();
         return Ok(true);
     }
     let shape = shape_of(heap, obj);
@@ -414,12 +692,23 @@ fn ordinary_delete(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey) -> Inte
 
 fn ordinary_own_property_keys(heap: &Heap, obj: Handle<JsObject>) -> Vec<PropKey> {
     let shape = shape_of(heap, obj);
-    heap.get(shape)
+    let mut keys: Vec<PropKey> = heap
+        .get(shape)
         .descriptors
         .as_slice()
         .iter()
         .map(|d| d.key())
-        .collect()
+        .collect();
+    // Overflow keys append in insertion order (`seq`), matching the base
+    // path's insertion-order convention. The two stores never overlap
+    // (post-spill keys enter only the map), so nothing double-reports.
+    if let Some(map) = heap.get(obj).dictionary.as_ref() {
+        let mut overflow: Vec<(u32, PropKey)> =
+            map.iter().map(|(k, e)| (e.seq, *k)).collect();
+        overflow.sort_by_key(|&(seq, _)| seq);
+        keys.extend(overflow.into_iter().map(|(_, k)| k));
+    }
+    keys
 }
 
 // Proxy traps: stub that throws TypeError for trapped operations.

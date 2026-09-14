@@ -219,6 +219,17 @@ pub fn object_enumerable_own_keys(
         }
         items.push(JsValue::string(h));
     }
+    // Dictionary-rung overflow keys, enumerable only, insertion order.
+    // (Length-skip is shape business; overflow keys are user data.)
+    if let Some(map) = ctx.heap.get(obj).dictionary.as_ref() {
+        let mut overflow: Vec<(u32, v12_heap::Handle<v12_heap::V12Str>)> = map
+            .iter()
+            .filter(|(_, e)| e.attrs.enumerable())
+            .filter_map(|(k, e)| k.string().map(|h| (e.seq, h)))
+            .collect();
+        overflow.sort_by_key(|&(seq, _)| seq);
+        items.extend(overflow.into_iter().map(|(_, h)| JsValue::string(h)));
+    }
     Ok(array_value(ctx, items))
 }
 
@@ -237,10 +248,34 @@ fn descriptor_is_live(heap: &v12_heap::Heap, obj: Handle<v12_heap::JsObject>, de
     }
 }
 
+/// Dictionary-rung analog: data entries read non-hole storage,
+/// accessors are always live.
+fn dict_entry_is_live(
+    heap: &v12_heap::Heap,
+    obj: Handle<v12_heap::JsObject>,
+    entry: &v12_heap::DictEntry,
+) -> bool {
+    if entry.is_accessor {
+        return true;
+    }
+    heap.get(obj)
+        .properties
+        .get(entry.slot as usize)
+        .is_some_and(|v| !v.is_hole())
+}
+
 pub fn object_has_own_property(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let this_obj = this.as_object().ok_or_else(|| ctx.type_error("TypeError: Object.prototype.hasOwnProperty called on non-object"))?;
     let key = args.first().copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key).map_err(Throw::Value)?;
+    // Dictionary rung first (overflow keys live only here).
+    if let Some((entry, _)) = crate::internal_methods::dict_lookup(ctx.heap, this_obj, pk) {
+        return Ok(JsValue::from_bool(dict_entry_is_live(
+            ctx.heap,
+            this_obj,
+            &entry,
+        )));
+    }
     let shape = ctx.heap.shape_of(this_obj);
     let found = ctx
         .heap
@@ -261,6 +296,19 @@ pub fn object_proto_property_is_enumerable(
     })?;
     let key_v = args.first().copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v).map_err(Throw::Value)?;
+    // Dictionary rung first (overflow keys live only here).
+    if let Some((entry, _)) = crate::internal_methods::dict_lookup(ctx.heap, obj, pk) {
+        if entry.is_accessor {
+            return Ok(JsValue::from_bool(entry.attrs.enumerable()));
+        }
+        let populated = ctx
+            .heap
+            .get(obj)
+            .properties
+            .get(entry.slot as usize)
+            .is_some_and(|v| !v.is_hole());
+        return Ok(JsValue::from_bool(populated && entry.attrs.enumerable()));
+    }
     let shape = ctx.heap.shape_of(obj);
     let enumerable = match ctx.heap.lookup_property(shape, pk) {
         Some(desc) if desc.is_data() => {
@@ -291,20 +339,32 @@ pub fn function_proto_to_string(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]
 
 /// Own string keys from the shape descriptors (the shape is authoritative:
 /// properties defined via [[DefineOwnProperty]] never touch the parallel
-/// `property_keys` vec).
+/// `property_keys` vec), plus dictionary-rung overflow keys in insertion
+/// order (the two stores never overlap).
 fn collect_own_string_keys(heap: &v12_heap::Heap, obj: Handle<v12_heap::JsObject>) -> Vec<Handle<V12Str>> {
     let shape = heap.shape_of(obj);
-    heap.get(shape)
+    let mut keys: Vec<Handle<V12Str>> = heap
+        .get(shape)
         .descriptors
         .as_slice()
         .iter()
         .filter_map(|d| d.key().string())
-        .collect()
+        .collect();
+    if let Some(map) = heap.get(obj).dictionary.as_ref() {
+        let mut overflow: Vec<(u32, Handle<V12Str>)> = map
+            .iter()
+            .filter_map(|(k, e)| k.string().map(|h| (e.seq, h)))
+            .collect();
+        overflow.sort_by_key(|&(seq, _)| seq);
+        keys.extend(overflow.into_iter().map(|(_, h)| h));
+    }
+    keys
 }
 
 fn collect_own_values(heap: &v12_heap::Heap, obj: Handle<v12_heap::JsObject>) -> Vec<JsValue> {
     let shape = heap.shape_of(obj);
-    heap.get(shape)
+    let mut vals: Vec<JsValue> = heap
+        .get(shape)
         .descriptors
         .as_slice()
         .iter()
@@ -313,12 +373,49 @@ fn collect_own_values(heap: &v12_heap::Heap, obj: Handle<v12_heap::JsObject>) ->
                 .and_then(|slot| heap.get(obj).properties.get(slot as usize))
                 .copied()
         })
-        .collect()
+        .collect();
+    // Overflow values in the same insertion order as the keys above, so
+    // `entries` zipping stays aligned. No hole filtering here either —
+    // the shape path includes holes positionally.
+    if let Some(map) = heap.get(obj).dictionary.as_ref() {
+        let mut overflow: Vec<(u32, JsValue)> = map
+            .iter()
+            .map(|(_, e)| {
+                (
+                    e.seq,
+                    heap.get(obj)
+                        .properties
+                        .get(e.slot as usize)
+                        .copied()
+                        .unwrap_or(JsValue::undefined()),
+                )
+            })
+            .collect();
+        overflow.sort_by_key(|&(seq, _)| seq);
+        vals.extend(overflow.into_iter().map(|(_, v)| v));
+    }
+    vals
 }
 
 fn property_key(ctx: &mut Ctx, v: JsValue) -> Result<PropKey, JsValue> {
     if let Some(h) = v.as_string() {
-        return Ok(PropKey::from_string(h));
+        // Intern: `PropKey` identity is handle identity, so a non-canonical
+        // handle (concat, slice, computed key) must alias the canonical
+        // instance or shape lookup misses. Flatten-once first, then a
+        // single `intern_string` over the flat storage.
+        ctx.heap.flatten(h);
+        let owned = match &ctx.heap.get(h).storage {
+            v12_heap::StrStorage::Latin1(bytes) => v12_heap::V12Str::latin1(bytes.clone()),
+            v12_heap::StrStorage::Utf16(units) => v12_heap::V12Str::utf16(units.clone()),
+            // Unreachable post-flatten (flatten materializes in place), but
+            // degrade gracefully instead of assuming it: re-read lossy text.
+            _ => v12_heap::V12Str::utf16(
+                helpers::string_text(&mut *ctx.heap, h)
+                    .encode_utf16()
+                    .collect(),
+            ),
+        };
+        return Ok(PropKey::from_string(ctx.heap.intern_string(owned)));
     }
     if let Some(sym) = v.as_symbol() {
         return Ok(PropKey::from_symbol(sym));
@@ -636,27 +733,51 @@ pub fn object_get_own_property_descriptor(
         Data { slot: u32, writable: bool, enumerable: bool, configurable: bool },
         Accessor { get: Option<v12_heap::Handle<v12_heap::JsObject>>, set: Option<v12_heap::Handle<v12_heap::JsObject>>, enumerable: bool, configurable: bool },
     }
-    let Some(desc) = ctx
-        .heap
-        .lookup_property(shape, pk)
-        .filter(|d| descriptor_is_live(ctx.heap, obj, d))
-    else {
-        return Ok(JsValue::undefined());
-    };
-    // Copy the descriptor out before any allocation (heap borrows nest).
-    let kind = if let Some(slot) = desc.slot() {
-        SlotKind::Data {
-            slot,
-            writable: desc.attrs().writable(),
-            enumerable: desc.attrs().enumerable(),
-            configurable: desc.attrs().configurable(),
+    // Dictionary rung first (overflow keys live only here), with the
+    // same liveness filter as the shape path below. Either arm resolves
+    // to a `SlotKind` for the shared tail.
+    let kind: SlotKind = if let Some((entry, _)) = crate::internal_methods::dict_lookup(ctx.heap, obj, pk) {
+        if !dict_entry_is_live(ctx.heap, obj, &entry) {
+            return Ok(JsValue::undefined());
+        }
+        if entry.is_accessor {
+            SlotKind::Accessor {
+                get: entry.getter,
+                set: entry.setter,
+                enumerable: entry.attrs.enumerable(),
+                configurable: entry.attrs.configurable(),
+            }
+        } else {
+            SlotKind::Data {
+                slot: entry.slot,
+                writable: entry.attrs.writable(),
+                enumerable: entry.attrs.enumerable(),
+                configurable: entry.attrs.configurable(),
+            }
         }
     } else {
-        SlotKind::Accessor {
-            get: desc.getter(),
-            set: desc.setter(),
-            enumerable: desc.attrs().enumerable(),
-            configurable: desc.attrs().configurable(),
+        let Some(desc) = ctx
+            .heap
+            .lookup_property(shape, pk)
+            .filter(|d| descriptor_is_live(ctx.heap, obj, d))
+        else {
+            return Ok(JsValue::undefined());
+        };
+        // Copy the descriptor out before any allocation (heap borrows nest).
+        if let Some(slot) = desc.slot() {
+            SlotKind::Data {
+                slot,
+                writable: desc.attrs().writable(),
+                enumerable: desc.attrs().enumerable(),
+                configurable: desc.attrs().configurable(),
+            }
+        } else {
+            SlotKind::Accessor {
+                get: desc.getter(),
+                set: desc.setter(),
+                enumerable: desc.attrs().enumerable(),
+                configurable: desc.attrs().configurable(),
+            }
         }
     };
     let d = ctx.alloc_obj(JsObject::default());

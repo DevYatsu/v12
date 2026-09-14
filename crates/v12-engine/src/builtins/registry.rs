@@ -373,9 +373,9 @@ pub(crate) fn error_object(
     super::builtin_install_prop(heap, obj, "name", JsValue::string(name_h));
     super::builtin_install_prop(heap, obj, "message", JsValue::string(msg_h));
     let ctor = global.and_then(|g| {
-        let idx = v12_bytecode::GLOBAL_INTRINSICS
-            .iter()
-            .position(|&n| n == kind)?;
+        // O(1) jump table over the fixed realm names (see `intrinsic_slot`
+        // below) — replaces the old `.position()` linear scan.
+        let idx = intrinsic_slot(kind)?;
         heap.get(g).properties.get(idx).copied()
     });
     if let Some(ctor) = ctor
@@ -391,6 +391,38 @@ pub(crate) fn error_object(
         }
     }
     JsValue::object(obj)
+}
+
+/// O(1) slot index for a `GLOBAL_INTRINSICS` name (compiler jump table).
+/// Indices mirror `v12_bytecode::GLOBAL_INTRINSICS` order; the
+/// `debug_assert!` pins each arm against the table so drift fails fast in
+/// test builds.
+fn intrinsic_slot(name: &str) -> Option<usize> {
+    let idx = match name {
+        "Object" => 0,
+        "Array" => 1,
+        "String" => 2,
+        "Number" => 3,
+        "Boolean" => 4,
+        "Math" => 5,
+        "JSON" => 6,
+        "Error" => 7,
+        "TypeError" => 8,
+        "RangeError" => 9,
+        "ReferenceError" => 10,
+        "SyntaxError" => 11,
+        "Promise" => 12,
+        "Symbol" => 13,
+        "Map" => 14,
+        "Set" => 15,
+        "RegExp" => 16,
+        "eval" => 17,
+        "console" => 18,
+        "globalThis" => 19,
+        _ => return None,
+    };
+    debug_assert!(v12_bytecode::GLOBAL_INTRINSICS.get(idx) == Some(&name));
+    Some(idx)
 }
 
 /// Builds a real `SyntaxError` object for an `eval` compile failure.

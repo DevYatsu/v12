@@ -225,7 +225,51 @@ pub fn string_match(
     }
 }
 
-/// `String.prototype.replace(regexp, replacement)` — regexp replace.
+/// Cap on the byte length of a `String.prototype.replace` result.
+///
+/// The spec allows strings up to 2^53−1 units, but this engine cannot
+/// realize multi-gigabyte strings: building them means unbounded `String`
+/// growth plus reallocation plus an interned duplicate. The conformance
+/// suite (`staging/sm/String/replace-math.js`) deliberately expands 1 MiB
+/// × a 64 KiB `"$1"`-repeat template toward 2^36 chars and accepts an
+/// OOM-style catch, so abort with a `RangeError` (catchable from JS)
+/// instead of stalling past the runner's hard-kill. 256 MiB sits far above
+/// any legitimate conformance string (~1 MiB via `puff`) and far below the
+/// test's 2^36 target.
+const MAX_REPLACE_LEN: u64 = 1 << 28;
+
+/// Byte length `expand_replacement` would produce, computed without
+/// building the string (saturating, so huge templates cannot overflow).
+fn expanded_len(template: &str, whole: &str, groups: &[&str]) -> u64 {
+    let whole_len = whole.len() as u64;
+    let mut len = 0u64;
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            len = len.saturating_add(c.len_utf8() as u64);
+            continue;
+        }
+        match chars.next() {
+            Some('$') => len = len.saturating_add(1),
+            Some('&') => len = len.saturating_add(whole_len),
+            Some(d @ '0'..='9') => {
+                let idx = d.to_digit(10).unwrap() as usize;
+                let sub = if idx == 0 {
+                    whole
+                } else if idx <= groups.len() {
+                    groups[idx - 1]
+                } else {
+                    ""
+                };
+                len = len.saturating_add(sub.len() as u64);
+            }
+            // `$` followed by anything else (or nothing) is literal.
+            Some(other) => len = len.saturating_add(1 + other.len_utf8() as u64),
+            None => len = len.saturating_add(1),
+        }
+    }
+    len
+}
 ///
 /// ES 22.2.6.11 subset: global regexps replace every match; otherwise only
 /// the first. The replacement is a string; `$&`, `$1`–`$9`, and `$$` are
@@ -259,16 +303,25 @@ pub fn string_replace(
     let mut out = String::new();
     let mut cursor = 0;
     for (s, e, groups) in spans {
-        out.push_str(&text[cursor..s]);
+        let gap = (s - cursor) as u64;
         let whole = &text[s..e];
-        out.push_str(&expand_replacement(
-            &replacement,
-            whole,
-            &groups
-                .iter()
-                .map(|g| g.as_deref().unwrap_or(""))
-                .collect::<Vec<_>>(),
-        ));
+        let group_refs = groups
+            .iter()
+            .map(|g| g.as_deref().unwrap_or(""))
+            .collect::<Vec<_>>();
+        // Project the post-splice length before allocating: a template of
+        // N `$1`s over a 1 MiB capture reaches tens of GiB, which must
+        // throw RangeError (catchable) rather than build + realloc + intern.
+        let expansion = expanded_len(&replacement, whole, &group_refs);
+        if (out.len() as u64)
+            .saturating_add(gap)
+            .saturating_add(expansion)
+            > MAX_REPLACE_LEN
+        {
+            return Err(ctx.range_error("RangeError: replace result exceeds maximum string length"));
+        }
+        out.push_str(&text[cursor..s]);
+        out.push_str(&expand_replacement(&replacement, whole, &group_refs));
         cursor = e;
     }
     out.push_str(&text[cursor..]);
@@ -284,15 +337,30 @@ fn replace_first_occurrence(
     replacement: &str,
 ) -> Result<JsValue, Throw> {
     let out = if needle.is_empty() {
+        if (replacement.len() as u64).saturating_add(text.len() as u64) > MAX_REPLACE_LEN {
+            return Err(ctx.range_error("RangeError: replace result exceeds maximum string length"));
+        }
         replacement.to_string() + text
     } else {
         match text.find(needle) {
-            Some(i) => format!(
-                "{}{}{}",
-                &text[..i],
-                expand_replacement(replacement, needle, &[]),
-                &text[i + needle.len()..]
-            ),
+            Some(i) => {
+                let expansion = expanded_len(replacement, needle, &[]);
+                if (text.len() as u64)
+                    .saturating_sub(needle.len() as u64)
+                    .saturating_add(expansion)
+                    > MAX_REPLACE_LEN
+                {
+                    return Err(ctx.range_error(
+                        "RangeError: replace result exceeds maximum string length",
+                    ));
+                }
+                format!(
+                    "{}{}{}",
+                    &text[..i],
+                    expand_replacement(replacement, needle, &[]),
+                    &text[i + needle.len()..]
+                )
+            }
             None => text.to_string(),
         }
     };

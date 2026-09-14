@@ -43,7 +43,9 @@
 //!   linearly, upgrading to a hash map beyond that.
 //! * [`Descriptors`] keeps up to eight entries directly on the shape; larger
 //!   layouts move to one exact-size boxed slice out-of-line (shapes are
-//!   immutable, so amortized-growth vectors buy nothing past construction).
+//!   immutable, so amortized-growth vectors buy nothing past construction)
+//!   plus a `key -> first position` hash index, so own-property reads stay
+//!   O(1) while writes (cold) keep their O(n) re-copy.
 //!
 //! [`Heap::add_property`]: crate::Heap::add_property
 //! [`Heap::add_shape_root`]: crate::Heap::add_shape_root
@@ -373,11 +375,12 @@ impl Transitions {
 pub const DESCRIPTORS_INLINE_CAP: usize = 8;
 
 /// Own-property records of one shape. Inline vector up to the cap, then a
-/// single exact-size boxed slice (module docs explain the tiering).
+/// single exact-size boxed slice plus its position index (module docs
+/// explain the tiering).
 #[derive(Clone, Debug)]
 pub enum Descriptors {
     Inline(Vec<Descriptor>),
-    OutOfLine(Box<[Descriptor]>),
+    OutOfLine(Box<[Descriptor]>, Box<rustc_hash::FxHashMap<PropKey, u32>>),
 }
 
 impl Default for Descriptors {
@@ -388,9 +391,10 @@ impl Default for Descriptors {
 
 impl Descriptors {
     /// Appends a descriptor, spilling out-of-line past the cap. Spill copies
-    /// the whole layout once into an exact-size boxed slice; further growth
-    /// re-copies (shapes are built incrementally but read for their entire
-    /// lifetime, so construction cost is amortized away).
+    /// the whole layout once into an exact-size boxed slice plus a
+    /// first-position index; further growth re-copies both (shapes are built
+    /// incrementally but read for their entire lifetime, so construction
+    /// cost is amortized away — writes stay O(n), reads go O(1)).
     pub fn push(&mut self, descriptor: Descriptor) {
         match self {
             Descriptors::Inline(vec) => {
@@ -401,13 +405,15 @@ impl Descriptors {
                 let mut flat = Vec::with_capacity(DESCRIPTORS_INLINE_CAP + 1);
                 flat.append(vec);
                 flat.push(descriptor);
-                *self = Descriptors::OutOfLine(flat.into_boxed_slice());
+                let (slice, index) = indexed(flat);
+                *self = Descriptors::OutOfLine(slice, index);
             }
-            Descriptors::OutOfLine(slice) => {
+            Descriptors::OutOfLine(slice, _) => {
                 let mut flat = Vec::with_capacity(slice.len() + 1);
                 flat.extend_from_slice(slice);
                 flat.push(descriptor);
-                *self = Descriptors::OutOfLine(flat.into_boxed_slice());
+                let (boxed, index) = indexed(flat);
+                *self = Descriptors::OutOfLine(boxed, index);
             }
         }
     }
@@ -416,7 +422,7 @@ impl Descriptors {
     pub fn len(&self) -> usize {
         match self {
             Descriptors::Inline(vec) => vec.len(),
-            Descriptors::OutOfLine(slice) => slice.len(),
+            Descriptors::OutOfLine(slice, _) => slice.len(),
         }
     }
 
@@ -427,15 +433,28 @@ impl Descriptors {
 
     /// The descriptor for `key` within this shape alone (no parent walk; see
     /// [`Shape::find_descriptor`] for chain-aware lookup).
+    ///
+    /// Inline tier scans linearly (fits a cache line); the out-of-line tier
+    /// answers from the position index in O(1).
     pub fn find(&self, key: PropKey) -> Option<&Descriptor> {
-        self.as_slice().iter().find(|d| d.key() == key)
+        match self {
+            Descriptors::Inline(vec) => vec.iter().find(|d| d.key() == key),
+            Descriptors::OutOfLine(slice, index) => {
+                let &pos = index.get(&key)?;
+                // The index names the first position holding `key`
+                // (first-wins, mirroring the linear scan). Re-checking the
+                // key pins the invariant even if construction ever desyncs:
+                // never a wrong descriptor, at worst a miss.
+                slice.get(pos as usize).filter(|d| d.key() == key)
+            }
+        }
     }
 
     /// All descriptors, cheapest slice view.
     pub fn as_slice(&self) -> &[Descriptor] {
         match self {
             Descriptors::Inline(vec) => vec,
-            Descriptors::OutOfLine(slice) => slice,
+            Descriptors::OutOfLine(slice, _) => slice,
         }
     }
 
@@ -443,9 +462,34 @@ impl Descriptors {
         let unit = core::mem::size_of::<Descriptor>();
         match self {
             Descriptors::Inline(vec) => vec.capacity() * unit,
-            Descriptors::OutOfLine(slice) => slice.len() * unit,
+            Descriptors::OutOfLine(slice, index) => {
+                slice.len() * unit
+                    + index.capacity()
+                        * (core::mem::size_of::<PropKey>() + core::mem::size_of::<u32>())
+            }
         }
     }
+}
+
+/// Boxes a descriptor layout with its position index: `key` maps to the
+/// FIRST position holding it. First-wins preserves linear-`find` semantics
+/// exactly — duplicate keys arise when reconfiguration forks a sibling edge
+/// (`add_property` keys on transitions, not descriptors), so overwriting
+/// with the later position would change which descriptor `find` returns.
+fn indexed(
+    flat: Vec<Descriptor>,
+) -> (
+    Box<[Descriptor]>,
+    Box<rustc_hash::FxHashMap<PropKey, u32>>,
+) {
+    let mut index = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        flat.len(),
+        rustc_hash::FxBuildHasher,
+    );
+    for (i, d) in flat.iter().enumerate() {
+        index.entry(d.key()).or_insert(i as u32);
+    }
+    (flat.into_boxed_slice(), Box::new(index))
 }
 
 /// Handle to a validity cell: a version stamp watching one prototype
@@ -557,7 +601,8 @@ impl Shape {
     /// therefore pure redundancy, and worse: since each node repeats the whole
     /// ancestor list, a miss re-scanned the same keys once per ancestor
     /// (cubic in chain depth). A single scan of `self.descriptors` is
-    /// equivalent and linear.
+    /// equivalent and linear — and past the inline cap the position index
+    /// answers it in O(1) (see [`Descriptors::find`]).
     pub fn find_descriptor<'a>(&'a self, key: PropKey) -> Option<&'a Descriptor> {
         self.descriptors.find(key)
     }
@@ -758,7 +803,7 @@ mod tests {
         shape = heap.add_property(shape, keys[DESCRIPTORS_INLINE_CAP], Attrs::DEFAULT);
         assert!(matches!(
             heap.get(shape).descriptors,
-            Descriptors::OutOfLine(_)
+            Descriptors::OutOfLine(_, _)
         ));
 
         // …and further adds keep working off the boxed slice.
@@ -766,7 +811,7 @@ mod tests {
             shape = heap.add_property(shape, k, Attrs::DEFAULT);
             assert!(matches!(
                 heap.get(shape).descriptors,
-                Descriptors::OutOfLine(_)
+                Descriptors::OutOfLine(_, _)
             ));
         }
         assert_eq!(heap.get(shape).num_own, DESCRIPTORS_INLINE_CAP as u32 + 4);
@@ -780,6 +825,86 @@ mod tests {
                 Some(slot as u32)
             );
         }
+    }
+
+    #[test]
+    fn descriptors_index_returns_first_match_on_duplicate_keys() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let base = heap.root_shape();
+        // Nine distinct keys spill the layout out-of-line…
+        let keys: Vec<PropKey> = (0..(DESCRIPTORS_INLINE_CAP as u32 + 1))
+            .map(|i| PropKey::from_parts(false, i * 13 + 1))
+            .collect();
+        let mut shape = base;
+        for &k in &keys {
+            shape = heap.add_property(shape, k, Attrs::DEFAULT);
+        }
+        assert!(matches!(
+            heap.get(shape).descriptors,
+            Descriptors::OutOfLine(_, _)
+        ));
+        // …then re-adding an existing key with different attrs forks a
+        // sibling edge whose descriptor list repeats the key (transitions
+        // key on (key, attrs), never descriptors).
+        let dup = keys[3];
+        let forked = heap.add_property(shape, dup, Attrs::new(false, true, true));
+        assert_eq!(heap.get(forked).descriptors.len(), keys.len() + 1);
+        // Linear-scan semantics: the FIRST descriptor wins (original slot
+        // and attrs, not the fork's).
+        assert_eq!(
+            heap.get(forked).descriptors.find(dup).and_then(|d| d.slot()),
+            Some(3)
+        );
+        assert_eq!(
+            heap.lookup_property(forked, dup).and_then(|d| d.slot()),
+            Some(3)
+        );
+        assert_eq!(
+            heap.get(forked).descriptors.find(dup).map(|d| d.attrs()),
+            Some(Attrs::DEFAULT)
+        );
+    }
+
+    #[test]
+    fn descriptors_index_survives_attr_and_accessor_rebuilds() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let base = heap.root_shape();
+        let keys: Vec<PropKey> = (0..(DESCRIPTORS_INLINE_CAP as u32 + 2))
+            .map(|i| PropKey::from_parts(false, i * 17 + 5))
+            .collect();
+        let mut shape = base;
+        for &k in &keys {
+            shape = heap.add_property(shape, k, Attrs::DEFAULT);
+        }
+        // Attribute reconfiguration rebuilds the list (replace, not append).
+        let narrowed = heap.update_data_attrs(shape, keys[2], Attrs::new(true, false, false));
+        assert_eq!(heap.get(narrowed).descriptors.len(), keys.len());
+        let d = heap
+            .lookup_property(narrowed, keys[2])
+            .expect("reconfigured key resolves");
+        assert_eq!(
+            (d.slot(), d.attrs()),
+            (Some(2), Attrs::new(true, false, false))
+        );
+        // Late keys still resolve; absent keys miss through the index.
+        assert_eq!(
+            heap.lookup_property(narrowed, keys[keys.len() - 1])
+                .and_then(|d| d.slot()),
+            Some(keys.len() as u32 - 1)
+        );
+        let absent = PropKey::from_parts(false, 0x5eed);
+        assert_eq!(heap.lookup_property(narrowed, absent), None);
+        // Accessor definition on a large shape keeps the index usable.
+        let fresh = PropKey::from_parts(false, 0xacce55);
+        let acc = heap.define_accessor(shape, fresh, None, None, Attrs::DEFAULT);
+        let d = heap
+            .lookup_property(acc, fresh)
+            .expect("accessor resolves");
+        assert!(d.is_accessor());
+        assert_eq!(
+            heap.lookup_property(acc, keys[0]).and_then(|d| d.slot()),
+            Some(0)
+        );
     }
 
     #[test]

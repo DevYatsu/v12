@@ -263,6 +263,9 @@ impl Interp<'_> {
         );
         let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed);
 
+        // Display snapshot for the fresh frame (bounded O(8) walk; calls
+        // are cold, slot accesses hot).
+        let env_display = self.env_display_for(captured_env);
         self.frames.push(Frame {
             fn_idx: target_idx,
             program: callee_program,
@@ -270,6 +273,7 @@ impl Interp<'_> {
             base: new_base,
             max_regs: callee_max_regs,
             env: captured_env,
+            env_display,
             generator: None,
             yield_dst: None,
             new_target: None,
@@ -370,6 +374,7 @@ impl Interp<'_> {
                     callee_rest_reg,
                 );
                 let frame_args = self.frame_arguments_for(fn_idx, func_program, args);
+                let env_display = self.env_display_for(captured_env);
                 self.frames.push(Frame {
                     fn_idx,
                     program: func_program,
@@ -377,6 +382,7 @@ impl Interp<'_> {
                     base: new_base,
                     max_regs: callee_max_regs,
                     env: captured_env,
+                    env_display,
                     generator: None,
                     yield_dst: None,
                     new_target: None,
@@ -484,6 +490,7 @@ impl Interp<'_> {
                     callee_rest_reg,
                 );
                 let frame_args = self.frame_arguments_for(fn_idx, func_program, args);
+                let env_display = self.env_display_for(captured_env);
                 self.frames.push(Frame {
                     fn_idx,
                     program: func_program,
@@ -491,6 +498,7 @@ impl Interp<'_> {
                     base: new_base,
                     max_regs: callee_max_regs,
                     env: captured_env,
+                    env_display,
                     generator: None,
                     yield_dst: None,
                     new_target: None,
@@ -810,9 +818,10 @@ impl Interp<'_> {
             .global
             .or_else(|| self.heap.realm_globals().first().copied());
         if let Some(global) = global {
-            let slot = v12_bytecode::GLOBAL_INTRINSICS
-                .iter()
-                .position(|&n| n == kind);
+            // O(1) jump table over the fixed realm names (the shared
+            // `super::intrinsic_slot`) — replaces the old `.position()`
+            // linear scan over `GLOBAL_INTRINSICS`.
+            let slot = super::intrinsic_slot(kind);
             if let Some(idx) = slot {
                 let ctor_v = self
                     .heap
@@ -988,6 +997,7 @@ impl Interp<'_> {
             }
         }
         let frame_args = self.frame_arguments_for(target_idx, callee_program, &elements);
+        let env_display = self.env_display_for(captured_env);
         self.frames.push(Frame {
             fn_idx: target_idx,
             program: callee_program,
@@ -995,6 +1005,7 @@ impl Interp<'_> {
             base: new_base,
             max_regs: callee_max_regs,
             env: captured_env,
+            env_display,
             generator: None,
             yield_dst: None,
             new_target: None,
@@ -1202,13 +1213,16 @@ impl Interp<'_> {
         }
 
         let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed);
+        let captured_env = self.heap.get(callee_obj).captured_env;
+        let env_display = self.env_display_for(captured_env);
         self.frames.push(Frame {
             fn_idx: target_idx,
             program: callee_program,
             pc: 0,
             base: new_base,
             max_regs: callee_max_regs,
-            env: self.heap.get(callee_obj).captured_env,
+            env: captured_env,
+            env_display,
             generator: None,
             yield_dst: None,
             new_target: Some(callee_v),

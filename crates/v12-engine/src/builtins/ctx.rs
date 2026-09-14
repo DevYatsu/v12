@@ -14,6 +14,38 @@ use v12_native::Throw;
 use super::helpers;
 use crate::job_queue::Job;
 
+/// O(1) slot index for a `GLOBAL_INTRINSICS` name (compiler jump table).
+/// Indices mirror `v12_bytecode::GLOBAL_INTRINSICS` order; the
+/// `debug_assert!` pins each arm against the table so drift fails fast in
+/// test builds.
+fn intrinsic_slot(name: &str) -> Option<usize> {
+    let idx = match name {
+        "Object" => 0,
+        "Array" => 1,
+        "String" => 2,
+        "Number" => 3,
+        "Boolean" => 4,
+        "Math" => 5,
+        "JSON" => 6,
+        "Error" => 7,
+        "TypeError" => 8,
+        "RangeError" => 9,
+        "ReferenceError" => 10,
+        "SyntaxError" => 11,
+        "Promise" => 12,
+        "Symbol" => 13,
+        "Map" => 14,
+        "Set" => 15,
+        "RegExp" => 16,
+        "eval" => 17,
+        "console" => 18,
+        "globalThis" => 19,
+        _ => return None,
+    };
+    debug_assert!(v12_bytecode::GLOBAL_INTRINSICS.get(idx) == Some(&name));
+    Some(idx)
+}
+
 /// Canonical builtin signature (plan §1.2). Bodies migrate to this in §5 step 3+.
 pub type BuiltinFn = fn(&mut Ctx, JsValue, &[JsValue]) -> Result<JsValue, Throw>;
 
@@ -68,12 +100,14 @@ impl<'a> Ctx<'a> {
 
     /// Reads a realm intrinsic by its `GLOBAL_INTRINSICS` name (never a
     /// hardcoded `properties.get(idx)` at the call site).
+    ///
+    /// O(1): `intrinsic_slot` is a compiler jump table over the fixed
+    /// 20-name realm table — no `.position()` linear scan, no string
+    /// compares on the hot builtin path.
     #[must_use]
     pub fn intrinsic(&self, name: &str) -> Option<JsValue> {
         let global = self.global?;
-        let idx = v12_bytecode::GLOBAL_INTRINSICS
-            .iter()
-            .position(|&n| n == name)?;
+        let idx = intrinsic_slot(name)?;
         self.heap.get(global).properties.get(idx).copied()
     }
 

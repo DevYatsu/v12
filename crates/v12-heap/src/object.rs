@@ -161,6 +161,17 @@ pub struct JsObject {
     pub validity_cell: ValidityCellId,
     pub private_brand: Option<u32>,
     pub private_fields: Option<Box<rustc_hash::FxHashMap<u32, crate::JsValue>>>,
+    /// Named-property dictionary rung (`None` = shape-backed mode). Past
+    /// the spill threshold, overflow properties live here instead of
+    /// forking ever-larger shapes; reads stay O(1) via the map while the
+    /// frozen shape keeps serving the base properties. Values live in
+    /// `properties` at the recorded slot, so value tracing is unchanged.
+    pub dictionary: Option<Box<rustc_hash::FxHashMap<crate::PropKey, DictEntry>>>,
+    /// Next insertion sequence for [`DictEntry::seq`]: the base shape's
+    /// `num_own` at spill time, then one per dictionary insert. Preserves
+    /// enumeration order once the hash map stops reflecting it.
+    /// Meaningless while `dictionary` is `None`.
+    pub dict_seq: u32,
     /// Arguments exotic mapping: `Some(map)` where `map[i]` is `Some(slot)`
     /// when indexed property `i` is aliased to the `slot`-th parameter slot,
     /// `None` for mapped holes and `None` for unmapped (strict) arguments.
@@ -190,9 +201,34 @@ impl Default for JsObject {
             validity_cell: ValidityCellId::NONE,
             private_brand: None,
             private_fields: None,
+            dictionary: None,
+            dict_seq: 0,
             arguments_mapped: None,
         }
     }
+}
+
+/// One named-property dictionary record: the value slot in `properties`
+/// plus the attributes (and accessor halves) a shape descriptor would
+/// carry. Values stay in `properties` so value tracing is unchanged;
+/// only getter/setter handles need explicit tracing (see `Trace` below).
+/// `seq` is the insertion sequence, preserving enumeration order once
+/// the hash map stops reflecting insertion order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictEntry {
+    /// Index into the owner's `properties` vector.
+    pub slot: u32,
+    /// Property attributes (writable/enumerable/configurable).
+    pub attrs: crate::shape::Attrs,
+    /// Getter for accessor entries (`None` for data entries).
+    pub getter: Option<Handle<JsObject>>,
+    /// Setter for accessor entries (`None` for data entries and
+    /// setter-less accessors).
+    pub setter: Option<Handle<JsObject>>,
+    /// True for accessor entries; data entries read `slot`.
+    pub is_accessor: bool,
+    /// Insertion sequence (see `JsObject::dict_seq`).
+    pub seq: u32,
 }
 
 impl JsObject {
@@ -774,6 +810,11 @@ impl SizeEstimate for JsObject {
             + self.property_keys.capacity() * core::mem::size_of::<Option<crate::PropKey>>()
             + self.elements_array.retained_bytes()
             + mapped
+            + self.dictionary.as_ref().map_or(0, |d| {
+                d.capacity()
+                    * (core::mem::size_of::<crate::PropKey>()
+                        + core::mem::size_of::<DictEntry>())
+            })
     }
 }
 
@@ -806,6 +847,18 @@ impl Trace for JsObject {
         if let Some(m) = &self.private_fields {
             for v in m.values() {
                 v.trace(sink);
+            }
+        }
+        // Dictionary entries name no values directly (slots read through
+        // `properties`, traced above); only accessor halves need marking.
+        if let Some(d) = &self.dictionary {
+            for e in d.values() {
+                if let Some(g) = e.getter {
+                    sink.mark_object(g);
+                }
+                if let Some(s) = e.setter {
+                    sink.mark_object(s);
+                }
             }
         }
     }

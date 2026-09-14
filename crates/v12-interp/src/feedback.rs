@@ -13,7 +13,7 @@
 //! selected bytecodes (arithmetic results, property loads). The lattice
 //! drives guard selection in `v12-jit-opt`.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use v12_heap::{JsValue, PropKey, ShapeHandle};
 
@@ -239,16 +239,44 @@ impl Lattice {
 
 /// Feedback state for one program function. Allocated lazily on first
 /// execution; counters saturate so long-running loops stop asking.
-#[derive(Default)]
+///
+/// Site tables are `FxHashMap` (no SipHash DOS-resistance overhead on
+/// this single-mutator hot path), pre-sized for a typical handful of
+/// sites so the common case never rehashes. A `Vec` indexed by pc was
+/// considered and rejected: pcs are bytecode offsets with variable
+/// widths, not dense site-ids, so a flat table would sparse-allocate per
+/// function for no lookup win over Fx hashing.
 pub struct FeedbackVector {
     /// Inline caches keyed by the pc of their `GetProperty` instruction.
-    pub ics: HashMap<u32, PolyIc>,
+    pub ics: FxHashMap<u32, PolyIc>,
     /// Per-opcode type feedback keyed by bytecode pc.
-    pub type_feedback: HashMap<u32, Lattice>,
+    pub type_feedback: FxHashMap<u32, Lattice>,
     /// Saturating count of loop-header crossings.
     pub loop_counter: u16,
     /// Saturating count of activations.
     pub entry_counter: u16,
+}
+
+/// Pre-sized site-table capacity: covers the usual handful of
+/// property/type sites per function without a first-insert rehash, while
+/// staying small enough that cold one-shot functions cost almost nothing.
+const SITE_TABLE_RESERVE: usize = 8;
+
+impl Default for FeedbackVector {
+    fn default() -> Self {
+        Self {
+            ics: FxHashMap::with_capacity_and_hasher(
+                SITE_TABLE_RESERVE,
+                rustc_hash::FxBuildHasher,
+            ),
+            type_feedback: FxHashMap::with_capacity_and_hasher(
+                SITE_TABLE_RESERVE,
+                rustc_hash::FxBuildHasher,
+            ),
+            loop_counter: 0,
+            entry_counter: 0,
+        }
+    }
 }
 
 impl FeedbackVector {

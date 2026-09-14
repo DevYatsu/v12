@@ -369,6 +369,9 @@ impl Interp<'_> {
         if (yield_dst as usize) < usize::from(f_max_regs) {
             self.stack[new_base + usize::from(yield_dst)] = value;
         }
+        // Display snapshot from the generator's live env chain (rebuilt
+        // fresh at each resume; the chain may have grown before the yield).
+        let env_display = self.env_display_for(env);
         self.frames.push(Frame {
             fn_idx,
             program: gen_program,
@@ -376,6 +379,7 @@ impl Interp<'_> {
             base: new_base,
             max_regs: f_max_regs,
             env,
+            env_display,
             generator: Some(r#gen),
             yield_dst: None,
             new_target: None,

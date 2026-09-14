@@ -510,6 +510,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.load_str(value_key, "value", span)?;
         let value = self.new_temp();
         self.emit_reg3(Opcode::GetProperty, value, result, value_key, span);
+        // for-await: await result.value so a rejected value promise throws
+        // here (inside the IteratorClose try range) instead of being bound
+        // silently and looping forever.
+        if f.r#await {
+            let awaited = self.new_temp();
+            self.emit_reg3(Opcode::Await, awaited, value, 0, span);
+            self.move_reg(value, awaited, span);
+        }
         match &f.left {
             oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
                 if v.declarations.len() != 1 {

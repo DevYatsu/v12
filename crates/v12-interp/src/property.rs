@@ -8,7 +8,12 @@ use v12_heap::{
 
 use super::{
     child_slot, Interp, JSException, RegExpSlot, ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET,
-    OBJECT_IDX, PROMISE_IDX, REGEXP_IDX, SYMBOL_IDX,
+    OBJECT_IDX, PROMISE_IDX, REGEXP_IDX, SYMBOL_IDX, WK_ADD, WK_APPLY, WK_BIND, WK_CALL,
+    WK_CATCH, WK_CLEAR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES, WK_ENUMERABLE_OWN_KEYS,
+    WK_FLAGS, WK_FOR_EACH, WK_GET, WK_GET_PROTOTYPE_OF, WK_HAS, WK_HAS_OWN_PROPERTY, WK_IS_ARRAY,
+    WK_ITERATOR, WK_KEYS, WK_LAST_INDEX, WK_LENGTH, WK_LOG, WK_NEXT, WK_PROTOTYPE, WK_REJECT,
+    WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN, WK_THROW, WK_TO_STRING, WK_VALUE_OF,
+    WK_VALUES,
 };
 use v12_native::NativeId;
 use crate::ops;
@@ -36,26 +41,58 @@ impl Interp<'_> {
                 "TypeError: Cannot read properties of {base} (reading '{key_text}')"
             ))));
         }
-        let Some(obj) = obj_v.as_object() else {
-            return self.string_prim_surface(obj_v, key_v);
+        // Flatten-once: every surface probe below reads flat storage, so one
+        // in-place flatten here replaces up to ~15 re-materializations.
+        self.flatten_key(key_v);
+        // Intern-once: string keys canonicalize here; every surface below
+        // integer-compares this key and `ic_lookup` reuses it — no second
+        // hash/alloc per access. Non-string keys stay `None` (their
+        // coercion defers to `ic_lookup`, and no surface matches them).
+        let key: Option<PropKey> = match key_v.as_string() {
+            Some(h) => {
+                let units = ops::string_units(self.heap, h);
+                Some(PropKey::from_string(
+                    self.heap.intern_string(v12_heap::V12Str::utf16(units)),
+                ))
+            }
+            None => None,
         };
+        let Some(obj) = obj_v.as_object() else {
+            return self.string_prim_surface(obj_v, key_v, key);
+        };
+        // Cheapest-integer-first: the canonical-index probe runs before any
+        // surface. Kind-guarded to Array/Arguments, so other receivers flow
+        // through unchanged; for index keys on arrays every later surface
+        // answers `None` (method tables hold no digit names) while the old
+        // code always resolved them at `element_surface` — same answer,
+        // reached in one probe instead of ~15.
+        let kind = self.heap.get(obj).kind;
+        if (kind == Kind::Array || kind == Kind::Arguments)
+            && let Some(idx) = self.array_index_of(key_v)
+        {
+            // Integer-index reads come from the element store (mapped
+            // arguments indices mirror the parameter slot; v1 returns the
+            // element — the param alias is exercised via the mapped array
+            // in heap tests).
+            return Ok(self.array_element(obj, idx));
+        }
         // Structural fast-path surfaces, probed in a fixed order. Each helper
         // recognizes one `(receiver, key)` surface and answers the read, or
         // returns `None` to defer to the next; the shape-bound lookup with the
         // inline cache runs only when no surface matches.
-        if let Some(answer) = self.console_log_surface(obj, key_v) {
+        if let Some(answer) = self.console_log_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.symbol_iterator_surface(obj, key_v) {
+        if let Some(answer) = self.symbol_iterator_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.promise_surface(obj, key_v) {
+        if let Some(answer) = self.promise_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.object_statics_surface(obj, key_v) {
+        if let Some(answer) = self.object_statics_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.generator_surface(obj, key_v) {
+        if let Some(answer) = self.generator_surface(obj, key) {
             return answer;
         }
         if let Some(answer) = self.well_known_iterator_surface(obj, key_v) {
@@ -64,31 +101,28 @@ impl Interp<'_> {
         if let Some(answer) = self.iterator_method_surface(obj, key_v) {
             return answer;
         }
-        if let Some(answer) = self.regexp_surface(obj, key_v) {
+        if let Some(answer) = self.regexp_surface(obj, key_v, key) {
             return answer;
         }
-        if let Some(answer) = self.array_statics_surface(obj, key_v) {
+        if let Some(answer) = self.array_statics_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.function_method_surface(obj, key_v) {
+        if let Some(answer) = self.function_method_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.object_proto_surface(obj, key_v) {
+        if let Some(answer) = self.object_proto_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.regexp_prototype_surface(obj, key_v) {
+        if let Some(answer) = self.regexp_prototype_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.array_instance_surface(obj, key_v) {
+        if let Some(answer) = self.array_instance_surface(obj, key_v, key) {
             return answer;
         }
-        if let Some(answer) = self.element_surface(obj, key_v) {
+        if let Some(answer) = self.map_set_surface(obj, key) {
             return answer;
         }
-        if let Some(answer) = self.map_set_surface(obj, key_v) {
-            return answer;
-        }
-        self.ic_lookup(site_fn, site_pc, obj, key_v)
+        self.ic_lookup(site_fn, site_pc, obj, key_v, key)
     }
 
     /// String primitives synthesize the regexp method surface (`match`/
@@ -100,6 +134,7 @@ impl Interp<'_> {
         &mut self,
         obj_v: JsValue,
         key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Result<JsValue, JSException> {
         let kind = if obj_v.is_string() {
             Kind::StringPrim
@@ -120,7 +155,7 @@ impl Interp<'_> {
         // `String.prototype.length`: UTF-16 code-unit count, so an astral
         // character (surrogate pair) contributes 2. `V12Str::len` already
         // counts units, not code points — read it directly.
-        if kind == Kind::StringPrim && self.key_is(key_v, "length") {
+        if kind == Kind::StringPrim && self.key_is_wk(key, WK_LENGTH) {
             let h = obj_v.as_string().expect("string primitive has a handle");
             let len = self.heap.get(h).len();
             return Ok(ops::box_number(len as f64));
@@ -134,7 +169,7 @@ impl Interp<'_> {
     pub(crate) fn console_log_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         let console_idx = CONSOLE_IDX;
         let (Some(g), Some(console_idx)) = (self.global, console_idx) else {
@@ -147,7 +182,7 @@ impl Interp<'_> {
                 .get(console_idx)
                 .and_then(|v| v.as_object())
         }?;
-        if obj != console_obj || !self.key_is(key_v, "log") {
+        if obj != console_obj || !self.key_is_wk(key, WK_LOG) {
             return None;
         }
         Some(Ok(self.console_log_fn()))
@@ -159,7 +194,7 @@ impl Interp<'_> {
     pub(crate) fn symbol_iterator_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         let symbol_idx = SYMBOL_IDX;
         let (Some(g), Some(symbol_idx)) = (self.global, symbol_idx) else {
@@ -172,7 +207,7 @@ impl Interp<'_> {
                 .get(symbol_idx)
                 .and_then(|v| v.as_object())
         }?;
-        if obj != symbol_ctor || !self.key_is(key_v, "iterator") {
+        if obj != symbol_ctor || !self.key_is_wk(key, WK_ITERATOR) {
             return None;
         }
         Some(Ok(JsValue::symbol(self.symbol_iterator_key())))
@@ -189,7 +224,7 @@ impl Interp<'_> {
     pub(crate) fn promise_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         let promise_idx = PROMISE_IDX;
         let (Some(g), Some(promise_idx)) = (self.global, promise_idx) else {
@@ -203,10 +238,10 @@ impl Interp<'_> {
                 .and_then(|v| v.as_object())
         }?;
         if obj == promise_ctor {
-            if self.key_is(key_v, "resolve") {
+            if self.key_is_wk(key, WK_RESOLVE) {
                 return Some(Ok(self.cached_native(NativeId::PromiseResolve)));
             }
-            if self.key_is(key_v, "reject") {
+            if self.key_is_wk(key, WK_REJECT) {
                 return Some(Ok(self.cached_native(NativeId::PromiseReject)));
             }
             return None;
@@ -216,10 +251,10 @@ impl Interp<'_> {
         // link — the interp has no realm handle at allocation time), so
         // prototype matching would miss `.then`/`.catch` on them.
         if self.is_promise(JsValue::object(obj)) {
-            if self.key_is(key_v, "then") {
+            if self.key_is_wk(key, WK_THEN) {
                 return Some(Ok(self.cached_native(NativeId::PromiseThen)));
             }
-            if self.key_is(key_v, "catch") {
+            if self.key_is_wk(key, WK_CATCH) {
                 return Some(Ok(self.cached_native(NativeId::PromiseCatch)));
             }
         }
@@ -233,7 +268,7 @@ impl Interp<'_> {
     pub(crate) fn object_statics_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         let object_idx = OBJECT_IDX;
         let (Some(g), Some(object_idx)) = (self.global, object_idx) else {
@@ -249,20 +284,20 @@ impl Interp<'_> {
         if obj != object_ctor {
             return None;
         }
-        if self.key_is(key_v, "enumerableOwnKeys") {
+        if self.key_is_wk(key, WK_ENUMERABLE_OWN_KEYS) {
             return Some(Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys)));
         }
-        let constant = if self.key_is(key_v, "create") {
+        let constant = if self.key_is_wk(key, WK_CREATE) {
             NativeId::ObjectCreate
-        } else if self.key_is(key_v, "getPrototypeOf") {
+        } else if self.key_is_wk(key, WK_GET_PROTOTYPE_OF) {
             NativeId::ObjectGetPrototypeOf
-        } else if self.key_is(key_v, "defineProperty") {
+        } else if self.key_is_wk(key, WK_DEFINE_PROPERTY) {
             NativeId::ObjectDefineProperty
-        } else if self.key_is(key_v, "keys") {
+        } else if self.key_is_wk(key, WK_KEYS) {
             NativeId::ObjectKeys
-        } else if self.key_is(key_v, "values") {
+        } else if self.key_is_wk(key, WK_VALUES) {
             NativeId::ObjectValues
-        } else if self.key_is(key_v, "entries") {
+        } else if self.key_is_wk(key, WK_ENTRIES) {
             NativeId::ObjectEntries
         } else {
             return None;
@@ -274,16 +309,16 @@ impl Interp<'_> {
     pub(crate) fn generator_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         if self.heap.get(obj).kind != Kind::Generator {
             return None;
         }
-        let constant = if self.key_is(key_v, "next") {
+        let constant = if self.key_is_wk(key, WK_NEXT) {
             NativeId::GeneratorNext
-        } else if self.key_is(key_v, "return") {
+        } else if self.key_is_wk(key, WK_RETURN) {
             NativeId::GeneratorReturn
-        } else if self.key_is(key_v, "throw") {
+        } else if self.key_is_wk(key, WK_THROW) {
             NativeId::GeneratorThrow
         } else {
             return None;
@@ -335,6 +370,7 @@ impl Interp<'_> {
         &mut self,
         obj: Handle<JsObject>,
         key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         if self.heap.get(obj).kind != Kind::RegExp {
             return None;
@@ -342,19 +378,20 @@ impl Interp<'_> {
         if let Some(id) = self.method_native(Kind::RegExp, key_v) {
             return Some(Ok(self.map_set_method(id)));
         }
-        let slot = self.regexp_slot(key_v)?;
+        let slot = self.regexp_slot(key)?;
         let value = self.heap.get(obj).properties.get(slot as usize).copied()?;
         Some(Ok(value))
     }
 
     /// Which internal-slot property a key names on a RegExp object. Slots
     /// live at fixed positions in `properties` (see [`RegExpSlot`]).
-    pub(crate) fn regexp_slot(&mut self, key_v: JsValue) -> Option<RegExpSlot> {
-        if self.key_is(key_v, "source") {
+    /// Integer compares on the entry-interned key — no memcmp.
+    pub(crate) fn regexp_slot(&mut self, key: Option<PropKey>) -> Option<RegExpSlot> {
+        if self.key_is_wk(key, WK_SOURCE) {
             Some(RegExpSlot::Source)
-        } else if self.key_is(key_v, "flags") {
+        } else if self.key_is_wk(key, WK_FLAGS) {
             Some(RegExpSlot::Flags)
-        } else if self.key_is(key_v, "lastIndex") {
+        } else if self.key_is_wk(key, WK_LAST_INDEX) {
             Some(RegExpSlot::LastIndex)
         } else {
             None
@@ -364,7 +401,7 @@ impl Interp<'_> {
     pub(crate) fn array_statics_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         let array_idx = ARRAY_IDX;
         let (Some(g), Some(array_idx)) = (self.global, array_idx) else {
@@ -377,7 +414,7 @@ impl Interp<'_> {
                 .get(array_idx)
                 .and_then(|v| v.as_object())
         }?;
-        if obj != array_ctor || !self.key_is(key_v, "isArray") {
+        if obj != array_ctor || !self.key_is_wk(key, WK_IS_ARRAY) {
             return None;
         }
         Some(Ok(self.map_set_method(NativeId::ArrayIsArray)))
@@ -387,22 +424,22 @@ impl Interp<'_> {
     pub(crate) fn function_method_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         if self.heap.get(obj).kind != Kind::Function {
             return None;
         }
-        let constant = if self.key_is(key_v, "call") {
+        let constant = if self.key_is_wk(key, WK_CALL) {
             NativeId::FunctionCall
-        } else if self.key_is(key_v, "apply") {
+        } else if self.key_is_wk(key, WK_APPLY) {
             NativeId::FunctionApply
-        } else if self.key_is(key_v, "bind") {
+        } else if self.key_is_wk(key, WK_BIND) {
             NativeId::FunctionBind
-        } else if self.key_is(key_v, "toString") {
+        } else if self.key_is_wk(key, WK_TO_STRING) {
             NativeId::FunctionProtoToString
-        } else if self.key_is(key_v, "valueOf") {
+        } else if self.key_is_wk(key, WK_VALUE_OF) {
             NativeId::ObjectProtoValueOf
-        } else if self.key_is(key_v, "hasOwnProperty") {
+        } else if self.key_is_wk(key, WK_HAS_OWN_PROPERTY) {
             NativeId::ObjectHasOwnProperty
         } else {
             return None;
@@ -415,35 +452,16 @@ impl Interp<'_> {
     pub(crate) fn object_proto_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
-        // Only serve the prototype methods when neither the receiver nor any
-        // prototype in its chain shadows them with an own property (user
-        // `Array.prototype.toString = …` overrides included).
-        if let Some(h) = key_v.as_string() {
-            let key = PropKey::from_string(h);
-            let mut cursor = Some(obj);
-            let mut shadowed = false;
-            while let Some(cur) = cursor {
-                let (shadow, shape) = {
-                    let o = self.heap.get(cur);
-                    (o.prototype, o.shape)
-                };
-                if self.heap.lookup_property(shape, key).is_some() {
-                    shadowed = true;
-                    break;
-                }
-                cursor = shadow;
-            }
-            if shadowed {
-                return None;
-            }
-        }
-        let constant = if self.key_is(key_v, "hasOwnProperty") {
+        // Integer dispatch first: non-proto keys exit here without paying
+        // the shadow walk below (it is a pure read, so comparing first
+        // preserves behavior exactly).
+        let constant = if self.key_is_wk(key, WK_HAS_OWN_PROPERTY) {
             NativeId::ObjectHasOwnProperty
-        } else if self.key_is(key_v, "valueOf") {
+        } else if self.key_is_wk(key, WK_VALUE_OF) {
             NativeId::ObjectProtoValueOf
-        } else if self.key_is(key_v, "toString") {
+        } else if self.key_is_wk(key, WK_TO_STRING) {
             if self.heap.get(obj).kind == Kind::Function {
                 NativeId::FunctionProtoToString
             } else if self.heap.get(obj).kind == Kind::Array {
@@ -455,6 +473,24 @@ impl Interp<'_> {
         } else {
             return None;
         };
+        // Only serve the prototype methods when neither the receiver nor any
+        // prototype in its chain shadows them with an own property (user
+        // `Array.prototype.toString = …` overrides included). The walk uses
+        // the entry-interned key, so shadowing compares canonical identity
+        // (the old raw-handle key could miss shadows behind computed keys).
+        if let Some(k) = key {
+            let mut cursor = Some(obj);
+            while let Some(cur) = cursor {
+                let (shadow, shape) = {
+                    let o = self.heap.get(cur);
+                    (o.prototype, o.shape)
+                };
+                if self.heap.lookup_property(shape, k).is_some() {
+                    return None;
+                }
+                cursor = shadow;
+            }
+        }
         Some(Ok(self.map_set_method(constant)))
     }
 
@@ -465,7 +501,7 @@ impl Interp<'_> {
     pub(crate) fn regexp_prototype_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         let regexp_idx = REGEXP_IDX;
         let (Some(g), Some(regexp_idx)) = (self.global, regexp_idx) else {
@@ -478,7 +514,7 @@ impl Interp<'_> {
                 .get(regexp_idx)
                 .and_then(|v| v.as_object())
         }?;
-        if obj != regexp_ctor || !self.key_is(key_v, "prototype") {
+        if obj != regexp_ctor || !self.key_is_wk(key, WK_PROTOTYPE) {
             return None;
         }
         if let Some(p) = self.heap.get(obj).prototype {
@@ -497,6 +533,7 @@ impl Interp<'_> {
         &mut self,
         obj: Handle<JsObject>,
         key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         if self.heap.get(obj).kind != Kind::Array {
             return None;
@@ -510,32 +547,13 @@ impl Interp<'_> {
             };
             return Some(Ok(value));
         }
-        if !self.key_is(key_v, "length") {
+        if !self.key_is_wk(key, WK_LENGTH) {
             return None;
         }
         // Length is properties[0] for arrays regardless of shape state
         // (covers arrays created by native handlers without shape binding)
         let value = self.heap.get(obj).properties.first().copied()?;
         Some(Ok(value))
-    }
-
-    /// Integer-index reads on arrays and arguments objects come from the
-    /// element store.
-    pub(crate) fn element_surface(
-        &mut self,
-        obj: Handle<JsObject>,
-        key_v: JsValue,
-    ) -> Option<Result<JsValue, JSException>> {
-        let kind = self.heap.get(obj).kind;
-        if (kind == Kind::Array || kind == Kind::Arguments)
-            && let Some(idx) = self.array_index_of(key_v)
-        {
-            // For arguments exotic, a mapped index mirrors the parameter slot;
-            // v1 simply returns the element (the param alias is exercised via
-            // the mapped array in heap tests).
-            return Some(Ok(self.array_element(obj, idx)));
-        }
-        None
     }
 
     /// Map/Set method fast paths, recognized by object kind. Each
@@ -545,7 +563,7 @@ impl Interp<'_> {
     pub(crate) fn map_set_surface(
         &mut self,
         obj: Handle<JsObject>,
-        key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Option<Result<JsValue, JSException>> {
         let kind = self.heap.get(obj).kind;
         if kind != Kind::Map && kind != Kind::Set {
@@ -553,7 +571,7 @@ impl Interp<'_> {
         }
         // `size` is a getter: invoke the handler directly with the
         // Map/Set as `this`. Methods return the synthesized function.
-        if self.key_is(key_v, "size") {
+        if self.key_is_wk(key, WK_SIZE) {
             let size_const = if kind == Kind::Map {
                 NativeId::MapSize
             } else {
@@ -566,42 +584,42 @@ impl Interp<'_> {
             return Some(self.dispatch_native(size_const, JsValue::object(obj), &[]));
         }
         let constant = if kind == Kind::Map {
-            if self.key_is(key_v, "get") {
+            if self.key_is_wk(key, WK_GET) {
                 NativeId::MapGet
-            } else if self.key_is(key_v, "set") {
+            } else if self.key_is_wk(key, WK_SET) {
                 NativeId::MapSet
-            } else if self.key_is(key_v, "has") {
+            } else if self.key_is_wk(key, WK_HAS) {
                 NativeId::MapHas
-            } else if self.key_is(key_v, "delete") {
+            } else if self.key_is_wk(key, WK_DELETE) {
                 NativeId::MapDelete
-            } else if self.key_is(key_v, "clear") {
+            } else if self.key_is_wk(key, WK_CLEAR) {
                 NativeId::MapClear
-            } else if self.key_is(key_v, "forEach") {
+            } else if self.key_is_wk(key, WK_FOR_EACH) {
                 NativeId::MapForEach
-            } else if self.key_is(key_v, "entries") {
+            } else if self.key_is_wk(key, WK_ENTRIES) {
                 NativeId::MapEntries
-            } else if self.key_is(key_v, "keys") {
+            } else if self.key_is_wk(key, WK_KEYS) {
                 NativeId::MapKeys
-            } else if self.key_is(key_v, "values") {
+            } else if self.key_is_wk(key, WK_VALUES) {
                 NativeId::MapValues
             } else {
                 return None;
             }
-        } else if self.key_is(key_v, "add") {
+        } else if self.key_is_wk(key, WK_ADD) {
             NativeId::SetAdd
-        } else if self.key_is(key_v, "has") {
+        } else if self.key_is_wk(key, WK_HAS) {
             NativeId::SetHas
-        } else if self.key_is(key_v, "delete") {
+        } else if self.key_is_wk(key, WK_DELETE) {
             NativeId::SetDelete
-        } else if self.key_is(key_v, "clear") {
+        } else if self.key_is_wk(key, WK_CLEAR) {
             NativeId::SetClear
-        } else if self.key_is(key_v, "forEach") {
+        } else if self.key_is_wk(key, WK_FOR_EACH) {
             NativeId::SetForEach
-        } else if self.key_is(key_v, "entries") {
+        } else if self.key_is_wk(key, WK_ENTRIES) {
             NativeId::SetEntries
-        } else if self.key_is(key_v, "keys") {
+        } else if self.key_is_wk(key, WK_KEYS) {
             NativeId::SetKeys
-        } else if self.key_is(key_v, "values") {
+        } else if self.key_is_wk(key, WK_VALUES) {
             NativeId::SetValues
         } else {
             return None;
@@ -613,15 +631,35 @@ impl Interp<'_> {
     /// first (only data descriptors with a slot are cached; up to
     /// `IC_MAX_ENTRIES` shapes per site), then walk the own shape and the
     /// prototype chain, recording own-shape hits in the IC.
+    ///
+    /// `key` is the entry-interned key from `get_property` (`Some` for
+    /// string keys); `None` coerces here via `property_key`, preserving the
+    /// old single-intern behavior for non-string keys.
     pub(crate) fn ic_lookup(
         &mut self,
         site_fn: u32,
         site_pc: u32,
         obj: Handle<JsObject>,
         key_v: JsValue,
+        key: Option<PropKey>,
     ) -> Result<JsValue, JSException> {
-        let key = self.property_key(key_v)?;
+        let key = match key {
+            Some(k) => k,
+            None => self.property_key(key_v)?,
+        };
         let shape = self.shape_of(obj);
+
+        // StubCache guarded fast path: serves recorded own AND proto
+        // `Data` locations in O(1) (shape+key identity, proto generation,
+        // and chain verifies — one integer compare each). OOB storage
+        // falls through to the walk below, which resolves exactly as
+        // before (including the realm-global fallback).
+        if let Some((holder, hsl)) = self.heap.stub_lookup_proto(obj, shape, key) {
+            let idx = self.global_slot_index(holder, hsl as usize);
+            if let Some(v) = self.heap.get(holder).properties.get(idx) {
+                return Ok(*v);
+            }
+        }
 
         let cached_slot = self
             .feedback
@@ -638,10 +676,25 @@ impl Interp<'_> {
             return Ok(*v);
         }
 
-        // Slow path: own shape first, then the prototype chain.
+        // Slow path: own dictionary rung and shape first, then the
+        // prototype chain (each level consults both — the two stores are
+        // disjoint: overflow keys live only in the map, base keys only in
+        // the frozen shape).
         let mut cur = Some(obj);
         let mut hit: Option<(Handle<JsObject>, Descriptor)> = None;
+        let mut dict_hit: Option<(Handle<JsObject>, v12_heap::DictEntry)> = None;
         while let Some(o) = cur {
+            if let Some(entry) = self
+                .heap
+                .get(o)
+                .dictionary
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .copied()
+            {
+                dict_hit = Some((o, entry));
+                break;
+            }
             let sh = self.shape_of(o);
             if let Some(d) = self.heap.lookup_property(sh, key) {
                 hit = Some((o, *d));
@@ -649,9 +702,31 @@ impl Interp<'_> {
             }
             cur = self.heap.get(o).prototype;
         }
+        if let Some((owner, entry)) = dict_hit {
+            // Dictionary overflow hit: same serving rules as the shape
+            // Data arm below (bias, stub record, direct index). Accessors
+            // invoke through the shared path.
+            if entry.is_accessor {
+                if let Some(getter) = entry.getter {
+                    return self.call_accessor(getter, JsValue::object(obj));
+                }
+                return Ok(JsValue::undefined());
+            }
+            let owner_shape = self.shape_of(owner);
+            self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, entry.slot);
+            let value = self.heap.get(owner).properties
+                [self.global_slot_index(owner, entry.slot as usize)];
+            return Ok(value);
+        }
         match hit {
             Some((owner, desc)) => match desc {
                 Descriptor::Data { slot, .. } => {
+                    // Record the chain stub (own or proto, depth ≤ 2) for
+                    // future O(1) probes — deliberately WITHOUT the
+                    // `owner == obj` gate below: proto hits are the point.
+                    // Accessor hits never record (no servable slot).
+                    let owner_shape = self.shape_of(owner);
+                    self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, slot);
                     let value = self.heap.get(owner).properties
                         [self.global_slot_index(owner, slot as usize)];
                     if owner == obj {
@@ -709,6 +784,9 @@ impl Interp<'_> {
             return Ok(());
         };
 
+        // Flatten-once (same contract as `get_property`): the element fast
+        // path, the RegExp check, and the intern below share one flatten.
+        self.flatten_key(key_v);
         let kind = self.heap.get(obj).kind;
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
@@ -761,6 +839,30 @@ impl Interp<'_> {
             }
         }
 
+        // Dictionary rung: overflow keys update in place (mirrors the
+        // shape arms above; the two stores never overlap).
+        if let Some(entry) = self
+            .heap
+            .get(obj)
+            .dictionary
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .copied()
+        {
+            if entry.is_accessor {
+                if let Some(setter) = entry.setter {
+                    let args = [value];
+                    self.call_accessor_with(setter, JsValue::object(obj), &args)?;
+                }
+                return Ok(());
+            }
+            if entry.attrs.writable() {
+                let idx = self.global_slot_index(obj, entry.slot as usize);
+                self.heap.get_mut(obj).properties[idx] = value;
+            }
+            return Ok(());
+        }
+
         // An inherited non-writable data property or accessor without setter
         // blocks shadowing (ES OrdinarySet).
         if let Some(d) = self.inherited_descriptor(obj, key) {
@@ -786,7 +888,30 @@ impl Interp<'_> {
 
         // Extend the layout: the transition may allocate, so protect roots
         // first and publish the new shape before touching storage again.
+        // Dictionary-rung objects absorb new keys into the map instead
+        // (shapes stop growing past the spill threshold).
         self.gc_protect();
+        if self.heap.get(obj).dictionary.is_some() {
+            let (slot, seq) = {
+                let o = self.heap.get(obj);
+                (o.properties.len() as u32, o.dict_seq)
+            };
+            self.heap.get_mut(obj).properties.push(value);
+            self.heap.get_mut(obj).property_keys.push(Some(key));
+            let entry = v12_heap::DictEntry {
+                slot,
+                attrs: Attrs::DEFAULT,
+                getter: None,
+                setter: None,
+                is_accessor: false,
+                seq,
+            };
+            if let Some(map) = self.heap.get_mut(obj).dictionary.as_mut() {
+                map.insert(key, entry);
+            }
+            self.heap.get_mut(obj).dict_seq = seq + 1;
+            return Ok(());
+        }
         let child = self.heap.add_property(shape, key, Attrs::DEFAULT);
         self.bind_shape(obj, child);
         if self.is_realm_global(obj) {
@@ -830,8 +955,62 @@ impl Interp<'_> {
                 self.error_value("TypeError: cannot define property on non-object"),
             ));
         };
+        // Flatten-once so the single intern below reads flat storage.
+        self.flatten_key(key_v);
         let key = self.property_key(key_v)?;
         self.gc_protect();
+        // Dictionary rung: defines update or insert in the map (shapes
+        // frozen); base keys still take the shape path below.
+        if self.heap.get(obj).dictionary.is_some() {
+            let shape = self.shape_of(obj);
+            let in_shape = self.heap.get(shape).descriptors.find(key).is_some();
+            if let Some(entry) = self
+                .heap
+                .get(obj)
+                .dictionary
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .copied()
+            {
+                if !entry.is_accessor {
+                    let idx = entry.slot as usize;
+                    let settings = &mut self.heap.get_mut(obj);
+                    if settings.properties.len() <= idx {
+                        settings.properties.resize(idx + 1, JsValue::hole());
+                    }
+                    settings.properties[idx] = value;
+                    if let Some(map) = self.heap.get_mut(obj).dictionary.as_mut()
+                        && let Some(slot_entry) = map.get_mut(&key)
+                    {
+                        slot_entry.attrs = attrs;
+                    }
+                }
+                // Data-over-accessor redefine is a no-op (mirrors the
+                // engine path); either way no shape is touched.
+                return Ok(());
+            }
+            if !in_shape {
+                let (slot, seq) = {
+                    let o = self.heap.get(obj);
+                    (o.properties.len() as u32, o.dict_seq)
+                };
+                self.heap.get_mut(obj).properties.push(value);
+                self.heap.get_mut(obj).property_keys.push(Some(key));
+                let entry = v12_heap::DictEntry {
+                    slot,
+                    attrs,
+                    getter: None,
+                    setter: None,
+                    is_accessor: false,
+                    seq,
+                };
+                if let Some(map) = self.heap.get_mut(obj).dictionary.as_mut() {
+                    map.insert(key, entry);
+                }
+                self.heap.get_mut(obj).dict_seq = seq + 1;
+                return Ok(());
+            }
+        }
         let shape = self.shape_of(obj);
         let child = self.heap.add_property(shape, key, attrs);
         self.bind_shape(obj, child);
@@ -852,6 +1031,29 @@ impl Interp<'_> {
     pub(crate) fn inherited_descriptor(&mut self, obj: Handle<JsObject>, key: PropKey) -> Option<Descriptor> {
         let mut cur = self.heap.get(obj).prototype;
         while let Some(o) = cur {
+            // Dictionary rung first (overflow keys live only here).
+            if let Some(entry) = self
+                .heap
+                .get(o)
+                .dictionary
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .copied()
+            {
+                if entry.is_accessor {
+                    return Some(Descriptor::Accessor {
+                        key,
+                        getter: entry.getter,
+                        setter: entry.setter,
+                        attrs: entry.attrs,
+                    });
+                }
+                return Some(Descriptor::Data {
+                    key,
+                    slot: entry.slot,
+                    attrs: entry.attrs,
+                });
+            }
             let sh = self.shape_of(o);
             if let Some(d) = self.heap.lookup_property(sh, key) {
                 return Some(*d);
@@ -872,6 +1074,8 @@ impl Interp<'_> {
         };
         // Fast path for array/arguments indices: check element storage before
         // coercing the key, which may allocate. Holes count as absent.
+        // Flatten-once so the index scan never materializes.
+        self.flatten_key(key_v);
         let kind = self.heap.get(obj).kind;
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
@@ -882,6 +1086,16 @@ impl Interp<'_> {
         let key = self.property_key(key_v)?;
         let mut cur = Some(obj);
         while let Some(o) = cur {
+            // Dictionary rung: overflow keys live only here.
+            if self
+                .heap
+                .get(o)
+                .dictionary
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&key))
+            {
+                return Ok(true);
+            }
             let sh = self.shape_of(o);
             if self.heap.lookup_property(sh, key).is_some() {
                 return Ok(true);
@@ -1023,6 +1237,8 @@ impl Interp<'_> {
             return Ok(true);
         };
 
+        // Flatten-once so the index scan and the intern below share it.
+        self.flatten_key(key_v);
         if (self.heap.get(obj).kind == Kind::Array || self.heap.get(obj).kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
@@ -1031,6 +1247,32 @@ impl Interp<'_> {
         }
 
         let key = self.property_key(key_v)?;
+        // Dictionary rung: overflow keys remove from the map (and hole
+        // their storage slot, mirroring the shape arm below).
+        if let Some(entry) = self
+            .heap
+            .get(obj)
+            .dictionary
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .copied()
+        {
+            if !entry.attrs.configurable() {
+                return Ok(false);
+            }
+            let slot = entry.slot as usize;
+            if let Some(map) = self.heap.get_mut(obj).dictionary.as_mut() {
+                map.remove(&key);
+            }
+            if let Some(v) = self.heap.get_mut(obj).properties.get_mut(slot) {
+                *v = JsValue::hole();
+            }
+            // Entry removal changes walk resolution (unlike shape
+            // `delete`, which keeps the descriptor): bump the proto epoch
+            // so guarded stubs re-verify instead of serving the hole.
+            self.heap.bump_proto_generation();
+            return Ok(true);
+        }
         let shape = self.shape_of(obj);
         let Some(d) = self.heap.get(shape).descriptors.find(key).copied() else {
             return Ok(true); // not an own property: ES says success

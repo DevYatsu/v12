@@ -8,7 +8,7 @@ use std::time::Instant;
 use v12_bytecode::{BytecodeError, Const, Instr, Opcode, WideOp};
 use v12_heap::{Handle, JsObject, JsValue, Kind, V12Str};
 
-use super::{CallOutcome, Interp, JSException, DEADLINE_CHECK_INTERVAL};
+use super::{CallOutcome, Interp, JSException, DEADLINE_CHECK_INTERVAL, env_display_push};
 use crate::feedback::{Lattice, TYPE_NAMES};
 use crate::generator::Suspendable;
 use crate::ops;
@@ -296,7 +296,11 @@ impl Interp<'_> {
                             let h = self
                                 .heap
                                 .alloc(JsObject::environment(usize::from(slots), parent));
-                            self.frames.last_mut().expect("frame").env = Some(h);
+                            // Display head-shift (O(1)): the new head's
+                            // parent is the old head by construction.
+                            let frame = self.frames.last_mut().expect("frame");
+                            env_display_push(&mut frame.env_display, h);
+                            frame.env = Some(h);
                         }
                         WideOp::CopyObjectRestW {
                             dst,
@@ -693,7 +697,10 @@ impl Interp<'_> {
                     // properties that occupy the same physical storage.
                     let parent = self.frames.last().expect("frame").env;
                     let h = self.heap.alloc(JsObject::environment(slots, parent));
-                    self.frames.last_mut().expect("frame").env = Some(h);
+                    // Display head-shift (O(1)), mirroring the wide op.
+                    let frame = self.frames.last_mut().expect("frame");
+                    env_display_push(&mut frame.env_display, h);
+                    frame.env = Some(h);
                     self.set_pc(pc + op_width);
                 }
                 Opcode::GetEnvSlot => {

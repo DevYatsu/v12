@@ -5,8 +5,10 @@
 //! `ctx::call_ctx`, so dispatch IDs and install paths are unchanged.
 //!
 //! v1: symbols are fresh heap handles (`V12Symbol` is an opaque unit —
-//! identity is the handle). Descriptions and the `Symbol.for` registry are
-//! not modeled.
+//! identity is the handle). `Symbol.for` shares per-key symbols through
+//! the heap's global registry (`Heap::symbol_for_key`); `keyFor` reads
+//! the reverse map. Well-known singletons keep their existing O(1) paths
+//! (interpreter surface + install layer) and never consult the registry.
 //!
 //! Well-known singleton contract: the JS-visible identity of
 //! `Symbol.iterator` is owned by the interpreter realm — its
@@ -47,18 +49,33 @@ pub fn symbol_construct(
     Ok(fresh_symbol(ctx))
 }
 
-/// `Symbol.for(key)` — v1 returns a fresh symbol (no global registry yet).
-pub fn symbol_for(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    Ok(fresh_symbol(ctx))
+/// `Symbol.for(key)` — the shared symbol for `key` from the heap's
+/// global registry (spec: same key → identical symbol across calls;
+/// `Symbol.for` never mints). The key coerces via ToString; the
+/// registry probe is O(1), allocation happens once per distinct key.
+pub fn symbol_for(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let key_arg = args.first().copied().unwrap_or(JsValue::undefined());
+    let key_text = ctx.to_string(key_arg);
+    Ok(JsValue::symbol(ctx.heap.symbol_for_key(&key_text)))
 }
 
-/// `Symbol.keyFor(sym)` — v1 always `undefined` (no registry).
+/// `Symbol.keyFor(sym)` — the registry key for a `Symbol.for` symbol,
+/// else `undefined` (fresh and well-known symbols were never
+/// registered). Non-symbols throw per spec.
 pub fn symbol_key_for(
-    _ctx: &mut Ctx,
+    ctx: &mut Ctx,
     _this: JsValue,
-    _args: &[JsValue],
+    args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    Ok(JsValue::undefined())
+    let Some(sym) = args.first().and_then(|v| v.as_symbol()) else {
+        return Err(ctx.type_error("TypeError: Symbol.keyFor requires a symbol"));
+    };
+    // Copy the key out first: the registry borrow must end before the
+    // interning mutable borrow below.
+    match ctx.heap.symbol_key_for(sym).map(str::to_owned) {
+        Some(key) => Ok(JsValue::string(ctx.heap.intern_text(&key))),
+        None => Ok(JsValue::undefined()),
+    }
 }
 
 /// `Symbol.prototype.toString` — `"Symbol()"` (descriptions not modeled).

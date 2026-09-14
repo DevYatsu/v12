@@ -24,6 +24,7 @@ use crate::handle::{Handle, HeapSpace, Space};
 use crate::object::{IntegrityLevel, JsObject, SizeEstimate, V12BigInt, V12Symbol};
 use crate::prop_key::PropKey;
 use crate::shape::{Attrs, Descriptor, Serial, Shape, ShapeHandle, Transitions, ValidityCellId};
+use crate::stub_cache::StubCache;
 use crate::string::{self, CONCAT_EAGER_FLATTEN_MAX_UNITS, Seed, StrStorage, V12Str};
 use crate::value::JsValue;
 
@@ -291,6 +292,28 @@ pub struct Heap {
     /// [`Heap::deregister_realm_global`] when a realm is destroyed.
     realm_globals: Vec<Handle<JsObject>>,
 
+    /// `Symbol.for` registry: key string → the single shared symbol for
+    /// that key on this heap (spec: one registry per agent; per-heap
+    /// here). Handles are GC roots (marked at each collection start,
+    /// like interned strings) so shared symbols survive collection.
+    symbol_registry: rustc_hash::FxHashMap<String, Handle<V12Symbol>>,
+    /// Reverse map for `Symbol.keyFor`: symbol slot index → key string.
+    symbol_registry_reverse: rustc_hash::FxHashMap<u32, String>,
+
+    /// Shape-chain stub cache (own + validity-guarded proto entries). Plain
+    /// metadata: handles inside are never traced — entries are harmless
+    /// when stale (identity + verifies fail) and the table is
+    /// generation-cleared at every collection, closing shape-slot reuse.
+    stub_cache: StubCache,
+
+    /// Proto-chain epoch for stub-cache proto entries. Bumped by
+    /// [`Heap::bump_proto_generation`] on the ordinary `[[SetPrototypeOf]]`
+    /// path and integrity raises; entries stamp the epoch at record time
+    /// and miss once it moves. Defense-in-depth beside the link/shape
+    /// verifies (which catch every rewiring uniformly): a bump only ever
+    /// costs extra misses, never wrong hits.
+    proto_generation: u64,
+
     policy: GcPolicy,
     allocated_since_gc: usize,
     live_after_gc: usize,
@@ -333,6 +356,10 @@ impl Heap {
             validity_cells: Vec::new(),
             interned_strings: rustc_hash::FxHashMap::default(),
             realm_globals: Vec::new(),
+            symbol_registry: rustc_hash::FxHashMap::default(),
+            symbol_registry_reverse: rustc_hash::FxHashMap::default(),
+            stub_cache: StubCache::new(),
+            proto_generation: 0,
             policy,
             allocated_since_gc: 0,
             live_after_gc: 0,
@@ -350,12 +377,30 @@ impl Heap {
         self.root_shape
     }
 
+    /// Header bit marking a realm global directly on the object.
+    ///
+    /// `JsObject` integrity flags occupy bits 0-2 (`FLAG_NOT_EXTENSIBLE` /
+    /// `FLAG_SEALED` / `FLAG_FROZEN`); bit 3 is free, so the hot
+    /// `is_realm_global` check is a single flag read — O(1) with no
+    /// `realm_globals` vec scan. The vec itself stays as the GC-root
+    /// registry (traced at every collection start).
+    pub const REALM_GLOBAL_FLAG: u8 = 0b0000_1000;
+
+    /// O(1) realm-global test: one header-bit read, no vec scan.
+    pub fn is_realm_global(&self, obj: Handle<JsObject>) -> bool {
+        self.get(obj).flags & Self::REALM_GLOBAL_FLAG != 0
+    }
+
     /// Registers a realm global created on this heap (see
     /// [`Heap::realm_globals`]). Called for every [`Realm::new`], including
     /// the primary realm. Entries are traced as GC roots; call
     /// [`Heap::deregister_realm_global`] when a realm is destroyed so the
     /// vec does not grow without bound.
     pub fn register_realm_global(&mut self, global: Handle<JsObject>) {
+        // Stamp the O(1) header bit first so every later `is_realm_global`
+        // check hits the flag path. Registration itself is cold (once per
+        // `Realm::new`), so the vec `contains` below is acceptable.
+        self.get_mut(global).flags |= Self::REALM_GLOBAL_FLAG;
         if !self.realm_globals.contains(&global) {
             self.realm_globals.push(global);
         }
@@ -366,6 +411,7 @@ impl Heap {
     pub fn deregister_realm_global(&mut self, global: Handle<JsObject>) {
         if let Some(pos) = self.realm_globals.iter().position(|&g| g == global) {
             self.realm_globals.remove(pos);
+            self.get_mut(global).flags &= !Self::REALM_GLOBAL_FLAG;
         }
     }
 
@@ -374,6 +420,31 @@ impl Heap {
     /// [`Heap::realm_globals`] field docs).
     pub fn realm_globals(&self) -> &[Handle<JsObject>] {
         &self.realm_globals
+    }
+
+    /// `Symbol.for` shared symbol for `key`: the registered handle on a
+    /// hit (O(1) probe), otherwise a freshly allocated, rooted, and
+    /// registered symbol (cold path: once per distinct key). Registry
+    /// members are marked at every collection start, so shared symbols
+    /// survive collection like interned strings do.
+    pub fn symbol_for_key(&mut self, key: &str) -> Handle<V12Symbol> {
+        if let Some(&h) = self.symbol_registry.get(key) {
+            return h;
+        }
+        let h = self.alloc(V12Symbol);
+        self.add_root(JsValue::symbol(h));
+        self.symbol_registry.insert(key.to_owned(), h);
+        self.symbol_registry_reverse.insert(h.index(), key.to_owned());
+        h
+    }
+
+    /// Key string a `Symbol.for` symbol was registered under, or `None`
+    /// for fresh symbols and well-known singletons (spec `keyFor` maps
+    /// those to `undefined`).
+    pub fn symbol_key_for(&self, sym: Handle<V12Symbol>) -> Option<&str> {
+        self.symbol_registry_reverse
+            .get(&sym.index())
+            .map(String::as_str)
     }
 
     // ------------------------------------------------------------------
@@ -791,6 +862,146 @@ impl Heap {
         }
     }
 
+    /// Current proto-chain epoch (see the `proto_generation` field docs).
+    /// Tier-2 guard emission reads this alongside
+    /// [`Heap::stub_lookup_proto`].
+    pub fn proto_generation(&self) -> u64 {
+        self.proto_generation
+    }
+
+    /// Advances the proto-chain epoch, invalidating stub-cache proto
+    /// entries recorded before this call (they miss and re-record).
+    /// Called on the ordinary `[[SetPrototypeOf]]` path and integrity
+    /// raises. Only ever costs extra misses — the link/shape verifies
+    /// already catch every rewiring uniformly.
+    pub fn bump_proto_generation(&mut self) {
+        self.proto_generation = self.proto_generation.wrapping_add(1);
+    }
+
+    /// Guarded stub-cache probe: the `(target, target_slot)` answering a
+    /// read of `key` on a receiver of `shape`, or `None` on any mismatch.
+    /// Observes the live chain (links, intermediate shape, holder shape,
+    /// proto generation) and requires every recorded verify to hold —
+    /// steady-state chain reads stay O(1) with invalidation purely
+    /// comparative, never a scan. Own hits resolve to the current
+    /// receiver (per-instance values); proto hits to the recorded holder
+    /// (chain verifies pin its identity). Serves `Data` locations only;
+    /// callers record `Data` hits and slow-path everything else.
+    pub fn stub_lookup_proto(
+        &self,
+        receiver: Handle<JsObject>,
+        shape: ShapeHandle,
+        key: PropKey,
+    ) -> Option<(Handle<JsObject>, u32)> {
+        let link0 = self.get(receiver).prototype;
+        let (link1, mid_shape) = match link0 {
+            Some(p0) => {
+                let p = self.get(p0);
+                (p.prototype, p.shape)
+            }
+            None => (None, ShapeHandle::new(u32::MAX)),
+        };
+        let hit = self.stub_cache.lookup_proto(
+            receiver,
+            shape,
+            key,
+            self.proto_generation,
+            link0,
+            link1,
+            mid_shape,
+        )?;
+        // Final verify on proto entries: the holder's live shape still
+        // matches the recorded one (closes shadowing adds,
+        // reconfigurations, and duplicate-key forks on the holder itself).
+        // Own entries skip it — their layout comes from the
+        // already-matched receiver shape, and the recorded holder may be
+        // any dead-or-live instance of it.
+        if !hit.is_own && self.get(hit.target).shape != hit.holder_shape {
+            return None;
+        }
+        Some((hit.target, hit.slot))
+    }
+
+    /// Records a stub-cache chain stub: a `Data` hit for receiver
+    /// `(shape, key)` lives at `slot` on `owner` (whose shape is
+    /// `owner_shape`). Returns false — recording nothing — when the owner
+    /// sits deeper than two links down the chain (rare long chains keep
+    /// the slow path). Own hits (`owner == receiver`) record with no
+    /// chain verifies; their layout is covered by the shape identity
+    /// alone. Callers pass only `Data` hits.
+    pub fn stub_record_proto(
+        &mut self,
+        receiver: Handle<JsObject>,
+        shape: ShapeHandle,
+        key: PropKey,
+        owner: Handle<JsObject>,
+        owner_shape: ShapeHandle,
+        slot: u32,
+    ) -> bool {
+        // Own hit: no chain was consulted.
+        if owner == receiver {
+            self.stub_cache.record_proto(
+                shape,
+                key,
+                owner,
+                owner_shape,
+                slot,
+                None,
+                None,
+                ShapeHandle::new(u32::MAX),
+                self.proto_generation,
+            );
+            return true;
+        }
+        // Chain hit: observe the links (shared borrows end before the
+        // cache's mutable borrow below) and gate on depth ≤ 2.
+        let link0 = self.get(receiver).prototype;
+        if let Some(p0) = link0
+            && p0 == owner
+        {
+            // Copy the observes out first: the shared borrow must end
+            // before the cache's mutable borrow below.
+            let (link1, mid_shape) = {
+                let p = self.get(p0);
+                (p.prototype, p.shape)
+            };
+            self.stub_cache.record_proto(
+                shape,
+                key,
+                owner,
+                owner_shape,
+                slot,
+                link0,
+                link1,
+                mid_shape,
+                self.proto_generation,
+            );
+            return true;
+        }
+        let (link1, mid_shape) = match link0 {
+            Some(p0) => {
+                let p = self.get(p0);
+                (p.prototype, p.shape)
+            }
+            None => (None, ShapeHandle::new(u32::MAX)),
+        };
+        if Some(owner) == link1 {
+            self.stub_cache.record_proto(
+                shape,
+                key,
+                owner,
+                owner_shape,
+                slot,
+                link0,
+                link1,
+                mid_shape,
+                self.proto_generation,
+            );
+            return true;
+        }
+        false
+    }
+
     /// Raises `obj` to `level` (ES `SetIntegrityLevel`) and records the
     /// transition by bumping the object's validity cell: inline caches that
     /// assumed attribute stability re-verify on their next guarded use.
@@ -805,6 +1016,9 @@ impl Heap {
         self.get_mut(obj).flags |= bits;
         let cell = self.validity_cell_of(obj);
         self.bump_validity(cell);
+        // Stub-cache proto entries stamp this epoch: the raise may narrow
+        // what later reads may assume, so guarded stubs re-verify.
+        self.bump_proto_generation();
     }
 
     // ------------------------------------------------------------------
@@ -1084,6 +1298,12 @@ impl Heap {
     /// the dead slots drain into the free lists through [`Heap::sweep_step`]
     /// as later allocations need them.
     pub fn force_collect(&mut self) {
+        // Generation-clear the stub cache first: entries name shapes and
+        // holders by handle, and this cycle may free either for slot reuse.
+        // Clearing is O(1) (stamps fall out of currency) and every later
+        // record is fresh, so a reclaimed slot can never answer for a
+        // recorded layout again.
+        self.stub_cache.clear();
         // Complete the previous cycle's lazy sweep first so marking never
         // races partially-drained free-list bookkeeping.
         self.finish_sweep();
@@ -1116,6 +1336,11 @@ impl Heap {
             for &handle in bucket {
                 collector.mark(Space::Strings, handle.index());
             }
+        }
+        // `Symbol.for` shared symbols are permanent roots for the same
+        // reason: the registry promises identity for the heap's lifetime.
+        for &handle in self.symbol_registry.values() {
+            collector.mark(Space::Symbols, handle.index());
         }
 
         while let Some((space, index)) = collector.work.pop() {
@@ -1327,6 +1552,8 @@ mod tests {
             validity_cell: ValidityCellId::NONE,
             private_brand: None,
             private_fields: None,
+            dictionary: None,
+            dict_seq: 0,
             arguments_mapped: None,
         }
     }

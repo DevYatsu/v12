@@ -205,6 +205,87 @@ const fn intrinsic_slot_guard() {
 }
 const _: () = intrinsic_slot_guard();
 
+/// Every well-known property name the `get_property` surface chain probes,
+/// in canonical slot order. [`Interp::wk_keys`] caches one interned
+/// [`PropKey`] per entry; surface probes integer-compare against those
+/// instead of `key_is` flatten+memcmp. Keep the `WK_*` indices in the same
+/// order as this array.
+const WELL_KNOWN_NAMES: &[&str] = &[
+    "length",            // 0
+    "prototype",         // 1
+    "log",               // 2
+    "iterator",          // 3
+    "resolve",           // 4
+    "reject",            // 5
+    "then",              // 6
+    "catch",             // 7
+    "create",            // 8
+    "getPrototypeOf",    // 9
+    "defineProperty",    // 10
+    "keys",              // 11
+    "values",            // 12
+    "entries",           // 13
+    "enumerableOwnKeys", // 14
+    "next",              // 15
+    "return",            // 16
+    "throw",             // 17
+    "source",            // 18
+    "flags",             // 19
+    "lastIndex",         // 20
+    "isArray",           // 21
+    "call",              // 22
+    "apply",             // 23
+    "bind",              // 24
+    "toString",          // 25
+    "valueOf",           // 26
+    "hasOwnProperty",    // 27
+    "size",              // 28
+    "get",               // 29
+    "set",               // 30
+    "has",               // 31
+    "delete",            // 32
+    "clear",             // 33
+    "forEach",           // 34
+    "add",               // 35
+];
+const WK_COUNT: usize = WELL_KNOWN_NAMES.len();
+const WK_LENGTH: usize = 0;
+const WK_PROTOTYPE: usize = 1;
+const WK_LOG: usize = 2;
+const WK_ITERATOR: usize = 3;
+const WK_RESOLVE: usize = 4;
+const WK_REJECT: usize = 5;
+const WK_THEN: usize = 6;
+const WK_CATCH: usize = 7;
+const WK_CREATE: usize = 8;
+const WK_GET_PROTOTYPE_OF: usize = 9;
+const WK_DEFINE_PROPERTY: usize = 10;
+const WK_KEYS: usize = 11;
+const WK_VALUES: usize = 12;
+const WK_ENTRIES: usize = 13;
+const WK_ENUMERABLE_OWN_KEYS: usize = 14;
+const WK_NEXT: usize = 15;
+const WK_RETURN: usize = 16;
+const WK_THROW: usize = 17;
+const WK_SOURCE: usize = 18;
+const WK_FLAGS: usize = 19;
+const WK_LAST_INDEX: usize = 20;
+const WK_IS_ARRAY: usize = 21;
+const WK_CALL: usize = 22;
+const WK_APPLY: usize = 23;
+const WK_BIND: usize = 24;
+const WK_TO_STRING: usize = 25;
+const WK_VALUE_OF: usize = 26;
+const WK_HAS_OWN_PROPERTY: usize = 27;
+const WK_SIZE: usize = 28;
+const WK_GET: usize = 29;
+const WK_SET: usize = 30;
+const WK_HAS: usize = 31;
+const WK_DELETE: usize = 32;
+const WK_CLEAR: usize = 33;
+const WK_FOR_EACH: usize = 34;
+const WK_ADD: usize = 35;
+
 /// Maximum simultaneous JavaScript activations.
 ///
 /// Why a limit exists: the dispatch loop is iterative, so recursion costs
@@ -301,6 +382,13 @@ enum AwaitResume {
 /// against its own program.
 type ProgramTable = (Rc<[FunctionBytecode]>, Rc<[String]>);
 
+/// Display width: how many innermost environments each [`Frame`] caches
+/// for O(1) `Get/SetEnvSlot` resolution. Depth 8 covers virtually all
+/// real closures (functions nest far shallower); deeper walks fall back
+/// to the parent-link chain. Eight words per frame — accepted, speed-first
+/// (frames already hold register windows).
+const ENV_DISPLAY_CAP: usize = 8;
+
 /// One JavaScript activation: a function body, its register window on the
 /// shared stack, its pc, and the head of its environment chain.
 struct Frame {
@@ -318,6 +406,13 @@ struct Frame {
     /// Innermost environment object (`None` until `NewEnvironment` runs).
     /// Kept here rather than derived so closure capture has one source.
     env: Option<Handle<JsObject>>,
+    /// Cached innermost environments: `env_display[i]` is the environment
+    /// `i` hops out, mirroring the parent-link chain exactly. Built once
+    /// at frame creation ([`Interp::env_display_for`]) and head-shifted by
+    /// `NewEnvironment` only — never otherwise mutated — so it stays exact
+    /// for the frame's whole life. Entries are chain members, hence rooted
+    /// transitively through `env` at every safepoint; no extra rooting.
+    env_display: [Option<Handle<JsObject>>; ENV_DISPLAY_CAP],
     /// Associated generator object when this frame is a generator activation.
     generator: Option<Handle<JsObject>>,
     /// Destination register of the SuspendYield that suspended this frame (for resume value delivery).
@@ -335,6 +430,21 @@ struct Frame {
     /// register the compiler did not reserve — and surfaced through the
     /// `GetGlobal`/`SetGlobal` `arguments` binding.
     arguments: Option<JsValue>,
+}
+
+/// Head-shifts an environment display for `NewEnvironment`: slot 0 takes
+/// the new head, every older entry moves one deeper, the 8th falls off.
+/// O(1), allocation-free. Equivalent to re-walking — the new head's
+/// parent IS the previous head by construction — while the parent-link
+/// chain stays the source of truth.
+fn env_display_push(
+    display: &mut [Option<Handle<JsObject>>; ENV_DISPLAY_CAP],
+    head: Handle<JsObject>,
+) {
+    let mut prev = Some(head);
+    for slot in display.iter_mut() {
+        core::mem::swap(slot, &mut prev);
+    }
 }
 
 pub mod generator;
@@ -364,10 +474,13 @@ pub struct Interp<'a> {
     const_strings: std::collections::HashMap<(u32, u32), Handle<V12Str>>,
     /// Interned `typeof` names, lazily filled in [`TYPE_NAMES`] order.
     typeof_names: [Option<Handle<V12Str>>; TYPE_NAME_COUNT],
-    /// Cached property key for the array `length` property.
-    length_key: Option<PropKey>,
-    /// Cached key for the `prototype` property used by `instanceof`.
-    prototype_key: Option<PropKey>,
+    /// Cached canonical keys for every well-known name the `get_property`
+    /// surface chain probes (see [`WELL_KNOWN_NAMES`]). Integer `==`
+    /// against these replaces per-probe `key_is` flatten+memcmp; slots
+    /// fill lazily via [`Interp::wk_key`]. Replaces the old one-off
+    /// `length_key`/`prototype_key` option fields (those accessors now
+    /// read their table slots).
+    wk_keys: [Option<PropKey>; WK_COUNT],
     /// Cached `root --length--> child` shape shared by every array.
     length_shape: Option<ShapeHandle>,
     /// Shape indexes already pinned via `add_shape_root` (pinning is
@@ -494,8 +607,7 @@ impl<'a> Interp<'a> {
             heap,
             const_strings: std::collections::HashMap::new(),
             typeof_names: [const { None }; TYPE_NAME_COUNT],
-            length_key: None,
-            prototype_key: None,
+            wk_keys: [None; WK_COUNT],
             length_shape: None,
             pinned_shapes: HashSet::new(),
             stack: Vec::with_capacity(INITIAL_STACK_CAPACITY),
@@ -985,6 +1097,7 @@ impl<'a> Interp<'a> {
             base: 0,
             max_regs: main_regs,
             env: None,
+            env_display: [None; ENV_DISPLAY_CAP],
             generator: None,
             yield_dst: None,
             new_target: None,
@@ -1317,7 +1430,7 @@ impl<'a> Interp<'a> {
     // ------------------------------------------------------------------
 
     fn env_read(&mut self, depth: u16, slot: u16) -> Result<JsValue, JSException> {
-        let env = self.walk_env_expect(depth)?;
+        let env = self.env_at_expect(depth)?;
         let idx = usize::from(slot);
         let len = self.heap.get(env).properties.len();
         if idx < len {
@@ -1330,7 +1443,7 @@ impl<'a> Interp<'a> {
     }
 
     fn env_write(&mut self, depth: u16, slot: u16, v: JsValue) -> Result<(), JSException> {
-        let env = self.walk_env_expect(depth)?;
+        let env = self.env_at_expect(depth)?;
         let idx = usize::from(slot);
         let len = self.heap.get(env).properties.len();
         if idx < len {
@@ -1343,6 +1456,45 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Display for a fresh frame whose environment head is `env`: the
+    /// head plus up to `ENV_DISPLAY_CAP - 1` ancestors, walked once here
+    /// (bounded O(8) per call — calls are cold, slot accesses hot).
+    fn env_display_for(&self, env: Option<Handle<JsObject>>) -> [Option<Handle<JsObject>>; ENV_DISPLAY_CAP] {
+        let mut out = [None; ENV_DISPLAY_CAP];
+        let mut cur = env;
+        for slot in out.iter_mut() {
+            let h = match cur {
+                Some(h) => h,
+                None => break,
+            };
+            *slot = Some(h);
+            cur = self.heap.get(h).prototype;
+        }
+        out
+    }
+
+    /// Environment `depth` hops out from the current frame: display hit
+    /// for `depth < ENV_DISPLAY_CAP` (one slot read, O(1)), parent-link
+    /// walk past it. The display mirrors the chain exactly (built at
+    /// frame creation, head-shifted only by `NewEnvironment`), so both
+    /// arms agree; the walk is the source of truth the display shadows.
+    fn env_at(&self, depth: u16) -> Option<Handle<JsObject>> {
+        let d = usize::from(depth);
+        if d < ENV_DISPLAY_CAP {
+            self.frames.last()?.env_display[d]
+        } else {
+            self.walk_env(depth)
+        }
+    }
+
+    fn env_at_expect(&mut self, depth: u16) -> Result<Handle<JsObject>, JSException> {
+        self.env_at(depth).ok_or_else(|| {
+            JSException(self.error_value(
+                "InternalError: environment depth exceeds live chain or missing environment",
+            ))
+        })
+    }
+
     /// Walks `depth` parent links from the current frame's environment.
     fn walk_env(&self, depth: u16) -> Option<Handle<JsObject>> {
         let mut cur = self.frames.last()?.env?;
@@ -1350,14 +1502,6 @@ impl<'a> Interp<'a> {
             cur = self.heap.get(cur).prototype?;
         }
         Some(cur)
-    }
-
-    fn walk_env_expect(&mut self, depth: u16) -> Result<Handle<JsObject>, JSException> {
-        self.walk_env(depth).ok_or_else(|| {
-            JSException(self.error_value(
-                "InternalError: environment depth exceeds live chain or missing environment",
-            ))
-        })
     }
 
     // ------------------------------------------------------------------
@@ -1394,24 +1538,36 @@ impl<'a> Interp<'a> {
         child
     }
 
-    fn length_key(&mut self) -> PropKey {
-        if let Some(k) = self.length_key {
+    /// Canonical [`PropKey`] for `WELL_KNOWN_NAMES[wk]`, interned once and
+    /// cached. One hash+lookup on first use per name; O(1) slot read after.
+    fn wk_key(&mut self, wk: usize) -> PropKey {
+        if let Some(k) = self.wk_keys[wk] {
             return k;
         }
-        let h = self.heap.intern_text("length");
+        let h = self.heap.intern_text(WELL_KNOWN_NAMES[wk]);
         let k = PropKey::from_string(h);
-        self.length_key = Some(k);
+        self.wk_keys[wk] = Some(k);
         k
     }
 
-    fn prototype_key(&mut self) -> PropKey {
-        if let Some(k) = self.prototype_key {
-            return k;
+    /// Integer-compare probe against a well-known name: true when the
+    /// entry-interned `key` equals `WELL_KNOWN_NAMES[wk]`. Replaces `key_is`
+    /// (flatten + memcmp) wherever the caller already holds the entry key;
+    /// `None` (non-string key) never matches — mirroring `key_is`, which
+    /// returns false for non-strings.
+    fn key_is_wk(&mut self, key: Option<PropKey>, wk: usize) -> bool {
+        match key {
+            Some(k) => k == self.wk_key(wk),
+            None => false,
         }
-        let h = self.heap.intern_text("prototype");
-        let k = PropKey::from_string(h);
-        self.prototype_key = Some(k);
-        k
+    }
+
+    fn length_key(&mut self) -> PropKey {
+        self.wk_key(WK_LENGTH)
+    }
+
+    fn prototype_key(&mut self) -> PropKey {
+        self.wk_key(WK_PROTOTYPE)
     }
 
     /// Get the canonical array shape (cached after first computation).
@@ -1441,6 +1597,13 @@ impl<'a> Interp<'a> {
 
     /// Canonical array index for a key value: unsigned small integers (Smi or
     /// integral double) or their decimal-string spellings.
+    ///
+    /// Zero-allocation: the caller flattens once per entry
+    /// ([`Self::flatten_key`]), then the flat storage scans in place — no
+    /// `String` materialization. The defensive `flatten` below is an O(1)
+    /// no-op once the entry flattened, and keeps this correct for direct
+    /// callers. Digit semantics match the old `str::parse` path
+    /// (empty/too-long/non-digit/overflow → `None`, leading zeros fold).
     fn array_index_of(&mut self, key_v: JsValue) -> Option<u32> {
         if let Some(n) = key_v.as_smi() {
             return u32::try_from(n).ok();
@@ -1449,11 +1612,38 @@ impl<'a> Interp<'a> {
             return Some(n);
         }
         let h = key_v.as_string()?;
-        let digits = self.string_text(h);
-        if digits.is_empty() || digits.len() > 10 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
+        self.heap.flatten(h);
+        match &self.heap.get(h).storage {
+            v12_heap::StrStorage::Latin1(bytes) => {
+                if bytes.is_empty() || bytes.len() > 10 {
+                    return None;
+                }
+                let mut acc: u32 = 0;
+                for &b in bytes {
+                    if !b.is_ascii_digit() {
+                        return None;
+                    }
+                    acc = acc.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+                }
+                Some(acc)
+            }
+            v12_heap::StrStorage::Utf16(units) => {
+                if units.is_empty() || units.len() > 10 {
+                    return None;
+                }
+                let mut acc: u32 = 0;
+                for &u in units {
+                    if u > 127 || !(u as u8).is_ascii_digit() {
+                        return None;
+                    }
+                    acc = acc
+                        .checked_mul(10)?
+                        .checked_add(u32::from(u as u8 - b'0'))?;
+                }
+                Some(acc)
+            }
+            _ => None,
         }
-        digits.parse::<u32>().ok()
     }
 
     /// Decodes a heap string to Rust text (key handling and diagnostics).
@@ -1465,6 +1655,13 @@ impl<'a> Interp<'a> {
     /// Resolves a key value to a named-property key. Numbers coerce through
     /// their canonical decimal spelling; everything else goes through
     /// ES `ToString`.
+    ///
+    /// Intern-once: exactly one `intern_string` per call — callers never
+    /// pre-materialize (entry [`Self::flatten_key`] is an in-place,
+    /// allocation-free flatten, not a copy). Skipping the intern for
+    /// already-canonical handles in O(1) needs a heap canonical-bit (the
+    /// `Heap::REALM_GLOBAL_FLAG` precedent); that heap change is outside
+    /// this lane and stays a follow-up.
     fn property_key(&mut self, key_v: JsValue) -> Result<PropKey, JSException> {
         if let Some(h) = key_v.as_string() {
             // Canonicalize through the intern table: PropKey identity is
@@ -1533,6 +1730,18 @@ impl<'a> Interp<'a> {
         })
     }
 
+    /// Flattens a property-key string in place (allocation-free; an O(1)
+    /// no-op when already flat). Every `get/set_property`-family entry
+    /// calls this once, so the surface probes below (`key_is`,
+    /// `method_native`, `array_index_of`) never re-materialize: their
+    /// defensive flattens become no-ops on the hot path while staying
+    /// correct for direct callers that skip the entry.
+    fn flatten_key(&mut self, key_v: JsValue) {
+        if let Some(h) = key_v.as_string() {
+            self.heap.flatten(h);
+        }
+    }
+
     /// The native for `key` on receiver kind `kind`, from the const method
     /// table. Returns `None` when the key is not a method of that kind.
     ///
@@ -1559,6 +1768,9 @@ impl<'a> Interp<'a> {
     }
 
     /// Compares a key value's string text against `text` (flattening first).
+    /// The flatten is defensive — an O(1) no-op when the entry already ran
+    /// [`Self::flatten_key`] — so every surface probe stays correct whether
+    /// or not the caller pre-flattened.
     fn key_is(&mut self, key_v: JsValue, text: &str) -> bool {
         let Some(handle) = key_v.as_string() else {
             return false;
