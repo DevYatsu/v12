@@ -105,10 +105,19 @@ impl<'a> Ctx<'a> {
     /// O(1): `intrinsic_slot` is a compiler jump table over the fixed
     /// 20-name realm table — no `.position()` linear scan, no string
     /// compares on the hot builtin path.
+    ///
+    /// Realm fallback: compile-time builtins dispatch through
+    /// [`call_ctx`], which carries no explicit global, so `self.global` is
+    /// `None`. Falling back to the first registered realm global keeps those
+    /// natives able to reach their realm (same source the module-import seam
+    /// uses); without it a `RegExp` literal minted outside the interpreter
+    /// would read `None` and skip its `[[Prototype]]` link.
     #[must_use]
     pub fn intrinsic(&self, name: &str) -> Option<JsValue> {
-        let global = self.global?;
         let idx = intrinsic_slot(name)?;
+        let global = self
+            .global
+            .or_else(|| self.heap.realm_globals().first().copied())?;
         self.heap.get(global).properties.get(idx).copied()
     }
 

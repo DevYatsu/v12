@@ -84,11 +84,29 @@ pub fn regexp_construct(
 }
 
 fn alloc_regexp(ctx: &mut Ctx, source: JsValue, flags: JsValue) -> Handle<JsObject> {
-    ctx.alloc_obj(JsObject::regexp(
+    let h = ctx.alloc_obj(JsObject::regexp(
             source.as_string().expect("source is a string"),
             flags.as_string().expect("flags is a string"),
         ),
-    )
+    );
+    link_regexp_proto(ctx, h);
+    h
+}
+
+/// Stamps `%RegExp.prototype%` as `h`'s `[[Prototype]]` (spec
+/// `RegExpCreate` → `OrdinaryCreateFromConstructor`). The prototype is the
+/// realm's, resolved through the `RegExp` constructor's `prototype` field
+/// (installed at realm build via `install_ctor`), so
+/// `Object.getPrototypeOf(re) === RegExp.prototype` and
+/// `re instanceof RegExp` both hold. No-op when the realm cannot be
+/// resolved (engine-side tests that build a bare heap).
+pub(crate) fn link_regexp_proto(ctx: &mut Ctx, h: Handle<JsObject>) {
+    let Some(ctor) = ctx.intrinsic("RegExp").and_then(|v| v.as_object()) else {
+        return;
+    };
+    if let Some(proto) = ctx.heap.get(ctor).prototype {
+        ctx.heap.get_mut(h).prototype = Some(proto);
+    }
 }
 
 /// ES ToString for the RegExp constructor's pattern/flags arguments.

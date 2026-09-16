@@ -160,6 +160,34 @@ impl Interp<'_> {
             let len = self.heap.get(h).len();
             return Ok(ops::box_number(len as f64));
         }
+        // `StringGetOwnProperty` for the decimal index keys: a canonical
+        // numeric index `i < length` names the single UTF-16 code unit at
+        // `i`; every other index (negative, huge, fractional) is absent, so
+        // the read is `undefined`. Flat storage is read in place — no
+        // per-index `Vec` materialization (`String.prototype.charAt` clones,
+        // this does not).
+        if kind == Kind::StringPrim
+            && let Some(idx) = self.array_index_of(key_v)
+        {
+            let h = obj_v.as_string().expect("string primitive has a handle");
+            self.heap.flatten(h);
+            let unit = match &self.heap.get(h).storage {
+                v12_heap::StrStorage::Latin1(bytes) => {
+                    bytes.get(idx as usize).map(|&b| u16::from(b))
+                }
+                v12_heap::StrStorage::Utf16(units) => units.get(idx as usize).copied(),
+                _ => None,
+            };
+            return Ok(match unit {
+                Some(u) => {
+                    let sh = self
+                        .heap
+                        .intern_string(v12_heap::V12Str::utf16(vec![u]));
+                    JsValue::string(sh)
+                }
+                None => JsValue::undefined(),
+            });
+        }
         Ok(JsValue::undefined())
     }
 

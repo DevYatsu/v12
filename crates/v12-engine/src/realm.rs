@@ -237,6 +237,15 @@ impl Realm {
         );
         let boolean_proto = alloc_root(heap);
         let symbol_proto = alloc_root(heap);
+        // `RegExp.prototype`: the spec's `%RegExp.prototype%` is an ordinary
+        // object; the interpreter synthesizes the method surface from
+        // `Kind::RegExp`, so no own props are stamped here. Linking it at
+        // realm build (rather than lazily on first `.prototype` read) is what
+        // gives every RegExp instance a real `[[Prototype]]`, so
+        // `Object.getPrototypeOf(/1/) === RegExp.prototype` holds — including
+        // for instances built inside `eval`, which never touches the
+        // interpreter's lazy surface.
+        let regexp_proto = alloc_root(heap);
 
         // Link the intrinsic constructors to their prototypes through the
         // unified install family (`install_ctor`: `prototype` field +
@@ -252,6 +261,7 @@ impl Realm {
             ("Number", number_proto),
             ("Boolean", boolean_proto),
             ("Symbol", symbol_proto),
+            ("RegExp", regexp_proto),
         ] {
             if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
                 crate::builtins::install_ctor(heap, o, proto);

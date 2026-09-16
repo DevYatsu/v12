@@ -440,7 +440,9 @@ pub fn string_split(
     } else {
         let source_h = ctx.heap.intern_text(&source);
         let flags_h = ctx.heap.intern_text(&format!("{flags}g"));
-        ctx.alloc_obj(v12_heap::JsObject::regexp(source_h, flags_h))
+        let h = ctx.alloc_obj(v12_heap::JsObject::regexp(source_h, flags_h));
+        regexp::link_regexp_proto(ctx, h);
+        h
     };
     let text_h = ctx.heap.intern_text(&text);
     let spans = collect_match_spans(ctx, splitter, text_h, &text, true)?;
