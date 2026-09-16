@@ -482,35 +482,49 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         rid: Option<oxc_semantic::ReferenceId>,
         span: Span,
     ) -> Res<u16> {
+        let dst = self.new_temp();
+        // Inside a `with` body the spec scope chain puts the object
+        // environment records ahead of every static scope, so the dynamic
+        // probe must run before static resolution. Outside one this costs
+        // nothing (the helper returns immediately).
+        let end = self.emit_with_probe(name, dst, None, span)?;
+        self.read_identifier_static(name, rid, dst, span)?;
+        if let Some(end) = end {
+            self.bind(end);
+        }
+        Ok(dst)
+    }
+
+    /// Static (lexical) resolution for an identifier read: symbol access when
+    /// the reference resolves, else the spec-defined global fallbacks.
+    fn read_identifier_static(
+        &mut self,
+        name: &str,
+        rid: Option<oxc_semantic::ReferenceId>,
+        dst: u16,
+        span: Span,
+    ) -> Res<()> {
         if let Some(sym) = self.comp.symbol_of(rid) {
-            let dst = self.new_temp();
             self.read_access(self.access(sym), dst, span);
-            return Ok(dst);
+            return Ok(());
         }
         // Spec-defined non-writable globals that need no runtime binding.
         match name {
-            "undefined" => {
-                let dst = self.new_temp();
-                self.load_undefined(dst, span);
-                Ok(dst)
-            }
+            "undefined" => self.load_undefined(dst, span),
             "NaN" | "Infinity" => {
-                let dst = self.new_temp();
                 let v = if name == "NaN" {
                     f64::NAN
                 } else {
                     f64::INFINITY
                 };
                 self.load_const(dst, Const::F64(v), span)?;
-                Ok(dst)
             }
             other => {
-                let dst = self.new_temp();
                 let id = self.global_name_id(other);
                 self.emit_get_global(dst, id, span);
-                Ok(dst)
             }
         }
+        Ok(())
     }
 
     /// Reads storage into `dst`.
@@ -868,6 +882,41 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // dedicated value materialisation in `read_identifier` and need no
         // special casing either.
         if let Expression::Identifier(id) = arg {
+            let name = id.name.as_str();
+            // Inside a `with` body the object environment records precede
+            // every static scope, and a missing binding must still yield
+            // `"undefined"` rather than throwing.
+            if !self.with_objs.is_empty() {
+                let dst = self.new_temp();
+                let end = self.emit_with_probe(name, dst, None, span)?;
+                match self.comp.symbol_of(id.reference_id.get()) {
+                    Some(sym)
+                        if matches!(self.access(sym), crate::model::VarAccess::Global { .. }) =>
+                    {
+                        let gid = self.global_name_id(name);
+                        self.emit_get_global_lenient(dst, gid, span);
+                    }
+                    Some(sym) => {
+                        let access = self.access(sym);
+                        self.read_access(access, dst, span);
+                    }
+                    None => match name {
+                        "undefined" | "NaN" | "Infinity" => {
+                            self.read_identifier_static(name, None, dst, span)?;
+                        }
+                        other => {
+                            let gid = self.global_name_id(other);
+                            self.emit_get_global_lenient(dst, gid, span);
+                        }
+                    },
+                }
+                if let Some(end) = end {
+                    self.bind(end);
+                }
+                let out = self.new_temp();
+                self.emit_reg3(Opcode::TypeOf, out, dst, 0, span);
+                return Ok(out);
+            }
             if let Some(sym) = self.comp.symbol_of(id.reference_id.get()) {
                 if matches!(self.access(sym), crate::model::VarAccess::Global { .. }) {
                     let name = self.comp.scoping.symbol_name(sym).to_string();

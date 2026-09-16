@@ -12,7 +12,7 @@
 use oxc_ast::ast::{
     ArrayPattern, BindingPattern, Declaration, Expression, ForInStatement, ForOfStatement,
     ForStatementInit, Function, LabeledStatement, ModuleDeclaration, ObjectPattern, Statement,
-    TryStatement, VariableDeclarationKind,
+    TryStatement, VariableDeclarationKind, WithStatement,
 };
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{HandlerRange, Instr, Label, Opcode, WideOp};
@@ -161,11 +161,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Statement::ForInStatement(f) => self.for_in_loop(f, None),
             Statement::ForOfStatement(f) => self.for_of_loop(f, None),
-            Statement::WithStatement(_) => {
-                // `with` needs dynamic scope resolution; silently ignoring the
-                // scope object would resolve identifiers wrongly, so reject.
-                Err(self.err(s.span(), "with statements are not supported"))
-            }
+            Statement::WithStatement(w) => self.with_stmt(w),
             Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => {
                 Err(self.err(
                     s.span(),
@@ -437,6 +433,39 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.lower_binding_pattern(&ap.left, chosen)
             }
         }
+    }
+
+    /// `with (object) statement` (ES 14.11).
+    ///
+    /// Sloppy mode only: spec 14.11.1 makes `with` an early `SyntaxError` in
+    /// strict-mode code. The message is prefixed `SyntaxError:` so the
+    /// conformance harness classifies the compile failure as parse-phase and
+    /// `assert.throws(SyntaxError, ...)` negatives are satisfied by the value
+    /// thrown at `Function`/`eval` construction time.
+    ///
+    /// The scope object is evaluated once into a register reserved for the
+    /// whole body ([`FnCtx::with_objs`]); identifier *reads* inside the body
+    /// probe it dynamically before falling back to static resolution
+    /// ([`FnCtx::emit_with_probe`]).
+    ///
+    /// Known limitation (documented, not exercised by the target tests):
+    /// identifier *writes* inside the body still resolve statically, and a
+    /// function *declared* inside the body compiles in a fresh `FnCtx` that
+    /// sees no `with` objects. Both need the full spec `ObjectEnvironmentRecord`
+    /// chain to be correct.
+    fn with_stmt(&mut self, w: &'a WithStatement<'a>) -> Res<()> {
+        if self.comp.plans.units[self.unit].is_strict {
+            return Err(self.err(
+                w.span,
+                "SyntaxError: strict mode code may not include a with statement",
+            ));
+        }
+        let obj = self.new_temp();
+        self.expr_into(&w.object, obj)?;
+        self.with_objs.push(obj);
+        let res = self.stmt(&w.body);
+        self.with_objs.pop();
+        res
     }
 
     // -- loops -------------------------------------------------------------------

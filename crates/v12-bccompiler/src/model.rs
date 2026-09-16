@@ -468,6 +468,15 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     pub(crate) handler_max: u32,
     pub loops: Vec<LoopCtx>,
     pub finallies: Vec<FinallyCtx<'a>>,
+    /// Registers holding the scope objects of the enclosing `with` statements,
+    /// innermost last (spec `ObjectEnvironmentRecord` chain). Identifier
+    /// *reads* are dynamically probed against these before static resolution.
+    ///
+    /// The register is reserved for the whole `with` body: `new_temp()` is a
+    /// monotonic bump with no free list, so nothing else can clobber it. The
+    /// value stack is already a GC root (`gc_protect` extends from `self.stack`),
+    /// so no `Frame` field or extra rooting is required.
+    pub with_objs: Vec<u16>,
     /// Register holding the value of the last expression statement compiled
     /// so far, when there is one. The main unit emits a `Return` of it so
     /// `eval` gets the spec-compliant script completion value.
@@ -487,6 +496,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             handler_max: 0,
             loops: Vec::new(),
             finallies: Vec::new(),
+            with_objs: Vec::new(),
             last_expr_reg: None,
             overflow: None,
         }
@@ -941,6 +951,52 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let tmp = self.new_temp();
         self.emit_reg3(Opcode::GetProperty, tmp, src, key, span);
         Ok(())
+    }
+
+    /// Emits the dynamic `with`-scope probe for the identifier `name`.
+    ///
+    /// For each enclosing `with` object (innermost first — the spec
+    /// `ObjectEnvironmentRecord` binding chain) emits
+    /// `HasProperty(obj, name) ? obj[name] : <next>`, branching to the returned
+    /// label on the first hit. When no enclosing object has the binding the
+    /// caller emits static resolution and then binds that label, so the probe
+    /// costs zero instructions outside any `with`.
+    ///
+    /// `HasProperty` is the `In` operator, which walks the prototype chain.
+    /// `store` selects `SetProperty` over `GetProperty`; `dst` is the read
+    /// destination.
+    ///
+    /// Limitations (documented, outside the target tests): `In` throws
+    /// `TypeError` on a primitive right-hand side, so `with` over a primitive
+    /// throws instead of boxing it; and a function *declared* inside a `with`
+    /// body compiles in a fresh `FnCtx` that sees no `with` objects, so its
+    /// identifiers resolve statically.
+    pub fn emit_with_probe(
+        &mut self,
+        name: &str,
+        dst: u16,
+        store: Option<u16>,
+        span: Span,
+    ) -> Result<Option<Label>, CompileError> {
+        if self.with_objs.is_empty() {
+            return Ok(None);
+        }
+        let key = self.load_str_key(name, span)?;
+        let end = self.label();
+        for idx in (0..self.with_objs.len()).rev() {
+            let obj = self.with_objs[idx];
+            let hit = self.new_temp();
+            self.emit_reg3(Opcode::In, hit, key, obj, span);
+            let miss = self.label();
+            self.emit_jump(Opcode::JumpIfFalse, hit, miss);
+            match store {
+                Some(v) => self.emit_reg3(Opcode::SetProperty, obj, key, v, span),
+                None => self.emit_reg3(Opcode::GetProperty, dst, obj, key, span),
+            }
+            self.emit_jump(Opcode::Jump, 0, end);
+            self.bind(miss);
+        }
+        Ok(Some(end))
     }
 
     /// `SetGlobal name_id, src` — same `Spur`-derived string table id as
