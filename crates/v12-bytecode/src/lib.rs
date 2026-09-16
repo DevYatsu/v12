@@ -330,6 +330,9 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
     "eval",
     "console",
     "globalThis",
+    // Appended (never mid-inserted): index 20. Appending only biases
+    // `GLOBAL_VAR_OFFSET`, so no existing intrinsic index changes.
+    "Proxy",
 ];
 
 /// Offset of user-declared global slots in the global object's `properties`.
@@ -369,6 +372,10 @@ pub const GLOBAL_ACCESS_INTRINSICS: &[&str] = &[
     "eval",
     "console",
     "globalThis",
+    // Kept in the same order as `GLOBAL_INTRINSICS` (this table is its
+    // superset); the two extra error constructors above are the only pins
+    // before it.
+    "Proxy",
 ];
 
 /// Human-readable opcode name; exhaustive so a new variant fails to compile

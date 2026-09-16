@@ -17,6 +17,7 @@ pub mod math;
 pub mod number;
 pub mod object;
 pub mod promise;
+pub mod proxy;
 pub mod registry;
 pub mod regexp;
 pub mod string;
@@ -51,6 +52,11 @@ pub struct BuiltinTargets {
     pub boolean_proto: v12_heap::Handle<v12_heap::JsObject>,
     pub symbol: Option<v12_heap::Handle<v12_heap::JsObject>>,
     pub symbol_proto: v12_heap::Handle<v12_heap::JsObject>,
+    /// The `Proxy` constructor. Statics install on it (`Proxy.revocable`);
+    /// `Proxy` intentionally has no `prototype` (test262
+    /// `built-ins/Proxy/proxy-no-prototype.js`), so there is no
+    /// `proxy_proto` field.
+    pub proxy: Option<v12_heap::Handle<v12_heap::JsObject>>,
 }
 
 pub(crate) fn builtin_install_prop(
@@ -219,6 +225,7 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::SymbolKeyFor => Some(1),
         NativeId::SymbolProtoToString => Some(0),
         NativeId::SymbolProtoValueOf => Some(0),
+        NativeId::ProxyRevocable => Some(2),
         _ => None,
     }
 }
@@ -375,6 +382,9 @@ macro_rules! __builtin_emit_install {
     (Symbol, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, $targets.symbol, $name, $id)
     };
+    (Proxy, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.proxy, $name, $id)
+    };
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, Some($targets.symbol_proto), $name, $id)
     };
@@ -427,6 +437,9 @@ macro_rules! __builtin_emit_install {
     };
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length($heap, Some($targets.symbol_proto), $name, $id, Some($len))
+    };
+    (Proxy, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.proxy, $name, $id, Some($len))
     };
     // Value-constant groups ignore length (constants, not functions).
     (GlobalValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
@@ -728,6 +741,9 @@ define_builtins! {
         "toString" (0) => SymbolProtoToString => |heap, this, args| call_ctx(symbol::symbol_proto_to_string, heap, this, args),
         "valueOf" (0) => SymbolProtoValueOf => |heap, this, args| call_ctx(symbol::symbol_proto_value_of, heap, this, args),
         "description" => SymbolProtoDescription => |heap, this, args| call_ctx(symbol::symbol_proto_description, heap, this, args),
+    },
+    Proxy {
+        "revocable" (2) => ProxyRevocable => |heap, this, args| call_ctx(proxy::proxy_revocable, heap, this, args),
     };
     // Truly internal / non-JS-visible dispatch-only natives (not installed).
     StringConstruct => |heap, this, args| call_ctx(string_construct, heap, this, args),
@@ -775,6 +791,7 @@ define_builtins! {
     IteratorEvery => callback_stub,
     IteratorFind => callback_stub,
     SymbolConstruct => |heap, this, args| call_ctx(symbol::symbol_construct, heap, this, args),
+    ProxyConstruct => |heap, this, args| call_ctx(proxy::proxy_construct, heap, this, args),
     MapIterator => |heap, this, args| call_ctx(iterator::map_iterator, heap, this, args),
     SetIterator => |heap, this, args| call_ctx(iterator::set_iterator, heap, this, args),
     IteratorSelf => |heap, this, args| call_ctx(iterator::iterator_self, heap, this, args),

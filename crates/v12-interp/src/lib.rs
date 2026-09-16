@@ -165,6 +165,7 @@ fn intrinsic_slot(text: &str) -> Option<usize> {
         "eval" => Some(intrinsic_idx("eval").expect("intrinsic 'eval' present")),
         "console" => Some(CONSOLE_IDX.expect("intrinsic 'console' present")),
         "globalThis" => Some(intrinsic_idx("globalThis").expect("intrinsic 'globalThis' present")),
+        "Proxy" => Some(intrinsic_idx("Proxy").expect("intrinsic 'Proxy' present")),
         _ => None,
     }
 }

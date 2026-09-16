@@ -154,6 +154,15 @@ pub struct JsObject {
     /// Prototype link; traced as a strong reference. Guards over this chain
     /// watch a validity-cell serial, not this field alone.
     pub prototype: Option<Handle<JsObject>>,
+    /// Proxy exotic object slots: `[[ProxyTarget]]` and `[[ProxyHandler]]`.
+    ///
+    /// Invariant: a proxy is revoked exactly when `kind == Kind::Proxy` and
+    /// `proxy_target.is_none()`. Revocation clears both slots; every future
+    /// trap dispatcher checks this and throws `TypeError` for a revoked
+    /// proxy. `None` on every non-proxy object. Both are traced.
+    pub proxy_target: Option<Handle<JsObject>>,
+    /// See [`JsObject::proxy_target`].
+    pub proxy_handler: Option<Handle<JsObject>>,
     /// The validity cell watching assumptions about this object (prototype
     /// identity, attribute stability), assigned lazily on first use. The
     /// registry holding serials lives on the heap. Not on the shape-lookup
@@ -198,6 +207,8 @@ impl Default for JsObject {
             elements: Vec::new(),
             elements_array: crate::elements::ElementsArray::new(),
             prototype: None,
+            proxy_target: None,
+            proxy_handler: None,
             validity_cell: ValidityCellId::NONE,
             private_brand: None,
             private_fields: None,
@@ -593,6 +604,19 @@ impl JsObject {
             ..Self::default()
         }
     }
+
+    /// Proxy exotic object holding its `[[ProxyTarget]]` and `[[ProxyHandler]]`.
+    ///
+    /// Revocation clears both to `None`, so the revoked predicate is
+    /// `kind == Kind::Proxy && proxy_target.is_none()`.
+    pub fn proxy(target: Handle<JsObject>, handler: Handle<JsObject>) -> Self {
+        Self {
+            kind: Kind::Proxy,
+            proxy_target: Some(target),
+            proxy_handler: Some(handler),
+            ..Self::default()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -800,12 +824,18 @@ const VALUE_BYTES: usize = core::mem::size_of::<crate::JsValue>();
 
 impl SizeEstimate for JsObject {
     fn approx_size(&self) -> usize {
-        // Header (kind, flags, prototype) + capacity of all slot vectors.
+        // Header (kind, flags, prototype, proxy slots) + capacity of all slot
+        // vectors.
         let mapped = self
             .arguments_mapped
             .as_ref()
             .map_or(0, |m| m.len() * core::mem::size_of::<Option<u32>>());
-        16 + self.properties.capacity() * VALUE_BYTES
+        // The two proxy slots (`proxy_target`/`proxy_handler`) live inline in
+        // the object, not in a heap vector, so charge them here alongside the
+        // prototype link.
+        let proxy_slots = 2 * core::mem::size_of::<Option<Handle<JsObject>>>();
+        16 + proxy_slots
+            + self.properties.capacity() * VALUE_BYTES
             + self.elements.capacity() * VALUE_BYTES
             + self.property_keys.capacity() * core::mem::size_of::<Option<crate::PropKey>>()
             + self.elements_array.retained_bytes()
@@ -840,6 +870,10 @@ impl Trace for JsObject {
         self.elements.trace(sink);
         self.elements_array.trace(sink);
         self.prototype.trace(sink);
+        // Proxy exotic slots: keep the target and handler alive for as long as
+        // the proxy itself is reachable (a revoked proxy has both cleared).
+        self.proxy_target.trace(sink);
+        self.proxy_handler.trace(sink);
         self.captured_env.trace(sink);
         // The callable target can itself carry heap handles (`RealmEval`
         // global, `Bound` state object); trace it so those stay reachable.

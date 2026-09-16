@@ -284,6 +284,13 @@ pub enum NativeId {
     /// this index, which the engine intercepts to build the namespace object
     /// (see `v12-bccompiler::model::NATIVE_IMPORT_INDEX`).
     ModuleImport = 254,
+    // Proxy
+    /// `new Proxy(target, handler)` — the constructor. Phase 1 allocates the
+    /// proxy exotic object; trap dispatch is a later phase.
+    ProxyConstruct = 2700,
+    /// `Proxy.revocable(target, handler)` — allocates the proxy plus its
+    /// revocation function and returns `{ proxy, revoke }`.
+    ProxyRevocable = 2701,
 }
 
 /// The serialized index of a native function.

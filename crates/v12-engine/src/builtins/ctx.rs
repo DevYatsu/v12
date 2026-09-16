@@ -40,6 +40,7 @@ fn intrinsic_slot(name: &str) -> Option<usize> {
         "eval" => 17,
         "console" => 18,
         "globalThis" => 19,
+        "Proxy" => 20,
         _ => return None,
     };
     debug_assert!(v12_bytecode::GLOBAL_INTRINSICS.get(idx) == Some(&name));

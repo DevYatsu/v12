@@ -161,6 +161,44 @@ impl Realm {
         wire_callable(heap, &intrinsics, "Set", NativeId::SetConstruct);
         wire_callable(heap, &intrinsics, "Symbol", NativeId::SymbolConstruct);
         wire_callable(heap, &intrinsics, "RegExp", NativeId::RegExpConstruct);
+        // `Proxy`: the constructor allocates a proxy exotic object (target
+        // validation + slots; trap dispatch is a later phase).
+        //
+        // Proxy intentionally has NO `.prototype` (test262
+        // `built-ins/Proxy/proxy-no-prototype.js`): proxy exotic objects have
+        // no `[[Prototype]]` slot that construction initializes, so the spec
+        // gives `%Proxy%` no `prototype` property. `install_ctor` and
+        // `install_ctor_link` are therefore NOT called for Proxy, and no
+        // `proxy_proto` object is allocated. The `prototype` field on the
+        // placeholder function object stays `None`, which the interpreter's
+        // `prepare_construct` path tolerates (it is a native, so it never
+        // allocates an instance).
+        wire_callable(heap, &intrinsics, "Proxy", NativeId::ProxyConstruct);
+        // `Proxy.length` is 2 and `Proxy.name` is `"Proxy"` (ES `CreateBuiltinFunction`).
+        // The intrinsic placeholders carry neither property (no other intrinsic
+        // ctor does yet — `Array.length` reads `undefined` today), and the
+        // interpreter has no name surface for them, so stamp both here with the
+        // spec attrs `{ writable: false, enumerable: false, configurable: true }`
+        // in `length`-then-`name` order (test262 `built-ins/Proxy/length.js`,
+        // `name.js`).
+        if let Some(proxy_ctor) = intrinsics.get("Proxy").and_then(|v| v.as_object()) {
+            // Intern everything the ctx needs before constructing it (the ctx
+            // holds the only `&mut Heap` borrow).
+            let proxy_name = heap.intern_text("Proxy");
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            ctx.define_data_prop_with_attrs(
+                proxy_ctor,
+                "length",
+                JsValue::from_i32_smi(2).expect("2 fits Smi"),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            ctx.define_data_prop_with_attrs(
+                proxy_ctor,
+                "name",
+                JsValue::string(proxy_name),
+                v12_heap::Attrs::new(false, false, true),
+            );
+        }
         // `eval` is realm-bound: a `RealmEval` function carrying THIS realm's
         // global, so eval'd code — direct or detached like
         // `$262.createRealm().global.eval` — executes against this realm's
@@ -241,6 +279,7 @@ impl Realm {
             boolean_proto,
             symbol: intrinsics.get("Symbol").and_then(|v| v.as_object()),
             symbol_proto,
+            proxy: intrinsics.get("Proxy").and_then(|v| v.as_object()),
         };
         crate::builtins::install_builtins(heap, &targets);
 
