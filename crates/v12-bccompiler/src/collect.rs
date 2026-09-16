@@ -174,6 +174,11 @@ impl<'s> Collector<'s> {
         let is_strict = parent_strict || own_strict;
         let mut plan = UnitPlan::new(Some(parent), false, name_hint);
         plan.is_strict = is_strict;
+        // A named function's `name` own property (installed at closure alloc):
+        // without this the name is unobservable (`f.name === undefined`).
+        if let Some(id) = f.id.as_ref() {
+            plan.function_name = Some(id.name.to_string());
+        }
         self.plans.units.push(plan);
         self.plans.fn_index.insert(f.span(), idx);
         self.unit_stack.push(idx);

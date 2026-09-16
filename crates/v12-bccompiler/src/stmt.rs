@@ -299,6 +299,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// pattern handling. Array rest uses `CopyArrayRest` (slice of elements);
     /// object rest uses `CopyObjectRestW` (iterate shapes, skip extracted keys).
     fn object_pattern_store(&mut self, o: &ObjectPattern<'_>, src: u16) -> Res<()> {
+        // An empty `{}` emits zero reads, so `null`/`undefined` would slip
+        // past the `get_property` null guard: require coercibility first.
+        if o.properties.is_empty() && o.rest.is_none() {
+            self.emit_require_object_coercible(src, o.span)?;
+        }
         let has_rest = o.rest.is_some();
         let prop_count = o.properties.len();
         // Allocate contiguous registers for excluded keys when rest exists.
@@ -369,6 +374,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// `let [a, b, ...rest] = arr` with nested, default, and rest via slice.
     fn array_pattern_store(&mut self, a: &ArrayPattern<'_>, src: u16) -> Res<()> {
+        // An all-elision `[,]` with no rest emits zero reads: require
+        // coercibility so `null`/`undefined` still throw `TypeError`.
+        if a.rest.is_none() && a.elements.iter().all(|el| el.is_none()) {
+            self.emit_require_object_coercible(src, a.span)?;
+        }
         let fixed_len = a.elements.len();
         for (idx, el) in a.elements.iter().enumerate() {
             let Some(pat) = el else { continue };
@@ -687,7 +697,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                                 self.store_access(access, val, span);
                             } else {
                                 let gid = self.global_name_id(id.binding.name.as_str());
-                                self.emit_set_global(gid, val, span);
+                                if self.comp.plans.units[self.unit].is_strict {
+                                    self.emit_set_global_strict(gid, val, span);
+                                } else {
+                                    self.emit_set_global(gid, val, span);
+                                }
                             }
                         }
                         oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {

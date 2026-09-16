@@ -16,6 +16,72 @@ impl Engine {
         }
     }
 
+    /// Reads a property `key` walking the prototype chain (own shape first,
+    /// then each `[[Prototype]]`): the first hit whose value is a string.
+    /// Shape lookup is own-shape only, so inherited links like
+    /// `instance.constructor` (living on the class prototype) need the walk.
+    fn chain_str_prop(
+        &mut self,
+        obj: v12_heap::Handle<v12_heap::JsObject>,
+        key: &str,
+    ) -> Option<v12_heap::Handle<V12Str>> {
+        let h = self.heap.intern_text(key);
+        let pk = v12_heap::PropKey::from_string(h);
+        let mut cur = Some(obj);
+        while let Some(o) = cur {
+            let shape = self.heap.shape_of(o);
+            if let Some(desc) = self.heap.lookup_property(shape, pk)
+                && let Some(slot) = desc.slot()
+            {
+                let props = &self.heap.get(o).properties;
+                let hit = props
+                    .get(slot as usize)
+                    .and_then(|v| v.as_string())
+                    .or_else(|| {
+                        let idx = crate::realm::INTRINSIC_COUNT + slot as usize;
+                        props.get(idx).and_then(|v| v.as_string())
+                    });
+                if hit.is_some() {
+                    return hit;
+                }
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        None
+    }
+
+    /// Reads an object-valued property `key` walking the prototype chain:
+    /// the first hit whose value is an object.
+    fn chain_obj_prop(
+        &mut self,
+        obj: v12_heap::Handle<v12_heap::JsObject>,
+        key: &str,
+    ) -> Option<v12_heap::Handle<v12_heap::JsObject>> {
+        let h = self.heap.intern_text(key);
+        let pk = v12_heap::PropKey::from_string(h);
+        let mut cur = Some(obj);
+        while let Some(o) = cur {
+            let shape = self.heap.shape_of(o);
+            if let Some(desc) = self.heap.lookup_property(shape, pk)
+                && let Some(slot) = desc.slot()
+            {
+                let props = &self.heap.get(o).properties;
+                let hit = props
+                    .get(slot as usize)
+                    .and_then(|v| v.as_object())
+                    .or_else(|| {
+                        let idx = crate::realm::INTRINSIC_COUNT + slot as usize;
+                        props.get(idx).and_then(|v| v.as_object())
+                    });
+                if hit.is_some() {
+                    return hit;
+                }
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        None
+    }
+
     /// Returns a display string for a value, using the engine heap.
     pub fn to_display_string(&mut self, value: JsValue) -> String {
         // For engine-heap values, intern and flatten via heap string ops.
@@ -120,6 +186,17 @@ impl Engine {
                     // No name — return the message directly (covers Test262Error which
                     // stores only `message`; prefixing with generic "Error" would be noisy).
                     if !msg.is_empty() { return msg; }
+                }
+                // Empty/missing message (e.g. `new Test262Error()` with no
+                // message argument): fall back to `constructor.name` so the
+                // runner can classify the throw (it requires "Test262Error").
+                if let Some(co) = self.chain_obj_prop(obj, "constructor")
+                    && let Some(nh) = self.chain_str_prop(co, "name")
+                {
+                    let name = self.heap_string_text(nh);
+                    if !name.is_empty() {
+                        return name;
+                    }
                 }
             }
             return "[object Object]".to_string();

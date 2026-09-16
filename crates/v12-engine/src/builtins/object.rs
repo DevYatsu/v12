@@ -439,6 +439,14 @@ fn to_string_handle(ctx: &mut Ctx, v: JsValue) -> Result<Handle<V12Str>, JsValue
 /// object that outlives the call).
 fn array_value(ctx: &mut Ctx, items: Vec<JsValue>) -> JsValue {
     let arr = ctx.heap.alloc(v12_heap::JsObject::array(items));
+    // Link [[Prototype]] to %Array.prototype% (via the Array constructor's
+    // linked field) so `result.constructor === Array`; mirrors the
+    // error-instance linking in `builtins/registry.rs`.
+    if let Some(ctor) = ctx.intrinsic("Array").and_then(|v| v.as_object())
+        && let Some(proto) = ctx.heap.get(ctor).prototype
+    {
+        ctx.heap.get_mut(arr).prototype = Some(proto);
+    }
     ctx.add_root(JsValue::object(arr));
     JsValue::object(arr)
 }

@@ -925,6 +925,24 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_regs(Opcode::GetGlobalLenient, dst, k >> 8, k & 0xFF, 0b0001, span);
     }
 
+    /// `RequireObjectCoercible` guard for destructuring: a dummy
+    /// `GetProperty` read that throws `TypeError` on `null`/`undefined`
+    /// sources (via the null guard in the interpreter's `get_property`)
+    /// and is otherwise a harmless miss discarded into a fresh temp. Only
+    /// needed when a pattern would emit zero reads (empty `{}`/`[]` with
+    /// no rest); non-empty patterns throw through their own first read.
+    pub fn emit_require_object_coercible(
+        &mut self,
+        src: u16,
+        span: oxc_span::Span,
+    ) -> Result<(), CompileError> {
+        let key = self.new_temp();
+        self.load_str(key, "__coercible__", span)?;
+        let tmp = self.new_temp();
+        self.emit_reg3(Opcode::GetProperty, tmp, src, key, span);
+        Ok(())
+    }
+
     /// `SetGlobal name_id, src` — same `Spur`-derived string table id as
     /// `GetGlobal`.
     // Global-name table ids fit u16 in this subset; audited invariant.
@@ -932,6 +950,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     pub fn emit_set_global(&mut self, name_id: u32, src: u16, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
         self.emit_regs(Opcode::SetGlobal, src, k >> 8, k & 0xFF, 0b0001, span);
+    }
+
+    /// Strict-mode `SetGlobal`: a throwing `GetGlobal` existence check
+    /// (`ReferenceError` on an unresolvable identifier) before the store, so
+    /// strict assignment to an undeclared name throws instead of creating a
+    /// global. Sloppy mode keeps the bare `SetGlobal`. Callers evaluate the
+    /// RHS first, so the check runs after it, matching spec order.
+    pub fn emit_set_global_strict(&mut self, name_id: u32, src: u16, span: oxc_span::Span) {
+        let probe = self.new_temp();
+        self.emit_get_global(probe, name_id, span);
+        self.emit_set_global(name_id, src, span);
     }
 
     /// `Call` with the documented layout; wide encodings for large arities

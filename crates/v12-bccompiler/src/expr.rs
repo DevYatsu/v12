@@ -1096,6 +1096,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let Some(simple) = left.as_simple_assignment_target() else {
             unreachable!("destructuring handled above");
         };
+        // Strict-mode assignment to an undeclared name throws ReferenceError.
+        // Probe resolvability BEFORE evaluating the RHS: the RHS may create
+        // the property as a side effect (`undeclared = (this.undeclared = 5)`),
+        // which must not satisfy the check — the spec records resolvability
+        // at reference creation, before RHS evaluation. (Compound `op=` and
+        // updates already read via `GetGlobal` first, so only plain `=` needs
+        // the probe.)
+        if binop.is_none() && self.comp.plans.units[self.unit].is_strict {
+            if let Some(oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id)) =
+                left.as_simple_assignment_target()
+                && self.comp.symbol_of(id.reference_id.get()).is_none()
+            {
+                let gid = self.global_name_id(id.name.as_str());
+                let probe = self.new_temp();
+                self.emit_get_global(probe, gid, span);
+            }
+        }
         let rhs = self.expr(right)?;
 
         match simple {
@@ -1179,6 +1196,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let src = self.expr(right)?;
         match left {
             AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                // An all-elision `[,] = rhs` with no rest emits zero reads:
+                // require coercibility so `null`/`undefined` still throw.
+                if arr.rest.is_none() && arr.elements.iter().all(|el| el.is_none()) {
+                    self.emit_require_object_coercible(src, span)?;
+                }
                 // `[a, b, ...rest] = rhs`: element `i` reads index `i` off
                 // the source; a rest element copies the tail via
                 // `CopyArrayRest`. Elisions (`[a, , b]`) skip.
@@ -1230,6 +1252,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(src)
             }
             AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                // An empty `({} = rhs)` emits zero reads: require
+                // coercibility so `null`/`undefined` still throw.
+                if obj.properties.is_empty() {
+                    self.emit_require_object_coercible(src, span)?;
+                }
                 // `{x, y: z} = rhs`: property `x` reads `rhs.x`.
                 for prop in &obj.properties {
                     match prop {
@@ -1247,7 +1274,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                             };
                             let Some(sym) = self.comp.symbol_of(id.binding.reference_id.get()) else {
                                 let gid = self.global_name_id(id.binding.name.as_str());
-                                self.emit_set_global(gid, val, span);
+                                if self.comp.plans.units[self.unit].is_strict {
+                                    self.emit_set_global_strict(gid, val, span);
+                                } else {
+                                    self.emit_set_global(gid, val, span);
+                                }
                                 continue;
                             };
                             let access = self.access(sym);
@@ -1292,7 +1323,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
                     let gid =
                         self.global_name_id(id.name.as_str());
-                    self.emit_set_global(gid, val, span);
+                    if self.comp.plans.units[self.unit].is_strict {
+                        self.emit_set_global_strict(gid, val, span);
+                    } else {
+                        self.emit_set_global(gid, val, span);
+                    }
                     return Ok(());
                 };
                 let access = self.access(sym);

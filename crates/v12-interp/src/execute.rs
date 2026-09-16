@@ -676,6 +676,7 @@ impl Interp<'_> {
                     // else can allocate (the shape is pinned in
                     // `array_shape`, satisfying the allocation contract).
                     self.bind_shape(h, shape);
+                    self.link_array_proto(h);
                     self.stack[base + usize::from(ra)] = JsValue::object(h);
                     self.set_pc(pc + op_width);
                 }

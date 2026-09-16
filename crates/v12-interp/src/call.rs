@@ -91,6 +91,7 @@ pub(crate) fn alloc_rest_array(interp: &mut Interp<'_>, elements: Vec<JsValue>) 
     let shape = interp.array_shape();
     let h = interp.heap_mut().alloc(JsObject::array(elements));
     interp.bind_shape(h, shape);
+    interp.link_array_proto(h);
     JsValue::object(h)
 }
 

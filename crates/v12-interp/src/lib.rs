@@ -1415,6 +1415,17 @@ impl<'a> Interp<'a> {
                         return msg;
                     }
                 }
+                // Empty/missing message (e.g. `new Test262Error()` with no
+                // message argument): fall back to `constructor.name` so the
+                // runner can classify the throw (it requires "Test262Error").
+                if let Some(co) = self.chain_prop(obj, "constructor").and_then(|v| v.as_object())
+                    && let Some(nh) = self.chain_prop(co, "name").and_then(|v| v.as_string())
+                {
+                    let name = self.string_text(nh);
+                    if !name.is_empty() {
+                        return name;
+                    }
+                }
             }
         match ops::to_js_string(self.heap, v) {
             Ok(h) => {
@@ -1568,6 +1579,63 @@ impl<'a> Interp<'a> {
 
     fn prototype_key(&mut self) -> PropKey {
         self.wk_key(WK_PROTOTYPE)
+    }
+
+    /// The realm's `%Array.prototype%`, resolved through the `Array`
+    /// constructor's linked `prototype` field (installed by the realm via
+    /// `install_ctor`). Array makers stamp it as the fresh instance's
+    /// `[[Prototype]]` so `instance.constructor === Array` resolves through
+    /// the prototype's `constructor` back-link. `None` before realm install
+    /// or for embedder globals without the intrinsic prefix.
+    pub(crate) fn array_prototype(&self) -> Option<Handle<JsObject>> {
+        let global = self.global?;
+        let idx = intrinsic_slot("Array")?;
+        let ctor_v = *self.heap.get(global).properties.get(idx)?;
+        if ctor_v.is_hole() {
+            return None;
+        }
+        let ctor = ctor_v.as_object()?;
+        self.heap.get(ctor).prototype
+    }
+
+    /// Stamps the realm's `%Array.prototype%` as `h`'s `[[Prototype]]`
+    /// (no-op when unresolvable; see [`Self::array_prototype`]).
+    pub(crate) fn link_array_proto(&mut self, h: Handle<JsObject>) {
+        if let Some(p) = self.array_prototype() {
+            self.heap.get_mut(h).prototype = Some(p);
+        }
+    }
+
+    /// Reads a property `key` walking the prototype chain (own shape first,
+    /// then each `[[Prototype]]`): the first hit. Shape lookup is own-shape
+    /// only, so inherited links like `instance.constructor` (living on the
+    /// class prototype) need the walk. (Interp objects carry no
+    /// `GLOBAL_VAR_OFFSET` bias, so no index adjustment.)
+    pub(crate) fn chain_prop(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: &str,
+    ) -> Option<JsValue> {
+        let h = self
+            .heap
+            .intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));
+        let pk = v12_heap::PropKey::from_string(h);
+        let mut cur = Some(obj);
+        while let Some(o) = cur {
+            let shape = self.heap.shape_of_mut(o);
+            if let Some(desc) = self.heap.lookup_property(shape, pk)
+                && let Some(slot) = desc.slot()
+            {
+                let hit = self.heap.get(o).properties.get(slot as usize).copied();
+                if let Some(v) = hit
+                    && !v.is_hole()
+                {
+                    return Some(v);
+                }
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        None
     }
 
     /// Get the canonical array shape (cached after first computation).

@@ -35,6 +35,7 @@ impl Interp<'_> {
         let shape = self.array_shape();
         let h = self.heap.alloc(JsObject::array(slice));
         self.bind_shape(h, shape);
+        self.link_array_proto(h);
         // Elements may contain holes; they are preserved as hole values.
         Ok(JsValue::object(h))
     }
