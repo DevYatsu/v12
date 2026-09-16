@@ -48,12 +48,21 @@ fn same_value_zero(a: JsValue, b: JsValue) -> bool {
 
 /// Allocates an empty collection of `kind`.
 fn construct(ctx: &mut Ctx, kind: Kind) -> Result<JsValue, Throw> {
-    let obj = ctx.alloc_obj(JsObject { kind, ..JsObject::default() });
+    let obj = ctx.alloc_obj(JsObject {
+        kind,
+        ..JsObject::default()
+    });
     Ok(JsValue::object(obj))
 }
 
 /// Membership test over `kind`'s entries: keys at every `stride`-th slot.
-fn has(ctx: &mut Ctx, this: JsValue, method: &str, kind: Kind, key: JsValue) -> Result<JsValue, Throw> {
+fn has(
+    ctx: &mut Ctx,
+    this: JsValue,
+    method: &str,
+    kind: Kind,
+    key: JsValue,
+) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, method, Some(kind))?;
     let step = stride(kind);
     let store = entries(ctx.heap, obj, kind).unwrap_or_default();
@@ -62,7 +71,13 @@ fn has(ctx: &mut Ctx, this: JsValue, method: &str, kind: Kind, key: JsValue) -> 
 }
 
 /// Removes the first entry whose leading slot matches `key`; reports presence.
-fn delete(ctx: &mut Ctx, this: JsValue, method: &str, kind: Kind, key: JsValue) -> Result<JsValue, Throw> {
+fn delete(
+    ctx: &mut Ctx,
+    this: JsValue,
+    method: &str,
+    kind: Kind,
+    key: JsValue,
+) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, method, Some(kind))?;
     let step = stride(kind);
     let store = &mut ctx.heap.get_mut(obj).elements;
@@ -91,7 +106,10 @@ pub fn set_construct(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result
 pub fn map_get(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Map.prototype.get", Some(Kind::Map))?;
     let key = args.first().copied().unwrap_or_else(JsValue::undefined);
-    for pair in entries(ctx.heap, obj, Kind::Map).unwrap_or_default().chunks_exact(2) {
+    for pair in entries(ctx.heap, obj, Kind::Map)
+        .unwrap_or_default()
+        .chunks_exact(2)
+    {
         if same_value_zero(pair[0], key) {
             return Ok(pair[1]);
         }

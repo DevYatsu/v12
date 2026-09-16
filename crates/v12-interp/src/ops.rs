@@ -198,7 +198,11 @@ pub(crate) fn number_to_string(n: f64) -> String {
         return "-Infinity".into();
     }
     if n == 0.0 {
-        return if n.is_sign_negative() { "-0".into() } else { "0".into() };
+        return if n.is_sign_negative() {
+            "-0".into()
+        } else {
+            "0".into()
+        };
     }
     // `{:e}` yields shortest digits: `d[.ddd]e±X` (no leading zeros, no
     // trailing zeros in the fraction).
@@ -490,26 +494,6 @@ pub(crate) fn add(heap: &mut Heap, l: JsValue, r: JsValue) -> Result<JsValue, JS
     Ok(box_number(to_number(heap, l) + to_number(heap, r)))
 }
 
-pub(crate) fn sub(heap: &mut Heap, l: JsValue, r: JsValue) -> JsValue {
-    smi_fast(l, r, |a, b| a.checked_sub(b))
-        .unwrap_or_else(|| box_number(to_number(heap, l) - to_number(heap, r)))
-}
-
-pub(crate) fn mul(heap: &mut Heap, l: JsValue, r: JsValue) -> JsValue {
-    smi_fast(l, r, |a, b| a.checked_mul(b))
-        .unwrap_or_else(|| box_number(to_number(heap, l) * to_number(heap, r)))
-}
-
-pub(crate) fn div(heap: &mut Heap, l: JsValue, r: JsValue) -> JsValue {
-    box_number(to_number(heap, l) / to_number(heap, r))
-}
-
-/// ES `%` on doubles. Rust's `%` is IEEE truncated remainder — identical to
-/// JS semantics, including the sign following the dividend.
-pub(crate) fn modulo(heap: &mut Heap, l: JsValue, r: JsValue) -> JsValue {
-    box_number(to_number(heap, l) % to_number(heap, r))
-}
-
 /// ES `**`. `f64::powf` agrees with JS except when `|base| == 1` and the
 /// exponent is infinite: IEEE says ±1, the spec says NaN. Patch that case.
 pub(crate) fn js_pow(ln: f64, rn: f64) -> JsValue {
@@ -519,21 +503,6 @@ pub(crate) fn js_pow(ln: f64, rn: f64) -> JsValue {
         ln.powf(rn)
     };
     box_number(result)
-}
-
-/// Smi×Smi fast path: applies `op` in `i64` space and boxes back only when
-/// the exact result fits the Smi range. Overflow falls through to the double
-/// path via `None`.
-fn smi_fast(l: JsValue, r: JsValue, op: impl Fn(i64, i64) -> Option<i64>) -> Option<JsValue> {
-    let (a, b) = (i64::from(l.as_smi()?), i64::from(r.as_smi()?));
-    let n = op(a, b)?;
-    let lo = i64::from(JsValue::SMI_MIN);
-    let hi = i64::from(JsValue::SMI_MAX);
-    if !(lo..=hi).contains(&n) {
-        return None;
-    }
-    // Range-checked immediately above.
-    Some(JsValue::from_i32_smi(n as i32).expect("result fits the Smi range"))
 }
 
 /// ES ToUint32: NaN and the infinities map to 0; finite values truncate
@@ -569,7 +538,12 @@ impl Interp<'_> {
 
     /// ES abstract relational comparison with object operands converted
     /// through [`Self::to_primitive_default`] first.
-    pub(crate) fn compare(&mut self, op: crate::Opcode, l: JsValue, r: JsValue) -> Result<bool, JSException> {
+    pub(crate) fn compare(
+        &mut self,
+        op: crate::Opcode,
+        l: JsValue,
+        r: JsValue,
+    ) -> Result<bool, JSException> {
         if l.is_object() {
             let prim = self.to_primitive_default(l)?;
             return self.compare(op, prim, r);
@@ -602,9 +576,9 @@ impl Interp<'_> {
                 }
             }
         }
-        Err(JSException(
-            self.error_value("TypeError: Cannot convert object to primitive value"),
-        ))
+        Err(JSException(self.error_value(
+            "TypeError: Cannot convert object to primitive value",
+        )))
     }
 
     /// ES ToNumber, routing objects through [`Self::to_primitive_default`]

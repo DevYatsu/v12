@@ -29,10 +29,6 @@ impl Interp<'_> {
         false
     }
 
-    pub(crate) fn is_async_fn(&self, fn_idx: u32) -> bool {
-        self.is_async_fn_for(fn_idx, self.program_id)
-    }
-
     /// Program-aware async check.
     pub(crate) fn is_async_fn_for(&self, fn_idx: u32, program: u32) -> bool {
         let funcs = self.functions_for_program(program);
@@ -75,15 +71,7 @@ impl Interp<'_> {
         );
         // Real suspension: store initial register window snapshot, not eager yields.
         self.gc_protect();
-        let mut g_obj = JsObject::generator_with(
-            fn_idx,
-            0,
-            0.0,
-            0,
-            window,
-            captured_env,
-            None,
-        );
+        let mut g_obj = JsObject::generator_with(fn_idx, 0, 0.0, 0, window, captured_env, None);
         // The resume path (`resume_generator_nested`) reads the program id
         // from the generator object; default 0 would resolve `fn_idx`
         // against the main program's table (see above).
@@ -93,7 +81,11 @@ impl Interp<'_> {
         Ok(r#gen)
     }
 
-    pub(crate) fn generator_next(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
+    pub(crate) fn generator_next(
+        &mut self,
+        this_v: JsValue,
+        arg: JsValue,
+    ) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(
                 self.error_value("TypeError: generator next called on non-object"),
@@ -151,7 +143,11 @@ impl Interp<'_> {
         JsValue::object(h)
     }
 
-    pub(crate) fn generator_return(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
+    pub(crate) fn generator_return(
+        &mut self,
+        this_v: JsValue,
+        arg: JsValue,
+    ) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(
                 self.error_value("TypeError: generator return called on non-object"),
@@ -199,7 +195,11 @@ impl Interp<'_> {
         }
     }
 
-    pub(crate) fn generator_throw(&mut self, this_v: JsValue, arg: JsValue) -> Result<JsValue, JSException> {
+    pub(crate) fn generator_throw(
+        &mut self,
+        this_v: JsValue,
+        arg: JsValue,
+    ) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(
                 self.error_value("TypeError: generator throw called on non-object"),
@@ -231,7 +231,6 @@ impl Interp<'_> {
             Err(e) => Err(e),
         }
     }
-
 
     pub(crate) fn is_promise(&self, v: JsValue) -> bool {
         let Some(obj) = v.as_object() else {
@@ -286,7 +285,11 @@ impl Interp<'_> {
         None
     }
 
-    pub(crate) fn resume_async(&mut self, r#gen: Handle<JsObject>, value: JsValue) -> Result<(), JSException> {
+    pub(crate) fn resume_async(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        value: JsValue,
+    ) -> Result<(), JSException> {
         self.resume_generator(r#gen, value, false)?;
         Ok(())
     }
@@ -438,8 +441,12 @@ impl Interp<'_> {
                     // completion promise for settlement (the engine drain
                     // runs its reactions — see `pending_settlements`).
                     if self.is_async_fn_for(fn_idx, gen_program)
-                        && let Some(ph) =
-                            self.heap.get(r#gen).properties.get(4).and_then(|v| v.as_object())
+                        && let Some(ph) = self
+                            .heap
+                            .get(r#gen)
+                            .properties
+                            .get(4)
+                            .and_then(|v| v.as_object())
                     {
                         self.pending_settlements.push((ph, ret, false));
                     }

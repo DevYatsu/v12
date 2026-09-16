@@ -58,7 +58,10 @@ pub fn object_get_prototype_of(
 /// `writable`, `enumerable`, `configurable` with spec-default `false` for
 /// absent flags. `PropertyDescriptor::default()` is all-`true`, so it is
 /// deliberately not used here.
-fn parse_data_descriptor(ctx: &mut Ctx, v: JsValue) -> Result<crate::internal_methods::PropertyDescriptor, Throw> {
+fn parse_data_descriptor(
+    ctx: &mut Ctx,
+    v: JsValue,
+) -> Result<crate::internal_methods::PropertyDescriptor, Throw> {
     let mut desc = crate::internal_methods::PropertyDescriptor {
         value: None,
         writable: false,
@@ -72,7 +75,9 @@ fn parse_data_descriptor(ctx: &mut Ctx, v: JsValue) -> Result<crate::internal_me
         let key = ctx.heap.intern_text(name);
         let present = {
             let shape = ctx.heap.shape_of(obj);
-            ctx.heap.lookup_property(shape, PropKey::from_string(key)).is_some()
+            ctx.heap
+                .lookup_property(shape, PropKey::from_string(key))
+                .is_some()
         };
         if !present {
             continue;
@@ -124,31 +129,35 @@ pub fn object_define_property(
             configurable: false,
         }
     };
-    let defined = crate::internal_methods::ordinary_define_own_property(
-        &mut *ctx.heap,
-        obj,
-        key,
-        descriptor,
-    )
-    .map_err(Throw::Value)?;
+    let defined =
+        crate::internal_methods::ordinary_define_own_property(&mut *ctx.heap, obj, key, descriptor)
+            .map_err(Throw::Value)?;
     if !defined {
-        return Err(ctx.type_error(
-            "TypeError: Cannot redefine property: Invalid property definition",
-        ));
+        return Err(
+            ctx.type_error("TypeError: Cannot redefine property: Invalid property definition")
+        );
     }
     Ok(JsValue::object(obj))
 }
 
 pub fn object_keys(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = args.first().and_then(|v| v.as_object()).ok_or_else(|| ctx.type_error("TypeError: Object.keys called on non-object"))?;
+    let obj = args
+        .first()
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| ctx.type_error("TypeError: Object.keys called on non-object"))?;
     let keys = collect_own_string_keys(&ctx.heap, obj);
-    let arr = ctx.heap.alloc(v12_heap::JsObject::array(keys.iter().map(|&k| JsValue::string(k)).collect()));
+    let arr = ctx.heap.alloc(v12_heap::JsObject::array(
+        keys.iter().map(|&k| JsValue::string(k)).collect(),
+    ));
     ctx.add_root(JsValue::object(arr));
     Ok(JsValue::object(arr))
 }
 
 pub fn object_values(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = args.first().and_then(|v| v.as_object()).ok_or_else(|| ctx.type_error("TypeError: Object.values called on non-object"))?;
+    let obj = args
+        .first()
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| ctx.type_error("TypeError: Object.values called on non-object"))?;
     let vals = collect_own_values(&ctx.heap, obj);
     let arr = ctx.heap.alloc(v12_heap::JsObject::array(vals));
     ctx.add_root(JsValue::object(arr));
@@ -156,15 +165,22 @@ pub fn object_values(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<
 }
 
 pub fn object_entries(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let obj = args.first().and_then(|v| v.as_object()).ok_or_else(|| ctx.type_error("TypeError: Object.entries called on non-object"))?;
+    let obj = args
+        .first()
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| ctx.type_error("TypeError: Object.entries called on non-object"))?;
     let keys = collect_own_string_keys(&ctx.heap, obj);
     let vals = collect_own_values(&ctx.heap, obj);
-    let pairs: Vec<JsValue> = keys.into_iter().zip(vals).map(|(k, v)| {
-        let ks = JsValue::string(k);
-        let pair = ctx.heap.alloc(v12_heap::JsObject::array(vec![ks, v]));
-        ctx.add_root(JsValue::object(pair));
-        JsValue::object(pair)
-    }).collect();
+    let pairs: Vec<JsValue> = keys
+        .into_iter()
+        .zip(vals)
+        .map(|(k, v)| {
+            let ks = JsValue::string(k);
+            let pair = ctx.heap.alloc(v12_heap::JsObject::array(vec![ks, v]));
+            ctx.add_root(JsValue::object(pair));
+            JsValue::object(pair)
+        })
+        .collect();
     let arr = ctx.heap.alloc(v12_heap::JsObject::array(pairs));
     ctx.add_root(JsValue::object(arr));
     Ok(JsValue::object(arr))
@@ -195,7 +211,9 @@ pub fn object_enumerable_own_keys(
         let elems = o.elements.clone();
         for (i, v) in elems.iter().enumerate() {
             if !v.is_hole() {
-                items.push(JsValue::string(ctx.heap.intern_text(&(i as u32).to_string())));
+                items.push(JsValue::string(
+                    ctx.heap.intern_text(&(i as u32).to_string()),
+                ));
             }
         }
     }
@@ -237,7 +255,11 @@ pub fn object_enumerable_own_keys(
 /// data property's slot while leaving the shared shape descriptor in place, so
 /// a holed data descriptor is not observable. Accessors have no slot and are
 /// always live.
-fn descriptor_is_live(heap: &v12_heap::Heap, obj: Handle<v12_heap::JsObject>, desc: &v12_heap::Descriptor) -> bool {
+fn descriptor_is_live(
+    heap: &v12_heap::Heap,
+    obj: Handle<v12_heap::JsObject>,
+    desc: &v12_heap::Descriptor,
+) -> bool {
     match desc {
         v12_heap::Descriptor::Data { slot, .. } => heap
             .get(obj)
@@ -264,16 +286,20 @@ fn dict_entry_is_live(
         .is_some_and(|v| !v.is_hole())
 }
 
-pub fn object_has_own_property(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let this_obj = this.as_object().ok_or_else(|| ctx.type_error("TypeError: Object.prototype.hasOwnProperty called on non-object"))?;
+pub fn object_has_own_property(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let this_obj = this.as_object().ok_or_else(|| {
+        ctx.type_error("TypeError: Object.prototype.hasOwnProperty called on non-object")
+    })?;
     let key = args.first().copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key).map_err(Throw::Value)?;
     // Dictionary rung first (overflow keys live only here).
     if let Some((entry, _)) = crate::internal_methods::dict_lookup(ctx.heap, this_obj, pk) {
         return Ok(JsValue::from_bool(dict_entry_is_live(
-            ctx.heap,
-            this_obj,
-            &entry,
+            ctx.heap, this_obj, &entry,
         )));
     }
     let shape = ctx.heap.shape_of(this_obj);
@@ -324,16 +350,34 @@ pub fn object_proto_property_is_enumerable(
     Ok(JsValue::from_bool(enumerable))
 }
 
-pub fn object_proto_to_string(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let text = if this.is_object() && ctx.heap.get(this.as_object().unwrap()).kind == v12_heap::Kind::Array { "[object Array]" } else { "[object Object]" };
+pub fn object_proto_to_string(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let text = if this.is_object()
+        && ctx.heap.get(this.as_object().unwrap()).kind == v12_heap::Kind::Array
+    {
+        "[object Array]"
+    } else {
+        "[object Object]"
+    };
     Ok(JsValue::string(ctx.heap.intern_text(text)))
 }
 
-pub fn object_proto_value_of(_ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn object_proto_value_of(
+    _ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     Ok(this)
 }
 
-pub fn function_proto_to_string(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn function_proto_to_string(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     Ok(JsValue::string(ctx.heap.intern_text("function() {}")))
 }
 
@@ -341,7 +385,10 @@ pub fn function_proto_to_string(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]
 /// properties defined via [[DefineOwnProperty]] never touch the parallel
 /// `property_keys` vec), plus dictionary-rung overflow keys in insertion
 /// order (the two stores never overlap).
-fn collect_own_string_keys(heap: &v12_heap::Heap, obj: Handle<v12_heap::JsObject>) -> Vec<Handle<V12Str>> {
+fn collect_own_string_keys(
+    heap: &v12_heap::Heap,
+    obj: Handle<v12_heap::JsObject>,
+) -> Vec<Handle<V12Str>> {
     let shape = heap.shape_of(obj);
     let mut keys: Vec<Handle<V12Str>> = heap
         .get(shape)
@@ -430,7 +477,6 @@ fn to_string_handle(ctx: &mut Ctx, v: JsValue) -> Result<Handle<V12Str>, JsValue
     Ok(ctx.heap.intern_text(&text))
 }
 
-
 // ---------------------------------------------------------------------------
 // Object statics
 // ---------------------------------------------------------------------------
@@ -455,10 +501,12 @@ fn array_value(ctx: &mut Ctx, items: Vec<JsValue>) -> JsValue {
 pub fn object_is(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let a = args.first().copied().unwrap_or(JsValue::undefined());
     let b = args.get(1).copied().unwrap_or(JsValue::undefined());
-    let same = match (a.as_smi().map(f64::from).or(a.as_f64()), b.as_smi().map(f64::from).or(b.as_f64())) {
+    let same = match (
+        a.as_smi().map(f64::from).or(a.as_f64()),
+        b.as_smi().map(f64::from).or(b.as_f64()),
+    ) {
         (Some(x), Some(y)) => {
-            (x.is_nan() && y.is_nan())
-                || (x == y && (x != 0.0 || x.to_bits() == y.to_bits()))
+            (x.is_nan() && y.is_nan()) || (x == y && (x != 0.0 || x.to_bits() == y.to_bits()))
         }
         _ => helpers::strict_equals(&ctx.heap, a, b),
     };
@@ -489,7 +537,9 @@ pub fn object_assign(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<
         .and_then(|v| v.as_object())
         .ok_or_else(|| ctx.type_error("TypeError: Object.assign called on non-object"))?;
     for &source in args.iter().skip(1) {
-        let Some(src) = source.as_object() else { continue };
+        let Some(src) = source.as_object() else {
+            continue;
+        };
         // Integer-indexed elements: aligned element-store copy.
         if ctx.heap.get(src).kind == v12_heap::Kind::Array {
             let elems = ctx.heap.get(src).elements_snapshot();
@@ -627,7 +677,12 @@ pub fn object_from_entries(
     };
     let len = ctx.heap.get(entries).element_len();
     for i in 0..len as u32 {
-        let Some(pair) = ctx.heap.get(entries).get_element(i).and_then(|v| v.as_object()) else {
+        let Some(pair) = ctx
+            .heap
+            .get(entries)
+            .get_element(i)
+            .and_then(|v| v.as_object())
+        else {
             continue;
         };
         let k = ctx
@@ -674,7 +729,8 @@ pub fn own_property_names(ctx: &mut Ctx, obj: Handle<v12_heap::JsObject>) -> Vec
     }
     let handles: Vec<v12_heap::Handle<v12_heap::V12Str>> = {
         let shape = ctx.heap.shape_of(obj);
-        ctx.heap.get(shape)
+        ctx.heap
+            .get(shape)
             .descriptors
             .as_slice()
             .iter()
@@ -695,12 +751,14 @@ pub fn object_get_own_property_names(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = args
-        .first()
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| ctx.type_error("TypeError: Object.getOwnPropertyNames called on non-object"))?;
+    let obj = args.first().and_then(|v| v.as_object()).ok_or_else(|| {
+        ctx.type_error("TypeError: Object.getOwnPropertyNames called on non-object")
+    })?;
     let names = own_property_names(ctx, obj);
-    let items: Vec<JsValue> = names.iter().map(|n| JsValue::string(ctx.heap.intern_text(n))).collect();
+    let items: Vec<JsValue> = names
+        .iter()
+        .map(|n| JsValue::string(ctx.heap.intern_text(n)))
+        .collect();
     Ok(array_value(ctx, items))
 }
 
@@ -710,12 +768,13 @@ pub fn object_get_own_property_symbols(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = args
-        .first()
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| ctx.type_error("TypeError: Object.getOwnPropertySymbols called on non-object"))?;
+    let obj = args.first().and_then(|v| v.as_object()).ok_or_else(|| {
+        ctx.type_error("TypeError: Object.getOwnPropertySymbols called on non-object")
+    })?;
     let shape = ctx.heap.shape_of(obj);
-    let items: Vec<JsValue> = ctx.heap.get(shape)
+    let items: Vec<JsValue> = ctx
+        .heap
+        .get(shape)
         .descriptors
         .as_slice()
         .iter()
@@ -738,59 +797,75 @@ pub fn object_get_own_property_descriptor(
     let pk = property_key(ctx, key_v).map_err(Throw::Value)?;
     let shape = ctx.heap.shape_of(obj);
     enum SlotKind {
-        Data { slot: u32, writable: bool, enumerable: bool, configurable: bool },
-        Accessor { get: Option<v12_heap::Handle<v12_heap::JsObject>>, set: Option<v12_heap::Handle<v12_heap::JsObject>>, enumerable: bool, configurable: bool },
+        Data {
+            slot: u32,
+            writable: bool,
+            enumerable: bool,
+            configurable: bool,
+        },
+        Accessor {
+            get: Option<v12_heap::Handle<v12_heap::JsObject>>,
+            set: Option<v12_heap::Handle<v12_heap::JsObject>>,
+            enumerable: bool,
+            configurable: bool,
+        },
     }
     // Dictionary rung first (overflow keys live only here), with the
     // same liveness filter as the shape path below. Either arm resolves
     // to a `SlotKind` for the shared tail.
-    let kind: SlotKind = if let Some((entry, _)) = crate::internal_methods::dict_lookup(ctx.heap, obj, pk) {
-        if !dict_entry_is_live(ctx.heap, obj, &entry) {
-            return Ok(JsValue::undefined());
-        }
-        if entry.is_accessor {
-            SlotKind::Accessor {
-                get: entry.getter,
-                set: entry.setter,
-                enumerable: entry.attrs.enumerable(),
-                configurable: entry.attrs.configurable(),
+    let kind: SlotKind =
+        if let Some((entry, _)) = crate::internal_methods::dict_lookup(ctx.heap, obj, pk) {
+            if !dict_entry_is_live(ctx.heap, obj, &entry) {
+                return Ok(JsValue::undefined());
+            }
+            if entry.is_accessor {
+                SlotKind::Accessor {
+                    get: entry.getter,
+                    set: entry.setter,
+                    enumerable: entry.attrs.enumerable(),
+                    configurable: entry.attrs.configurable(),
+                }
+            } else {
+                SlotKind::Data {
+                    slot: entry.slot,
+                    writable: entry.attrs.writable(),
+                    enumerable: entry.attrs.enumerable(),
+                    configurable: entry.attrs.configurable(),
+                }
             }
         } else {
-            SlotKind::Data {
-                slot: entry.slot,
-                writable: entry.attrs.writable(),
-                enumerable: entry.attrs.enumerable(),
-                configurable: entry.attrs.configurable(),
+            let Some(desc) = ctx
+                .heap
+                .lookup_property(shape, pk)
+                .filter(|d| descriptor_is_live(ctx.heap, obj, d))
+            else {
+                return Ok(JsValue::undefined());
+            };
+            // Copy the descriptor out before any allocation (heap borrows nest).
+            if let Some(slot) = desc.slot() {
+                SlotKind::Data {
+                    slot,
+                    writable: desc.attrs().writable(),
+                    enumerable: desc.attrs().enumerable(),
+                    configurable: desc.attrs().configurable(),
+                }
+            } else {
+                SlotKind::Accessor {
+                    get: desc.getter(),
+                    set: desc.setter(),
+                    enumerable: desc.attrs().enumerable(),
+                    configurable: desc.attrs().configurable(),
+                }
             }
-        }
-    } else {
-        let Some(desc) = ctx
-            .heap
-            .lookup_property(shape, pk)
-            .filter(|d| descriptor_is_live(ctx.heap, obj, d))
-        else {
-            return Ok(JsValue::undefined());
         };
-        // Copy the descriptor out before any allocation (heap borrows nest).
-        if let Some(slot) = desc.slot() {
-            SlotKind::Data {
-                slot,
-                writable: desc.attrs().writable(),
-                enumerable: desc.attrs().enumerable(),
-                configurable: desc.attrs().configurable(),
-            }
-        } else {
-            SlotKind::Accessor {
-                get: desc.getter(),
-                set: desc.setter(),
-                enumerable: desc.attrs().enumerable(),
-                configurable: desc.attrs().configurable(),
-            }
-        }
-    };
     let d = ctx.alloc_obj(JsObject::default());
     match kind {
-        SlotKind::Data { slot, writable, enumerable, configurable } => {
+        SlotKind::Data {
+            slot,
+            writable,
+            enumerable,
+            configurable,
+        } => {
             let value = ctx
                 .heap
                 .get(obj)
@@ -803,9 +878,24 @@ pub fn object_get_own_property_descriptor(
             define_plain_prop(ctx, d, "enumerable", JsValue::from_bool(enumerable));
             define_plain_prop(ctx, d, "configurable", JsValue::from_bool(configurable));
         }
-        SlotKind::Accessor { get, set, enumerable, configurable } => {
-            define_plain_prop(ctx, d, "get", get.map(JsValue::object).unwrap_or(JsValue::undefined()));
-            define_plain_prop(ctx, d, "set", set.map(JsValue::object).unwrap_or(JsValue::undefined()));
+        SlotKind::Accessor {
+            get,
+            set,
+            enumerable,
+            configurable,
+        } => {
+            define_plain_prop(
+                ctx,
+                d,
+                "get",
+                get.map(JsValue::object).unwrap_or(JsValue::undefined()),
+            );
+            define_plain_prop(
+                ctx,
+                d,
+                "set",
+                set.map(JsValue::object).unwrap_or(JsValue::undefined()),
+            );
             define_plain_prop(ctx, d, "enumerable", JsValue::from_bool(enumerable));
             define_plain_prop(ctx, d, "configurable", JsValue::from_bool(configurable));
         }
@@ -844,7 +934,9 @@ pub fn object_set_prototype_of(
     } else if let Some(h) = proto.as_object() {
         Some(h)
     } else {
-        return Err(ctx.type_error("TypeError: Object.setPrototypeOf prototype must be object or null"));
+        return Err(
+            ctx.type_error("TypeError: Object.setPrototypeOf prototype must be object or null")
+        );
     };
     ctx.heap.get_mut(obj).prototype = link;
     Ok(JsValue::object(obj))

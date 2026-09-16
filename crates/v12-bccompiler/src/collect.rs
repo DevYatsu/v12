@@ -478,8 +478,8 @@ impl<'s> Collector<'s> {
                     oxc_ast::ast::MethodDefinitionKind::Set => "set ",
                     _ => "",
                 };
-                mplan.function_name = crate::expr::static_key_text(&m.key)
-                    .map(|k| format!("{prefix}{k}"));
+                mplan.function_name =
+                    crate::expr::static_key_text(&m.key).map(|k| format!("{prefix}{k}"));
                 let parent_strict = *self.strict_stack.last().unwrap_or(&false);
                 let own_strict = m.value.body.as_deref().is_some_and(|b| {
                     b.directives

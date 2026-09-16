@@ -141,10 +141,7 @@ fn collect_match_spans(
             .unwrap_or(0) as usize;
         // Snapshot the element handles first: resolving their text below
         // needs `&mut ctx`, which cannot coexist with a live heap borrow.
-        let (m0_h, group_handles): (
-            Option<Handle<V12Str>>,
-            Vec<Option<Handle<V12Str>>>,
-        ) = {
+        let (m0_h, group_handles): (Option<Handle<V12Str>>, Vec<Option<Handle<V12Str>>>) = {
             let arr_ref = ctx.heap.get(arr);
             (
                 arr_ref.elements_array.get(0).and_then(|v| v.as_string()),
@@ -187,19 +184,12 @@ fn collect_match_spans(
 /// `index`/`input`). With a non-global regexp, delegates to
 /// `RegExp.prototype.exec` and returns that result directly (`null` or a
 /// match array).
-pub fn string_match(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn string_match(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let handle = this_string(ctx, this, "String.prototype.match")?;
     let text = ctx.string_text(handle);
     let Some(re) = as_regexp(ctx.heap, args.first()) else {
         // Non-regexp argument: ToString and return a single-match array.
-        let arg = args
-            .first()
-            .map(|v| ctx.to_string(*v))
-            .unwrap_or_default();
+        let arg = args.first().map(|v| ctx.to_string(*v)).unwrap_or_default();
         return Ok(match_text_to_array(
             ctx,
             &text,
@@ -274,20 +264,13 @@ fn expanded_len(template: &str, whole: &str, groups: &[&str]) -> u64 {
 /// ES 22.2.6.11 subset: global regexps replace every match; otherwise only
 /// the first. The replacement is a string; `$&`, `$1`–`$9`, and `$$` are
 /// expanded (no function replacements).
-pub fn string_replace(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn string_replace(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let handle = this_string(ctx, this, "String.prototype.replace")?;
     let text = ctx.string_text(handle);
     let Some(search) = args.first().copied() else {
         return Ok(JsValue::string(handle));
     };
-    let replacement = args
-        .get(1)
-        .map(|v| ctx.to_string(*v))
-        .unwrap_or_default();
+    let replacement = args.get(1).map(|v| ctx.to_string(*v)).unwrap_or_default();
     // Non-regexp search: replace the first occurrence.
     let Some(re) = as_regexp(ctx.heap, Some(&search)) else {
         let needle = ctx.to_string(search);
@@ -350,9 +333,9 @@ fn replace_first_occurrence(
                     .saturating_add(expansion)
                     > MAX_REPLACE_LEN
                 {
-                    return Err(ctx.range_error(
-                        "RangeError: replace result exceeds maximum string length",
-                    ));
+                    return Err(
+                        ctx.range_error("RangeError: replace result exceeds maximum string length")
+                    );
                 }
                 format!(
                     "{}{}{}",
@@ -368,11 +351,7 @@ fn replace_first_occurrence(
 }
 
 /// `String.prototype.search(regexp)` — the index of the first match, or -1.
-pub fn string_search(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn string_search(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let handle = this_string(ctx, this, "String.prototype.search")?;
     let text = ctx.string_text(handle);
     let Some(search) = args.first().copied() else {
@@ -402,11 +381,7 @@ pub fn string_search(
 /// ES 22.2.6.17 subset: non-global regexps split on the first match (the
 /// captured groups are omitted from the output); global regexps split on
 /// every match. Empty segments are preserved.
-pub fn string_split(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn string_split(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let handle = this_string(ctx, this, "String.prototype.split")?;
     let text = ctx.string_text(handle);
     let limit = args
@@ -471,9 +446,7 @@ fn match_text_to_array(ctx: &mut Ctx, text: &str, found: Option<(usize, usize)>)
     match found {
         Some((s, e)) => {
             let matched_h = ctx.heap.intern_text(&text[s..e]);
-            let arr = ctx.alloc_obj(
-                v12_heap::JsObject::array(vec![JsValue::string(matched_h)]),
-            );
+            let arr = ctx.alloc_obj(v12_heap::JsObject::array(vec![JsValue::string(matched_h)]));
             JsValue::object(arr)
         }
         None => JsValue::null(),
@@ -535,11 +508,7 @@ fn to_int(ctx: &mut Ctx, v: Option<JsValue>) -> i64 {
         return 0;
     }
     let n = ctx.to_number(v);
-    if n.is_nan() {
-        0
-    } else {
-        n.trunc() as i64
-    }
+    if n.is_nan() { 0 } else { n.trunc() as i64 }
 }
 
 /// UTF-16 code units of the text — JS string indices are UTF-16 offsets.
@@ -565,7 +534,11 @@ fn arg_text(ctx: &mut Ctx, v: JsValue) -> String {
     ctx.to_string(v)
 }
 
-pub fn string_char_code_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_char_code_at(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "charCodeAt")?;
     let units = utf16(&text);
     let i = to_int(ctx, args.first().copied());
@@ -575,7 +548,11 @@ pub fn string_char_code_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Re
     }
 }
 
-pub fn string_code_point_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_code_point_at(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "codePointAt")?;
     let units = utf16(&text);
     let i = to_int(ctx, args.first().copied());
@@ -610,7 +587,9 @@ pub fn string_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVal
         return Ok(JsValue::undefined());
     }
     let unit = units[i as usize];
-    Ok(JsValue::string(ctx.heap.intern_text(&(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')).to_string())))
+    Ok(JsValue::string(ctx.heap.intern_text(
+        &(char::from_u32(u32::from(unit)).unwrap_or('\u{FFFD}')).to_string(),
+    )))
 }
 
 pub fn string_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
@@ -621,10 +600,16 @@ pub fn string_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result
     };
     let from = to_int(ctx, args.get(1).copied()).max(0) as usize;
     let result = utf16_find(&utf16(&text), &utf16(&search), from);
-    Ok(helpers::js_number(result.map_or(-1.0, |i| f64::from(i as u32))))
+    Ok(helpers::js_number(
+        result.map_or(-1.0, |i| f64::from(i as u32)),
+    ))
 }
 
-pub fn string_last_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_last_index_of(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "lastIndexOf")?;
     let search = match args.first().copied() {
         Some(v) => arg_text(ctx, v),
@@ -652,7 +637,9 @@ pub fn string_last_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> R
             .windows(needle.len())
             .rposition(|w| w == needle)
     };
-    Ok(helpers::js_number(result.map_or(-1.0, |i| f64::from(i as u32))))
+    Ok(helpers::js_number(
+        result.map_or(-1.0, |i| f64::from(i as u32)),
+    ))
 }
 
 pub fn string_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
@@ -662,10 +649,16 @@ pub fn string_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result
         None => "undefined".to_string(),
     };
     let from = to_int(ctx, args.get(1).copied()).max(0) as usize;
-    Ok(JsValue::from_bool(utf16_find(&utf16(&text), &utf16(&search), from).is_some()))
+    Ok(JsValue::from_bool(
+        utf16_find(&utf16(&text), &utf16(&search), from).is_some(),
+    ))
 }
 
-pub fn string_starts_with(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_starts_with(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "startsWith")?;
     let search = match args.first().copied() {
         Some(v) => arg_text(ctx, v),
@@ -733,12 +726,7 @@ pub fn string_pad_end(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
     pad(ctx, text, args, false)
 }
 
-fn pad(
-    ctx: &mut Ctx,
-    text: String,
-    args: &[JsValue],
-    start: bool,
-) -> Result<JsValue, Throw> {
+fn pad(ctx: &mut Ctx, text: String, args: &[JsValue], start: bool) -> Result<JsValue, Throw> {
     let target = match args.first().copied() {
         None => 0,
         Some(v) => ctx.to_number(v).clamp(0.0, f64::from(u32::MAX)) as usize,
@@ -778,20 +766,14 @@ fn pad(
 fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
-        ' ' | '\t'
-            | '\n'
-            | '\u{000B}'
-            | '\u{000C}'
-            | '\r'
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
+        ' ' | '\t' | '\n' | '\u{000B}' | '\u{000C}' | '\r' | '\u{00A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
     )
 }
 
@@ -802,26 +784,40 @@ pub fn string_trim(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<Js
     ))
 }
 
-pub fn string_trim_start(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_trim_start(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "trimStart")?;
     Ok(JsValue::string(
-        ctx.heap.intern_text(text.trim_start_matches(is_js_whitespace)),
+        ctx.heap
+            .intern_text(text.trim_start_matches(is_js_whitespace)),
     ))
 }
 
 pub fn string_trim_end(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "trimEnd")?;
     Ok(JsValue::string(
-        ctx.heap.intern_text(text.trim_end_matches(is_js_whitespace)),
+        ctx.heap
+            .intern_text(text.trim_end_matches(is_js_whitespace)),
     ))
 }
 
-pub fn string_to_lower_case(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_to_lower_case(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "toLowerCase")?;
     Ok(JsValue::string(ctx.heap.intern_text(&text.to_lowercase())))
 }
 
-pub fn string_to_upper_case(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_to_upper_case(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "toUpperCase")?;
     Ok(JsValue::string(ctx.heap.intern_text(&text.to_uppercase())))
 }
@@ -863,7 +859,11 @@ pub fn string_substr(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<J
     Ok(JsValue::string(ctx.heap.intern_text(&result)))
 }
 
-pub fn string_to_string(_ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_to_string(
+    _ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
     Ok(this)
 }
 
@@ -872,7 +872,11 @@ pub fn string_value_of(_ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Resu
 }
 
 /// Approximate `localeCompare`: UTF-16 code-unit lexicographic order.
-pub fn string_locale_compare(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_locale_compare(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let a = this_text(ctx, this, "localeCompare")?;
     let b = match args.first().copied() {
         Some(v) => arg_text(ctx, v),
@@ -887,16 +891,26 @@ pub fn string_locale_compare(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> 
     Ok(helpers::js_number(f64::from(ord)))
 }
 
-pub fn string_from_char_code(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_from_char_code(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for &v in args {
         let n = ctx.to_number(v);
         units.push(if n.is_nan() { 0 } else { n as u16 });
     }
-    Ok(JsValue::string(ctx.heap.intern_text(&String::from_utf16_lossy(&units))))
+    Ok(JsValue::string(
+        ctx.heap.intern_text(&String::from_utf16_lossy(&units)),
+    ))
 }
 
-pub fn string_from_code_point(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_from_code_point(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let mut text = String::new();
     for &v in args {
         let n = ctx.to_number(v);
@@ -913,7 +927,11 @@ pub fn string_from_code_point(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -
 
 /// `String.prototype.replaceAll` for string search values (regex search
 /// values remain on the registry's regex path).
-pub fn string_replace_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn string_replace_all(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = this_text(ctx, this, "replaceAll")?;
     let search = match args.first().copied() {
         Some(v) => arg_text(ctx, v),

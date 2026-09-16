@@ -63,15 +63,25 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 // only if parsing fails — never the "not supported" error.
                 let raw_opt = b.raw.as_deref().unwrap_or("");
                 let stripped = raw_opt.trim_end_matches('n').replace('_', "");
-                let stripped = if stripped.is_empty() { b.value.to_string() } else { stripped };
+                let stripped = if stripped.is_empty() {
+                    b.value.to_string()
+                } else {
+                    stripped
+                };
                 let body = stripped.as_str();
                 let dst = self.new_temp();
                 // Try hex/binary/octal prefixes via u64
-                let parsed_u64 = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+                let parsed_u64 = if let Some(hex) =
+                    body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
+                {
                     u64::from_str_radix(hex, 16).ok()
-                } else if let Some(bin) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+                } else if let Some(bin) =
+                    body.strip_prefix("0b").or_else(|| body.strip_prefix("0B"))
+                {
                     u64::from_str_radix(bin, 2).ok()
-                } else if let Some(oct) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+                } else if let Some(oct) =
+                    body.strip_prefix("0o").or_else(|| body.strip_prefix("0O"))
+                {
                     u64::from_str_radix(oct, 8).ok()
                 } else {
                     // decimal — allow leading sign handled by parser? BigInt is unsigned with optional sign stripped earlier
@@ -230,10 +240,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::PrivateFieldExpression(p) => {
                 let obj = self.expr(&p.object)?;
                 let dst = self.new_temp();
-                let name_id =
-                    crate::model::str_id_of(self.comp.strings.get_or_intern(format!("#{}", p.field.name)));
+                let name_id = crate::model::str_id_of(
+                    self.comp
+                        .strings
+                        .get_or_intern(format!("#{}", p.field.name)),
+                );
                 // class_id 0 for minimal brand check
-                let words = v12_bytecode::WideOp::GetPrivateW { dst, obj, class_id: 0, name_id }.encode();
+                let words = v12_bytecode::WideOp::GetPrivateW {
+                    dst,
+                    obj,
+                    class_id: 0,
+                    name_id,
+                }
+                .encode();
                 self.emit_words(words, p.span);
                 Ok(dst)
             }
@@ -439,9 +458,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::PrivateInExpression(x) => {
                 let obj = self.expr(&x.right)?;
                 let dst = self.new_temp();
-                let name_id =
-                    crate::model::str_id_of(self.comp.strings.get_or_intern(format!("#{}", x.left.name)));
-                let words = v12_bytecode::WideOp::HasPrivateW { dst, obj, class_id: 0, name_id }.encode();
+                let name_id = crate::model::str_id_of(
+                    self.comp.strings.get_or_intern(format!("#{}", x.left.name)),
+                );
+                let words = v12_bytecode::WideOp::HasPrivateW {
+                    dst,
+                    obj,
+                    class_id: 0,
+                    name_id,
+                }
+                .encode();
                 self.emit_words(words, x.span);
                 Ok(dst)
             }
@@ -832,7 +858,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// return completion. The return path runs the active finalizer copies
     /// (without consuming them — normal resumes fall through here too) and
     /// returns the resume value.
-    fn emit_suspend_yield(&mut self, ydst: u16, iter: Option<u16>, span: Span) -> Res<()> {
+    fn emit_suspend_yield(&mut self, ydst: u16, _iter: Option<u16>, span: Span) -> Res<()> {
         self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, span);
         let mode = self.new_temp();
         self.emit_reg2(Opcode::GenResumeMode, mode, 0, span);
@@ -1062,8 +1088,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     // intrinsic working without a `CompileError`. For v1 any
                     // unbound name is treated as a global (missing globals read
                     // as `undefined`, writes create the property).
-                    let gid =
-                        self.global_name_id(id.name.as_str());
+                    let gid = self.global_name_id(id.name.as_str());
                     let old = self.new_temp();
                     self.emit_get_global(old, gid, span);
                     let one = self.new_temp();
@@ -1181,8 +1206,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                             out
                         }
                     };
-                    let gid =
-                        self.global_name_id(id.name.as_str());
+                    let gid = self.global_name_id(id.name.as_str());
                     self.emit_set_global(gid, rhs_val, span);
                     return Ok(rhs_val);
                 };
@@ -1370,8 +1394,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         match target {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
-                    let gid =
-                        self.global_name_id(id.name.as_str());
+                    let gid = self.global_name_id(id.name.as_str());
                     if self.comp.plans.units[self.unit].is_strict {
                         self.emit_set_global_strict(gid, val, span);
                     } else {

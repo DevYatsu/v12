@@ -1,7 +1,6 @@
 //! Value display: `to_display_string` rendering (strings, objects with
 //! name/message, functions, arrays) used by errors and host output.
 
-
 use v12_heap::{JsValue, V12Str};
 
 use super::Engine;
@@ -161,18 +160,23 @@ impl Engine {
             // opaque "[object Object]" so the runner bucket becomes actionable.
             if let Some(obj) = value.as_object() {
                 let shape = self.heap.shape_of(obj);
-                let lookup_str_prop = |heap: &mut v12_heap::Heap, key: &str| -> Option<v12_heap::Handle<v12_heap::V12Str>> {
-                    let h = heap.intern_text(key);
-                    let pk = v12_heap::PropKey::from_string(h);
-                    let desc = heap.lookup_property(shape, pk)?;
-                    let slot = desc.slot()?;
-                    // Ordinary objects store properties at `slot`; the global object biases by INTRINSIC_COUNT.
-                    let props = &heap.get(obj).properties;
-                    let idx_plain = slot as usize;
-                    if let Some(v) = props.get(idx_plain).and_then(|v| v.as_string()) { return Some(v); }
-                    let idx_global = crate::realm::INTRINSIC_COUNT + slot as usize;
-                    props.get(idx_global).and_then(|v| v.as_string())
-                };
+                let lookup_str_prop =
+                    |heap: &mut v12_heap::Heap,
+                     key: &str|
+                     -> Option<v12_heap::Handle<v12_heap::V12Str>> {
+                        let h = heap.intern_text(key);
+                        let pk = v12_heap::PropKey::from_string(h);
+                        let desc = heap.lookup_property(shape, pk)?;
+                        let slot = desc.slot()?;
+                        // Ordinary objects store properties at `slot`; the global object biases by INTRINSIC_COUNT.
+                        let props = &heap.get(obj).properties;
+                        let idx_plain = slot as usize;
+                        if let Some(v) = props.get(idx_plain).and_then(|v| v.as_string()) {
+                            return Some(v);
+                        }
+                        let idx_global = crate::realm::INTRINSIC_COUNT + slot as usize;
+                        props.get(idx_global).and_then(|v| v.as_string())
+                    };
                 // Snapshot handles before borrowing self mutably for text decode.
                 let msg_h = lookup_str_prop(&mut self.heap, "message");
                 if let Some(mh) = msg_h {
@@ -180,12 +184,16 @@ impl Engine {
                     let msg = self.heap_string_text(mh);
                     if let Some(nh) = name_h {
                         let name = self.heap_string_text(nh);
-                        if msg.is_empty() { return name; }
+                        if msg.is_empty() {
+                            return name;
+                        }
                         return format!("{name}: {msg}");
                     }
                     // No name — return the message directly (covers Test262Error which
                     // stores only `message`; prefixing with generic "Error" would be noisy).
-                    if !msg.is_empty() { return msg; }
+                    if !msg.is_empty() {
+                        return msg;
+                    }
                 }
                 // Empty/missing message (e.g. `new Test262Error()` with no
                 // message argument): fall back to `constructor.name` so the
@@ -207,7 +215,11 @@ impl Engine {
     /// Comma-joined element text of a real array (`undefined`/`null`/holes
     /// render empty, matching `Array.prototype.join`). Nested arrays
     /// recurse; `depth` caps the recursion so cyclic arrays terminate.
-    fn array_join_text(&mut self, obj: v12_heap::Handle<v12_heap::JsObject>, depth: usize) -> String {
+    fn array_join_text(
+        &mut self,
+        obj: v12_heap::Handle<v12_heap::JsObject>,
+        depth: usize,
+    ) -> String {
         if depth > 8 {
             return String::new();
         }
@@ -230,4 +242,3 @@ impl Engine {
         parts.join(",")
     }
 }
-

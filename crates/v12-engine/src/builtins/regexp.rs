@@ -45,11 +45,7 @@ const SLOT_LAST_INDEX: usize = 2;
 /// undefined, the new object copies `pattern.source` and `pattern.flags`.
 /// Otherwise `pattern` is coerced to a string (with `undefined` → `""` and
 /// `null` → `"null"` per ToString). Invalid flags are a SyntaxError.
-pub fn regexp_construct(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn regexp_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let (source_text, flags_text) = match (args.first(), args.get(1)) {
         (Some(first), None) => {
             // Copy-from-regexp fast path.
@@ -75,20 +71,15 @@ pub fn regexp_construct(
         .map_err(|e| ctx.syntax_error(format!("SyntaxError: {e}")))?;
     let source_h = ctx.heap.intern_text(&source_text);
     let flags_h = ctx.heap.intern_text(&flags_text);
-    let handle = alloc_regexp(
-        ctx,
-        JsValue::string(source_h),
-        JsValue::string(flags_h),
-    );
+    let handle = alloc_regexp(ctx, JsValue::string(source_h), JsValue::string(flags_h));
     Ok(JsValue::object(handle))
 }
 
 fn alloc_regexp(ctx: &mut Ctx, source: JsValue, flags: JsValue) -> Handle<JsObject> {
     let h = ctx.alloc_obj(JsObject::regexp(
-            source.as_string().expect("source is a string"),
-            flags.as_string().expect("flags is a string"),
-        ),
-    );
+        source.as_string().expect("source is a string"),
+        flags.as_string().expect("flags is a string"),
+    ));
     link_regexp_proto(ctx, h);
     h
 }
@@ -208,11 +199,13 @@ pub fn last_index(heap: &Heap, obj: Handle<JsObject>) -> f64 {
 
 /// Sets `lastIndex`, canonicalizing to a Smi when integral and in range.
 pub fn set_last_index(heap: &mut Heap, obj: Handle<JsObject>, v: f64) {
-    if v.fract() == 0.0 && (-1e15..=1e15).contains(&v)
-        && let Some(smi) = JsValue::from_i32_smi(v as i32) {
-            heap.get_mut(obj).properties[SLOT_LAST_INDEX] = smi;
-            return;
-        }
+    if v.fract() == 0.0
+        && (-1e15..=1e15).contains(&v)
+        && let Some(smi) = JsValue::from_i32_smi(v as i32)
+    {
+        heap.get_mut(obj).properties[SLOT_LAST_INDEX] = smi;
+        return;
+    }
     heap.get_mut(obj).properties[SLOT_LAST_INDEX] = JsValue::from_f64(v);
 }
 
@@ -223,20 +216,9 @@ pub fn set_last_index(heap: &mut Heap, obj: Handle<JsObject>, v: f64) {
 /// `v12_regex`, and returns either `null` or an array-like match object
 /// (`[0]` = whole match, `[1..n]` = capture groups, plus `index`, `input`,
 /// and `groups` properties).
-pub fn regexp_exec(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
-    let obj = ctx.this_object(
-        this,
-        "RegExp.prototype.exec",
-        Some(v12_heap::Kind::RegExp),
-    )?;
-    let input_text = args
-        .first()
-        .map(|v| ctx.to_string(*v))
-        .unwrap_or_default();
+pub fn regexp_exec(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let obj = ctx.this_object(this, "RegExp.prototype.exec", Some(v12_heap::Kind::RegExp))?;
+    let input_text = args.first().map(|v| ctx.to_string(*v)).unwrap_or_default();
     let input_units: Vec<u16> = input_text.encode_utf16().collect();
 
     let (source, flags) = regexp_source_flags(ctx.heap, obj);
@@ -340,7 +322,10 @@ fn match_result(
     // `properties[0]` is the length Smi (from `JsObject::array`); slots 1/2
     // get index/input.
     if ctx.heap.get(arr).properties.len() < 3 {
-        ctx.heap.get_mut(arr).properties.resize(3, JsValue::undefined());
+        ctx.heap
+            .get_mut(arr)
+            .properties
+            .resize(3, JsValue::undefined());
         ctx.heap.get_mut(arr).property_keys.resize(3, None);
     }
     ctx.heap.get_mut(arr).properties[1] = helpers::smi_or_f64(m.start() as i64);
@@ -350,11 +335,7 @@ fn match_result(
 }
 
 /// `RegExp.prototype.test(string)` — `Boolean(exec(string))`.
-pub fn regexp_test(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn regexp_test(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     match regexp_exec(ctx, this, args)? {
         v if v.is_null() => Ok(JsValue::false_()),
         _ => Ok(JsValue::true_()),
@@ -362,11 +343,7 @@ pub fn regexp_test(
 }
 
 /// `RegExp.prototype.toString()` — `"/" + source + "/" + flags`.
-pub fn regexp_to_string(
-    ctx: &mut Ctx,
-    this: JsValue,
-    _args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn regexp_to_string(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(
         this,
         "RegExp.prototype.toString",
@@ -378,11 +355,7 @@ pub fn regexp_to_string(
 }
 
 /// `RegExp.prototype.compile` — legacy recompile-in-place (Annex B).
-pub fn regexp_compile(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn regexp_compile(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(
         this,
         "RegExp.prototype.compile",
@@ -415,7 +388,8 @@ pub fn regexp_compile(
     let flags_h = ctx.heap.intern_text(&flags_text);
     ctx.heap.get_mut(obj).properties[SLOT_SOURCE] = JsValue::string(source_h);
     ctx.heap.get_mut(obj).properties[SLOT_FLAGS] = JsValue::string(flags_h);
-    ctx.heap.get_mut(obj).properties[SLOT_LAST_INDEX] = JsValue::from_i32_smi(0).expect("0 fits Smi");
+    ctx.heap.get_mut(obj).properties[SLOT_LAST_INDEX] =
+        JsValue::from_i32_smi(0).expect("0 fits Smi");
     // Drop any cached compilation for this object.
     if let Some(cache) = ctx.regex_cache() {
         cache.borrow_mut().remove(&obj.index());

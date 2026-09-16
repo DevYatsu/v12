@@ -12,13 +12,20 @@ use super::ctx::Ctx;
 /// Unreserved characters (RFC 2396 §2.3) plus the mark set — never encoded
 /// by `encodeURIComponent`.
 fn is_unreserved(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+        )
 }
 
 /// Characters `encodeURI` leaves unencoded (reserved URI syntax) on top of
 /// the unreserved set.
 fn is_uri_reserved(b: u8) -> bool {
-    matches!(b, b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#')
+    matches!(
+        b,
+        b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
+    )
 }
 
 fn encode(ctx: &mut Ctx, text: &str, keep_reserved: bool) -> Result<JsValue, Throw> {
@@ -37,12 +44,7 @@ fn encode(ctx: &mut Ctx, text: &str, keep_reserved: bool) -> Result<JsValue, Thr
     Ok(JsValue::string(ctx.heap.intern_text(&out)))
 }
 
-fn decode(
-    ctx: &mut Ctx,
-    text: &str,
-    component_only: bool,
-    what: &str,
-) -> Result<JsValue, Throw> {
+fn decode(ctx: &mut Ctx, text: &str, component_only: bool, what: &str) -> Result<JsValue, Throw> {
     let bytes = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -71,9 +73,10 @@ fn decode(
             // encodeURI leaves unencoded (reserved `;/?:@&=+$,#`): the
             // original `%XX` passes through verbatim (original case kept),
             // per spec — it is not a URIError.
-            if matches!(decoded,
-                b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#')
-            {
+            if matches!(
+                decoded,
+                b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
+            ) {
                 out.extend_from_slice(&bytes[i..i + 3]);
                 i += 3;
                 continue;
@@ -95,7 +98,11 @@ fn arg_string(ctx: &mut Ctx, args: &[JsValue], what: &str) -> Result<String, Thr
     }
 }
 
-pub fn global_encode_uri(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn global_encode_uri(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = arg_string(ctx, args, "encodeURI")?;
     encode(ctx, &text, true)
 }
@@ -109,7 +116,11 @@ pub fn global_encode_uri_component(
     encode(ctx, &text, false)
 }
 
-pub fn global_decode_uri(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn global_decode_uri(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     let text = arg_string(ctx, args, "decodeURI")?;
     decode(ctx, &text, false, "decodeURI")
 }

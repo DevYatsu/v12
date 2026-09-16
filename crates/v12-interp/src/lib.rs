@@ -58,13 +58,13 @@
 
 pub(crate) mod call;
 mod call_setup;
+mod execute;
+pub mod feedback;
 mod generator_async;
 mod globals;
 mod object_ops;
-mod execute;
-mod property;
-pub mod feedback;
 mod ops;
+mod property;
 
 #[cfg(test)]
 mod tests;
@@ -75,9 +75,7 @@ use std::time::Instant;
 
 use v12_bytecode::{FunctionBytecode, Opcode};
 use v12_bytecode::{GLOBAL_INTRINSICS as GLOBAL_INTRINSIC_NAMES, GLOBAL_VAR_OFFSET};
-use v12_heap::{
-    Attrs, Handle, Heap, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
-};
+use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str};
 
 #[cfg(test)]
 use crate::feedback::Lattice;
@@ -155,8 +153,12 @@ fn intrinsic_slot(text: &str) -> Option<usize> {
         "Error" => Some(intrinsic_idx("Error").expect("intrinsic 'Error' present")),
         "TypeError" => Some(intrinsic_idx("TypeError").expect("intrinsic 'TypeError' present")),
         "RangeError" => Some(intrinsic_idx("RangeError").expect("intrinsic 'RangeError' present")),
-        "ReferenceError" => Some(intrinsic_idx("ReferenceError").expect("intrinsic 'ReferenceError' present")),
-        "SyntaxError" => Some(intrinsic_idx("SyntaxError").expect("intrinsic 'SyntaxError' present")),
+        "ReferenceError" => {
+            Some(intrinsic_idx("ReferenceError").expect("intrinsic 'ReferenceError' present"))
+        }
+        "SyntaxError" => {
+            Some(intrinsic_idx("SyntaxError").expect("intrinsic 'SyntaxError' present"))
+        }
         "Promise" => Some(PROMISE_IDX.expect("intrinsic 'Promise' present")),
         "Symbol" => Some(SYMBOL_IDX.expect("intrinsic 'Symbol' present")),
         "Map" => Some(intrinsic_idx("Map").expect("intrinsic 'Map' present")),
@@ -246,7 +248,7 @@ const WELL_KNOWN_NAMES: &[&str] = &[
     "has",               // 31
     "delete",            // 32
     "clear",             // 33
-    "forEach",         // 34
+    "forEach",           // 34
     "add",               // 35
     "constructor",       // 36
 ];
@@ -825,12 +827,7 @@ impl<'a> Interp<'a> {
         let result = self
             .define_own_data_attrs(proto_v, ctor_key, f_v, Attrs::BUILTIN)
             .and_then(|()| {
-                self.define_own_data_attrs(
-                    f_v,
-                    proto_key_v,
-                    proto_v,
-                    Attrs::FUNCTION_PROTOTYPE,
-                )
+                self.define_own_data_attrs(f_v, proto_key_v, proto_v, Attrs::FUNCTION_PROTOTYPE)
             });
         self.stack.pop();
         self.stack.pop();
@@ -1236,9 +1233,10 @@ impl<'a> Interp<'a> {
         main: u32,
     ) -> Result<JsValue, JSException> {
         let id = self.register_program(functions, strings);
-        let callee = self
-            .heap
-            .alloc(JsObject::function(v12_heap::FunctionTarget::Bytecode(main), None));
+        let callee = self.heap.alloc(JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(main),
+            None,
+        ));
         self.heap.get_mut(callee).program_id = id;
         self.call_object(callee, JsValue::undefined(), &[])
     }
@@ -1286,9 +1284,10 @@ impl<'a> Interp<'a> {
             return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
         }
         if let Some(m) = &o.private_fields
-            && let Some(v) = m.get(&name_id) {
-                return Ok(*v);
-            }
+            && let Some(v) = m.get(&name_id)
+        {
+            return Ok(*v);
+        }
         Ok(crate::JsValue::undefined())
     }
     fn private_has(&self, obj_v: crate::JsValue, class_id: u32, name_id: u32) -> bool {
@@ -1384,52 +1383,55 @@ impl<'a> Interp<'a> {
         }
         // Plain-object errors (e.g. Test262Error): render `message`/`name` instead of opaque fallthrough.
         if v.is_object()
-            && let Some(obj) = v.as_object() {
-                let shape = self.heap.shape_of_mut(obj);
-                let lookup = |heap: &mut v12_heap::Heap,
-                              shape: v12_heap::ShapeHandle,
-                              key: &str|
-                 -> Option<v12_heap::Handle<v12_heap::V12Str>> {
-                    let h = heap.intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));
-                    let pk = v12_heap::PropKey::from_string(h);
-                    let desc = heap.lookup_property(shape, pk)?;
-                    let slot = desc.slot()?;
-                    // Interp objects have no GLOBAL_VAR_OFFSET bias (only engine global does).
-                    let idx = slot as usize;
-                    heap.get(obj)
-                        .properties
-                        .get(idx)
-                        .and_then(|val| val.as_string())
-                };
-                let shape2 = self.heap.shape_of_mut(obj);
-                // Need two separate lookups without overlapping mutable borrows.
-                let msg_h = lookup(self.heap, shape, "message");
-                if let Some(mh) = msg_h {
-                    let name_h = lookup(self.heap, shape2, "name");
-                    let msg = self.string_text(mh);
-                    if let Some(nh) = name_h {
-                        let name = self.string_text(nh);
-                        if msg.is_empty() {
-                            return name;
-                        }
-                        return format!("{name}: {msg}");
-                    }
-                    if !msg.is_empty() {
-                        return msg;
-                    }
-                }
-                // Empty/missing message (e.g. `new Test262Error()` with no
-                // message argument): fall back to `constructor.name` so the
-                // runner can classify the throw (it requires "Test262Error").
-                if let Some(co) = self.chain_prop(obj, "constructor").and_then(|v| v.as_object())
-                    && let Some(nh) = self.chain_prop(co, "name").and_then(|v| v.as_string())
-                {
+            && let Some(obj) = v.as_object()
+        {
+            let shape = self.heap.shape_of_mut(obj);
+            let lookup = |heap: &mut v12_heap::Heap,
+                          shape: v12_heap::ShapeHandle,
+                          key: &str|
+             -> Option<v12_heap::Handle<v12_heap::V12Str>> {
+                let h = heap.intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));
+                let pk = v12_heap::PropKey::from_string(h);
+                let desc = heap.lookup_property(shape, pk)?;
+                let slot = desc.slot()?;
+                // Interp objects have no GLOBAL_VAR_OFFSET bias (only engine global does).
+                let idx = slot as usize;
+                heap.get(obj)
+                    .properties
+                    .get(idx)
+                    .and_then(|val| val.as_string())
+            };
+            let shape2 = self.heap.shape_of_mut(obj);
+            // Need two separate lookups without overlapping mutable borrows.
+            let msg_h = lookup(self.heap, shape, "message");
+            if let Some(mh) = msg_h {
+                let name_h = lookup(self.heap, shape2, "name");
+                let msg = self.string_text(mh);
+                if let Some(nh) = name_h {
                     let name = self.string_text(nh);
-                    if !name.is_empty() {
+                    if msg.is_empty() {
                         return name;
                     }
+                    return format!("{name}: {msg}");
+                }
+                if !msg.is_empty() {
+                    return msg;
                 }
             }
+            // Empty/missing message (e.g. `new Test262Error()` with no
+            // message argument): fall back to `constructor.name` so the
+            // runner can classify the throw (it requires "Test262Error").
+            if let Some(co) = self
+                .chain_prop(obj, "constructor")
+                .and_then(|v| v.as_object())
+                && let Some(nh) = self.chain_prop(co, "name").and_then(|v| v.as_string())
+            {
+                let name = self.string_text(nh);
+                if !name.is_empty() {
+                    return name;
+                }
+            }
+        }
         match ops::to_js_string(self.heap, v) {
             Ok(h) => {
                 let units = ops::string_units(self.heap, h);
@@ -1473,7 +1475,10 @@ impl<'a> Interp<'a> {
     /// Display for a fresh frame whose environment head is `env`: the
     /// head plus up to `ENV_DISPLAY_CAP - 1` ancestors, walked once here
     /// (bounded O(8) per call — calls are cold, slot accesses hot).
-    fn env_display_for(&self, env: Option<Handle<JsObject>>) -> [Option<Handle<JsObject>>; ENV_DISPLAY_CAP] {
+    fn env_display_for(
+        &self,
+        env: Option<Handle<JsObject>>,
+    ) -> [Option<Handle<JsObject>>; ENV_DISPLAY_CAP] {
         let mut out = [None; ENV_DISPLAY_CAP];
         let mut cur = env;
         for slot in out.iter_mut() {
@@ -1614,11 +1619,7 @@ impl<'a> Interp<'a> {
     /// only, so inherited links like `instance.constructor` (living on the
     /// class prototype) need the walk. (Interp objects carry no
     /// `GLOBAL_VAR_OFFSET` bias, so no index adjustment.)
-    pub(crate) fn chain_prop(
-        &mut self,
-        obj: Handle<JsObject>,
-        key: &str,
-    ) -> Option<JsValue> {
+    pub(crate) fn chain_prop(&mut self, obj: Handle<JsObject>, key: &str) -> Option<JsValue> {
         let h = self
             .heap
             .intern_string(v12_heap::V12Str::latin1(key.as_bytes().to_vec()));

@@ -3,11 +3,15 @@
 
 use v12_heap::{Attrs, Handle, JsObject, JsValue, Kind, PropKey};
 
-use super::{accessor_target, child_slot, Interp, JSException};
+use super::{Interp, JSException, accessor_target, child_slot};
 use crate::ops;
 
 impl Interp<'_> {
-    pub(crate) fn op_copy_array_rest(&mut self, src_v: JsValue, start: u16) -> Result<JsValue, JSException> {
+    pub(crate) fn op_copy_array_rest(
+        &mut self,
+        src_v: JsValue,
+        start: u16,
+    ) -> Result<JsValue, JSException> {
         let Some(src_obj) = src_v.as_object() else {
             return Err(JSException(
                 self.error_value("TypeError: cannot destructure non-iterable"),
@@ -145,7 +149,11 @@ impl Interp<'_> {
     /// `MergeObject`: copies every enumerable own property of `src` onto the
     /// existing object `dst` (object spread). `null`/`undefined` sources are
     /// no-ops per spec; later writes win.
-    pub(crate) fn op_merge_object(&mut self, dst_v: JsValue, src_v: JsValue) -> Result<(), JSException> {
+    pub(crate) fn op_merge_object(
+        &mut self,
+        dst_v: JsValue,
+        src_v: JsValue,
+    ) -> Result<(), JSException> {
         if src_v.is_null() || src_v.is_undefined() {
             return Ok(());
         }
@@ -274,7 +282,11 @@ impl Interp<'_> {
     /// `SetPrototype`: sets `obj`'s `[[Prototype]]` to `proto` (the class
     /// `extends` wiring). `proto` may be an object or `null`; primitive
     /// prototypes are rejected per ES `OrdinarySetPrototypeOf`.
-    pub(crate) fn op_set_prototype(&mut self, obj_v: JsValue, proto_v: JsValue) -> Result<(), JSException> {
+    pub(crate) fn op_set_prototype(
+        &mut self,
+        obj_v: JsValue,
+        proto_v: JsValue,
+    ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             return Err(JSException(
                 self.error_value("TypeError: cannot set prototype of a primitive"),
@@ -352,7 +364,10 @@ impl Interp<'_> {
     /// Resolves the `@@iterator` method value off `obj` (a symbol-keyed
     /// `get_property`), without treating a missing method as an error — the
     /// caller decides the failure mode.
-    pub(crate) fn iterator_symbol_method(&mut self, obj_v: JsValue) -> Result<JsValue, JSException> {
+    pub(crate) fn iterator_symbol_method(
+        &mut self,
+        obj_v: JsValue,
+    ) -> Result<JsValue, JSException> {
         let sym = self.symbol_iterator_key();
         let sym_v = JsValue::symbol(sym);
         self.gc_protect();
@@ -450,7 +465,11 @@ impl Interp<'_> {
         Ok(())
     }
 
-    pub(crate) fn op_array_append(&mut self, dst_v: JsValue, src_v: JsValue) -> Result<(), JSException> {
+    pub(crate) fn op_array_append(
+        &mut self,
+        dst_v: JsValue,
+        src_v: JsValue,
+    ) -> Result<(), JSException> {
         let Some(dst_obj) = dst_v.as_object() else {
             return Err(JSException(
                 self.error_value("TypeError: destination is not an object"),
@@ -505,7 +524,7 @@ impl Interp<'_> {
     /// track (the realm installs them by pushing directly), so every
     /// descriptor slot on the global maps to `GLOBAL_VAR_OFFSET + slot`;
     /// ordinary objects use the slot as-is.
-pub(crate) fn array_join_fallback(
+    pub(crate) fn array_join_fallback(
         &mut self,
         this_v: JsValue,
         args: &[JsValue],
@@ -565,7 +584,13 @@ pub(crate) fn array_join_fallback(
                 v.as_smi()
                     .map(|s| f64::from(s))
                     .or_else(|| v.as_f64())
-                    .map(|n| if n.is_nan() { 0.0 } else { n.trunc().clamp(0.0, 9007199254740991.0) })
+                    .map(|n| {
+                        if n.is_nan() {
+                            0.0
+                        } else {
+                            n.trunc().clamp(0.0, 9007199254740991.0)
+                        }
+                    })
             })
             .unwrap_or_else(|| self.heap.get(obj).element_len() as f64);
         for &item in args {

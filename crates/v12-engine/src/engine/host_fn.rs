@@ -1,11 +1,9 @@
 //! Host-facing callables: the `Function` constructor and `create_host_function`
 //! bridging Rust closures into the interpreter.
 
-
-
 use v12_heap::JsValue;
 
-use super::{string_value, Engine};
+use super::{Engine, string_value};
 
 impl Engine {
     /// Installs `name` on the global as a host function that creates a fresh
@@ -23,9 +21,8 @@ impl Engine {
 
     pub fn create_function(&mut self, params: &str, body: &str) -> Result<JsValue, JsValue> {
         let src = format!("function __f({params}){{{body}}}");
-        let (program, _strings) =
-            v12_bccompiler::compile_source_with_strings(&src)
-                .map_err(|err| string_value(&mut self.heap, &err.message))?;
+        let (program, _strings) = v12_bccompiler::compile_source_with_strings(&src)
+            .map_err(|err| string_value(&mut self.heap, &err.message))?;
         let idx = program
             .functions
             .iter()
@@ -70,9 +67,7 @@ impl Engine {
         self.heap.add_root(JsValue::object(func));
         // Install `name` on the global via the public shape API, exactly as
         // the interpreter's `op_set_global` does (GLOBAL_VAR_OFFSET bias).
-        let h = self
-            .heap
-            .intern_text(name);
+        let h = self.heap.intern_text(name);
         let key = v12_heap::PropKey::from_string(h);
         let shape = self.heap.shape_of(global);
         if let Some(desc) = self.heap.lookup_property(shape, key)

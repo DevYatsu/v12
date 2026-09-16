@@ -2,21 +2,19 @@
 //! built-in-method "surface" dispatch, inline-cache lookup, and the
 //! `in`/`instanceof`/`delete` operators plus array element access.
 
-use v12_heap::{
-    Attrs, Descriptor, Handle, JsObject, JsValue, Kind, PropKey,
-};
+use v12_heap::{Attrs, Descriptor, Handle, JsObject, JsValue, Kind, PropKey};
 
 use super::{
-    child_slot, Interp, JSException, RegExpSlot, ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET,
-    OBJECT_IDX, PROMISE_IDX, REGEXP_IDX, SYMBOL_IDX, WK_ADD, WK_APPLY, WK_BIND, WK_CALL,
-    WK_CATCH, WK_CLEAR, WK_CONSTRUCTOR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES, WK_ENUMERABLE_OWN_KEYS,
+    ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET, Interp, JSException, OBJECT_IDX, PROMISE_IDX,
+    REGEXP_IDX, RegExpSlot, SYMBOL_IDX, WK_ADD, WK_APPLY, WK_BIND, WK_CALL, WK_CATCH, WK_CLEAR,
+    WK_CONSTRUCTOR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES, WK_ENUMERABLE_OWN_KEYS,
     WK_FLAGS, WK_FOR_EACH, WK_GET, WK_GET_PROTOTYPE_OF, WK_HAS, WK_HAS_OWN_PROPERTY, WK_IS_ARRAY,
     WK_ITERATOR, WK_KEYS, WK_LAST_INDEX, WK_LENGTH, WK_LOG, WK_NEXT, WK_PROTOTYPE, WK_REJECT,
-    WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN, WK_THROW, WK_TO_STRING, WK_VALUE_OF,
-    WK_VALUES,
+    WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN, WK_THROW, WK_TO_STRING,
+    WK_VALUE_OF, WK_VALUES, child_slot,
 };
-use v12_native::NativeId;
 use crate::ops;
+use v12_native::NativeId;
 
 impl Interp<'_> {
     pub(crate) fn get_property(
@@ -180,9 +178,7 @@ impl Interp<'_> {
             };
             return Ok(match unit {
                 Some(u) => {
-                    let sh = self
-                        .heap
-                        .intern_string(v12_heap::V12Str::utf16(vec![u]));
+                    let sh = self.heap.intern_string(v12_heap::V12Str::utf16(vec![u]));
                     JsValue::string(sh)
                 }
                 None => JsValue::undefined(),
@@ -527,11 +523,7 @@ impl Interp<'_> {
     /// global: shape slots on a realm global index `properties` with the
     /// `GLOBAL_VAR_OFFSET` bias, which the unadjusted `chain_prop` walk
     /// misreads (it served a neighboring intrinsic's constructor).
-    fn global_own_constructor(
-        &mut self,
-        global: Handle<JsObject>,
-        name: &str,
-    ) -> Option<JsValue> {
+    fn global_own_constructor(&mut self, global: Handle<JsObject>, name: &str) -> Option<JsValue> {
         let h = self.heap.intern_text(name);
         let pk = v12_heap::PropKey::from_string(h);
         // Dictionary rung first: globals with many properties (harness
@@ -776,9 +768,7 @@ impl Interp<'_> {
         // and chain verifies — one integer compare each). OOB storage
         // falls through to the walk below, which resolves exactly as
         // before (including the realm-global fallback).
-        if !is_proxy
-            && let Some((holder, hsl)) = self.heap.stub_lookup_proto(obj, shape, key)
-        {
+        if !is_proxy && let Some((holder, hsl)) = self.heap.stub_lookup_proto(obj, shape, key) {
             let idx = self.global_slot_index(holder, hsl as usize);
             if let Some(v) = self.heap.get(holder).properties.get(idx) {
                 return Ok(*v);
@@ -841,10 +831,11 @@ impl Interp<'_> {
             }
             let owner_shape = self.shape_of(owner);
             if !is_proxy {
-                self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, entry.slot);
+                self.heap
+                    .stub_record_proto(obj, shape, key, owner, owner_shape, entry.slot);
             }
-            let value = self.heap.get(owner).properties
-                [self.global_slot_index(owner, entry.slot as usize)];
+            let value =
+                self.heap.get(owner).properties[self.global_slot_index(owner, entry.slot as usize)];
             return Ok(value);
         }
         match hit {
@@ -856,7 +847,8 @@ impl Interp<'_> {
                     // Accessor hits never record (no servable slot).
                     let owner_shape = self.shape_of(owner);
                     if !is_proxy {
-                        self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, slot);
+                        self.heap
+                            .stub_record_proto(obj, shape, key, owner, owner_shape, slot);
                     }
                     let value = self.heap.get(owner).properties
                         [self.global_slot_index(owner, slot as usize)];
@@ -1159,7 +1151,11 @@ impl Interp<'_> {
     }
 
     /// First descriptor naming `key` along `obj`'s prototype chain.
-    pub(crate) fn inherited_descriptor(&mut self, obj: Handle<JsObject>, key: PropKey) -> Option<Descriptor> {
+    pub(crate) fn inherited_descriptor(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: PropKey,
+    ) -> Option<Descriptor> {
         let mut cur = self.heap.get(obj).prototype;
         while let Some(o) = cur {
             // Dictionary rung first (overflow keys live only here).
@@ -1292,20 +1288,21 @@ impl Interp<'_> {
                 // No trap: forward to the target through the ordinary path.
                 return self.op_in(key_v, JsValue::object(target));
             }
-            return Err(JSException(self.error_value(
-                "TypeError: 'has' trap must be a function",
-            )));
+            return Err(JSException(
+                self.error_value("TypeError: 'has' trap must be a function"),
+            ));
         };
         if self.heap.get(trap).kind != Kind::Function {
-            return Err(JSException(self.error_value(
-                "TypeError: 'has' trap must be a function",
-            )));
+            return Err(JSException(
+                self.error_value("TypeError: 'has' trap must be a function"),
+            ));
         }
         self.gc_protect();
-        let result = self.call_inline(trap, JsValue::object(handler), &[
-            JsValue::object(target),
-            key_v,
-        ])?;
+        let result = self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[JsValue::object(target), key_v],
+        )?;
         Ok(ops::to_boolean(self.heap, result))
     }
 
@@ -1313,7 +1310,11 @@ impl Interp<'_> {
     /// with an object-typed `prototype` property; returns false if `lhs`
     /// is not an object; otherwise walks `lhs`'s prototype chain for
     /// identity against `rhs.prototype`.
-    pub(crate) fn op_instanceof(&mut self, lhs_v: JsValue, rhs_v: JsValue) -> Result<bool, JSException> {
+    pub(crate) fn op_instanceof(
+        &mut self,
+        lhs_v: JsValue,
+        rhs_v: JsValue,
+    ) -> Result<bool, JSException> {
         let Some(rhs_obj) = rhs_v.as_object() else {
             return Err(JSException(self.error_value(
                 "TypeError: right-hand side of 'instanceof' is not an object",
@@ -1424,7 +1425,11 @@ impl Interp<'_> {
     /// `DeleteProperty`: configurable own properties become holes (slot
     /// numbering survives for siblings), absent ones report success, locked
     /// ones report failure. Element deletes hole out the slot.
-    pub(crate) fn delete_property(&mut self, obj_v: JsValue, key_v: JsValue) -> Result<bool, JSException> {
+    pub(crate) fn delete_property(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+    ) -> Result<bool, JSException> {
         let Some(obj) = obj_v.as_object() else {
             if obj_v.is_null() || obj_v.is_undefined() {
                 return Err(JSException(self.error_value(
@@ -1513,8 +1518,7 @@ impl Interp<'_> {
             .and_then(|d| d.slot())
             .map(|s| s as usize);
         if let Some(slot) = slot {
-            self.heap.get_mut(obj).properties[slot] =
-                ops::box_number(f64::from(len_after));
+            self.heap.get_mut(obj).properties[slot] = ops::box_number(f64::from(len_after));
         }
     }
 }

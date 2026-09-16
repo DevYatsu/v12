@@ -194,13 +194,32 @@ pub fn array_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
     let elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     let len = elems.len() as i64;
     let to_idx = |v: JsValue| -> i64 {
-        if v.is_undefined() { return 0; }
-        
-        v.as_smi().map(i64::from).or_else(|| v.as_f64().map(|f| f.trunc() as i64)).unwrap_or(0)
+        if v.is_undefined() {
+            return 0;
+        }
+
+        v.as_smi()
+            .map(i64::from)
+            .or_else(|| v.as_f64().map(|f| f.trunc() as i64))
+            .unwrap_or(0)
     };
-    let start = if args.is_empty() { 0 } else { let n=to_idx(args[0]); if n<0 { (len+n).max(0) } else { n.min(len) } };
-    let end = if args.len()<2 || args[1].is_undefined() { len } else { let n=to_idx(args[1]); if n<0 { (len+n).max(0) } else { n.min(len) } };
-    let slice = if start>=end { Vec::new() } else { elems[start as usize..end as usize].to_vec() };
+    let start = if args.is_empty() {
+        0
+    } else {
+        let n = to_idx(args[0]);
+        if n < 0 { (len + n).max(0) } else { n.min(len) }
+    };
+    let end = if args.len() < 2 || args[1].is_undefined() {
+        len
+    } else {
+        let n = to_idx(args[1]);
+        if n < 0 { (len + n).max(0) } else { n.min(len) }
+    };
+    let slice = if start >= end {
+        Vec::new()
+    } else {
+        elems[start as usize..end as usize].to_vec()
+    };
     let arr = heap.alloc(JsObject::array(slice));
     heap.add_root(JsValue::object(arr));
     Ok(JsValue::object(arr))
@@ -236,9 +255,7 @@ fn sync_length(heap: &mut Heap, obj: Handle<JsObject>, len: f64) {
     // No length slot yet: create one via shape extension if needed.
     if heap.get(obj).properties.len() < 1024 {
         let _child = heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
-        heap.get_mut(obj)
-            .properties
-            .push(JsValue::from_f64(len));
+        heap.get_mut(obj).properties.push(JsValue::from_f64(len));
     }
 }
 
@@ -291,11 +308,16 @@ fn dense_bound(heap: &mut Heap, obj: Handle<JsObject>, len: i64) -> i64 {
         let shape = heap.shape_of(obj);
         // Collect the keys first: decoding each key's text needs `&mut heap`
         // and cannot hold the descriptor borrow across it.
-        let keys: Vec<_> = heap.get(shape).descriptors.as_slice().iter().filter_map(|d| d.key().string()).collect();
+        let keys: Vec<_> = heap
+            .get(shape)
+            .descriptors
+            .as_slice()
+            .iter()
+            .filter_map(|d| d.key().string())
+            .collect();
         for key in keys {
             let text = helpers::string_text(heap, key);
-            if text.len() <= 10 && !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
-            {
+            if text.len() <= 10 && !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
                 if let Ok(n) = text.parse::<i64>() {
                     bound = bound.max(n.saturating_add(1));
                 }
@@ -340,7 +362,8 @@ fn set_array_len(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
         let old = heap.get(obj).element_len() as u32;
         if len < old {
             let kept: Vec<JsValue> = heap.get(obj).elements_snapshot();
-            heap.get_mut(obj).replace_elements(kept[..len as usize].to_vec());
+            heap.get_mut(obj)
+                .replace_elements(kept[..len as usize].to_vec());
         }
         if let Some(slot) = heap.get_mut(obj).properties.first_mut() {
             *slot = helpers::smi_or_f64(i64::from(len));
@@ -376,7 +399,11 @@ fn relative_index(v: Option<JsValue>, len: i64, default: i64) -> i64 {
     if v.is_undefined() {
         return default;
     }
-    let n = v.as_smi().map(i64::from).or_else(|| v.as_f64().map(|f| f.trunc() as i64)).unwrap_or(0);
+    let n = v
+        .as_smi()
+        .map(i64::from)
+        .or_else(|| v.as_f64().map(|f| f.trunc() as i64))
+        .unwrap_or(0);
     if n < 0 { (len + n).max(0) } else { n.min(len) }
 }
 
@@ -416,7 +443,9 @@ pub fn array_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
     // Holes never match, so scanning past the last stored element (or
     // shape-bound integer key) cannot find anything — bound the loop.
     let dense = dense_bound(heap, obj, len);
-    let from = relative_index(args.get(1).copied(), len, 0).max(0).min(dense);
+    let from = relative_index(args.get(1).copied(), len, 0)
+        .max(0)
+        .min(dense);
     for i in from..dense {
         if let Some(v) = read_index(heap, obj, i as u32)
             && helpers::strict_equals(heap, search, v)
@@ -510,10 +539,14 @@ pub fn array_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
         return Ok(JsValue::from_bool(false));
     }
     let dense = dense_bound(heap, obj, len);
-    let from = relative_index(args.get(1).copied(), len, 0).max(0).min(dense);
+    let from = relative_index(args.get(1).copied(), len, 0)
+        .max(0)
+        .min(dense);
     for i in from..dense {
         match read_index(heap, obj, i as u32) {
-            Some(v) if helpers::same_value_zero(heap, search, v) => return Ok(JsValue::from_bool(true)),
+            Some(v) if helpers::same_value_zero(heap, search, v) => {
+                return Ok(JsValue::from_bool(true));
+            }
             // A hole reads as `undefined` for `includes`.
             None if search.is_undefined() => return Ok(JsValue::from_bool(true)),
             _ => {}
@@ -617,7 +650,11 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
         None => len - start,
         Some(v) if v.is_undefined() => len - start,
         Some(v) => {
-            let d = v.as_smi().map(i64::from).or_else(|| v.as_f64().map(|f| f.trunc() as i64)).unwrap_or(0);
+            let d = v
+                .as_smi()
+                .map(i64::from)
+                .or_else(|| v.as_f64().map(|f| f.trunc() as i64))
+                .unwrap_or(0);
             d.max(0).min(len - start)
         }
     };
@@ -671,11 +708,7 @@ pub fn array_fill(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVa
 }
 
 /// `Array.prototype.copyWithin(target, start, end?)` – interior memmove.
-pub fn array_copy_within(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn array_copy_within(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.copyWithin", None)?;
     let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
@@ -702,7 +735,10 @@ pub fn array_copy_within(
     let elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     for k in 0..count {
         let d = target + k;
-        let v = elems.get((start + k) as usize).copied().unwrap_or(JsValue::hole());
+        let v = elems
+            .get((start + k) as usize)
+            .copied()
+            .unwrap_or(JsValue::hole());
         if d >= store_len && (v.is_hole() || d > cap) {
             continue;
         }

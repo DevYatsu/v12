@@ -265,10 +265,7 @@ const SITE_TABLE_RESERVE: usize = 8;
 impl Default for FeedbackVector {
     fn default() -> Self {
         Self {
-            ics: FxHashMap::with_capacity_and_hasher(
-                SITE_TABLE_RESERVE,
-                rustc_hash::FxBuildHasher,
-            ),
+            ics: FxHashMap::with_capacity_and_hasher(SITE_TABLE_RESERVE, rustc_hash::FxBuildHasher),
             type_feedback: FxHashMap::with_capacity_and_hasher(
                 SITE_TABLE_RESERVE,
                 rustc_hash::FxBuildHasher,

@@ -20,16 +20,17 @@ pub use error::BytecodeError;
 /// conversion layer.
 pub type SpanPair = (u32, u32);
 
-
 mod analysis;
 mod builder;
 mod opcode;
 mod wide;
 
-pub use analysis::{CountedLoop, MAX_INLINE_SIZE, find_counted_loop, is_inline_candidate,
-    is_loop_header, logical_pcs, loop_headers, next_logical_pc};
+pub use analysis::{
+    CountedLoop, MAX_INLINE_SIZE, find_counted_loop, is_inline_candidate, is_loop_header,
+    logical_pcs, loop_headers, next_logical_pc,
+};
 pub use builder::{FunctionBuilder, Label};
-pub use opcode::{Instr, Opcode, MAX_IMM24};
+pub use opcode::{Instr, MAX_IMM24, Opcode};
 pub use wide::WideOp;
 
 // ---------------------------------------------------------------------------
@@ -484,7 +485,11 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         | Opcode::Ge
         | Opcode::StrictEq
         | Opcode::StrictNe => write!(f, " r{a}, r{b}, r{c}"),
-        Opcode::Neg | Opcode::BitNot | Opcode::Not | Opcode::TypeOf | Opcode::ToNumber
+        Opcode::Neg
+        | Opcode::BitNot
+        | Opcode::Not
+        | Opcode::TypeOf
+        | Opcode::ToNumber
         | Opcode::ToPropertyKey => {
             write!(f, " r{a}, r{b}")
         }

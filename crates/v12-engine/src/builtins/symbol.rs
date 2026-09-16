@@ -36,11 +36,7 @@ fn fresh_symbol(ctx: &mut Ctx) -> JsValue {
 
 /// `Symbol(description?)` — returns a fresh symbol. `new Symbol()` throws
 /// (construct path passes the constructor as `this`, a Function object).
-pub fn symbol_construct(
-    ctx: &mut Ctx,
-    this: JsValue,
-    _args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn symbol_construct(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     if let Some(o) = this.as_object()
         && ctx.heap.get(o).kind == v12_heap::Kind::Function
     {
@@ -62,11 +58,7 @@ pub fn symbol_for(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsV
 /// `Symbol.keyFor(sym)` — the registry key for a `Symbol.for` symbol,
 /// else `undefined` (fresh and well-known symbols were never
 /// registered). Non-symbols throw per spec.
-pub fn symbol_key_for(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn symbol_key_for(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let Some(sym) = args.first().and_then(|v| v.as_symbol()) else {
         return Err(ctx.type_error("TypeError: Symbol.keyFor requires a symbol"));
     };
@@ -109,9 +101,7 @@ pub fn symbol_proto_description(
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     if this.as_symbol().is_none() {
-        return Err(
-            ctx.type_error("TypeError: Symbol.prototype.description requires a Symbol"),
-        );
+        return Err(ctx.type_error("TypeError: Symbol.prototype.description requires a Symbol"));
     }
     Ok(JsValue::undefined())
 }

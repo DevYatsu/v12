@@ -135,11 +135,7 @@ impl JsValue {
 
     /// The boolean `b` as a value (`true_`/`false_` for runtime bools).
     pub const fn from_bool(b: bool) -> JsValue {
-        if b {
-            Self::true_()
-        } else {
-            Self::false_()
-        }
+        if b { Self::true_() } else { Self::false_() }
     }
 
     /// The internal absent-element marker; never observable from conforming

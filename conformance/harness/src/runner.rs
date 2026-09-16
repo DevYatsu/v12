@@ -189,8 +189,8 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     // Async verdict needed when the test carries the `async` flag or calls
     // `$DONE` directly (older style). Raw tests get neither harness nor
     // verdict — `$DONE` cannot exist there.
-    let needs_async_verdict =
-        !frontmatter.has_flag("raw") && (frontmatter.has_flag("async") || source.contains("$DONE("));
+    let needs_async_verdict = !frontmatter.has_flag("raw")
+        && (frontmatter.has_flag("async") || source.contains("$DONE("));
 
     // Harness preamble.
     let (harness_source, harness_errors) = if frontmatter.has_flag("raw") {
@@ -397,9 +397,22 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     match exec_result {
         Ok(Ok((_ok_value, prints))) => {
             if needs_async_verdict {
-                handle_async_ok(&prints, &frontmatter, file_path, relative, suite, duration_ms)
+                handle_async_ok(
+                    &prints,
+                    &frontmatter,
+                    file_path,
+                    relative,
+                    suite,
+                    duration_ms,
+                )
             } else {
-                handle_positive_or_negative_ok(&frontmatter, file_path, relative, suite, duration_ms)
+                handle_positive_or_negative_ok(
+                    &frontmatter,
+                    file_path,
+                    relative,
+                    suite,
+                    duration_ms,
+                )
             }
         }
         Ok(Err((thrown_str, _prints))) => {
@@ -731,7 +744,9 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     // 5 s hard-kill window (observed as STALLED on tco-lhs-body/tco-finally).
     // Skip the ~35 such tests until TCO lands.
     if fm.has_feature("tail-call-optimization") {
-        return Some("requires tail-call-optimization (proper tail calls not implemented)".to_string());
+        return Some(
+            "requires tail-call-optimization (proper tail calls not implemented)".to_string(),
+        );
     }
     // TypedArrays (and resizable ArrayBuffers) are not implemented: skip
     // tests declaring the feature instead of failing on

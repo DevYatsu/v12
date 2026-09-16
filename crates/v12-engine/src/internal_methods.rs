@@ -323,7 +323,11 @@ fn prop_key_as_index(heap: &mut Heap, key: PropKey) -> Option<u32> {
 /// mode or for base keys (which stay shape-addressed — the two stores
 /// never overlap). Shared by the internal methods and the builtins'
 /// shape-walk sites that must see overflow keys.
-pub(crate) fn dict_lookup(heap: &Heap, obj: Handle<JsObject>, key: PropKey) -> Option<(DictEntry, JsValue)> {
+pub(crate) fn dict_lookup(
+    heap: &Heap,
+    obj: Handle<JsObject>,
+    key: PropKey,
+) -> Option<(DictEntry, JsValue)> {
     let entry = heap.get(obj).dictionary.as_ref()?.get(&key).copied()?;
     let value = heap
         .get(obj)
@@ -703,8 +707,7 @@ fn ordinary_own_property_keys(heap: &Heap, obj: Handle<JsObject>) -> Vec<PropKey
     // path's insertion-order convention. The two stores never overlap
     // (post-spill keys enter only the map), so nothing double-reports.
     if let Some(map) = heap.get(obj).dictionary.as_ref() {
-        let mut overflow: Vec<(u32, PropKey)> =
-            map.iter().map(|(k, e)| (e.seq, *k)).collect();
+        let mut overflow: Vec<(u32, PropKey)> = map.iter().map(|(k, e)| (e.seq, *k)).collect();
         overflow.sort_by_key(|&(seq, _)| seq);
         keys.extend(overflow.into_iter().map(|(_, k)| k));
     }

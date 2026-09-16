@@ -842,8 +842,7 @@ impl SizeEstimate for JsObject {
             + mapped
             + self.dictionary.as_ref().map_or(0, |d| {
                 d.capacity()
-                    * (core::mem::size_of::<crate::PropKey>()
-                        + core::mem::size_of::<DictEntry>())
+                    * (core::mem::size_of::<crate::PropKey>() + core::mem::size_of::<DictEntry>())
             })
     }
 }

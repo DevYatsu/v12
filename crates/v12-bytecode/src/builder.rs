@@ -1,7 +1,8 @@
 //! Stage 4: backpatching builder — labels, fixups, and `FunctionBuilder`.
 
-use crate::{BytecodeError, Const, ConstantPool, FunctionBytecode, HandlerRange,
-    Instr, Opcode, SpanPair};
+use crate::{
+    BytecodeError, Const, ConstantPool, FunctionBytecode, HandlerRange, Instr, Opcode, SpanPair,
+};
 
 // ---------------------------------------------------------------------------
 // Stage 4: backpatching builder

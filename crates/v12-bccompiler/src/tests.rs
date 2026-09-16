@@ -85,10 +85,7 @@ fn switch_duplicate_default_is_a_syntax_error() {
     let err = compile_source_with_strings("switch (1) { default: ; break; default: ; break; }")
         .map_err(|e| e.message)
         .expect_err("duplicate default clauses must fail compilation");
-    assert!(
-        err.contains("default"),
-        "unexpected error message: {err}"
-    );
+    assert!(err.contains("default"), "unexpected error message: {err}");
 }
 
 #[test]
@@ -1648,7 +1645,10 @@ fn param_default_lowers_in_prologue() {
     // `function k(a = 1){ return a; }` must test `a` against undefined
     // in the prologue and select the default when it is.
     let text = fn0_text("function k(a = 1){ return a; }");
-    assert!(text.contains("strict_eq"), "expected default test in:\n{text}");
+    assert!(
+        text.contains("strict_eq"),
+        "expected default test in:\n{text}"
+    );
     assert!(
         text.contains("jump_if_false"),
         "expected default branch in:\n{text}"
@@ -1669,7 +1669,8 @@ fn param_pattern_destructures_in_prologue() {
 #[test]
 fn simple_params_layout_is_unchanged() {
     // The all-simple-identifier fast path must not grow the prologue.
-    let (prog, _) = compile_source_with_strings("function f(a, b){ return a + b; }").expect("compile");
+    let (prog, _) =
+        compile_source_with_strings("function f(a, b){ return a + b; }").expect("compile");
     for f in &prog.functions {
         f.validate().expect("validate");
     }
@@ -1686,8 +1687,8 @@ fn simple_params_layout_is_unchanged() {
 fn pattern_formal_then_rest_register_abi() {
     // Formal 0 is the pattern (incoming r1, reserved as scratch); the rest
     // array therefore lands at r2, NOT r3.
-    let (prog, _) = compile_source_with_strings("function f([a], ...r){ return r.length; }")
-        .expect("compile");
+    let (prog, _) =
+        compile_source_with_strings("function f([a], ...r){ return r.length; }").expect("compile");
     for f in &prog.functions {
         f.validate().expect("validate");
     }
@@ -1835,7 +1836,8 @@ fn global_intrinsics_compile_to_get_global() {
         assert!(
             fb2.instrs
                 .iter()
-                .any(|i| i.op() == Some(Opcode::GetGlobal) || i.op() == Some(Opcode::GetGlobalLenient)),
+                .any(|i| i.op() == Some(Opcode::GetGlobal)
+                    || i.op() == Some(Opcode::GetGlobalLenient)),
             "typeof {name} should still read the global in:\n{fb2}"
         );
         assert!(

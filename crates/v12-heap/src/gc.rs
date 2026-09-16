@@ -24,8 +24,8 @@ use crate::handle::{Handle, HeapSpace, Space};
 use crate::object::{IntegrityLevel, JsObject, SizeEstimate, V12BigInt, V12Symbol};
 use crate::prop_key::PropKey;
 use crate::shape::{Attrs, Descriptor, Serial, Shape, ShapeHandle, Transitions, ValidityCellId};
-use crate::stub_cache::StubCache;
 use crate::string::{self, CONCAT_EAGER_FLATTEN_MAX_UNITS, Seed, StrStorage, V12Str};
+use crate::stub_cache::StubCache;
 use crate::value::JsValue;
 
 /// Participation in marking. Implemented by values, handles, heap objects,
@@ -434,7 +434,8 @@ impl Heap {
         let h = self.alloc(V12Symbol);
         self.add_root(JsValue::symbol(h));
         self.symbol_registry.insert(key.to_owned(), h);
-        self.symbol_registry_reverse.insert(h.index(), key.to_owned());
+        self.symbol_registry_reverse
+            .insert(h.index(), key.to_owned());
         h
     }
 
@@ -613,7 +614,9 @@ impl Heap {
             proto_cell,
             num_own: slot + 1,
         });
-        self.get_mut(parent).transitions.insert(key, attrs, child_handle);
+        self.get_mut(parent)
+            .transitions
+            .insert(key, attrs, child_handle);
         child_handle
     }
 
@@ -625,7 +628,12 @@ impl Heap {
     /// accessor descriptors both become a data descriptor. The descriptor's
     /// slot is preserved for data properties; a fresh slot is allocated only
     /// when the key is absent.
-    pub fn update_data_attrs(&mut self, parent: ShapeHandle, key: PropKey, attrs: Attrs) -> ShapeHandle {
+    pub fn update_data_attrs(
+        &mut self,
+        parent: ShapeHandle,
+        key: PropKey,
+        attrs: Attrs,
+    ) -> ShapeHandle {
         if let Some(existing) = self.get(parent).transitions.get(key, attrs) {
             return existing;
         }
@@ -663,7 +671,9 @@ impl Heap {
             proto_cell,
             num_own: next_num_own,
         });
-        self.get_mut(parent).transitions.insert(key, attrs, child_handle);
+        self.get_mut(parent)
+            .transitions
+            .insert(key, attrs, child_handle);
         child_handle
     }
 
@@ -789,7 +799,9 @@ impl Heap {
             proto_cell,
             num_own: slot + 1,
         });
-        self.get_mut(parent).transitions.insert(key, attrs, child_handle);
+        self.get_mut(parent)
+            .transitions
+            .insert(key, attrs, child_handle);
         child_handle
     }
 
@@ -1998,7 +2010,11 @@ mod tests {
         assert_eq!(heap.get(with_x).num_own, 1);
         let reconfigured = heap.update_data_attrs(with_x, key, Attrs::BUILTIN);
         assert_eq!(heap.get(reconfigured).num_own, 1, "no duplicate descriptor");
-        let desc = heap.get(reconfigured).descriptors.find(key).expect("present");
+        let desc = heap
+            .get(reconfigured)
+            .descriptors
+            .find(key)
+            .expect("present");
         assert_eq!(desc.attrs(), Attrs::BUILTIN);
         // A second call with the same attrs returns the same cached child.
         let again = heap.update_data_attrs(with_x, key, Attrs::BUILTIN);

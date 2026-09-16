@@ -381,7 +381,7 @@ impl Pipeline {
     ///   `Lattice::Smi`,
     /// - inlines small monomorphic callees `≤ MAX_INLINE_SIZE`,
     /// - versions hot loops (peel + unroll `2×` for counted loops).
-#[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
+    #[allow(dead_code)] // speculative tier-2 API: exercised by tests, wired when tier-2 lands
     pub fn compile_with_feedback(
         &mut self,
         fb: &FunctionBytecode,

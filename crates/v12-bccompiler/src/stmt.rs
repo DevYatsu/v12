@@ -528,7 +528,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let mut syms = Vec::new();
         collect_pat_symbols(pat, &mut syms);
         syms.into_iter().any(|sym| {
-            self.comp.plans.home_of.get(&sym).is_some_and(|&home| home == self.unit)
+            self.comp
+                .plans
+                .home_of
+                .get(&sym)
+                .is_some_and(|&home| home == self.unit)
                 && matches!(
                     self.comp.plans.units[self.unit].vars.get(&sym),
                     Some(VarLoc::Env(_))
@@ -645,8 +649,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     let access = self.access(sym);
                     self.store_access(access, src, span);
                 } else {
-                    let gid =
-                        self.global_name_id(id.name.as_str());
+                    let gid = self.global_name_id(id.name.as_str());
                     self.emit_set_global(gid, src, span);
                 }
             }
@@ -702,7 +705,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         continue;
                     };
                     // Helper to bind a value with optional default.
-                    let bind_with_default = |ctx: &mut Self, raw: u16, binding: &oxc_ast::ast::AssignmentTarget<'_>, init: Option<&oxc_ast::ast::Expression<'_>>| -> Res<()> {
+                    let bind_with_default = |ctx: &mut Self,
+                                             raw: u16,
+                                             binding: &oxc_ast::ast::AssignmentTarget<'_>,
+                                             init: Option<&oxc_ast::ast::Expression<'_>>|
+                     -> Res<()> {
                         let val = if let Some(def_expr) = init {
                             // default when raw === undefined
                             let chosen = ctx.new_temp();
@@ -729,7 +736,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                             ctx.assign_for_of_value(val, binding, span)
                         }
                     };
-                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) = el {
+                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(
+                        d,
+                    ) = el
+                    {
                         let raw = self.read_index(src, index, span)?;
                         bind_with_default(self, raw, &d.binding, Some(&d.init))?;
                         index += 1;
@@ -751,7 +761,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     if start <= u16::from(u8::MAX) as u32 {
                         self.emit_reg2_imm8(Opcode::CopyArrayRest, dst, src, start as u8, span);
                     } else {
-                        let words = WideOp::CopyArrayRestW { dst, src, start: start as u16 }.encode();
+                        let words = WideOp::CopyArrayRestW {
+                            dst,
+                            src,
+                            start: start as u16,
+                        }
+                        .encode();
                         self.emit_words(words, span);
                     }
                     if let Some(simple) = rest.target.as_simple_assignment_target() {
@@ -851,10 +866,22 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 if let Some(rest) = &obj.rest {
                     let dst = self.new_temp();
                     if prop_count == 0 {
-                        let words = WideOp::CopyObjectRestW { dst, src, excl_base: 0, excl_count: 0 }.encode();
+                        let words = WideOp::CopyObjectRestW {
+                            dst,
+                            src,
+                            excl_base: 0,
+                            excl_count: 0,
+                        }
+                        .encode();
                         self.emit_words(words, span);
                     } else {
-                        let words = WideOp::CopyObjectRestW { dst, src, excl_base, excl_count: prop_count as u16 }.encode();
+                        let words = WideOp::CopyObjectRestW {
+                            dst,
+                            src,
+                            excl_base,
+                            excl_count: prop_count as u16,
+                        }
+                        .encode();
                         self.emit_words(words, span);
                     }
                     if let Some(simple) = rest.target.as_simple_assignment_target() {

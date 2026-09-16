@@ -276,8 +276,7 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
         // rather than written out twelve times.
         macro_rules! binop {
             ($helper:expr) => {{
-                let (dst, lhs, rhs) =
-                    (instr.a() as usize, instr.b() as usize, instr.c() as usize);
+                let (dst, lhs, rhs) = (instr.a() as usize, instr.b() as usize, instr.c() as usize);
                 emit_binop(
                     &mut builder,
                     &vars,
@@ -598,8 +597,7 @@ fn make_exec_closure(bytecode: &FunctionBytecode) -> JitExecFn {
             // times.
             macro_rules! binop {
                 ($helper:expr) => {{
-                    let (dst, a, b) =
-                        (instr.a() as usize, instr.b() as usize, instr.c() as usize);
+                    let (dst, a, b) = (instr.a() as usize, instr.b() as usize, instr.c() as usize);
                     let res = $helper(regs[a].bits(), regs[b].bits());
                     regs[dst] = JsValue(res);
                     pc += 1;

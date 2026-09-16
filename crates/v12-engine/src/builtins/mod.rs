@@ -18,8 +18,8 @@ pub mod number;
 pub mod object;
 pub mod promise;
 pub mod proxy;
-pub mod registry;
 pub mod regexp;
+pub mod registry;
 pub mod string;
 pub mod symbol;
 
@@ -394,22 +394,58 @@ macro_rules! __builtin_emit_install {
     // install time; entries without `(len)` keep the 5-arg form (no `length`
     // prop — current observable behavior) until their arity is audited.
     (Global, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.global), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.global),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (NumberProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.number_proto), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.number_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (StringProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.string_proto), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.string_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (ArrayProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.array_proto), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.array_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (ObjectProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.object_proto), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.object_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (FunctionProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.function_proto), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.function_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (Math, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length($heap, $targets.math, $name, $id, Some($len))
@@ -427,7 +463,13 @@ macro_rules! __builtin_emit_install {
         $crate::builtins::install_native_with_length($heap, $targets.json, $name, $id, Some($len))
     };
     (BooleanProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.boolean_proto), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.boolean_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (StringCtor, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length($heap, $targets.string, $name, $id, Some($len))
@@ -436,21 +478,30 @@ macro_rules! __builtin_emit_install {
         $crate::builtins::install_native_with_length($heap, $targets.symbol, $name, $id, Some($len))
     };
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        $crate::builtins::install_native_with_length($heap, Some($targets.symbol_proto), $name, $id, Some($len))
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.symbol_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     (Proxy, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length($heap, $targets.proxy, $name, $id, Some($len))
     };
     // Value-constant groups ignore length (constants, not functions).
-    (GlobalValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        { let _ = $len; $crate::builtins::install_value($heap, Some($targets.global), $name, $id) }
-    };
-    (MathValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        { let _ = $len; $crate::builtins::install_value($heap, $targets.math, $name, $id) }
-    };
-    (NumberValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
-        { let _ = $len; $crate::builtins::install_value($heap, $targets.number, $name, $id) }
-    };
+    (GlobalValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {{
+        let _ = $len;
+        $crate::builtins::install_value($heap, Some($targets.global), $name, $id)
+    }};
+    (MathValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {{
+        let _ = $len;
+        $crate::builtins::install_value($heap, $targets.math, $name, $id)
+    }};
+    (NumberValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {{
+        let _ = $len;
+        $crate::builtins::install_value($heap, $targets.number, $name, $id)
+    }};
 }
 
 /// Unified builtin declaration: single source of truth for dispatch + install.

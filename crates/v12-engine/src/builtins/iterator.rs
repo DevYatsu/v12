@@ -259,12 +259,24 @@ fn drain_iterator(ctx: &mut Ctx, this: JsValue) -> Result<Vec<JsValue>, Throw> {
 fn array_values_iterator(ctx: &mut Ctx, values: Vec<JsValue>) -> Result<JsValue, Throw> {
     let arr = ctx.alloc_obj(JsObject::array(values));
     let h = arr;
-    Ok(JsValue::object(create_iterator(ctx, h, ITER_KIND_ARRAY_VALUES)))
+    Ok(JsValue::object(create_iterator(
+        ctx,
+        h,
+        ITER_KIND_ARRAY_VALUES,
+    )))
 }
 
 /// `Iterator.prototype.toArray()` — drains `this` into an array.
-pub fn iterator_to_array(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    let _ = ctx.this_object(this, "Iterator.prototype.toArray", Some(v12_heap::Kind::Iterator))?;
+pub fn iterator_to_array(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let _ = ctx.this_object(
+        this,
+        "Iterator.prototype.toArray",
+        Some(v12_heap::Kind::Iterator),
+    )?;
     let values = drain_iterator(ctx, this)?;
     let arr = ctx.alloc_obj(JsObject::array(values));
     Ok(JsValue::object(arr))
@@ -283,7 +295,11 @@ fn take_limit(ctx: &mut Ctx, args: &[JsValue]) -> usize {
 
 /// `Iterator.prototype.take(limit)` — first `limit` values as an iterator.
 pub fn iterator_take(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let _ = ctx.this_object(this, "Iterator.prototype.take", Some(v12_heap::Kind::Iterator))?;
+    let _ = ctx.this_object(
+        this,
+        "Iterator.prototype.take",
+        Some(v12_heap::Kind::Iterator),
+    )?;
     let limit = take_limit(ctx, args);
     let mut values = drain_iterator(ctx, this)?;
     values.truncate(limit.min(values.len()));
@@ -292,10 +308,18 @@ pub fn iterator_take(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<J
 
 /// `Iterator.prototype.drop(limit)` — values after the first `limit`.
 pub fn iterator_drop(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let _ = ctx.this_object(this, "Iterator.prototype.drop", Some(v12_heap::Kind::Iterator))?;
+    let _ = ctx.this_object(
+        this,
+        "Iterator.prototype.drop",
+        Some(v12_heap::Kind::Iterator),
+    )?;
     let limit = take_limit(ctx, args);
     let values = drain_iterator(ctx, this)?;
-    let rest = if limit < values.len() { values[limit..].to_vec() } else { Vec::new() };
+    let rest = if limit < values.len() {
+        values[limit..].to_vec()
+    } else {
+        Vec::new()
+    };
     array_values_iterator(ctx, rest)
 }
 

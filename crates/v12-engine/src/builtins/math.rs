@@ -125,11 +125,7 @@ static RNG_STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
 /// `Math.random()` – a deterministic, seeded number in [0, 1). A xorshift step
 /// advances the state on every call.
-pub fn math_random(
-    _ctx: &mut Ctx,
-    _this: JsValue,
-    _args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn math_random(_ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let mut x = RNG_STATE.load(Ordering::Relaxed);
     // xorshift: three inline shifts cover the state space, no final multiply.
     x ^= x << 13;

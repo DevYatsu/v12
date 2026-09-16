@@ -45,9 +45,9 @@ fn create_proxy(ctx: &mut Ctx, args: &[JsValue]) -> Result<JsValue, Throw> {
     let target = args.first().copied().unwrap_or_else(JsValue::undefined);
     let handler = args.get(1).copied().unwrap_or_else(JsValue::undefined);
     let (Some(target_obj), Some(handler_obj)) = (target.as_object(), handler.as_object()) else {
-        return Err(ctx.type_error(
-            "TypeError: Cannot create proxy with a non-object as target or handler",
-        ));
+        return Err(
+            ctx.type_error("TypeError: Cannot create proxy with a non-object as target or handler")
+        );
     };
     let proxy = ctx.alloc_obj(JsObject::proxy(target_obj, handler_obj));
     Ok(JsValue::object(proxy))

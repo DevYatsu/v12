@@ -505,10 +505,7 @@ fn has_use_strict(program: &oxc_ast::ast::Program<'_>) -> bool {
 /// misplaced `#!` instead of panicking). With eval leniency,
 /// `new.target` diagnostics are skipped: their legality depends on the
 /// eval caller (see [`compile_eval_source_with_interner`]).
-fn parse_diagnostics_error(
-    parsed: &ParserReturn<'_>,
-    eval_leniency: bool,
-) -> Option<CompileError> {
+fn parse_diagnostics_error(parsed: &ParserReturn<'_>, eval_leniency: bool) -> Option<CompileError> {
     let mut errors = parsed.diagnostics.errors();
     let d = if eval_leniency {
         errors.find(|d| !d.message.contains("new.target"))?

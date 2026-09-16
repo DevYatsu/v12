@@ -181,22 +181,13 @@ pub enum VarLoc {
     ///
     /// Used for `var` bindings that alias the global object as well as for
     /// unresolved references to well-known intrinsics (see
-    /// [`GLOBAL_INTRINSICS`]). Keeping it distinct from `Reg`/`Env` makes the
-    /// global path explicit in `VarAccess` lowering and satisfies the
-    /// `collect.rs` → `model.rs` contract for `known-failures.md` bucket 3.
+    /// [`v12_bytecode::GLOBAL_INTRINSICS`]). Keeping it distinct from
+    /// `Reg`/`Env` makes the global path explicit in `VarAccess` lowering and
+    /// satisfies the `collect.rs` → `model.rs` contract for
+    /// `known-failures.md` bucket 3.
     #[allow(dead_code)]
     Global,
 }
-
-/// Names the compiler treats as global references (`GetGlobal`/`SetGlobal`)
-/// when no binding exists.
-///
-/// Re-exported from [`v12_bytecode::GLOBAL_ACCESS_INTRINSICS`]: the
-/// canonical home of the table is the bytecode crate. This is the compiler's
-/// superset of the realm-installed [`v12_bytecode::GLOBAL_INTRINSICS`]
-/// (whose slot order also fixes `GLOBAL_VAR_OFFSET`) — it additionally lists
-/// error constructors the v1 realm does not install as intrinsic slots.
-pub use v12_bytecode::GLOBAL_ACCESS_INTRINSICS as GLOBAL_INTRINSICS;
 
 /// Per-function-unit layout decided by the collect pass.
 #[derive(Debug)]
@@ -728,8 +719,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// must still see those finallies as active. Mirrors the emission shape
     /// of [`Self::run_finally_copies`] with a restored stack.
     pub fn emit_yield_return_finally_copies(&mut self) -> Result<(), CompileError> {
-        let bodies: Vec<&'a BlockStatement<'a>> =
-            self.finallies.iter().map(|c| c.body).collect();
+        let bodies: Vec<&'a BlockStatement<'a>> = self.finallies.iter().map(|c| c.body).collect();
         for body in bodies.into_iter().rev() {
             let saved = std::mem::take(&mut self.finallies);
             let r = self.stmt_list(&body.body);
@@ -932,7 +922,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// missing bindings yield `undefined` (spec `typeof` semantics).
     pub fn emit_get_global_lenient(&mut self, dst: u16, name_id: u32, span: oxc_span::Span) {
         let k = u16::try_from(name_id).expect("global name id fits u16");
-        self.emit_regs(Opcode::GetGlobalLenient, dst, k >> 8, k & 0xFF, 0b0001, span);
+        self.emit_regs(
+            Opcode::GetGlobalLenient,
+            dst,
+            k >> 8,
+            k & 0xFF,
+            0b0001,
+            span,
+        );
     }
 
     /// `RequireObjectCoercible` guard for destructuring: a dummy

@@ -132,7 +132,13 @@ fn define_elements(
                         .ok_or_else(|| cx.err(m.span, "unsupported private method name"))?;
                     let name_id = crate::model::str_id_of(cx.comp.strings.get_or_intern(&name));
                     let fn_reg = method_fn(cx, m)?;
-                    let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: fn_reg }.encode();
+                    let words = v12_bytecode::WideOp::DefinePrivateW {
+                        obj: ctor,
+                        class_id: 0,
+                        name_id,
+                        value: fn_reg,
+                    }
+                    .encode();
                     cx.emit_words(words, m.span);
                     continue;
                 }
@@ -170,8 +176,20 @@ fn define_elements(
                     let name = static_key_text(&p.key)
                         .ok_or_else(|| cx.err(p.span, "unsupported private field name"))?;
                     let name_id = crate::model::str_id_of(cx.comp.strings.get_or_intern(&name));
-                    let value_reg = if let Some(v) = &p.value { cx.expr(v)? } else { let d = cx.new_temp(); cx.load_undefined(d, p.span); d };
-                    let words = v12_bytecode::WideOp::DefinePrivateW { obj: ctor, class_id: 0, name_id, value: value_reg }.encode();
+                    let value_reg = if let Some(v) = &p.value {
+                        cx.expr(v)?
+                    } else {
+                        let d = cx.new_temp();
+                        cx.load_undefined(d, p.span);
+                        d
+                    };
+                    let words = v12_bytecode::WideOp::DefinePrivateW {
+                        obj: ctor,
+                        class_id: 0,
+                        name_id,
+                        value: value_reg,
+                    }
+                    .encode();
                     cx.emit_words(words, p.span);
                     continue;
                 }

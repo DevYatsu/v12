@@ -134,7 +134,10 @@ pub fn js_number(n: f64) -> JsValue {
 /// (interned-identity/textual), boolean, bigint, symbol, and object-identity
 /// comparison; special values compare by bit identity.
 pub fn strict_equals(heap: &Heap, a: JsValue, b: JsValue) -> bool {
-    if let (Some(x), Some(y)) = (a.as_smi().map(f64::from).or(a.as_f64()), b.as_smi().map(f64::from).or(b.as_f64())) {
+    if let (Some(x), Some(y)) = (
+        a.as_smi().map(f64::from).or(a.as_f64()),
+        b.as_smi().map(f64::from).or(b.as_f64()),
+    ) {
         return x == y;
     }
     if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {

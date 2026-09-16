@@ -8,7 +8,7 @@ use std::time::Instant;
 use v12_bytecode::{BytecodeError, Const, Instr, Opcode, WideOp};
 use v12_heap::{Handle, JsObject, JsValue, Kind, V12Str};
 
-use super::{CallOutcome, Interp, JSException, DEADLINE_CHECK_INTERVAL, env_display_push};
+use super::{CallOutcome, DEADLINE_CHECK_INTERVAL, Interp, JSException, env_display_push};
 use crate::feedback::{Lattice, TYPE_NAMES};
 use crate::generator::Suspendable;
 use crate::ops;
@@ -90,7 +90,10 @@ pub(crate) fn decode_instr(instrs: &[Instr], pc: usize) -> (Opcode, u16, u16, u1
 /// Returns `Err` on corrupt bytecode instead of panicking — callers turn it
 /// into a JS `TypeError` (or, for the Await resume path, fall back to
 /// undefined advancement) rather than unwinding the native stack.
-pub(crate) fn decode_parked_call(instrs: &[Instr], pc: usize) -> Result<(bool, u16, usize), BytecodeError> {
+pub(crate) fn decode_parked_call(
+    instrs: &[Instr],
+    pc: usize,
+) -> Result<(bool, u16, usize), BytecodeError> {
     let instr = instrs
         .get(pc)
         .copied()
@@ -164,12 +167,13 @@ impl Interp<'_> {
             self.deadline_ticks = self.deadline_ticks.wrapping_add(1);
             if (self.deadline_ticks & (DEADLINE_CHECK_INTERVAL - 1)) == 0
                 && let Some(dl) = self.deadline
-                    && Instant::now() >= dl {
-                        self.deadline_exceeded = true;
-                        return Err(JSException(
-                            self.error_value("ScriptRuntimeError: execution deadline exceeded"),
-                        ));
-                    }
+                && Instant::now() >= dl
+            {
+                self.deadline_exceeded = true;
+                return Err(JSException(
+                    self.error_value("ScriptRuntimeError: execution deadline exceeded"),
+                ));
+            }
 
             // Snapshot hot frame state: arms call back into `self` and must
             // not hold borrows across those calls. Resolve the frame's
@@ -368,7 +372,8 @@ impl Interp<'_> {
                         } => {
                             let obj_v = self.stack[base + usize::from(obj)];
                             let present = self.private_has(obj_v, class_id, name_id);
-                            self.stack[base + usize::from(dst)] = v12_heap::JsValue::from_bool(present);
+                            self.stack[base + usize::from(dst)] =
+                                v12_heap::JsValue::from_bool(present);
                         }
                     }
                     self.set_pc(pc + width);
@@ -500,9 +505,8 @@ impl Interp<'_> {
                 Opcode::ToPropertyKey => {
                     // ES ToPropertyKey: materialize the key so a key object's
                     // `toString`/`valueOf` side effects run at this pc.
-                    let k = attempt!(
-                        self.to_property_key_value(self.stack[base + usize::from(rb)])
-                    );
+                    let k =
+                        attempt!(self.to_property_key_value(self.stack[base + usize::from(rb)]));
                     self.stack[base + usize::from(ra)] = k;
                     self.set_pc(pc + op_width);
                 }
@@ -640,9 +644,8 @@ impl Interp<'_> {
                     // and callers that truncate the stack afterwards then
                     // corrupt the machine (the register-window OOB class).
                     if obj_v.is_null() || obj_v.is_undefined() {
-                        let exc = self.error_value(
-                            "TypeError: cannot set properties of null or undefined",
-                        );
+                        let exc = self
+                            .error_value("TypeError: cannot set properties of null or undefined");
                         throw_js!(exc);
                     }
                     self.gc_protect();
@@ -958,12 +961,7 @@ impl Interp<'_> {
                     // register-window OOB class). Top-level await in a module
                     // main hits the second guard until module mains compile
                     // as async functions.
-                    if self
-                        .frames
-                        .last()
-                        .and_then(|f| f.generator)
-                        .is_none()
-                    {
+                    if self.frames.last().and_then(|f| f.generator).is_none() {
                         let exc = self.error_value("SyntaxError: await outside async");
                         throw_js!(exc);
                     };
@@ -1047,7 +1045,6 @@ impl Interp<'_> {
         }
     }
 
-
     pub(crate) fn set_pc(&mut self, pc: usize) {
         self.frames
             .last_mut()
@@ -1063,7 +1060,12 @@ impl Interp<'_> {
     // Constants
     // ------------------------------------------------------------------
 
-    pub(crate) fn const_value(&mut self, fn_idx: u32, id: u32, program: u32) -> Result<JsValue, JSException> {
+    pub(crate) fn const_value(
+        &mut self,
+        fn_idx: u32,
+        id: u32,
+        program: u32,
+    ) -> Result<JsValue, JSException> {
         let funcs = self.functions_for_program(program);
         let konst = funcs[fn_idx as usize]
             .consts
@@ -1189,4 +1191,3 @@ impl Interp<'_> {
     // Calls
     // ------------------------------------------------------------------
 }
-

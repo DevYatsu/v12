@@ -15,22 +15,38 @@ pub fn error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<J
 }
 
 /// `TypeError(message)` – same construction, `TypeError` class.
-pub fn type_error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn type_error_create(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     error_create_named(ctx, "TypeError", args)
 }
 
 /// `RangeError(message)` – same construction, `RangeError` class.
-pub fn range_error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn range_error_create(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     error_create_named(ctx, "RangeError", args)
 }
 
 /// `ReferenceError(message)` – same construction, `ReferenceError` class.
-pub fn reference_error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn reference_error_create(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     error_create_named(ctx, "ReferenceError", args)
 }
 
 /// `SyntaxError(message)` – same construction, `SyntaxError` class.
-pub fn syntax_error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn syntax_error_create(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
     error_create_named(ctx, "SyntaxError", args)
 }
 

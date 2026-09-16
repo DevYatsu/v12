@@ -168,8 +168,7 @@ impl<'a> Ctx<'a> {
     /// sites keep their intent); otherwise `default_kind` applies. The
     /// stored `message` never duplicates the `name`.
     fn make_error(&mut self, default_kind: &str, text: &str) -> Throw {
-        let (kind, message) =
-            v12_native::parse_error_text(text, default_kind);
+        let (kind, message) = v12_native::parse_error_text(text, default_kind);
         // Borrow the fields disjointly: the shape-bound builder needs both.
         let global = self.global;
         Throw::Value(super::registry::error_object(
@@ -271,11 +270,7 @@ impl<'a> Ctx<'a> {
     /// Comma-joined element text of a real array (`undefined`/`null`/holes
     /// render empty, matching `Array.prototype.join`). Nested arrays
     /// recurse; `depth` caps the recursion so cyclic arrays terminate.
-    fn array_join_text(
-        heap: &mut Heap,
-        obj: Handle<JsObject>,
-        depth: usize,
-    ) -> String {
+    fn array_join_text(heap: &mut Heap, obj: Handle<JsObject>, depth: usize) -> String {
         if depth > 8 {
             return String::new();
         }
@@ -301,11 +296,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Pushes the flattened text of `h` onto `parts` (array-join helper).
-    fn string_text_of(
-        heap: &mut Heap,
-        h: Handle<v12_heap::V12Str>,
-        parts: &mut Vec<String>,
-    ) {
+    fn string_text_of(heap: &mut Heap, h: Handle<v12_heap::V12Str>, parts: &mut Vec<String>) {
         heap.flatten(h);
         let text = match &heap.get(h).storage {
             v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
@@ -360,7 +351,8 @@ impl<'a> Ctx<'a> {
     ) {
         use v12_heap::{PropKey, V12Str};
         let h = if name.is_ascii() {
-            self.heap.intern_string(V12Str::latin1_slice(name.as_bytes()))
+            self.heap
+                .intern_string(V12Str::latin1_slice(name.as_bytes()))
         } else {
             self.heap
                 .intern_string(V12Str::utf16(name.encode_utf16().collect()))
@@ -397,7 +389,7 @@ impl<'a> Ctx<'a> {
         );
     }
 
-#[allow(dead_code)]
+    #[allow(dead_code)]
     /// Duplicate-install guard helper (kept for callers; the live check is
     /// the `lookup_property` debug_assert above).
     fn has_own_key(heap: &Heap, obj: Handle<JsObject>, _name: &str) -> bool {
@@ -406,12 +398,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Shape-descriptor install of one data property (spec `BUILTIN` attrs).
-    pub fn define_data_prop(
-        &mut self,
-        obj: Handle<JsObject>,
-        name: &str,
-        value: JsValue,
-    ) {
+    pub fn define_data_prop(&mut self, obj: Handle<JsObject>, name: &str, value: JsValue) {
         self.define_data_prop_with_attrs(obj, name, value, v12_heap::Attrs::BUILTIN);
     }
 
@@ -476,21 +463,20 @@ impl<'a> Ctx<'a> {
     /// `name` whose stored value is `expected`. Fresh builtin function objects
     /// are storage-lockstep (one push per descriptor), so the descriptor slot
     /// indexes `properties` directly.
-    fn assert_own_data_value(
-        &mut self,
-        obj: Handle<JsObject>,
-        name: &str,
-        expected: JsValue,
-    ) {
+    fn assert_own_data_value(&mut self, obj: Handle<JsObject>, name: &str, expected: JsValue) {
         use v12_heap::{PropKey, V12Str};
         let probe = if name.is_ascii() {
-            self.heap.intern_string(V12Str::latin1_slice(name.as_bytes()))
+            self.heap
+                .intern_string(V12Str::latin1_slice(name.as_bytes()))
         } else {
             self.heap
                 .intern_string(V12Str::utf16(name.encode_utf16().collect()))
         };
         let shape = self.heap.shape_of(obj);
-        let slot = match self.heap.lookup_property(shape, PropKey::from_string(probe)) {
+        let slot = match self
+            .heap
+            .lookup_property(shape, PropKey::from_string(probe))
+        {
             Some(v12_heap::Descriptor::Data { slot, .. }) => *slot as usize,
             other => panic!("expected own data prop `{name}`, found {other:?}"),
         };
@@ -506,11 +492,7 @@ impl<'a> Ctx<'a> {
     /// `ctor.prototype` (non-writable, non-configurable) and the
     /// `proto.constructor` back-link (`BUILTIN` attrs). Both directions are
     /// expected rooted by the caller (realm roots hold them).
-    pub fn install_ctor_link(
-        &mut self,
-        ctor: Handle<JsObject>,
-        proto: Handle<JsObject>,
-    ) {
+    pub fn install_ctor_link(&mut self, ctor: Handle<JsObject>, proto: Handle<JsObject>) {
         use v12_heap::{PropKey, V12Str};
         self.heap.get_mut(ctor).prototype = Some(proto);
         // Idempotent: the Promise path wires before the generic loop, so
@@ -530,7 +512,9 @@ impl<'a> Ctx<'a> {
             );
         }
         let proto_shape = self.heap.shape_of_mut(proto);
-        let ctor_probe = self.heap.intern_string(V12Str::latin1_slice(b"constructor"));
+        let ctor_probe = self
+            .heap
+            .intern_string(V12Str::latin1_slice(b"constructor"));
         if self
             .heap
             .lookup_property(proto_shape, PropKey::from_string(ctor_probe))
@@ -555,8 +539,10 @@ impl<'a> Ctx<'a> {
             "ctor `prototype` must be non-writable, non-configurable"
         );
         let back_shape = self.heap.shape_of(proto);
-        let back_key =
-            PropKey::from_string(self.heap.intern_string(V12Str::latin1_slice(b"constructor")));
+        let back_key = PropKey::from_string(
+            self.heap
+                .intern_string(V12Str::latin1_slice(b"constructor")),
+        );
         let back_desc = self
             .heap
             .lookup_property(back_shape, back_key)
@@ -584,20 +570,11 @@ impl<'a> Ctx<'a> {
 /// digits — the caller maps those to NaN). Digits accumulate in f64 so
 /// huge literals saturate toward Infinity instead of wrapping.
 fn parse_non_decimal_integer(s: &str) -> Option<f64> {
-    let (digits, radix) = if let Some(d) = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-    {
+    let (digits, radix) = if let Some(d) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         (d, 16u32)
-    } else if let Some(d) = s
-        .strip_prefix("0b")
-        .or_else(|| s.strip_prefix("0B"))
-    {
+    } else if let Some(d) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
         (d, 2u32)
-    } else if let Some(d) = s
-        .strip_prefix("0o")
-        .or_else(|| s.strip_prefix("0O"))
-    {
+    } else if let Some(d) = s.strip_prefix("0o").or_else(|| s.strip_prefix("0O")) {
         (d, 8u32)
     } else {
         return None;

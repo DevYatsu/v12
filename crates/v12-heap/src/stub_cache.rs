@@ -63,10 +63,10 @@
 //! stale entries read as absent on their next probe and are overwritten in
 //! place as the cache refills. Nothing is swept, because nothing needs to be.
 
+use crate::Handle;
 use crate::object::JsObject;
 use crate::prop_key::PropKey;
 use crate::shape::ShapeHandle;
-use crate::Handle;
 
 /// Fixed slot count. A power of two so addressing is a mask and the forced-odd
 /// secondary step stays coprime with the table size; sized at a few dozen KiB
@@ -351,14 +351,16 @@ impl StubCache {
         // current-generation entry that isn't ours means our insert
         // collided here and may have gone secondary; a stale-or-empty home
         // means our insert would have taken home).
-        if let Some(hit) =
-            self.matching_proto(home, receiver, shape, key, proto_gen, link0, link1, mid_shape)
-        {
+        if let Some(hit) = self.matching_proto(
+            home, receiver, shape, key, proto_gen, link0, link1, mid_shape,
+        ) {
             return Some(hit);
         }
         if self.slots[home].stamp == self.generation {
             let alt = (home + probe_step(hash)) & CAPACITY_MASK;
-            return self.matching_proto(alt, receiver, shape, key, proto_gen, link0, link1, mid_shape);
+            return self.matching_proto(
+                alt, receiver, shape, key, proto_gen, link0, link1, mid_shape,
+            );
         }
         None
     }
@@ -390,8 +392,7 @@ impl StubCache {
             // intermediate shape must all still match. (Depth-1 entries
             // record `link1` too; rewiring past the holder only costs an
             // extra miss, never a wrong hit.)
-            if link0 != Some(recorded0) || entry.link1 != link1 || entry.mid_shape != mid_shape
-            {
+            if link0 != Some(recorded0) || entry.link1 != link1 || entry.mid_shape != mid_shape {
                 return None;
             }
         }
@@ -529,7 +530,8 @@ mod tests {
     }
 
     #[test]
-    fn clear_bumps_generation_and_invalidates_everything() {        let mut cache = StubCache::new();
+    fn clear_bumps_generation_and_invalidates_everything() {
+        let mut cache = StubCache::new();
         let gen0 = cache.generation();
         cache.record(ShapeHandle::new(3), key(5), 11);
         assert_eq!(cache.lookup(ShapeHandle::new(3), key(5)), Some(11));
@@ -561,7 +563,12 @@ mod tests {
 
     /// Expected hit under test: same shape the pure-value API cannot
     /// verify itself (no heap), so tests spell it out.
-    fn hit(target: Handle<JsObject>, slot: u32, holder_shape: ShapeHandle, is_own: bool) -> ProtoHit {
+    fn hit(
+        target: Handle<JsObject>,
+        slot: u32,
+        holder_shape: ShapeHandle,
+        is_own: bool,
+    ) -> ProtoHit {
         ProtoHit {
             target,
             slot,
@@ -574,7 +581,17 @@ mod tests {
     fn proto_own_entry_resolves_current_receiver() {
         let mut cache = StubCache::new();
         // Own entry: holder is the recording receiver, no links recorded.
-        cache.record_proto(shape(1), key(1), obj(10), shape(1), 4, None, None, shape(99), 7);
+        cache.record_proto(
+            shape(1),
+            key(1),
+            obj(10),
+            shape(1),
+            4,
+            None,
+            None,
+            shape(99),
+            7,
+        );
         // Hits whether or not a receiver currently links anywhere — and
         // always resolves to the CURRENT receiver (per-instance values).
         assert_eq!(
@@ -627,12 +644,28 @@ mod tests {
         // Exact replay hits (any receiver sharing the shape+chain serves
         // the recorded holder).
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(10)), Some(obj(12)), shape(11)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(10)),
+                Some(obj(12)),
+                shape(11)
+            ),
             Some(hit(obj(10), 4, shape(11), false))
         );
         // Rewired receiver link misses.
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(13)), Some(obj(12)), shape(11)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(13)),
+                Some(obj(12)),
+                shape(11)
+            ),
             None
         );
         // Nulled receiver link misses.
@@ -642,17 +675,41 @@ mod tests {
         );
         // Rewiring past the holder only costs a miss, never a wrong hit.
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(10)), Some(obj(14)), shape(11)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(10)),
+                Some(obj(14)),
+                shape(11)
+            ),
             None
         );
         // Changed intermediate shape misses.
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(10)), Some(obj(12)), shape(15)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(10)),
+                Some(obj(12)),
+                shape(15)
+            ),
             None
         );
         // Bumped proto generation misses.
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 9, Some(obj(10)), Some(obj(12)), shape(11)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                9,
+                Some(obj(10)),
+                Some(obj(12)),
+                shape(11)
+            ),
             None
         );
     }
@@ -673,20 +730,52 @@ mod tests {
             7,
         );
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(10)), Some(obj(11)), shape(13)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(10)),
+                Some(obj(11)),
+                shape(13)
+            ),
             Some(hit(obj(11), 6, shape(12), false))
         );
         // Either link rewired, or the intermediate reshaped, misses.
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(19)), Some(obj(11)), shape(13)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(19)),
+                Some(obj(11)),
+                shape(13)
+            ),
             None
         );
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(10)), Some(obj(19)), shape(13)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(10)),
+                Some(obj(19)),
+                shape(13)
+            ),
             None
         );
         assert_eq!(
-            cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(10)), Some(obj(11)), shape(19)),
+            cache.lookup_proto(
+                obj(30),
+                shape(1),
+                key(1),
+                7,
+                Some(obj(10)),
+                Some(obj(11)),
+                shape(19)
+            ),
             None
         );
     }
@@ -694,8 +783,28 @@ mod tests {
     #[test]
     fn proto_rerecord_same_pair_overwrites() {
         let mut cache = StubCache::new();
-        cache.record_proto(shape(1), key(1), obj(10), shape(11), 4, Some(obj(10)), None, shape(11), 7);
-        cache.record_proto(shape(1), key(1), obj(20), shape(21), 9, Some(obj(20)), None, shape(21), 7);
+        cache.record_proto(
+            shape(1),
+            key(1),
+            obj(10),
+            shape(11),
+            4,
+            Some(obj(10)),
+            None,
+            shape(11),
+            7,
+        );
+        cache.record_proto(
+            shape(1),
+            key(1),
+            obj(20),
+            shape(21),
+            9,
+            Some(obj(20)),
+            None,
+            shape(21),
+            7,
+        );
         assert_eq!(
             cache.lookup_proto(obj(30), shape(1), key(1), 7, Some(obj(20)), None, shape(21)),
             Some(hit(obj(20), 9, shape(21), false))

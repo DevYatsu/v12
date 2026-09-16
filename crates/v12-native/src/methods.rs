@@ -14,7 +14,6 @@
 //!
 //! Zero allocation, no runtime construction, no dependencies.
 
-
 // The built-in method surface, declared at the kinds.
 //
 // These are the *pure* name→native bindings the interpreter's `get_property`

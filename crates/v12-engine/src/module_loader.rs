@@ -164,9 +164,10 @@ pub(crate) fn load_and_evaluate(
     }
     if state.borrow().loading.contains(path) {
         // Cycle: return an empty placeholder (no live bindings in v1).
-        let placeholder = interp
-            .heap_mut()
-            .alloc(v12_heap::JsObject::ordinary(Default::default(), Default::default()));
+        let placeholder = interp.heap_mut().alloc(v12_heap::JsObject::ordinary(
+            Default::default(),
+            Default::default(),
+        ));
         return Ok(JsValue::object(placeholder));
     }
     let source = std::fs::read_to_string(path).map_err(|e| {
@@ -175,8 +176,8 @@ pub(crate) fn load_and_evaluate(
             &format!("Cannot find module '{}': {e}", path.display()),
         )
     })?;
-    let (module, strings) =
-        v12_bccompiler::compile_source_as_module_with_strings(&source).map_err(|e| {
+    let (module, strings) = v12_bccompiler::compile_source_as_module_with_strings(&source)
+        .map_err(|e| {
             string_value(
                 interp.heap_mut(),
                 &format!("SyntaxError: {}: {}", path.display(), e.message),
@@ -205,7 +206,10 @@ pub(crate) fn load_and_evaluate(
     let namespace = result.map_err(|exc| exc.0)?;
     state.borrow_mut().loading.remove(path);
     interp.heap_mut().add_root(namespace);
-    state.borrow_mut().modules.insert(path.to_path_buf(), namespace);
+    state
+        .borrow_mut()
+        .modules
+        .insert(path.to_path_buf(), namespace);
     Ok(namespace)
 }
 

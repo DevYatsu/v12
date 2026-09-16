@@ -476,16 +476,9 @@ impl Descriptors {
 /// exactly — duplicate keys arise when reconfiguration forks a sibling edge
 /// (`add_property` keys on transitions, not descriptors), so overwriting
 /// with the later position would change which descriptor `find` returns.
-fn indexed(
-    flat: Vec<Descriptor>,
-) -> (
-    Box<[Descriptor]>,
-    Box<rustc_hash::FxHashMap<PropKey, u32>>,
-) {
-    let mut index = rustc_hash::FxHashMap::with_capacity_and_hasher(
-        flat.len(),
-        rustc_hash::FxBuildHasher,
-    );
+fn indexed(flat: Vec<Descriptor>) -> (Box<[Descriptor]>, Box<rustc_hash::FxHashMap<PropKey, u32>>) {
+    let mut index =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(flat.len(), rustc_hash::FxBuildHasher);
     for (i, d) in flat.iter().enumerate() {
         index.entry(d.key()).or_insert(i as u32);
     }
@@ -852,7 +845,10 @@ mod tests {
         // Linear-scan semantics: the FIRST descriptor wins (original slot
         // and attrs, not the fork's).
         assert_eq!(
-            heap.get(forked).descriptors.find(dup).and_then(|d| d.slot()),
+            heap.get(forked)
+                .descriptors
+                .find(dup)
+                .and_then(|d| d.slot()),
             Some(3)
         );
         assert_eq!(
@@ -897,9 +893,7 @@ mod tests {
         // Accessor definition on a large shape keeps the index usable.
         let fresh = PropKey::from_parts(false, 0xacce55);
         let acc = heap.define_accessor(shape, fresh, None, None, Attrs::DEFAULT);
-        let d = heap
-            .lookup_property(acc, fresh)
-            .expect("accessor resolves");
+        let d = heap.lookup_property(acc, fresh).expect("accessor resolves");
         assert!(d.is_accessor());
         assert_eq!(
             heap.lookup_property(acc, keys[0]).and_then(|d| d.slot()),
@@ -959,7 +953,10 @@ mod tests {
         // matters is that the edge names a live shape with fresh contents.
         let sz2 = heap.add_property(base, kz, Attrs::DEFAULT);
         heap.add_shape_root(sz2);
-        assert_eq!(heap.get(base).transitions.get(kz, Attrs::DEFAULT), Some(sz2));
+        assert_eq!(
+            heap.get(base).transitions.get(kz, Attrs::DEFAULT),
+            Some(sz2)
+        );
         assert_eq!(heap.get(sz2).num_own, 1);
         assert_eq!(heap.get(sz2).parent, Some(base));
     }

@@ -69,8 +69,7 @@ pub fn boolean_proto_value_of(
     if this.is_true() || this.is_false() {
         Ok(this)
     } else {
-        Err(ctx.type_error(
-            "TypeError: Boolean.prototype.valueOf requires that 'this' be a Boolean",
-        ))
+        Err(ctx
+            .type_error("TypeError: Boolean.prototype.valueOf requires that 'this' be a Boolean"))
     }
 }

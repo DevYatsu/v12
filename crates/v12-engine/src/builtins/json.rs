@@ -15,7 +15,9 @@ struct Parser<'p> {
 
 impl<'p> Parser<'p> {
     fn ws(&mut self) {
-        while self.pos < self.chars.len() && matches!(self.chars[self.pos], b' ' | b'\t' | b'\n' | b'\r') {
+        while self.pos < self.chars.len()
+            && matches!(self.chars[self.pos], b' ' | b'\t' | b'\n' | b'\r')
+        {
             self.pos += 1;
         }
     }
@@ -150,7 +152,8 @@ impl<'p> Parser<'p> {
                                 && self.chars.get(self.pos) == Some(&b'\\')
                                 && self.chars.get(self.pos + 1) == Some(&b'u')
                             {
-                                let hex2 = self.chars.get(self.pos + 2..self.pos + 6).unwrap_or(&[]);
+                                let hex2 =
+                                    self.chars.get(self.pos + 2..self.pos + 6).unwrap_or(&[]);
                                 let low = std::str::from_utf8(hex2)
                                     .ok()
                                     .and_then(|s| u16::from_str_radix(s, 16).ok())
@@ -164,7 +167,9 @@ impl<'p> Parser<'p> {
                                     continue;
                                 }
                             }
-                            char::from_u32(u32::from(units)).map(|c| out.push(c)).ok_or("Lone surrogate")?;
+                            char::from_u32(u32::from(units))
+                                .map(|c| out.push(c))
+                                .ok_or("Lone surrogate")?;
                         }
                         _ => return Err("Invalid escape".to_string()),
                     }
@@ -208,7 +213,8 @@ impl<'p> Parser<'p> {
                 self.pos += 1;
             }
         }
-        let text = std::str::from_utf8(&self.chars[start..self.pos]).map_err(|_| "Invalid number")?;
+        let text =
+            std::str::from_utf8(&self.chars[start..self.pos]).map_err(|_| "Invalid number")?;
         text.parse::<f64>()
             .map(helpers::js_number)
             .map_err(|_| "Invalid number".to_string())

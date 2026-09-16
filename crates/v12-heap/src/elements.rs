@@ -360,7 +360,11 @@ impl ElementsArray {
                 let last = dict.length() - 1;
                 let v = dict.entries.remove(&last).map(|e| e.value);
                 // Recompute the length view: highest remaining index + 1.
-                dict.length = dict.entries.keys().max().map_or(0, |&k| k.saturating_add(1));
+                dict.length = dict
+                    .entries
+                    .keys()
+                    .max()
+                    .map_or(0, |&k| k.saturating_add(1));
                 v
             }
         }
@@ -561,11 +565,9 @@ impl ElementsArray {
                 .enumerate()
                 .map(|(i, &d)| (i as u32, JsValue::from_f64(d)))
                 .collect(),
-            ElementsStorage::PackedObject(v) => v
-                .iter()
-                .enumerate()
-                .map(|(i, &u)| (i as u32, u))
-                .collect(),
+            ElementsStorage::PackedObject(v) => {
+                v.iter().enumerate().map(|(i, &u)| (i as u32, u)).collect()
+            }
             ElementsStorage::HoleySmi(v)
             | ElementsStorage::HoleyDouble(v)
             | ElementsStorage::HoleyObject(v) => v

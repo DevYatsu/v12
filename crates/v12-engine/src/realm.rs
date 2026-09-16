@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue};
 use v12_heap::FunctionTarget;
+use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue};
 use v12_native::NativeId;
 
 /// Maximum number of intrinsics a realm may host.
@@ -128,9 +128,19 @@ impl Realm {
         // reads resolve per spec.
         let error_proto = alloc_root(heap);
         let error_name_h = heap.intern_text("Error");
-        crate::builtins::builtin_install_prop(heap, error_proto, "name", JsValue::string(error_name_h));
+        crate::builtins::builtin_install_prop(
+            heap,
+            error_proto,
+            "name",
+            JsValue::string(error_name_h),
+        );
         let empty_msg_h = heap.intern_text("");
-        crate::builtins::builtin_install_prop(heap, error_proto, "message", JsValue::string(empty_msg_h));
+        crate::builtins::builtin_install_prop(
+            heap,
+            error_proto,
+            "message",
+            JsValue::string(empty_msg_h),
+        );
         if let Some(e) = intrinsics.get("Error").and_then(|v| v.as_object()) {
             crate::builtins::install_ctor(heap, e, error_proto);
         }
@@ -362,7 +372,12 @@ fn alloc_root(heap: &mut Heap) -> Handle<JsObject> {
 /// Points an intrinsic constructor's placeholder callable at a native:
 /// out-of-range bytecode routes to the native seam, which dispatches by
 /// `native`. A missing intrinsic is silently skipped (optional constructors).
-fn wire_callable(heap: &mut Heap, intrinsics: &HashMap<String, JsValue>, name: &str, native: NativeId) {
+fn wire_callable(
+    heap: &mut Heap,
+    intrinsics: &HashMap<String, JsValue>,
+    name: &str,
+    native: NativeId,
+) {
     if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
         heap.get_mut(o).callable = v12_heap::FunctionTarget::Bytecode(u32::from(native));
     }

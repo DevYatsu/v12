@@ -2,16 +2,15 @@
 //! `call`/`apply`/`new`, native inline calls, frame completion, and
 //! exception unwinding.
 
-
 use v12_heap::{Attrs, Descriptor, Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 
 use super::{CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH};
-use v12_native::NativeId;
-use crate::ops;
 use crate::execute::decode_parked_call;
+use crate::ops;
+use v12_native::NativeId;
 
-    /// Resolves `[callee][this][args…]` at `callee_reg` in the current frame
-    /// and either pushes a bytecode frame or completes a native inline.
+/// Resolves `[callee][this][args…]` at `callee_reg` in the current frame
+/// and either pushes a bytecode frame or completes a native inline.
 impl Interp<'_> {
     pub(crate) fn prepare_call(
         &mut self,
@@ -85,7 +84,9 @@ impl Interp<'_> {
                 // the actual arguments, ignoring the passed `this_v` (spec).
                 let (target_fn, this_arg, prefix) = {
                     let st = self.heap.get(state_h);
-                    let target_fn = st.elements[0].as_object().expect("bound target is an object");
+                    let target_fn = st.elements[0]
+                        .as_object()
+                        .expect("bound target is an object");
                     let this_arg = st.elements[1];
                     let prefix: Vec<JsValue> = st.elements[2..].to_vec();
                     (target_fn, this_arg, prefix)
@@ -192,7 +193,8 @@ impl Interp<'_> {
             // Promise` and `Promise.prototype`-identity checks see async
             // return promises as real promises.
             if let Some(g) = self.global {
-                let promise_proto = self.heap
+                let promise_proto = self
+                    .heap
                     .get(g)
                     .properties
                     .get(super::PROMISE_IDX.expect("intrinsic 'Promise' present"))
@@ -327,7 +329,9 @@ impl Interp<'_> {
                 let (target_fn, this_arg, prefix) = {
                     let st = self.heap.get(state_h);
                     (
-                        st.elements[0].as_object().expect("bound target is an object"),
+                        st.elements[0]
+                            .as_object()
+                            .expect("bound target is an object"),
                         st.elements[1],
                         st.elements[2..].to_vec(),
                     )
@@ -443,7 +447,9 @@ impl Interp<'_> {
                 let (target_fn, this_arg, prefix) = {
                     let st = self.heap.get(state_h);
                     (
-                        st.elements[0].as_object().expect("bound target is an object"),
+                        st.elements[0]
+                            .as_object()
+                            .expect("bound target is an object"),
                         st.elements[1],
                         st.elements[2..].to_vec(),
                     )
@@ -535,9 +541,10 @@ impl Interp<'_> {
         // detector misclassifies completion as another yield, which in turn
         // makes for-of over a generator never observe done=true (hang).
         if let Some(r#gen) = finished.generator
-            && self.heap.get(r#gen).properties.len() >= 3 {
-                self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
-            }
+            && self.heap.get(r#gen).properties.len() >= 3
+        {
+            self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+        }
         if self.stop_at_frames.is_some_and(|n| self.frames.len() == n) {
             self.stack.truncate(finished.base);
             self.top_result = Some(result);
@@ -696,20 +703,22 @@ impl Interp<'_> {
             // absent from its program table covers nothing (it unwinds).
             // (The table `Rc` is bound per iteration so handler refs cannot
             // outlive it.)
-            let covering = self.frames.last().map(|frame| {
-                (frame.fn_idx, frame.program, frame.pc)
-            }).and_then(|(fn_idx, program, pc)| {
-                let funcs = self.functions_for_program(program);
-                let f = funcs.get(fn_idx as usize)?;
-                f.handlers
-                    .iter()
-                    .filter(|h| {
-                        usize::try_from(h.start).expect("handler pc fits usize") <= pc
-                            && pc < usize::try_from(h.end).expect("handler pc fits usize")
-                    })
-                    .max_by_key(|h| h.start)
-                    .map(|h| (h.target, h.stack_depth))
-            });
+            let covering = self
+                .frames
+                .last()
+                .map(|frame| (frame.fn_idx, frame.program, frame.pc))
+                .and_then(|(fn_idx, program, pc)| {
+                    let funcs = self.functions_for_program(program);
+                    let f = funcs.get(fn_idx as usize)?;
+                    f.handlers
+                        .iter()
+                        .filter(|h| {
+                            usize::try_from(h.start).expect("handler pc fits usize") <= pc
+                                && pc < usize::try_from(h.end).expect("handler pc fits usize")
+                        })
+                        .max_by_key(|h| h.start)
+                        .map(|h| (h.target, h.stack_depth))
+                });
             if let Some((target, stack_depth)) = covering {
                 // Truncate the register window to the handler depth, then
                 // deliver the exception into register `stack_depth`. The
@@ -793,12 +802,10 @@ impl Interp<'_> {
             None => ("Error", text),
         };
         self.gc_protect();
-        let obj = self
-            .heap
-            .alloc(JsObject {
-                kind: Kind::Error,
-                ..Default::default()
-            });
+        let obj = self.heap.alloc(JsObject {
+            kind: Kind::Error,
+            ..Default::default()
+        });
         self.heap.add_root(JsValue::object(obj));
         // Shape-bound installs in display order: `properties[0]`/`[1]` stay
         // the name/message strings the display paths read positionally, with
@@ -837,8 +844,7 @@ impl Interp<'_> {
                     }
                     self.gc_protect();
                     let ctor_key = JsValue::string(self.heap.intern_text("constructor"));
-                    let _ =
-                        self.define_own_data_attrs(obj_v, ctor_key, ctor_v, Attrs::BUILTIN);
+                    let _ = self.define_own_data_attrs(obj_v, ctor_key, ctor_v, Attrs::BUILTIN);
                 }
             }
         }
@@ -848,7 +854,6 @@ impl Interp<'_> {
     // ------------------------------------------------------------------
     // Environments
     // ------------------------------------------------------------------
-
 
     pub(crate) fn prepare_call_apply(
         &mut self,
@@ -922,7 +927,9 @@ impl Interp<'_> {
                 let (target_fn, this_arg, prefix) = {
                     let st = self.heap.get(state_h);
                     (
-                        st.elements[0].as_object().expect("bound target is an object"),
+                        st.elements[0]
+                            .as_object()
+                            .expect("bound target is an object"),
                         st.elements[1],
                         st.elements[2..].to_vec(),
                     )
@@ -1318,7 +1325,11 @@ impl Interp<'_> {
                     )));
                 }
                 let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
-                let fwd = if args.len() > 1 { &args[1..] } else { &[] as &[JsValue] };
+                let fwd = if args.len() > 1 {
+                    &args[1..]
+                } else {
+                    &[] as &[JsValue]
+                };
                 self.call_object(target, this_arg, fwd)
             }
             NativeId::FunctionApply => {
@@ -1372,8 +1383,11 @@ impl Interp<'_> {
                 // prefix arguments. Both are captured in a state object the
                 // bound function's `FunctionTarget::Bound` handle points at.
                 let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
-                let bound_args: Vec<JsValue> =
-                    if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                let bound_args: Vec<JsValue> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
                 // GC discipline: root long-lived interpreter state before the
                 // allocation. The bound state is kept reachable by the bound
                 // function's `Bound` target (traced in `FunctionTarget::trace`).
@@ -1394,7 +1408,10 @@ impl Interp<'_> {
                 let (target_len, target_name) = {
                     let shape = self.shape_of(target);
                     let len_key = self.heap.intern_text("length");
-                    let target_len = match self.heap.lookup_property(shape, PropKey::from_string(len_key)) {
+                    let target_len = match self
+                        .heap
+                        .lookup_property(shape, PropKey::from_string(len_key))
+                    {
                         Some(Descriptor::Data { slot, .. }) => self
                             .heap
                             .get(target)
@@ -1406,17 +1423,19 @@ impl Interp<'_> {
                         _ => 0,
                     };
                     let name_key = self.heap.intern_text("name");
-                    let target_name =
-                        match self.heap.lookup_property(shape, PropKey::from_string(name_key)) {
-                            Some(Descriptor::Data { slot, .. }) => self
-                                .heap
-                                .get(target)
-                                .properties
-                                .get(*slot as usize)
-                                .copied()
-                                .and_then(|v| v.as_string()),
-                            _ => None,
-                        };
+                    let target_name = match self
+                        .heap
+                        .lookup_property(shape, PropKey::from_string(name_key))
+                    {
+                        Some(Descriptor::Data { slot, .. }) => self
+                            .heap
+                            .get(target)
+                            .properties
+                            .get(*slot as usize)
+                            .copied()
+                            .and_then(|v| v.as_string()),
+                        _ => None,
+                    };
                     (target_len, target_name)
                 };
                 let bound_len = target_len.saturating_sub(bound_args.len());
@@ -1434,11 +1453,8 @@ impl Interp<'_> {
                 let _ = self.set_property(JsValue::object(bound), len_key, len_v);
                 let name_key = JsValue::string(self.heap.intern_text("name"));
                 let name_h = self.heap.intern_text(&bound_name);
-                let _ = self.set_property(
-                    JsValue::object(bound),
-                    name_key,
-                    JsValue::string(name_h),
-                );
+                let _ =
+                    self.set_property(JsValue::object(bound), name_key, JsValue::string(name_h));
                 self.stack.pop();
                 Ok(JsValue::object(bound))
             }
@@ -1581,10 +1597,18 @@ impl Interp<'_> {
         let mut bound = self.heap.get(obj).element_len() as u64;
         if self.heap.get(obj).kind != Kind::Array {
             let shape = self.heap.shape_of(obj);
-            let keys: Vec<_> = self.heap.get(shape).descriptors.as_slice().iter().filter_map(|d| d.key().string()).collect();
+            let keys: Vec<_> = self
+                .heap
+                .get(shape)
+                .descriptors
+                .as_slice()
+                .iter()
+                .filter_map(|d| d.key().string())
+                .collect();
             for h in keys {
                 let text = self.string_text(h);
-                if !text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit()) {
+                if !text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit())
+                {
                     if let Ok(n) = text.parse::<u64>() {
                         bound = bound.max(n.saturating_add(1));
                     }
@@ -1595,7 +1619,8 @@ impl Interp<'_> {
     }
 
     fn callback_is_callable(&self, v: JsValue) -> Option<Handle<JsObject>> {
-        v.as_object().filter(|h| self.heap.get(*h).kind == Kind::Function)
+        v.as_object()
+            .filter(|h| self.heap.get(*h).kind == Kind::Function)
     }
 
     /// Shared iteration engine for the callback methods.
@@ -1613,7 +1638,11 @@ impl Interp<'_> {
         if id == NativeId::ArraySort {
             return self.array_sort_callback(obj, args);
         }
-        let Some(cb) = args.first().copied().and_then(|v| self.callback_is_callable(v)) else {
+        let Some(cb) = args
+            .first()
+            .copied()
+            .and_then(|v| self.callback_is_callable(v))
+        else {
             return Err(JSException(
                 self.error_value("TypeError: callback is not a function"),
             ));
@@ -1736,9 +1765,9 @@ impl Interp<'_> {
             }),
             NativeId::ArrayReduce | NativeId::ArrayReduceRight => match accumulator {
                 Some(v) => Ok(v),
-                None => Err(JSException(
-                    self.error_value("TypeError: Reduce of empty array with no initial value"),
-                )),
+                None => Err(JSException(self.error_value(
+                    "TypeError: Reduce of empty array with no initial value",
+                ))),
             },
             NativeId::ArrayFlatMap => {
                 // flatMap: flatten one level of array results into the output.
@@ -1750,7 +1779,13 @@ impl Interp<'_> {
                         .filter(|h| self.heap.get(*h).kind == Kind::Array);
                     if let Some(h) = nested {
                         let items = self.heap.get(h).elements_snapshot();
-                        flat.extend(items.iter().map(|x| if x.is_hole() { JsValue::undefined() } else { *x }));
+                        flat.extend(items.iter().map(|x| {
+                            if x.is_hole() {
+                                JsValue::undefined()
+                            } else {
+                                *x
+                            }
+                        }));
                     } else {
                         flat.push(*v);
                     }
@@ -1783,7 +1818,11 @@ impl Interp<'_> {
                 self.error_value("TypeError: forEach called on incompatible receiver"),
             ));
         }
-        let Some(cb) = args.first().copied().and_then(|v| self.callback_is_callable(v)) else {
+        let Some(cb) = args
+            .first()
+            .copied()
+            .and_then(|v| self.callback_is_callable(v))
+        else {
             return Err(JSException(
                 self.error_value("TypeError: callback is not a function"),
             ));
@@ -1826,7 +1865,11 @@ impl Interp<'_> {
                 self.error_value("TypeError: Iterator method called on non-iterator"),
             ));
         }
-        let Some(cb) = args.first().copied().and_then(|v| self.callback_is_callable(v)) else {
+        let Some(cb) = args
+            .first()
+            .copied()
+            .and_then(|v| self.callback_is_callable(v))
+        else {
             return Err(JSException(
                 self.error_value("TypeError: callback is not a function"),
             ));
@@ -1844,19 +1887,33 @@ impl Interp<'_> {
         let mut values: Vec<JsValue> = Vec::new();
         loop {
             self.gc_protect();
-            let r = self.natives.call_native(self.heap, this_v, &[], NativeId::IteratorNext);
+            let r = self
+                .natives
+                .call_native(self.heap, this_v, &[], NativeId::IteratorNext);
             let r = r.map_err(|t| JSException::from_throw(self.heap, t))?;
             let Some(ro) = r.as_object() else { break };
-            let done = self.heap.get(ro).properties.get(1).copied().unwrap_or(JsValue::undefined());
+            let done = self
+                .heap
+                .get(ro)
+                .properties
+                .get(1)
+                .copied()
+                .unwrap_or(JsValue::undefined());
             if done.is_true() {
                 break;
             }
-            let v = self.heap.get(ro).properties.first().copied().unwrap_or(JsValue::undefined());
+            let v = self
+                .heap
+                .get(ro)
+                .properties
+                .first()
+                .copied()
+                .unwrap_or(JsValue::undefined());
             values.push(v);
             if values.len() > MAX_ITERATOR_DRAIN {
-                return Err(JSException(
-                    self.error_value("RangeError: iterator drain exceeds 1,000,000 values"),
-                ));
+                return Err(JSException(self.error_value(
+                    "RangeError: iterator drain exceeds 1,000,000 values",
+                )));
             }
         }
         let mut mapped: Vec<JsValue> = Vec::new();
@@ -1933,7 +1990,10 @@ impl Interp<'_> {
                 self.gc_protect();
                 let mut flat: Vec<JsValue> = Vec::with_capacity(mapped.len());
                 for v in &mapped {
-                    if let Some(h) = v.as_object().filter(|h| self.heap.get(*h).kind == Kind::Array) {
+                    if let Some(h) = v
+                        .as_object()
+                        .filter(|h| self.heap.get(*h).kind == Kind::Array)
+                    {
                         flat.extend(self.heap.get(h).elements_snapshot());
                     } else {
                         flat.push(*v);
@@ -1945,9 +2005,9 @@ impl Interp<'_> {
             }
             NativeId::IteratorReduce => match acc {
                 Some(v) => Ok(v),
-                None => Err(JSException(
-                    self.error_value("TypeError: Reduce of empty iterator with no initial value"),
-                )),
+                None => Err(JSException(self.error_value(
+                    "TypeError: Reduce of empty iterator with no initial value",
+                ))),
             },
             NativeId::IteratorSome => Ok(JsValue::from_bool(false)),
             NativeId::IteratorEvery => Ok(JsValue::from_bool(true)),
@@ -1963,7 +2023,10 @@ impl Interp<'_> {
         obj: Handle<JsObject>,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        let comparator = args.first().copied().and_then(|v| self.callback_is_callable(v));
+        let comparator = args
+            .first()
+            .copied()
+            .and_then(|v| self.callback_is_callable(v));
         let mut elems: Vec<JsValue> = self.heap.get(obj).elements_snapshot();
         // Undefined sorts last; holes after undefined. Sort the defined part.
         let undefined_count = elems.iter().filter(|v| v.is_undefined()).count();
@@ -1982,7 +2045,11 @@ impl Interp<'_> {
                     let mid = (lo + hi) / 2;
                     let a: [JsValue; 2] = [sorted[mid], v];
                     let r = self.call_object(cb, JsValue::undefined(), &a)?;
-                    let n = r.as_smi().map(i64::from).or(r.as_f64().map(|f| f as i64)).unwrap_or(0);
+                    let n = r
+                        .as_smi()
+                        .map(i64::from)
+                        .or(r.as_f64().map(|f| f as i64))
+                        .unwrap_or(0);
                     // comparefn(sorted[mid], v) <= 0 → v sorts after mid.
                     if n <= 0 {
                         lo = mid + 1;

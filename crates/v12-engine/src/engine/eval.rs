@@ -1,7 +1,6 @@
 //! Evaluation and scheduling: script/module/indirect eval entry points, the
 //! shared `run_compiled` driver, and the microtask checkpoint drain.
 
-
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -10,12 +9,11 @@ use v12_bytecode::FunctionBytecode;
 use v12_heap::{GcPolicy, Handle, Heap, JsObject, JsValue};
 use v12_interp::{Interp, JSException};
 
-use super::{string_value, Engine, RetainedProgram, MAX_SOURCE_LEN};
-use crate::builtins::{promise, NativeRegistry};
+use super::{Engine, MAX_SOURCE_LEN, RetainedProgram, string_value};
+use crate::builtins::{NativeRegistry, promise};
 use crate::error::EngineError;
 #[cfg(feature = "jit")]
 use crate::jit_tier;
-use v12_native::{NativeId, Throw};
 use crate::job_queue::{Job, JobQueue};
 use crate::realm::Realm;
 
@@ -193,9 +191,8 @@ impl Engine {
         let realm = Realm::new(&mut heap);
         let global = realm.global();
         heap.add_root(JsValue::object(global));
-        let (program, strings) =
-            v12_bccompiler::compile_source_with_strings(source)
-                .map_err(|err| string_value(&mut heap, &err.message))?;
+        let (program, strings) = v12_bccompiler::compile_source_with_strings(source)
+            .map_err(|err| string_value(&mut heap, &err.message))?;
         // The indirect-eval gets its OWN `NativeRegistry` with its
         // OWN pending sink, so jobs enqueued in this realm never reach the
         // engine's queue and no `set_pending` save/restore is needed. The
@@ -381,7 +378,13 @@ impl Engine {
             let settlements = interp.take_pending_settlements();
             count += settlements.len();
             for (promise, value, rejecting) in settlements {
-                promise::settle_async_completion(interp.heap_mut(), pending, promise, value, rejecting);
+                promise::settle_async_completion(
+                    interp.heap_mut(),
+                    pending,
+                    promise,
+                    value,
+                    rejecting,
+                );
             }
             // Adopt follow-ups enqueued by natives/promises during the last
             // iteration, then run host jobs until the queue is empty.

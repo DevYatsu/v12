@@ -169,8 +169,8 @@ mod tests {
 
     #[test]
     fn enabled_hook_compiles_hot_functions_and_preserves_semantics() {
-        let (program, strings) = v12_bccompiler::compile_source_with_strings(HOT_SCRIPT)
-            .expect("compile");
+        let (program, strings) =
+            v12_bccompiler::compile_source_with_strings(HOT_SCRIPT).expect("compile");
         let functions: Rc<[FunctionBytecode]> = Rc::from(program.functions);
 
         let mut heap = Heap::new(v12_heap::GcPolicy::default());
@@ -185,10 +185,7 @@ mod tests {
         interp.run().expect("run");
 
         let s = stats.borrow();
-        assert!(
-            s.tier_ups > 0,
-            "hot loop must cross the tier-up threshold"
-        );
+        assert!(s.tier_ups > 0, "hot loop must cross the tier-up threshold");
         assert!(s.compiled > 0, "baseline JIT must compile the hot function");
     }
 }

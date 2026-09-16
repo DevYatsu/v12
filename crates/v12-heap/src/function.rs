@@ -77,9 +77,7 @@ type HostFn = dyn FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsVal
 /// function object that references it (the JIT's executable-memory layer is
 /// the only other audited `unsafe` in the codebase).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct HostClosure(
-    pub(crate) *mut HostFn,
-);
+pub struct HostClosure(pub(crate) *mut HostFn);
 
 // Safety: HostClosure is a pointer handle, never dereferenced here; the
 // engine's registry owns the box and drops it after all referencing function

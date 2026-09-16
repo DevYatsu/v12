@@ -150,8 +150,13 @@ mod builtin_tests {
     #[test]
     fn object_create_with_null_prototype() {
         let mut heap = Heap::new(GcPolicy::NoGC);
-        let obj = ctx::call_ctx(object::object_create, &mut heap, JsValue::undefined(), &[JsValue::null()])
-            .expect("create");
+        let obj = ctx::call_ctx(
+            object::object_create,
+            &mut heap,
+            JsValue::undefined(),
+            &[JsValue::null()],
+        )
+        .expect("create");
         let handle = obj.as_object().unwrap();
         assert!(heap.get(handle).prototype.is_none());
     }
@@ -178,10 +183,17 @@ mod builtin_tests {
         heap.add_root(JsValue::object(arr));
         let one = JsValue::from_i32_smi(1).unwrap();
         let two = JsValue::from_i32_smi(2).unwrap();
-        let len = ctx::call_ctx(array::array_push, &mut heap, JsValue::object(arr), &[one, two]).expect("push");
+        let len = ctx::call_ctx(
+            array::array_push,
+            &mut heap,
+            JsValue::object(arr),
+            &[one, two],
+        )
+        .expect("push");
         assert_eq!(len.as_smi(), Some(2));
         assert_eq!(heap.get(arr).elements_array.len(), 2);
-        let popped = ctx::call_ctx(array::array_pop, &mut heap, JsValue::object(arr), &[]).expect("pop");
+        let popped =
+            ctx::call_ctx(array::array_pop, &mut heap, JsValue::object(arr), &[]).expect("pop");
         assert_eq!(popped.as_smi(), Some(2));
         assert_eq!(heap.get(arr).elements_array.len(), 1);
     }
@@ -191,8 +203,13 @@ mod builtin_tests {
         let mut heap = Heap::new(GcPolicy::NoGC);
         let h = heap.intern_string(V12Str::latin1(b"hello".to_vec()));
         let s = JsValue::string(h);
-        let ch = ctx::call_ctx(string::string_char_at, &mut heap, s, &[JsValue::from_i32_smi(1).unwrap()])
-            .expect("charAt");
+        let ch = ctx::call_ctx(
+            string::string_char_at,
+            &mut heap,
+            s,
+            &[JsValue::from_i32_smi(1).unwrap()],
+        )
+        .expect("charAt");
         assert!(ch.is_string());
         let tmp = crate::engine::Engine::new();
         let text = {
@@ -234,8 +251,7 @@ mod builtin_tests {
         let nan = JsValue::from_f64(f64::NAN);
         let mut ctx = crate::builtins::Ctx::new(&mut heap, None, None);
         let is_nan =
-            crate::builtins::number::number_is_nan(&mut ctx, JsValue::undefined(), &[nan])
-                .unwrap();
+            crate::builtins::number::number_is_nan(&mut ctx, JsValue::undefined(), &[nan]).unwrap();
         assert_eq!(is_nan.as_bool(), Some(true));
         let abs = crate::builtins::math::math_abs(
             &mut ctx,

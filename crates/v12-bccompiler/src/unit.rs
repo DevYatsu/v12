@@ -142,18 +142,14 @@ pub fn compile_unit(
         UnitNode::Fn(f) => Some(&f.params),
         UnitNode::Arrow(a) => Some(&a.params),
         UnitNode::Method(f) => Some(&f.params),
-        UnitNode::Class(c) => c
-            .body
-            .body
-            .iter()
-            .find_map(|el| match el {
-                oxc_ast::ast::ClassElement::MethodDefinition(m)
-                    if m.kind == MethodDefinitionKind::Constructor =>
-                {
-                    Some(&*m.value.params)
-                }
-                _ => None,
-            }),
+        UnitNode::Class(c) => c.body.body.iter().find_map(|el| match el {
+            oxc_ast::ast::ClassElement::MethodDefinition(m)
+                if m.kind == MethodDefinitionKind::Constructor =>
+            {
+                Some(&*m.value.params)
+            }
+            _ => None,
+        }),
         UnitNode::Main(_) => None,
     };
     emit_prologue(&mut cx, idx, params, self_symbol)?;
@@ -324,7 +320,12 @@ fn emit_prologue(
 ) -> Result<(), CompileError> {
     let (has_env, env_slots, this_slot, arity) = {
         let plan = &cx.comp.plans.units[cx.unit];
-        (plan.has_env, plan.env_slot_count, plan.this_slot, plan.arity)
+        (
+            plan.has_env,
+            plan.env_slot_count,
+            plan.this_slot,
+            plan.arity,
+        )
     };
 
     if has_env {
@@ -452,7 +453,8 @@ fn emit_exports_epilogue(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileEr
     Ok(())
 }
 
-fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {    use std::collections::{HashMap, HashSet};
+fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {
+    use std::collections::{HashMap, HashSet};
 
     if cx.comp.plans.imports.is_empty() {
         return Ok(());

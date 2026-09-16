@@ -4,7 +4,7 @@
 
 use v12_heap::{Handle, JsObject, JsValue, PropKey, V12Str};
 
-use super::{intrinsic_slot, Interp, JSException, GLOBAL_VAR_OFFSET};
+use super::{GLOBAL_VAR_OFFSET, Interp, JSException, intrinsic_slot};
 
 impl Interp<'_> {
     pub(crate) fn global_slot_index(&self, obj: Handle<JsObject>, slot: usize) -> usize {
@@ -69,14 +69,22 @@ impl Interp<'_> {
 
     /// The value of a populated global slot: `None` for out-of-range and
     /// hole slots (a hole means "never initialized").
-    pub(crate) fn global_slot_value(&self, global: Handle<JsObject>, idx: usize) -> Option<JsValue> {
+    pub(crate) fn global_slot_value(
+        &self,
+        global: Handle<JsObject>,
+        idx: usize,
+    ) -> Option<JsValue> {
         let v = *self.heap.get(global).properties.get(idx)?;
         if v.is_hole() { None } else { Some(v) }
     }
 
     /// The intrinsic-slot value for a global name (the fixed prefix slots),
     /// or `None` when the name is not an intrinsic or the slot is unpopulated.
-    pub(crate) fn global_intrinsic_value(&self, global: Handle<JsObject>, text: &str) -> Option<JsValue> {
+    pub(crate) fn global_intrinsic_value(
+        &self,
+        global: Handle<JsObject>,
+        text: &str,
+    ) -> Option<JsValue> {
         let idx = intrinsic_slot(text)?;
         self.global_slot_value(global, idx)
     }
@@ -84,7 +92,11 @@ impl Interp<'_> {
     /// The own-property value for `text` via the shape graph, mapped through
     /// [`Self::global_slot_index`]. `None` when the name is not an own data
     /// property or the slot is unpopulated.
-    pub(crate) fn global_property_value(&mut self, global: Handle<JsObject>, text: &str) -> Option<JsValue> {
+    pub(crate) fn global_property_value(
+        &mut self,
+        global: Handle<JsObject>,
+        text: &str,
+    ) -> Option<JsValue> {
         let h = self.heap.intern_text(text);
         let key = PropKey::from_string(h);
         let shape = self.shape_of(global);
@@ -122,7 +134,11 @@ impl Interp<'_> {
         self.heap.get_mut(global).properties[idx] = val;
     }
 
-    pub(crate) fn op_get_global(&mut self, str_id: u32, program: u32) -> Result<JsValue, JSException> {
+    pub(crate) fn op_get_global(
+        &mut self,
+        str_id: u32,
+        program: u32,
+    ) -> Result<JsValue, JSException> {
         let Some(v) = self.resolve_global(str_id, program) else {
             // Missing binding: the compiler only emits `GetGlobal` for
             // declared variables, hoisted names, and intrinsics, so an
@@ -137,8 +153,14 @@ impl Interp<'_> {
 
     /// `GetGlobalLenient`: same resolution as `GetGlobal`, but a missing
     /// binding yields `undefined` (spec: `typeof undeclared` never throws).
-    pub(crate) fn op_get_global_lenient(&mut self, str_id: u32, program: u32) -> Result<JsValue, JSException> {
-        Ok(self.resolve_global(str_id, program).unwrap_or_else(JsValue::undefined))
+    pub(crate) fn op_get_global_lenient(
+        &mut self,
+        str_id: u32,
+        program: u32,
+    ) -> Result<JsValue, JSException> {
+        Ok(self
+            .resolve_global(str_id, program)
+            .unwrap_or_else(JsValue::undefined))
     }
 
     fn global_name_text(&mut self, str_id: u32, program: u32) -> String {

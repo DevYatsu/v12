@@ -52,11 +52,7 @@ pub fn global_is_nan(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<
 
 /// Global `isFinite(value)` – COERCES via `ToNumber`, then requires a finite
 /// number (NaN and ±Infinity yield `false`).
-pub fn global_is_finite(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn global_is_finite(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let v = args.first().copied().unwrap_or(JsValue::undefined());
     let n = ctx.to_number(v);
     Ok(JsValue::from_bool(n.is_finite()))
@@ -81,11 +77,7 @@ fn scan_int_digits(digits: &str, radix: u32, sign: f64) -> f64 {
 }
 
 /// Global `parseInt(string, radix?)` (also `Number.parseInt`).
-pub fn global_parse_int(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn global_parse_int(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     // Owned text via `ctx.to_string`: no heap borrow is held, so the radix
     // coercion order is unobservable (`to_number` never runs user code).
     let radix_arg = args.get(1).copied();
@@ -191,11 +183,7 @@ pub fn global_parse_float(
 /// `Number(value)` – the callable/constructible `Number` intrinsic.
 /// `Number()` → 0; `Number(undefined)` → NaN; `Number(null)` → 0;
 /// `Number(true)` → 1; strings are parsed; objects → NaN (subset).
-pub fn number_construct(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn number_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let Some(&v) = args.first() else {
         return Ok(helpers::js_number(0.0));
     };
@@ -295,7 +283,9 @@ pub fn number_proto_to_string(
         Some(v) => {
             let r = ctx.to_number(v);
             if !(2.0..=36.0).contains(&r) || r.fract() != 0.0 {
-                return Err(ctx.range_error("RangeError: toString() radix must be between 2 and 36"));
+                return Err(
+                    ctx.range_error("RangeError: toString() radix must be between 2 and 36")
+                );
             }
             r as u32
         }
@@ -309,7 +299,11 @@ pub fn number_proto_to_string(
         return Ok(JsValue::string(ctx.heap.intern_text("NaN")));
     }
     if n.is_infinite() {
-        return Ok(JsValue::string(ctx.heap.intern_text(if n > 0.0 { "Infinity" } else { "-Infinity" })));
+        return Ok(JsValue::string(ctx.heap.intern_text(if n > 0.0 {
+            "Infinity"
+        } else {
+            "-Infinity"
+        })));
     }
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     let negative = n < 0.0;
@@ -355,7 +349,9 @@ pub fn number_to_fixed(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result
         Some(&v) => {
             let d = ctx.to_number(v);
             if !(0.0..=100.0).contains(&d) {
-                return Err(ctx.range_error("RangeError: toFixed() digits argument must be between 0 and 100"));
+                return Err(ctx.range_error(
+                    "RangeError: toFixed() digits argument must be between 0 and 100",
+                ));
             }
             d as usize
         }
@@ -436,7 +432,9 @@ pub fn number_to_exponential(
         Some(&v) if !v.is_undefined() => {
             let f = ctx.to_number(v);
             if !(0.0..=100.0).contains(&f) {
-                return Err(ctx.range_error("RangeError: toExponential() argument must be between 0 and 100"));
+                return Err(ctx.range_error(
+                    "RangeError: toExponential() argument must be between 0 and 100",
+                ));
             }
             format_scientific(n, Some(f as usize))
         }

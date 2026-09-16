@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use v12_bytecode::FunctionBytecode;
 use v12_heap::HeapExt;
-use v12_heap::{GcPolicy, Heap, JsObject, JsValue};
 #[cfg(test)]
 use v12_heap::V12Str;
+use v12_heap::{GcPolicy, Heap, JsObject, JsValue};
 use v12_interp::{Interp, JSException};
 
 use crate::builtins::NativeRegistry;
@@ -107,11 +107,10 @@ impl Engine {
         registry.set_loader(Rc::new(RefCell::new(
             crate::module_loader::LoaderState::default(),
         )));
-        let programs: Rc<RefCell<Vec<v12_native::ProgramTable>>> =
-            Rc::new(RefCell::new(vec![(
-                Rc::<[FunctionBytecode]>::from(Vec::new()),
-                Rc::<[String]>::from(Vec::new()),
-            )]));
+        let programs: Rc<RefCell<Vec<v12_native::ProgramTable>>> = Rc::new(RefCell::new(vec![(
+            Rc::<[FunctionBytecode]>::from(Vec::new()),
+            Rc::<[String]>::from(Vec::new()),
+        )]));
         Self {
             heap,
             realm,
@@ -224,14 +223,15 @@ impl Engine {
     pub fn call_global(&mut self, name: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
         let global = self.realm.global();
         let func = {
-            let h = self
-                .heap
-                .intern_text(name);
+            let h = self.heap.intern_text(name);
             let key = v12_heap::PropKey::from_string(h);
             let shape = self.heap.shape_of(global);
             let desc = self.heap.lookup_property(shape, key);
             let slot = desc.and_then(|d| d.slot()).ok_or_else(|| {
-                string_value(&mut self.heap, &format!("ReferenceError: {name} is not defined"))
+                string_value(
+                    &mut self.heap,
+                    &format!("ReferenceError: {name} is not defined"),
+                )
             })?;
             let idx = crate::realm::INTRINSIC_COUNT + slot as usize;
             self.heap
@@ -247,7 +247,10 @@ impl Engine {
                 })?
         };
         let callee = func.as_object().ok_or_else(|| {
-            string_value(&mut self.heap, &format!("TypeError: {name} is not a function"))
+            string_value(
+                &mut self.heap,
+                &format!("TypeError: {name} is not a function"),
+            )
         })?;
         self.heap.add_root(JsValue::object(callee));
 

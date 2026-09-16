@@ -83,11 +83,7 @@ fn create_promise(
 
 /// `Promise.resolve(x)`: identity for promises; otherwise a fulfilled promise
 /// carrying `x` (`undefined` when the argument is missing).
-pub fn promise_resolve(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn promise_resolve(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
     if is_promise(ctx.heap, value) {
         return Ok(value);
@@ -97,7 +93,9 @@ pub fn promise_resolve(
     // recognizes instances by that identity. Unbound calls (e.g. a destructured
     // `const r = Promise.resolve`) degrade gracefully: the promise works but
     // its `then` is unreachable from script.
-    let prototype = this.as_object().and_then(|ctor| ctx.heap.get(ctor).prototype);
+    let prototype = this
+        .as_object()
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
     Ok(JsValue::object(create_promise(
         ctx.heap,
         prototype,
@@ -107,13 +105,11 @@ pub fn promise_resolve(
 }
 
 /// `Promise.reject(x)`: a rejected promise carrying `x`.
-pub fn promise_reject(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn promise_reject(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-    let prototype = this.as_object().and_then(|ctor| ctx.heap.get(ctor).prototype);
+    let prototype = this
+        .as_object()
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
     Ok(JsValue::object(create_promise(
         ctx.heap,
         prototype,
@@ -149,11 +145,7 @@ pub(crate) fn make_pending_promise(
 /// registry intercept always supplies it, so no separate stateful signature
 /// is needed. A detached `Ctx` without a sink falls back to an ephemeral
 /// queue (jobs are dropped) rather than failing the `then`.
-pub fn promise_then(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn promise_then(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     if !is_promise(ctx.heap, this) {
         return Err(ctx.type_error("Promise.prototype.then requires a promise"));
     }
@@ -181,7 +173,8 @@ pub fn promise_then(
                 smallvec::smallvec![None; 3],
             ));
             ctx.heap.add_root(JsValue::object(record));
-            ctx.heap.get_mut(reactions)
+            ctx.heap
+                .get_mut(reactions)
                 .elements
                 .push(JsValue::object(record));
         }
@@ -206,11 +199,7 @@ pub fn promise_then(
 /// `queueMicrotask(cb)`: enqueues a job that calls `cb` with no arguments.
 /// Throw completions from the callback are swallowed (Tier-0 reporting
 /// substrate does not exist yet).
-pub fn queue_microtask(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn queue_microtask(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let cb = args.first().copied().unwrap_or_else(JsValue::undefined);
     if cb.as_object().is_none() {
         return Err(ctx.type_error("queueMicrotask requires a function"));
@@ -342,8 +331,7 @@ fn capability_settle(
     value: JsValue,
     rejecting: bool,
 ) -> Result<JsValue, JsValue> {
-    let still_pending =
-        heap.get(promise).properties[0].as_smi() == Some(STATE_PENDING);
+    let still_pending = heap.get(promise).properties[0].as_smi() == Some(STATE_PENDING);
     if !still_pending {
         return Ok(JsValue::undefined());
     }
@@ -378,11 +366,17 @@ fn capability_settle(
         ));
         heap.add_root(JsValue::object(record));
         if let Some(reactions) = heap.get(value_obj).properties[2].as_object() {
-            heap.get_mut(reactions).elements.push(JsValue::object(record));
+            heap.get_mut(reactions)
+                .elements
+                .push(JsValue::object(record));
         }
         return Ok(JsValue::undefined());
     }
-    let state = if rejecting { STATE_REJECTED } else { STATE_FULFILLED };
+    let state = if rejecting {
+        STATE_REJECTED
+    } else {
+        STATE_FULFILLED
+    };
     heap.get_mut(promise).properties[0] = smi(state);
     heap.get_mut(promise).properties[1] = value;
     let jobs = drain_reaction_jobs(heap, promise, state, value);
@@ -398,11 +392,7 @@ fn capability_settle(
 /// asynchronous surface are unaffected. Calling `Promise` without `new`
 /// throws per spec (prepare_construct passes the constructor as `this`; a
 /// plain call's receiver never carries the construct target).
-pub fn promise_construct(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn promise_construct(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let executor = args.first().copied().unwrap_or_else(JsValue::undefined);
     if !executor
         .as_object()
@@ -445,22 +435,16 @@ pub fn promise_construct(
     let p = promise;
     let rv = resolve_v;
     let jv = reject_v;
-    pending.borrow_mut().push(Box::new(move |ctx: &mut JobCtx<'_, '_>| {
-        match ctx.call_object(executor_obj, JsValue::undefined(), &[resolve_v, reject_v]) {
-            Ok(_) => {}
-            Err(JSException(e)) => {
-                let _ = capability_settle(
-                    ctx.heap_mut(),
-                    &sink,
-                    p,
-                    rv,
-                    jv,
-                    e,
-                    true,
-                );
+    pending
+        .borrow_mut()
+        .push(Box::new(move |ctx: &mut JobCtx<'_, '_>| {
+            match ctx.call_object(executor_obj, JsValue::undefined(), &[resolve_v, reject_v]) {
+                Ok(_) => {}
+                Err(JSException(e)) => {
+                    let _ = capability_settle(ctx.heap_mut(), &sink, p, rv, jv, e, true);
+                }
             }
-        }
-    }));
+        }));
     Ok(promise_v)
 }
 
@@ -493,15 +477,7 @@ pub(crate) fn make_capability(
     let jv = reject_v;
     let resolve_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
         let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-        capability_settle(
-            heap,
-            &sink1,
-            p,
-            rv,
-            jv,
-            value,
-            false,
-        )
+        capability_settle(heap, &sink1, p, rv, jv, value, false)
     });
     heap.get_mut(resolve_obj).callable = v12_heap::FunctionTarget::Host(resolve_closure);
 
@@ -511,15 +487,7 @@ pub(crate) fn make_capability(
     let jv = reject_v;
     let reject_closure = v12_heap::HostClosure::new(move |heap, _this, args| {
         let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
-        capability_settle(
-            heap,
-            &sink2,
-            p,
-            rv,
-            jv,
-            reason,
-            true,
-        )
+        capability_settle(heap, &sink2, p, rv, jv, reason, true)
     });
     heap.get_mut(reject_obj).callable = v12_heap::FunctionTarget::Host(reject_closure);
     (resolve_v, reject_v)
@@ -549,11 +517,7 @@ pub(crate) fn settle_async_completion(
 }
 
 /// `Promise.prototype.catch(on_rejected)`: `then(undefined, on_rejected)`.
-pub fn promise_catch(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn promise_catch(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let on_rejected = args.first().copied().unwrap_or_else(JsValue::undefined);
     promise_then(ctx, this, &[JsValue::undefined(), on_rejected])
 }
