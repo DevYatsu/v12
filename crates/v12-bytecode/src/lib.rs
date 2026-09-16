@@ -451,6 +451,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::IteratorClose => "iterator_close",
         Opcode::DefineMethod => "define_method",
         Opcode::GetNewTarget => "get_new_target",
+        Opcode::ToPropertyKey => "to_property_key",
     }
 }
 
@@ -483,7 +484,8 @@ fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result
         | Opcode::Ge
         | Opcode::StrictEq
         | Opcode::StrictNe => write!(f, " r{a}, r{b}, r{c}"),
-        Opcode::Neg | Opcode::BitNot | Opcode::Not | Opcode::TypeOf | Opcode::ToNumber => {
+        Opcode::Neg | Opcode::BitNot | Opcode::Not | Opcode::TypeOf | Opcode::ToNumber
+        | Opcode::ToPropertyKey => {
             write!(f, " r{a}, r{b}")
         }
         Opcode::GenResumeMode => write!(f, " r{a}"),

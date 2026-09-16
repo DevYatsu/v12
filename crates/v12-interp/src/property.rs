@@ -737,24 +737,34 @@ impl Interp<'_> {
             None => self.property_key(key_v)?,
         };
         let shape = self.shape_of(obj);
+        // A proxy is never served or recorded by the shape/IC path: its shape
+        // is the shared empty-object root, so a stub or IC entry recorded
+        // under it would alias unrelated ordinary objects. `[[Get]]` trap
+        // dispatch is a later phase; this only keeps both caches clean.
+        let is_proxy = self.heap.get(obj).kind == Kind::Proxy;
 
         // StubCache guarded fast path: serves recorded own AND proto
         // `Data` locations in O(1) (shape+key identity, proto generation,
         // and chain verifies — one integer compare each). OOB storage
         // falls through to the walk below, which resolves exactly as
         // before (including the realm-global fallback).
-        if let Some((holder, hsl)) = self.heap.stub_lookup_proto(obj, shape, key) {
+        if !is_proxy
+            && let Some((holder, hsl)) = self.heap.stub_lookup_proto(obj, shape, key)
+        {
             let idx = self.global_slot_index(holder, hsl as usize);
             if let Some(v) = self.heap.get(holder).properties.get(idx) {
                 return Ok(*v);
             }
         }
 
-        let cached_slot = self
-            .feedback
-            .get(&site_fn)
-            .and_then(|fv| fv.ics.get(&site_pc))
-            .and_then(|ic| ic.get(shape, key));
+        let cached_slot = if is_proxy {
+            None
+        } else {
+            self.feedback
+                .get(&site_fn)
+                .and_then(|fv| fv.ics.get(&site_pc))
+                .and_then(|ic| ic.get(shape, key))
+        };
         if let Some(slot) = cached_slot
             && let Some(v) = self
                 .heap
@@ -802,7 +812,9 @@ impl Interp<'_> {
                 return Ok(JsValue::undefined());
             }
             let owner_shape = self.shape_of(owner);
-            self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, entry.slot);
+            if !is_proxy {
+                self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, entry.slot);
+            }
             let value = self.heap.get(owner).properties
                 [self.global_slot_index(owner, entry.slot as usize)];
             return Ok(value);
@@ -815,10 +827,12 @@ impl Interp<'_> {
                     // `owner == obj` gate below: proto hits are the point.
                     // Accessor hits never record (no servable slot).
                     let owner_shape = self.shape_of(owner);
-                    self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, slot);
+                    if !is_proxy {
+                        self.heap.stub_record_proto(obj, shape, key, owner, owner_shape, slot);
+                    }
                     let value = self.heap.get(owner).properties
                         [self.global_slot_index(owner, slot as usize)];
-                    if owner == obj {
+                    if owner == obj && !is_proxy {
                         self.feedback
                             .entry(site_fn)
                             .or_default()
@@ -1161,6 +1175,12 @@ impl Interp<'_> {
                 "TypeError: right-hand side of 'in' should be an object",
             )));
         };
+        // Proxy exotic: `HasProperty` is the `has` trap (ES 10.5.6). Checked
+        // before the element fast path so a proxy is never treated as an
+        // ordinary object.
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_has(key_v, obj);
+        }
         // Fast path for array/arguments indices: check element storage before
         // coercing the key, which may allocate. Holes count as absent.
         // Flatten-once so the index scan never materializes.
@@ -1198,6 +1218,67 @@ impl Interp<'_> {
         // If we fell through from the array fast path with a hole, and the
         // shape walk found nothing, the property is absent.
         Ok(false)
+    }
+
+    /// Proxy `[[HasProperty]]` (ES 10.5.6): consult the handler's `has` trap.
+    ///
+    /// Absent or `undefined` trap forwards to the target's ordinary `in`
+    /// (which recursively handles a proxy target). A present non-callable trap
+    /// is a `TypeError`. The trap result is coerced with ToBoolean; a falsy
+    /// result is returned as `false` without forwarding.
+    ///
+    /// Deliberate limitation: the spec's invariant check (a `has` trap
+    /// reporting `false` for a non-configurable own property of a
+    /// non-extensible target throws) is not applied — the target walked by the
+    /// tests is extensible, so no invariant can be violated.
+    fn proxy_op_has(
+        &mut self,
+        key_v: JsValue,
+        proxy: Handle<JsObject>,
+    ) -> Result<bool, JSException> {
+        let (target, handler) = {
+            let o = self.heap.get(proxy);
+            (o.proxy_target, o.proxy_handler)
+        };
+        // Revoked proxy (both slots cleared by revocation): TypeError.
+        let (Some(target), Some(handler)) = (target, handler) else {
+            return Err(JSException(self.error_value(
+                "TypeError: Cannot perform 'has' on a proxy that has been revoked",
+            )));
+        };
+        // ToPropertyKey before the trap sees the key (spec step order: the
+        // key is materialised once, ahead of the handler lookup).
+        let key = self.property_key(key_v)?;
+        let key_v = if let Some(h) = key.string() {
+            JsValue::string(h)
+        } else if let Some(y) = key.symbol() {
+            JsValue::symbol(y)
+        } else {
+            // Unreachable: `property_key` is string-or-symbol by construction.
+            JsValue::undefined()
+        };
+        let has_key = self.new_temp_key("has");
+        let trap_v = self.get_property(0, 0, JsValue::object(handler), has_key)?;
+        let Some(trap) = trap_v.as_object() else {
+            if trap_v.is_undefined() {
+                // No trap: forward to the target through the ordinary path.
+                return self.op_in(key_v, JsValue::object(target));
+            }
+            return Err(JSException(self.error_value(
+                "TypeError: 'has' trap must be a function",
+            )));
+        };
+        if self.heap.get(trap).kind != Kind::Function {
+            return Err(JSException(self.error_value(
+                "TypeError: 'has' trap must be a function",
+            )));
+        }
+        self.gc_protect();
+        let result = self.call_inline(trap, JsValue::object(handler), &[
+            JsValue::object(target),
+            key_v,
+        ])?;
+        Ok(ops::to_boolean(self.heap, result))
     }
 
     /// `instanceof` operator. Throws TypeError if `rhs` is not an object

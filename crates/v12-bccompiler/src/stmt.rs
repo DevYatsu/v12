@@ -325,6 +325,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 };
                 let k = self.expr(expr)?;
                 self.move_reg(key_reg, k, prop.key.span());
+                // Spec 14.3.3.1 step 1: ToPropertyKey runs as part of
+                // evaluating the PropertyName, i.e. BEFORE the binding-target
+                // ResolveBinding probe. Materialize in place so any key-object
+                // `toString`/`valueOf` side effect lands here.
+                self.emit_reg2(Opcode::ToPropertyKey, key_reg, key_reg, prop.key.span());
             } else {
                 let Some(text) = crate::expr::static_key_text(&prop.key) else {
                     // Remaining non-computed keys are private names or exotic
@@ -336,6 +341,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 };
                 self.load_str(key_reg, &text, prop.key.span())?;
             }
+            // Spec 14.3.3.3 step 2: ResolveBinding probes the binding name
+            // before the `GetV` below (step 3).
+            self.probe_resolve_binding(&prop.value, prop.span)?;
             let tmp = self.new_temp();
             self.emit_reg3(Opcode::GetProperty, tmp, src, key_reg, prop.span);
             self.lower_binding_pattern(&prop.value, tmp)?;
@@ -380,6 +388,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             let Some(pat) = el else { continue };
             let key = self.new_temp();
             self.load_str(key, &idx.to_string(), pat.span())?;
+            // Spec 14.3.3.3 step 2: ResolveBinding before the `GetV` (step 3).
+            // The index key is already a string, so no ToPropertyKey is due.
+            self.probe_resolve_binding(pat, pat.span())?;
             let tmp = self.new_temp();
             self.emit_reg3(Opcode::GetProperty, tmp, src, key, pat.span());
             self.lower_binding_pattern(pat, tmp)?;
@@ -396,6 +407,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_words(words, rest.span);
             }
             self.lower_binding_pattern(&rest.argument, dst)?;
+        }
+        Ok(())
+    }
+
+    /// Spec 14.3.3.3 step 2: `ResolveBinding(bindingId, environment)` runs a
+    /// `HasBinding` probe BEFORE `GetV`. Unwraps `Initializer` so
+    /// `SingleNameBinding : BindingIdentifier Initializer_opt` is covered.
+    /// Nested object/array patterns get no probe here (they recurse instead).
+    fn probe_resolve_binding(&mut self, pat: &BindingPattern<'_>, span: Span) -> Res<()> {
+        let mut cur = pat;
+        while let BindingPattern::AssignmentPattern(ap) = cur {
+            cur = &ap.left;
+        }
+        if let BindingPattern::BindingIdentifier(id) = cur {
+            self.emit_with_binding_probe(id.name.as_str(), span)?;
         }
         Ok(())
     }

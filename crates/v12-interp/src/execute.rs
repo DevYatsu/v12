@@ -497,6 +497,15 @@ impl Interp<'_> {
                     self.stack[base + usize::from(ra)] = ops::box_number(n);
                     self.set_pc(pc + op_width);
                 }
+                Opcode::ToPropertyKey => {
+                    // ES ToPropertyKey: materialize the key so a key object's
+                    // `toString`/`valueOf` side effects run at this pc.
+                    let k = attempt!(
+                        self.to_property_key_value(self.stack[base + usize::from(rb)])
+                    );
+                    self.stack[base + usize::from(ra)] = k;
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::BitNot => {
                     let n = attempt!(self.to_number_value(self.stack[base + usize::from(rb)]));
                     self.stack[base + usize::from(ra)] =

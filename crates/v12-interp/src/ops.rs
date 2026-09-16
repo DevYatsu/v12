@@ -616,4 +616,32 @@ impl Interp<'_> {
         }
         Ok(to_number(self.heap, v))
     }
+
+    /// ES ToPropertyKey (7.1.19): strings and symbols pass through; any other
+    /// primitive is `ToString`ed; an object is converted via
+    /// [`Self::to_primitive_default`] first, so a key object's
+    /// `valueOf`/`toString` runs at a defined point rather than silently
+    /// rendering as `[object Object]`.
+    ///
+    /// v1 deviation: the spec's hint is `string` (toString first), while
+    /// `to_primitive_default` is the default hint (valueOf first). Shared with
+    /// every coercion site in the interpreter; the two orders differ only for
+    /// an object that defines both methods to yield primitives.
+    pub(crate) fn to_property_key_value(&mut self, v: JsValue) -> Result<JsValue, JSException> {
+        if v.is_string() || v.is_symbol() {
+            return Ok(v);
+        }
+        let prim = if v.is_object() {
+            self.to_primitive_default(v)?
+        } else {
+            v
+        };
+        // A symbol can only appear here via `to_primitive_default`, so it is
+        // checked before the string conversion (which throws for symbols).
+        if prim.is_symbol() {
+            return Ok(prim);
+        }
+        let h = to_js_string(self.heap, prim)?;
+        Ok(JsValue::string(h))
+    }
 }

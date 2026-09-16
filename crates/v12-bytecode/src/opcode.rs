@@ -145,6 +145,8 @@ pub enum Opcode {
     /// right after `SuspendYield` in generator bodies so the compiled return
     /// path can run the active finalizer copies before returning.
     GenResumeMode = 74,
+    /// ES ToPropertyKey: `r{a} = ToPropertyKey(r{b})`. Materialises the property key so a key object's `toString`/`valueOf` runs at a defined point.
+    ToPropertyKey = 75,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -222,6 +224,7 @@ impl TryFrom<u8> for Opcode {
             72 => Ok(Self::DefineMethod),
             73 => Ok(Self::GetGlobalLenient),
             74 => Ok(Self::GenResumeMode),
+            75 => Ok(Self::ToPropertyKey),
             other => Err(other),
         }
     }
@@ -400,6 +403,7 @@ mod encoding_tests {
         Opcode::DefineMethod,
         Opcode::GetGlobalLenient,
         Opcode::GenResumeMode,
+        Opcode::ToPropertyKey,
     ];
 
     #[test]
@@ -418,6 +422,7 @@ mod encoding_tests {
         assert_eq!(Opcode::SetGlobal as u8, 61);
         assert_eq!(Opcode::Construct as u8, 62);
         assert_eq!(Opcode::GetNewTarget as u8, 63);
+        assert_eq!(Opcode::ToPropertyKey as u8, 75);
         let unique: std::collections::HashSet<u8> = ALL_OPS.iter().map(|&op| op as u8).collect();
         assert_eq!(unique.len(), ALL_OPS.len());
     }

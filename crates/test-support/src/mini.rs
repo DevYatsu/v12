@@ -216,6 +216,12 @@ impl<'p> Mini<'p> {
                     regs[instr.a() as usize] = Val::F64(to_number(&regs[instr.b() as usize]));
                     pc += 1;
                 }
+                Opcode::ToPropertyKey => {
+                    // Model-side key materialisation: no user coercion in the
+                    // mini value model, so this is `to_key` (string form).
+                    regs[instr.a() as usize] = Val::Str(to_key(&regs[instr.b() as usize]).into());
+                    pc += 1;
+                }
                 Opcode::BitNot => {
                     regs[instr.a() as usize] =
                         Val::F64(!to_int32(&to_number(&regs[instr.b() as usize])) as f64);

@@ -999,6 +999,24 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(Some(end))
     }
 
+    /// Observable binding-resolution probe: emits one `In` per enclosing `with`
+    /// scope object, innermost first, so a proxy `has` trap can observe
+    /// `ResolveBinding`. The boolean result is deliberately DISCARDED — lane 4's
+    /// documented YAGNI boundary still applies, i.e. a *hit* still resolves
+    /// statically. Mirrors spec 9.1.2.1 GetIdentifierReference step 2.
+    pub fn emit_with_binding_probe(&mut self, name: &str, span: Span) -> Result<(), CompileError> {
+        if self.with_objs.is_empty() {
+            return Ok(());
+        }
+        let key = self.load_str_key(name, span)?;
+        for idx in (0..self.with_objs.len()).rev() {
+            let obj = self.with_objs[idx];
+            let probe = self.new_temp();
+            self.emit_reg3(Opcode::In, probe, key, obj, span);
+        }
+        Ok(())
+    }
+
     /// `SetGlobal name_id, src` — same `Spur`-derived string table id as
     /// `GetGlobal`.
     // Global-name table ids fit u16 in this subset; audited invariant.
