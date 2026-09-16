@@ -248,7 +248,7 @@ impl v12_native::NativeRegistry for NativeRegistry {
         programs: std::rc::Rc<std::cell::RefCell<Vec<v12_native::ProgramTable>>>,
     ) -> Result<JsValue, Throw> {
         let (program, strings) =
-            v12_bccompiler::compile_source_with_strings(source).map_err(|err| {
+            v12_bccompiler::compile_eval_source_with_strings(source).map_err(|err| {
                 Throw::Value(syntax_error_value(heap, global, &err.message))
             })?;
         // Register the eval program so its closures can be invoked from the
@@ -285,6 +285,7 @@ impl v12_native::NativeRegistry for NativeRegistry {
         &mut self,
         heap: &mut Heap,
         args: &[JsValue],
+        global: Option<Handle<JsObject>>,
         programs: Rc<RefCell<Vec<v12_native::ProgramTable>>>,
     ) -> Result<JsValue, Throw> {
         let mut param_parts = Vec::new();
@@ -306,7 +307,10 @@ impl v12_native::NativeRegistry for NativeRegistry {
         let (program, strings) = v12_bccompiler::compile_source_with_strings(&src)
             .map_err(|err| {
                 let (kind, message) = parse_error_text(&err.message, "SyntaxError");
-                Throw::Value(error_object(heap, None, kind, message))
+                // Realm-linked (not `None`): `assert.throws(SyntaxError, …)`
+                // needs `thrown.constructor === SyntaxError`, which only the
+                // global-wired error object carries.
+                Throw::Value(error_object(heap, global, kind, message))
             })?;
         let fn_idx = program
             .functions

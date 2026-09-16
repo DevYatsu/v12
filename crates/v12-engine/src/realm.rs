@@ -259,6 +259,20 @@ impl Realm {
         {
             crate::builtins::install_ctor(heap, ctor, function_proto);
         }
+        // The derived constructors (`AsyncFunction`, `GeneratorFunction`,
+        // `AsyncGeneratorFunction`): minimal natives sharing the `Function`
+        // seam. The install stamps the correct `name`, and calls/constructs
+        // route to `function_construct`, so hashbang bodies reject with a
+        // real SyntaxError exactly like `Function`. They exist so
+        // `(async function(){}).constructor`-style reads and `ctor.name`
+        // resolve instead of throwing on `undefined`.
+        for name in [
+            "AsyncFunction",
+            "GeneratorFunction",
+            "AsyncGeneratorFunction",
+        ] {
+            crate::builtins::install_native(heap, Some(global), name, NativeId::Function);
+        }
 
         Self { global, intrinsics }
     }

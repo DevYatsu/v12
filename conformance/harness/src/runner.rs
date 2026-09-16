@@ -181,7 +181,10 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     }
 
     // Strip frontmatter early — needed for harness decision.
-    let test_body = strip_frontmatter(&source);
+    // Owned: `strip_frontmatter` preserves source ahead of the block, and
+    // the hashbang split below borrows from it.
+    let stripped_body = strip_frontmatter(&source);
+    let test_body: &str = &stripped_body;
 
     // Async verdict needed when the test carries the `async` flag or calls
     // `$DONE` directly (older style). Raw tests get neither harness nor
@@ -274,7 +277,28 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     }
 
     // Build the combined source (test_body already stripped).
+    //
+    // Hashbang must lead: `#!` is only a comment at offset 0 (spec
+    // `HashbangComment`). The shim/harness preamble below would push a
+    // file-leading `#!` mid-source, where the parser rejects it — turning
+    // valid hashbang tests (e.g. `hashbang/multi-line-comment`, whose
+    // `#!/*` line must comment out just line 1) into silent truncations.
+    // Slice that first line off and re-emit it ahead of everything, but
+    // ONLY when the file itself starts with `#!`: a `#!` anywhere else
+    // (`preceding-*` tests) is a genuine SyntaxError and must stay
+    // mid-source so the parser still rejects it.
+    let (hashbang, test_body) = match source.strip_prefix("#!") {
+        Some(_) => {
+            let end = test_body
+                .find('\n')
+                .map(|i| i + 1)
+                .unwrap_or(test_body.len());
+            test_body.split_at(end)
+        }
+        None => ("", test_body),
+    };
     let mut combined = String::with_capacity(harness_source.len() + test_body.len() + 64);
+    combined.push_str(hashbang);
 
     // onlyStrict handling: ensure strict mode when requested. We prepend a
     // directive if the file does not already contain one, to avoid double
@@ -708,6 +732,14 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
     // Skip the ~35 such tests until TCO lands.
     if fm.has_feature("tail-call-optimization") {
         return Some("requires tail-call-optimization (proper tail calls not implemented)".to_string());
+    }
+    // TypedArrays (and resizable ArrayBuffers) are not implemented: skip
+    // tests declaring the feature instead of failing on
+    // `Uint8Array is not defined` (approved scope decision).
+    if fm.has_feature("resizable-arraybuffer") {
+        return Some(
+            "requires resizable-arraybuffer (TypedArray/ArrayBuffer not implemented)".to_string(),
+        );
     }
     None
 }

@@ -221,6 +221,13 @@ impl<'a> Ctx<'a> {
             if trimmed.is_empty() {
                 return 0.0;
             }
+            // Non-decimal integer literals (`0x`/`0b`/`0o`): Rust's
+            // `f64` parser accepts neither, but `Number("0x000A")` is
+            // 10 per `StringNumericLiteral` (no sign allowed — the
+            // prefix check below rejects `+0x1`, which stays NaN).
+            if let Some(n) = parse_non_decimal_integer(trimmed) {
+                return n;
+            }
             return trimmed.parse::<f64>().unwrap_or(f64::NAN);
         }
         f64::NAN
@@ -558,6 +565,41 @@ impl<'a> Ctx<'a> {
     pub fn array_ctor_value(&self) -> Option<JsValue> {
         self.intrinsic("Array")
     }
+}
+
+/// Parses a trimmed `0x`/`0b`/`0o` integer literal per
+/// `StringNumericLiteral` (integral `Number()`/unary-`ToNumber` input).
+/// Returns `None` for anything without such a prefix (the caller falls
+/// back to decimal parsing) and for malformed runs (empty digits, bad
+/// digits — the caller maps those to NaN). Digits accumulate in f64 so
+/// huge literals saturate toward Infinity instead of wrapping.
+fn parse_non_decimal_integer(s: &str) -> Option<f64> {
+    let (digits, radix) = if let Some(d) = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+    {
+        (d, 16u32)
+    } else if let Some(d) = s
+        .strip_prefix("0b")
+        .or_else(|| s.strip_prefix("0B"))
+    {
+        (d, 2u32)
+    } else if let Some(d) = s
+        .strip_prefix("0o")
+        .or_else(|| s.strip_prefix("0O"))
+    {
+        (d, 8u32)
+    } else {
+        return None;
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut acc = 0.0f64;
+    for c in digits.chars() {
+        acc = acc * f64::from(radix) + f64::from(c.to_digit(radix)?);
+    }
+    Some(acc)
 }
 
 /// Adapter shim: invokes a legacy `NativeHandler` (`fn(&mut Heap, …)`) with

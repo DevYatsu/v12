@@ -78,7 +78,7 @@ mod tests;
 mod unit;
 
 use oxc_allocator::Allocator;
-use oxc_parser::Parser;
+use oxc_parser::{ParseOptions, Parser, ParserReturn};
 use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, SourceType};
 
@@ -152,6 +152,30 @@ pub fn compile_source_with_interner(
     src: &str,
     interner: &mut Interner,
 ) -> Result<Program, CompileError> {
+    compile_script_with_interner(src, interner, false)
+}
+
+/// Compiles direct-eval payload (the [`v12_native::NativeRegistry::eval`]
+/// seam): same as [`compile_source_with_interner`], except
+/// context-sensitive early errors are treated with eval leniency —
+/// top-level `return` is allowed outright (direct eval inside a function
+/// may return), and `new.target` diagnostics are not surfaced. Whether a
+/// top-level `new.target` is legal depends on the CALLER (direct eval
+/// inside a function or class initializer inherits the construct call),
+/// which standalone parsing cannot know; the interpreter's `GetNewTarget`
+/// resolves it at runtime instead (undefined outside constructors).
+pub fn compile_eval_source_with_interner(
+    src: &str,
+    interner: &mut Interner,
+) -> Result<Program, CompileError> {
+    compile_script_with_interner(src, interner, true)
+}
+
+fn compile_script_with_interner(
+    src: &str,
+    interner: &mut Interner,
+    eval_leniency: bool,
+) -> Result<Program, CompileError> {
     // Cheap pre-check: module syntax is a strict superset of script syntax
     // for this subset, and `SourceType::script()` panics on `import` rather
     // than producing a useful `Module`-aware AST. Probing as a module first
@@ -161,7 +185,24 @@ pub fn compile_source_with_interner(
         return Err(err);
     }
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, src, SourceType::script()).parse();
+    let mut options = ParseOptions::default();
+    if eval_leniency {
+        // Direct eval inside a function may contain a top-level `return`.
+        options.allow_return_outside_function = true;
+    }
+    let parsed = Parser::new(&allocator, src, SourceType::script())
+        .with_options(options)
+        .parse();
+    // Recoverable syntax errors leave a partial AST behind (`panicked`
+    // stays false); per oxc's contract the AST is only valid when
+    // `diagnostics` is empty. Surface the first error here instead of
+    // compiling the truncation (observed: a mid-file `#!` parsed "clean"
+    // while silently dropping the rest of the program, and a second
+    // `#!` line vanished the same way). This also covers the panicked
+    // case, which always carries at least one diagnostic.
+    if let Some(err) = parse_diagnostics_error(&parsed, eval_leniency) {
+        return Err(err);
+    }
     if parsed.panicked {
         // Panicked parses carry at least one diagnostic; fall through to the
         // check below, which surfaces it.
@@ -229,6 +270,12 @@ pub fn compile_source_as_module_with_interner(
 ) -> Result<Module, CompileError> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, src, SourceType::mjs()).parse();
+    // Same recoverable-diagnostics surfacing as the script entry point:
+    // a partial module AST must not compile clean. Modules are never eval
+    // payload, so no eval leniency here.
+    if let Some(err) = parse_diagnostics_error(&parsed, false) {
+        return Err(err);
+    }
     if parsed.panicked {
         if let Some(d) = parsed.diagnostics.errors().next() {
             return Err(CompileError {
@@ -336,6 +383,19 @@ pub fn freeze_interner(interner: Interner) -> lasso::RodeoResolver<lasso::Spur> 
     interner.into_resolver()
 }
 
+/// Compatibility shim over [`compile_eval_source_with_interner`] +
+/// [`freeze_interner`]: the eval-seam counterpart of
+/// [`compile_source_with_strings`].
+pub fn compile_eval_source_with_strings(src: &str) -> Result<(Program, Vec<String>), CompileError> {
+    let mut interner = Interner::default();
+    let program = compile_eval_source_with_interner(src, &mut interner)?;
+    let strings = freeze_interner(interner)
+        .iter()
+        .map(|(_, s)| s.to_string())
+        .collect();
+    Ok((program, strings))
+}
+
 /// Compatibility shim over [`compile_source_with_interner`] + [`freeze_interner`]:
 /// compiles against a fresh interner and drains it into a `Vec<String>`
 /// indexed by [`v12_bytecode::Const::Str32`] id. Prefer the interner-based API.
@@ -437,4 +497,29 @@ fn has_use_strict(program: &oxc_ast::ast::Program<'_>) -> bool {
         .directives
         .iter()
         .any(|d| d.expression.value == "use strict")
+}
+
+/// First recoverable syntax error from a finished oxc parse, if any (see
+/// the call sites: `ParserReturn::program` is only valid when
+/// `diagnostics` is empty, and the parser recovers past errors like a
+/// misplaced `#!` instead of panicking). With eval leniency,
+/// `new.target` diagnostics are skipped: their legality depends on the
+/// eval caller (see [`compile_eval_source_with_interner`]).
+fn parse_diagnostics_error(
+    parsed: &ParserReturn<'_>,
+    eval_leniency: bool,
+) -> Option<CompileError> {
+    let mut errors = parsed.diagnostics.errors();
+    let d = if eval_leniency {
+        errors.find(|d| !d.message.contains("new.target"))?
+    } else {
+        errors.next()?
+    };
+    Some(CompileError {
+        message: format!("parse error: {d}"),
+        span: d.labels.first().map(|l| {
+            let s = l.span();
+            (s.start, s.end)
+        }),
+    })
 }

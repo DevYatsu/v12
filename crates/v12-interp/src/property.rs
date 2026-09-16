@@ -9,7 +9,7 @@ use v12_heap::{
 use super::{
     child_slot, Interp, JSException, RegExpSlot, ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET,
     OBJECT_IDX, PROMISE_IDX, REGEXP_IDX, SYMBOL_IDX, WK_ADD, WK_APPLY, WK_BIND, WK_CALL,
-    WK_CATCH, WK_CLEAR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES, WK_ENUMERABLE_OWN_KEYS,
+    WK_CATCH, WK_CLEAR, WK_CONSTRUCTOR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES, WK_ENUMERABLE_OWN_KEYS,
     WK_FLAGS, WK_FOR_EACH, WK_GET, WK_GET_PROTOTYPE_OF, WK_HAS, WK_HAS_OWN_PROPERTY, WK_IS_ARRAY,
     WK_ITERATOR, WK_KEYS, WK_LAST_INDEX, WK_LENGTH, WK_LOG, WK_NEXT, WK_PROTOTYPE, WK_REJECT,
     WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN, WK_THROW, WK_TO_STRING, WK_VALUE_OF,
@@ -429,6 +429,21 @@ impl Interp<'_> {
         if self.heap.get(obj).kind != Kind::Function {
             return None;
         }
+        if self.key_is_wk(key, WK_CONSTRUCTOR) {
+            // `f.constructor` on closures: closures carry no [[Prototype]]
+            // link to `%Function.prototype%`, so without this surface the
+            // read misses (observed as `undefined` for every function
+            // object). An own `constructor` (user-assigned, or a
+            // prototype's back-link) still wins — defer to the shape
+            // lookup below when one shadows.
+            if let Some(k) = key {
+                let shape = self.shape_of(obj);
+                if self.heap.lookup_property(shape, k).is_some() {
+                    return None;
+                }
+            }
+            return Some(Ok(self.closure_constructor(obj)));
+        }
         let constant = if self.key_is_wk(key, WK_CALL) {
             NativeId::FunctionCall
         } else if self.key_is_wk(key, WK_APPLY) {
@@ -445,6 +460,80 @@ impl Interp<'_> {
             return None;
         };
         Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// The realm constructor matching a closure's bytecode kind: plain
+    /// functions read the `Function` global, async/generator closures read
+    /// their derived constructor. Served by `function_method_surface`
+    /// because closures have no prototype link to consult; falls back to
+    /// `undefined` (the old answer) when no realm global is present.
+    fn closure_constructor(&mut self, obj: Handle<JsObject>) -> JsValue {
+        let (target, program_id) = {
+            let o = self.heap.get(obj);
+            (o.callable, o.program_id)
+        };
+        let name = match target {
+            v12_heap::FunctionTarget::Bytecode(fn_idx) => {
+                let (is_async, is_generator) = self
+                    .functions_for_program(program_id)
+                    .get(fn_idx as usize)
+                    .map(|f| (f.is_async, f.is_generator))
+                    .unwrap_or((false, false));
+                match (is_async, is_generator) {
+                    (true, true) => "AsyncGeneratorFunction",
+                    (true, false) => "AsyncFunction",
+                    (false, true) => "GeneratorFunction",
+                    (false, false) => "Function",
+                }
+            }
+            // Natives, host closures, bound functions: plain `Function`.
+            _ => "Function",
+        };
+        self.global
+            .and_then(|g| self.global_own_constructor(g, name))
+            .unwrap_or_else(JsValue::undefined)
+    }
+
+    /// Own-shape read of a constructor global (`Function`, `AsyncFunction`,
+    /// …) off a realm global. This is `chain_prop` specialized for the
+    /// global: shape slots on a realm global index `properties` with the
+    /// `GLOBAL_VAR_OFFSET` bias, which the unadjusted `chain_prop` walk
+    /// misreads (it served a neighboring intrinsic's constructor).
+    fn global_own_constructor(
+        &mut self,
+        global: Handle<JsObject>,
+        name: &str,
+    ) -> Option<JsValue> {
+        let h = self.heap.intern_text(name);
+        let pk = v12_heap::PropKey::from_string(h);
+        // Dictionary rung first: globals with many properties (harness
+        // preambles push them over the shape-transition threshold) hold
+        // overflow keys only in the map, with frozen shapes — the same
+        // two-store discipline as the `ic_lookup` slow path.
+        if let Some(entry) = self
+            .heap
+            .get(global)
+            .dictionary
+            .as_ref()
+            .and_then(|m| m.get(&pk))
+            .copied()
+        {
+            if entry.is_accessor {
+                return None;
+            }
+            let idx = self.global_slot_index(global, entry.slot as usize);
+            return match self.heap.get(global).properties.get(idx).copied() {
+                Some(v) if !v.is_hole() => Some(v),
+                _ => None,
+            };
+        }
+        let shape = self.shape_of(global);
+        let slot = self.heap.lookup_property(shape, pk)?.slot()? as usize;
+        let idx = self.global_slot_index(global, slot);
+        match self.heap.get(global).properties.get(idx).copied() {
+            Some(v) if !v.is_hole() => Some(v),
+            _ => None,
+        }
     }
 
     /// `Object.prototype` methods on any ordinary object (including arrays

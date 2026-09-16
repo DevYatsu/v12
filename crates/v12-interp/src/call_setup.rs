@@ -1466,10 +1466,13 @@ impl Interp<'_> {
                 // registered in this interpreter's cross-program table and
                 // return a real closure stamped with that program's id (the
                 // compile-time table's stub cannot do the registration).
+                // The realm global goes along so compile failures throw
+                // realm-linked errors (`thrown.constructor === SyntaxError`).
+                let global = self.global;
                 let programs = self.programs();
                 self.gc_protect();
                 self.natives
-                    .function_construct(self.heap, args, programs)
+                    .function_construct(self.heap, args, global, programs)
                     .map_err(|t| JSException::from_throw(self.heap, t))
             }
             // Any other native id: callback-taking built-ins re-enter the

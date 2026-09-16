@@ -85,17 +85,24 @@ pub fn parse_frontmatter(source: &str) -> Frontmatter {
     parse_yaml_block(&raw)
 }
 
-/// Removes the frontmatter comment block from `source`, returning the
-/// remainder. If no block is present, returns `source` unchanged.
+/// Removes the frontmatter comment block from `source`, returning the head
+/// and tail joined. The block is not always the file's first element (the
+/// raw `hashbang/multi-line-comment` test carries real source — the `#!`
+/// line — ahead of it), so only the block itself is excised: returning just
+/// the tail would silently drop that leading source. If no block is present,
+/// returns `source` unchanged.
 #[must_use]
-pub fn strip_frontmatter(source: &str) -> &str {
+pub fn strip_frontmatter(source: &str) -> String {
     if let Some(start) = source.find("/*---")
         && let Some(end_offset) = source[start..].find("---*/")
     {
         let end = start + end_offset + "---*/".len();
-        return &source[end..];
+        let mut out = String::with_capacity(source.len() - (end - start));
+        out.push_str(&source[..start]);
+        out.push_str(&source[end..]);
+        return out;
     }
-    source
+    source.to_string()
 }
 
 /// Parses a YAML-like frontmatter block into [`Frontmatter`].

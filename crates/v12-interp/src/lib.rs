@@ -245,8 +245,9 @@ const WELL_KNOWN_NAMES: &[&str] = &[
     "has",               // 31
     "delete",            // 32
     "clear",             // 33
-    "forEach",           // 34
+    "forEach",         // 34
     "add",               // 35
+    "constructor",       // 36
 ];
 const WK_COUNT: usize = WELL_KNOWN_NAMES.len();
 const WK_LENGTH: usize = 0;
@@ -285,6 +286,7 @@ const WK_DELETE: usize = 32;
 const WK_CLEAR: usize = 33;
 const WK_FOR_EACH: usize = 34;
 const WK_ADD: usize = 35;
+const WK_CONSTRUCTOR: usize = 36;
 
 /// Maximum simultaneous JavaScript activations.
 ///
