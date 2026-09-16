@@ -17,7 +17,7 @@ use oxc_ast::ast::{
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{HandlerRange, Instr, Label, Opcode, WideOp};
 
-use crate::model::{CompileError, FinallyCtx, FnCtx};
+use crate::model::{CompileError, FinallyCtx, FnCtx, VarLoc};
 
 type Res<T> = Result<T, CompileError>;
 
@@ -441,6 +441,46 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     // -- loops -------------------------------------------------------------------
 
+    /// Per-iteration environment for `let`/`const` loop variables (spec
+    /// `CreatePerIterationEnvironment`): when the loop variable is captured
+    /// (env-resident), every iteration splices a fresh Environment before
+    /// the binding store, so closures created in that iteration capture
+    /// that iteration's binding instead of aliasing one slot across all
+    /// iterations. `var` bindings keep the old single-slot behavior
+    /// (caller-gated on the declaration kind).
+    fn emit_per_iteration_env(&mut self, span: Span) {
+        let slots = self.comp.plans.units[self.unit].env_slot_count;
+        if slots == 0 {
+            return;
+        }
+        self.emit_new_env(0, slots, span);
+        // The fresh env shadows the prologue env at depth 0: copy every
+        // slot forward from the parent so sibling bindings already captured
+        // stay visible at their static slot indices.
+        for s in 0..slots {
+            let tmp = self.new_temp();
+            self.emit_get_env(tmp, 1, s, span);
+            self.emit_set_env(0, s, tmp, span);
+        }
+    }
+
+    /// True when `pat` declares at least one symbol stored in the current
+    /// unit's heap Environment (i.e. captured by an inner function). Only
+    /// then does a loop variable need a fresh per-iteration env: plain
+    /// register locals are invisible to closures, and gating here keeps
+    /// static env depths exact for units that own no Environment.
+    fn per_iteration_env_needed(&self, pat: &BindingPattern<'a>) -> bool {
+        let mut syms = Vec::new();
+        collect_pat_symbols(pat, &mut syms);
+        syms.into_iter().any(|sym| {
+            self.comp.plans.home_of.get(&sym).is_some_and(|&home| home == self.unit)
+                && matches!(
+                    self.comp.plans.units[self.unit].vars.get(&sym),
+                    Some(VarLoc::Env(_))
+                )
+        })
+    }
+
     fn while_loop(
         &mut self,
         test: &'a Expression<'a>,
@@ -532,6 +572,15 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
                 if v.declarations.len() != 1 {
                     return Err(self.err(span, "for-of requires exactly one binding"));
+                }
+                // `let`/`const` loop variables get a fresh per-iteration
+                // environment when captured; `var` keeps single-slot stores.
+                let is_lexical = matches!(
+                    v.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                );
+                if is_lexical && self.per_iteration_env_needed(&v.declarations[0].id) {
+                    self.emit_per_iteration_env(span);
                 }
                 self.lower_binding_pattern(&v.declarations[0].id, value)?;
             }
@@ -826,7 +875,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.move_reg(iter_idx, next_idx, f.span);
 
         // Store key to lhs binding - convert ForStatementLeft to AssignmentTargetPattern
-        let pattern: &oxc_ast::ast::BindingPattern<'_> = match &f.left {
+        let (pattern, is_lexical): (&oxc_ast::ast::BindingPattern<'_>, bool) = match &f.left {
             oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(_id) => {
                 // This is a simple identifier like `for (let x in obj)`
                 // We need to convert to BindingPattern
@@ -841,7 +890,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 if v.declarations.len() != 1 {
                     return Err(self.err(f.span, "for-in requires exactly one binding"));
                 }
-                &v.declarations[0].id
+                let is_lexical = matches!(
+                    v.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                );
+                (&v.declarations[0].id, is_lexical)
             }
             _ => {
                 return Err(self.err(
@@ -851,6 +904,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
         };
 
+        // `let`/`const` loop variables get a fresh per-iteration environment
+        // when captured; `var` keeps the old single-slot behavior.
+        if is_lexical && self.per_iteration_env_needed(pattern) {
+            self.emit_per_iteration_env(f.span);
+        }
         self.lower_binding_pattern(pattern, key_reg)?;
 
         self.with_loop(end, Some(cont), name, None, |s| s.stmt(&f.body))?;
@@ -1197,4 +1255,33 @@ fn binding_symbol(p: &BindingPattern<'_>) -> Option<oxc_semantic::SymbolId> {
 
 fn binding_symbol_pattern(p: &oxc_ast::ast::CatchParameter<'_>) -> Option<oxc_semantic::SymbolId> {
     binding_symbol(&p.pattern)
+}
+
+/// Declared symbols under a binding pattern, any nesting depth (defaults
+/// contribute no bindings; only the assignment target side is walked).
+fn collect_pat_symbols<'b>(pat: &BindingPattern<'b>, out: &mut Vec<oxc_semantic::SymbolId>) {
+    match pat {
+        BindingPattern::BindingIdentifier(id) => {
+            if let Some(sym) = id.symbol_id.get() {
+                out.push(sym);
+            }
+        }
+        BindingPattern::ObjectPattern(o) => {
+            for prop in &o.properties {
+                collect_pat_symbols(&prop.value, out);
+            }
+            if let Some(rest) = &o.rest {
+                collect_pat_symbols(&rest.argument, out);
+            }
+        }
+        BindingPattern::ArrayPattern(a) => {
+            for el in a.elements.iter().flatten() {
+                collect_pat_symbols(el, out);
+            }
+            if let Some(rest) = &a.rest {
+                collect_pat_symbols(&rest.argument, out);
+            }
+        }
+        BindingPattern::AssignmentPattern(ap) => collect_pat_symbols(&ap.left, out),
+    }
 }
