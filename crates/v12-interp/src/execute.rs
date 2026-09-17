@@ -679,6 +679,10 @@ impl Interp<'_> {
                 Opcode::NewObject => {
                     self.gc_protect();
                     let h = self.heap.alloc(JsObject::default());
+                    // Ordinary objects inherit from `%Object.prototype%`; the
+                    // lookup allocates nothing, so the pre-alloc protect above
+                    // already covers `h`.
+                    self.link_object_proto(h);
                     self.stack[base + usize::from(ra)] = JsValue::object(h);
                     self.set_pc(pc + op_width);
                 }

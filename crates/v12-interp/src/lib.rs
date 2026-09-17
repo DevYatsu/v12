@@ -1677,6 +1677,31 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The realm's `%Object.prototype%`, resolved through the `Object`
+    /// constructor's linked `prototype` field (installed by the realm via
+    /// `install_ctor`). Ordinary object makers stamp it as the fresh
+    /// instance's `[[Prototype]]` so `Object.getPrototypeOf(o)` and
+    /// inherited methods like `hasOwnProperty` resolve. `None` before realm
+    /// install or for embedder globals without the intrinsic prefix.
+    pub(crate) fn object_prototype(&self) -> Option<Handle<JsObject>> {
+        let global = self.global?;
+        let idx = intrinsic_slot("Object")?;
+        let ctor_v = *self.heap.get(global).properties.get(idx)?;
+        if ctor_v.is_hole() {
+            return None;
+        }
+        let ctor = ctor_v.as_object()?;
+        self.heap.get(ctor).prototype
+    }
+
+    /// Stamps the realm's `%Object.prototype%` as `h`'s `[[Prototype]]`
+    /// (no-op when unresolvable; see [`Self::object_prototype`]).
+    pub(crate) fn link_object_proto(&mut self, h: Handle<JsObject>) {
+        if let Some(p) = self.object_prototype() {
+            self.heap.get_mut(h).prototype = Some(p);
+        }
+    }
+
     /// Reads a property `key` walking the prototype chain (own shape first,
     /// then each `[[Prototype]]`): the first hit. Shape lookup is own-shape
     /// only, so inherited links like `instance.constructor` (living on the
