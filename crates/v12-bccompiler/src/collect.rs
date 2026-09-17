@@ -21,9 +21,9 @@
 //! them with a `CompileError`.
 
 use oxc_ast::ast::{
-    ArrayExpressionElement, ArrowFunctionExpression, BindingPattern, Expression, ForStatementInit,
-    FormalParameters, Function, ModuleDeclaration, ModuleExportName, Program, PropertyKey,
-    SimpleAssignmentTarget, Statement, VariableDeclaration,
+    ArrayExpressionElement, ArrowFunctionExpression, AssignmentTarget, BindingPattern, Expression,
+    ForStatementInit, FormalParameters, Function, ModuleDeclaration, ModuleExportName, Program,
+    PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
 };
 use oxc_semantic::{Scoping, SymbolId};
 use oxc_span::GetSpan;
@@ -65,6 +65,7 @@ fn collect_inner(
         unit_stack: Vec::new(),
         super_allowed_stack: Vec::new(),
         super_call_allowed_stack: Vec::new(),
+        private_name_scopes: Vec::new(),
         early_error: None,
     };
     c.plans.is_module = is_module;
@@ -127,6 +128,163 @@ fn is_strict_reserved_word(name: &str) -> bool {
     )
 }
 
+/// Best-effort key text for a class element or object-literal property key
+/// (diagnostics/hint only).
+fn static_key_or_default(key: &PropertyKey<'_>) -> String {
+    crate::expr::static_key_text(key).unwrap_or_else(|| "<computed>".to_string())
+}
+
+/// `ClassElementName` text for a private name (`#x` → `#x`); `None` for
+/// public/computed keys.
+fn private_name_text(key: &oxc_ast::ast::PropertyKey<'_>) -> Option<String> {
+    match key {
+        oxc_ast::ast::PropertyKey::PrivateIdentifier(p) => Some(format!("#{}", p.name)),
+        _ => None,
+    }
+}
+
+/// Gathers the private names declared by a class body (`#x` fields, methods,
+/// accessors — static and instance alike). The class's private environment
+/// holds all of them regardless of placement.
+fn declared_private_names(c: &oxc_ast::ast::Class<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    for el in &c.body.body {
+        match el {
+            oxc_ast::ast::ClassElement::MethodDefinition(m) => {
+                if let Some(n) = private_name_text(&m.key) {
+                    names.push(n);
+                }
+            }
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
+                if let Some(n) = private_name_text(&p.key) {
+                    names.push(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// `ContainsArguments` (ES §15.7.1): true when the expression textually
+/// references the `arguments` identifier. Used for the field-initializer
+/// early error.
+fn contains_arguments(e: &Expression<'_>) -> bool {
+    // A nested ordinary function/class introduces its own `arguments`, so the
+    // search stops there; arrows inherit the enclosing binding and recurse.
+    fn walk_expr(e: &Expression<'_>) -> bool {
+        match e {
+            Expression::Identifier(id) => id.name.as_str() == "arguments",
+            Expression::FunctionExpression(_) => false,
+            Expression::ClassExpression(ce) => ce
+                .heritage
+                .as_ref()
+                .is_some_and(|h| walk_expr(&h.expression)),
+            Expression::ArrowFunctionExpression(a) => match a.get_function_body() {
+                Some(body) => body.statements.iter().any(walk_stmt),
+                None => a.get_expression().is_some_and(walk_expr),
+            },
+            Expression::BinaryExpression(b) => walk_expr(&b.left) || walk_expr(&b.right),
+            Expression::LogicalExpression(l) => walk_expr(&l.left) || walk_expr(&l.right),
+            Expression::UnaryExpression(u) => walk_expr(&u.argument),
+            Expression::UpdateExpression(u) => match &u.argument {
+                oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    id.name.as_str() == "arguments"
+                }
+                _ => false,
+            },
+            Expression::AssignmentExpression(a) => {
+                let lhs = match &a.left {
+                    AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                        id.name.as_str() == "arguments"
+                    }
+                    AssignmentTarget::ArrayAssignmentTarget(arr) => arr
+                        .elements
+                        .iter()
+                        .flatten()
+                        .any(|el| match el {
+                            oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                                target_is_arguments(&d.binding) || walk_expr(&d.init)
+                            }
+                            other => other
+                                .as_simple_assignment_target()
+                                .is_some_and(simple_target_is_arguments),
+                        }),
+                    _ => false,
+                };
+                lhs || walk_expr(&a.right)
+            }
+            Expression::ConditionalExpression(c) => {
+                walk_expr(&c.test) || walk_expr(&c.consequent) || walk_expr(&c.alternate)
+            }
+            Expression::SequenceExpression(s) => s.expressions.iter().any(walk_expr),
+            Expression::CallExpression(c) => {
+                walk_expr(&c.callee)
+                    || c.arguments.iter().any(|a| match a {
+                        oxc_ast::ast::Argument::SpreadElement(s) => walk_expr(&s.argument),
+                        other => other.as_expression().is_some_and(walk_expr),
+                    })
+            }
+            Expression::NewExpression(n) => {
+                walk_expr(&n.callee)
+                    || n.arguments.iter().any(|a| match a {
+                        oxc_ast::ast::Argument::SpreadElement(s) => walk_expr(&s.argument),
+                        other => other.as_expression().is_some_and(walk_expr),
+                    })
+            }
+            Expression::TemplateLiteral(t) => t.expressions.iter().any(walk_expr),
+            Expression::TaggedTemplateExpression(t) => {
+                walk_expr(&t.tag) || t.quasi.expressions.iter().any(walk_expr)
+            }
+            Expression::ComputedMemberExpression(c) => {
+                walk_expr(&c.object) || walk_expr(&c.expression)
+            }
+            Expression::StaticMemberExpression(s) => walk_expr(&s.object),
+            Expression::PrivateFieldExpression(p) => walk_expr(&p.object),
+            Expression::ParenthesizedExpression(p) => walk_expr(&p.expression),
+            Expression::ObjectExpression(o) => o.properties.iter().any(|p| match p {
+                oxc_ast::ast::ObjectPropertyKind::ObjectProperty(op) => walk_expr(&op.value),
+                oxc_ast::ast::ObjectPropertyKind::SpreadProperty(s) => walk_expr(&s.argument),
+            }),
+            Expression::ArrayExpression(arr) => arr.elements.iter().any(|el| match el {
+                ArrayExpressionElement::SpreadElement(s) => walk_expr(&s.argument),
+                ArrayExpressionElement::Elision(_) => false,
+                other => other.as_expression().is_some_and(walk_expr),
+            }),
+            Expression::YieldExpression(y) => y.argument.as_ref().is_some_and(walk_expr),
+            Expression::AwaitExpression(a) => walk_expr(&a.argument),
+            Expression::PrivateInExpression(p) => walk_expr(&p.right),
+            _ => false,
+        }
+    }
+    fn simple_target_is_arguments(t: &SimpleAssignmentTarget<'_>) -> bool {
+        matches!(
+            t,
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) if id.name.as_str() == "arguments"
+        )
+    }
+    fn target_is_arguments(t: &oxc_ast::ast::AssignmentTarget<'_>) -> bool {
+        t.as_simple_assignment_target()
+            .is_some_and(simple_target_is_arguments)
+    }
+    fn walk_stmt(s: &Statement<'_>) -> bool {
+        match s {
+            Statement::ExpressionStatement(e) => walk_expr(&e.expression),
+            Statement::ReturnStatement(r) => r.argument.as_ref().is_some_and(walk_expr),
+            Statement::IfStatement(i) => walk_expr(&i.test) || walk_stmt(&i.consequent),
+            Statement::BlockStatement(b) => b.body.iter().any(walk_stmt),
+            Statement::VariableDeclaration(v) => v
+                .declarations
+                .iter()
+                .any(|d| d.init.as_ref().is_some_and(walk_expr)),
+            Statement::ThrowStatement(t) => walk_expr(&t.argument),
+            Statement::FunctionDeclaration(_) => false,
+            _ => false,
+        }
+    }
+    walk_expr(e)
+}
+
 /// `IsSimpleParameterList` (ES §14.1.13): every formal is a plain
 /// `BindingIdentifier` with no initializer and there is no rest parameter.
 fn is_simple_parameter_list(params: &FormalParameters<'_>) -> bool {
@@ -152,6 +310,11 @@ struct Collector<'s> {
     /// derived constructor. `super()` in a method, a base-class constructor,
     /// or a field initializer is an early SyntaxError (ES §15.7.1).
     super_call_allowed_stack: Vec<bool>,
+    /// Lexically-nested class private-name environments, innermost last. A
+    /// `#x` reference is valid iff some entry contains `#x`; private names are
+    /// only visible inside the class body that declares them (ES §15.7.1
+    /// `AllPrivateNamesValid`).
+    private_name_scopes: Vec<Vec<String>>,
     /// First early-error found during the walk; aborts collection after the
     /// current subtree so one bad construct yields one diagnostic.
     early_error: Option<CompileError>,
@@ -169,6 +332,31 @@ impl<'s> Collector<'s> {
         let unit = self.cur_unit();
         self.plans.home_of.insert(sym, unit);
         self.plans.units[unit].decl_order.push(sym);
+    }
+
+    /// Validates a `#name` reference against the active lexical class scopes.
+    /// `class Outer { #x; m() { this.#x } }` resolves; a reference to a name
+    /// declared only by a nested class, or by no class at all, is an early
+    /// error (`AllPrivateNamesValid`).
+    fn check_private_name_ref(&mut self, name: &str, span: oxc_span::Span) {
+        if self.private_name_scopes.is_empty() {
+            // Not inside any class body: `obj.#x` is always invalid.
+            self.record_early_error(
+                span,
+                format!("SyntaxError: private name '{name}' is not declared in an enclosing class"),
+            );
+            return;
+        }
+        let declared = self
+            .private_name_scopes
+            .iter()
+            .any(|scope| scope.iter().any(|n| n == name));
+        if !declared {
+            self.record_early_error(
+                span,
+                format!("SyntaxError: private name '{name}' is not declared in an enclosing class"),
+            );
+        }
     }
 
     /// Records the first early error encountered while walking; later walks
@@ -228,12 +416,34 @@ impl<'s> Collector<'s> {
         }
     }
 
+    /// Registers an object-literal method (`{ m() {…} }`, getters/setters
+    /// included): a non-arrow function whose HomeObject makes `super.x` legal.
+    fn enter_object_method(&mut self, p: &oxc_ast::ast::ObjectProperty<'_>) {
+        if let Expression::FunctionExpression(f) = &p.value {
+            let hint = static_key_or_default(&p.key);
+            self.fn_unit_ext(f, false, &format!("<objmethod>:{hint}"), true);
+        }
+    }
+
     /// Registers a non-arrow function unit and walks params + body inside it.
     ///
     /// `declare_name_here` is `Some(())` for declarations (name binds in the
     /// enclosing unit) and `None` for expressions (named expressions bind
     /// their own name inside themselves).
     fn fn_unit(&mut self, f: &Function<'_>, declare_name_in_enclosing: bool, hint: &str) -> usize {
+        self.fn_unit_ext(f, declare_name_in_enclosing, hint, false)
+    }
+
+    /// [`Self::fn_unit`] with an explicit HomeObject flag: `allows_super` is
+    /// `true` for object-literal methods, whose function has a HomeObject and
+    /// may reference `super.x` (ES §13.2.5).
+    fn fn_unit_ext(
+        &mut self,
+        f: &Function<'_>,
+        declare_name_in_enclosing: bool,
+        hint: &str,
+        allows_super: bool,
+    ) -> usize {
         if declare_name_in_enclosing
             && let Some(id) = &f.id
             && let Some(sym) = id.symbol_id.get()
@@ -259,6 +469,7 @@ impl<'s> Collector<'s> {
         self.check_use_strict_with_non_simple_params(&f.params, own_strict, f.span());
         let mut plan = UnitPlan::new(Some(parent), false, name_hint);
         plan.is_strict = is_strict;
+        plan.allows_super = allows_super;
         // A named function's `name` own property (installed at closure alloc):
         // without this the name is unobservable (`f.name === undefined`).
         if let Some(id) = f.id.as_ref() {
@@ -269,8 +480,10 @@ impl<'s> Collector<'s> {
         self.unit_stack.push(idx);
         self.strict_stack.push(is_strict);
         // An ordinary (non-arrow) function is a new `super` scope: `super` is
-        // not allowed inside it even when it is textually nested in a method.
-        self.super_allowed_stack.push(false);
+        // not allowed inside it even when it is textually nested in a method —
+        // unless it is an object-literal method with its own HomeObject. It may
+        // never call `super()` (that is constructor-only).
+        self.super_allowed_stack.push(allows_super);
         self.super_call_allowed_stack.push(false);
 
         // Params register first; they occupy the incoming-argument window.
@@ -493,7 +706,7 @@ impl<'s> Collector<'s> {
 
     /// Best-effort key text for a class element's static key (diagnostics only).
     fn static_key_or_default(key: &oxc_ast::ast::PropertyKey<'_>) -> String {
-        crate::expr::static_key_text(key).unwrap_or_else(|| "<computed>".to_string())
+        static_key_or_default(key)
     }
 
     /// Registers a class's constructor and every method as function units,
@@ -519,10 +732,67 @@ impl<'s> Collector<'s> {
                 self.plans.global_vars.insert(sym);
             }
         }
-        // Walk the heritage expression for references.
+        // Static Semantics: Early Errors — a class may declare at most one
+        // `constructor`, and every private name it uses must be bound by the
+        // class body (§15.7.1 `PrototypePropertyNameList`,
+        // `AllPrivateNamesValid`).
+        let mut ctor_count = 0usize;
+        for el in &c.body.body {
+            if let oxc_ast::ast::ClassElement::MethodDefinition(m) = el
+                && m.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+                && !m.r#static
+            {
+                ctor_count += 1;
+            }
+        }
+        if ctor_count > 1 {
+            self.record_early_error(c.span, "SyntaxError: a class may only have one constructor");
+        }
+        // Duplicate private names: `#x` may be declared once (get/set accessor
+        // pairs share a name; a further declaration is an error).
+        let mut seen_private: Vec<(String, bool, bool)> = Vec::new();
+        for el in &c.body.body {
+            let (name, is_accessor, is_get) = match el {
+                oxc_ast::ast::ClassElement::MethodDefinition(m) => {
+                    let Some(n) = private_name_text(&m.key) else {
+                        continue;
+                    };
+                    let is_get = m.kind == oxc_ast::ast::MethodDefinitionKind::Get;
+                    let is_set = m.kind == oxc_ast::ast::MethodDefinitionKind::Set;
+                    (n, is_get || is_set, is_get)
+                }
+                oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
+                    let Some(n) = private_name_text(&p.key) else {
+                        continue;
+                    };
+                    (n, false, false)
+                }
+                _ => continue,
+            };
+            if let Some(existing) = seen_private.iter_mut().find(|(n, _, _)| *n == name) {
+                // A get/set pair is the only legal repeat: one get and one set.
+                if existing.1 && is_accessor && existing.2 != is_get {
+                    existing.1 = false; // pair complete — a third is an error
+                    continue;
+                }
+                self.record_early_error(
+                    el.span(),
+                    format!("SyntaxError: duplicate private name '{name}'"),
+                );
+                continue;
+            }
+            seen_private.push((name, is_accessor, is_get));
+        }
+        // Walk the heritage expression for references. The heritage evaluates
+        // in the *enclosing* context, before this class's private environment
+        // exists, so the new scope is pushed only after it.
         if let Some(h) = &c.heritage {
             self.expr(&h.expression);
         }
+        // Every `#name` referenced anywhere in the class body must be declared
+        // by this class or an enclosing one.
+        self.private_name_scopes.push(declared_private_names(c));
+        let scope_guard = self.private_name_scopes.len();
         // The constructor unit. Class code is always strict: force `is_strict`
         // regardless of the surrounding unit (the class body is its own strict
         // function context).
@@ -593,7 +863,14 @@ impl<'s> Collector<'s> {
                 // attribute any `this` inside them to the constructor unit so
                 // `this` slot is planned. We push constructor idx as current.
                 // A field initializer may read `super.x` but may never call
-                // `super()` (ES §15.7.1: `Initializer Contains SuperCall`).
+                // `super()` (ES §15.7.1: `Initializer Contains SuperCall`) nor
+                // reference `arguments` (`Initializer ContainsArguments`).
+                if contains_arguments(init) {
+                    self.record_early_error(
+                        init.span(),
+                        "SyntaxError: 'arguments' is not allowed in a class field initializer",
+                    );
+                }
                 self.unit_stack.push(idx);
                 self.super_allowed_stack.push(true);
                 self.super_call_allowed_stack.push(false);
@@ -658,8 +935,10 @@ impl<'s> Collector<'s> {
                 self.super_call_allowed_stack.pop();
             }
         }
-        // Pop the class-body strict frame pushed above.
+        // Pop the class-body strict and private-name frames pushed above.
         self.strict_stack.pop();
+        debug_assert_eq!(self.private_name_scopes.len(), scope_guard);
+        self.private_name_scopes.pop();
     }
 
     fn import_decl(&mut self, d: &oxc_ast::ast::ImportDeclaration<'_>) {
@@ -1124,6 +1403,10 @@ impl<'s> Collector<'s> {
             Expression::ChainExpression(_ch) => {
                 // chain contains nested functions only via arguments; ignore detailed walk
             }
+            Expression::PrivateInExpression(p) => {
+                self.check_private_name_ref(&format!("#{}", p.left.name), p.span);
+                self.expr(&p.right);
+            }
             Expression::TemplateLiteral(t) => {
                 for q in &t.quasis {
                     let _ = q;
@@ -1149,7 +1432,10 @@ impl<'s> Collector<'s> {
                 self.expr(&c.expression);
             }
             Expression::StaticMemberExpression(s) => self.expr(&s.object),
-            Expression::PrivateFieldExpression(p) => self.expr(&p.object),
+            Expression::PrivateFieldExpression(p) => {
+                self.check_private_name_ref(&format!("#{}", p.field.name), p.span);
+                self.expr(&p.object);
+            }
             Expression::ObjectExpression(o) => {
                 for prop_kind in &o.properties {
                     if let Some(p) = prop_kind.as_property() {
@@ -1162,7 +1448,21 @@ impl<'s> Collector<'s> {
                                 }
                             }
                         }
-                        self.expr(&p.value);
+                        // An object-literal method (`{ m() { super.x } }`,
+                        // getters/setters included) has a HomeObject, so it
+                        // may use `super.x` (ES §13.2.5); it may still not
+                        // call `super()`. Shorthand `{m}` and `{m: fn}` carry
+                        // no HomeObject and are walked normally.
+                        let is_method_like = p.method
+                            || p.kind == oxc_ast::ast::PropertyKind::Get
+                            || p.kind == oxc_ast::ast::PropertyKind::Set;
+                        if is_method_like
+                            && matches!(&p.value, Expression::FunctionExpression(f) if f.r#type == oxc_ast::ast::FunctionType::FunctionExpression)
+                        {
+                            self.enter_object_method(p);
+                        } else {
+                            self.expr(&p.value);
+                        }
                     }
                 }
             }
@@ -1269,6 +1569,11 @@ impl<'s> Collector<'s> {
                 self.expr(&c.expression);
             }
             SimpleAssignmentTarget::StaticMemberExpression(s) => self.expr(&s.object),
+            SimpleAssignmentTarget::PrivateFieldExpression(p) => {
+                // `this.#x = v`: the write target must also resolve.
+                self.check_private_name_ref(&format!("#{}", p.field.name), p.span);
+                self.expr(&p.object);
+            }
             _ => {}
         }
     }

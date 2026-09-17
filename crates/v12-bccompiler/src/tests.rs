@@ -1857,6 +1857,85 @@ fn super_outside_class_method_is_syntax_error() {
     }
 }
 
+/// ES §15.7.1: object-literal methods have a HomeObject and may use `super.x`,
+/// but not call `super()`.
+#[test]
+fn object_method_super_property_is_allowed() {
+    compile_source_with_strings("var o = { m() { return super.x; } };")
+        .expect("object method super.x is legal");
+    compile_source_with_strings("var o = { get x() { return super.x; } };")
+        .expect("object getter super.x is legal");
+    let err = compile_source_with_strings("var o = { m() { super(); } };")
+        .map_err(|e| e.message)
+        .expect_err("object method super() should fail");
+    assert!(err.contains("super()"), "got: {err}");
+}
+
+/// ES §15.7.1: a class declares `constructor` at most once and a private name
+/// at most once per class (get/set pairs excepted).
+#[test]
+fn duplicate_class_constructor_and_private_names_are_syntax_errors() {
+    let err = compile_source_with_strings("var C = class { constructor(){} constructor(){} };")
+        .map_err(|e| e.message)
+        .expect_err("duplicate constructor should fail");
+    assert!(err.contains("constructor"), "got: {err}");
+    for src in [
+        "var C = class { #m(){} #m(){} };",
+        "var C = class { #m; #m; };",
+        "var C = class { get #m(){} get #m(){} };",
+        "var C = class { #m(){} get #m(){} };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("duplicate private name should fail");
+        assert!(err.contains("private name"), "for {src}: got {err}");
+    }
+    compile_source_with_strings("var C = class { get #m(){} set #m(v){} };")
+        .expect("a get/set pair is one private name");
+}
+
+/// ES §15.7.1: every `#name` reference in a class body must resolve against
+/// the class body's own private names or an enclosing class's.
+#[test]
+fn unresolved_private_name_is_syntax_error() {
+    for src in [
+        "var C = class { m() { this.#x } };",
+        "var C = class { m() { something.#x } };",
+        "var C = class { m() { function fn() { something.#x } } };",
+        "var C = class { m() { class Outter { #x; } this.#x; } };",
+        "var C = class extends class { x = this.#foo; } { #foo; };",
+        "var C = class { m() { return #x in this; } };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("unresolved private name should fail");
+        assert!(err.contains("private name"), "for {src}: got {err}");
+    }
+    // Declared by the class, or by an enclosing class: legal.
+    compile_source_with_strings("var C = class { #x; m() { return this.#x; } };")
+        .expect("declared private name resolves");
+    compile_source_with_strings("var C = class { m() { class O { #x; m2() { this.#x } } } };")
+        .expect("nested class declares and uses its own private name");
+}
+
+/// ES §15.7.1 (`Initializer ContainsArguments`): a class field initializer may
+/// not reference `arguments`, directly or through an arrow.
+#[test]
+fn class_field_initializer_arguments_is_syntax_error() {
+    for src in [
+        "var C = class { x = arguments; };",
+        "var C = class { x = () => true ? {} : arguments; };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("field initializer arguments should fail");
+        assert!(err.contains("arguments"), "for {src}: got {err}");
+    }
+    // A method body may still use `arguments`.
+    compile_source_with_strings("var C = class { m() { return arguments; } };")
+        .expect("method arguments is legal");
+}
+
 /// ES §15.7.1: the `super()` *call* form is constructor-of-a-derived-class only.
 #[test]
 fn super_call_outside_derived_constructor_is_syntax_error() {
