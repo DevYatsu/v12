@@ -569,6 +569,58 @@ impl<'a> Ctx<'a> {
     pub fn array_ctor_value(&self) -> Option<JsValue> {
         self.intrinsic("Array")
     }
+
+    /// Overwrites the value of an already-installed own data property
+    /// `name` on `obj` (no shape transition — the descriptor slot is
+    /// reused). Used by the realm to replace a placeholder installed by
+    /// `install_builtins` with a computed value (e.g. a well-known symbol
+    /// replacing its handler function). A missing key is a no-op.
+    pub fn overwrite_data_prop(&mut self, obj: Handle<JsObject>, name: &str, value: JsValue) {
+        use v12_heap::{PropKey, V12Str};
+        let probe = self
+            .heap
+            .intern_string(V12Str::latin1_slice(name.as_bytes()));
+        let key = PropKey::from_string(probe);
+        let shape = self.heap.shape_of(obj);
+        let Some(slot) = self.heap.lookup_property(shape, key).and_then(|d| d.slot()) else {
+            return;
+        };
+        if let Some(v) = self.heap.get_mut(obj).properties.get_mut(slot as usize) {
+            *v = value;
+        }
+    }
+
+    /// Installs a symbol-keyed data property with explicit attrs. The
+    /// string-keyed [`Self::define_data_prop`] cannot carry a symbol key, so
+    /// well-known-symbol methods (`Date.prototype[@@toPrimitive]`) use this.
+    pub fn define_symbol_data_prop_with_attrs(
+        &mut self,
+        obj: Handle<JsObject>,
+        sym: Handle<v12_heap::V12Symbol>,
+        value: JsValue,
+        attrs: v12_heap::Attrs,
+    ) {
+        let key = v12_heap::PropKey::from_symbol(sym);
+        let shape = self.heap.shape_of_mut(obj);
+        debug_assert!(
+            self.heap.lookup_property(shape, key).is_none(),
+            "duplicate symbol install"
+        );
+        let child = self.heap.add_property(shape, key, attrs);
+        self.heap.bind_shape(obj, child);
+        self.heap.get_mut(obj).properties.push(value);
+        self.heap.get_mut(obj).property_keys.push(Some(key));
+    }
+
+    /// Mints a fresh, rooted symbol (identity is the handle) for a well-known
+    /// `Symbol` property value. Deliberately NOT registered with
+    /// `Heap::symbol_for_key`, so `Symbol.keyFor` returns `undefined` for it
+    /// per spec.
+    pub fn fresh_symbol(&mut self) -> Handle<v12_heap::V12Symbol> {
+        let h = self.heap.alloc(v12_heap::V12Symbol);
+        self.heap.add_root(JsValue::symbol(h));
+        h
+    }
 }
 
 /// Parses a trimmed `0x`/`0b`/`0o` integer literal per
