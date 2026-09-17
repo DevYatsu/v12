@@ -434,6 +434,33 @@ pub enum NativeId {
     /// `Date.prototype.toTemporalInstant` — a stub: v1 has no Temporal, so
     /// the call always throws (the descriptor/arity tests still pass).
     DateProtoToTemporalInstant = 2849,
+    // Reflect
+    /// `Reflect.apply(target, thisArgument, argumentsList)`.
+    ReflectApply = 2900,
+    /// `Reflect.construct(target, argumentsList[, newTarget])`.
+    ReflectConstruct = 2901,
+    /// `Reflect.defineProperty(target, propertyKey, attributes)`.
+    ReflectDefineProperty = 2902,
+    /// `Reflect.deleteProperty(target, propertyKey)`.
+    ReflectDeleteProperty = 2903,
+    /// `Reflect.get(target, propertyKey[, receiver])`.
+    ReflectGet = 2904,
+    /// `Reflect.getOwnPropertyDescriptor(target, propertyKey)`.
+    ReflectGetOwnPropertyDescriptor = 2905,
+    /// `Reflect.getPrototypeOf(target)`.
+    ReflectGetPrototypeOf = 2906,
+    /// `Reflect.has(target, propertyKey)`.
+    ReflectHas = 2907,
+    /// `Reflect.isExtensible(target)`.
+    ReflectIsExtensible = 2908,
+    /// `Reflect.ownKeys(target)`.
+    ReflectOwnKeys = 2909,
+    /// `Reflect.preventExtensions(target)`.
+    ReflectPreventExtensions = 2910,
+    /// `Reflect.set(target, propertyKey, V[, receiver])`.
+    ReflectSet = 2911,
+    /// `Reflect.setPrototypeOf(target, proto)`.
+    ReflectSetPrototypeOf = 2912,
 }
 
 /// The serialized index of a native function.

@@ -337,6 +337,7 @@ impl Realm {
             proxy: intrinsics.get("Proxy").and_then(|v| v.as_object()),
             date: None,
             date_proto,
+            reflect: None,
         };
         crate::builtins::install_builtins(heap, &targets);
 
@@ -447,6 +448,67 @@ impl Realm {
                 }
             }
         }
+
+        // `Reflect`: an ordinary, non-callable object global (like `Math`/
+        // `JSON`, NOT a `GLOBAL_INTRINSICS` slot). Its [[Prototype]] is
+        // `%Object.prototype%`; the 13 statics install on it via
+        // `install_builtins`'s `Reflect` group. `install_builtins` already ran
+        // with `reflect: None`, so allocate first, then run a second grouped
+        // install pass that targets it.
+        let reflect = alloc_root(heap);
+        heap.get_mut(reflect).prototype = Some(object_proto);
+        // `Symbol.toStringTag` = "Reflect": non-writable, non-enumerable,
+        // configurable (ES 17). Symbol-keyed, so it cannot ride the
+        // string-keyed macro install.
+        {
+            let symbol_ctor = intrinsics.get("Symbol").and_then(|v| v.as_object());
+            if let Some(symbol_ctor) = symbol_ctor {
+                let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+                let tag_sym = ctx.fresh_symbol();
+                ctx.overwrite_data_prop(
+                    symbol_ctor,
+                    "toStringTag",
+                    JsValue::symbol(tag_sym),
+                );
+                let reflect_name = ctx.heap.intern_text("Reflect");
+                ctx.define_symbol_data_prop_with_attrs(
+                    reflect,
+                    tag_sym,
+                    JsValue::string(reflect_name),
+                    v12_heap::Attrs::new(false, false, true),
+                );
+            }
+        }
+        let reflect_targets = crate::builtins::BuiltinTargets {
+            global,
+            math: None,
+            number: None,
+            number_proto,
+            string: None,
+            string_proto,
+            array: None,
+            array_proto,
+            object: None,
+            object_proto,
+            function_proto,
+            json: None,
+            boolean_proto,
+            symbol: None,
+            symbol_proto,
+            proxy: None,
+            date: None,
+            date_proto,
+            reflect: Some(reflect),
+        };
+        crate::builtins::install_reflect_builtins(heap, &reflect_targets);
+        // `Reflect` is a global property with the standard builtin attrs
+        // (writable, non-enumerable, configurable).
+        crate::builtins::builtin_install_prop(
+            heap,
+            global,
+            "Reflect",
+            JsValue::object(reflect),
+        );
 
         // The `Function` constructor: not a `GLOBAL_INTRINSICS` slot (so the
         // compiler still refuses a bare `Function` identifier), but installed

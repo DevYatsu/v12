@@ -20,6 +20,7 @@ pub mod object;
 pub mod promise;
 pub mod proxy;
 pub mod regexp;
+pub mod reflect;
 pub mod registry;
 pub mod string;
 pub mod symbol;
@@ -63,6 +64,10 @@ pub struct BuiltinTargets {
     pub date: Option<v12_heap::Handle<v12_heap::JsObject>>,
     /// `%Date.prototype%`.
     pub date_proto: v12_heap::Handle<v12_heap::JsObject>,
+    /// The `Reflect` global object. An ordinary, non-callable object whose 13
+    /// static methods install on it (same mechanism as `Date`: a plain
+    /// shape-bound global property, not a `GLOBAL_INTRINSICS` slot).
+    pub reflect: Option<v12_heap::Handle<v12_heap::JsObject>>,
 }
 
 pub(crate) fn builtin_install_prop(
@@ -313,6 +318,19 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::PromiseFinally => Some(1),
         NativeId::ErrorIsError => Some(1),
         NativeId::ErrorProtoToString => Some(0),
+        NativeId::ReflectApply => Some(3),
+        NativeId::ReflectConstruct => Some(2),
+        NativeId::ReflectDefineProperty => Some(3),
+        NativeId::ReflectDeleteProperty => Some(2),
+        NativeId::ReflectGet => Some(2),
+        NativeId::ReflectGetOwnPropertyDescriptor => Some(2),
+        NativeId::ReflectGetPrototypeOf => Some(1),
+        NativeId::ReflectHas => Some(2),
+        NativeId::ReflectIsExtensible => Some(1),
+        NativeId::ReflectOwnKeys => Some(1),
+        NativeId::ReflectPreventExtensions => Some(1),
+        NativeId::ReflectSet => Some(3),
+        NativeId::ReflectSetPrototypeOf => Some(2),
         _ => None,
     }
 }
@@ -478,6 +496,9 @@ macro_rules! __builtin_emit_install {
     (DateProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, Some($targets.date_proto), $name, $id)
     };
+    (Reflect, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.reflect, $name, $id)
+    };
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, Some($targets.symbol_proto), $name, $id)
     };
@@ -589,6 +610,15 @@ macro_rules! __builtin_emit_install {
         $crate::builtins::install_native_with_length(
             $heap,
             Some($targets.date_proto),
+            $name,
+            $id,
+            Some($len),
+        )
+    };
+    (Reflect, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length(
+            $heap,
+            $targets.reflect,
             $name,
             $id,
             Some($len),
@@ -901,6 +931,21 @@ define_builtins! {
         "toString" (0) => BooleanProtoToString => |heap, this, args| call_ctx(boolean::boolean_proto_to_string, heap, this, args),
         "valueOf" (0) => BooleanProtoValueOf => |heap, this, args| call_ctx(boolean::boolean_proto_value_of, heap, this, args),
     },
+    Reflect {
+        "getPrototypeOf" (1) => ReflectGetPrototypeOf => |heap, this, args| call_ctx(reflect::reflect_get_prototype_of, heap, this, args),
+        "setPrototypeOf" (2) => ReflectSetPrototypeOf => |heap, this, args| call_ctx(reflect::reflect_set_prototype_of, heap, this, args),
+        "isExtensible" (1) => ReflectIsExtensible => |heap, this, args| call_ctx(reflect::reflect_is_extensible, heap, this, args),
+        "preventExtensions" (1) => ReflectPreventExtensions => |heap, this, args| call_ctx(reflect::reflect_prevent_extensions, heap, this, args),
+        "has" (2) => ReflectHas => |heap, this, args| call_ctx(reflect::reflect_has, heap, this, args),
+        "deleteProperty" (2) => ReflectDeleteProperty => |heap, this, args| call_ctx(reflect::reflect_delete_property, heap, this, args),
+        "ownKeys" (1) => ReflectOwnKeys => |heap, this, args| call_ctx(reflect::reflect_own_keys, heap, this, args),
+        "getOwnPropertyDescriptor" (2) => ReflectGetOwnPropertyDescriptor => |heap, this, args| call_ctx(reflect::reflect_get_own_property_descriptor, heap, this, args),
+        "defineProperty" (3) => ReflectDefineProperty => |heap, this, args| call_ctx(reflect::reflect_define_property, heap, this, args),
+        "get" (2) => ReflectGet => |heap, this, args| call_ctx(reflect::reflect_get, heap, this, args),
+        "set" (3) => ReflectSet => |heap, this, args| call_ctx(reflect::reflect_set, heap, this, args),
+        "apply" (3) => ReflectApply => |heap, this, args| call_ctx(reflect::reflect_apply, heap, this, args),
+        "construct" (2) => ReflectConstruct => |heap, this, args| call_ctx(reflect::reflect_construct, heap, this, args),
+    },
     Symbol {
         "for" (1) => SymbolFor => |heap, this, args| call_ctx(symbol::symbol_for, heap, this, args),
         "keyFor" (1) => SymbolKeyFor => |heap, this, args| call_ctx(symbol::symbol_key_for, heap, this, args),
@@ -1044,6 +1089,37 @@ define_builtins! {
     DateProtoToGmtString => |heap, this, args| call_ctx(date::date_proto_to_utc_string, heap, this, args),
     DateProtoToPrimitive => |heap, this, args| call_ctx(date::date_proto_to_primitive, heap, this, args),
     DateProtoToTemporalInstant => |heap, this, args| call_ctx(date::date_proto_to_temporal_instant, heap, this, args),
+}
+
+/// Installs the `Reflect` static methods onto `targets.reflect`.
+///
+/// Separate from [`install_builtins`] because `Reflect` is materialized by
+/// the realm *after* the main install pass runs (with `reflect: None`), so a
+/// second `install_builtins` call would double-install every other group.
+/// The dispatch arms still live in the macro's `Reflect` group — this only
+/// performs the installs.
+pub fn install_reflect_builtins(heap: &mut Heap, targets: &BuiltinTargets) {
+    let Some(reflect) = targets.reflect else { return };
+    for (name, id) in [
+        ("getPrototypeOf", NativeId::ReflectGetPrototypeOf),
+        ("setPrototypeOf", NativeId::ReflectSetPrototypeOf),
+        ("isExtensible", NativeId::ReflectIsExtensible),
+        ("preventExtensions", NativeId::ReflectPreventExtensions),
+        ("has", NativeId::ReflectHas),
+        ("deleteProperty", NativeId::ReflectDeleteProperty),
+        ("ownKeys", NativeId::ReflectOwnKeys),
+        (
+            "getOwnPropertyDescriptor",
+            NativeId::ReflectGetOwnPropertyDescriptor,
+        ),
+        ("defineProperty", NativeId::ReflectDefineProperty),
+        ("get", NativeId::ReflectGet),
+        ("set", NativeId::ReflectSet),
+        ("apply", NativeId::ReflectApply),
+        ("construct", NativeId::ReflectConstruct),
+    ] {
+        install_native(heap, Some(reflect), name, id);
+    }
 }
 
 /// Installs the core built-ins into `registry`.
