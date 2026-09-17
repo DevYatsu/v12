@@ -418,29 +418,44 @@ impl Interp<'_> {
     }
 
     /// ES IteratorClose (7.4.6): call `iterator.return()` when present.
-    /// Non-object `return` methods are ignored (spec: return is not a
-    /// function → continue unwinding). The close is best-effort — the
-    /// original completion always wins.
+    /// GetMethod semantics: null/undefined means "no close"; any other
+    /// non-callable value is a TypeError. Callability is `Kind::Function`
+    /// (the same gate as `prepare_call`), not mere object-ness: a plain
+    /// object in the `return` slot must throw here rather than fall through
+    /// to `call_inline` and read a placeholder callable.
+    /// A throw from `return()` propagates: on the inline break/return path
+    /// the close error is the completion, and on the exception-handler path
+    /// the compiler rethrows the original error after a successful close.
+    /// NOTE: the `return()` *result* is deliberately not validated as an
+    /// Object here. Spec 7.4.6 checks the result only after the
+    /// throw-completion early-out ("if completion is throw, return
+    /// completion"), so the check needs the completion type the opcode
+    /// does not carry. Validating unconditionally regresses the throw path
+    /// (a `return(){}` yielding `undefined` would mask the original error
+    /// with a TypeError). The check belongs in the completion-aware close
+    /// contract — PENDING on lane A2 (see fix-log).
     pub(crate) fn op_iterator_close(&mut self, iter_v: JsValue) -> Result<(), JSException> {
         let Some(_iter_obj) = iter_v.as_object() else {
             return Ok(());
         };
         let return_key = self.new_temp_key("return");
         let return_v = self.get_property(0, 0, iter_v, return_key)?;
-        // Spec 7.4.11: `return` may be null/undefined (no close), but any
-        // other non-callable value is a TypeError.
         if return_v.is_null() || return_v.is_undefined() {
             return Ok(());
         }
-        let Some(return_obj) = return_v.as_object() else {
+        let Some(return_obj) = return_v
+            .as_object()
+            .filter(|h| self.heap.get(*h).kind == Kind::Function)
+        else {
             return Err(JSException(
                 self.error_value("TypeError: iterator.return is not a function"),
             ));
         };
         self.stack.push(JsValue::object(return_obj));
         self.gc_protect();
-        self.call_inline(return_obj, iter_v, &[])?;
+        let inner = self.call_inline(return_obj, iter_v, &[]);
         self.stack.pop();
+        inner?;
         Ok(())
     }
 

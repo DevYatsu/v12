@@ -16,6 +16,23 @@ Append-only log. Each entry records one fix, its before/after harness numbers, a
 - **Runner:** `./conformance/run.sh --filter <f> --jobs 8`
 - **Notes:** workspace gate 584/584; `cargo clippy --workspace --all-targets` 0 errors (only the accepted unwrap/expect policy notes); `cargo fmt --check` clean. Lane tag: `lane/builtin-breadth`.
 
+### 2026-09-17 — Lane E iterator-close (interp half) [lane/e-iterator-close]
+
+- **Filter:** `language/statements/for-of` (752 tests) and `language/statements/for-await-of` (1 235 tests), `--jobs 4`, `--format human`
+- **Before:** for-of 474 pass / 273 fail / 5 skip (63.5 %); for-await 413 pass / 822 fail / 0 skip (33.4 %) — measured on detached baseline worktree at 8722ba9
+- **After:** for-of 474 pass / 273 fail / 5 skip (63.5 %); for-await 413 pass / 822 fail / 0 skip (33.4 %) — identical, no regressions
+- **Delta:** +0 pass, −0 fail (behavior-neutral on test262; no test covers the fixed hole — see notes)
+- **Engine change:** `op_iterator_close` (crates/v12-interp/src/object_ops.rs) now applies GetMethod callability (`Kind::Function`, same gate as `prepare_call`): a present-but-plain-object `iterator.return` throws `TypeError: iterator.return is not a function` instead of falling into `call_inline` and reading a placeholder callable. Comment corrected (old text claimed "original completion always wins", which is false on the inline path).
+- **Files:** crates/v12-interp/src/object_ops.rs (only); conformance/fix-log.md (this entry)
+- **Bucket:** ROADMAP item E (interp half) — abrupt-completion close hardening; the 205-count `abrupt completion closes iter` bucket stays open for lane A2
+- **Runner:** `./conformance/run.sh --filter language/statements/for-of --jobs 4` / `--filter language/statements/for-await-of --jobs 4`
+- **Verification:** `cargo nextest run --workspace` 584 passed / 0 skipped; `cargo clippy --workspace --all-targets` 0 errors (accepted unwrap/expect policy warnings only); `cargo fmt --check -p v12-interp` clean
+- **Notes:**
+  - An intermediate revision also validated the `return()` result as an Object (spec 7.4.6 post-throw-out step; fixes `iterator-close-non-object.js` on the break path) but it regressed the throw path (`body-put-error.js`, `body-dstr-assign-error.js`: `return(){}` yields `undefined`, which must be ignored when the completion is throw) — reverted before commit. The opcode carries no completion type, so that check cannot live in the shared arm.
+  - PENDING (lane A2, compiler lowering — not touched): the for-of/for-await exception-handler shape `IteratorClose iter; Throw exc` propagates close errors (GetMethod throw, non-callable, `return()` throw, non-object result) and masks the original error, violating spec 7.4.6 step "if completion is throw, return completion" (cf. `iterator-close-throw-get-method-non-callable.js`, `iterator-close-throw-get-method-abrupt.js`, `iterator-close-non-object.js` on throw paths, `dstr/*-nrml-close-*`). Prescription: emit a swallowing/best-effort close variant on handler paths (inline break/continue/return closes keep propagating semantics); the non-object-result TypeError check then belongs in the shared completion-aware helper. Also for-await still lowers via sync `GetIterator` (async-from-sync wrapping is lowering-side).
+  - Yield* needs no interp change: it lowers to a generic SuspendYield iterator loop whose abrupt edges already route through the same close paths.
+  - Remaining for-of failures are out-of-scope buckets (arguments aliasing, destructuring `missing from plans`, classes, completions) owned by other lanes.
+
 ## Template
 
 Copy the block below for each fix. Keep it under 20 lines.
