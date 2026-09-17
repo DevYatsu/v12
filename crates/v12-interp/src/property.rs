@@ -896,13 +896,17 @@ impl Interp<'_> {
     /// `SetProperty`: overwrite own writable slots, create new own properties
     /// through shape transitions, shadow writable inherited ones, and route
     /// canonical indices on arrays through the element store. Blocked writes
-    /// are silently dropped, matching sloppy-mode JS; strict-mode throwing
-    /// awaits error-object plumbing.
+    /// (non-writable own/inherited data, setterless accessors, primitive
+    /// bases, non-extensible receivers) are silently dropped in sloppy mode
+    /// and throw a `TypeError` in strict mode (ES OrdinarySet `Throw`
+    /// parameter), selected by `strict` — threaded from the current
+    /// `FunctionBytecode::is_strict` at the `SetProperty` arm.
     pub(crate) fn set_property(
         &mut self,
         obj_v: JsValue,
         key_v: JsValue,
         value: JsValue,
+        strict: bool,
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             if obj_v.is_null() || obj_v.is_undefined() {
@@ -910,7 +914,13 @@ impl Interp<'_> {
                     "TypeError: cannot set properties of null or undefined",
                 )));
             }
-            // Primitive targets accept and drop writes (no wrapper objects).
+            // Primitive targets accept and drop writes in sloppy mode (no
+            // wrapper objects); strict mode throws per ES SetValue.
+            if strict {
+                return Err(JSException(self.error_value(
+                    "TypeError: cannot set property on a primitive value",
+                )));
+            }
             return Ok(());
         };
 
@@ -960,16 +970,25 @@ impl Interp<'_> {
                     if attrs.writable() {
                         let idx = self.global_slot_index(obj, slot as usize);
                         self.heap.get_mut(obj).properties[idx] = value;
+                    } else if strict {
+                        return Err(JSException(
+                            self.error_value("TypeError: cannot assign to read-only property"),
+                        ));
                     }
                     return Ok(());
                 }
                 Descriptor::Accessor { setter, .. } => {
                     // Accessor with setter: invoke it with `this` = the
                     // receiver and the assigned value as the argument. Without
-                    // a setter, sloppy sets are silently dropped.
+                    // a setter, sloppy sets are silently dropped and strict
+                    // sets throw.
                     if let Some(setter) = setter {
                         let args = [value];
                         self.call_accessor_with(setter, JsValue::object(obj), &args)?;
+                    } else if strict {
+                        return Err(JSException(self.error_value(
+                            "TypeError: cannot assign to accessor without setter",
+                        )));
                     }
                     return Ok(());
                 }
@@ -990,22 +1009,45 @@ impl Interp<'_> {
                 if let Some(setter) = entry.setter {
                     let args = [value];
                     self.call_accessor_with(setter, JsValue::object(obj), &args)?;
+                } else if strict {
+                    return Err(JSException(self.error_value(
+                        "TypeError: cannot assign to accessor without setter",
+                    )));
                 }
                 return Ok(());
             }
             if entry.attrs.writable() {
                 let idx = self.global_slot_index(obj, entry.slot as usize);
                 self.heap.get_mut(obj).properties[idx] = value;
+            } else if strict {
+                return Err(JSException(
+                    self.error_value("TypeError: cannot assign to read-only property"),
+                ));
             }
             return Ok(());
         }
 
         // An inherited non-writable data property or accessor without setter
-        // blocks shadowing (ES OrdinarySet).
+        // blocks shadowing (ES OrdinarySet): silent in sloppy, TypeError in
+        // strict.
         if let Some(d) = self.inherited_descriptor(obj, key) {
             match d {
-                Descriptor::Data { attrs, .. } if !attrs.writable() => return Ok(()),
-                Descriptor::Accessor { setter, .. } if setter.is_none() => return Ok(()),
+                Descriptor::Data { attrs, .. } if !attrs.writable() => {
+                    if strict {
+                        return Err(JSException(
+                            self.error_value("TypeError: cannot assign to read-only property"),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Descriptor::Accessor { setter, .. } if setter.is_none() => {
+                    if strict {
+                        return Err(JSException(self.error_value(
+                            "TypeError: cannot assign to accessor without setter",
+                        )));
+                    }
+                    return Ok(());
+                }
                 Descriptor::Accessor {
                     setter: Some(setter),
                     ..
@@ -1020,6 +1062,11 @@ impl Interp<'_> {
         }
 
         if self.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
+            if strict {
+                return Err(JSException(self.error_value(
+                    "TypeError: cannot add property to non-extensible object",
+                )));
+            }
             return Ok(());
         }
 
@@ -1302,7 +1349,7 @@ impl Interp<'_> {
             if trap_v.is_undefined() || trap_v.is_null() {
                 // No trap (`GetMethod` maps null to undefined): forward to
                 // the target through the ordinary path.
-                return self.set_property(JsValue::object(target), key_v, value);
+                return self.set_property(JsValue::object(target), key_v, value, false);
             }
             return Err(JSException(
                 self.error_value("TypeError: 'set' trap must be a function"),

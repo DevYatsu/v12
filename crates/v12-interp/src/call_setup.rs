@@ -1140,7 +1140,7 @@ impl Interp<'_> {
                 // that path allocates, so root it for the duration.
                 let p_val = JsValue::object(p);
                 self.heap.add_root(p_val);
-                self.set_property(callee_v, JsValue::string(key_handle), p_val)?;
+                self.set_property(callee_v, JsValue::string(key_handle), p_val, false)?;
                 p_val
             }
         };
@@ -1450,11 +1450,15 @@ impl Interp<'_> {
                 self.gc_protect();
                 let len_key = JsValue::string(self.heap.intern_text("length"));
                 let len_v = JsValue::from_i32_smi(bound_len as i32).expect("bound arity fits Smi");
-                let _ = self.set_property(JsValue::object(bound), len_key, len_v);
+                let _ = self.set_property(JsValue::object(bound), len_key, len_v, false);
                 let name_key = JsValue::string(self.heap.intern_text("name"));
                 let name_h = self.heap.intern_text(&bound_name);
-                let _ =
-                    self.set_property(JsValue::object(bound), name_key, JsValue::string(name_h));
+                let _ = self.set_property(
+                    JsValue::object(bound),
+                    name_key,
+                    JsValue::string(name_h),
+                    false,
+                );
                 self.stack.pop();
                 Ok(JsValue::object(bound))
             }
