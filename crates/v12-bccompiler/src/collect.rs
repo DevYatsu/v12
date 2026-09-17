@@ -66,6 +66,7 @@ fn collect_inner(
         super_allowed_stack: Vec::new(),
         super_call_allowed_stack: Vec::new(),
         private_name_scopes: Vec::new(),
+        walking_params: false,
         early_error: None,
     };
     c.plans.is_module = is_module;
@@ -315,6 +316,12 @@ struct Collector<'s> {
     /// only visible inside the class body that declares them (ES §15.7.1
     /// `AllPrivateNamesValid`).
     private_name_scopes: Vec<Vec<String>>,
+    /// `true` while walking a formal-parameter list (including defaults and
+    /// nested arrow parameters). A `YieldExpression` or `AwaitExpression`
+    /// appearing directly in a parameter list is always an early SyntaxError,
+    /// because parameters evaluate before the function is resumable
+    /// (ES §14.1.2, §14.2.1, §14.4).
+    walking_params: bool,
     /// First early-error found during the walk; aborts collection after the
     /// current subtree so one bad construct yields one diagnostic.
     early_error: Option<CompileError>,
@@ -487,6 +494,8 @@ impl<'s> Collector<'s> {
         self.super_call_allowed_stack.push(false);
 
         // Params register first; they occupy the incoming-argument window.
+        // `register_formals` walks them under `walking_params` to reject
+        // `yield`/`await` in defaults; the body below is a fresh context.
         self.register_formals(idx, &f.params);
 
         // Named function *expressions* bind their own name inside themselves,
@@ -498,9 +507,16 @@ impl<'s> Collector<'s> {
             self.declare(sym);
         }
 
+        // The body is a fresh function context: clear `walking_params` so a
+        // nested generator/async function declared inside an *outer* parameter
+        // default can use `yield`/`await` in its own body. `register_formals`
+        // already restored the caller's value for the outer walk to resume.
+        let prev_params = self.walking_params;
+        self.walking_params = false;
         if let Some(body) = f.body.as_deref() {
             self.stmt_list(&body.statements);
         }
+        self.walking_params = prev_params;
         self.unit_stack.pop();
         self.strict_stack.pop();
         self.super_allowed_stack.pop();
@@ -534,7 +550,12 @@ impl<'s> Collector<'s> {
         self.plans.units[idx].allows_super = inherited_super;
         self.super_allowed_stack.push(inherited_super);
         self.super_call_allowed_stack.push(inherited_super_call);
+        // `register_formals` walks the arrow's parameters as a parameter list
+        // (rejecting `yield`/`await` in defaults) and restores the flag. The
+        // body is a fresh function context.
+        let prev_params = self.walking_params;
         self.register_formals(idx, &a.params);
+        self.walking_params = false;
         match a.get_function_body() {
             Some(body) => self.stmt_list(&body.statements),
             None => {
@@ -543,6 +564,7 @@ impl<'s> Collector<'s> {
                 }
             }
         }
+        self.walking_params = prev_params;
         self.unit_stack.pop();
         self.strict_stack.pop();
         self.super_allowed_stack.pop();
@@ -840,10 +862,13 @@ impl<'s> Collector<'s> {
                 ctor_strict,
                 m.value.span,
             );
+            let prev_params = self.walking_params;
             self.register_formals(idx, &m.value.params);
+            self.walking_params = false;
             if let Some(body) = m.value.body.as_deref() {
                 self.stmt_list(&body.statements);
             }
+            self.walking_params = prev_params;
         }
         if let Some(id) = &c.id {
             self.plans.units[idx].function_name = Some(id.name.to_string());
@@ -946,10 +971,13 @@ impl<'s> Collector<'s> {
                 // A method (including a getter/setter) may use `super.x` but
                 // may not call `super()` — that is constructor-only.
                 self.super_call_allowed_stack.push(false);
+                let prev_params = self.walking_params;
                 self.register_formals(midx, &m.value.params);
+                self.walking_params = false;
                 if let Some(body) = m.value.body.as_deref() {
                     self.stmt_list(&body.statements);
                 }
+                self.walking_params = prev_params;
                 self.unit_stack.pop();
                 self.strict_stack.pop();
                 self.super_allowed_stack.pop();
@@ -1286,6 +1314,11 @@ impl<'s> Collector<'s> {
     /// (so captures and default-RHS references are collected) and records the
     /// top-level arity separately from the leaf count.
     fn register_formals(&mut self, idx: usize, params: &FormalParameters<'_>) {
+        // Every caller is evaluating a parameter list; defaults in particular
+        // must reject `yield`/`await` (ES §14.1.2/§14.2.1/§14.4). Nested
+        // functions inside a default save and restore this flag themselves.
+        let prev_params = self.walking_params;
+        self.walking_params = true;
         for p in &params.items {
             self.binding_pattern(&p.pattern);
             // oxc stores a top-level default (`a = 1`, `[a] = []`) on the
@@ -1312,6 +1345,7 @@ impl<'s> Collector<'s> {
         self.plans.units[idx].rest_ident = rest_ident;
         self.plans.units[idx].has_rest = params.rest.is_some();
         self.plans.units[idx].expected_args = expected_args(&params.items);
+        self.walking_params = prev_params;
     }
 
     // Arrow units always have a parent (the compiler guarantees a non-arrow
@@ -1460,11 +1494,31 @@ impl<'s> Collector<'s> {
                 }
             }
             Expression::YieldExpression(y) => {
+                // A `YieldExpression` in a formal-parameter list is always an
+                // early error: parameters evaluate before the generator is
+                // resumable (ES §14.4). In a non-generator context oxc parses
+                // `yield` as an `IdentifierReference`, so this arm only fires
+                // for genuine yield expressions.
+                if self.walking_params {
+                    self.record_early_error(
+                        y.span,
+                        "SyntaxError: yield expression not allowed in a parameter list",
+                    );
+                }
                 if let Some(arg) = &y.argument {
                     self.expr(arg);
                 }
             }
-            Expression::AwaitExpression(a) => self.expr(&a.argument),
+            Expression::AwaitExpression(a) => {
+                // Likewise `await` in a formal-parameter list (ES §14.2.1).
+                if self.walking_params {
+                    self.record_early_error(
+                        a.span,
+                        "SyntaxError: await expression not allowed in a parameter list",
+                    );
+                }
+                self.expr(&a.argument);
+            }
             Expression::ComputedMemberExpression(c) => {
                 self.expr(&c.object);
                 self.expr(&c.expression);

@@ -1925,6 +1925,45 @@ fn unresolved_private_name_is_syntax_error() {
     assert!(err.contains("private name"), "got: {err}");
 }
 
+/// ES §14.1.2/§14.2.1/§14.4: `yield` and `await` expressions may not appear
+/// in a formal-parameter list (parameters evaluate before the function is
+/// resumable), but a nested function's own body is a fresh context.
+#[test]
+fn yield_await_in_parameter_list_is_syntax_error() {
+    for src in [
+        "function* g(x = yield) {}",
+        "0, function*(x = yield) {};",
+        "function *g() { (x = yield) => {}; }",
+        "(async function*(x = await 1) { });",
+        "async() => { (a = await 1) => {} };",
+        "0, class { m(x = yield) {} };",
+        "0, class { static *m(x = yield) {} };",
+        "function* outer() { ({ *method(x = yield) {} }); }",
+    ] {
+        // Class methods are always strict, so they may reject with either the
+        // parameter-list or the strict reserved-word diagnostic; both are
+        // correct early errors.
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("yield/await in a parameter list should fail");
+        assert!(
+            err.contains("parameter list")
+                || err.contains("not allowed")
+                || err.contains("reserved word"),
+            "for {src}: got {err}"
+        );
+    }
+    // A nested generator/async function declared in an outer parameter default
+    // may use yield/await in its own body.
+    for src in [
+        "function f(a = function*() { yield 1; }) { return a; }",
+        "function f(a = async function() { await 1; }) { return a; }",
+        "var g = function(a = function*() { yield 1; }) {};",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
 /// ES §12.1.1: strict-mode `IdentifierReference` positions reject the
 /// FutureReservedWords, including object shorthand and destructuring targets.
 #[test]
