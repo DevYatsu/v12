@@ -2,6 +2,27 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/reflect-builtin: the `Reflect` global from scratch [lane/reflect-builtin]
+
+- **Filter:** `built-ins/Reflect` (154), `language/expressions` (11 128), `--jobs 6`/`8`, `--format human`
+- **Before:** `built-ins/Reflect` **0 / 154 (0 %)** — `Reflect` was entirely absent (`ReferenceError: Reflect is not defined` on every test); `language/expressions` 7 172 pass at base `2011965`.
+- **After:** `built-ins/Reflect` **109 / 154 (71.2 %)**; `language/expressions` **7 189 pass / 3 923 fail / 16 skip (64.7 %)**. +109 and +17, 0 regressions.
+- **Engine change:** two commits on `lane/reflect-builtin` — `d6de02c` (delegating statics + install), `6700695` (non-constructor guard + `ownKeys` liveness).
+  - **Surface:** all 13 statics — `apply`, `construct`, `defineProperty`, `deleteProperty`, `get`, `getOwnPropertyDescriptor`, `getPrototypeOf`, `has`, `isExtensible`, `ownKeys`, `preventExtensions`, `set`, `setPrototypeOf` — plus `Reflect[Symbol.toStringTag]` = `"Reflect"` `{writable:false, enumerable:false, configurable:true}`.
+  - **Wiring:** `Reflect` is deliberately NOT a `GLOBAL_INTRINSICS` slot (avoiding any `crates/v12-bytecode/**` change): it installs as an ordinary shape-bound global property with `{writable:true, enumerable:false, configurable:true}`, the same mechanism `Date`/`Function` use, which the compiler resolves through `GetGlobal`. New `NativeId`s appended with explicit discriminants from 2900.
+  - **Semantics:** `ToObject` target guard (`TypeError` on primitive targets); `ToPropertyKey` on the key; boolean-returning operations (`defineProperty`/`deleteProperty`/`preventExtensions`/`set`/`setPrototypeOf`/`isExtensible`/`has`) return `false` rather than throwing on ordinary failure; `getOwnPropertyDescriptor` builds a real `FromPropertyDescriptor` object; `ownKeys` implements `OrdinaryOwnPropertyKeys` (indices ascending, strings in creation order, symbols last) with deleted-slot liveness filtering; `setPrototypeOf` implements the same-value short-circuit, extension check, and cycle guard.
+  - **Non-constructor guard:** the interpreter's native construct path passes the callee function object as `this`, so a `Kind::Function` receiver identifies `new Reflect.method(...)` and throws `TypeError` (13 `not-a-constructor` tests).
+- **Files:** `crates/v12-engine/src/builtins/reflect.rs` (new, ~740 lines), `crates/v12-engine/src/builtins/mod.rs`, `crates/v12-engine/src/realm.rs`, `crates/v12-native/src/id.rs`, conformance/fix-log.md (this entry). No additions were needed to `internal_methods.rs` or `builtins/helpers.rs`.
+- **Bucket:** ROADMAP item A — a completely missing builtin global.
+- **Runner:** `./conformance/run.sh --filter built-ins/Reflect --jobs 6`; `./conformance/run.sh --filter language/expressions --jobs 8`
+- **Verification:** `cargo nextest run --workspace` 617 passed / 0 failed; `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean (files formatted with `cargo fmt -p v12-engine -p v12-native`, never workspace-wide).
+- **Residual blocker (documented, not fought):** a `NativeHandler` receives only `&mut Heap` and cannot re-enter the interpreter. The 44 remaining failures reduce to this one limit:
+  - `apply`/`construct` on *bytecode* targets (call/construct must be driven by the interpreter): `apply` 4, `construct` 4.
+  - Accessor side effects during an operation: `get`/`set` cannot invoke a bytecode getter/setter (`get` 4, `set` 6).
+  - `Proxy` trap dispatch: 8 tests install a throwing proxy trap and expect the trap's `Test262Error`; proxy traps are stubs.
+  - Abrupt-from-`toString`/`ToPropertyKey` (`{toString(){throw …}}` on the key, `{get enumerable(){throw}}` on the descriptor object): ~9 — the coercion path cannot call the bytecode hook.
+  - `Object.prototype` linkage for object literals is incomplete engine-wide (`Object.getPrototypeOf({})` reads `null`), which fails 6 `setPrototypeOf`/`getPrototypeOf`/`prop-desc` tests that assert the prototype stays `Object.prototype`.
+
 ### 2026-09-17 — lane/property-descriptors: partial-descriptor `[[DefineOwnProperty]]`, `defineProperties`/`getOwnPropertyDescriptors`/`Object.create(props)`, own-key ordering, array `ArraySetLength` [lane/property-descriptors]
 
 - **Filter:** `built-ins/Object` (3 414), `language/expressions/object` (1 170), `language/expressions` (11 128), `--jobs 6`/`8`, `--format human`

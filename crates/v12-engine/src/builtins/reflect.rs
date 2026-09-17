@@ -262,9 +262,7 @@ pub(crate) fn to_property_descriptor(
     v: JsValue,
 ) -> Result<crate::internal_methods::FullDescriptor, Throw> {
     let Some(obj) = v.as_object() else {
-        return Err(Throw::Message(
-            "TypeError: Property description must be an object".to_string(),
-        ));
+        return Err(ctx.type_error("Property description must be an object"));
     };
     let mut desc = crate::internal_methods::FullDescriptor::default();
     for name in [
@@ -296,10 +294,9 @@ pub(crate) fn to_property_descriptor(
                         .as_object()
                         .is_some_and(|h| ctx.heap.get(h).kind == v12_heap::Kind::Function);
                     if !callable {
-                        return Err(Throw::Message(
-                            "TypeError: Accessor property must be a function or undefined"
-                                .to_string(),
-                        ));
+                        return Err(
+                            ctx.type_error("Accessor property must be a function or undefined")
+                        );
                     }
                 }
                 if name == "get" {
@@ -312,8 +309,8 @@ pub(crate) fn to_property_descriptor(
         }
     }
     if desc.is_data() && desc.is_accessor() {
-        return Err(Throw::Message(
-            "TypeError: Invalid property descriptor: cannot both specify accessors and a value or writable attribute".to_string(),
+        return Err(ctx.type_error(
+            "Invalid property descriptor: cannot both specify accessors and a value or writable attribute",
         ));
     }
     Ok(desc)
@@ -348,9 +345,7 @@ pub fn reflect_set_prototype_of(
     } else if let Some(h) = proto.as_object() {
         Some(h)
     } else {
-        return Err(Throw::Message(
-            "TypeError: Reflect.setPrototypeOf proto must be an object or null".to_string(),
-        ));
+        return Err(ctx.type_error("Reflect.setPrototypeOf proto must be an object or null"));
     };
     // ES 9.1.2 step 4: same value short-circuits true, even when frozen.
     if link == ctx.heap.get(obj).prototype {
@@ -659,9 +654,7 @@ fn is_constructor(heap: &Heap, obj: Handle<JsObject>) -> bool {
 /// requires an object, reads `length`, then indices `0..len`.
 pub fn create_list_from_array_like(ctx: &mut Ctx, v: JsValue) -> Result<Vec<JsValue>, Throw> {
     let Some(obj) = v.as_object() else {
-        return Err(Throw::Message(
-            "TypeError: CreateListFromArrayLike called on non-object".to_string(),
-        ));
+        return Err(ctx.type_error("CreateListFromArrayLike called on non-object"));
     };
     let len_key = PropKey::from_string(ctx.heap.intern_text("length"));
     let len_v =
