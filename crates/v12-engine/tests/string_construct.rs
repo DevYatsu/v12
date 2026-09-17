@@ -39,11 +39,10 @@ fn new_string_invokes_object_to_string() {
 }
 
 #[test]
-fn string_symbol_throws_type_error() {
-    assert_eq!(
-        eval_display("try { String(Symbol('x')); 'no'; } catch (e) { 'threw'; }"),
-        "threw"
-    );
+fn string_symbol_call_descriptive_construct_throws() {
+    // ES 22.1.1.1: the call form returns SymbolDescriptiveString (v1 has
+    // opaque symbols, so `Symbol()`); only `new String(symbol)` throws.
+    assert_eq!(eval_display("String(Symbol('x'))"), "Symbol()");
     assert_eq!(
         eval_display("try { new String(Symbol('x')); 'no'; } catch (e) { 'threw'; }"),
         "threw"
@@ -52,7 +51,7 @@ fn string_symbol_throws_type_error() {
 
 #[test]
 fn string_primitives_unchanged() {
-    assert_eq!(eval_display("String()"), "undefined");
+    assert_eq!(eval_display("String()"), "");
     assert_eq!(eval_display("String(null)"), "null");
     assert_eq!(eval_display("String(12)"), "12");
     assert_eq!(eval_display("String(true)"), "true");

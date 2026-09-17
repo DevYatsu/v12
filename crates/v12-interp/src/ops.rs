@@ -634,7 +634,7 @@ impl Interp<'_> {
     }
 
     /// The ES TypeError for `ToString(symbol)`.
-    fn symbol_to_string_type_error(&mut self) -> JSException {
+    pub(crate) fn symbol_to_string_type_error(&mut self) -> JSException {
         JSException(self.error_value("TypeError: Cannot convert a Symbol value to a string"))
     }
 

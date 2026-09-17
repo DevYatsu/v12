@@ -1527,11 +1527,7 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Option<Result<JsValue, JSException>> {
         match id {
-            // `String(x)` must run user `toString`/`valueOf` (string-hint
-            // ToPrimitive), which re-enters the machine, so it cannot run as
-            // a pure `NativeHandler`. Both the call and `new String(x)`
-            // construct paths reach this router.
-            NativeId::StringConstruct => Some(self.run_string_construct(args)),
+            NativeId::StringConstruct => Some(self.run_string_construct(this_v, args)),
             NativeId::ArrayForEach
             | NativeId::ArrayMap
             | NativeId::ArrayFilter
@@ -1561,11 +1557,34 @@ impl Interp<'_> {
     }
 
     /// ES `String(value)` with the string-hint ToPrimitive so a user
-    /// `toString` is invoked. `new String(value)` reaches the same router
-    /// via `prepare_construct`; v1 has no String-wrapper object, so both
-    /// forms yield the primitive (documented YAGNI deviation).
-    fn run_string_construct(&mut self, args: &[JsValue]) -> Result<JsValue, JSException> {
-        let v = args.first().copied().unwrap_or(JsValue::undefined());
+    /// `toString` is invoked. The construct path (`new String(value)`)
+    /// arrives with the constructor function as `this` (same discriminator
+    /// as `Symbol`): ES requires `new String(symbol)` to throw, while the
+    /// call form returns `SymbolDescriptiveString`. v1 has no String-wrapper
+    /// object, so `new String(x)` yields the primitive (documented YAGNI
+    /// deviation).
+    fn run_string_construct(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let is_construct = this_v
+            .as_object()
+            .is_some_and(|o| self.heap.get(o).kind == Kind::Function);
+        // ES 22.1.1.1 step 1: no arguments yields "".
+        let Some(&v) = args.first() else {
+            return Ok(JsValue::string(self.heap.intern_text("")));
+        };
+        // ES 22.1.1.1 step 2: call form with a Symbol returns
+        // SymbolDescriptiveString without throwing; only the construct form
+        // (and implicit ToString) throws. v1 symbols are opaque, so the
+        // description is always `Symbol()`.
+        if v.is_symbol() {
+            if is_construct {
+                return Err(self.symbol_to_string_type_error());
+            }
+            return Ok(JsValue::string(self.heap.intern_text("Symbol()")));
+        }
         self.to_string_value(v)
     }
 
