@@ -294,3 +294,117 @@ mod promise_job_tests {
         assert_eq!(*flag.borrow(), 1);
     }
 }
+
+#[cfg(test)]
+mod display_tests {
+    use crate::engine::Engine;
+
+    /// Display text of a value thrown by `source` (the engine's diagnostic
+    /// path, `Engine::to_display_string`).
+    fn thrown_text(source: &str) -> String {
+        let mut engine = Engine::new();
+        let thrown = engine.eval(source).expect_err("source must throw");
+        engine.to_display_string(thrown)
+    }
+
+    #[test]
+    fn map_results_render_as_arrays_not_opaque_objects() {
+        assert_eq!(thrown_text("throw [1,2,3].map(x => x * 2);"), "2,4,6");
+    }
+
+    #[test]
+    fn collections_render_their_entries() {
+        assert_eq!(
+            thrown_text("let s = new Set(); s.add(1); s.add('x'); throw s;"),
+            "Set(2) {1, x}"
+        );
+        assert_eq!(
+            thrown_text("let m = new Map(); m.set('a', 1); throw m;"),
+            "Map(1) {a => 1}"
+        );
+    }
+
+    #[test]
+    fn bigints_render_decimal_with_suffix() {
+        assert_eq!(thrown_text("throw 255n;"), "255n");
+        assert_eq!(thrown_text("throw 0n;"), "0n");
+        // 2^64, well past the f64 exact-integer range: decimal must be exact.
+        assert_eq!(
+            thrown_text("throw 18446744073709551616n;"),
+            "18446744073709551616n"
+        );
+        assert_eq!(
+            thrown_text("throw 123456789012345678901234567890n;"),
+            "123456789012345678901234567890n"
+        );
+    }
+
+    #[test]
+    fn symbols_render_like_symbol_to_string() {
+        assert_eq!(thrown_text("throw Symbol.iterator;"), "Symbol()");
+    }
+
+    #[test]
+    fn regexps_render_source_and_flags() {
+        assert_eq!(thrown_text("throw /ab+/gi;"), "/ab+/gi");
+    }
+
+    #[test]
+    fn settled_promises_render_state_and_payload() {
+        assert_eq!(thrown_text("throw Promise.resolve(42);"), "Promise { 42 }");
+        assert_eq!(
+            thrown_text("throw Promise.reject('bad');"),
+            "Promise { <rejected> bad }"
+        );
+        assert_eq!(
+            thrown_text("throw new Promise(function () {});"),
+            "Promise { <pending> }"
+        );
+    }
+
+    #[test]
+    fn functions_render_their_name() {
+        assert_eq!(
+            thrown_text("function foo() {} throw foo;"),
+            "[Function: foo]"
+        );
+        assert_eq!(thrown_text("throw function bar() {};"), "[Function: bar]");
+        assert_eq!(
+            thrown_text("throw function () {};"),
+            "[Function (anonymous)]"
+        );
+        assert_eq!(thrown_text("throw () => {};"), "[Function (anonymous)]");
+    }
+
+    #[test]
+    fn generators_and_iterators_render_their_kind() {
+        assert_eq!(
+            thrown_text("function* g() { yield 1; } throw g();"),
+            "[Generator]"
+        );
+        assert_eq!(
+            thrown_text("throw [1,2][Symbol.iterator]();"),
+            "[Array Iterator]"
+        );
+        assert_eq!(
+            thrown_text("let s = new Set(); s.add(1); throw s[Symbol.iterator]();"),
+            "[Set Iterator]"
+        );
+        assert_eq!(
+            thrown_text("let m = new Map(); m.set('a', 1); throw m[Symbol.iterator]();"),
+            "[Map Iterator]"
+        );
+    }
+
+    #[test]
+    fn cyclic_collections_terminate_instead_of_overflowing() {
+        // A Map holding itself would recurse forever without the depth cap.
+        let text = thrown_text("let m = new Map(); m.set(m, 1); throw m;");
+        assert!(text.starts_with("Map(1) {"), "got {text:?}");
+    }
+
+    #[test]
+    fn plain_objects_stay_opaque() {
+        assert_eq!(thrown_text("throw {a: 1};"), "[object Object]");
+    }
+}
