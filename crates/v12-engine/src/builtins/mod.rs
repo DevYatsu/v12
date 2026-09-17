@@ -247,6 +247,9 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::SymbolProtoToString => Some(0),
         NativeId::SymbolProtoValueOf => Some(0),
         NativeId::ProxyRevocable => Some(2),
+        NativeId::PromiseAll => Some(1),
+        NativeId::PromiseRace => Some(1),
+        NativeId::PromiseFinally => Some(1),
         _ => None,
     }
 }

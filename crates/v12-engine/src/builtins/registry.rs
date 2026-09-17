@@ -174,6 +174,18 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
                 promise::promise_catch(&mut ctx, this, args)
             }
+            NativeId::PromiseAll => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_all(&mut ctx, this, args)
+            }
+            NativeId::PromiseRace => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_race(&mut ctx, this, args)
+            }
+            NativeId::PromiseFinally => {
+                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                promise::promise_finally(&mut ctx, this, args)
+            }
             NativeId::PromiseConstruct => {
                 let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
                 promise::promise_construct(&mut ctx, this, args)

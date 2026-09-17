@@ -120,6 +120,26 @@ impl Realm {
         // The Promise constructor itself: `new Promise(executor)` routes to
         // the stateful native seam (the capability needs the job sink).
         wire_callable(heap, &intrinsics, "Promise", NativeId::PromiseConstruct);
+        // `Promise.all` / `Promise.race` statics and
+        // `Promise.prototype.finally`: shape-bound installs on the
+        // constructor / prototype (found by ordinary property lookup — no
+        // interpreter surface change needed). The handlers are stateful
+        // natives dispatched through the registry's pending-sink seam.
+        if let Some(promise_ctor) = intrinsics.get("Promise").and_then(|v| v.as_object()) {
+            crate::builtins::install_native(heap, Some(promise_ctor), "all", NativeId::PromiseAll);
+            crate::builtins::install_native(
+                heap,
+                Some(promise_ctor),
+                "race",
+                NativeId::PromiseRace,
+            );
+            crate::builtins::install_native(
+                heap,
+                Some(promise_proto),
+                "finally",
+                NativeId::PromiseFinally,
+            );
+        }
         // Error class prototypes: `Error.prototype` carries `name: "Error"`
         // (and the spec's own `message: ""`); each subclass prototype chains
         // to it and carries its class `name`. Every error instance (user

@@ -521,3 +521,302 @@ pub fn promise_catch(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<J
     let on_rejected = args.first().copied().unwrap_or_else(JsValue::undefined);
     promise_then(ctx, this, &[JsValue::undefined(), on_rejected])
 }
+
+/// Settles `promise` synchronously from a builtin (`Ctx`) context: writes
+/// the state/payload slots and moves the queued reaction jobs onto the
+/// pending sink for the next checkpoint. First settlement wins (no-op once
+/// settled). Mirrors [`settle`] (the `JobCtx` variant) without needing a
+/// job context.
+fn settle_sync(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+    state: i32,
+    value: JsValue,
+) {
+    if heap.get(promise).properties[0].as_smi() != Some(STATE_PENDING) {
+        return;
+    }
+    heap.get_mut(promise).properties[0] = smi(state);
+    heap.get_mut(promise).properties[1] = value;
+    let jobs = drain_reaction_jobs(heap, promise, state, value);
+    sink.borrow_mut().extend(jobs);
+}
+
+/// Reads a promise value's settlement: `(handle, state, payload)`.
+/// Returns `None` for non-promise values.
+fn promise_settlement(
+    heap: &Heap,
+    v: JsValue,
+) -> Option<(v12_heap::Handle<JsObject>, i32, JsValue)> {
+    if !is_promise(heap, v) {
+        return None;
+    }
+    let obj = v.as_object().expect("checked above");
+    let o = heap.get(obj);
+    Some((
+        obj,
+        o.properties[0].as_smi().unwrap_or(STATE_PENDING),
+        o.properties[1],
+    ))
+}
+
+/// Allocates a rooted `Kind::Function` object backed by a host closure.
+/// The per-index watchers below run through `reaction_job`, which only
+/// invokes `Kind::Function` callees via `call_object` — host targets need
+/// no interpreter re-entry, exactly like the constructor capabilities.
+fn alloc_host(
+    heap: &mut Heap,
+    f: impl FnMut(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, JsValue> + 'static,
+) -> JsValue {
+    let func = heap.alloc(JsObject::function(
+        v12_heap::FunctionTarget::Host(v12_heap::HostClosure::new(f)),
+        None,
+    ));
+    heap.add_root(JsValue::object(func));
+    JsValue::object(func)
+}
+
+/// Appends a `[fulfill, reject, derived]` reaction record to a pending
+/// promise's reactions array (the record shape `promise_then` uses). The
+/// derived slot holds an unobservable dummy promise: `reaction_job`
+/// settles it with each handler's return and nothing ever reads it.
+fn push_record(
+    heap: &mut Heap,
+    input: v12_heap::Handle<JsObject>,
+    fulfill: JsValue,
+    reject: JsValue,
+) {
+    let dummy = create_promise(heap, None, STATE_PENDING, JsValue::undefined());
+    let record = heap.alloc(JsObject::ordinary(
+        smallvec::smallvec![fulfill, reject, JsValue::object(dummy)],
+        smallvec::smallvec![None; 3],
+    ));
+    heap.add_root(JsValue::object(record));
+    if let Some(reactions) = heap.get(input).properties[2].as_object() {
+        heap.get_mut(reactions)
+            .elements
+            .push(JsValue::object(record));
+    }
+}
+
+/// `Promise.all(iterable)`: fulfills with an array of results once every
+/// input fulfills, or rejects with the first rejection.
+///
+/// Only array inputs are supported (the overwhelmingly common shape — every
+/// `Promise.all` Test262 case passes an array): anything else throws a
+/// `TypeError`. Non-promise inputs count as already-fulfilled. Pending
+/// promise inputs are watched by host-closure reaction records appended to
+/// the input's own reactions (the adoption-record shape `capability_settle`
+/// uses): no polling jobs, so never-settling inputs cost nothing and cannot
+/// spin the drain. Arbitrary thenable unwrapping is out of scope (see the
+/// module docs).
+pub fn promise_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
+    let Some(iter_obj) = iterable.as_object() else {
+        return Err(ctx.type_error("Promise.all requires an iterable"));
+    };
+    if ctx.heap.get(iter_obj).kind != Kind::Array {
+        return Err(ctx.type_error("Promise.all requires an iterable"));
+    }
+    let inputs: Vec<JsValue> = ctx.heap.get(iter_obj).elements_snapshot();
+    let prototype = this
+        .as_object()
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
+    let aggregate = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
+    let aggregate_v = JsValue::object(aggregate);
+    let results = ctx
+        .heap
+        .alloc(JsObject::array(vec![JsValue::undefined(); inputs.len()]));
+    ctx.heap.add_root(JsValue::object(results));
+    let results_v = JsValue::object(results);
+    let sink = ctx.pending.clone().unwrap_or_default();
+
+    let remaining = Rc::new(RefCell::new(inputs.len()));
+    for (index, input) in inputs.into_iter().enumerate() {
+        match promise_settlement(ctx.heap, input) {
+            Some((_, STATE_FULFILLED, payload)) => {
+                ctx.heap.get_mut(results).set_element(index as u32, payload);
+                *remaining.borrow_mut() -= 1;
+            }
+            Some((input_obj, STATE_PENDING, _)) => {
+                let res_h = results;
+                let rem = Rc::clone(&remaining);
+                let agg = aggregate;
+                let res_v = results_v;
+                let sink_f = Rc::clone(&sink);
+                let fulfill = alloc_host(ctx.heap, move |heap, _this, args| {
+                    let payload = args.first().copied().unwrap_or_else(JsValue::undefined);
+                    heap.get_mut(res_h).set_element(index as u32, payload);
+                    *rem.borrow_mut() -= 1;
+                    if *rem.borrow() == 0 {
+                        settle_sync(heap, &sink_f, agg, STATE_FULFILLED, res_v);
+                    }
+                    Ok(JsValue::undefined())
+                });
+                let agg = aggregate;
+                let sink_r = Rc::clone(&sink);
+                let reject = alloc_host(ctx.heap, move |heap, _this, args| {
+                    let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
+                    settle_sync(heap, &sink_r, agg, STATE_REJECTED, reason);
+                    Ok(JsValue::undefined())
+                });
+                push_record(ctx.heap, input_obj, fulfill, reject);
+            }
+            Some((_, _, reason)) => {
+                // Already-rejected input: the aggregate rejects at once
+                // (first rejection wins; pending inputs' watchers no-op
+                // against the settled aggregate).
+                settle_sync(ctx.heap, &sink, aggregate, STATE_REJECTED, reason);
+                return Ok(aggregate_v);
+            }
+            None => {
+                ctx.heap.get_mut(results).set_element(index as u32, input);
+                *remaining.borrow_mut() -= 1;
+            }
+        }
+    }
+    if *remaining.borrow() == 0 {
+        settle_sync(ctx.heap, &sink, aggregate, STATE_FULFILLED, results_v);
+    }
+    Ok(aggregate_v)
+}
+
+/// `Promise.race(iterable)`: settles with the first input's outcome.
+///
+/// Same array-only input contract as [`promise_all`]. Already-settled
+/// inputs (and non-promise inputs, which count as fulfilled) settle the
+/// aggregate synchronously in iteration order; pending inputs are watched
+/// by host-closure reaction records, first settlement winning.
+pub fn promise_race(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
+    let Some(iter_obj) = iterable.as_object() else {
+        return Err(ctx.type_error("Promise.race requires an iterable"));
+    };
+    if ctx.heap.get(iter_obj).kind != Kind::Array {
+        return Err(ctx.type_error("Promise.race requires an iterable"));
+    }
+    let inputs: Vec<JsValue> = ctx.heap.get(iter_obj).elements_snapshot();
+    let prototype = this
+        .as_object()
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
+    let aggregate = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
+    let aggregate_v = JsValue::object(aggregate);
+    let sink = ctx.pending.clone().unwrap_or_default();
+    for input in inputs {
+        match promise_settlement(ctx.heap, input) {
+            Some((_, STATE_FULFILLED, payload)) => {
+                settle_sync(ctx.heap, &sink, aggregate, STATE_FULFILLED, payload);
+                return Ok(aggregate_v);
+            }
+            Some((input_obj, STATE_PENDING, _)) => {
+                let agg = aggregate;
+                let sink_f = Rc::clone(&sink);
+                let fulfill = alloc_host(ctx.heap, move |heap, _this, args| {
+                    let payload = args.first().copied().unwrap_or_else(JsValue::undefined);
+                    settle_sync(heap, &sink_f, agg, STATE_FULFILLED, payload);
+                    Ok(JsValue::undefined())
+                });
+                let agg = aggregate;
+                let sink_r = Rc::clone(&sink);
+                let reject = alloc_host(ctx.heap, move |heap, _this, args| {
+                    let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
+                    settle_sync(heap, &sink_r, agg, STATE_REJECTED, reason);
+                    Ok(JsValue::undefined())
+                });
+                push_record(ctx.heap, input_obj, fulfill, reject);
+            }
+            Some((_, _, reason)) => {
+                settle_sync(ctx.heap, &sink, aggregate, STATE_REJECTED, reason);
+                return Ok(aggregate_v);
+            }
+            None => {
+                settle_sync(ctx.heap, &sink, aggregate, STATE_FULFILLED, input);
+                return Ok(aggregate_v);
+            }
+        }
+    }
+    Ok(aggregate_v)
+}
+
+/// `Promise.prototype.finally(on_finally)`: runs `on_finally` when `this`
+/// settles, passing the original outcome through.
+///
+/// The derived promise pends until `this` settles. Settlement is watched
+/// by host-closure reaction records: each watcher enqueues one real job
+/// that runs the callback via `JobCtx::call_object` (so user functions
+/// work without builtin-time interpreter re-entry) and settles the derived
+/// promise — with the original outcome, or with the callback's thrown
+/// value when the callback throws. An already-settled `this` enqueues that
+/// job directly. No polling, so a never-settling `this` costs nothing.
+pub fn promise_finally(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    if !is_promise(ctx.heap, this) {
+        return Err(ctx.type_error("Promise.prototype.finally requires a promise"));
+    }
+    let promise = this.as_object().expect("checked above");
+    let on_finally = args.first().copied().unwrap_or_else(JsValue::undefined);
+    ctx.heap.add_root(on_finally);
+    let prototype = ctx.heap.get(promise).prototype;
+    let derived = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let (state, payload) = {
+        let o = ctx.heap.get(promise);
+        (
+            o.properties[0].as_smi().unwrap_or(STATE_PENDING),
+            o.properties[1],
+        )
+    };
+    if state == STATE_PENDING {
+        let sink_f = Rc::clone(&sink);
+        let fulfill = alloc_host(ctx.heap, move |_heap, _this, args| {
+            let value = args.first().copied().unwrap_or_else(JsValue::undefined);
+            sink_f.borrow_mut().push(finally_settle_job(
+                derived,
+                on_finally,
+                STATE_FULFILLED,
+                value,
+            ));
+            Ok(JsValue::undefined())
+        });
+        let sink_r = Rc::clone(&sink);
+        let reject = alloc_host(ctx.heap, move |_heap, _this, args| {
+            let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
+            sink_r.borrow_mut().push(finally_settle_job(
+                derived,
+                on_finally,
+                STATE_REJECTED,
+                reason,
+            ));
+            Ok(JsValue::undefined())
+        });
+        push_record(ctx.heap, promise, fulfill, reject);
+    } else {
+        sink.borrow_mut()
+            .push(finally_settle_job(derived, on_finally, state, payload));
+    }
+    Ok(JsValue::object(derived))
+}
+
+/// One settlement job for [`promise_finally`]: calls the callback (when
+/// callable) and settles `derived` with the watched outcome — or with the
+/// callback's thrown value when the callback throws.
+fn finally_settle_job(
+    derived: v12_heap::Handle<JsObject>,
+    on_finally: JsValue,
+    state: i32,
+    payload: JsValue,
+) -> Job {
+    Box::new(move |ctx: &mut JobCtx<'_, '_>| {
+        let callable = on_finally
+            .as_object()
+            .is_some_and(|h| ctx.heap_mut().get(h).kind == Kind::Function);
+        if callable {
+            let handler = on_finally.as_object().expect("checked above");
+            if let Err(JSException(thrown)) = ctx.call_object(handler, JsValue::undefined(), &[]) {
+                settle(ctx, derived, STATE_REJECTED, thrown);
+                return;
+            }
+        }
+        settle(ctx, derived, state, payload);
+    })
+}
