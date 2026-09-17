@@ -1013,17 +1013,25 @@ impl<'s> Collector<'s> {
             self.simple_target(simple);
             return;
         }
-        // Complex destructuring assignment targets: walk inner targets
-        // where possible via simple check; full recursion omitted for brevity
-        // but simple members like `[{get y(){}} .y]` are simple and handled above.
-        // For array/object wrappers, attempt to walk contained simples.
+        // Complex destructuring assignment targets: recurse into nested
+        // patterns so references, captures, and nested functions inside
+        // defaults are all registered (emission mirrors this recursion in
+        // `destructure_assign`, including `lower_default` initializers).
         match target {
             oxc_ast::ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
                 for el in arr.elements.iter().flatten() {
-                    if let Some(simple) = el.as_simple_assignment_target() {
+                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(
+                        d,
+                    ) = el
+                    {
+                        // `[a = init]` / `[[a] = init]`: the default runs at
+                        // the use site, so its references belong here.
+                        self.walk_assignment_target(&d.binding);
+                        self.expr(&d.init);
+                    } else if let Some(simple) = el.as_simple_assignment_target() {
                         self.simple_target(simple);
-                    } else if let Some(pat) = el.as_assignment_target_pattern() {
-                        let _ = pat;
+                    } else if let Some(inner) = el.as_assignment_target() {
+                        self.walk_assignment_target(inner);
                     }
                 }
                 if let Some(rest) = &arr.rest {
@@ -1046,8 +1054,19 @@ impl<'s> Collector<'s> {
                             }
                         }
                         oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                            if let Some(simple) = p.binding.as_simple_assignment_target() {
+                            if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(
+                                d,
+                            ) = &p.binding
+                            {
+                                // `{y: z = init}`: default runs at the use site.
+                                self.walk_assignment_target(&d.binding);
+                                self.expr(&d.init);
+                            } else if let Some(simple) =
+                                p.binding.as_simple_assignment_target()
+                            {
                                 self.simple_target(simple);
+                            } else if let Some(inner) = p.binding.as_assignment_target() {
+                                self.walk_assignment_target(inner);
                             }
                         }
                     }
