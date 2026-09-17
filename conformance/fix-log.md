@@ -2,6 +2,20 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-17 — lane/display-string: heap-aware diagnostic rendering [lane/display-string]
+
+- **Filter:** none directly — `Engine::to_display_string` is the diagnostic path used for runner `threw:` reporting, not for verdicts ($DONE markers / completion decide pass/fail), so no test262 slice count moves on this change.
+- **Before:** arrays/… rendered opaquely — `throw [1,2,3].map(x => x*2)` displayed `[object Object]`; BigInt/Symbol/Map/Set/Promise/RegExp/Function/iterator all fell through to the object branch.
+- **After:** arrays `2,4,6`; `Set(2) {1, x}`; `Map(1) {a => 1}`; `255n` / `0n` / exact 20+-digit decimals; `Symbol()`; `/ab+/gi`; `Promise { 42 }` / `Promise { <rejected> bad }` / `Promise { <pending> }`; `[Function: foo]` / `[Function (anonymous)]`; `[Generator]` / `[Array Iterator]` / `[Map Iterator]` / `[Set Iterator]`; plain objects stay `[object Object]`.
+- **Engine change:** `crates/v12-engine/src/engine/display.rs` — `to_display_string` now delegates to a depth-threaded `display_value(value, depth)`. Composite kinds render before the opaque object fallback: `Kind::Function` → own `name` data property (`function_text`), `Kind::Generator`, `Kind::Iterator` via `elements[0]` kind slot, then (capped at depth 8) `Kind::Map`/`Set`/`Promise`/`RegExp` with payloads read from `elements`/internal slots. `bigint_text` decodes the little-endian base-256 magnitude by repeated divide-by-10 (pure snapshot, no heap access). Cyclic structures (a Map holding itself) terminate at the depth cap instead of overflowing the stack. Arity is unchanged: no value semantics touched, only string rendering.
+- **Files:** `crates/v12-engine/src/engine/display.rs` (+226), `crates/v12-engine/src/tests.rs` (+114, 10 new `display_tests`), conformance/fix-log.md (this entry)
+- **Bucket:** diagnostics quality — the `[object Object]` display gap noted in the Step 7a entry and in the built-ins expansion notes (`map` results displayed as `[object Object]`)
+- **Verification:** `cargo nextest run --workspace -p v12-engine` 603 passed / 0 skipped (master was 593; +10 new display tests); `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean; per-case probes asserted in `display_tests` (arrays, Set/Map, BigInt incl. 2^64 and 30-digit, Symbol, RegExp, three Promise states, named/anonymous functions, generator + three iterator kinds, cycle termination, plain-object opacity)
+- **Notes:**
+  - Cycle safety is a depth cap (8), not a visited set: a cyclic structure renders truncated rather than memoized. Acceptable for diagnostics.
+  - `Kind::Generator` renders without body/state; iterator state (source, index) is deliberately not descended — it would recurse into the collection and can form cycles.
+  - Recovered by the orchestrator after two infra deaths of the lane session: the worktree WIP was complete and green, so only the fix-log entry + commit were finished directly.
+
 ### 2026-09-17 — lane/dstr-forwarding: iterator GetMethod gates + completion-aware IteratorClose [lane/dstr-forwarding]
 
 - **Filter:** `language/expressions` (11 128 files), `language/statements/for-of` (752), `language/statements/for-await-of` (1 235), `--jobs 4`, `--format human` (+ `--format tap --tap-out` for the for-of fail-list diff)
