@@ -260,8 +260,34 @@ pub(crate) fn apply_field_function_name(
     let Some(name) = static_key_text(key) else {
         return;
     };
-    // Peel transparent wrappers (`(fn)`, `fn as T`): NamedEvaluation
-    // propagates through them to the inner function.
+    apply_function_name(cx, &name, init);
+}
+
+/// Applies spec `SetFunctionName` for any binding/assignment whose value is a
+/// syntactically anonymous function definition (`IsAnonymousFunctionDefinition`
+/// → `SetFunctionName(v, name)`). Must run before the initializer is lowered:
+/// the planned unit's `function_name` is stamped, and `Closure` installs the
+/// own `name` property from it. A named function expression already carries
+/// its own name and is left untouched.
+pub(crate) fn apply_function_name(
+    cx: &mut FnCtx<'_, '_, '_, '_>,
+    name: &str,
+    init: &Expression<'_>,
+) {
+    let Some(span) = anonymous_function_span(init) else {
+        return;
+    };
+    if let Ok(idx) = cx.planned_index(span)
+        && cx.comp.plans.units[idx].function_name.is_none()
+    {
+        cx.comp.plans.units[idx].function_name = Some(name.to_string());
+    }
+}
+
+/// The span of the planned unit for `init` when it is a syntactically
+/// anonymous function definition, peeling transparent wrappers. `None` for
+/// non-function initializers and named definitions.
+pub(crate) fn anonymous_function_span(init: &Expression<'_>) -> Option<Span> {
     let mut e = init;
     loop {
         match e {
@@ -272,16 +298,11 @@ pub(crate) fn apply_field_function_name(
             _ => break,
         }
     }
-    let span = match e {
-        Expression::FunctionExpression(f) if f.id.is_none() => f.span,
-        Expression::ArrowFunctionExpression(a) => a.span,
-        Expression::ClassExpression(c) if c.id.is_none() => c.span,
-        _ => return,
-    };
-    if let Ok(idx) = cx.planned_index(span)
-        && cx.comp.plans.units[idx].function_name.is_none()
-    {
-        cx.comp.plans.units[idx].function_name = Some(name);
+    match e {
+        Expression::FunctionExpression(f) if f.id.is_none() => Some(f.span),
+        Expression::ArrowFunctionExpression(a) => Some(a.span),
+        Expression::ClassExpression(c) if c.id.is_none() => Some(c.span),
+        _ => None,
     }
 }
 

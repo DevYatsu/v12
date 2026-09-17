@@ -24,6 +24,42 @@ pub enum UnitNode<'a> {
     Method(&'a Function<'a>),
 }
 
+/// Emits the `SetProperty this.<key> = <init>` sequence for every instance
+/// public (non-private) field of `c`, in declaration order (ES
+/// `InitializeInstanceElements` / `DefineField`). A field with no initializer
+/// installs `undefined`. Private fields are handled by the construct-clone
+/// path and are skipped here.
+pub(crate) fn emit_instance_fields(
+    cx: &mut FnCtx<'_, '_, '_, '_>,
+    c: &Class<'_>,
+) -> Result<(), CompileError> {
+    for el in &c.body.body {
+        let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el else {
+            continue;
+        };
+        if p.r#static || matches!(&p.key, PropertyKey::PrivateIdentifier(_)) {
+            continue;
+        }
+        let value_reg = if let Some(value) = &p.value {
+            crate::class::apply_field_function_name(cx, &p.key, p.computed, value);
+            cx.expr(value)?
+        } else {
+            let d = cx.new_temp();
+            cx.load_undefined(d, p.span);
+            d
+        };
+        let key_reg = crate::class::property_key_reg(cx, &p.key, p.computed, p.span)?;
+        cx.emit_reg3(
+            Opcode::SetProperty,
+            crate::model::REG_THIS,
+            key_reg,
+            value_reg,
+            p.span,
+        );
+    }
+    Ok(())
+}
+
 fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
     let mut fb = FunctionBytecode::with_instructions(Vec::new(), 1);
     fb.name_hint = name_hint;
@@ -234,39 +270,7 @@ pub fn compile_unit(
             }
         },
         UnitNode::Class(c) => {
-            // Base-class instance fields initialize on `this` at the top of the
-            // constructor, before the body. Derived classes must wait until
-            // after `super()`; that ordering is not modeled yet, so derived
-            // fields are skipped rather than initialized too early.
-            if c.heritage.is_none() {
-                for el in &c.body.body {
-                    let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el else {
-                        continue;
-                    };
-                    if p.r#static {
-                        continue;
-                    }
-                    if matches!(&p.key, PropertyKey::PrivateIdentifier(_)) {
-                        continue;
-                    }
-                    let Some(value) = &p.value else {
-                        continue;
-                    };
-                    crate::class::apply_field_function_name(&mut cx, &p.key, p.computed, value);
-                    let value_reg = cx.expr(value)?;
-                    let key_reg =
-                        crate::class::property_key_reg(&mut cx, &p.key, p.computed, p.span)?;
-                    cx.emit_reg3(
-                        Opcode::SetProperty,
-                        crate::model::REG_THIS,
-                        key_reg,
-                        value_reg,
-                        p.span,
-                    );
-                }
-            }
-            // Find the explicit `constructor` element; compile its body, or
-            // emit a default empty constructor when absent.
+            // Find the explicit `constructor` element.
             let ctor = c.body.body.iter().find_map(|el| match el {
                 oxc_ast::ast::ClassElement::MethodDefinition(m)
                     if m.kind == MethodDefinitionKind::Constructor =>
@@ -275,13 +279,32 @@ pub fn compile_unit(
                 }
                 _ => None,
             });
+            if c.heritage.is_none() {
+                // Base-class instance fields initialize on `this` at the top of
+                // the constructor, before the body (ES `InitializeInstanceElements`
+                // runs after `OrdinaryCreateFromConstructor` with no super step).
+                emit_instance_fields(&mut cx, c)?;
+            }
             if let Some(m) = ctor {
                 let Some(body) = m.value.body.as_deref() else {
                     return Err(cx.err(m.span, "constructor without a body is not supported"));
                 };
-                cx.stmt_list(&body.statements)?;
+                if c.heritage.is_none() {
+                    cx.stmt_list(&body.statements)?;
+                } else {
+                    // Derived fields initialize only after `super()` returns
+                    // (ES `InitializeInstanceElements` runs in the derived
+                    // constructor after the super call). Hook the first
+                    // top-level `super(...)` statement.
+                    cx.ctor_body_f(&body.statements, |cx| emit_instance_fields(cx, c))?;
+                }
+            } else if c.heritage.is_some() {
+                // Default derived constructor: `constructor(...args) {
+                // super(...args); }` — initialize fields after the (absent,
+                // not-yet-forwarded) super step.
+                emit_instance_fields(&mut cx, c)?;
             }
-            // Default constructor: field initializers above, then `return undefined`.
+            // Default base constructor: field initializers above, then `return undefined`.
         }
         UnitNode::Method(f) => {
             let Some(body) = f.body.as_deref() else {
@@ -371,7 +394,13 @@ fn emit_prologue(
             // default first, then bind the (possibly destructuring) pattern
             // against the chosen value.
             if let Some(init) = &p.initializer {
-                let chosen = cx.lower_default(incoming, init, p.span)?;
+                // Formal-parameter default: `NamedEvaluation` names an
+                // anonymous function after the parameter binding.
+                let fname = match &p.pattern {
+                    BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                    _ => None,
+                };
+                let chosen = cx.lower_default(incoming, init, p.span, fname)?;
                 match &p.pattern {
                     BindingPattern::BindingIdentifier(id) => {
                         if let Some(sym) = id.symbol_id.get() {

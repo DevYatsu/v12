@@ -22,6 +22,35 @@ use crate::model::{CompileError, FinallyCtx, FnCtx, VarLoc};
 type Res<T> = Result<T, CompileError>;
 
 impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
+    /// Compiles a derived-class constructor body, running `on_super` once
+    /// immediately after the first top-level `super(...)` statement executes
+    /// (ES `InitializeInstanceElements` runs after the super call).
+    /// Statements before the super call compile first, then `on_super`, then
+    /// the rest.
+    ///
+    /// If no direct `super()` statement exists (a constructor that never
+    /// calls super, or one whose only call is nested in a conditional), the
+    /// fallback runs `on_super` at the end of the body — still after any
+    /// super step that executed.
+    pub(crate) fn ctor_body_f(
+        &mut self,
+        stmts: &'a [Statement<'a>],
+        on_super: impl FnOnce(&mut Self) -> Res<()>,
+    ) -> Res<()> {
+        let mut on_super = Some(on_super);
+        for s in stmts {
+            let is_super_stmt = is_direct_super_call(s);
+            self.stmt(s)?;
+            if is_super_stmt && let Some(f) = on_super.take() {
+                f(self)?;
+            }
+        }
+        if let Some(f) = on_super {
+            f(self)?;
+        }
+        Ok(())
+    }
+
     /// Compiles a statement list, hoisting function declarations to its top.
     /// Only direct list items hoist (subset limitation).
     pub fn stmt_list(&mut self, stmts: &'a [Statement<'a>]) -> Res<()> {
@@ -251,8 +280,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         for d in &v.declarations {
             match &d.id {
-                BindingPattern::BindingIdentifier(_) => {
+                BindingPattern::BindingIdentifier(id) => {
                     if let Some(init) = &d.init {
+                        // ES `BindingInitialization`/`NamedEvaluation`:
+                        // `let f = function(){}` names the anonymous function
+                        // after the binding identifier. Must run before the
+                        // initializer is compiled.
+                        crate::class::apply_function_name(self, id.name.as_str(), init);
                         let val = self.expr(init)?;
                         let sym = binding_symbol(&d.id).ok_or_else(|| {
                             self.err(d.span, "internal: declarator without symbol")
@@ -450,6 +484,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_reg3(Opcode::StrictEq, cond, src, undef, ap.span);
                 self.emit_jump(Opcode::JumpIfFalse, cond, use_src);
                 // Default branch: evaluate default expression into chosen.
+                // ES `NamedEvaluation`: `[f = function(){}]` names the
+                // anonymous function after the binding identifier.
+                if let Some(name) = binding_identifier_name(&ap.left) {
+                    crate::class::apply_function_name(self, &name, &ap.right);
+                }
                 let def = self.expr(&ap.right)?;
                 self.move_reg(chosen, def, ap.span);
                 self.emit_jump(Opcode::Jump, 0, end);
@@ -1335,6 +1374,20 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 }
 
+/// `true` when `s` is a top-level expression statement whose expression is a
+/// direct `super(...)` call — the only statement form that reports the
+/// derived-constructor super step. Purely syntactic; `collect` has already
+/// validated that `super()` is legal here.
+fn is_direct_super_call(s: &Statement<'_>) -> bool {
+    match s {
+        Statement::ExpressionStatement(e) => match &e.expression {
+            Expression::CallExpression(c) => c.callee.is_super(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn fn_decl_of<'a, 'b>(s: &'b Statement<'a>) -> Option<&'b Function<'a>> {
     match s {
         Statement::FunctionDeclaration(f) => Some(f),
@@ -1354,6 +1407,19 @@ fn fn_decl_of<'a, 'b>(s: &'b Statement<'a>) -> Option<&'b Function<'a>> {
             }
             None
         }
+    }
+}
+
+/// The binding identifier name of a binding target, peeling nested
+/// `AssignmentPattern` wrappers (`[f = fn]`). `None` for destructuring.
+fn binding_identifier_name(p: &BindingPattern<'_>) -> Option<String> {
+    let mut cur = p;
+    while let BindingPattern::AssignmentPattern(ap) = cur {
+        cur = &ap.left;
+    }
+    match cur {
+        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+        _ => None,
     }
 }
 

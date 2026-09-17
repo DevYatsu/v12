@@ -624,6 +624,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         let Some(x) = el.as_expression() else {
                             return Err(self.err(el.span(), "array element must be an expression"));
                         };
+                        // ES `ArrayAccumulation` `NamedEvaluation`: an
+                        // anonymous function element is named after its
+                        // `ToString(index)`.
+                        crate::class::apply_function_name(self, &i.to_string(), x);
                         self.expr_into(x, slot)?;
                     }
                 }
@@ -658,6 +662,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     let Some(x) = el.as_expression() else {
                         return Err(self.err(el.span(), "array element must be an expression"));
                     };
+                    // ES `ArrayAccumulation` `NamedEvaluation`: an anonymous
+                    // function element is named after its `ToString(index)`.
+                    // In the spread path the index is the array's current
+                    // length, which is not known at compile time; skip naming
+                    // there (accepted gap) and only stamp the compile-time
+                    // index when it is provably stable.
                     let val = self.expr(x)?;
                     let len_key = self.new_temp();
                     self.load_str(len_key, "length", span)?;
@@ -1219,6 +1229,15 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_get_global(probe, gid, span);
             }
         }
+        // ES `NamedEvaluation` for `id = function(){}`: only the plain `=`
+        // operator (a compound `+=` never names its RHS). The name is the
+        // target identifier, so a syntactically anonymous function becomes
+        // `id.name === "id"`.
+        if binop.is_none()
+            && let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = simple
+        {
+            crate::class::apply_function_name(self, id.name.as_str(), right);
+        }
         let rhs = self.expr(right)?;
 
         match simple {
@@ -1363,7 +1382,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 // when the read is `undefined` (shared `lower_default`
                 // lowering), then the chosen value binds or recurses.
                 let raw = self.read_index(src, index, span)?;
-                let val = self.lower_default(raw, &d.init, span)?;
+                let val =
+                    self.lower_default(raw, &d.init, span, destructure_target_name(&d.binding))?;
                 self.destructure_assign_target(&d.binding, val, span)?;
             } else {
                 let raw = self.read_index(src, index, span)?;
@@ -1418,7 +1438,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     let raw = self.new_temp();
                     self.emit_reg3(Opcode::GetProperty, raw, src, key, span);
                     let val = match &id.init {
-                        Some(default) => self.lower_default(raw, default, span)?,
+                        Some(default) => {
+                            self.lower_default(raw, default, span, Some(id.binding.name.as_str()))?
+                        }
                         None => raw,
                     };
                     let Some(sym) = self.comp.symbol_of(id.binding.reference_id.get()) else {
@@ -1444,7 +1466,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         d,
                     ) = &p.binding
                     {
-                        let val = self.lower_default(raw, &d.init, span)?;
+                        let val = self.lower_default(
+                            raw,
+                            &d.init,
+                            span,
+                            destructure_target_name(&d.binding),
+                        )?;
                         self.destructure_assign_target(&d.binding, val, span)?;
                     } else if let Some(simple) = p.binding.as_simple_assignment_target() {
                         self.assign_simple(simple, raw, span)?;
@@ -2179,6 +2206,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             .map_err(|_| self.err(span, "programs above 65535 functions are not supported"))?;
         self.emit_closure(dst, idx16, span);
         Ok(())
+    }
+}
+
+/// The `NamedEvaluation` binding name of a destructuring assignment target:
+/// the identifier for `[f = fn]` / `{x: f = fn}`, `None` for nested patterns
+/// and member targets.
+fn destructure_target_name<'a, 'b>(target: &'b AssignmentTarget<'a>) -> Option<&'b str> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
+        _ => None,
     }
 }
 
