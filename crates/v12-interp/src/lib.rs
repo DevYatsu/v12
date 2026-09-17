@@ -1056,7 +1056,7 @@ impl<'a> Interp<'a> {
         value: JsValue,
     ) -> Result<(), JSException> {
         self.gc_protect();
-        self.set_property(obj_v, key_v, value)
+        self.set_property(obj_v, key_v, value, false)
     }
 
     #[cfg(test)]

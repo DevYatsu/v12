@@ -648,8 +648,13 @@ impl Interp<'_> {
                             .error_value("TypeError: cannot set properties of null or undefined");
                         throw_js!(exc);
                     }
+                    // Strictness comes from the running function itself
+                    // (`FunctionBytecode::is_strict`, set by the compiler from
+                    // the unit plan): strict [[Set]] failures throw, sloppy
+                    // ones are silently dropped inside `set_property`.
+                    let strict = funcs[fn_idx as usize].is_strict;
                     self.gc_protect();
-                    attempt!(self.set_property(obj_v, key_v, value));
+                    attempt!(self.set_property(obj_v, key_v, value, strict));
                     self.set_pc(pc + op_width);
                 }
                 Opcode::DefineMethod => {
