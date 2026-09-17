@@ -247,6 +247,14 @@ pub(crate) fn number_to_string(n: f64) -> String {
     format!("{sign}{body}")
 }
 
+/// ES ToPrimitive hint. `Default` and `Number` share the `valueOf`-first
+/// order; `String` uses `toString`-first (`OrdinaryToPrimitive`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrimitiveHint {
+    Default,
+    String,
+}
+
 /// ES ToString. Strings return themselves; numbers/booleans/specials intern
 /// their spelling (idempotent — the interner deduplicates). Plain objects
 /// render as `[object Object]` and functions as `function`, matching the
@@ -559,10 +567,27 @@ impl Interp<'_> {
     /// `toString`. Primitives pass through unchanged; an object whose
     /// methods yield no primitive is a TypeError.
     pub(crate) fn to_primitive_default(&mut self, v: JsValue) -> Result<JsValue, JSException> {
+        self.to_primitive_with_hint(v, PrimitiveHint::Default)
+    }
+
+    /// ES ToPrimitive (7.1.1) honoring the hint. `Default` and `Number` try
+    /// `valueOf` first; `String` tries `toString` first (`OrdinaryToPrimitive`
+    /// order). Primitives pass through unchanged; an object whose methods
+    /// yield no primitive is a TypeError.
+    pub(crate) fn to_primitive_with_hint(
+        &mut self,
+        v: JsValue,
+        hint: PrimitiveHint,
+    ) -> Result<JsValue, JSException> {
         if !v.is_object() {
             return Ok(v);
         }
-        for name in ["valueOf", "toString"] {
+        let order: [&str; 2] = if hint == PrimitiveHint::String {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in order {
             let key = self.new_temp_key(name);
             let m = self.get_property(0, 0, v, key)?;
             if let Some(f) = m.as_object() {
@@ -589,6 +614,28 @@ impl Interp<'_> {
             return Ok(to_number(self.heap, prim));
         }
         Ok(to_number(self.heap, v))
+    }
+
+    /// ES ToString (7.1.17) with the string hint: objects run
+    /// `OrdinaryToPrimitive(hint "string")` (user `toString` first), the
+    /// resulting primitive is stringified, and a Symbol result throws
+    /// TypeError. Primitives stringify directly.
+    pub(crate) fn to_string_value(&mut self, v: JsValue) -> Result<JsValue, JSException> {
+        if v.is_object() {
+            let prim = self.to_primitive_with_hint(v, PrimitiveHint::String)?;
+            if prim.is_symbol() {
+                return Err(self.symbol_to_string_type_error());
+            }
+            let h = to_js_string(self.heap, prim)?;
+            return Ok(JsValue::string(h));
+        }
+        let h = to_js_string(self.heap, v)?;
+        Ok(JsValue::string(h))
+    }
+
+    /// The ES TypeError for `ToString(symbol)`.
+    pub(crate) fn symbol_to_string_type_error(&mut self) -> JSException {
+        JSException(self.error_value("TypeError: Cannot convert a Symbol value to a string"))
     }
 
     /// ES ToPropertyKey (7.1.19): strings and symbols pass through; any other

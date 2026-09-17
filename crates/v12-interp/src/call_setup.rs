@@ -1527,6 +1527,10 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Option<Result<JsValue, JSException>> {
         match id {
+            NativeId::StringConstruct => Some(self.run_string_construct(this_v, args)),
+            // `Number(x)`/`new Number(x)` must run a user `valueOf`/`toString`
+            // (default-hint ToPrimitive), which re-enters the machine.
+            NativeId::NumberConstruct => Some(self.run_number_construct(args)),
             NativeId::ArrayForEach
             | NativeId::ArrayMap
             | NativeId::ArrayFilter
@@ -1553,6 +1557,50 @@ impl Interp<'_> {
             | NativeId::IteratorFind => Some(self.run_iterator_callback(id, this_v, args)),
             _ => None,
         }
+    }
+
+    /// ES `String(value)` with the string-hint ToPrimitive so a user
+    /// `toString` is invoked. The construct path (`new String(value)`)
+    /// arrives with the constructor function as `this` (same discriminator
+    /// as `Symbol`): ES requires `new String(symbol)` to throw, while the
+    /// call form returns `SymbolDescriptiveString`. v1 has no String-wrapper
+    /// object, so `new String(x)` yields the primitive (documented YAGNI
+    /// deviation).
+    fn run_string_construct(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let is_construct = this_v
+            .as_object()
+            .is_some_and(|o| self.heap.get(o).kind == Kind::Function);
+        // ES 22.1.1.1 step 1: no arguments yields "".
+        let Some(&v) = args.first() else {
+            return Ok(JsValue::string(self.heap.intern_text("")));
+        };
+        // ES 22.1.1.1 step 2: call form with a Symbol returns
+        // SymbolDescriptiveString without throwing; only the construct form
+        // (and implicit ToString) throws. v1 symbols are opaque, so the
+        // description is always `Symbol()`.
+        if v.is_symbol() {
+            if is_construct {
+                return Err(self.symbol_to_string_type_error());
+            }
+            return Ok(JsValue::string(self.heap.intern_text("Symbol()")));
+        }
+        self.to_string_value(v)
+    }
+
+    /// ES `Number(value)`: objects coerce via the default-hint ToPrimitive
+    /// (`valueOf` first) so a user `valueOf` is invoked. `new Number(value)`
+    /// reaches the same router; v1 has no Number-wrapper object, so both
+    /// forms yield the primitive number (documented YAGNI deviation).
+    fn run_number_construct(&mut self, args: &[JsValue]) -> Result<JsValue, JSException> {
+        let Some(&v) = args.first() else {
+            return Ok(JsValue::from_f64(0.0));
+        };
+        let n = self.to_number_value(v)?;
+        Ok(JsValue::from_f64(n))
     }
 
     /// The receiver's length (array slot or element count for array-likes).
