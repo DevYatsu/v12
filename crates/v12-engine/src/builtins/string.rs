@@ -8,7 +8,7 @@
 use v12_heap::{Handle, Heap, JsValue, V12Str};
 use v12_native::Throw;
 
-use super::{ctx::Ctx, helpers, regexp};
+use super::{ctx::Ctx, helpers, iterator, regexp};
 
 /// The `this` string primitive, or a `TypeError` naming `method`.
 fn this_string(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<Handle<V12Str>, Throw> {
@@ -924,6 +924,249 @@ pub fn string_from_code_point(
     }
     Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
+
+/// `String.prototype.trimLeft` – Annex B alias of `trimStart`.
+pub fn string_trim_left(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    string_trim_start(ctx, this, args)
+}
+
+/// `String.prototype.trimRight` – Annex B alias of `trimEnd`.
+pub fn string_trim_right(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    string_trim_end(ctx, this, args)
+}
+
+/// `String.prototype.toLocaleLowerCase` – locale-insensitive lowercasing.
+pub fn string_to_locale_lower_case(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    string_to_lower_case(ctx, this, args)
+}
+
+/// `String.prototype.toLocaleUpperCase` – locale-insensitive uppercasing.
+pub fn string_to_locale_upper_case(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    string_to_upper_case(ctx, this, args)
+}
+
+/// `String.prototype.toWellFormed()` – lone surrogates become U+FFFD.
+pub fn string_to_well_formed(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "toWellFormed")?;
+    Ok(JsValue::string(
+        ctx.heap.intern_text(&well_formed(&utf16(&text))),
+    ))
+}
+
+/// `String.prototype.isWellFormed()` – false when a lone surrogate occurs.
+pub fn string_is_well_formed(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, "isWellFormed")?;
+    let units = utf16(&text);
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..0xDC00).contains(&u) {
+            if units
+                .get(i + 1)
+                .is_some_and(|&low| (0xDC00..0xE000).contains(&low))
+            {
+                i += 2;
+            } else {
+                return Ok(JsValue::from_bool(false));
+            }
+        } else if (0xDC00..0xE000).contains(&u) {
+            return Ok(JsValue::from_bool(false));
+        } else {
+            i += 1;
+        }
+    }
+    Ok(JsValue::from_bool(true))
+}
+
+/// Replaces every lone surrogate in `units` with U+FFFD.
+fn well_formed(units: &[u16]) -> String {
+    let mut fixed: Vec<u16> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..0xDC00).contains(&u)
+            && units
+                .get(i + 1)
+                .is_some_and(|&low| (0xDC00..0xE000).contains(&low))
+        {
+            fixed.push(u);
+            fixed.push(units[i + 1]);
+            i += 2;
+        } else if (0xD800..0xE000).contains(&u) {
+            fixed.push(0xFFFD);
+            i += 1;
+        } else {
+            fixed.push(u);
+            i += 1;
+        }
+    }
+    String::from_utf16_lossy(&fixed)
+}
+
+/// `String.prototype.matchAll(regexp)` — iterator of `exec` match arrays.
+///
+/// ES 22.2.6.12 subset: the search value must be a global regexp (a
+/// non-global regexp throws `TypeError`); matches are collected with the
+/// same `exec` + zero-width-guard loop as `match`, then served through the
+/// existing array-values iterator.
+pub fn string_match_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let handle = this_string(ctx, this, "String.prototype.matchAll")?;
+    let text = ctx.string_text(handle);
+    let search = args.first().copied().unwrap_or(JsValue::undefined());
+    let Some(re) = as_regexp(ctx.heap, Some(&search)) else {
+        return Err(ctx.type_error("TypeError: String.prototype.matchAll requires a RegExp"));
+    };
+    let (_, flags) = regexp::regexp_source_flags(ctx.heap, re);
+    if !flags.contains('g') {
+        return Err(ctx.type_error("TypeError: String.prototype.matchAll requires a global RegExp"));
+    }
+    let text_h = ctx.heap.intern_text(&text);
+    let units_len: usize = text.chars().map(char::len_utf16).sum();
+    regexp::set_last_index(ctx.heap, re, 0.0);
+    let mut matches = Vec::new();
+    let mut start = 0.0;
+    loop {
+        let m = regexp::regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)])?;
+        if m.is_null() {
+            break;
+        }
+        matches.push(m);
+        let li = regexp::last_index(ctx.heap, re);
+        if li <= start {
+            regexp::set_last_index(ctx.heap, re, start + 1.0);
+        }
+        start = li;
+        if start > units_len as f64 {
+            break;
+        }
+    }
+    let arr = ctx.alloc_obj(v12_heap::JsObject::array(matches));
+    iterator::array_iterator(ctx, JsValue::object(arr), &[])
+}
+
+/// `String.raw(template, ...substitutions)` – raw template strings with
+/// substitutions interleaved.
+pub fn string_raw(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let Some(cooked) = args.first().and_then(|v| v.as_object()) else {
+        return Err(ctx.type_error("TypeError: String.raw requires a template object"));
+    };
+    let raw_key = v12_heap::PropKey::from_string(ctx.heap.intern_text("raw"));
+    let raw_v = crate::internal_methods::dispatch_get(
+        &mut *ctx.heap,
+        cooked,
+        raw_key,
+        JsValue::object(cooked),
+    )
+    .map_err(Throw::Value)?;
+    let Some(raw) = raw_v.as_object() else {
+        return Err(ctx.type_error("TypeError: String.raw template is missing raw strings"));
+    };
+    let len = ctx.heap.get(raw).element_len();
+    let mut out = String::new();
+    for i in 0..len as u32 {
+        let seg = ctx
+            .heap
+            .get(raw)
+            .get_element(i)
+            .map(|v| ctx.to_string(v))
+            .unwrap_or_default();
+        out.push_str(&seg);
+        if i + 1 < len as u32 {
+            let sub = args
+                .get(i as usize + 1)
+                .map(|v| ctx.to_string(*v))
+                .unwrap_or_default();
+            out.push_str(&sub);
+        }
+    }
+    Ok(JsValue::string(ctx.heap.intern_text(&out)))
+}
+
+// ---------------------------------------------------------------------------
+// Annex B HTML methods (`String.prototype.anchor`, `bold`, …).
+// ---------------------------------------------------------------------------
+
+/// Shared Annex B wrapper: `<tag>S</tag>`, or `<tag attr="v">S</tag>` when
+/// `attr` is set (attribute `"` escaped as `&quot;`).
+fn html_wrap(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+    method: &str,
+    tag: &str,
+    attr: Option<(&str, Option<JsValue>)>,
+) -> Result<JsValue, Throw> {
+    let text = this_text(ctx, this, method)?;
+    let mut out = String::with_capacity(text.len() + tag.len() * 2 + 5);
+    out.push('<');
+    out.push_str(tag);
+    if let Some((name, value)) = attr {
+        let v = value.map(|v| arg_text(ctx, v)).unwrap_or_default();
+        out.push(' ');
+        out.push_str(name);
+        out.push_str("=\"");
+        out.push_str(&v.replace('"', "&quot;"));
+        out.push('"');
+    }
+    out.push('>');
+    out.push_str(&text);
+    out.push_str("</");
+    out.push_str(tag);
+    out.push('>');
+    Ok(JsValue::string(ctx.heap.intern_text(&out)))
+}
+
+/// Annex B HTML wrapper methods. Each is `"<tag>" + S + "</tag>"` (or the
+/// attributed form); argument-less ones ignore `args`.
+macro_rules! html_method {
+    ($name:ident, $method:literal, $tag:literal) => {
+        pub fn $name(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+            html_wrap(ctx, this, args, $method, $tag, None)
+        }
+    };
+    ($name:ident, $method:literal, $tag:literal, $attr:literal) => {
+        pub fn $name(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+            html_wrap(
+                ctx,
+                this,
+                args,
+                $method,
+                $tag,
+                Some(($attr, args.first().copied())),
+            )
+        }
+    };
+}
+
+html_method!(string_anchor, "anchor", "a", "name");
+html_method!(string_big, "big", "big");
+html_method!(string_blink, "blink", "blink");
+html_method!(string_bold, "bold", "b");
+html_method!(string_fixed, "fixed", "tt");
+html_method!(string_fontcolor, "fontcolor", "font", "color");
+html_method!(string_fontsize, "fontsize", "font", "size");
+html_method!(string_italics, "italics", "i");
+html_method!(string_link, "link", "a", "href");
+html_method!(string_small, "small", "small");
+html_method!(string_strike, "strike", "strike");
+html_method!(string_sub, "sub", "sub");
+html_method!(string_sup, "sup", "sup");
 
 /// `String.prototype.replaceAll` for string search values (regex search
 /// values remain on the registry's regex path).

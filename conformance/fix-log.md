@@ -2,6 +2,20 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-17 — lane/builtin-breadth: getOwnPropertyNames coercion, Error cause/remainder, remaining string methods
+
+- **Filter:** `built-ins/Object` (3 412 files), `built-ins/Error` (93 files), `built-ins/String` (1 341 files), 8 jobs
+- **Before:** Object 1 118/3 414 (32.8 %), Error 13/93 (14.0 %), String 462/1 341 (34.5 %) — pristine 8722ba9 worktree
+- **After:** Object 1 126/3 412 (33.1 %), Error 13/93 (14.0 %), String 538/1 341 (40.1 %)
+- **Delta:** Object +8 pass (partly test262-submodule skew: totals 3 414 vs 3 412, skips 7 vs 5), Error ±0, String +76 pass
+- **Root cause:** `Object.getOwnPropertyNames` threw on primitives and dropped dictionary-rung overflow keys; error constructors ignored `options.cause`; `EvalError`/`URIError` had no constructor bodies; `Error.isError`/`Error.prototype.toString` were missing; `String.prototype` lacked `matchAll`/`toWellFormed`/`isWellFormed`/`trimLeft`/`trimRight`/`toLocale*`/`String.raw`/Annex B HTML wrappers.
+- **Fix:** ToObject coercion + overflow keys in `object_get_own_property_names`/`own_property_names`; `InstallErrorCause` in `error_create_named`; new `eval_error_create`/`uri_error_create`/`error_is_error`/`error_proto_to_string` (dispatch-only); new string bodies wired through the `StringPrim` method table + `StringProto`/`StringCtor` installs, with `matchAll` on the registry regex-cache intercept (same path as `match`/`split`).
+- **Accepted gaps (PENDING-WIRING):** `EvalError`/`URIError` globals + `Error.isError`/`Error.prototype.toString` installs need realm wiring + new `GLOBAL_INTRINSICS` slots (frozen); `String.prototype.normalize` needs a `unicode-normalization` dependency (no network); `String.prototype[Symbol.iterator]` needs heap/realm wiring.
+- **Engine change:** lane commit (see below)
+- **Files:** `crates/v12-engine/src/builtins/{object,error,string,mod,registry}.rs`, `crates/v12-native/src/{id,methods}.rs`
+- **Runner:** `./conformance/run.sh --filter <f> --jobs 8`
+- **Notes:** workspace gate 584/584; `cargo clippy --workspace --all-targets` 0 errors (only the accepted unwrap/expect policy notes); `cargo fmt --check` clean. Lane tag: `lane/builtin-breadth`.
+
 ## Template
 
 Copy the block below for each fix. Keep it under 20 lines.
