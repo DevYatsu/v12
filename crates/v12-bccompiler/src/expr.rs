@@ -973,31 +973,60 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(dst)
     }
 
+    /// ES §13.15.1 / §13.4.1: a strict-mode `IdentifierReference` whose
+    /// StringValue is `eval` or `arguments` has AssignmentTargetType
+    /// `strict`, so it may not appear as an assignment or update target.
+    fn check_strict_assign_target(&self, id: &oxc_ast::ast::IdentifierReference<'_>) -> Res<()> {
+        if !self.comp.plans.units[self.unit].is_strict {
+            return Ok(());
+        }
+        let name = id.name.as_str();
+        if name == "eval" || name == "arguments" {
+            return Err(self.err(
+                id.span,
+                format!("SyntaxError: '{name}' cannot be an assignment target in strict mode"),
+            ));
+        }
+        Ok(())
+    }
+
     fn delete(&mut self, arg: &Expression<'_>, span: Span) -> Res<u16> {
-        // `delete unqualifiedIdentifier`: a SyntaxError early error in strict
-        // mode; in sloppy mode Annex B says it evaluates to `true` (and does
-        // nothing — the binding is not deleted).
-        if !arg.is_member_expression() {
-            if self.comp.plans.units[self.unit].is_strict {
-                return Err(self.err(
-                    span,
-                    "SyntaxError: Delete of an unqualified identifier in strict mode",
-                ));
+        // Peel transparent parentheses before classifying the operand:
+        // `delete ((obj.#x))` is still a PrivateName-target early error, and
+        // `delete (x)` in strict mode is still a delete of an identifier.
+        let is_strict = self.comp.plans.units[self.unit].is_strict;
+        match peel_member_parens(arg) {
+            // `delete obj.#priv` / `delete f().#priv`: PrivateName targets are
+            // always an early error (`MemberExpression : MemberExpression
+            // . PrivateName`, ES §13.15.1) — class bodies are strict code.
+            Some(MemberExpression::PrivateFieldExpression(_)) => Err(self.err(
+                span,
+                "SyntaxError: Delete of a private member in strict mode",
+            )),
+            Some(m) => {
+                if m.optional() {
+                    return Err(self.err(span, "optional chaining is not supported"));
+                }
+                let (obj, key) = self.member_parts(m)?;
+                let dst = self.new_temp();
+                self.emit_reg3(Opcode::DeleteProperty, dst, obj, key, span);
+                Ok(dst)
             }
-            let dst = self.new_temp();
-            self.load_bool(dst, true, span);
-            return Ok(dst);
+            // `delete unqualifiedIdentifier`: a SyntaxError early error in
+            // strict mode; in sloppy mode Annex B says it evaluates to `true`
+            // (and does nothing — the binding is not deleted).
+            None => {
+                if is_strict {
+                    return Err(self.err(
+                        span,
+                        "SyntaxError: Delete of an unqualified identifier in strict mode",
+                    ));
+                }
+                let dst = self.new_temp();
+                self.load_bool(dst, true, span);
+                Ok(dst)
+            }
         }
-        let Some(m) = arg.as_member_expression() else {
-            return Err(self.err(span, "`delete` is only supported on properties"));
-        };
-        if m.optional() {
-            return Err(self.err(span, "optional chaining is not supported"));
-        }
-        let (obj, key) = self.member_parts(m)?;
-        let dst = self.new_temp();
-        self.emit_reg3(Opcode::DeleteProperty, dst, obj, key, span);
-        Ok(dst)
     }
 
     fn binary(
@@ -1082,6 +1111,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         };
         match target {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                // `eval++` / `arguments++` are early errors in strict mode
+                // (`UpdateExpression` AssignmentTargetType `strict`).
+                self.check_strict_assign_target(id)?;
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
                     // Unbound identifier → global property via `GetGlobal`/`SetGlobal`.
                     // Mirrors the `assign` global path and keeps `x++` on an
@@ -1191,6 +1223,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
         match simple {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                // `eval = x` / `arguments = x` are early errors in strict mode
+                // (`AssignmentTargetType` of the identifier is `strict`).
+                self.check_strict_assign_target(id)?;
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
                     // Unbound assignment goes to global.
                     let rhs_val = match binop {
@@ -1376,6 +1411,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     // `{x} = rhs`: property `x` → target variable `x`;
                     // `{x = default} = rhs` applies the default when
                     // the read is `undefined` (shared `lower_default`).
+                    // `eval`/`arguments` as the target are strict early errors.
+                    self.check_strict_assign_target(&id.binding)?;
                     let key = self.new_temp();
                     self.load_str(key, id.binding.name.as_str(), span)?;
                     let raw = self.new_temp();
@@ -1438,6 +1475,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     ) -> Res<()> {
         match target {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                // `[eval] = x` / `({arguments} = x)` are strict early errors.
+                self.check_strict_assign_target(id)?;
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
                     let gid = self.global_name_id(id.name.as_str());
                     if self.comp.plans.units[self.unit].is_strict {
@@ -1816,6 +1855,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         let target = match simple {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                // `eval &&= x` / `arguments ||= x` are early errors in strict mode.
+                self.check_strict_assign_target(id)?;
                 let Some(sym) = self.comp.symbol_of(id.reference_id.get()) else {
                     // Unbound identifier → global property.
                     return self.logical_assign_global(op, id, right, span);
@@ -2138,6 +2179,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             .map_err(|_| self.err(span, "programs above 65535 functions are not supported"))?;
         self.emit_closure(dst, idx16, span);
         Ok(())
+    }
+}
+
+/// Strips transparent `ParenthesizedExpression` wrappers from an expression
+/// and returns the inner `MemberExpression`, if the core is one. Returns
+/// `None` for non-member cores (identifier references, calls, literals).
+fn peel_member_parens<'e, 'a>(e: &'e Expression<'a>) -> Option<&'e MemberExpression<'a>> {
+    let mut cur = e;
+    loop {
+        match cur {
+            Expression::ParenthesizedExpression(p) => cur = &p.expression,
+            _ => return cur.as_member_expression(),
+        }
     }
 }
 

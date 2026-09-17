@@ -63,6 +63,7 @@ fn collect_inner(
         strict_stack: Vec::new(),
         ref_sites: Vec::new(),
         unit_stack: Vec::new(),
+        early_error: None,
     };
     c.plans.is_module = is_module;
     // Unit 0 = main script body.
@@ -72,10 +73,16 @@ fn collect_inner(
     c.unit_stack.push(0);
     c.strict_stack.push(is_strict);
     c.stmt_list(&program.body);
+    if let Some(err) = c.early_error {
+        return Err(err);
+    }
     let mut plans = c.plans;
     plans.ref_sites = c.ref_sites;
-    // Strict-mode eval/arguments checks for declarations.
-    for (idx, unit) in plans.units.iter().enumerate() {
+    // Strict-mode binding-name checks for declarations: `eval`/`arguments`
+    // are never valid binding names in strict code, and the FutureReservedWords
+    // (`implements`, `interface`, `let`, `package`, `private`, `protected`,
+    // `public`, `static`, `yield`) are reserved (ES §12.1.1, §12.6.2).
+    for unit in plans.units.iter() {
         if !unit.is_strict {
             continue;
         }
@@ -87,11 +94,42 @@ fn collect_inner(
                     span: None,
                 });
             }
+            if is_strict_reserved_word(name) {
+                return Err(CompileError {
+                    message: format!("SyntaxError: '{name}' is a reserved word in strict mode"),
+                    span: None,
+                });
+            }
         }
-        let _ = idx;
     }
     finalize(&mut plans)?;
     Ok(plans)
+}
+
+/// The strict-mode-only reserved words: binding any of these in strict mode
+/// code is an early SyntaxError (ES §12.1.1).
+fn is_strict_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "implements"
+            | "interface"
+            | "let"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "yield"
+    )
+}
+
+/// `IsSimpleParameterList` (ES §14.1.13): every formal is a plain
+/// `BindingIdentifier` with no initializer and there is no rest parameter.
+fn is_simple_parameter_list(params: &FormalParameters<'_>) -> bool {
+    params.rest.is_none()
+        && params.items.iter().all(|p| {
+            p.initializer.is_none() && matches!(p.pattern, BindingPattern::BindingIdentifier(_))
+        })
 }
 
 struct Collector<'s> {
@@ -101,6 +139,9 @@ struct Collector<'s> {
     /// `(symbol, referencing unit)` pairs; joined against homes in `finalize`.
     ref_sites: Vec<(SymbolId, usize)>,
     unit_stack: Vec<usize>,
+    /// First early-error found during the walk; aborts collection after the
+    /// current subtree so one bad construct yields one diagnostic.
+    early_error: Option<CompileError>,
 }
 
 impl<'s> Collector<'s> {
@@ -115,6 +156,36 @@ impl<'s> Collector<'s> {
         let unit = self.cur_unit();
         self.plans.home_of.insert(sym, unit);
         self.plans.units[unit].decl_order.push(sym);
+    }
+
+    /// Records the first early error encountered while walking; later walks
+    /// still run (cheaply) but the whole collect aborts on return.
+    fn record_early_error(&mut self, span: oxc_span::Span, message: impl Into<String>) {
+        if self.early_error.is_none() {
+            self.early_error = Some(CompileError {
+                message: message.into(),
+                span: Some((span.start, span.end)),
+            });
+        }
+    }
+
+    /// ES §14.1.2 / §14.2.1: a function with a non-simple parameter list may
+    /// not carry a `"use strict"` directive — the directive is an early error
+    /// then, because the parameters and the strict body cannot both bind.
+    /// `strict_span` is the span to report (the function/arrow body).
+    fn check_use_strict_with_non_simple_params(
+        &mut self,
+        params: &FormalParameters<'_>,
+        has_own_use_strict: bool,
+        span: oxc_span::Span,
+    ) {
+        if has_own_use_strict && !is_simple_parameter_list(params) {
+            self.record_early_error(
+                span,
+                "SyntaxError: 'use strict' directive not allowed in a function with a \
+                 non-simple parameter list",
+            );
+        }
     }
 
     fn note_ref(&mut self, sym: SymbolId) {
@@ -172,6 +243,7 @@ impl<'s> Collector<'s> {
                 .any(|d| d.expression.value == "use strict")
         });
         let is_strict = parent_strict || own_strict;
+        self.check_use_strict_with_non_simple_params(&f.params, own_strict, f.span());
         let mut plan = UnitPlan::new(Some(parent), false, name_hint);
         plan.is_strict = is_strict;
         // A named function's `name` own property (installed at closure alloc):
@@ -216,6 +288,7 @@ impl<'s> Collector<'s> {
             None => false,
         };
         let is_strict = parent_strict || own_strict;
+        self.check_use_strict_with_non_simple_params(&a.params, own_strict, a.span);
         let mut plan = UnitPlan::new(Some(parent), true, format!("<arrow>{}", idx));
         plan.is_strict = is_strict;
         self.plans.units.push(plan);
@@ -400,10 +473,19 @@ impl<'s> Collector<'s> {
     /// constructor unit's span is the *class* span so the lowering can find
     /// it; each method unit's span is the method function's span.
     fn class_unit(&mut self, c: &oxc_ast::ast::Class<'_>) {
-        // The class name binds in the enclosing unit.
+        // The class name binds in the enclosing unit. All class definitions
+        // are strict mode code (ES §15.7.1/§15.8.1), so the name itself must
+        // also be a valid strict binding: `class implements {}` is an error.
         if let Some(id) = &c.id
             && let Some(sym) = id.symbol_id.get()
         {
+            let name = self.scoping.symbol_name(sym).to_string();
+            if is_strict_reserved_word(&name) || name == "eval" || name == "arguments" {
+                self.record_early_error(
+                    id.span,
+                    format!("SyntaxError: '{name}' is not a valid class name"),
+                );
+            }
             self.declare(sym);
             if self.cur_unit() == 0 && !self.plans.is_module {
                 self.plans.global_vars.insert(sym);
@@ -413,10 +495,12 @@ impl<'s> Collector<'s> {
         if let Some(h) = &c.heritage {
             self.expr(&h.expression);
         }
-        // The constructor unit.
+        // The constructor unit. Class code is always strict: force `is_strict`
+        // regardless of the surrounding unit (the class body is its own strict
+        // function context).
         let parent = self.cur_unit();
         let idx = self.plans.units.len();
-        let plan = UnitPlan::new(
+        let mut plan = UnitPlan::new(
             Some(parent),
             false,
             format!(
@@ -424,11 +508,13 @@ impl<'s> Collector<'s> {
                 c.id.as_ref().map(|i| i.name.as_str()).unwrap_or("")
             ),
         );
+        plan.is_strict = true;
         self.plans.units.push(plan);
         self.plans.fn_index.insert(c.span, idx);
         // The constructor's params/body come from the explicit `constructor`
         // element; register them in the constructor unit.
         self.unit_stack.push(idx);
+        self.strict_stack.push(true);
         let ctor_el = c.body.body.iter().find_map(|el| match el {
             oxc_ast::ast::ClassElement::MethodDefinition(m)
                 if m.kind == oxc_ast::ast::MethodDefinitionKind::Constructor =>
@@ -439,7 +525,19 @@ impl<'s> Collector<'s> {
         });
         if let Some(m) = ctor_el {
             // The explicit constructor is a Function; register its params and
-            // walk its body, and note references inside it.
+            // walk its body, and note references inside it. A `"use strict"`
+            // directive is redundant here but still subject to the
+            // use-strict-with-non-simple-params early error.
+            let ctor_strict = m.value.body.as_deref().is_some_and(|b| {
+                b.directives
+                    .iter()
+                    .any(|d| d.expression.value == "use strict")
+            });
+            self.check_use_strict_with_non_simple_params(
+                &m.value.params,
+                ctor_strict,
+                m.value.span,
+            );
             self.register_formals(idx, &m.value.params);
             if let Some(body) = m.value.body.as_deref() {
                 self.stmt_list(&body.statements);
@@ -501,6 +599,8 @@ impl<'s> Collector<'s> {
                 self.strict_stack.pop();
             }
         }
+        // Pop the class-body strict frame pushed above.
+        self.strict_stack.pop();
     }
 
     fn import_decl(&mut self, d: &oxc_ast::ast::ImportDeclaration<'_>) {

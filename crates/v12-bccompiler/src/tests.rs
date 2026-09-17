@@ -1736,6 +1736,100 @@ fn strict_eval_binding_is_syntax_error() {
     assert!(err.message.contains("eval"), "got: {}", err.message);
 }
 
+/// ES §12.1.1: the strict-mode reserved words may not bind as identifiers.
+#[test]
+fn strict_reserved_word_binding_is_syntax_error() {
+    for name in [
+        "implements",
+        "interface",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "static",
+        "yield",
+        "let",
+    ] {
+        let src = format!("\"use strict\"; var {name} = 1;");
+        let err = compile_source_with_strings(&src)
+            .map_err(|e| e.message)
+            .expect_err("strict reserved-word binding should be a SyntaxError");
+        assert!(err.contains(name), "for {name}: got {err}");
+    }
+    // Sloppy mode must still accept every one of them.
+    for name in ["implements", "static", "let"] {
+        let src = format!("var {name} = 1;");
+        compile_source_with_strings(&src).expect("sloppy binding should compile");
+    }
+}
+
+/// ES §14.1.2: a `"use strict"` directive is an early error when the
+/// parameter list is not simple (rest, default, or a destructuring pattern).
+#[test]
+fn use_strict_with_non_simple_params_is_syntax_error() {
+    let err = compile_source_with_strings("function f(...a) { \"use strict\"; }")
+        .map_err(|e| e.message)
+        .expect_err("rest + use strict should fail");
+    assert!(err.contains("use strict"), "got: {err}");
+    let err = compile_source_with_strings("var f = (a = 1) => { \"use strict\"; };")
+        .map_err(|e| e.message)
+        .expect_err("default param + use strict should fail");
+    assert!(err.contains("use strict"), "got: {err}");
+    // A simple parameter list with the directive is legal.
+    compile_source_with_strings("function f(a) { \"use strict\"; return a; }")
+        .expect("simple params + use strict should compile");
+}
+
+/// ES §13.15.1/§13.4.1: strict-mode `eval`/`arguments` are never valid
+/// assignment or update targets.
+#[test]
+fn strict_eval_arguments_assign_target_is_syntax_error() {
+    for src in [
+        "\"use strict\"; eval = 1;",
+        "\"use strict\"; arguments = 1;",
+        "\"use strict\"; eval++;",
+        "\"use strict\"; arguments += 1;",
+        "\"use strict\"; eval &&= 1;",
+        "\"use strict\"; 0, { eval = 0 } = {};",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("strict eval/arguments target should be a SyntaxError");
+        assert!(err.contains("assignment target"), "for {src}: got {err}");
+    }
+    // Sloppy mode keeps the Annex B web-compat behavior.
+    compile_source_with_strings("eval = 1;").expect("sloppy eval assignment compiles");
+}
+
+/// `delete` of a `PrivateName` target is an early error regardless of the
+/// surrounding unit (class bodies are always strict).
+#[test]
+fn delete_private_member_is_syntax_error() {
+    for src in [
+        "var C = class { #m() {} x() { delete this.#m; } };",
+        "var C = class { #x; x = delete ((this.#x)); };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("delete of a private member should fail");
+        assert!(err.contains("private"), "for {src}: got {err}");
+    }
+    // Non-private deletes still compile in strict mode.
+    compile_source_with_strings("\"use strict\"; var o = {a:1}; delete o.a;")
+        .expect("delete of a property should compile");
+}
+
+/// All parts of a class definition are strict mode code (ES §10.2.1), so a
+/// `FutureReservedWord` class name is an early error even in sloppy code.
+#[test]
+fn class_name_strict_reserved_word_is_syntax_error() {
+    let err = compile_source_with_strings("class static {}")
+        .map_err(|e| e.message)
+        .expect_err("`class static` should fail");
+    assert!(err.contains("static"), "got: {err}");
+    compile_source_with_strings("class C {}").expect("plain class name compiles");
+}
+
 #[test]
 fn annex_b_sloppy_block_function_compiles() {
     let src = "if (true) function f(){ return 1; }";
