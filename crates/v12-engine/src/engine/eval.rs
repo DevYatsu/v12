@@ -289,10 +289,8 @@ impl Engine {
         let entry_ns = entry_path.map(|ep| {
             let ns = crate::module_namespace::alloc_namespace(&mut self.heap);
             if let Some(loader) = self.registry.loader() {
-                let canonical = crate::module_loader::resolve_specifier(
-                    Path::new("."),
-                    &ep.to_string_lossy(),
-                );
+                let canonical =
+                    crate::module_loader::resolve_specifier(Path::new("."), &ep.to_string_lossy());
                 loader
                     .borrow_mut()
                     .modules

@@ -102,11 +102,7 @@ pub(crate) fn seed_export_keys(heap: &mut Heap, ns: Handle<JsObject>, names: &[S
 /// Installation is a direct shape transition (not the ordinary define path)
 /// because the namespace is already non-extensible. An existing key's value is
 /// overwritten in place; the spec attributes are fixed.
-pub(crate) fn populate_namespace(
-    heap: &mut Heap,
-    ns: Handle<JsObject>,
-    exports: Handle<JsObject>,
-) {
+pub(crate) fn populate_namespace(heap: &mut Heap, ns: Handle<JsObject>, exports: Handle<JsObject>) {
     let shape = heap.shape_of(exports);
     // Copy the descriptor list out before any mutable borrow (key_text
     // flattens strings); descriptors are `Copy`.

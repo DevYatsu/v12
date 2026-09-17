@@ -408,3 +408,89 @@ mod display_tests {
         assert_eq!(thrown_text("throw {a: 1};"), "[object Object]");
     }
 }
+
+#[cfg(test)]
+mod module_namespace_tests {
+    use crate::engine::Engine;
+
+    /// Evaluates a module that captures the namespace into a global so the
+    /// test can then eval assertions against it on the same engine.
+    fn namespace_engine() -> Engine {
+        let mut engine = Engine::new();
+        let src = "import * as ns from './self.js';\n\
+                   export var local1 = 201;\n\
+                   var local2 = 207;\n\
+                   export { local2 as renamed };\n\
+                   export default 302;\n\
+                   globalThis.__ns = ns;\n";
+        let dir = std::env::temp_dir().join("v12_modns_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("self.js");
+        engine
+            .eval_module_source_at(src, &dir, Some(&path))
+            .expect("module evaluates");
+        engine
+    }
+
+    fn assert_eval_true(engine: &mut Engine, src: &str) {
+        let v = engine.eval(src).expect("eval");
+        assert_eq!(v.as_bool(), Some(true), "assertion failed: {src}");
+    }
+
+    #[test]
+    fn namespace_has_null_prototype() {
+        let mut e = namespace_engine();
+        assert_eval_true(&mut e, "Object.getPrototypeOf(globalThis.__ns) === null");
+    }
+
+    #[test]
+    fn namespace_is_not_extensible() {
+        let mut e = namespace_engine();
+        assert_eval_true(&mut e, "Object.isExtensible(globalThis.__ns) === false");
+        // Already non-extensible: preventExtensions reports success.
+        assert_eval_true(
+            &mut e,
+            "Object.preventExtensions(globalThis.__ns) === globalThis.__ns",
+        );
+    }
+
+    #[test]
+    fn namespace_export_descriptor_shape() {
+        let mut e = namespace_engine();
+        // Spec quirk: exports report writable:true, enumerable:true,
+        // configurable:false.
+        assert_eval_true(
+            &mut e,
+            "var d = Object.getOwnPropertyDescriptor(globalThis.__ns, 'local1');\n\
+             d.value === 201 && d.writable === true && \
+             d.enumerable === true && d.configurable === false",
+        );
+    }
+
+    #[test]
+    fn namespace_reports_sorted_export_keys() {
+        let mut e = namespace_engine();
+        // local1, renamed, default are the exports; sort order is
+        // [default, local1, renamed] (byte order: 'd' < 'l' < 'r').
+        assert_eval_true(
+            &mut e,
+            "Object.getOwnPropertyNames(globalThis.__ns).join(',') === \
+             'default,local1,renamed'",
+        );
+    }
+
+    #[test]
+    fn namespace_self_import_resolves_to_same_object() {
+        let mut e = namespace_engine();
+        // The loader registered the entry namespace before dependencies ran,
+        // so the self-import returned that object (not a fresh placeholder).
+        assert_eval_true(&mut e, "globalThis.__ns.local1 === 201");
+    }
+
+    #[test]
+    fn namespace_absent_key_reads_undefined() {
+        let mut e = namespace_engine();
+        assert_eval_true(&mut e, "globalThis.__ns.notExported === undefined");
+        assert_eval_true(&mut e, "('notExported' in globalThis.__ns) === false");
+    }
+}
