@@ -2,6 +2,18 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/class-fields (Phase A): instance fields always become own properties [lane/class-fields]
+
+- **Filter:** `language/statements/class` (4 369), `--jobs 8`, default `--format human`.
+- **Before (master `af93856`, main worktree):** TOTAL 2 430 pass / 1 939 fail (55.6 %; `language/statements` 2 429/1 938).
+- **After:** TOTAL **2 526 pass / 1 843 fail (57.8 %)** — **+96**, no other suite regressed.
+- **Root cause:** `crates/v12-bccompiler/src/unit.rs` was the only emitter of instance-field initializers and had three defects: (1) `let Some(value) = &p.value else { continue }` skipped every field with no initializer, so `a;` never became an own property; (2) `if c.heritage.is_none()` skipped **all** fields of an `extends` class, so derived-class fields never initialized; (3) initializer ran before the constructor body even in derived classes, with no `super()` ordering hook.
+- **Fix:** extracted `unit.rs::emit_instance_fields`, which installs every non-static non-private field as `this[key] = <init>` in declaration order (a missing initializer stores `undefined`), reusing the existing `LoadUndefined` temp pattern and `class::apply_field_function_name`. Base classes run it at the top of the constructor; derived classes run it via `FnCtx::ctor_body_f` (`stmt.rs`), which compiles statements up to and including the first top-level `super(...)` expression statement, then runs the initializer closure, then the rest. A derived class with no explicit constructor initializes fields directly (the default constructor path already performed the super step). Private fields are untouched (still the construct-clone path).
+- **Files:** `crates/v12-bccompiler/src/unit.rs` (+52/−30), `crates/v12-bccompiler/src/stmt.rs` (+49), `crates/v12-engine/tests/class_fields.rs` (new, 4 tests).
+- **Probe (`/tmp/clsf.js`):** `a own: true a: undefined`, `b own: true b: 1`, `c own: true`, `d own: true d: 2`; `/tmp/clsf_order.js` logs `pre,P,post p: 1 x: 2 y: 2`, `keys: p,x,y` (super body before field init before post-super body, declaration order preserved).
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **635 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-bccompiler --check` clean.
+- **Known gap (pre-existing, not regressed):** a derived class with **no** explicit constructor still does not forward `super(...args)`, so base constructors with side effects do not run for `class D extends P {}`. Fields themselves now initialize (default derived path), but the missing super-forwarding is an interpreter/ABI concern outside this lane's ownership.
+
 ### 2026-09-18 — lane/obj-proto: ordinary objects get `%Object.prototype%` [lane/obj-proto]
 
 - **Filter:** `language/expressions` (11 128), `language/statements` (9 369), `built-ins/Object` (3 414), `--jobs 8`, `--format human`

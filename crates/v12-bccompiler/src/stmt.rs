@@ -22,6 +22,35 @@ use crate::model::{CompileError, FinallyCtx, FnCtx, VarLoc};
 type Res<T> = Result<T, CompileError>;
 
 impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
+    /// Compiles a derived-class constructor body, running `on_super` once
+    /// immediately after the first top-level `super(...)` statement executes
+    /// (ES `InitializeInstanceElements` runs after the super call).
+    /// Statements before the super call compile first, then `on_super`, then
+    /// the rest.
+    ///
+    /// If no direct `super()` statement exists (a constructor that never
+    /// calls super, or one whose only call is nested in a conditional), the
+    /// fallback runs `on_super` at the end of the body — still after any
+    /// super step that executed.
+    pub(crate) fn ctor_body_f(
+        &mut self,
+        stmts: &'a [Statement<'a>],
+        on_super: impl FnOnce(&mut Self) -> Res<()>,
+    ) -> Res<()> {
+        let mut on_super = Some(on_super);
+        for s in stmts {
+            let is_super_stmt = is_direct_super_call(s);
+            self.stmt(s)?;
+            if is_super_stmt && let Some(f) = on_super.take() {
+                f(self)?;
+            }
+        }
+        if let Some(f) = on_super {
+            f(self)?;
+        }
+        Ok(())
+    }
+
     /// Compiles a statement list, hoisting function declarations to its top.
     /// Only direct list items hoist (subset limitation).
     pub fn stmt_list(&mut self, stmts: &'a [Statement<'a>]) -> Res<()> {
@@ -1332,6 +1361,20 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             target,
             stack_depth,
         });
+    }
+}
+
+/// `true` when `s` is a top-level expression statement whose expression is a
+/// direct `super(...)` call — the only statement form that reports the
+/// derived-constructor super step. Purely syntactic; `collect` has already
+/// validated that `super()` is legal here.
+fn is_direct_super_call(s: &Statement<'_>) -> bool {
+    match s {
+        Statement::ExpressionStatement(e) => match &e.expression {
+            Expression::CallExpression(c) => c.callee.is_super(),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
