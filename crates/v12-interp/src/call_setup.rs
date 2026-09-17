@@ -1528,6 +1528,9 @@ impl Interp<'_> {
     ) -> Option<Result<JsValue, JSException>> {
         match id {
             NativeId::StringConstruct => Some(self.run_string_construct(this_v, args)),
+            // `Number(x)`/`new Number(x)` must run a user `valueOf`/`toString`
+            // (default-hint ToPrimitive), which re-enters the machine.
+            NativeId::NumberConstruct => Some(self.run_number_construct(args)),
             NativeId::ArrayForEach
             | NativeId::ArrayMap
             | NativeId::ArrayFilter
@@ -1586,6 +1589,18 @@ impl Interp<'_> {
             return Ok(JsValue::string(self.heap.intern_text("Symbol()")));
         }
         self.to_string_value(v)
+    }
+
+    /// ES `Number(value)`: objects coerce via the default-hint ToPrimitive
+    /// (`valueOf` first) so a user `valueOf` is invoked. `new Number(value)`
+    /// reaches the same router; v1 has no Number-wrapper object, so both
+    /// forms yield the primitive number (documented YAGNI deviation).
+    fn run_number_construct(&mut self, args: &[JsValue]) -> Result<JsValue, JSException> {
+        let Some(&v) = args.first() else {
+            return Ok(JsValue::from_f64(0.0));
+        };
+        let n = self.to_number_value(v)?;
+        Ok(JsValue::from_f64(n))
     }
 
     /// The receiver's length (array slot or element count for array-likes).

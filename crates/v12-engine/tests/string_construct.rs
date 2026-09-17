@@ -57,3 +57,18 @@ fn string_primitives_unchanged() {
     assert_eq!(eval_display("String(true)"), "true");
     assert_eq!(eval_display("String('x')"), "x");
 }
+
+#[test]
+fn number_invokes_object_value_of() {
+    // `Number(x)` uses the default-hint ToPrimitive (`valueOf` first), so a
+    // user `valueOf` is honored; previously every object yielded NaN.
+    assert_eq!(eval_display("Number({ valueOf() { return 42; } })"), "42");
+    assert_eq!(
+        eval_display("new Number({ valueOf() { return 42; } })"),
+        "42"
+    );
+    // `toString` is consulted only when `valueOf` yields no primitive.
+    assert_eq!(eval_display("Number({ toString() { return '7'; } })"), "7");
+    assert_eq!(eval_display("Number('5')"), "5");
+    assert_eq!(eval_display("Number()"), "0");
+}
