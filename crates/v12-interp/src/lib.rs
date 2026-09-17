@@ -253,6 +253,7 @@ const WELL_KNOWN_NAMES: &[&str] = &[
     "forEach",           // 34
     "add",               // 35
     "constructor",       // 36
+    "asyncIterator",     // 37
 ];
 const WK_COUNT: usize = WELL_KNOWN_NAMES.len();
 const WK_LENGTH: usize = 0;
@@ -292,6 +293,7 @@ const WK_CLEAR: usize = 33;
 const WK_FOR_EACH: usize = 34;
 const WK_ADD: usize = 35;
 const WK_CONSTRUCTOR: usize = 36;
+const WK_ASYNC_ITERATOR: usize = 37;
 
 /// Maximum simultaneous JavaScript activations.
 ///
@@ -545,6 +547,9 @@ pub struct Interp<'a> {
     /// The realm's `Symbol.iterator` well-known symbol, allocated lazily on
     /// first `for-of`/spread use and rooted so it survives collection.
     symbol_iterator: Option<Handle<v12_heap::V12Symbol>>,
+    /// The realm's `Symbol.asyncIterator` well-known symbol (distinct from
+    /// `Symbol.iterator`), allocated lazily on first `for await` use.
+    symbol_async_iterator: Option<Handle<v12_heap::V12Symbol>>,
     /// Completion value of the bottom frame when the dispatch loop ends.
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
@@ -638,6 +643,7 @@ impl<'a> Interp<'a> {
             generator_return_fn: None,
             generator_throw_fn: None,
             symbol_iterator: None,
+            symbol_async_iterator: None,
             top_result: None,
             pending_awaits: std::collections::VecDeque::new(),
             pending_settlements: Vec::new(),
@@ -2132,7 +2138,19 @@ impl<'a> Interp<'a> {
                     // A resumed async body that throws must *reject* its
                     // completion promise, not surface the throw to the drain
                     // driver (spec 27.5.3.6: the error rides the promise).
-                    self.pending_settlements.push((r#gen, e, true));
+                    // The completion promise lives at slot 4 on async-function
+                    // generators (`None` for a sync generator, whose abrupt
+                    // completion propagates to its caller instead).
+                    match self
+                        .heap
+                        .get(r#gen)
+                        .properties
+                        .get(4)
+                        .and_then(|v| v.as_object())
+                    {
+                        Some(promise) => self.pending_settlements.push((promise, e, true)),
+                        None => return false,
+                    }
                 }
             }
         }
@@ -2243,6 +2261,9 @@ impl<'a> Interp<'a> {
             roots.push(v);
         }
         if let Some(sym) = self.symbol_iterator {
+            roots.push(JsValue::symbol(sym));
+        }
+        if let Some(sym) = self.symbol_async_iterator {
             roots.push(JsValue::symbol(sym));
         }
         roots.extend(persistent.into_iter().flatten());

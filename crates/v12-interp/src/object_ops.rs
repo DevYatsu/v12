@@ -333,9 +333,32 @@ impl Interp<'_> {
     /// it goes through the ordinary `get_property` path so user code can
     /// observe and override it.
     pub(crate) fn op_get_iterator(&mut self, src_v: JsValue) -> Result<JsValue, JSException> {
+        self.get_iterator(src_v, false)
+    }
+
+    /// ES GetIterator (7.4.1) with the `async` hint. When `is_async`, the
+    /// `@@asyncIterator` method is preferred; if absent, the sync
+    /// `@@iterator` method is used and its results are awaited by the
+    /// for-await lowering (`AsyncFromSyncIterator` semantics approximated by
+    /// the `Await` around `IteratorNext` and the bound value). When
+    /// `is_async` is false the `@@iterator` method is used.
+    pub(crate) fn get_iterator(
+        &mut self,
+        src_v: JsValue,
+        is_async: bool,
+    ) -> Result<JsValue, JSException> {
         // 1. `method = GetV(iterable, @@iterator)` — resolve the well-known
         //    symbol first so the lookup uses the real symbol key.
-        let method = self.iterator_symbol_method(src_v)?;
+        let method = if is_async {
+            let async_method = self.async_iterator_symbol_method(src_v)?;
+            if async_method.is_null() || async_method.is_undefined() {
+                self.iterator_symbol_method(src_v)?
+            } else {
+                async_method
+            }
+        } else {
+            self.iterator_symbol_method(src_v)?
+        };
         // 2. `iterator = Call(method, iterable)` — reuse the call machinery
         //    (handles bytecode natives and engine natives uniformly). The
         //    method object is freshly synthesized by `get_property`; park it
@@ -366,6 +389,32 @@ impl Interp<'_> {
             ))),
             Err(e) => Err(e),
         }
+    }
+
+    /// Resolves the `@@asyncIterator` method value off `obj` (a symbol-keyed
+    /// `get_property`); a missing method yields `undefined` so the caller can
+    /// fall back to the sync iterator.
+    pub(crate) fn async_iterator_symbol_method(
+        &mut self,
+        obj_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let sym = self.symbol_async_iterator_key();
+        let sym_v = JsValue::symbol(sym);
+        self.gc_protect();
+        self.get_property(0, 0, obj_v, sym_v)
+    }
+
+    /// The realm's `Symbol.asyncIterator` well-known symbol handle, allocated
+    /// once (distinct from `Symbol.iterator`).
+    pub(crate) fn symbol_async_iterator_key(&mut self) -> Handle<v12_heap::V12Symbol> {
+        if let Some(h) = self.symbol_async_iterator {
+            return h;
+        }
+        self.gc_protect();
+        let h = self.heap.alloc(v12_heap::V12Symbol);
+        self.heap.add_root(JsValue::symbol(h));
+        self.symbol_async_iterator = Some(h);
+        h
     }
 
     /// Resolves the `@@iterator` method value off `obj` (a symbol-keyed

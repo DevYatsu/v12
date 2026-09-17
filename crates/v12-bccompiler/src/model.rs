@@ -429,8 +429,14 @@ pub struct LoopCtx {
     /// Register holding the loop's iterator (`for-of` only): an abrupt exit
     /// (`break`/`return`) emits `IteratorClose` on it, innermost loop first.
     pub close_iter: Option<u16>,
+    /// Register holding a boolean "close already in progress" guard for the
+    /// same loop. The break/return path sets it before calling `return()`:
+    /// that call happens *inside* the loop's exception range, so if it
+    /// throws, the loop's own handler must not close a second time (spec
+    /// 7.4.6 — the close error is itself the completion). The handler tests
+    /// the guard and rethrows the original abrupt without re-closing.
+    pub close_guard: Option<u16>,
 }
-
 /// One active `try … finally` region; intercepted exits (`return`, crossing
 /// `break`/`continue`) duplicate its finalizer inline — completion-dispatch
 /// duplication of its finalizer inline.
@@ -693,6 +699,31 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             name,
             finally_base: self.finallies.len(),
             close_iter,
+            close_guard: None,
+        });
+        let out = f(self);
+        self.loops.pop();
+        out
+    }
+
+    /// Like [`Self::with_loop`] but for a `for-of` loop that carries an
+    /// iterator-close guard register (see [`LoopCtx::close_guard`]).
+    pub fn with_for_of_loop<R>(
+        &mut self,
+        break_label: Label,
+        continue_label: Option<Label>,
+        name: Option<String>,
+        close_iter: u16,
+        close_guard: u16,
+        f: impl FnOnce(&mut Self) -> Result<R, CompileError>,
+    ) -> Result<R, CompileError> {
+        self.loops.push(LoopCtx {
+            break_label,
+            continue_label,
+            name,
+            finally_base: self.finallies.len(),
+            close_iter: Some(close_iter),
+            close_guard: Some(close_guard),
         });
         let out = f(self);
         self.loops.pop();
@@ -706,12 +737,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// as an Object (spec 7.4.6). The throw-path handler in `stmt.rs`
     /// emits `rb` 0 instead (no validation — the original error wins).
     pub fn emit_iterator_closes(&mut self, until: usize) {
-        let iters: Vec<u16> = self.loops[until..]
+        let iters: Vec<(u16, Option<u16>)> = self.loops[until..]
             .iter()
             .rev()
-            .filter_map(|ctx| ctx.close_iter)
+            .filter_map(|ctx| ctx.close_iter.map(|it| (it, ctx.close_guard)))
             .collect();
-        for iter in iters {
+        for (iter, guard) in iters {
+            // Arm the loop's close guard *before* the `return()` call: that
+            // call sits inside the loop's exception range, so a throwing
+            // close re-enters the handler, which must not close a second time
+            // (spec 7.4.6 — the close error is the completion).
+            if let Some(g) = guard {
+                self.load_bool(g, true, oxc_span::Span::default());
+            }
             self.emit_reg3(Opcode::IteratorClose, iter, 1, 0, oxc_span::Span::default());
         }
     }

@@ -50,6 +50,15 @@ const TEST262_HOST_SHIM: &str = r#"
 globalThis.__test262Prints = [];
 function __consolePrintHandle__(s) { globalThis.__test262Prints.push(String(s)); }
 function print(s) { globalThis.__test262Prints.push(String(s)); }
+// `$262.IsHTMLDDA` (INTERPRETING.md): an object emulating the [[IsHTMLDDA]]
+// internal slot. This shim is a real callable — the minimal behavior the
+// harness relies on — returning `null` when called with no arguments or an
+// empty string, per the host contract. (The `typeof`/loose-equality emulation
+// of `document.all` is a separate engine concern, not exercised here.)
+function __isHTMLDDA__() {
+    if (arguments.length === 0 || arguments[0] === "") return null;
+    return undefined;
+}
 var $262 = {
     createRealm: function () { return globalThis.__v12CreateRealm__(); },
     detachArrayBuffer: function (b) { return b; },
@@ -57,6 +66,7 @@ var $262 = {
     destroy: function () {},
     gc: function () {},
     global: globalThis,
+    IsHTMLDDA: __isHTMLDDA__,
 };
 "#;
 

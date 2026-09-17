@@ -586,7 +586,15 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         //    result object. Registers `iter` and `result` are loop-invariant.
         let rhs = self.expr(&f.right)?;
         let iter = self.new_temp();
-        self.emit_reg3(Opcode::GetIterator, iter, rhs, 0, span);
+        // for-await uses GetIterator with the async hint: `@@asyncIterator`
+        // when present, else the sync `@@iterator` (whose results the `Await`
+        // below unwraps, approximating AsyncFromSyncIterator).
+        let get_iter_op = if f.r#await {
+            Opcode::GetAsyncIterator
+        } else {
+            Opcode::GetIterator
+        };
+        self.emit_reg3(get_iter_op, iter, rhs, 0, span);
         let result = self.new_temp();
         let top = self.label();
         let cont = self.label();
@@ -594,6 +602,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // Abrupt completions from inside the loop must IteratorClose: an
         // exception range covers the whole iteration; its handler closes the
         // iterator and re-throws (spec 14.7.4.9).
+        // The close guard must live *below* the handler delivery register:
+        // unwinding truncates the window to `stack_depth` (the `exc` slot) and
+        // resizes, clobbering every register above it. Allocating the guard
+        // before `exc` keeps it in the preserved prefix.
+        let close_guard = self.new_temp();
+        self.load_bool(close_guard, false, span);
         let exc = self.new_temp();
         let try_start = self.pc();
         self.bind(top);
@@ -669,7 +683,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         // 5. Body: `break` closes the iterator (via the loop ctx); the
         //    exception range closes it when a throw escapes the body.
-        self.with_loop(end, Some(cont), name, Some(iter), |s| s.stmt(&f.body))?;
+        self.with_for_of_loop(end, Some(cont), name, iter, close_guard, |s| {
+            s.stmt(&f.body)
+        })?;
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
         // Normal completion exits here WITHOUT closing (spec 14.7.4.8) —
@@ -684,7 +700,15 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // failures are swallowed). A successful close falls through to the
         // rethrow below; the exception value sits in `exc` (handler
         // delivery register).
+        //
+        // The break/return path arms `close_guard` before its `return()` call
+        // (see `emit_iterator_closes`), so a close error re-entering this
+        // handler must NOT close a second time: the close error *is* the
+        // completion (spec 7.4.6). Skip the close when the guard is set.
+        let skip_close = self.label();
+        self.emit_jump(Opcode::JumpIfTrue, close_guard, skip_close);
         self.emit_reg3(Opcode::IteratorClose, iter, 0, 0, span);
+        self.bind(skip_close);
         self.emit_reg3(Opcode::Throw, exc, 0, 0, span);
         self.bind(over_handler);
         self.push_range(try_start, try_end, handler_start, exc);

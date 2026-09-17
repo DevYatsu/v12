@@ -6,12 +6,12 @@ use v12_heap::{Attrs, Descriptor, Handle, JsObject, JsValue, Kind, PropKey};
 
 use super::{
     ARRAY_IDX, CONSOLE_IDX, GLOBAL_VAR_OFFSET, Interp, JSException, OBJECT_IDX, PROMISE_IDX,
-    REGEXP_IDX, RegExpSlot, SYMBOL_IDX, WK_ADD, WK_APPLY, WK_BIND, WK_CALL, WK_CATCH, WK_CLEAR,
-    WK_CONSTRUCTOR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES, WK_ENUMERABLE_OWN_KEYS,
-    WK_FLAGS, WK_FOR_EACH, WK_GET, WK_GET_PROTOTYPE_OF, WK_HAS, WK_HAS_OWN_PROPERTY, WK_IS_ARRAY,
-    WK_ITERATOR, WK_KEYS, WK_LAST_INDEX, WK_LENGTH, WK_LOG, WK_NEXT, WK_PROTOTYPE, WK_REJECT,
-    WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN, WK_THROW, WK_TO_STRING,
-    WK_VALUE_OF, WK_VALUES, child_slot,
+    REGEXP_IDX, RegExpSlot, SYMBOL_IDX, WK_ADD, WK_APPLY, WK_ASYNC_ITERATOR, WK_BIND, WK_CALL,
+    WK_CATCH, WK_CLEAR, WK_CONSTRUCTOR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES,
+    WK_ENUMERABLE_OWN_KEYS, WK_FLAGS, WK_FOR_EACH, WK_GET, WK_GET_PROTOTYPE_OF, WK_HAS,
+    WK_HAS_OWN_PROPERTY, WK_IS_ARRAY, WK_ITERATOR, WK_KEYS, WK_LAST_INDEX, WK_LENGTH, WK_LOG,
+    WK_NEXT, WK_PROTOTYPE, WK_REJECT, WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN,
+    WK_THROW, WK_TO_STRING, WK_VALUE_OF, WK_VALUES, child_slot,
 };
 use crate::ops;
 use v12_native::NativeId;
@@ -238,10 +238,16 @@ impl Interp<'_> {
                 .get(symbol_idx)
                 .and_then(|v| v.as_object())
         }?;
-        if obj != symbol_ctor || !self.key_is_wk(key, WK_ITERATOR) {
+        if obj != symbol_ctor {
             return None;
         }
-        Some(Ok(JsValue::symbol(self.symbol_iterator_key())))
+        if self.key_is_wk(key, WK_ITERATOR) {
+            return Some(Ok(JsValue::symbol(self.symbol_iterator_key())));
+        }
+        if self.key_is_wk(key, WK_ASYNC_ITERATOR) {
+            return Some(Ok(JsValue::symbol(self.symbol_async_iterator_key())));
+        }
+        None
     }
 
     /// The Promise surface. Natives cannot attach shape-bound properties

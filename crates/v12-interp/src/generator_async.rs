@@ -2,12 +2,23 @@
 //! protocol (`next`/`return`/`throw`), promise unwrapping for `await`, and the
 //! parked-frame resume paths.
 
-use v12_heap::{Handle, JsObject, JsValue, Kind, PropKey};
+use v12_heap::{Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 
 use super::{Frame, Interp, JSException, MAX_RESUME_DEPTH};
 use crate::ops;
 
 impl Interp<'_> {
+    /// Slot index of the pending request promise on an async generator object.
+    /// Async *function* generators reuse slots 0..4 (`properties[4]` is the
+    /// completion promise); async generators append here so the resume path can
+    /// settle the promise returned by `.next()`/`.return()`/`.throw()`.
+    pub(crate) const ASYNC_GEN_REQUEST_SLOT: usize = 6;
+    /// Slot marking that the generator suspended on a real `yield` (not an
+    /// internal `await`) during the current resume. `SuspendYield` sets it for
+    /// async generators; the resume path reads it to decide whether the
+    /// pending request promise settles now or stays parked on the await.
+    pub(crate) const ASYNC_GEN_YIELD_SLOT: usize = 7;
+
     pub(crate) fn is_generator_fn_for(&self, fn_idx: u32, program: u32) -> bool {
         let funcs = self.functions_for_program(program);
         if fn_idx as usize >= funcs.len() {
@@ -81,6 +92,139 @@ impl Interp<'_> {
         Ok(r#gen)
     }
 
+    /// True when `r#gen` is an async-generator object (its function carries
+    /// both `is_async` and `is_generator`). Async generators resolve against
+    /// their own program table, so the lookup is program-aware.
+    pub(crate) fn is_async_generator_for(&self, r#gen: Handle<JsObject>) -> bool {
+        let (fn_idx, program) = self.generator_fn_and_program(r#gen);
+        self.is_async_fn_for(fn_idx, program) && self.is_generator_fn_for(fn_idx, program)
+    }
+
+    /// Reads `(fn_idx, program_id)` off a generator object's header slots.
+    fn generator_fn_and_program(&self, r#gen: Handle<JsObject>) -> (u32, u32) {
+        let o = self.heap.get(r#gen);
+        let fn_idx = o
+            .properties
+            .first()
+            .and_then(|v| v.as_smi().map(|n| n as u32 as f64).or(v.as_f64()))
+            .unwrap_or(0.0) as u32;
+        (fn_idx, o.program_id)
+    }
+
+    /// Pads an async generator's property slots through
+    /// `ASYNC_GEN_YIELD_SLOT` so the request-promise and yield-flag slots are
+    /// addressable (generators are created with only the 4 header slots).
+    fn ensure_async_gen_slots(&mut self, r#gen: Handle<JsObject>) {
+        let need = Self::ASYNC_GEN_YIELD_SLOT + 1;
+        let o = self.heap.get_mut(r#gen);
+        if o.properties.len() < need {
+            o.properties.resize(need, JsValue::undefined());
+            o.property_keys.resize(need, None);
+        }
+    }
+
+    /// Allocates a pending promise for an async-generator request
+    /// (`next`/`return`/`throw`), linked to `%Promise.prototype%` so `.then`
+    /// resolves through the promise surface.
+    fn alloc_async_gen_request(&mut self) -> Handle<JsObject> {
+        self.gc_protect();
+        let promise = self.heap.alloc_pending_promise();
+        if let Some(g) = self.global
+            && let Some(pp) = self
+                .heap
+                .get(g)
+                .properties
+                .get(super::PROMISE_IDX.expect("intrinsic 'Promise' present"))
+                .and_then(|v| v.as_object())
+                .and_then(|ctor| self.heap.get(ctor).prototype)
+        {
+            self.heap.get_mut(promise).prototype = Some(pp);
+        }
+        promise
+    }
+
+    /// Stores `promise` as an async generator's pending request promise at
+    /// [`Self::ASYNC_GEN_REQUEST_SLOT`]. The resume path (`resume_generator_nested`)
+    /// settles it: both the direct `.next()` resume and the later await
+    /// resumption (which carries no caller-side reference) route through one
+    /// settlement point.
+    pub(crate) fn set_async_gen_request(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        promise: Handle<JsObject>,
+    ) {
+        self.ensure_async_gen_slots(r#gen);
+        self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_REQUEST_SLOT] =
+            JsValue::object(promise);
+    }
+
+    /// Settles and clears the pending request promise (`next`/`return`/`throw`)
+    /// stored at [`Self::ASYNC_GEN_REQUEST_SLOT`], if any.
+    ///
+    /// `suspended` reports whether the resume stopped at a yield; `suspended`
+    /// with a value is `{value, done: false}`, a completion is
+    /// `{value, done: true}`, and `reject` rejects with `value`. A suspension
+    /// on an internal `await` (not a real `yield`) leaves the promise pending
+    /// for the eventual yield/completion resume.
+    pub(crate) fn settle_async_gen_request_slot(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        suspended: bool,
+        value: JsValue,
+        reject: bool,
+    ) {
+        if !self.is_async_generator_for(r#gen) {
+            return;
+        }
+        if suspended && !reject && !self.async_gen_yielded(r#gen) {
+            return;
+        }
+        let Some(promise) = self
+            .heap
+            .get(r#gen)
+            .properties
+            .get(Self::ASYNC_GEN_REQUEST_SLOT)
+            .and_then(|v| v.as_object())
+        else {
+            return;
+        };
+        if reject {
+            self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_REQUEST_SLOT] =
+                JsValue::undefined();
+            self.pending_settlements.push((promise, value, true));
+            return;
+        }
+        // Build the iterator result before clearing the slot: the generator
+        // (and hence the promise) is reachable from `frames` during the
+        // allocation safepoint.
+        let result = self.make_iterator_result(value, !suspended);
+        self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_REQUEST_SLOT] = JsValue::undefined();
+        self.pending_settlements.push((promise, result, false));
+    }
+
+    /// Reads the yield-vs-await flag left by the most recent resume
+    /// (`SuspendYield` sets it, `Await` clears it).
+    fn async_gen_yielded(&self, r#gen: Handle<JsObject>) -> bool {
+        self.heap
+            .get(r#gen)
+            .properties
+            .get(Self::ASYNC_GEN_YIELD_SLOT)
+            .is_some_and(|v| v.is_true())
+    }
+
+    /// Marks whether the current async-generator suspension is a real `yield`
+    /// (`true`, settles the request promise) or an internal `await` (`false`,
+    /// request promise stays parked).
+    pub(crate) fn set_async_gen_suspended_on_yield(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        on_yield: bool,
+    ) {
+        self.ensure_async_gen_slots(r#gen);
+        self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_YIELD_SLOT] =
+            JsValue::from_bool(on_yield);
+    }
+
     pub(crate) fn generator_next(
         &mut self,
         this_v: JsValue,
@@ -94,6 +238,13 @@ impl Interp<'_> {
         if self.heap.get(r#gen).kind != Kind::Generator {
             return Err(JSException(self.error_value("TypeError: not a generator")));
         }
+        let async_gen = self.is_async_generator_for(r#gen);
+        let request = if async_gen {
+            self.ensure_async_gen_slots(r#gen);
+            Some(self.alloc_async_gen_request())
+        } else {
+            None
+        };
         let done = self
             .heap
             .get(r#gen)
@@ -103,7 +254,22 @@ impl Interp<'_> {
             .unwrap_or(0.0)
             == 1.0;
         if done {
+            if let Some(promise) = request {
+                let result = self.make_iterator_result(JsValue::undefined(), true);
+                self.pending_settlements.push((promise, result, false));
+                return Ok(JsValue::object(promise));
+            }
             return Ok(self.make_iterator_result(JsValue::undefined(), true));
+        }
+        if let Some(promise) = request {
+            // The request promise parks on the generator; the resume path
+            // (`resume_generator_nested`) settles it, whether the body yields
+            // synchronously here or suspends on an `await` and resumes later.
+            // Async generators never throw synchronously from `next()`: an
+            // abrupt body completion rejects the request promise.
+            self.set_async_gen_request(r#gen, promise);
+            let _ = self.resume_generator(r#gen, arg, false);
+            return Ok(JsValue::object(promise));
         }
         match self.resume_generator(r#gen, arg, false)? {
             Some(value) => Ok(self.make_iterator_result(value, true)),
@@ -165,6 +331,12 @@ impl Interp<'_> {
             .unwrap_or(0.0)
             == 1.0;
         if done {
+            if self.is_async_generator_for(r#gen) {
+                let request = self.alloc_async_gen_request();
+                let result = self.make_iterator_result(arg, true);
+                self.pending_settlements.push((request, result, false));
+                return Ok(JsValue::object(request));
+            }
             return Ok(self.make_iterator_result(arg, true));
         }
         // Spec 27.5.3.4: resume the suspended body with a *return*
@@ -182,6 +354,15 @@ impl Interp<'_> {
                 o.property_keys.resize(6, None);
             }
             o.properties[5] = ops::box_number(1.0);
+        }
+        if self.is_async_generator_for(r#gen) {
+            let request = self.alloc_async_gen_request();
+            self.set_async_gen_request(r#gen, request);
+            // `return()` is a real suspension point for an async generator's
+            // request promise: the resume path settles it when the body
+            // finally yields again or completes.
+            let _ = self.resume_generator(r#gen, arg, false);
+            return Ok(JsValue::object(request));
         }
         match self.resume_generator(r#gen, arg, false)? {
             // The return trampoline completed the body.
@@ -217,11 +398,22 @@ impl Interp<'_> {
             .unwrap_or(0.0)
             == 1.0;
         if done {
+            if self.is_async_generator_for(r#gen) {
+                let request = self.alloc_async_gen_request();
+                self.pending_settlements.push((request, arg, true));
+                return Ok(JsValue::object(request));
+            }
             return Err(JSException(arg));
         }
         // Spec 27.5.3.5: resume the suspended body with a throw completion —
         // the exception surfaces at the suspended yield, so `catch` can
         // intercept it and `finally` runs on the unwind path.
+        if self.is_async_generator_for(r#gen) {
+            let request = self.alloc_async_gen_request();
+            self.set_async_gen_request(r#gen, request);
+            let _ = self.resume_generator(r#gen, arg, true);
+            return Ok(JsValue::object(request));
+        }
         match self.resume_generator(r#gen, arg, true) {
             Ok(Some(ret)) => Ok(self.make_iterator_result(ret, true)),
             Ok(None) => {
@@ -431,15 +623,26 @@ impl Interp<'_> {
                     // Suspended: the yielded value stays in `top_result` for
                     // the caller (`generator_next` wraps it, async resumes
                     // settle the promise with it). `None` marks suspension.
+                    // An async generator's pending request promise settles
+                    // here — for a real `yield` now, or, for an internal
+                    // `await`, not at all (the flag keeps it parked). A plain
+                    // sync generator leaves `top_result` for `generator_next`.
+                    if self.is_async_generator_for(r#gen) {
+                        let yielded = self.top_result.take().unwrap_or(JsValue::undefined());
+                        self.settle_async_gen_request_slot(r#gen, true, yielded, false);
+                    }
                     Ok(None)
                 } else {
                     let ret = self.top_result.take().unwrap_or(JsValue::undefined());
                     if done_val != 1.0 && self.heap.get(r#gen).properties.len() >= 3 {
                         self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
                     }
-                    // Async-function completion on the resume path: queue the
-                    // completion promise for settlement (the engine drain
-                    // runs its reactions — see `pending_settlements`).
+                    // Async function *and* async generator completion: queue the
+                    // completion promise for settlement (the engine drain runs
+                    // its reactions — see `pending_settlements`). An async
+                    // generator's completion also settles the pending request
+                    // promise with `{value: ret, done: true}`.
+                    self.settle_async_gen_request_slot(r#gen, false, ret, false);
                     if self.is_async_fn_for(fn_idx, gen_program)
                         && let Some(ph) = self
                             .heap
@@ -462,6 +665,9 @@ impl Interp<'_> {
                 if self.heap.get(r#gen).properties.len() >= 3 {
                     self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
                 }
+                // An async generator's request promise rejects with the body's
+                // abrupt completion rather than surfacing the throw.
+                self.settle_async_gen_request_slot(r#gen, false, e.0, true);
                 Err(e)
             }
         }

@@ -28,9 +28,10 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     72, // DefineMethod
     73, 74, // GetGlobalLenient, GenResumeMode
     75, // ToPropertyKey
+    76, // GetAsyncIterator
 ];
 
-pub const EXPECTED_OPCODE_COUNT: usize = 70;
+pub const EXPECTED_OPCODE_COUNT: usize = 71;
 
 /// Seeded splitmix64. Deterministic across platforms and runs.
 pub struct Rng(u64);
