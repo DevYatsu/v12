@@ -441,4 +441,19 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 ---
 
+### 2026-09-17 — Promise surface: all/race/finally [lane/promise-surface]
+
+- **Before:** built-ins/Promise 67 pass / 665 fail / 0 skip, 9.2 % (732 tests)
+- **After:** built-ins/Promise 100 pass / 632 fail / 0 skip, 13.7 % (+33 net)
+- **After per-area:** `all/` 17 pass / 81 fail; `race/` 14 pass / 80 fail; `prototype/finally/` 11 pass / 18 fail
+- **Engine change:** `Promise.all` / `Promise.race` (NativeId 1715/1716) + `Promise.prototype.finally` (1717) in `crates/v12-engine/src/builtins/promise.rs`, dispatched via the existing pending-sink registry seam, installed shape-bound on the Promise constructor / `Promise.prototype` (ordinary lookup — no interpreter surface, WK-key, or wire-helper changes per the §2 freeze).
+- **Design:** settled inputs settle synchronously (`settle_sync` helper: slot write + `drain_reaction_jobs` onto the sink, first-wins); pending inputs are watched by host-closure reaction records on the input's own reactions (the `capability_settle` adoption shape) — zero polling, so never-settling inputs cost nothing; `finally` watchers enqueue one `JobCtx::call_object` job that runs the user callback and settles the derived promise (callback throw → reject). Array-only iterable contract (`TypeError` otherwise); arbitrary thenable unwrapping out of scope (same as `then`). Fixed along the way: results-array writes must use `set_element` (arrays live in the `elements_array` lattice, not the flat `elements` vec).
+- **Files:** `crates/v12-engine/src/builtins/promise.rs` (+~300), `registry.rs` (+3 arms), `builtins/mod.rs` (+3 `builtin_length`), `realm.rs` (+3 installs), `crates/v12-native/src/id.rs` (+3 ids)
+- **Runner:** `./conformance/run.sh --filter built-ins/Promise --jobs 8` (human) + `--format tap --tap-out` for per-area counts
+- **Notes:**
+  - Verified: `cargo nextest run --workspace` 584 passed / 0 skipped; `cargo clippy --workspace --all-targets` 0 errors (no warnings in touched files); `cargo fmt --check` clean. CLI smokes: sync all/race/finally + pending-input all/race/finally + throwing-finally + never-settling input (clean exit, no drain spin).
+  - Remaining `all`/`race` fails are the documented next steps: general (non-array) iterables, iterator-close, `Symbol.species` subclassing, `this`-ctor species reads. `Promise[Symbol.species]` absent (pre-existing, symbol-lane surface).
+  - Known pre-existing gap (not introduced): stateful-seam `TypeError`s carry no realm `constructor` link (`Ctx::new(heap, None, …)`), so `instanceof TypeError` is false for them — same for the older `then`/`resolve` errors.
+  - Deferred to later lanes: async-generator `.next()` promise semantics (interp resume path, frozen), timers, async iteration.
+
 <!-- Future entries go above this line -->
