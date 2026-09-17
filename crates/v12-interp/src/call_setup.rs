@@ -1527,6 +1527,11 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Option<Result<JsValue, JSException>> {
         match id {
+            // `String(x)` must run user `toString`/`valueOf` (string-hint
+            // ToPrimitive), which re-enters the machine, so it cannot run as
+            // a pure `NativeHandler`. Both the call and `new String(x)`
+            // construct paths reach this router.
+            NativeId::StringConstruct => Some(self.run_string_construct(args)),
             NativeId::ArrayForEach
             | NativeId::ArrayMap
             | NativeId::ArrayFilter
@@ -1553,6 +1558,15 @@ impl Interp<'_> {
             | NativeId::IteratorFind => Some(self.run_iterator_callback(id, this_v, args)),
             _ => None,
         }
+    }
+
+    /// ES `String(value)` with the string-hint ToPrimitive so a user
+    /// `toString` is invoked. `new String(value)` reaches the same router
+    /// via `prepare_construct`; v1 has no String-wrapper object, so both
+    /// forms yield the primitive (documented YAGNI deviation).
+    fn run_string_construct(&mut self, args: &[JsValue]) -> Result<JsValue, JSException> {
+        let v = args.first().copied().unwrap_or(JsValue::undefined());
+        self.to_string_value(v)
     }
 
     /// The receiver's length (array slot or element count for array-likes).
