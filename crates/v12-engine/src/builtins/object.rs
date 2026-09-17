@@ -664,7 +664,7 @@ fn array_index_key(heap: &mut v12_heap::Heap, h: Handle<V12Str>) -> Option<u32> 
             .checked_mul(10)?
             .checked_add(u32::from(unit - u16::from(b'0')))?;
     }
-    if acc >= u32::MAX {
+    if acc == u32::MAX {
         return None;
     }
     Some(acc)
@@ -831,7 +831,7 @@ pub fn object_is(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsVa
         (Some(x), Some(y)) => {
             (x.is_nan() && y.is_nan()) || (x == y && (x != 0.0 || x.to_bits() == y.to_bits()))
         }
-        _ => helpers::strict_equals(&ctx.heap, a, b),
+        _ => helpers::strict_equals(ctx.heap, a, b),
     };
     Ok(JsValue::from_bool(same))
 }
