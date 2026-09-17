@@ -58,6 +58,13 @@ impl Interp<'_> {
         let Some(obj) = obj_v.as_object() else {
             return self.string_prim_surface(obj_v, key_v, key);
         };
+        // Proxy exotic: `[[Get]]` is the `get` trap (ES 10.5.8). Checked
+        // before the element fast path and every structural surface so a
+        // proxy is never treated as an ordinary object (its empty shared
+        // shape would otherwise answer `undefined` or match a surface).
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_get(obj, obj_v, key_v);
+        }
         // Cheapest-integer-first: the canonical-index probe runs before any
         // surface. Kind-guarded to Array/Arguments, so other receivers flow
         // through unchanged; for index keys on arrays every later surface
@@ -907,6 +914,13 @@ impl Interp<'_> {
             return Ok(());
         };
 
+        // Proxy exotic: `[[Set]]` is the `set` trap (ES 10.5.9). Checked
+        // before the element fast path and the RegExp slot so a proxy is
+        // never treated as an ordinary object.
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_set(obj, obj_v, key_v, value);
+        }
+
         // Flatten-once (same contract as `get_property`): the element fast
         // path, the RegExp check, and the intern below share one flatten.
         self.flatten_key(key_v);
@@ -1244,6 +1258,71 @@ impl Interp<'_> {
         Ok(false)
     }
 
+    /// Proxy `[[Set]]` (ES 10.5.9): consult the handler's `set` trap.
+    ///
+    /// Absent or `undefined` trap forwards to the target's ordinary write
+    /// (which recursively handles a proxy target). A present non-callable trap
+    /// is a `TypeError`. The trap result is coerced with ToBoolean; sloppy
+    /// `set_property` has no boolean channel, so a falsy result is a silent
+    /// no-op (strict-mode throw is a v1 gap, documented here).
+    ///
+    /// Deliberate limitation: the spec's invariant checks (falsy result for a
+    /// non-configurable non-writable target data property, etc.) are not
+    /// applied.
+    fn proxy_op_set(
+        &mut self,
+        proxy: Handle<JsObject>,
+        receiver: JsValue,
+        key_v: JsValue,
+        value: JsValue,
+    ) -> Result<(), JSException> {
+        let (target, handler) = {
+            let o = self.heap.get(proxy);
+            (o.proxy_target, o.proxy_handler)
+        };
+        // Revoked proxy (both slots cleared by revocation): TypeError.
+        let (Some(target), Some(handler)) = (target, handler) else {
+            return Err(JSException(self.error_value(
+                "TypeError: Cannot perform 'set' on a proxy that has been revoked",
+            )));
+        };
+        // ToPropertyKey before the trap sees the key (spec step order).
+        let key = self.property_key(key_v)?;
+        let key_v = if let Some(h) = key.string() {
+            JsValue::string(h)
+        } else if let Some(y) = key.symbol() {
+            JsValue::symbol(y)
+        } else {
+            // Unreachable: `property_key` is string-or-symbol by construction.
+            JsValue::undefined()
+        };
+        let set_key = self.new_temp_key("set");
+        let trap_v = self.get_property(0, 0, JsValue::object(handler), set_key)?;
+        let Some(trap) = trap_v.as_object() else {
+            if trap_v.is_undefined() || trap_v.is_null() {
+                // No trap (`GetMethod` maps null to undefined): forward to
+                // the target through the ordinary path.
+                return self.set_property(JsValue::object(target), key_v, value);
+            }
+            return Err(JSException(
+                self.error_value("TypeError: 'set' trap must be a function"),
+            ));
+        };
+        if self.heap.get(trap).kind != Kind::Function {
+            return Err(JSException(
+                self.error_value("TypeError: 'set' trap must be a function"),
+            ));
+        }
+        self.gc_protect();
+        let result = self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[JsValue::object(target), key_v, value, receiver],
+        )?;
+        let _ = ops::to_boolean(self.heap, result);
+        Ok(())
+    }
+
     /// Proxy `[[HasProperty]]` (ES 10.5.6): consult the handler's `has` trap.
     ///
     /// Absent or `undefined` trap forwards to the target's ordinary `in`
@@ -1284,8 +1363,9 @@ impl Interp<'_> {
         let has_key = self.new_temp_key("has");
         let trap_v = self.get_property(0, 0, JsValue::object(handler), has_key)?;
         let Some(trap) = trap_v.as_object() else {
-            if trap_v.is_undefined() {
-                // No trap: forward to the target through the ordinary path.
+            if trap_v.is_undefined() || trap_v.is_null() {
+                // No trap (`GetMethod` maps null to undefined): forward to
+                // the target through the ordinary path.
                 return self.op_in(key_v, JsValue::object(target));
             }
             return Err(JSException(
@@ -1304,6 +1384,69 @@ impl Interp<'_> {
             &[JsValue::object(target), key_v],
         )?;
         Ok(ops::to_boolean(self.heap, result))
+    }
+
+    /// Proxy `[[Get]]` (ES 10.5.8): consult the handler's `get` trap.
+    ///
+    /// Absent or `undefined` trap forwards to the target's ordinary read
+    /// (which recursively handles a proxy target). A present non-callable trap
+    /// is a `TypeError`. The trap result returns uncoerced.
+    ///
+    /// Deliberate limitations: the spec's invariant checks (trap result vs. a
+    /// non-configurable non-writable target data property, or vs. a
+    /// non-configurable target accessor with undefined `get`) are not applied;
+    /// and a forward passes the target (not the proxy) as receiver, so an
+    /// inherited target getter observes the target as `this`.
+    fn proxy_op_get(
+        &mut self,
+        proxy: Handle<JsObject>,
+        receiver: JsValue,
+        key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let (target, handler) = {
+            let o = self.heap.get(proxy);
+            (o.proxy_target, o.proxy_handler)
+        };
+        // Revoked proxy (both slots cleared by revocation): TypeError.
+        let (Some(target), Some(handler)) = (target, handler) else {
+            return Err(JSException(self.error_value(
+                "TypeError: Cannot perform 'get' on a proxy that has been revoked",
+            )));
+        };
+        // ToPropertyKey before the trap sees the key (spec step order: the
+        // key is materialised once, ahead of the handler lookup).
+        let key = self.property_key(key_v)?;
+        let key_v = if let Some(h) = key.string() {
+            JsValue::string(h)
+        } else if let Some(y) = key.symbol() {
+            JsValue::symbol(y)
+        } else {
+            // Unreachable: `property_key` is string-or-symbol by construction.
+            JsValue::undefined()
+        };
+        let get_key = self.new_temp_key("get");
+        let trap_v = self.get_property(0, 0, JsValue::object(handler), get_key)?;
+        let Some(trap) = trap_v.as_object() else {
+            if trap_v.is_undefined() || trap_v.is_null() {
+                // No trap (`GetMethod` maps null to undefined): forward to
+                // the target through the ordinary path.
+                return self.get_property(0, 0, JsValue::object(target), key_v);
+            }
+            return Err(JSException(
+                self.error_value("TypeError: 'get' trap must be a function"),
+            ));
+        };
+        if self.heap.get(trap).kind != Kind::Function {
+            return Err(JSException(
+                self.error_value("TypeError: 'get' trap must be a function"),
+            ));
+        }
+        self.gc_protect();
+        self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[JsValue::object(target), key_v, receiver],
+        )
     }
 
     /// `instanceof` operator. Throws TypeError if `rhs` is not an object

@@ -24,6 +24,18 @@ Copy the block below for each fix. Keep it under 20 lines.
 
 <!-- Add newest entries at the top. Keep the template above as reference. -->
 
+### 2026-09-17 — [lane/proxy-remainder] Proxy `get` + `set` trap dispatch (ES 10.5.8/10.5.9)
+
+- **Filter:** `built-ins/Proxy`
+- **Before:** 71 pass / 239 fail / 1 skip, 22.8 % pass (baseline from 8d5a112)
+- **After:**  94 pass / 216 fail / 1 skip, 30.3 % pass
+- **Delta:** +23 pass, −23 fail, +7.5 pts
+- **Engine change:** `get_property`/`set_property` route `Kind::Proxy` receivers to new `proxy_op_get`/`proxy_op_set` (trap via `call_inline` with handler as this; revoked ⇒ TypeError; null trap forwards like undefined per GetMethod — same fix applied to existing `proxy_op_has`); + `crates/v12-interp/src/property.rs`
+- **Files:** `crates/v12-interp/src/property.rs`
+- **Bucket:** ROADMAP "Proxy remainder" — shrank (remaining: ownKeys 27, defineProperty 23, getOwnPropertyDescriptor 20, getPrototypeOf/setPrototypeOf, deleteProperty, apply/construct, Reflect)
+- **Runner:** `./conformance/run.sh --filter built-ins/Proxy --jobs 8` (default human format; tap to `/tmp/proxy-after2.tap`)
+- **Notes:** remaining get/set/has failures are out-of-scope engine gaps, not dispatch bugs: RegExp exotics, String-primitive length/indices, Array.prototype.length, Reflect.* missing, trap-invariant checks, forward-receiver threading, strict-mode set throw. Verified: `cargo nextest run --workspace` exit 0; `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean.
+
 ### 2026-09-14 — Shape lookup: drop redundant parent walk + skip TCO-feature tests (kills the STALLED class)
 
 - **Filter:** `language` (full, 24 590), targeted: `language/identifiers`, `tco-`
