@@ -51,9 +51,6 @@ pub fn syntax_error_create(
 }
 
 /// `EvalError(message)` – same construction, `EvalError` class.
-///
-/// Dispatch-only until the realm materializes the global (needs a new
-/// `GLOBAL_INTRINSICS` slot plus realm wiring — PENDING-WIRING).
 pub fn eval_error_create(
     ctx: &mut Ctx,
     _this: JsValue,
@@ -63,17 +60,11 @@ pub fn eval_error_create(
 }
 
 /// `URIError(message)` – same construction, `URIError` class.
-///
-/// Dispatch-only until the realm materializes the global (needs a new
-/// `GLOBAL_INTRINSICS` slot plus realm wiring — PENDING-WIRING).
 pub fn uri_error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     error_create_named(ctx, "URIError", args)
 }
 
 /// `Error.isError(value)` – whether `value` is an error object (any class).
-///
-/// Dispatch-only until the static is installed on the `Error` constructor
-/// (needs realm wiring — PENDING-WIRING).
 pub fn error_is_error(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let is_error = args
         .first()

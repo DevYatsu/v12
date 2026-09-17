@@ -2,6 +2,23 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-17 — lane/realm-wiring: `EvalError`/`URIError` globals + `Error.isError` static [lane/realm-wiring]
+
+- **Filter:** `built-ins/NativeErrors` (94 files), `built-ins/Error` (93), `--jobs 4`, `--format human`
+- **Before:** NativeErrors 28/66 (29.8 %), Error 13/80 (14.0 %) — pristine master worktree at fe170f9
+- **After:** NativeErrors 43/51 (45.7 %), Error 23/70 (24.7 %)
+- **Delta:** NativeErrors +15 pass / −15 fail; Error +10 pass / −10 fail. `EvalError`/`URIError` 0/15 → 7/15 each (exact `TypeError`/`RangeError` parity); `Error/isError` 0/12 → 9/12.
+- **Engine change:** `EvalError` + `URIError` appended to `GLOBAL_INTRINSICS` (indices 21, 22; append-only contract preserved) and the realm's ctor/proto loop extended to both, so the class prototypes, `prototype.constructor`/`name`, and instance `[[Prototype]]` links exist; `Error.isError` shape-bound on the `Error` constructor via the ordinary `install_native` path. Removed the three now-satisfied `PENDING-WIRING` doc notes. No interpreter/compiler logic changes: the compiler already listed both names in `GLOBAL_ACCESS_INTRINSICS`, and the interp/ctx/registry `intrinsic_slot` jump tables gained the two arms.
+- **Files:** `crates/v12-bytecode/src/lib.rs`, `crates/v12-engine/src/{realm.rs,builtins/{ctx.rs,error.rs,mod.rs,registry.rs}}`, `crates/v12-interp/src/lib.rs`, conformance/fix-log.md (this entry)
+- **Bucket:** built-ins expansion — error-constructor global installs + `Error.isError` static (was `PENDING-WIRING` in the lane/builtin-breadth entry)
+- **Runner:** `./conformance/run.sh --filter <f> --jobs 4`
+- **Verification:** `cargo nextest run --workspace` 593 passed / 0 skipped; `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean; CLI probes: `new EvalError("x") instanceof EvalError` true, `Error.isError(new Error())` true, `Error.isError({})` false, `new URIError("u") instanceof URIError` true, `Error.isError.length === 1`
+- **Notes:**
+  - Remaining `EvalError`/`URIError` failures are the same shared gaps as the already-wired `TypeError`/`RangeError`: `isConstructor` (no `[[Construct]]` surface), `[object Error]` string tag, `length`/`name` own-prop installs, `prop-desc`, `Reflect`-based `proto-from-ctor-realm`, `prototype/message`. Fixing these needs the descriptor/construct-surface work, not this lane.
+  - `Error/isError/error-subclass.js` still fails: `class MyError extends Error {}` subclasses are not recognized as Error objects (`Error.isError` checks `Kind::Error`); userland subclass construction is a class-lowering gap.
+  - `Error/isError/bigints.js` fails on `BigInt` (not installed) — pre-existing.
+  - Did not touch: proxy.rs, promise.rs, class.rs/unit.rs, property.rs, the dirty conformance/test262 submodule pointer.
+
 ### 2026-09-17 — lane/dstr-forwarding: iterator GetMethod gates + completion-aware IteratorClose [lane/dstr-forwarding]
 
 - **Filter:** `language/expressions` (11 128 files), `language/statements/for-of` (752), `language/statements/for-await-of` (1 235), `--jobs 4`, `--format human` (+ `--format tap --tap-out` for the for-of fail-list diff)

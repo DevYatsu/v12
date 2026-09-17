@@ -250,6 +250,8 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::PromiseAll => Some(1),
         NativeId::PromiseRace => Some(1),
         NativeId::PromiseFinally => Some(1),
+        NativeId::ErrorIsError => Some(1),
+        NativeId::ErrorProtoToString => Some(0),
         _ => None,
     }
 }

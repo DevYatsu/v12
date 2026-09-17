@@ -334,6 +334,10 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
     // Appended (never mid-inserted): index 20. Appending only biases
     // `GLOBAL_VAR_OFFSET`, so no existing intrinsic index changes.
     "Proxy",
+    // Appended (never mid-inserted): indices 21-22. Same append-only
+    // contract as `Proxy` above.
+    "EvalError",
+    "URIError",
 ];
 
 /// Offset of user-declared global slots in the global object's `properties`.
@@ -346,10 +350,9 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
 pub const GLOBAL_VAR_OFFSET: usize = GLOBAL_INTRINSICS.len();
 
 /// Names the compiler treats as global references (`GetGlobal`/`SetGlobal`)
-/// even when no binding exists — a superset of [`GLOBAL_INTRINSICS`] that
-/// also covers error constructors the v1 realm does not install as intrinsic
-/// slots. An unresolved `IdentifierReference` outside this table is a
-/// compile error.
+/// even when no binding exists — kept in the same order as
+/// [`GLOBAL_INTRINSICS`] (it is currently the same set). An unresolved
+/// `IdentifierReference` outside this table is a compile error.
 pub const GLOBAL_ACCESS_INTRINSICS: &[&str] = &[
     "Object",
     "Array",
@@ -363,8 +366,6 @@ pub const GLOBAL_ACCESS_INTRINSICS: &[&str] = &[
     "RangeError",
     "ReferenceError",
     "SyntaxError",
-    "URIError",
-    "EvalError",
     "Promise",
     "Symbol",
     "Map",
@@ -374,9 +375,10 @@ pub const GLOBAL_ACCESS_INTRINSICS: &[&str] = &[
     "console",
     "globalThis",
     // Kept in the same order as `GLOBAL_INTRINSICS` (this table is its
-    // superset); the two extra error constructors above are the only pins
-    // before it.
+    // same-order copy now that the realm installs every named ctor).
     "Proxy",
+    "EvalError",
+    "URIError",
 ];
 
 /// Human-readable opcode name; exhaustive so a new variant fails to compile

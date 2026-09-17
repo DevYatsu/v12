@@ -41,6 +41,8 @@ fn intrinsic_slot(name: &str) -> Option<usize> {
         "console" => 18,
         "globalThis" => 19,
         "Proxy" => 20,
+        "EvalError" => 21,
+        "URIError" => 22,
         _ => return None,
     };
     debug_assert!(v12_bytecode::GLOBAL_INTRINSICS.get(idx) == Some(&name));
@@ -103,7 +105,7 @@ impl<'a> Ctx<'a> {
     /// hardcoded `properties.get(idx)` at the call site).
     ///
     /// O(1): `intrinsic_slot` is a compiler jump table over the fixed
-    /// 20-name realm table — no `.position()` linear scan, no string
+    /// realm table — no `.position()` linear scan, no string
     /// compares on the hot builtin path.
     ///
     /// Realm fallback: compile-time builtins dispatch through

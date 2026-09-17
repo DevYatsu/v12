@@ -165,11 +165,19 @@ impl Realm {
             crate::builtins::install_ctor(heap, e, error_proto);
         }
         wire_callable(heap, &intrinsics, "Error", NativeId::ErrorCreate);
+        // `Error.isError` static (ES2026): shape-bound install on the Error
+        // constructor (found by ordinary property lookup — no interpreter
+        // surface change needed).
+        if let Some(e) = intrinsics.get("Error").and_then(|v| v.as_object()) {
+            crate::builtins::install_native(heap, Some(e), "isError", NativeId::ErrorIsError);
+        }
         for (name, native) in [
             ("TypeError", NativeId::TypeErrorCreate),
             ("RangeError", NativeId::RangeErrorCreate),
             ("ReferenceError", NativeId::ReferenceErrorCreate),
             ("SyntaxError", NativeId::SyntaxErrorCreate),
+            ("EvalError", NativeId::EvalErrorCreate),
+            ("URIError", NativeId::UriErrorCreate),
         ] {
             let Some(ctor) = intrinsics.get(name).and_then(|v| v.as_object()) else {
                 continue;
@@ -301,7 +309,7 @@ impl Realm {
 
         // Install the compile-time builtin table (isNaN, Math.floor, Array.push,
         // …) as shape-bound properties on the global and the constructors/
-        // prototypes. Must run after the 18 intrinsic slots are pushed so the
+        // prototypes. Must run after the intrinsic slots are pushed so the
         // global's shape slot `n` maps to `properties[GLOBAL_VAR_OFFSET + n]`.
         let targets = crate::builtins::BuiltinTargets {
             global,

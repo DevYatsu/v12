@@ -351,8 +351,8 @@ impl v12_native::NativeRegistry for NativeRegistry {
 /// Generalization of the former `syntax_error_value` (plan §4.2): the error
 /// carries own `name` + `message` props plus an own `constructor` wired to
 /// the caller's realm intrinsic for `kind` (located by its
-/// `GLOBAL_INTRINSICS` slot). Kinds without a realm slot (`URIError`,
-/// `InternalError`) or calls without a global skip the `constructor` link.
+/// `GLOBAL_INTRINSICS` slot). Kinds without a realm slot (`InternalError`)
+/// or calls without a global skip the `constructor` link.
 /// `assert.throws(SyntaxError, ...)` requires `typeof thrown === "object"`
 /// with `thrown.constructor === SyntaxError`; a plain string never
 /// satisfies it.
@@ -425,6 +425,8 @@ fn intrinsic_slot(name: &str) -> Option<usize> {
         "console" => 18,
         "globalThis" => 19,
         "Proxy" => 20,
+        "EvalError" => 21,
+        "URIError" => 22,
         _ => return None,
     };
     debug_assert!(v12_bytecode::GLOBAL_INTRINSICS.get(idx) == Some(&name));
