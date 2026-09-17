@@ -1449,6 +1449,192 @@ impl Interp<'_> {
         )
     }
 
+    /// Proxy `[[OwnPropertyKeys]]` (ES 10.5.11): consult the handler's
+    /// `ownKeys` trap.
+    ///
+    /// Absent or `undefined`/`null` trap (`GetMethod` maps null to undefined)
+    /// forwards to the target's ordinary keys (which recursively handles a
+    /// proxy target). A present non-callable trap is a `TypeError`. A present
+    /// trap runs via `call_inline` and its result goes through
+    /// `CreateListFromArrayLike` (object with a `length`, every entry a
+    /// String or Symbol, else `TypeError`) plus the duplicate-entry check.
+    ///
+    /// PENDING-WIRING: no caller routes here yet. `Object.keys`,
+    /// `Object.getOwnPropertyNames`, `Object.getOwnPropertySymbols`, and
+    /// for-in (`ObjectEnumerableOwnKeys`) all live in
+    /// `v12-engine/src/builtins/object.rs` (frozen this lane) and walk shapes
+    /// directly; each must route `Kind::Proxy` receivers to this dispatcher.
+    ///
+    /// Deliberate limitations: the extensible-target / non-configurable-key
+    /// invariant checks are not applied; a `length` past `u32::MAX` is a
+    /// `TypeError` (arrays cannot exceed it; absurd array-likes would hang
+    /// the dispatch loop, the same DoS class `dense_bound` hardens in the
+    /// builtins).
+    #[allow(dead_code)] // PENDING-WIRING: no caller routes here yet (see above).
+    pub(crate) fn proxy_op_own_keys(
+        &mut self,
+        proxy: Handle<JsObject>,
+    ) -> Result<Vec<PropKey>, JSException> {
+        let (target, handler) = {
+            let o = self.heap.get(proxy);
+            (o.proxy_target, o.proxy_handler)
+        };
+        // Revoked proxy (both slots cleared by revocation): TypeError.
+        let (Some(target), Some(handler)) = (target, handler) else {
+            return Err(JSException(self.error_value(
+                "TypeError: Cannot perform 'ownKeys' on a proxy that has been revoked",
+            )));
+        };
+        let trap_key = self.new_temp_key("ownKeys");
+        let trap_v = self.get_property(0, 0, JsValue::object(handler), trap_key)?;
+        let Some(trap) = trap_v.as_object() else {
+            if trap_v.is_undefined() || trap_v.is_null() {
+                // No trap: forward to the target's ordinary keys.
+                return Ok(self.ordinary_own_keys(target));
+            }
+            return Err(JSException(
+                self.error_value("TypeError: 'ownKeys' trap must be a function"),
+            ));
+        };
+        if self.heap.get(trap).kind != Kind::Function {
+            return Err(JSException(
+                self.error_value("TypeError: 'ownKeys' trap must be a function"),
+            ));
+        }
+        self.gc_protect();
+        let result =
+            self.call_inline(trap, JsValue::object(handler), &[JsValue::object(target)])?;
+        // `CreateListFromArrayLike` (ES 7.4.4): result must be an object.
+        let Some(list_obj) = result.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: 'ownKeys' trap result must be an object"),
+            ));
+        };
+        let len_key = self.new_temp_key("length");
+        let len_v = self.get_property(0, 0, JsValue::object(list_obj), len_key)?;
+        let len_f = ops::to_number(self.heap, len_v);
+        // `ToLength` floors and clamps the low end to 0; the high end is
+        // capped at `u32::MAX` (see the doc comment above).
+        if len_f.is_nan() || len_f > f64::from(u32::MAX) {
+            return Err(JSException(self.error_value(
+                "TypeError: 'ownKeys' trap result length out of range",
+            )));
+        }
+        let len = len_f.max(0.0).floor() as u32;
+        let mut keys: Vec<PropKey> = Vec::with_capacity(len.min(1024) as usize);
+        for i in 0..len {
+            let idx_v = JsValue::string(self.heap.intern_text(&i.to_string()));
+            let entry = self.get_property(0, 0, JsValue::object(list_obj), idx_v)?;
+            let key = if let Some(h) = entry.as_string() {
+                // Canonicalize: trap-built strings must alias the interned
+                // instance or later shape lookups miss.
+                let units = ops::string_units(self.heap, h);
+                PropKey::from_string(self.heap.intern_string(v12_heap::V12Str::utf16(units)))
+            } else if let Some(y) = entry.as_symbol() {
+                PropKey::from_symbol(y)
+            } else {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'ownKeys' trap result entries must be strings or symbols",
+                )));
+            };
+            // Duplicate entries are a `TypeError` (ES 10.5.11 step 8).
+            if keys.contains(&key) {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'ownKeys' trap result contains duplicate entries",
+                )));
+            }
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+
+    /// Ordinary `[[OwnPropertyKeys]]` for the `ownKeys` forward path: integer
+    /// indices ascending (holes absent), then string keys in insertion order
+    /// (shape descriptors, then dictionary-rung overflow by sequence), then
+    /// symbol keys in the same two-tier order. Holed data slots are absent,
+    /// matching what `in` observes.
+    fn ordinary_own_keys(&mut self, obj: Handle<JsObject>) -> Vec<PropKey> {
+        let mut keys: Vec<PropKey> = Vec::new();
+        let kind = self.heap.get(obj).kind;
+        if kind == Kind::Array || kind == Kind::Arguments {
+            let bound = self.heap.get(obj).element_len() as u32;
+            for i in 0..bound {
+                if self
+                    .heap
+                    .get(obj)
+                    .get_element(i)
+                    .is_some_and(|v| !v.is_hole())
+                {
+                    keys.push(PropKey::from_string(self.heap.intern_text(&i.to_string())));
+                }
+            }
+        }
+        let shape = self.shape_of(obj);
+        let descriptors: Vec<v12_heap::Descriptor> =
+            self.heap.get(shape).descriptors.as_slice().to_vec();
+        let mut overflow: Vec<(u32, PropKey)> = self
+            .heap
+            .get(obj)
+            .dictionary
+            .as_ref()
+            .map(|m| m.iter().map(|(k, e)| (e.seq, *k)).collect())
+            .unwrap_or_default();
+        overflow.sort_by_key(|&(seq, _)| seq);
+        // Liveness: a holed data slot is not an own property (accessors have
+        // no slot and are always live).
+        let live = |heap: &v12_heap::Heap, obj: Handle<JsObject>, key: PropKey| -> bool {
+            let entry = heap
+                .get(obj)
+                .dictionary
+                .as_ref()
+                .and_then(|m| m.get(&key))
+                .copied();
+            if let Some(entry) = entry {
+                if entry.is_accessor {
+                    return true;
+                }
+                return heap
+                    .get(obj)
+                    .properties
+                    .get(entry.slot as usize)
+                    .is_some_and(|v| !v.is_hole());
+            }
+            match heap.get(shape).descriptors.find(key).copied() {
+                Some(v12_heap::Descriptor::Data { slot, .. }) => heap
+                    .get(obj)
+                    .properties
+                    .get(slot as usize)
+                    .is_some_and(|v| !v.is_hole()),
+                Some(v12_heap::Descriptor::Accessor { .. }) => true,
+                None => true,
+            }
+        };
+        // Strings first (shape order, then overflow order), then symbols.
+        for d in &descriptors {
+            let k = d.key();
+            if !k.is_symbol() && live(self.heap, obj, k) {
+                keys.push(k);
+            }
+        }
+        for (_, k) in &overflow {
+            if !k.is_symbol() && live(self.heap, obj, *k) {
+                keys.push(*k);
+            }
+        }
+        for d in &descriptors {
+            let k = d.key();
+            if k.is_symbol() && live(self.heap, obj, k) {
+                keys.push(k);
+            }
+        }
+        for (_, k) in &overflow {
+            if k.is_symbol() && live(self.heap, obj, *k) {
+                keys.push(*k);
+            }
+        }
+        keys
+    }
+
     /// `instanceof` operator. Throws TypeError if `rhs` is not an object
     /// with an object-typed `prototype` property; returns false if `lhs`
     /// is not an object; otherwise walks `lhs`'s prototype chain for
@@ -1663,5 +1849,128 @@ impl Interp<'_> {
         if let Some(slot) = slot {
             self.heap.get_mut(obj).properties[slot] = ops::box_number(f64::from(len_after));
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_own_keys_tests {
+    use super::*;
+    use v12_heap::{FunctionTarget, GcPolicy, Heap};
+
+    fn fresh_interp(heap: &mut Heap) -> Interp<'_> {
+        Interp::from_source(heap, "0;").unwrap()
+    }
+
+    fn define_data(interp: &mut Interp<'_>, obj: Handle<JsObject>, name: &str, value: JsValue) {
+        let key = PropKey::from_string(interp.heap.intern_text(name));
+        let shape = interp.shape_of(obj);
+        let child = interp.heap.add_property(shape, key, Attrs::DEFAULT);
+        interp.bind_shape(obj, child);
+        interp.heap.get_mut(obj).properties.push(value);
+    }
+
+    fn native_trap(heap: &mut Heap, target: FunctionTarget) -> Handle<JsObject> {
+        heap.alloc(JsObject::function(target, None))
+    }
+
+    fn keys_result(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+        let key = JsValue::string(heap.intern_text("x"));
+        Ok(JsValue::object(heap.alloc(JsObject::array(vec![key]))))
+    }
+
+    fn setup(
+        heap: &mut Heap,
+        trap: Option<JsValue>,
+    ) -> (Interp<'_>, Handle<JsObject>, PropKey, PropKey) {
+        let target = heap.alloc(JsObject::default());
+        let handler = heap.alloc(JsObject::default());
+        let key_a = PropKey::from_string(heap.intern_text("a"));
+        let key_x = PropKey::from_string(heap.intern_text("x"));
+        let mut interp = fresh_interp(heap);
+        define_data(&mut interp, target, "a", JsValue::from_i32_smi(1).unwrap());
+        if let Some(t) = trap {
+            define_data(&mut interp, handler, "ownKeys", t);
+        }
+        let proxy = interp.heap.alloc(JsObject::proxy(target, handler));
+        (interp, proxy, key_a, key_x)
+    }
+
+    #[test]
+    fn trap_result_returned() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let trap = {
+            let f = native_trap(&mut heap, FunctionTarget::Native(keys_result));
+            JsValue::object(f)
+        };
+        let (mut interp, proxy, _, key_x) = setup(&mut heap, Some(trap));
+        assert_eq!(interp.proxy_op_own_keys(proxy).unwrap(), vec![key_x]);
+    }
+
+    #[test]
+    fn missing_trap_forwards_to_target() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let (mut interp, proxy, key_a, _) = setup(&mut heap, None);
+        assert_eq!(interp.proxy_op_own_keys(proxy).unwrap(), vec![key_a]);
+    }
+
+    #[test]
+    fn null_trap_forwards_to_target() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let (mut interp, proxy, key_a, _) = setup(&mut heap, Some(JsValue::null()));
+        assert_eq!(interp.proxy_op_own_keys(proxy).unwrap(), vec![key_a]);
+    }
+
+    #[test]
+    fn revoked_proxy_throws() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let (mut interp, proxy, _, _) = setup(&mut heap, None);
+        let o = interp.heap.get_mut(proxy);
+        o.proxy_target = None;
+        o.proxy_handler = None;
+        assert!(interp.proxy_op_own_keys(proxy).is_err());
+    }
+
+    #[test]
+    fn non_callable_trap_throws() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let smi = JsValue::from_i32_smi(5).unwrap();
+        let (mut interp, proxy, _, _) = setup(&mut heap, Some(smi));
+        assert!(interp.proxy_op_own_keys(proxy).is_err());
+    }
+
+    #[test]
+    fn duplicate_entries_throw() {
+        fn dup(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+            let key = JsValue::string(heap.intern_text("x"));
+            Ok(JsValue::object(heap.alloc(JsObject::array(vec![key, key]))))
+        }
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let trap = JsValue::object(native_trap(&mut heap, FunctionTarget::Native(dup)));
+        let (mut interp, proxy, _, _) = setup(&mut heap, Some(trap));
+        assert!(interp.proxy_op_own_keys(proxy).is_err());
+    }
+
+    #[test]
+    fn non_object_result_throws() {
+        fn num(_heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+            Ok(JsValue::from_i32_smi(3).unwrap())
+        }
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let trap = JsValue::object(native_trap(&mut heap, FunctionTarget::Native(num)));
+        let (mut interp, proxy, _, _) = setup(&mut heap, Some(trap));
+        assert!(interp.proxy_op_own_keys(proxy).is_err());
+    }
+
+    #[test]
+    fn non_string_entry_throws() {
+        fn mixed(heap: &mut Heap, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, JsValue> {
+            let key = JsValue::string(heap.intern_text("x"));
+            let num = JsValue::from_i32_smi(7).unwrap();
+            Ok(JsValue::object(heap.alloc(JsObject::array(vec![key, num]))))
+        }
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let trap = JsValue::object(native_trap(&mut heap, FunctionTarget::Native(mixed)));
+        let (mut interp, proxy, _, _) = setup(&mut heap, Some(trap));
+        assert!(interp.proxy_op_own_keys(proxy).is_err());
     }
 }

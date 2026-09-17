@@ -5,11 +5,15 @@
 //! `[[ProxyTarget]]`/`[[ProxyHandler]]` in `JsObject::proxy_target` /
 //! `JsObject::proxy_handler` (see `v12-heap/src/object.rs`).
 //!
-//! **Trap dispatch is a later phase.** Nothing here invokes a handler trap:
-//! `new Proxy(target, handler)` only validates that both arguments are
-//! objects, then allocates the exotic object. The internal-method stub table
-//! (`v12-engine/src/internal_methods.rs`) still reports "trap not
-//! implemented" for every trapped operation.
+//! Trap dispatch lives in the interpreter (`v12-interp/src/property.rs`):
+//! `proxy_op_has`, `proxy_op_get`, `proxy_op_set`, and `proxy_op_own_keys`
+//! consult the handler trap via `call_inline`. `ownKeys` has no caller yet
+//! (PENDING-WIRING: `Object.keys`/`getOwnPropertyNames`/`getOwnPropertySymbols`
+//! and for-in live in `builtins/object.rs`); the remaining traps
+//! (`defineProperty`, `getOwnPropertyDescriptor`, `deleteProperty`,
+//! `get/setPrototypeOf`, `isExtensible`, `preventExtensions`, `apply`,
+//! `construct`) still report "not implemented" via the internal-method stub
+//! table (`v12-engine/src/internal_methods.rs`).
 //!
 //! Revocation is represented, not enforced: `Proxy.revocable` wires a
 //! revocation function that clears the two slots. The invariant every future
