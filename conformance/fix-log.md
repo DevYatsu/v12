@@ -19,6 +19,22 @@ Append-only log. Each entry records one fix, its before/after harness numbers, a
   - Remaining `built-ins/Object` clusters, deliberately not closed: (a) **element-store index attributes** (~110): Array/Arguments element slots report fixed `{writable:true,enumerable:true,configurable:true}` and cannot hold per-index attrs or accessors, so `defineProperty(arr,'0',{…})` with non-default flags or `get` fails. Fixing needs per-index descriptors in the `elements.rs` lattice (out of this lane's safe surface). (b) **builtin getter re-entry** (~130): `to_property_descriptor`/`defineProperties` read descriptor fields with `dispatch_get`, which cannot call a *bytecode* getter (natives cannot re-enter the interpreter); tests that install a getter on the `Properties` object still throw "Property description must be an object". Resolving needs a call-capability seam in `Ctx`. (c) `Date` not installed (112), `Reflect` not installed (9), `new String()` returning a primitive instead of a wrapper, `isConstructor` tests — all other lanes' scope.
   - `Object.prototype.__defineGetter__`/`__defineSetter__` are installed but several `built-ins/Object/prototype/__define*__` tests still fail on the same bytecode-getter re-entry gap and on `Reflect`.
   - Did not touch: `set_property`'s strict flag signature, `proxy_op_own_keys`/`ordinary_own_keys`, proxy.rs, realm.rs, id.rs ordering beyond appends, promise.rs, error.rs, display.rs, compiler crates, bytecode crates, async/generator machinery.
+### 2026-09-17 — lane/json-builtin: spec-shape `JSON.parse` + `JSON.stringify` core [lane/json-builtin]
+
+- **Filter:** `built-ins/JSON` (165 files), `--jobs 8`, `--format human`
+- **Before:** 39 pass / 126 fail (23.6 %) — pristine master worktree at 46f3186.
+- **After:** 81 pass / 84 fail (49.1 %) — +42, 0 regressions.
+- **Engine change:** `crates/v12-engine/src/builtins/json.rs` only (commit `40b12a9`, 451 insertions / 95 deletions).
+  - **Parse:** rejects raw control code units in strings; preserves `-0`; overwrites duplicate keys instead of shadowing them (`__proto__` special-cased); links parsed objects/arrays to the realm Object/Array prototypes; `ToString` on a Symbol text argument throws TypeError.
+  - **Stringify:** functions are not representable (`undefined` at top level, `null` in arrays, skipped in objects); `space` honors only string/number; `gap` clamped to 10 and string space truncated to 10 code units; lone surrogates escape as `\uXXXX`; BigInt throws TypeError; property enumeration is integer-index-first then creation order; an array `replacer` becomes a deduplicated PropertyList that fixes key order and propagates into nested object values.
+  - Native errors built here now link the realm `constructor` (falling back to the first registered realm global), so `assert.throws(SyntaxError, …)` sees the right class — previously every `Ctx`-built native error had `constructor === undefined`.
+- **Files:** `crates/v12-engine/src/builtins/json.rs`, conformance/fix-log.md (this entry)
+- **Bucket:** ROADMAP item D (assertion-detail mismatches — builtin surface) + partially A (missing `JSON` surface)
+- **Runner:** `./conformance/run.sh --filter built-ins/JSON --jobs 8`
+- **Verification:** `cargo nextest run --workspace` 617 passed / 0 skipped (post-merge on master `662c678`); `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean.
+- **Notes:** remains unimplemented by design (needs interpreter re-entry from natives, the same `Ctx` call-capability gap the descriptor lane hit): `reviver`, function `replacer`, `toJSON`, accessor `Get` during the walk, Proxy traps, and `JSON.rawJSON`/`isRawJSON`. Those account for most of the residual 84 failures.
+- **Lane status:** the lane session was terminated by the account weekly API limit (`429`) after committing `40b12a9`; this entry was authored by the orchestrator during reconciliation from the lane's commit message and re-measured numbers.
+
 ### 2026-09-17 — lane/early-errors: static-semantics (early-error) validations [lane/early-errors]
 
 - **Filter:** `language/expressions` (11 128 files), `--jobs 8`, `--format human`; TAP used only for pass-set diffs.
