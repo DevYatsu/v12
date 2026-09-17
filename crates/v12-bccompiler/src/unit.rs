@@ -170,6 +170,10 @@ pub fn compile_unit(
     if idx == 0 {
         emit_import_calls(&mut cx)?;
     }
+    // Anonymous classes name their constructor `""` (ClassDefinitionEvaluation
+    // defaults `className` to the empty string); captured before `node` is
+    // moved by the body match below.
+    let anonymous_class = matches!(&node, UnitNode::Class(c) if c.id.is_none());
     match node {
         UnitNode::Main(p) => {
             // Declare top-level `var` slots on the global object (names were
@@ -248,6 +252,7 @@ pub fn compile_unit(
                     let Some(value) = &p.value else {
                         continue;
                     };
+                    crate::class::apply_field_function_name(&mut cx, &p.key, p.computed, value);
                     let value_reg = cx.expr(value)?;
                     let key_reg =
                         crate::class::property_key_reg(&mut cx, &p.key, p.computed, p.span)?;
@@ -288,6 +293,12 @@ pub fn compile_unit(
     let mut fb = cx.finish()?;
     fb.name_hint = Some(comp.plans.units[idx].name_hint.clone());
     fb.function_name = comp.plans.units[idx].function_name.clone();
+    // Anonymous classes name their constructor `""` (ClassDefinitionEvaluation
+    // defaults `className` to the empty string); without this the function has
+    // no own `name` property at all (`verifyProperty(class {}, "name", ...)`).
+    if fb.function_name.is_none() && anonymous_class {
+        fb.function_name = Some(String::new());
+    }
     fb.is_strict = strict;
     let plan = &comp.plans.units[idx];
     fb.has_rest = plan.has_rest;

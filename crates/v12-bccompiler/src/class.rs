@@ -13,7 +13,7 @@
 //!    parent constructor (static inheritance), and the prototype object's
 //!    prototype becomes `Parent.prototype` (instance inheritance).
 
-use oxc_ast::ast::{Class, ClassBody, ClassElement, MethodDefinitionKind, PropertyKey};
+use oxc_ast::ast::{Class, ClassBody, ClassElement, Expression, MethodDefinitionKind, PropertyKey};
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{Const, Opcode};
 
@@ -177,6 +177,7 @@ fn define_elements(
                         .ok_or_else(|| cx.err(p.span, "unsupported private field name"))?;
                     let name_id = crate::model::str_id_of(cx.comp.strings.get_or_intern(&name));
                     let value_reg = if let Some(v) = &p.value {
+                        apply_field_function_name(cx, &p.key, p.computed, v);
                         cx.expr(v)?
                     } else {
                         let d = cx.new_temp();
@@ -196,6 +197,7 @@ fn define_elements(
                 let target = if p.r#static { ctor } else { continue };
                 let key_reg = property_key_reg(cx, &p.key, p.computed, p.span)?;
                 let value_reg = if let Some(v) = &p.value {
+                    apply_field_function_name(cx, &p.key, p.computed, v);
                     cx.expr(v)?
                 } else {
                     let d = cx.new_temp();
@@ -234,6 +236,53 @@ fn method_fn(
     let d = cx.new_temp();
     cx.emit_closure_instr(d, idx, m.value.span)?;
     Ok(d)
+}
+
+/// Applies spec `SetFunctionName` for a class field whose initializer is an
+/// anonymous function definition (`DefineField` step 7: `static f =
+/// function() {}`, `x = () => ...`, `static c = class {}` name the value
+/// after the field when it carries no own `name`).
+///
+/// Implemented at compile time: a syntactically anonymous function never has
+/// an own `name` (a named function expression keeps its own via `collect`),
+/// so the planned unit's `function_name` is stamped *before* `cx.expr`
+/// compiles it. Must run before the initializer is lowered. Computed keys
+/// stay unresolved (accepted gap); private fields use their `#name` text.
+pub(crate) fn apply_field_function_name(
+    cx: &mut FnCtx<'_, '_, '_, '_>,
+    key: &PropertyKey<'_>,
+    computed: bool,
+    init: &Expression<'_>,
+) {
+    if computed {
+        return;
+    }
+    let Some(name) = static_key_text(key) else {
+        return;
+    };
+    // Peel transparent wrappers (`(fn)`, `fn as T`): NamedEvaluation
+    // propagates through them to the inner function.
+    let mut e = init;
+    loop {
+        match e {
+            Expression::ParenthesizedExpression(p) => e = &p.expression,
+            Expression::TSAsExpression(p) => e = &p.expression,
+            Expression::TSSatisfiesExpression(p) => e = &p.expression,
+            Expression::TSNonNullExpression(p) => e = &p.expression,
+            _ => break,
+        }
+    }
+    let span = match e {
+        Expression::FunctionExpression(f) if f.id.is_none() => f.span,
+        Expression::ArrowFunctionExpression(a) => a.span,
+        Expression::ClassExpression(c) if c.id.is_none() => c.span,
+        _ => return,
+    };
+    if let Ok(idx) = cx.planned_index(span)
+        && cx.comp.plans.units[idx].function_name.is_none()
+    {
+        cx.comp.plans.units[idx].function_name = Some(name);
+    }
 }
 
 /// Evaluates a property key into a register: static keys load the interned
