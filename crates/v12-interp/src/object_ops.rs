@@ -336,18 +336,25 @@ impl Interp<'_> {
         // 1. `method = GetV(iterable, @@iterator)` — resolve the well-known
         //    symbol first so the lookup uses the real symbol key.
         let method = self.iterator_symbol_method(src_v)?;
-        if method.as_object().is_none() {
-            return Err(JSException(self.error_value(
-                "TypeError: value is not iterable (its Symbol.iterator property is not a function)",
-            )));
-        }
         // 2. `iterator = Call(method, iterable)` — reuse the call machinery
         //    (handles bytecode natives and engine natives uniformly). The
         //    method object is freshly synthesized by `get_property`; park it
         //    on the stack so the safepoint inside `call_inline` keeps it
         //    alive (only `add_root`-ed otherwise, which the next protect
         //    discards).
-        let method_obj = method.as_object().expect("checked above");
+        //    GetMethod gate (spec 7.4.6): a present non-callable `@@iterator`
+        //    is a TypeError. Gate on `Kind::Function` (the same callability
+        //    gate as `op_iterator_close`), not mere object-ness: a plain
+        //    object in the slot must throw here rather than fall through to
+        //    `call_inline` and read a placeholder callable.
+        let method_obj = method
+            .as_object()
+            .filter(|h| self.heap.get(*h).kind == Kind::Function)
+            .ok_or_else(|| {
+                JSException(self.error_value(
+                    "TypeError: value is not iterable (its Symbol.iterator property is not a function)",
+                ))
+            })?;
         self.stack.push(JsValue::object(method_obj));
         self.gc_protect();
         let result = self.call_inline(method_obj, src_v, &[]);
@@ -391,6 +398,11 @@ impl Interp<'_> {
     }
 
     /// ES IteratorNext (7.4.2): `result = iterator.next()`.
+    /// GetMethod gate + result validation: a present non-callable `next`
+    /// is a TypeError (same `Kind::Function` gate as `op_iterator_close`),
+    /// and a non-Object `next()` result is a TypeError (spec 7.4.2 step 3).
+    /// Without the result check the primitive flows into the `done`/`value`
+    /// reads and the abrupt completion is silently dropped.
     pub(crate) fn op_iterator_next(&mut self, iter_v: JsValue) -> Result<JsValue, JSException> {
         let Some(_iter_obj) = iter_v.as_object() else {
             return Err(JSException(
@@ -399,12 +411,14 @@ impl Interp<'_> {
         };
         let next_key = self.new_temp_key("next");
         let next_v = self.get_property(0, 0, iter_v, next_key)?;
-        if next_v.as_object().is_none() {
+        let Some(next_obj) = next_v
+            .as_object()
+            .filter(|h| self.heap.get(*h).kind == Kind::Function)
+        else {
             return Err(JSException(
                 self.error_value("TypeError: iterator.next is not a function"),
             ));
-        }
-        let next_obj = next_v.as_object().expect("checked above");
+        };
         // Park the resolved function on the value stack: `gc_protect`
         // republishes the stack as roots, so the function object survives the
         // safepoint inside `call_inline` (it is freshly synthesized by
@@ -414,7 +428,13 @@ impl Interp<'_> {
         self.gc_protect();
         let result = self.call_inline(next_obj, iter_v, &[]);
         self.stack.pop();
-        result
+        match result {
+            Ok(v) if v.as_object().is_some() => Ok(v),
+            Ok(_) => Err(JSException(
+                self.error_value("TypeError: iterator.next() returned a non-object"),
+            )),
+            Err(e) => Err(e),
+        }
     }
 
     /// ES IteratorClose (7.4.6): call `iterator.return()` when present.
@@ -426,15 +446,37 @@ impl Interp<'_> {
     /// A throw from `return()` propagates: on the inline break/return path
     /// the close error is the completion, and on the exception-handler path
     /// the compiler rethrows the original error after a successful close.
-    /// NOTE: the `return()` *result* is deliberately not validated as an
-    /// Object here. Spec 7.4.6 checks the result only after the
-    /// throw-completion early-out ("if completion is throw, return
-    /// completion"), so the check needs the completion type the opcode
-    /// does not carry. Validating unconditionally regresses the throw path
-    /// (a `return(){}` yielding `undefined` would mask the original error
-    /// with a TypeError). The check belongs in the completion-aware close
-    /// contract — PENDING on lane A2 (see fix-log).
-    pub(crate) fn op_iterator_close(&mut self, iter_v: JsValue) -> Result<(), JSException> {
+    /// `check_result` is the completion-aware close contract: spec 7.4.6
+    /// validates the `return()` result as an Object only when the incoming
+    /// completion is NOT throw ("if completion is throw, return
+    /// completion"). The opcode carries `rb` as the flag — `0` on the
+    /// handler (throw) path, `1` on the normal break/return path. Validating
+    /// unconditionally regresses the throw path (a `return(){}` yielding
+    /// `undefined` would mask the original error with a TypeError); skipping
+    /// unconditionally swallows the normal-path abrupt (a non-Object result
+    /// on `break`/`return` must throw).
+    pub(crate) fn op_iterator_close(
+        &mut self,
+        iter_v: JsValue,
+        throw_path: bool,
+    ) -> Result<(), JSException> {
+        // Spec 7.4.6 step "if completion is throw, return completion": on
+        // the handler path the original abrupt always wins — a GetMethod
+        // abrupt, a non-callable `return`, a `return()` throw, or a
+        // non-Object result must NOT mask it. Swallow every close error and
+        // let the caller rethrow the original via `Throw exc`.
+        let result = self.fallible_iterator_close(iter_v, !throw_path);
+        if throw_path { Ok(()) } else { result }
+    }
+
+    /// The fallible half of [`Self::op_iterator_close`]: GetMethod gate,
+    /// `return()` call, and — when `check_result` — the Object-result
+    /// validation. Errors propagate to the caller.
+    fn fallible_iterator_close(
+        &mut self,
+        iter_v: JsValue,
+        check_result: bool,
+    ) -> Result<(), JSException> {
         let Some(_iter_obj) = iter_v.as_object() else {
             return Ok(());
         };
@@ -455,8 +497,13 @@ impl Interp<'_> {
         self.gc_protect();
         let inner = self.call_inline(return_obj, iter_v, &[]);
         self.stack.pop();
-        inner?;
-        Ok(())
+        match inner {
+            Err(e) => Err(e),
+            Ok(v) if check_result && v.as_object().is_none() => Err(JSException(
+                self.error_value("TypeError: iterator.return() returned a non-object"),
+            )),
+            Ok(_) => Ok(()),
+        }
     }
 
     /// Interns `text` into a fresh register (compiler-style temp) for use as

@@ -679,6 +679,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_jump(Opcode::Jump, 0, over_handler);
         let try_end = self.pc();
         let handler_start = self.pc();
+        // `rb` 0: throw-path close — best-effort (spec 7.4.6: on a throw
+        // completion the original error wins, so GetMethod/`return()`
+        // failures are swallowed). A successful close falls through to the
+        // rethrow below; the exception value sits in `exc` (handler
+        // delivery register).
         self.emit_reg3(Opcode::IteratorClose, iter, 0, 0, span);
         self.emit_reg3(Opcode::Throw, exc, 0, 0, span);
         self.bind(over_handler);

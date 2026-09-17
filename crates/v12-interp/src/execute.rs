@@ -769,9 +769,15 @@ impl Interp<'_> {
                     self.set_pc(pc + op_width);
                 }
                 Opcode::IteratorClose => {
+                    // `rb` is the completion flag: 0 = handler (throw) path —
+                    // best-effort close, errors swallowed so the original
+                    // abrupt wins (spec 7.4.6); nonzero = normal
+                    // break/return path — errors propagate and the
+                    // `return()` result is validated as an Object.
                     let iter_v = self.stack[base + usize::from(ra)];
+                    let throw_path = u16::from(rb) == 0;
                     self.gc_protect();
-                    attempt!(self.op_iterator_close(iter_v));
+                    attempt!(self.op_iterator_close(iter_v, throw_path));
                     self.set_pc(pc + op_width);
                 }
                 Opcode::CopyArrayRest => {

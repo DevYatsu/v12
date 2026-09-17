@@ -2,6 +2,23 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-17 — lane/dstr-forwarding: iterator GetMethod gates + completion-aware IteratorClose [lane/dstr-forwarding]
+
+- **Filter:** `language/expressions` (11 128 files), `language/statements/for-of` (752), `language/statements/for-await-of` (1 235), `--jobs 4`, `--format human` (+ `--format tap --tap-out` for the for-of fail-list diff)
+- **Before:** expressions 6 353/4 759/16 (57.2 %); for-of 475 pass / 272 fail / 5 skip; for-await 413/822/0 — pristine master worktree at c32a9d1
+- **After:** expressions 6 353/4 759/16 (identical); for-of 479 pass / 268 fail / 5 skip; for-await 413/822/0 (identical)
+- **Delta:** expressions ±0; for-of +4 pass / −4 fail; for-await ±0. Fixed: `iterator-close-non-object.js`, `iterator-close-throw-get-method-abrupt.js`, `iterator-close-throw-get-method-non-callable.js` (throw-path close now best-effort, original abrupt wins per spec 7.4.6), `iterator-next-result-type.js` (non-Object `next()` result now TypeError per spec 7.4.2).
+- **Engine change:** `op_get_iterator`/`op_iterator_next` now gate on `Kind::Function` (same GetMethod callability gate lane E added to `op_iterator_close`); `op_iterator_next` validates the result is an Object; `op_iterator_close(iter, throw_path)` splits the completion contract — `rb` 0 (handler path) swallows all close errors, `rb` 1 (break/return path) propagates + validates the `return()` result as an Object. Handler emission keeps `rb` 0, `emit_iterator_closes` emits `rb` 1; `execute.rs` decodes the flag; opcode docs updated.
+- **Files:** `crates/v12-interp/src/{object_ops,execute}.rs`, `crates/v12-bccompiler/src/{model,stmt}.rs`, `crates/v12-bytecode/src/opcode.rs`, conformance/fix-log.md (this entry)
+- **Bucket:** lane E PENDING (compiler-lowering half) — the 3 throw-path close tests + next-result validation; remaining for-of failures are other lanes' buckets (arguments aliasing, `missing from plans`, completions)
+- **Runner:** `./conformance/run.sh --filter <f> --jobs 4`
+- **Verification:** `cargo nextest run --workspace` 593 passed / 0 skipped; `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean; CLI probes: throw-path `return()`-throw/non-callable/non-object all yield the original error, break-path non-object result throws TypeError, break-path `return()`-throw propagates
+- **Notes:**
+  - `annexB/.../iterator-close-return-emulates-undefined-throws-when-called.js` still fails: `$262.IsHTMLDDA` has no runner shim, so `return` is `undefined` (no close) — pre-existing harness gap, out of scope.
+  - Pre-existing shape kept: a break-path close that throws is itself inside the loop's try range, so the handler re-closes (double `return()` call) before rethrowing — same as before for `return()` throws, now also for non-object results. Observable only via side-effect counting.
+  - for-await: async IteratorClose (awaiting the `return()` result) does NOT fall out cleanly — still sync close. Follow-up.
+  - Did not touch: proxy.rs, promise.rs, class.rs/unit.rs name-inference, property.rs strict-Set/ownKeys paths, realm.rs, id.rs.
+
 ### 2026-09-17 — lane/builtin-breadth: getOwnPropertyNames coercion, Error cause/remainder, remaining string methods
 
 - **Filter:** `built-ins/Object` (3 412 files), `built-ins/Error` (93 files), `built-ins/String` (1 341 files), 8 jobs

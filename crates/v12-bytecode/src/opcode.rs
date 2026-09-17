@@ -125,9 +125,12 @@ pub enum Opcode {
     /// receiver and stores the result. `r{c}` is unused (kept for a future
     /// `IteratorNextValue` fused op).
     IteratorNext = 70,
-    /// ES IteratorClose: `IteratorClose(r{a})`. Calls the iterator's
+    /// ES IteratorClose: `IteratorClose(r{a}, r{b})`. Calls the iterator's
     /// `"return"` method (if any) when the loop exits abruptly (break /
-    /// throw). `r{b}` and `r{c}` are unused.
+    /// throw). `r{b}` is the completion flag: 0 = handler (throw) path —
+    /// best-effort close, all close errors swallowed so the original abrupt
+    /// wins; nonzero = normal break/return path — close errors propagate
+    /// and a non-Object result throws (spec 7.4.6). `r{c}` is unused.
     IteratorClose = 71,
     /// Defines an own method property: `r{a}[r{b}] = r{c}` with spec method
     /// attributes (writable + configurable, non-enumerable). Unlike

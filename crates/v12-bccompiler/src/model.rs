@@ -702,6 +702,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Emits `IteratorClose r{iter}` for every loop being exited, innermost
     /// first (`for-of` abrupt completion; spec 14.7.4.9). `until` is the
     /// loop-stack index of the break target: loops above it are exited.
+    /// `rb` is 1 (normal completion): the `return()` result is validated
+    /// as an Object (spec 7.4.6). The throw-path handler in `stmt.rs`
+    /// emits `rb` 0 instead (no validation — the original error wins).
     pub fn emit_iterator_closes(&mut self, until: usize) {
         let iters: Vec<u16> = self.loops[until..]
             .iter()
@@ -709,7 +712,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             .filter_map(|ctx| ctx.close_iter)
             .collect();
         for iter in iters {
-            self.emit_reg3(Opcode::IteratorClose, iter, 0, 0, oxc_span::Span::default());
+            self.emit_reg3(Opcode::IteratorClose, iter, 1, 0, oxc_span::Span::default());
         }
     }
 
