@@ -203,6 +203,12 @@ pub(crate) fn load_and_evaluate(
         .modules
         .insert(path.to_path_buf(), JsValue::object(namespace));
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // Install the statically-known export keys (values snapshot later) so
+    // `in`/`hasOwnProperty`/enumeration observe the exports even for a
+    // cyclic/self importer that reads the namespace while this body (or a
+    // dependency's body) is still executing.
+    let export_names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
+    super::module_namespace::seed_export_keys(interp.heap_mut(), namespace, &export_names);
     // Evaluate static dependencies first (dedup, source order).
     let mut seen: HashSet<String> = HashSet::new();
     for entry in &module.imports {

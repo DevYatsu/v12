@@ -64,6 +64,37 @@ fn key_text(heap: &mut Heap, key: PropKey) -> String {
     }
 }
 
+/// Installs the module's export keys (sorted, deduped) with `undefined`
+/// values, before the body runs.
+///
+/// ES 10.4.6 defines `[[OwnPropertyKeys]]` as the module's export list, which
+/// the linker knows statically. Seeding the keys makes `hasOwnProperty`,
+/// `in`, and `getOwnPropertyNames` observe the exports while the body is
+/// still executing; values are filled later by [`populate_namespace`]. This
+/// does NOT close the live-binding gap: a read during the body sees
+/// `undefined`, not the current binding value.
+pub(crate) fn seed_export_keys(heap: &mut Heap, ns: Handle<JsObject>, names: &[String]) {
+    let mut sorted: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !n.is_empty() && *n != "*")
+        .collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let attrs = Attrs::new(true, true, false);
+    for name in sorted {
+        let key = PropKey::from_string(heap.intern_text(name));
+        let shape = heap.shape_of(ns);
+        if heap.get(shape).descriptors.find(key).is_some() {
+            continue;
+        }
+        let child = heap.add_property(shape, key, attrs);
+        heap.bind_shape(ns, child);
+        heap.get_mut(ns).properties.push(JsValue::undefined());
+        heap.get_mut(ns).property_keys.push(Some(key));
+    }
+}
+
 /// Populates `ns` from the compiler epilogue's `exports` object.
 ///
 /// Export keys are installed in ascending string order so the shape descriptor

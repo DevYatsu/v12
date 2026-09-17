@@ -306,6 +306,12 @@ impl Engine {
         let mut interner = v12_bccompiler::Interner::default();
         let module = v12_bccompiler::compile_source_as_module_with_interner(source, &mut interner)
             .map_err(|err| string_value(&mut self.heap, &err.message))?;
+        // Seed the entry's export keys before its dependencies evaluate: a
+        // self-import during the body must observe the export list.
+        if let Some(ns) = entry_ns {
+            let names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
+            crate::module_namespace::seed_export_keys(&mut self.heap, ns, &names);
+        }
         let strings: Vec<String> = v12_bccompiler::freeze_interner(interner)
             .iter()
             .map(|(_, s)| s.to_string())
