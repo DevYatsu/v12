@@ -58,6 +58,12 @@ pub enum Kind {
     /// the native registry's side table; the object itself only carries the
     /// source text and flag string.
     RegExp = 10,
+    /// Date object. The single internal slot `[[DateValue]]` lives in
+    /// `properties[0]` as a Number (the time value in milliseconds, or NaN
+    /// for an invalid date) — see `v12-engine/src/builtins/date.rs`. The slot
+    /// carries no shape descriptor, so it is invisible to property lookup and
+    /// enumeration; `Date.prototype`-installed methods serve the JS surface.
+    Date = 11,
     /// Proxy object: every internal method traps (the engine's dispatch
     /// reports a `TypeError` for the v1 stub).
     Proxy = 99,

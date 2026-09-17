@@ -7,6 +7,7 @@
 pub mod array;
 pub mod boolean;
 pub mod ctx;
+pub mod date;
 pub mod error;
 pub mod global;
 pub mod helpers;
@@ -57,6 +58,11 @@ pub struct BuiltinTargets {
     /// `built-ins/Proxy/proxy-no-prototype.js`), so there is no
     /// `proxy_proto` field.
     pub proxy: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    /// The `Date` constructor. Statics install on it (`Date.now`, `Date.UTC`,
+    /// `Date.parse`); prototype methods install on `date_proto`.
+    pub date: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    /// `%Date.prototype%`.
+    pub date_proto: v12_heap::Handle<v12_heap::JsObject>,
 }
 
 pub(crate) fn builtin_install_prop(
@@ -251,6 +257,56 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::SymbolProtoToString => Some(0),
         NativeId::SymbolProtoValueOf => Some(0),
         NativeId::ProxyRevocable => Some(2),
+        NativeId::DateNow => Some(0),
+        NativeId::DateUtc => Some(7),
+        NativeId::DateParse => Some(1),
+        NativeId::DateProtoValueOf => Some(0),
+        NativeId::DateProtoGetTime => Some(0),
+        NativeId::DateProtoGetFullYear => Some(0),
+        NativeId::DateProtoGetUtcFullYear => Some(0),
+        NativeId::DateProtoGetMonth => Some(0),
+        NativeId::DateProtoGetUtcMonth => Some(0),
+        NativeId::DateProtoGetDate => Some(0),
+        NativeId::DateProtoGetUtcDate => Some(0),
+        NativeId::DateProtoGetDay => Some(0),
+        NativeId::DateProtoGetUtcDay => Some(0),
+        NativeId::DateProtoGetHours => Some(0),
+        NativeId::DateProtoGetUtcHours => Some(0),
+        NativeId::DateProtoGetMinutes => Some(0),
+        NativeId::DateProtoGetUtcMinutes => Some(0),
+        NativeId::DateProtoGetSeconds => Some(0),
+        NativeId::DateProtoGetUtcSeconds => Some(0),
+        NativeId::DateProtoGetMilliseconds => Some(0),
+        NativeId::DateProtoGetUtcMilliseconds => Some(0),
+        NativeId::DateProtoGetTimezoneOffset => Some(0),
+        NativeId::DateProtoSetTime => Some(1),
+        NativeId::DateProtoSetFullYear => Some(3),
+        NativeId::DateProtoSetUtcFullYear => Some(3),
+        NativeId::DateProtoSetMonth => Some(2),
+        NativeId::DateProtoSetUtcMonth => Some(2),
+        NativeId::DateProtoSetDate => Some(1),
+        NativeId::DateProtoSetUtcDate => Some(1),
+        NativeId::DateProtoSetHours => Some(4),
+        NativeId::DateProtoSetUtcHours => Some(4),
+        NativeId::DateProtoSetMinutes => Some(3),
+        NativeId::DateProtoSetUtcMinutes => Some(3),
+        NativeId::DateProtoSetSeconds => Some(2),
+        NativeId::DateProtoSetUtcSeconds => Some(2),
+        NativeId::DateProtoSetMilliseconds => Some(1),
+        NativeId::DateProtoSetUtcMilliseconds => Some(1),
+        NativeId::DateProtoToIsoString => Some(0),
+        NativeId::DateProtoToString => Some(0),
+        NativeId::DateProtoToDateString => Some(0),
+        NativeId::DateProtoToTimeString => Some(0),
+        NativeId::DateProtoToUtcString => Some(0),
+        NativeId::DateProtoToGmtString => Some(0),
+        NativeId::DateProtoToLocaleString => Some(0),
+        NativeId::DateProtoToLocaleDateString => Some(0),
+        NativeId::DateProtoToLocaleTimeString => Some(0),
+        NativeId::DateProtoToJson => Some(1),
+        NativeId::DateProtoToPrimitive => Some(1),
+        NativeId::DateProtoGetYear => Some(0),
+        NativeId::DateProtoSetYear => Some(1),
         NativeId::PromiseAll => Some(1),
         NativeId::PromiseRace => Some(1),
         NativeId::PromiseFinally => Some(1),
@@ -415,6 +471,12 @@ macro_rules! __builtin_emit_install {
     (Proxy, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, $targets.proxy, $name, $id)
     };
+    (Date, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, $targets.date, $name, $id)
+    };
+    (DateProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_native($heap, Some($targets.date_proto), $name, $id)
+    };
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, Some($targets.symbol_proto), $name, $id)
     };
@@ -518,6 +580,18 @@ macro_rules! __builtin_emit_install {
     };
     (Proxy, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length($heap, $targets.proxy, $name, $id, Some($len))
+    };
+    (Date, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length($heap, $targets.date, $name, $id, Some($len))
+    };
+    (DateProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.date_proto),
+            $name,
+            $id,
+            Some($len),
+        )
     };
     // Value-constant groups ignore length (constants, not functions).
     (GlobalValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {{
@@ -849,11 +923,65 @@ define_builtins! {
     },
     Proxy {
         "revocable" (2) => ProxyRevocable => |heap, this, args| call_ctx(proxy::proxy_revocable, heap, this, args),
+    },
+    Date {
+        "now" (0) => DateNow => |heap, this, args| call_ctx(date::date_now, heap, this, args),
+        "UTC" (7) => DateUtc => |heap, this, args| call_ctx(date::date_utc, heap, this, args),
+        "parse" (1) => DateParse => |heap, this, args| call_ctx(date::date_parse, heap, this, args),
+    },
+    DateProto {
+        "valueOf" (0) => DateProtoValueOf => |heap, this, args| call_ctx(date::date_proto_value_of, heap, this, args),
+        "getTime" (0) => DateProtoGetTime => |heap, this, args| call_ctx(date::date_proto_value_of, heap, this, args),
+        "getFullYear" (0) => DateProtoGetFullYear => |heap, this, args| call_ctx(date::date_proto_get_full_year, heap, this, args),
+        "getUTCFullYear" (0) => DateProtoGetUtcFullYear => |heap, this, args| call_ctx(date::date_proto_get_utc_full_year, heap, this, args),
+        "getMonth" (0) => DateProtoGetMonth => |heap, this, args| call_ctx(date::date_proto_get_month, heap, this, args),
+        "getUTCMonth" (0) => DateProtoGetUtcMonth => |heap, this, args| call_ctx(date::date_proto_get_utc_month, heap, this, args),
+        "getDate" (0) => DateProtoGetDate => |heap, this, args| call_ctx(date::date_proto_get_date, heap, this, args),
+        "getUTCDate" (0) => DateProtoGetUtcDate => |heap, this, args| call_ctx(date::date_proto_get_utc_date, heap, this, args),
+        "getDay" (0) => DateProtoGetDay => |heap, this, args| call_ctx(date::date_proto_get_day, heap, this, args),
+        "getUTCDay" (0) => DateProtoGetUtcDay => |heap, this, args| call_ctx(date::date_proto_get_utc_day, heap, this, args),
+        "getHours" (0) => DateProtoGetHours => |heap, this, args| call_ctx(date::date_proto_get_hours, heap, this, args),
+        "getUTCHours" (0) => DateProtoGetUtcHours => |heap, this, args| call_ctx(date::date_proto_get_utc_hours, heap, this, args),
+        "getMinutes" (0) => DateProtoGetMinutes => |heap, this, args| call_ctx(date::date_proto_get_minutes, heap, this, args),
+        "getUTCMinutes" (0) => DateProtoGetUtcMinutes => |heap, this, args| call_ctx(date::date_proto_get_utc_minutes, heap, this, args),
+        "getSeconds" (0) => DateProtoGetSeconds => |heap, this, args| call_ctx(date::date_proto_get_seconds, heap, this, args),
+        "getUTCSeconds" (0) => DateProtoGetUtcSeconds => |heap, this, args| call_ctx(date::date_proto_get_utc_seconds, heap, this, args),
+        "getMilliseconds" (0) => DateProtoGetMilliseconds => |heap, this, args| call_ctx(date::date_proto_get_milliseconds, heap, this, args),
+        "getUTCMilliseconds" (0) => DateProtoGetUtcMilliseconds => |heap, this, args| call_ctx(date::date_proto_get_utc_milliseconds, heap, this, args),
+        "getTimezoneOffset" (0) => DateProtoGetTimezoneOffset => |heap, this, args| call_ctx(date::date_proto_get_timezone_offset, heap, this, args),
+        "setTime" (1) => DateProtoSetTime => |heap, this, args| call_ctx(date::date_proto_set_time, heap, this, args),
+        "setFullYear" (3) => DateProtoSetFullYear => |heap, this, args| call_ctx(date::date_proto_set_full_year, heap, this, args),
+        "setUTCFullYear" (3) => DateProtoSetUtcFullYear => |heap, this, args| call_ctx(date::date_proto_set_utc_full_year, heap, this, args),
+        "setMonth" (2) => DateProtoSetMonth => |heap, this, args| call_ctx(date::date_proto_set_month, heap, this, args),
+        "setUTCMonth" (2) => DateProtoSetUtcMonth => |heap, this, args| call_ctx(date::date_proto_set_utc_month, heap, this, args),
+        "setDate" (1) => DateProtoSetDate => |heap, this, args| call_ctx(date::date_proto_set_date, heap, this, args),
+        "setUTCDate" (1) => DateProtoSetUtcDate => |heap, this, args| call_ctx(date::date_proto_set_utc_date, heap, this, args),
+        "setHours" (4) => DateProtoSetHours => |heap, this, args| call_ctx(date::date_proto_set_hours, heap, this, args),
+        "setUTCHours" (4) => DateProtoSetUtcHours => |heap, this, args| call_ctx(date::date_proto_set_utc_hours, heap, this, args),
+        "setMinutes" (3) => DateProtoSetMinutes => |heap, this, args| call_ctx(date::date_proto_set_minutes, heap, this, args),
+        "setUTCMinutes" (3) => DateProtoSetUtcMinutes => |heap, this, args| call_ctx(date::date_proto_set_utc_minutes, heap, this, args),
+        "setSeconds" (2) => DateProtoSetSeconds => |heap, this, args| call_ctx(date::date_proto_set_seconds, heap, this, args),
+        "setUTCSeconds" (2) => DateProtoSetUtcSeconds => |heap, this, args| call_ctx(date::date_proto_set_utc_seconds, heap, this, args),
+        "setMilliseconds" (1) => DateProtoSetMilliseconds => |heap, this, args| call_ctx(date::date_proto_set_milliseconds, heap, this, args),
+        "setUTCMilliseconds" (1) => DateProtoSetUtcMilliseconds => |heap, this, args| call_ctx(date::date_proto_set_utc_milliseconds, heap, this, args),
+        "toISOString" (0) => DateProtoToIsoString => |heap, this, args| call_ctx(date::date_proto_to_iso_string, heap, this, args),
+        "toString" (0) => DateProtoToString => |heap, this, args| call_ctx(date::date_proto_to_string, heap, this, args),
+        "toDateString" (0) => DateProtoToDateString => |heap, this, args| call_ctx(date::date_proto_to_date_string, heap, this, args),
+        "toTimeString" (0) => DateProtoToTimeString => |heap, this, args| call_ctx(date::date_proto_to_time_string, heap, this, args),
+        "toUTCString" (0) => DateProtoToUtcString => |heap, this, args| call_ctx(date::date_proto_to_utc_string, heap, this, args),
+        "toLocaleString" (0) => DateProtoToLocaleString => |heap, this, args| call_ctx(date::date_proto_to_locale_string, heap, this, args),
+        "toLocaleDateString" (0) => DateProtoToLocaleDateString => |heap, this, args| call_ctx(date::date_proto_to_locale_date_string, heap, this, args),
+        "toLocaleTimeString" (0) => DateProtoToLocaleTimeString => |heap, this, args| call_ctx(date::date_proto_to_locale_time_string, heap, this, args),
+        "toJSON" (1) => DateProtoToJson => |heap, this, args| call_ctx(date::date_proto_to_json, heap, this, args),
+        // Annex B.
+        "getYear" (0) => DateProtoGetYear => |heap, this, args| call_ctx(date::date_proto_get_year, heap, this, args),
+        "setYear" (1) => DateProtoSetYear => |heap, this, args| call_ctx(date::date_proto_set_year, heap, this, args),
     };
     // Truly internal / non-JS-visible dispatch-only natives (not installed).
     StringConstruct => |heap, this, args| call_ctx(string_construct, heap, this, args),
     NumberConstruct => |heap, this, args| call_ctx(number::number_construct, heap, this, args),
     BooleanConstruct => |heap, this, args| call_ctx(boolean::boolean_construct, heap, this, args),
+    DateConstruct => |heap, this, args| call_ctx(date::date_construct, heap, this, args),
     ErrorCreate => |heap, this, args| call_ctx(error::error_create, heap, this, args),
     TypeErrorCreate => |heap, this, args| call_ctx(error::type_error_create, heap, this, args),
     RangeErrorCreate => |heap, this, args| call_ctx(error::range_error_create, heap, this, args),
@@ -907,6 +1035,13 @@ define_builtins! {
     RegExpConstruct => |heap, this, args| call_ctx(regexp::regexp_construct, heap, this, args),
     RegExpToString => |heap, this, args| call_ctx(regexp::regexp_to_string, heap, this, args),
     ObjectEnumerableOwnKeys => |heap, this, args| call_ctx(object::object_enumerable_own_keys, heap, this, args),
+    // Date: installed manually by the realm rather than by the macro.
+    // `toGMTString` must be the *same function object* as `toUTCString`
+    // (test262 `annexB/.../toGMTString/value.js`), and
+    // `[Symbol.toPrimitive]` needs a symbol key the string-based install
+    // cannot express.
+    DateProtoToGmtString => |heap, this, args| call_ctx(date::date_proto_to_utc_string, heap, this, args),
+    DateProtoToPrimitive => |heap, this, args| call_ctx(date::date_proto_to_primitive, heap, this, args),
 }
 
 /// Installs the core built-ins into `registry`.

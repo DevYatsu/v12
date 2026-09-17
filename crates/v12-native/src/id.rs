@@ -327,6 +327,110 @@ pub enum NativeId {
     /// `Proxy.revocable(target, handler)` — allocates the proxy plus its
     /// revocation function and returns `{ proxy, revoke }`.
     ProxyRevocable = 2701,
+    // Date
+    /// `new Date(...)` / `Date(...)`.
+    DateConstruct = 2800,
+    /// `Date.now()`.
+    DateNow = 2801,
+    /// `Date.UTC(...)`.
+    DateUtc = 2802,
+    /// `Date.parse(string)`.
+    DateParse = 2803,
+    /// `Date.prototype.valueOf`.
+    DateProtoValueOf = 2804,
+    /// `Date.prototype.getTime` (same behavior as `valueOf`, distinct
+    /// install identity so both names carry their own `name` prop).
+    DateProtoGetTime = 2850,
+    /// `Date.prototype.getFullYear`.
+    DateProtoGetFullYear = 2805,
+    /// `Date.prototype.getUTCFullYear`.
+    DateProtoGetUtcFullYear = 2806,
+    /// `Date.prototype.getMonth`.
+    DateProtoGetMonth = 2807,
+    /// `Date.prototype.getUTCMonth`.
+    DateProtoGetUtcMonth = 2808,
+    /// `Date.prototype.getDate`.
+    DateProtoGetDate = 2809,
+    /// `Date.prototype.getUTCDate`.
+    DateProtoGetUtcDate = 2810,
+    /// `Date.prototype.getDay`.
+    DateProtoGetDay = 2811,
+    /// `Date.prototype.getUTCDay`.
+    DateProtoGetUtcDay = 2812,
+    /// `Date.prototype.getHours`.
+    DateProtoGetHours = 2813,
+    /// `Date.prototype.getUTCHours`.
+    DateProtoGetUtcHours = 2814,
+    /// `Date.prototype.getMinutes`.
+    DateProtoGetMinutes = 2815,
+    /// `Date.prototype.getUTCMinutes`.
+    DateProtoGetUtcMinutes = 2816,
+    /// `Date.prototype.getSeconds`.
+    DateProtoGetSeconds = 2817,
+    /// `Date.prototype.getUTCSeconds`.
+    DateProtoGetUtcSeconds = 2818,
+    /// `Date.prototype.getMilliseconds`.
+    DateProtoGetMilliseconds = 2819,
+    /// `Date.prototype.getUTCMilliseconds`.
+    DateProtoGetUtcMilliseconds = 2820,
+    /// `Date.prototype.getTimezoneOffset`.
+    DateProtoGetTimezoneOffset = 2821,
+    /// `Date.prototype.setTime`.
+    DateProtoSetTime = 2822,
+    /// `Date.prototype.setFullYear`.
+    DateProtoSetFullYear = 2823,
+    /// `Date.prototype.setUTCFullYear`.
+    DateProtoSetUtcFullYear = 2824,
+    /// `Date.prototype.setMonth`.
+    DateProtoSetMonth = 2825,
+    /// `Date.prototype.setUTCMonth`.
+    DateProtoSetUtcMonth = 2826,
+    /// `Date.prototype.setDate`.
+    DateProtoSetDate = 2827,
+    /// `Date.prototype.setUTCDate`.
+    DateProtoSetUtcDate = 2828,
+    /// `Date.prototype.setHours`.
+    DateProtoSetHours = 2829,
+    /// `Date.prototype.setUTCHours`.
+    DateProtoSetUtcHours = 2830,
+    /// `Date.prototype.setMinutes`.
+    DateProtoSetMinutes = 2831,
+    /// `Date.prototype.setUTCMinutes`.
+    DateProtoSetUtcMinutes = 2832,
+    /// `Date.prototype.setSeconds`.
+    DateProtoSetSeconds = 2833,
+    /// `Date.prototype.setUTCSeconds`.
+    DateProtoSetUtcSeconds = 2834,
+    /// `Date.prototype.setMilliseconds`.
+    DateProtoSetMilliseconds = 2835,
+    /// `Date.prototype.setUTCMilliseconds`.
+    DateProtoSetUtcMilliseconds = 2836,
+    /// `Date.prototype.toISOString`.
+    DateProtoToIsoString = 2837,
+    /// `Date.prototype.toString`.
+    DateProtoToString = 2838,
+    /// `Date.prototype.toDateString`.
+    DateProtoToDateString = 2839,
+    /// `Date.prototype.toTimeString`.
+    DateProtoToTimeString = 2840,
+    /// `Date.prototype.toUTCString`.
+    DateProtoToUtcString = 2841,
+    /// Annex B `Date.prototype.toGMTString` (aliases `toUTCString`).
+    DateProtoToGmtString = 2851,
+    /// `Date.prototype.toLocaleString`.
+    DateProtoToLocaleString = 2842,
+    /// `Date.prototype.toLocaleDateString`.
+    DateProtoToLocaleDateString = 2843,
+    /// `Date.prototype.toLocaleTimeString`.
+    DateProtoToLocaleTimeString = 2844,
+    /// `Date.prototype.toJSON`.
+    DateProtoToJson = 2845,
+    /// `Date.prototype[Symbol.toPrimitive]`.
+    DateProtoToPrimitive = 2846,
+    /// Annex B `Date.prototype.getYear`.
+    DateProtoGetYear = 2847,
+    /// Annex B `Date.prototype.setYear`.
+    DateProtoSetYear = 2848,
 }
 
 /// The serialized index of a native function.

@@ -284,6 +284,13 @@ impl Realm {
         // for instances built inside `eval`, which never touches the
         // interpreter's lazy surface.
         let regexp_proto = alloc_root(heap);
+        // `%Date.prototype%`: an ordinary object. `Date` is deliberately NOT a
+        // `GLOBAL_INTRINSICS` slot: appending it there would require a
+        // runtime `intrinsic_slot` arm in `v12-interp`, which this lane does
+        // not own. Installed instead as an ordinary shape-bound global
+        // property (same mechanism as the `Function` constructor), which the
+        // compiler's unbound-identifier path resolves through `GetGlobal`.
+        let date_proto = alloc_root(heap);
 
         // Link the intrinsic constructors to their prototypes through the
         // unified install family (`install_ctor`: `prototype` field +
@@ -328,8 +335,110 @@ impl Realm {
             symbol: intrinsics.get("Symbol").and_then(|v| v.as_object()),
             symbol_proto,
             proxy: intrinsics.get("Proxy").and_then(|v| v.as_object()),
+            date: None,
+            date_proto,
         };
         crate::builtins::install_builtins(heap, &targets);
+
+        // `Date`: created and installed as an ordinary global property (see
+        // the `date_proto` note above). Statics install on the constructor,
+        // prototype methods on `date_proto`, and the returned handle is
+        // relinked below so `new Date(...)` finds `%Date.prototype%`.
+        let date_ctor =
+            crate::builtins::install_native(heap, Some(global), "Date", NativeId::DateConstruct);
+        if let Some(date_ctor) = date_ctor {
+            crate::builtins::install_ctor(heap, date_ctor, date_proto);
+            // `Date.length` is 7 (test262 `built-ins/Date/length.js`). The
+            // unified install path stamped `name` from the install name and
+            // left `length` absent because `builtin_length` has no
+            // `DateConstruct` entry (it is a bare dispatch id), so stamp
+            // `length` with spec attrs.
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            ctx.define_data_prop_with_attrs(
+                date_ctor,
+                "length",
+                JsValue::from_i32_smi(7).expect("7 fits Smi"),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            // Statics: `Date.now`/`UTC`/`parse` install on the constructor;
+            // the prototype method set on `date_proto`. `install_builtins`
+            // already ran with `date: None`, so these are the only installs.
+            for (name, id, len) in [
+                ("now", NativeId::DateNow, 0u32),
+                ("UTC", NativeId::DateUtc, 7),
+                ("parse", NativeId::DateParse, 1),
+            ] {
+                crate::builtins::install_native_with_length(
+                    heap,
+                    Some(date_ctor),
+                    name,
+                    id,
+                    Some(len),
+                );
+            }
+            // The prototype method set (including arities) is installed by
+            // `install_builtins` through its `DateProto` group; only the two
+            // entries that group cannot express are wired here:
+            //
+            // `toGMTString` must be the SAME function object as
+            // `toUTCString` (Annex B), so capture the installed handle and
+            // re-install it under the second name.
+            let utc_name = heap.intern_text("toUTCString");
+            let utc_key = v12_heap::PropKey::from_string(utc_name);
+            let utc_shape = heap.shape_of(date_proto);
+            let utc_slot = heap
+                .lookup_property(utc_shape, utc_key)
+                .and_then(|d| d.slot())
+                .expect("toUTCString installed by the DateProto group");
+            let utc_fn = heap.get(date_proto).properties[utc_slot as usize];
+            crate::builtins::builtin_install_prop(heap, date_proto, "toGMTString", utc_fn);
+            // `Date.prototype[Symbol.toPrimitive]`: needs a symbol key, so it
+            // cannot ride the macro's string install. The realm's
+            // `Symbol.toPrimitive` value must itself be a symbol; the macro
+            // installed a handler *function* for it, so overwrite that slot
+            // with a fresh well-known symbol first.
+            {
+                let symbol_ctor = intrinsics.get("Symbol").and_then(|v| v.as_object());
+                if let Some(symbol_ctor) = symbol_ctor {
+                    let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+                    let to_prim_sym = ctx.fresh_symbol();
+                    ctx.overwrite_data_prop(
+                        symbol_ctor,
+                        "toPrimitive",
+                        JsValue::symbol(to_prim_sym),
+                    );
+                    // Allocate the method function and stamp spec `length` +
+                    // `name` (the symbol spelling), then install it under the
+                    // symbol key.
+                    let func = ctx.alloc_obj(JsObject {
+                        kind: v12_heap::Kind::Function,
+                        callable: FunctionTarget::Bytecode(u32::from(
+                            NativeId::DateProtoToPrimitive,
+                        )),
+                        ..Default::default()
+                    });
+                    let prim_name = ctx.heap.intern_text("[Symbol.toPrimitive]");
+                    ctx.define_data_prop_with_attrs(
+                        func,
+                        "length",
+                        JsValue::from_i32_smi(1).expect("1 fits Smi"),
+                        v12_heap::Attrs::new(false, false, true),
+                    );
+                    ctx.define_data_prop_with_attrs(
+                        func,
+                        "name",
+                        JsValue::string(prim_name),
+                        v12_heap::Attrs::new(false, false, true),
+                    );
+                    ctx.define_symbol_data_prop_with_attrs(
+                        date_proto,
+                        to_prim_sym,
+                        JsValue::object(func),
+                        v12_heap::Attrs::new(false, false, true),
+                    );
+                }
+            }
+        }
 
         // The `Function` constructor: not a `GLOBAL_INTRINSICS` slot (so the
         // compiler still refuses a bare `Function` identifier), but installed
