@@ -239,6 +239,10 @@ pub struct UnitPlan {
     /// resolves against the parent constructor directly instead of its
     /// `prototype`.
     pub static_method: bool,
+    /// The unit is lexically a class member (constructor, method, or field
+    /// initializer), so `super` property/call references are legal in it.
+    /// Nested ordinary functions reset this; nested arrows inherit it.
+    pub allows_super: bool,
     /// First free register above params + non-captured locals.
     pub locals_end: u16,
 }
@@ -266,6 +270,7 @@ impl UnitPlan {
             is_strict: false,
             uses_super: false,
             static_method: false,
+            allows_super: false,
             locals_end: 1, // r0 = this
         }
     }

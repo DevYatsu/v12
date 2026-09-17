@@ -1736,6 +1736,323 @@ fn strict_eval_binding_is_syntax_error() {
     assert!(err.message.contains("eval"), "got: {}", err.message);
 }
 
+/// ES §12.1.1: the strict-mode reserved words may not bind as identifiers.
+#[test]
+fn strict_reserved_word_binding_is_syntax_error() {
+    for name in [
+        "implements",
+        "interface",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "static",
+        "yield",
+        "let",
+    ] {
+        let src = format!("\"use strict\"; var {name} = 1;");
+        let err = compile_source_with_strings(&src)
+            .map_err(|e| e.message)
+            .expect_err("strict reserved-word binding should be a SyntaxError");
+        assert!(err.contains(name), "for {name}: got {err}");
+    }
+    // Sloppy mode must still accept every one of them.
+    for name in ["implements", "static", "let"] {
+        let src = format!("var {name} = 1;");
+        compile_source_with_strings(&src).expect("sloppy binding should compile");
+    }
+}
+
+/// ES §14.1.2: a `"use strict"` directive is an early error when the
+/// parameter list is not simple (rest, default, or a destructuring pattern).
+#[test]
+fn use_strict_with_non_simple_params_is_syntax_error() {
+    let err = compile_source_with_strings("function f(...a) { \"use strict\"; }")
+        .map_err(|e| e.message)
+        .expect_err("rest + use strict should fail");
+    assert!(err.contains("use strict"), "got: {err}");
+    let err = compile_source_with_strings("var f = (a = 1) => { \"use strict\"; };")
+        .map_err(|e| e.message)
+        .expect_err("default param + use strict should fail");
+    assert!(err.contains("use strict"), "got: {err}");
+    // A simple parameter list with the directive is legal.
+    compile_source_with_strings("function f(a) { \"use strict\"; return a; }")
+        .expect("simple params + use strict should compile");
+}
+
+/// ES §13.15.1/§13.4.1: strict-mode `eval`/`arguments` are never valid
+/// assignment or update targets.
+#[test]
+fn strict_eval_arguments_assign_target_is_syntax_error() {
+    for src in [
+        "\"use strict\"; eval = 1;",
+        "\"use strict\"; arguments = 1;",
+        "\"use strict\"; eval++;",
+        "\"use strict\"; arguments += 1;",
+        "\"use strict\"; eval &&= 1;",
+        "\"use strict\"; 0, { eval = 0 } = {};",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("strict eval/arguments target should be a SyntaxError");
+        assert!(err.contains("assignment target"), "for {src}: got {err}");
+    }
+    // Sloppy mode keeps the Annex B web-compat behavior.
+    compile_source_with_strings("eval = 1;").expect("sloppy eval assignment compiles");
+}
+
+/// `delete` of a `PrivateName` target is an early error regardless of the
+/// surrounding unit (class bodies are always strict).
+#[test]
+fn delete_private_member_is_syntax_error() {
+    for src in [
+        "var C = class { #m() {} x() { delete this.#m; } };",
+        "var C = class { #x; x = delete ((this.#x)); };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("delete of a private member should fail");
+        assert!(err.contains("private"), "for {src}: got {err}");
+    }
+    // Non-private deletes still compile in strict mode.
+    compile_source_with_strings("\"use strict\"; var o = {a:1}; delete o.a;")
+        .expect("delete of a property should compile");
+}
+
+/// All parts of a class definition are strict mode code (ES §10.2.1), so a
+/// `FutureReservedWord` class name is an early error even in sloppy code.
+#[test]
+fn class_name_strict_reserved_word_is_syntax_error() {
+    let err = compile_source_with_strings("class static {}")
+        .map_err(|e| e.message)
+        .expect_err("`class static` should fail");
+    assert!(err.contains("static"), "got: {err}");
+    compile_source_with_strings("class C {}").expect("plain class name compiles");
+}
+
+/// ES §15.7.1: `super` is only legal in a class method or an arrow lexically
+/// inside one. Nested ordinary functions reset the scope.
+#[test]
+fn super_outside_class_method_is_syntax_error() {
+    for src in [
+        "super.x;",
+        "super();",
+        "function f() { super.x; }",
+        "var f = () => super.x;",
+        "class C extends Object { constructor() { function g() { super.x; } } }",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("super outside a class method should fail");
+        assert!(err.contains("super"), "for {src}: got {err}");
+    }
+    // Legal contexts: base/derived methods, arrows in methods, field inits.
+    for src in [
+        "class C { m() { return super.x; } }",
+        "class C extends Object { constructor() { super(); } }",
+        "class C { m() { var f = () => super.x; return f(); } }",
+        "class C extends Object { x = super.y; }",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
+/// ES §15.7.1: object-literal methods have a HomeObject and may use `super.x`,
+/// but not call `super()`.
+#[test]
+fn object_method_super_property_is_allowed() {
+    compile_source_with_strings("var o = { m() { return super.x; } };")
+        .expect("object method super.x is legal");
+    compile_source_with_strings("var o = { get x() { return super.x; } };")
+        .expect("object getter super.x is legal");
+    let err = compile_source_with_strings("var o = { m() { super(); } };")
+        .map_err(|e| e.message)
+        .expect_err("object method super() should fail");
+    assert!(err.contains("super()"), "got: {err}");
+}
+
+/// ES §15.7.1: a class declares `constructor` at most once and a private name
+/// at most once per class (get/set pairs excepted).
+#[test]
+fn duplicate_class_constructor_and_private_names_are_syntax_errors() {
+    let err = compile_source_with_strings("var C = class { constructor(){} constructor(){} };")
+        .map_err(|e| e.message)
+        .expect_err("duplicate constructor should fail");
+    assert!(err.contains("constructor"), "got: {err}");
+    for src in [
+        "var C = class { #m(){} #m(){} };",
+        "var C = class { #m; #m; };",
+        "var C = class { get #m(){} get #m(){} };",
+        "var C = class { #m(){} get #m(){} };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("duplicate private name should fail");
+        assert!(err.contains("private name"), "for {src}: got {err}");
+    }
+    compile_source_with_strings("var C = class { get #m(){} set #m(v){} };")
+        .expect("a get/set pair is one private name");
+}
+
+/// ES §15.7.1: every `#name` reference in a class body must resolve against
+/// the class body's own private names or an enclosing class's.
+#[test]
+fn unresolved_private_name_is_syntax_error() {
+    for src in [
+        "var C = class { m() { this.#x } };",
+        "var C = class { m() { something.#x } };",
+        "var C = class { m() { function fn() { something.#x } } };",
+        "var C = class { m() { class Outter { #x; } this.#x; } };",
+        "var C = class extends class { x = this.#foo; } { #foo; };",
+        "var C = class { m() { return #x in this; } };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("unresolved private name should fail");
+        assert!(err.contains("private name"), "for {src}: got {err}");
+    }
+    // Declared by the class, or by an enclosing class: legal.
+    compile_source_with_strings("var C = class { #x; m() { return this.#x; } };")
+        .expect("declared private name resolves");
+    compile_source_with_strings("var C = class { m() { class O { #x; m2() { this.#x } } } };")
+        .expect("nested class declares and uses its own private name");
+    // A computed element key evaluates in the private-aware class context.
+    compile_source_with_strings("var C = class { #f; [this.#f] = 1 };")
+        .expect("computed key sees the class private names");
+    let err = compile_source_with_strings("var C = class { [this.#f] = 1 };")
+        .map_err(|e| e.message)
+        .expect_err("computed key with an undeclared private name should fail");
+    assert!(err.contains("private name"), "got: {err}");
+}
+
+/// ES §14.1.2/§14.2.1/§14.4: `yield` and `await` expressions may not appear
+/// in a formal-parameter list (parameters evaluate before the function is
+/// resumable), but a nested function's own body is a fresh context.
+#[test]
+fn yield_await_in_parameter_list_is_syntax_error() {
+    for src in [
+        "function* g(x = yield) {}",
+        "0, function*(x = yield) {};",
+        "function *g() { (x = yield) => {}; }",
+        "(async function*(x = await 1) { });",
+        "async() => { (a = await 1) => {} };",
+        "0, class { m(x = yield) {} };",
+        "0, class { static *m(x = yield) {} };",
+        "function* outer() { ({ *method(x = yield) {} }); }",
+    ] {
+        // Class methods are always strict, so they may reject with either the
+        // parameter-list or the strict reserved-word diagnostic; both are
+        // correct early errors.
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("yield/await in a parameter list should fail");
+        assert!(
+            err.contains("parameter list")
+                || err.contains("not allowed")
+                || err.contains("reserved word"),
+            "for {src}: got {err}"
+        );
+    }
+    // A nested generator/async function declared in an outer parameter default
+    // may use yield/await in its own body.
+    for src in [
+        "function f(a = function*() { yield 1; }) { return a; }",
+        "function f(a = async function() { await 1; }) { return a; }",
+        "var g = function(a = function*() { yield 1; }) {};",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
+/// ES §12.1.1: strict-mode `IdentifierReference` positions reject the
+/// FutureReservedWords, including object shorthand and destructuring targets.
+#[test]
+fn strict_reserved_word_reference_is_syntax_error() {
+    for src in [
+        "\"use strict\"; package;",
+        "\"use strict\"; package = 42;",
+        "\"use strict\"; ({ package });",
+        "\"use strict\"; ({ pu\\u0062lic } = {});",
+        "\"use strict\"; 0, { yield } = {};",
+        "\"use strict\"; 0, { x: x = yield } = {};",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("strict reserved-word reference should fail");
+        assert!(err.contains("reserved word"), "for {src}: got {err}");
+    }
+    // Property keys, member names, and sloppy code keep working.
+    compile_source_with_strings("\"use strict\"; var o = {package: 1}; o.package;")
+        .expect("property keys are IdentifierName, not references");
+    compile_source_with_strings("package;").expect("sloppy reserved-word reference compiles");
+    // The optional second argument of `import()` is an AssignmentExpression.
+    let err = compile_source_with_strings("\"use strict\"; import(\"./x.js\", yield);")
+        .map_err(|e| e.message)
+        .expect_err("reserved word in import() options should fail");
+    assert!(err.contains("reserved word"), "got: {err}");
+}
+
+/// Annex B.3.1: two `__proto__: value` entries in one object literal are an
+/// early error; shorthand and methods do not count.
+#[test]
+fn duplicate_proto_colon_property_is_syntax_error() {
+    for src in [
+        "({ __proto__: null, __proto__: null });",
+        "({ __proto__: null, other: 1, \"__proto__\": null });",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("duplicate __proto__ should fail");
+        assert!(err.contains("__proto__"), "for {src}: got {err}");
+    }
+    for src in [
+        "({ __proto__: null, other: 1 });",
+        "var __proto__ = 1; ({ __proto__ });",
+        "({ __proto__() {} });",
+        "var __proto__ = 1; ({ __proto__, __proto__: null });",
+        "({ [\"__proto__\"]: 1, \"__proto__\": 2 });",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
+/// ES §15.7.1 (`Initializer ContainsArguments`): a class field initializer may
+/// not reference `arguments`, directly or through an arrow.
+#[test]
+fn class_field_initializer_arguments_is_syntax_error() {
+    for src in [
+        "var C = class { x = arguments; };",
+        "var C = class { x = () => true ? {} : arguments; };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("field initializer arguments should fail");
+        assert!(err.contains("arguments"), "for {src}: got {err}");
+    }
+    // A method body may still use `arguments`.
+    compile_source_with_strings("var C = class { m() { return arguments; } };")
+        .expect("method arguments is legal");
+}
+
+/// ES §15.7.1: the `super()` *call* form is constructor-of-a-derived-class only.
+#[test]
+fn super_call_outside_derived_constructor_is_syntax_error() {
+    for src in [
+        "class C { m() { super(); } }",
+        "class C { static m() { super(); } }",
+        "class C { constructor() { super(); } }",
+        "class C extends Object { x = super(); }",
+        "class C { m() { var f = () => super(); } }",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("illegal super() call should fail");
+        assert!(err.contains("super()"), "for {src}: got {err}");
+    }
+    compile_source_with_strings("class C extends Object { constructor() { super(); } }")
+        .expect("derived constructor super() is legal");
+}
+
 #[test]
 fn annex_b_sloppy_block_function_compiles() {
     let src = "if (true) function f(){ return 1; }";
