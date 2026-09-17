@@ -64,6 +64,23 @@ pub fn value_text(heap: &mut Heap, v: JsValue) -> String {
     Ctx::new(heap, None, None).to_string(v)
 }
 
+/// The single UTF-16 code unit at `index` of a heap string, as an interned
+/// string value (the observable form of a `String` index own property).
+/// Returns the empty string when `index` is past the code-unit length.
+pub fn string_index_unit(heap: &mut Heap, h: Handle<V12Str>, index: usize) -> Handle<V12Str> {
+    heap.flatten(h);
+    let unit = match &heap.get(h).storage {
+        v12_heap::StrStorage::Latin1(bytes) => bytes.get(index).map(|&b| u16::from(b)),
+        v12_heap::StrStorage::Utf16(units) => units.get(index).copied(),
+        // flatten just ran; composites are impossible now.
+        v12_heap::StrStorage::Cons { .. } | v12_heap::StrStorage::Sliced { .. } => None,
+    };
+    match unit {
+        Some(u) => heap.intern_string(V12Str::utf16(vec![u])),
+        None => heap.intern_string(V12Str::latin1(Vec::new())),
+    }
+}
+
 /// A number value: a Smi when integral and in Smi range, a double otherwise.
 pub fn smi_or_f64(n: i64) -> JsValue {
     JsValue::from_i32_smi(n as i32).unwrap_or_else(|| JsValue::from_f64(n as f64))

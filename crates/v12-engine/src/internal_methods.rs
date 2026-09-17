@@ -89,6 +89,58 @@ pub struct PropertyDescriptor {
     pub configurable: bool,
 }
 
+/// Full `ToPropertyDescriptor` result: the spec descriptor is a *partial*
+/// record (`empty` slots stay absent) and may carry `get`/`set`. The engine's
+/// internal methods consume the narrower [`PropertyDescriptor`]; this richer
+/// form is what `Object.defineProperty`/`defineProperties` build so accessor
+/// definitions and partial redefinitions behave per ES 6.2.5.5.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FullDescriptor {
+    /// `[[Value]]`, when present.
+    pub value: Option<JsValue>,
+    /// `[[Writable]]`, when present.
+    pub writable: Option<bool>,
+    /// `[[Enumerable]]`, when present.
+    pub enumerable: Option<bool>,
+    /// `[[Configurable]]`, when present.
+    pub configurable: Option<bool>,
+    /// `[[Get]]`, when the `get` field was present (`undefined` allowed).
+    pub get: Option<JsValue>,
+    /// `[[Set]]`, when the `set` field was present (`undefined` allowed).
+    pub set: Option<JsValue>,
+}
+
+impl FullDescriptor {
+    /// True when the descriptor carries any of the value/writable fields
+    /// (data half) — ES `IsDataDescriptor` for a partial record requires a
+    /// present `[[Value]]` or `[[Writable]]`.
+    #[must_use]
+    pub fn is_data(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+
+    /// True when the descriptor carries `get` or `set` (accessor half).
+    #[must_use]
+    pub fn is_accessor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+
+    /// ES 6.2.5.6 `CompletePropertyDescriptor`: fills absent attributes with
+    /// the field defaults (`undefined` value / `false` flags) so the
+    /// descriptor can be installed directly.
+    #[must_use]
+    pub fn completed(self) -> Self {
+        Self {
+            value: self.value.or(Some(JsValue::undefined())),
+            writable: self.writable.or(Some(false)),
+            enumerable: self.enumerable.or(Some(false)),
+            configurable: self.configurable.or(Some(false)),
+            get: self.get.or(Some(JsValue::undefined())),
+            set: self.set.or(Some(JsValue::undefined())),
+        }
+    }
+}
+
 impl Default for PropertyDescriptor {
     fn default() -> Self {
         Self {
@@ -297,6 +349,420 @@ pub(crate) fn ordinary_define_own_property(
     Ok(true)
 }
 
+/// Canonical array-index interpretation of a property key: a non-symbol key
+/// whose text is a canonical decimal spelling in `0..=2**32 - 2` (no leading
+/// zeros). `None` otherwise. Shared by the internal methods and the builtin
+/// own-property queries.
+pub(crate) fn prop_key_to_index(heap: &mut Heap, key: PropKey) -> Option<u32> {
+    prop_key_as_index(heap, key)
+}
+
+/// ES 10.1.6.3 `ValidateAndApplyPropertyDescriptor` (ordinary object path),
+/// driven by a *partial* [`FullDescriptor`] from `Object.defineProperty`/
+/// `defineProperties`/`Reflect.defineProperty`. Unlike
+/// [`ordinary_define_own_property`], absent fields do not reset the existing
+/// property's attributes, and accessor halves (`get`/`set`) are installed.
+///
+/// Returns `Ok(false)` when the descriptor is incompatible with the existing
+/// property (a `TypeError` at the caller), matching the spec's `false`
+/// return.
+pub(crate) fn apply_property_descriptor(
+    heap: &mut Heap,
+    obj: Handle<JsObject>,
+    key: PropKey,
+    desc: FullDescriptor,
+) -> InternalResult<bool> {
+    let kind = heap.get(obj).kind;
+    // Element-store index keys: data-only (array/arguments exotics report
+    // `{ writable: true, enumerable: true, configurable: true }`, so any
+    // data update is legal; an accessor definition is not).
+    if (kind == v12_heap::Kind::Arguments || kind == v12_heap::Kind::Array)
+        && let Some(idx) = prop_key_as_index(heap, key)
+    {
+        if desc.is_accessor() {
+            return Ok(false);
+        }
+        // A write far above the stored region must not materialize the gap
+        // (see `JsObject::set_element`); an absent index simply stays absent.
+        if let Some(v) = desc.value {
+            heap.get_mut(obj).set_element(idx, v);
+        }
+        return Ok(true);
+    }
+    let shape = shape_of(heap, obj);
+    // Existing dictionary-rung entry.
+    if let Some(entry) = heap
+        .get(obj)
+        .dictionary
+        .as_ref()
+        .and_then(|m| m.get(&key))
+        .copied()
+    {
+        if !validate_redefine(
+            heap,
+            entry.attrs,
+            entry.is_accessor,
+            entry_value(heap, obj, &entry),
+            entry.getter,
+            entry.setter,
+            &desc,
+        ) {
+            return Ok(false);
+        }
+        if entry.is_accessor {
+            if desc.is_accessor() {
+                if let Some(map) = heap.get_mut(obj).dictionary.as_mut()
+                    && let Some(slot_entry) = map.get_mut(&key)
+                {
+                    if let Some(g) = desc.get.and_then(|v| v.as_object()) {
+                        slot_entry.getter = Some(g);
+                    } else if desc.get.is_some() {
+                        slot_entry.getter = None;
+                    }
+                    if let Some(s) = desc.set.and_then(|v| v.as_object()) {
+                        slot_entry.setter = Some(s);
+                    } else if desc.set.is_some() {
+                        slot_entry.setter = None;
+                    }
+                }
+            }
+        } else {
+            if desc.is_accessor() {
+                // Data → accessor: convert the entry in place.
+                if let Some(map) = heap.get_mut(obj).dictionary.as_mut()
+                    && let Some(slot_entry) = map.get_mut(&key)
+                {
+                    slot_entry.is_accessor = true;
+                    slot_entry.getter = desc.get.and_then(|v| v.as_object());
+                    slot_entry.setter = desc.set.and_then(|v| v.as_object());
+                }
+            } else if let Some(v) = desc.value {
+                let idx = entry.slot as usize;
+                let obj_mut = heap.get_mut(obj);
+                if obj_mut.properties.len() <= idx {
+                    obj_mut.properties.resize(idx + 1, JsValue::hole());
+                }
+                obj_mut.properties[idx] = v;
+            }
+        }
+        let new_attrs = merged_attrs(entry.attrs, &desc);
+        if new_attrs != entry.attrs
+            && let Some(map) = heap.get_mut(obj).dictionary.as_mut()
+            && let Some(slot_entry) = map.get_mut(&key)
+        {
+            slot_entry.attrs = new_attrs;
+        }
+        return Ok(true);
+    }
+    // Existing shape-backed property.
+    if let Some(existing) = heap.get(shape).descriptors.find(key).copied() {
+        let is_accessor = existing.is_accessor();
+        let attrs = existing.attrs();
+        let current_value = existing
+            .slot()
+            .and_then(|slot| heap.get(obj).properties.get(slot as usize))
+            .copied()
+            .unwrap_or(JsValue::undefined());
+        if !validate_redefine(
+            heap,
+            attrs,
+            is_accessor,
+            current_value,
+            existing.getter(),
+            existing.setter(),
+            &desc,
+        ) {
+            return Ok(false);
+        }
+        if desc.is_accessor() {
+            if is_accessor {
+                // Reconfigure the accessor half in place: build the merged
+                // accessor and publish it through a shape transition.
+                let (mut getter, mut setter) = match existing {
+                    v12_heap::Descriptor::Accessor { getter, setter, .. } => (getter, setter),
+                    _ => (None, None),
+                };
+                if let Some(g) = desc.get {
+                    getter = g.as_object();
+                }
+                if let Some(s) = desc.set {
+                    setter = s.as_object();
+                }
+                let next_shape = heap.define_accessor(shape, key, getter, setter, attrs);
+                bind_shape(heap, obj, next_shape);
+            } else {
+                // Data → accessor conversion happens through the dictionary
+                // rung: shapes cannot express a data slot becoming accessor
+                // in place (the slot would remain in `properties`). Split the
+                // property into the per-object dictionary so the conversion
+                // preserves the object's other shape properties.
+                convert_key_to_accessor(heap, obj, key, attrs, &desc);
+            }
+            return Ok(true);
+        }
+        // Data descriptor update (or accessor → data conversion).
+        let new_attrs = merged_attrs(attrs, &desc);
+        if is_accessor {
+            convert_key_to_data(heap, obj, key, new_attrs, desc.value);
+            return Ok(true);
+        }
+        if let Some(v) = desc.value
+            && attrs.writable()
+        {
+            if let Some(slot) = existing.slot() {
+                let idx = slot as usize;
+                let obj_mut = heap.get_mut(obj);
+                if obj_mut.properties.len() <= idx {
+                    obj_mut.properties.resize(idx + 1, JsValue::hole());
+                }
+                obj_mut.properties[idx] = v;
+            }
+        }
+        if new_attrs != attrs {
+            let next_shape = heap.update_data_attrs(shape, key, new_attrs);
+            bind_shape(heap, obj, next_shape);
+        }
+        return Ok(true);
+    }
+    // Absent property.
+    if heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
+        return Ok(false);
+    }
+    // A *generic* descriptor (neither data nor accessor fields) defaults to
+    // a data property with `undefined` value. Decide on the partial
+    // descriptor: `completed()` fills `get`/`set`, which would otherwise
+    // make `is_accessor()` true for a generic descriptor.
+    let is_new_accessor = desc.is_accessor();
+    let completed = desc.completed();
+    if is_new_accessor {
+        install_new_accessor(heap, obj, key, &completed);
+        return Ok(true);
+    }
+    let value = completed.value.unwrap_or(JsValue::undefined());
+    let attrs = v12_heap::Attrs::new(
+        completed.writable.unwrap_or(false),
+        completed.enumerable.unwrap_or(false),
+        completed.configurable.unwrap_or(false),
+    );
+    if heap.get(obj).dictionary.is_some() {
+        dict_insert(heap, obj, key, value, attrs);
+        return Ok(true);
+    }
+    if heap.get(shape).num_own as usize >= NAMED_DICT_THRESHOLD {
+        convert_to_dictionary(heap, obj);
+        dict_insert(heap, obj, key, value, attrs);
+        return Ok(true);
+    }
+    let next_shape = heap.add_property(shape, key, attrs);
+    bind_shape(heap, obj, next_shape);
+    heap.get_mut(obj).properties.push(value);
+    Ok(true)
+}
+
+/// The current stored value of a dictionary-rung entry (`undefined` when the
+/// slot is out of range, mirroring the shape path's fallthrough).
+fn entry_value(heap: &Heap, obj: Handle<JsObject>, entry: &DictEntry) -> JsValue {
+    if entry.is_accessor {
+        return JsValue::undefined();
+    }
+    heap.get(obj)
+        .properties
+        .get(entry.slot as usize)
+        .copied()
+        .unwrap_or(JsValue::undefined())
+}
+
+/// ES 10.1.6.3 step 3-4: may `desc` redefine a property with `attrs` (and,
+/// when data, the current `current_value`)? Returns `false` for the cases the
+/// spec returns `false` from `ValidateAndApplyPropertyDescriptor` — the
+/// caller turns that into a `TypeError`.
+///
+/// The value/accessor-identity exceptions are load-bearing: a non-configurable
+/// non-writable data property may be re-`defineProperty`d with the *same*
+/// value (`SameValue`), and a non-configurable accessor may keep the same
+/// `[[Get]]`/`[[Set]]`.
+fn validate_redefine(
+    heap: &Heap,
+    attrs: v12_heap::Attrs,
+    current_is_accessor: bool,
+    current_value: JsValue,
+    current_get: Option<Handle<JsObject>>,
+    current_set: Option<Handle<JsObject>>,
+    desc: &FullDescriptor,
+) -> bool {
+    // Step 3: a configurable property accepts anything.
+    if attrs.configurable() {
+        return true;
+    }
+    if desc.configurable == Some(true) {
+        return false;
+    }
+    if let Some(e) = desc.enumerable
+        && e != attrs.enumerable()
+    {
+        return false;
+    }
+    match (current_is_accessor, desc.is_accessor()) {
+        (true, false) => {
+            // Step 4.c: an accessor property may not become data while
+            // non-configurable (`SameType` fails). A *generic* descriptor
+            // (neither half) is allowed — it only touches flags, checked
+            // above.
+            !desc.is_data()
+        }
+        (false, true) => {
+            // Step 4.c: a data property may not become accessor while
+            // non-configurable.
+            false
+        }
+        (false, false) => {
+            // Step 4.a: data → data.
+            if !attrs.writable() {
+                if desc.writable == Some(true) {
+                    return false;
+                }
+                if let Some(v) = desc.value
+                    && !same_value(heap, v, current_value)
+                {
+                    return false;
+                }
+            }
+            true
+        }
+        (true, true) => {
+            // Step 4.b: accessor → accessor; a present half must match the
+            // current one by identity.
+            if let Some(g) = desc.get
+                && g.as_object() != current_get
+            {
+                return false;
+            }
+            if let Some(s) = desc.set
+                && s.as_object() != current_set
+            {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// ES `SameValue`: `NaN` equals `NaN`, `+0` and `-0` differ, numbers compare
+/// numerically, everything else by type-tagged identity (via the shared
+/// strict-equality kernel, which already covers strings/symbols/objects).
+fn same_value(heap: &Heap, a: JsValue, b: JsValue) -> bool {
+    let an = a.as_smi().map(f64::from).or(a.as_f64());
+    let bn = b.as_smi().map(f64::from).or(b.as_f64());
+    if let (Some(x), Some(y)) = (an, bn) {
+        return (x.is_nan() && y.is_nan()) || (x == y && (x != 0.0 || x.to_bits() == y.to_bits()));
+    }
+    super::builtins::helpers::strict_equals(heap, a, b)
+}
+
+/// Merges a partial descriptor over an existing attribute set: absent fields
+/// keep the current value (ES `ValidateAndApplyPropertyDescriptor` steps 4+).
+fn merged_attrs(current: v12_heap::Attrs, desc: &FullDescriptor) -> v12_heap::Attrs {
+    v12_heap::Attrs::new(
+        desc.writable.unwrap_or_else(|| current.writable()),
+        desc.enumerable.unwrap_or_else(|| current.enumerable()),
+        desc.configurable.unwrap_or_else(|| current.configurable()),
+    )
+}
+
+/// Installs a brand-new accessor property on an object (shape path, spilling
+/// to the dictionary rung past the threshold).
+fn install_new_accessor(
+    heap: &mut Heap,
+    obj: Handle<JsObject>,
+    key: PropKey,
+    desc: &FullDescriptor,
+) {
+    let getter = desc.get.and_then(|v| v.as_object());
+    let setter = desc.set.and_then(|v| v.as_object());
+    let attrs = v12_heap::Attrs::new(
+        false,
+        desc.enumerable.unwrap_or(false),
+        desc.configurable.unwrap_or(false),
+    );
+    let shape = shape_of(heap, obj);
+    if heap.get(obj).dictionary.is_some() {
+        convert_key_to_accessor(heap, obj, key, attrs, desc);
+        return;
+    }
+    if heap.get(shape).num_own as usize >= NAMED_DICT_THRESHOLD {
+        convert_to_dictionary(heap, obj);
+        convert_key_to_accessor(heap, obj, key, attrs, desc);
+        return;
+    }
+    let next_shape = heap.define_accessor(shape, key, getter, setter, attrs);
+    bind_shape(heap, obj, next_shape);
+    // Accessor descriptors occupy a slot but store a hole.
+    let slot = heap.get(next_shape).num_own.saturating_sub(1) as usize;
+    let props = &mut heap.get_mut(obj).properties;
+    if props.len() <= slot {
+        props.resize(slot + 1, JsValue::hole());
+    }
+}
+
+/// Converts a shape/accessor key into a dictionary accessor entry (used when
+/// neither peer shape can express the conversion).
+fn convert_key_to_accessor(
+    heap: &mut Heap,
+    obj: Handle<JsObject>,
+    key: PropKey,
+    attrs: v12_heap::Attrs,
+    desc: &FullDescriptor,
+) {
+    if heap.get(obj).dictionary.is_none() {
+        convert_to_dictionary(heap, obj);
+    }
+    let seq = heap.get(obj).dict_seq;
+    let slot = heap.get(obj).properties.len() as u32;
+    heap.get_mut(obj).properties.push(JsValue::hole());
+    let entry = DictEntry {
+        slot,
+        attrs,
+        getter: desc.get.and_then(|v| v.as_object()),
+        setter: desc.set.and_then(|v| v.as_object()),
+        is_accessor: true,
+        seq,
+    };
+    if let Some(map) = heap.get_mut(obj).dictionary.as_mut() {
+        map.insert(key, entry);
+    }
+    heap.get_mut(obj).dict_seq = seq + 1;
+}
+
+/// Converts an accessor key into a dictionary data entry.
+fn convert_key_to_data(
+    heap: &mut Heap,
+    obj: Handle<JsObject>,
+    key: PropKey,
+    attrs: v12_heap::Attrs,
+    value: Option<JsValue>,
+) {
+    if heap.get(obj).dictionary.is_none() {
+        convert_to_dictionary(heap, obj);
+    }
+    let seq = heap.get(obj).dict_seq;
+    let slot = heap.get(obj).properties.len() as u32;
+    heap.get_mut(obj)
+        .properties
+        .push(value.unwrap_or(JsValue::undefined()));
+    let entry = DictEntry {
+        slot,
+        attrs,
+        getter: None,
+        setter: None,
+        is_accessor: false,
+        seq,
+    };
+    if let Some(map) = heap.get_mut(obj).dictionary.as_mut() {
+        map.insert(key, entry);
+    }
+    heap.get_mut(obj).dict_seq = seq + 1;
+}
+
 fn prop_key_as_index(heap: &mut Heap, key: PropKey) -> Option<u32> {
     if key.is_symbol() {
         return None;
@@ -336,6 +802,17 @@ pub(crate) fn dict_lookup(
         .copied()
         .unwrap_or(JsValue::undefined());
     Some((entry, value))
+}
+
+/// Dictionary-rung entry for the string key `h`, without materializing a
+/// value. Shared by enumerable-key walks that need only the attributes.
+pub(crate) fn dict_entry_by_key(
+    heap: &Heap,
+    obj: Handle<JsObject>,
+    h: v12_heap::Handle<v12_heap::V12Str>,
+) -> Option<DictEntry> {
+    let key = PropKey::from_string(h);
+    heap.get(obj).dictionary.as_ref()?.get(&key).copied()
 }
 
 /// Spills `obj` to dictionary mode: files an empty dictionary rung and

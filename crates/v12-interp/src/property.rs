@@ -299,6 +299,24 @@ impl Interp<'_> {
     }
 
     /// Static methods on the `Object` constructor: `create`/
+    /// True when `obj` carries an own (shape or dictionary) descriptor for
+    /// `key`. Used by static-method surfaces to defer to a shape-installed
+    /// builtin (which owns spec `length`/`name` own props) instead of
+    /// synthesizing a fresh, unattributed function object.
+    fn has_own_descriptor(&mut self, obj: Handle<JsObject>, key: PropKey) -> bool {
+        if self
+            .heap
+            .get(obj)
+            .dictionary
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&key))
+        {
+            return true;
+        }
+        let shape = self.shape_of(obj);
+        self.heap.lookup_property(shape, key).is_some()
+    }
+
     /// `getPrototypeOf`/`defineProperty`/`enumerableOwnKeys` and the
     /// `keys`/`values`/`entries` trio. The constructor is the global's first
     /// intrinsic slot (`OBJECT_IDX`).
@@ -321,8 +339,19 @@ impl Interp<'_> {
         if obj != object_ctor {
             return None;
         }
+        // `enumerableOwnKeys` is an internal-only key (never shape-installed
+        // on the constructor), so it is always synthesized here. Every other
+        // name in this surface is a real own property installed by the realm
+        // with spec `length`/`name`; defer to the shape walk when the
+        // descriptor exists so the installed function object (not a fresh
+        // unattributed synthesis) answers the read.
         if self.key_is_wk(key, WK_ENUMERABLE_OWN_KEYS) {
             return Some(Ok(self.cached_native(NativeId::ObjectEnumerableOwnKeys)));
+        }
+        if let Some(k) = key
+            && self.has_own_descriptor(obj, k)
+        {
+            return None;
         }
         let constant = if self.key_is_wk(key, WK_CREATE) {
             NativeId::ObjectCreate
@@ -452,6 +481,13 @@ impl Interp<'_> {
                 .and_then(|v| v.as_object())
         }?;
         if obj != array_ctor || !self.key_is_wk(key, WK_IS_ARRAY) {
+            return None;
+        }
+        // `Array.isArray` is shape-installed by the realm; defer so the
+        // installed function object answers (length/name present).
+        if let Some(k) = key
+            && self.has_own_descriptor(obj, k)
+        {
             return None;
         }
         Some(Ok(self.map_set_method(NativeId::ArrayIsArray)))
@@ -1871,7 +1907,26 @@ impl Interp<'_> {
                 self.heap.get_mut(obj).properties[idx] = JsValue::hole();
             }
             Descriptor::Accessor { .. } => {
-                // Accessor: no slot to hole; deletion succeeds if configurable.
+                // Accessors carry no storage slot, so deletion cannot be
+                // expressed by holing one. Reconfigure the key to a holed
+                // data descriptor on a private child shape (shapes are
+                // shared, so the transition is bound only to this object);
+                // `descriptor_is_live` then reports the property absent.
+                let child = self.heap.update_data_attrs(shape, key, Attrs::DEFAULT);
+                self.bind_shape(obj, child);
+                let slot = self
+                    .heap
+                    .get(child)
+                    .descriptors
+                    .find(key)
+                    .and_then(|d| d.slot())
+                    .expect("reconfigured data descriptor has a slot");
+                let idx = self.global_slot_index(obj, slot as usize);
+                let props = &mut self.heap.get_mut(obj).properties;
+                if props.len() <= idx {
+                    props.resize(idx + 1, JsValue::hole());
+                }
+                props[idx] = JsValue::hole();
             }
         }
         Ok(true)
