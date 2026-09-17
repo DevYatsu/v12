@@ -256,6 +256,12 @@ impl<'a> Ctx<'a> {
         if let Some(h) = v.as_string() {
             return self.string_text(h);
         }
+        // ES `ToString` on a Number is `Number::toString` — notably `-0`
+        // renders `"0"`, unlike the console `display_text` form (`"-0"`).
+        // Property keys and `String(-0)` both flow through here.
+        if let Some(number) = v.as_smi().map(f64::from).or(v.as_f64()) {
+            return super::number::number_to_string(number);
+        }
         Self::display_text(v)
     }
 
@@ -604,16 +610,20 @@ pub fn call_legacy(
 }
 
 /// Forward adapter: invokes a migrated `BuiltinFn` (`fn(&mut Ctx, …)`) from a
-/// legacy `&mut Heap` dispatch site. Builds a detached `Ctx` (no global, no
-/// pending sink) for pure builtins like `math.rs` that need no realm or job
-/// context, so `builtin_dispatch` arms can route through the `Ctx` seam
-/// without changing the dispatch signature.
+/// legacy `&mut Heap` dispatch site. Passes the registered realm global so
+/// `Ctx::{type_error,range_error,…}` build error objects with their
+/// `constructor`/`[[Prototype]]` linked to the realm class: test262's
+/// `assert.throws` compares `thrown.constructor` against the expected
+/// constructor, so a detached error object reads `undefined` there. The
+/// realm-global fallback inside `Ctx::intrinsic` already assumed this source,
+/// so naming it explicitly changes no reader's answer.
 pub fn call_ctx(
     handler: BuiltinFn,
     heap: &mut Heap,
     this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let mut ctx = Ctx::new(heap, None, None);
+    let global = heap.realm_globals().first().copied();
+    let mut ctx = Ctx::new(heap, global, None);
     handler(&mut ctx, this, args)
 }

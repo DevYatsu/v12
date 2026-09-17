@@ -1604,11 +1604,12 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// `root --key--> child` transition, pinned immediately.
-    fn named_child_shape(&mut self, key: PropKey) -> ShapeHandle {
-        let child = self
-            .heap
-            .add_property(self.heap.root_shape(), key, Attrs::DEFAULT);
+    /// `root --key--> child` transition, pinned immediately, with explicit
+    /// attributes. Used for the canonical array `length` descriptor, which
+    /// the spec fixes at `{ writable: true, enumerable: false,
+    /// configurable: false }` (ES `ArrayCreate` / `ArraySetLength`).
+    fn named_child_shape_with_attrs(&mut self, key: PropKey, attrs: Attrs) -> ShapeHandle {
+        let child = self.heap.add_property(self.heap.root_shape(), key, attrs);
         self.pin_shape(child);
         child
     }
@@ -1704,7 +1705,9 @@ impl<'a> Interp<'a> {
             return s;
         }
         let k = self.length_key();
-        let s = self.named_child_shape(k);
+        // ES `ArrayCreate`: `length` is `{ writable: true, enumerable: false,
+        // configurable: false }`.
+        let s = self.named_child_shape_with_attrs(k, Attrs::new(true, false, false));
         self.length_shape = Some(s);
         s
     }
