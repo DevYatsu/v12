@@ -263,10 +263,43 @@ impl Engine {
     /// the body answer synchronously. Dynamic `import()` calls inside module
     /// code go through the loader's promise/job path.
     pub fn eval_module_source(&mut self, source: &str, base: &Path) -> Result<JsValue, JsValue> {
+        self.eval_module_source_at(source, base, None)
+    }
+
+    /// Like [`Self::eval_module_source`], but registers the entry module's
+    /// namespace under `entry_path` before evaluating its static imports.
+    ///
+    /// Required for a self-import (`import * as ns from './self.js'`) or a
+    /// cycle back to the entry: without entry registration the importer
+    /// re-reads the raw file from disk (bypassing any harness-prepended
+    /// source) and gets a second, unrelated namespace.
+    pub fn eval_module_source_at(
+        &mut self,
+        source: &str,
+        base: &Path,
+        entry_path: Option<&Path>,
+    ) -> Result<JsValue, JsValue> {
         if source.len() > MAX_SOURCE_LEN {
             return Err(string_value(&mut self.heap, "RangeError: source too large"));
         }
         self.prime_loader(base.to_path_buf());
+        // Register the entry namespace under its own path so a self-import or
+        // cyclic importer resolves to it. `resolve_specifier(".", abs)` just
+        // normalizes the absolute path.
+        let entry_ns = entry_path.map(|ep| {
+            let ns = crate::module_namespace::alloc_namespace(&mut self.heap);
+            if let Some(loader) = self.registry.loader() {
+                let canonical = crate::module_loader::resolve_specifier(
+                    Path::new("."),
+                    &ep.to_string_lossy(),
+                );
+                loader
+                    .borrow_mut()
+                    .modules
+                    .insert(canonical, JsValue::object(ns));
+            }
+            ns
+        });
         let global = self.realm.global();
         self.heap.add_root(JsValue::object(global));
         // Compile as module.
@@ -328,6 +361,13 @@ impl Engine {
         let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         *completion = interp.completion_value();
         drop(interp); // releases the `&mut heap` borrow
+        // Fill the entry namespace from the module epilogue's exports object
+        // (the completion value) so self-importers read real exports.
+        if let Some(ns) = entry_ns
+            && let Some(exports) = (*completion).and_then(|v| v.as_object())
+        {
+            crate::module_namespace::populate_namespace(heap, ns, exports);
+        }
         match outcome {
             Ok(()) => Ok(completion.unwrap_or_else(JsValue::undefined)),
             Err(JSException(thrown)) => Err(thrown),

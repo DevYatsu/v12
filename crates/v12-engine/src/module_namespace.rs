@@ -15,9 +15,10 @@
 //! every exotic behaviour:
 //!
 //! - `[[Prototype]]` is `null` — represented directly, observable and correct.
-//! - `[[Extensible]]` is `false` — `FLAG_NOT_EXTENSIBLE`, correct.
+//! - `[[Extensible]]` is `false` — `FLAG_NOT_EXTENSIBLE`, set at allocation so
+//!   it holds even while exports are still being initialized, correct.
 //! - Export descriptors — installed with the spec attributes, correct.
-//! - `[[OwnPropertyKeys]]` order — keys are defined in sorted order so the
+//! - `[[OwnPropertyKeys]]` order — keys are installed in sorted order so the
 //!   shape walk (which `Object.getOwnPropertyNames` reads) reports sorted
 //!   export string keys, correct.
 //! - `[[Delete]]` — `configurable: false` makes deletes of export keys fail
@@ -28,21 +29,22 @@
 //! - `@@toStringTag` — **gap**: the engine has no reachable well-known
 //!   `Symbol.toStringTag` singleton to key a stored property against, so the
 //!   property is not installed.
+//! - Live bindings — **gap**: exports are a post-evaluation snapshot; a module
+//!   that reads its own namespace mid-body observes an empty object.
 //!
 //! The loader registers the namespace before evaluating dependencies, so a
 //! cyclic or self importer resolves to the same object; exports are populated
-//! after the module body completes (a snapshot, not live bindings).
+//! after the module body completes.
 
-use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey};
+use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, PropKey};
 
-use crate::internal_methods::{FullDescriptor, apply_property_descriptor};
-
-/// Allocates an empty namespace object: `[[Prototype]]` null, initially
-/// extensible (the loader makes it non-extensible once populated). The
-/// object is rooted so dependency evaluation cannot collect it.
+/// Allocates an empty namespace object: `[[Prototype]]` null and
+/// `[[Extensible]]` false from birth. Rooted so dependency evaluation cannot
+/// collect it.
 pub(crate) fn alloc_namespace(heap: &mut Heap) -> Handle<JsObject> {
     let obj = heap.alloc(JsObject {
         prototype: None,
+        flags: JsObject::FLAG_NOT_EXTENSIBLE,
         ..JsObject::default()
     });
     heap.add_root(JsValue::object(obj));
@@ -62,13 +64,13 @@ fn key_text(heap: &mut Heap, key: PropKey) -> String {
     }
 }
 
-/// Populates `ns` from the compiler epilogue's `exports` object and marks the
-/// namespace non-extensible.
+/// Populates `ns` from the compiler epilogue's `exports` object.
 ///
-/// Export keys are defined in ascending string order so the shape descriptor
+/// Export keys are installed in ascending string order so the shape descriptor
 /// order — hence `[[OwnPropertyKeys]]` — is sorted per ES 10.4.6 step 1.
-/// Existing keys are updated in place; `exports` keys that collide with a
-/// previously installed key keep the namespace's fixed attributes.
+/// Installation is a direct shape transition (not the ordinary define path)
+/// because the namespace is already non-extensible. An existing key's value is
+/// overwritten in place; the spec attributes are fixed.
 pub(crate) fn populate_namespace(
     heap: &mut Heap,
     ns: Handle<JsObject>,
@@ -102,18 +104,25 @@ pub(crate) fn populate_namespace(
         entries.push((text, key, value));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // `{ [[Writable]]: true, [[Enumerable]]: true, [[Configurable]]: false }`
+    // is the spec's report for an export data property (ES 10.4.6 step 5).
+    let attrs = Attrs::new(true, true, false);
     for (_, key, value) in entries {
-        let desc = FullDescriptor {
-            value: Some(value),
-            writable: Some(true),
-            enumerable: Some(true),
-            configurable: Some(false),
-            ..FullDescriptor::default()
-        };
-        let _ = apply_property_descriptor(heap, ns, key, desc);
+        let shape = heap.shape_of(ns);
+        if let Some(desc) = heap.get(shape).descriptors.find(key).copied() {
+            // Update in place; attributes stay fixed.
+            if let Some(slot) = desc.slot() {
+                let o = heap.get_mut(ns);
+                if o.properties.len() <= slot as usize {
+                    o.properties.resize(slot as usize + 1, JsValue::hole());
+                }
+                o.properties[slot as usize] = value;
+            }
+            continue;
+        }
+        let child = heap.add_property(shape, key, attrs);
+        heap.bind_shape(ns, child);
+        heap.get_mut(ns).properties.push(value);
+        heap.get_mut(ns).property_keys.push(Some(key));
     }
-    // ES 10.4.6: the namespace is born non-extensible. Set after population so
-    // the ordinary define path (which rejects new keys on a non-extensible
-    // object) can install the exports.
-    heap.get_mut(ns).flags |= JsObject::FLAG_NOT_EXTENSIBLE;
 }
