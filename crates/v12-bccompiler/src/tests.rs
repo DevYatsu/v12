@@ -1916,6 +1916,60 @@ fn unresolved_private_name_is_syntax_error() {
         .expect("declared private name resolves");
     compile_source_with_strings("var C = class { m() { class O { #x; m2() { this.#x } } } };")
         .expect("nested class declares and uses its own private name");
+    // A computed element key evaluates in the private-aware class context.
+    compile_source_with_strings("var C = class { #f; [this.#f] = 1 };")
+        .expect("computed key sees the class private names");
+    let err = compile_source_with_strings("var C = class { [this.#f] = 1 };")
+        .map_err(|e| e.message)
+        .expect_err("computed key with an undeclared private name should fail");
+    assert!(err.contains("private name"), "got: {err}");
+}
+
+/// ES §12.1.1: strict-mode `IdentifierReference` positions reject the
+/// FutureReservedWords, including object shorthand and destructuring targets.
+#[test]
+fn strict_reserved_word_reference_is_syntax_error() {
+    for src in [
+        "\"use strict\"; package;",
+        "\"use strict\"; package = 42;",
+        "\"use strict\"; ({ package });",
+        "\"use strict\"; ({ pu\\u0062lic } = {});",
+        "\"use strict\"; 0, { yield } = {};",
+        "\"use strict\"; 0, { x: x = yield } = {};",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("strict reserved-word reference should fail");
+        assert!(err.contains("reserved word"), "for {src}: got {err}");
+    }
+    // Property keys, member names, and sloppy code keep working.
+    compile_source_with_strings("\"use strict\"; var o = {package: 1}; o.package;")
+        .expect("property keys are IdentifierName, not references");
+    compile_source_with_strings("package;").expect("sloppy reserved-word reference compiles");
+}
+
+/// Annex B.3.1: two `__proto__: value` entries in one object literal are an
+/// early error; shorthand and methods do not count.
+#[test]
+fn duplicate_proto_colon_property_is_syntax_error() {
+    for src in [
+        "({ __proto__: null, __proto__: null });",
+        "({ __proto__: null, other: 1, \"__proto__\": null });",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("duplicate __proto__ should fail");
+        assert!(err.contains("__proto__"), "for {src}: got {err}");
+    }
+    for src in [
+        "({ __proto__: null, other: 1 });",
+        "var __proto__ = 1; ({ __proto__ });",
+        "({ __proto__() {} });",
+        "var __proto__ = 1; ({ __proto__, __proto__: null });",
+        "({ [\"__proto__\"]: 1, \"__proto__\": 2 });",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
 }
 
 /// ES §15.7.1 (`Initializer ContainsArguments`): a class field initializer may

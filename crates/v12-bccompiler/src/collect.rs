@@ -851,6 +851,27 @@ impl<'s> Collector<'s> {
         self.unit_stack.pop();
         self.super_allowed_stack.pop();
         self.super_call_allowed_stack.pop();
+        // Computed class-element names (`class { [expr]() {} }`,
+        // `[expr] = v`) evaluate in the class's strict, private-aware context.
+        for el in &c.body.body {
+            match el {
+                oxc_ast::ast::ClassElement::MethodDefinition(m) if m.computed => {
+                    if let Some(kx) = m.key.as_expression() {
+                        self.unit_stack.push(idx);
+                        self.expr(kx);
+                        self.unit_stack.pop();
+                    }
+                }
+                oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.computed => {
+                    if let Some(kx) = p.key.as_expression() {
+                        self.unit_stack.push(idx);
+                        self.expr(kx);
+                        self.unit_stack.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
         // Walk field initializers for `this`/`super`/captures (e.g. `#x = () => this.#y`).
         // The initializer runs in the class's strict context; `super` property
         // access is legal there but a `super()` *call* is not (checked in the
@@ -1299,6 +1320,23 @@ impl<'s> Collector<'s> {
     fn expr(&mut self, e: &Expression<'_>) {
         match e {
             Expression::Identifier(id) => {
+                // ES §12.1.1/§12.6.2: strict-mode code may not use a
+                // FutureReservedWord as an `IdentifierReference`, so a bare
+                // `package`/`yield`/`let` reference is an early SyntaxError.
+                // Property keys and member names are `IdentifierName`, not
+                // references, and never reach this arm.
+                if *self.strict_stack.last().unwrap_or(&false)
+                    && is_strict_reserved_word(id.name.as_str())
+                {
+                    self.record_early_error(
+                        id.span,
+                        format!(
+                            "SyntaxError: '{name}' is a reserved word in strict mode",
+                            name = id.name
+                        ),
+                    );
+                    return;
+                }
                 if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
                     self.note_ref(sym);
                 }
@@ -1437,6 +1475,28 @@ impl<'s> Collector<'s> {
                 self.expr(&p.object);
             }
             Expression::ObjectExpression(o) => {
+                // Annex B.3.1: two `PropertyDefinition : PropertyName :
+                // AssignmentExpression` entries for `__proto__` are an early
+                // error. Shorthand (`{__proto__}`) and methods/accessors do not
+                // count toward the pair.
+                let mut proto_colon_defs: Vec<oxc_span::Span> = Vec::new();
+                for prop_kind in &o.properties {
+                    if let Some(p) = prop_kind.as_property()
+                        && !p.computed
+                        && !p.shorthand
+                        && p.kind == oxc_ast::ast::PropertyKind::Init
+                        && crate::expr::static_key_text(&p.key).as_deref() == Some("__proto__")
+                    {
+                        proto_colon_defs.push(p.key.span());
+                    }
+                }
+                if proto_colon_defs.len() > 1 {
+                    let span = proto_colon_defs[1];
+                    self.record_early_error(
+                        span,
+                        "SyntaxError: duplicate '__proto__' property in object literal",
+                    );
+                }
                 for prop_kind in &o.properties {
                     if let Some(p) = prop_kind.as_property() {
                         match &p.key {
@@ -1519,6 +1579,20 @@ impl<'s> Collector<'s> {
                 for prop in &obj.properties {
                     match prop {
                         oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
+                            // `{ yield } = {}`: the shorthand is an
+                            // IdentifierReference, so a strict-mode
+                            // FutureReservedWord is an early error.
+                            if *self.strict_stack.last().unwrap_or(&false)
+                                && is_strict_reserved_word(id.binding.name.as_str())
+                            {
+                                self.record_early_error(
+                                    id.binding.span,
+                                    format!(
+                                        "SyntaxError: '{name}' is a reserved word in strict mode",
+                                        name = id.binding.name
+                                    ),
+                                );
+                            }
                             if let Some(sym) = self.ref_symbol(id.binding.reference_id.get()) {
                                 self.note_ref(sym);
                             }
@@ -1559,6 +1633,21 @@ impl<'s> Collector<'s> {
     fn simple_target(&mut self, t: &SimpleAssignmentTarget<'_>) {
         match t {
             SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                // A strict-mode assignment/update target is an
+                // `IdentifierReference`, so a FutureReservedWord is an early
+                // error there too (`public = 42`).
+                if *self.strict_stack.last().unwrap_or(&false)
+                    && is_strict_reserved_word(id.name.as_str())
+                {
+                    self.record_early_error(
+                        id.span,
+                        format!(
+                            "SyntaxError: '{name}' is a reserved word in strict mode",
+                            name = id.name
+                        ),
+                    );
+                    return;
+                }
                 if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
                     self.note_ref(sym);
                 }
