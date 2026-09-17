@@ -583,13 +583,27 @@ impl Interp<'_> {
         self.top_result = None;
         let frames_before = self.frames.len();
         let exec_res = if is_throw {
+            // Arm the boundary BEFORE unwinding: `unwind` consults
+            // `stop_at_frames` to decide where to stop. A stale boundary
+            // (e.g. an outer nested-execute boundary from a callback call)
+            // makes it pop the generator frame -- and then keep draining
+            // past it to that stale value -- leaving `execute` below driving
+            // an unrelated frame whose register window no longer exists (the
+            // `index out of bounds` panic in the `Call` arm).
+            //
+            // The generator frame is the last one pushed (line above), so
+            // the boundary that preserves its caller is `frames_before - 1`:
+            // `unwind` may pop the generator frame itself (when the body does
+            // not catch the injected throw) but must stop there, leaving
+            // `generator_next`'s caller frames intact for the for-of/await
+            // dispatch arm, which resumes its own dispatch.
+            let saved_stop = self.stop_at_frames;
+            self.stop_at_frames = Some(frames_before - 1);
             // Inject the exception through the normal unwind path first.
-            self.unwind(value)?;
-            // The nested run must stop at this frame's boundary: a throwing
-            // generator body unwinds only the generator frame, leaving the
-            // caller's frames intact for `generator_next`'s caller (the
-            // for-of/await dispatch arm, which resumes its own dispatch).
-            self.stop_at_frames = Some(self.frames.len() - 1);
+            if let Err(e) = self.unwind(value) {
+                self.stop_at_frames = saved_stop;
+                return Err(e);
+            }
             let r = self.execute();
             self.stop_at_frames = None;
             r
