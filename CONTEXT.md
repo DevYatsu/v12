@@ -1,8 +1,8 @@
 # CONTEXT.md — v12 ubiquitous language
 
 Canonical terms for the v12 project. One meaning per term; use these words
-consistently in docs, ADRs, and discussion. Implementation details live in
-`plan_idea.md`, not here.
+consistently in docs, ADRs, and discussion. Future work lives in
+`ROADMAP.md`, not here.
 
 ## Engine & scope
 

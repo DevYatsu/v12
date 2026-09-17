@@ -1,6 +1,6 @@
 # Fix log — Test262 harness burn-down
 
-Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `known-failures.md` it closed or shrank.
+Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
 ## Template
 
@@ -15,7 +15,7 @@ Copy the block below for each fix. Keep it under 20 lines.
 - **Delta:** +119 pass, −119 fail, +14.7 pts
 - **Engine change:** one-line summary + commit hash
 - **Files:** `crates/v12-bccompiler/src/expr.rs`, `crates/v12-bytecode/src/op.rs`
-- **Bucket:** `known-failures.md` #1 (`in`/`instanceof`) — closed / shrank (remaining: …)
+- **Bucket:** `ROADMAP.md` #1 (`in`/`instanceof`) — closed / shrank (remaining: …)
 - **Runner:** `cargo run -p test262-runner -- --filter language/expressions/assignment --jobs 4`
 - **Notes:** optional; e.g. "negative tests for invalid `in` now pass as SyntaxError".
 ```

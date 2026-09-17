@@ -157,7 +157,7 @@ cargo nextest run --workspace
 - [x] ESM modules — `compile_source_as_module`, import/export linkage, `Engine` module compilation
 - [x] Unified native dispatch — `NativeId` enum, typed `NativeSig`, structural built-in method lookup (O(1))
 - [x] Built-in breadth — Map/Set, RegExp runtime, `for-of`/iterator protocol, error objects
-- [ ] Test262 `language` conformance burn-down — 32.1 % → ≥60 % (queue in `conformance/known-failures.md`)
+- [ ] Test262 `language` conformance burn-down — 32.1 % → ≥60 % (queue in `ROADMAP.md`)
 - [ ] Tier-2 driver wiring — second tier-up fire → `JitOpt::compile`, deopt backoff
 - [ ] Built-in breadth — `Object.getOwnPropertyNames`, proper error classes/`Error.prototype`, remaining string methods
 

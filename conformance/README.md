@@ -18,8 +18,7 @@ conformance/
 │       ├── runner.rs      # per-test Engine::eval + negative/flag handling
 │       └── report.rs      # TAP / JSON / human summary
 ├── run.sh              # one-shot entry point
-├── known-failures.md   # seeded from the bootstrap run
-└── fix-log.md          # template for recording fixes
+└── fix-log.md          # append-only record of fixes (queue lives in repo-root `ROADMAP.md`)
 ```
 
 ### test262 checkout
@@ -197,11 +196,11 @@ Top engine gaps surfaced (first 20 failures all share these):
 - `attempt to add with overflow` panic in `v12-bccompiler/src/collect.rs:706` — collection phase overflows on some language files, caught as `Fail: engine panic`. Needs `checked_add` / saturated counter.
 - Most built-ins and destructuring still stubbed; 22–23 % on `language/expressions` and `language/statements` is the Tier-0 baseline.
 
-See `known-failures.md` for the curated bucket list and `fix-log.md` for the next targeted fixes.
+See `ROADMAP.md` (repo root) for the curated bucket list and `fix-log.md` for the next targeted fixes.
 
 ## Fix-it loop
 
-1. Pick a bucket in `known-failures.md` (start with the smallest surface, e.g. `in`/`instanceof` or the overflow).
+1. Pick a bucket in `ROADMAP.md` (start with the smallest surface).
 2. Fix the engine, then re-run:
 
    ```sh
@@ -211,7 +210,7 @@ See `known-failures.md` for the curated bucket list and `fix-log.md` for the nex
    ```
 
 3. Append to `fix-log.md` (date, filter, before/after counts, files changed, failure delta).
-4. Move the bucket from `known-failures.md` to `fix-log.md` when green. The harness summary is the only scoreboard — keep `known-failures.md` honest.
+4. Move the bucket from `ROADMAP.md` to `fix-log.md` when green. The harness summary is the only scoreboard — keep `ROADMAP.md` honest.
 
 ## CI integration
 
@@ -270,18 +269,18 @@ jobs:
           path: /tmp/test262-*.json
 ```
 
-For the Phase 1 gate in CI you can either let the runner's exit code gate (strict: zero fails) or gate on percentage with the `jq` line above, depending on how far the `known-failures.md` burn-down has progressed. The plan calls for ≥60 % on `language` before Tier 1 work starts, then ≥85 % overall before Tier 2.
+For the Phase 1 gate in CI you can either let the runner's exit code gate (strict: zero fails) or gate on percentage with the `jq` line above, depending on how far the `ROADMAP.md` burn-down has progressed. The plan calls for ≥60 % on `language` before Tier 1 work starts, then ≥85 % overall before Tier 2.
 
 ## Roadmap to wiring
 
-- **Module**: replace the `module not yet wired` skip with `v12_bccompiler::compile_source_as_module` (or `SourceType::module()`) plus the host `resolve`/`load` hooks described in `plan_idea.md` §4 (`v12-engine` Modules). The harness's `resolution` negative handling is already in place.
+- **Module**: already wired via `v12_bccompiler::compile_source_as_module` plus host `resolve`/`load` hooks in `v12-engine` (see `fix-log.md` Step C). Remaining gap: top-level await (§G in `ROADMAP.md`).
 - **Async**: replace the `$DONE` skip with a host `print` hook that watches for `Test262:AsyncTestComplete` / `Test262:AsyncTestFailure:…` and drains the job queue with a small event loop (timeout ~1 s). The harness `doneprintHandle.js` already prints those markers.
 - **$262 host**: expose `createRealm`, `detachArrayBuffer`, etc. behind a `#[cfg(test262_host)]` feature so `$262`-dependent tests become runnable.
 
 ## Troubleshooting
 
 - `harness include error: assert.js: read error: No such file…` — the checkout is missing or the path is wrong. Check `--test262-root` and that `conformance/test262/harness/assert.js` exists.
-- `attempt to add with overflow` — known compiler bug on some files; tracked in `known-failures.md`. The runner turns it into a fail, not a harness crash.
+- `attempt to add with overflow` — fixed via `checked_add` (returns a clean compile error). The runner turns residual cases into a fail, not a harness crash.
 - `combined source too large` skip — a test + harness exceeded 2 MiB; raise the constant if needed for spec-size stress tests.
 - `Suite — pass%` — skipped tests are not counted in the denominator.
 
