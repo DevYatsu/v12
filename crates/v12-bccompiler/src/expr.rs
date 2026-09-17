@@ -1267,112 +1267,157 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         span: Span,
     ) -> Res<u16> {
         let src = self.expr(right)?;
-        match left {
+        self.destructure_assign_target(left, src, span)?;
+        Ok(src)
+    }
+
+    /// Assigns an already-evaluated `val` to any assignment target: a simple
+    /// target stores directly, a nested array/object pattern recurses so each
+    /// level reads off its own source value with its own default handling.
+    fn destructure_assign_target(
+        &mut self,
+        target: &AssignmentTarget<'_>,
+        val: u16,
+        span: Span,
+    ) -> Res<()> {
+        if let Some(simple) = target.as_simple_assignment_target() {
+            return self.assign_simple(simple, val, span);
+        }
+        match target {
             AssignmentTarget::ArrayAssignmentTarget(arr) => {
-                // An all-elision `[,] = rhs` with no rest emits zero reads:
-                // require coercibility so `null`/`undefined` still throw.
-                if arr.rest.is_none() && arr.elements.iter().all(|el| el.is_none()) {
-                    self.emit_require_object_coercible(src, span)?;
-                }
-                // `[a, b, ...rest] = rhs`: element `i` reads index `i` off
-                // the source; a rest element copies the tail via
-                // `CopyArrayRest`. Elisions (`[a, , b]`) skip.
-                let mut index: u32 = 0;
-                for el in &arr.elements {
-                    // `None` is an elision (`[a, , b]`): the slot is skipped.
-                    let Some(el) = el else {
-                        index += 1;
-                        continue;
-                    };
-                    // `AssignmentTargetWithDefault` is a direct variant; the
-                    // rest of the inner `AssignmentTarget` variants (simple
-                    // identifiers/members) are flattened in. The rest element
-                    // lives in `arr.rest`, handled after the loop.
-                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(
-                        d,
-                    ) = el
-                    {
-                        // `[a = default]`: the default applies when the read
-                        // is `undefined` (shared `lower_default` lowering).
-                        if let Some(target) = d.binding.as_simple_assignment_target() {
-                            let raw = self.read_index(src, index, span)?;
-                            let val = self.lower_default(raw, &d.init, span)?;
-                            self.assign_simple(target, val, span)?;
-                        }
-                        index += 1;
-                    } else if let Some(simple) = el.as_simple_assignment_target() {
-                        let val = self.read_index(src, index, span)?;
-                        self.assign_simple(simple, val, span)?;
-                        index += 1;
-                    } else {
-                        index += 1;
-                    }
-                }
-                // `...rest`: tail copy from the current index.
-                if let Some(rest) = &arr.rest {
-                    let dst = self.new_temp();
-                    self.emit_reg3(
-                        Opcode::CopyArrayRest,
-                        dst,
-                        src,
-                        index.min(u16::MAX as u32) as u16,
-                        span,
-                    );
-                    if let Some(simple) = rest.target.as_simple_assignment_target() {
-                        self.assign_simple(simple, dst, span)?;
-                    }
-                }
-                Ok(src)
+                self.destructure_assign_array(arr, val, span)
             }
             AssignmentTarget::ObjectAssignmentTarget(obj) => {
-                // An empty `({} = rhs)` emits zero reads: require
-                // coercibility so `null`/`undefined` still throw.
-                if obj.properties.is_empty() {
-                    self.emit_require_object_coercible(src, span)?;
-                }
-                // `{x, y: z} = rhs`: property `x` reads `rhs.x`.
-                for prop in &obj.properties {
-                    match prop {
-                        oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
-                            // `{x} = rhs`: property `x` → target variable `x`;
-                            // `{x = default} = rhs` applies the default when
-                            // the read is `undefined` (shared `lower_default`).
-                            let key = self.new_temp();
-                            self.load_str(key, id.binding.name.as_str(), span)?;
-                            let raw = self.new_temp();
-                            self.emit_reg3(Opcode::GetProperty, raw, src, key, span);
-                            let val = match &id.init {
-                                Some(default) => self.lower_default(raw, default, span)?,
-                                None => raw,
-                            };
-                            let Some(sym) = self.comp.symbol_of(id.binding.reference_id.get()) else {
-                                let gid = self.global_name_id(id.binding.name.as_str());
-                                if self.comp.plans.units[self.unit].is_strict {
-                                    self.emit_set_global_strict(gid, val, span);
-                                } else {
-                                    self.emit_set_global(gid, val, span);
-                                }
-                                continue;
-                            };
-                            let access = self.access(sym);
-                            self.store_access(access, val, span);
-                        }
-                        oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                            // `{y: z} = rhs`: property `y` → target `z`.
-                            let key = self.property_key(&p.name)?;
-                            let Some(simple) = p.binding.as_simple_assignment_target() else {
-                                continue;
-                            };
-                            let val = self.new_temp();
-                            self.emit_reg3(Opcode::GetProperty, val, src, key, span);
-                            self.assign_simple(simple, val, span)?;
-                        }
-                    }
-                }
-                Ok(src)
+                self.destructure_assign_object(obj, val, span)
             }
             _ => Err(self.err(span, "unsupported destructuring target")),
         }
+    }
+
+    /// `[a, b, ...rest] = src`: element `i` reads index `i` off the source;
+    /// a rest element copies the tail via `CopyArrayRest`. Elisions
+    /// (`[a, , b]`) skip. Elements with defaults (`[a = d]`) apply the
+    /// default when the read is `undefined`, then bind (or recurse into) the
+    /// inner target — the default-value temp is a fresh register that never
+    /// aliases the call windows or member reads evaluated around it.
+    fn destructure_assign_array(
+        &mut self,
+        arr: &oxc_ast::ast::ArrayAssignmentTarget<'_>,
+        src: u16,
+        span: Span,
+    ) -> Res<()> {
+        // An all-elision `[,] = rhs` with no rest emits zero reads:
+        // require coercibility so `null`/`undefined` still throw.
+        if arr.rest.is_none() && arr.elements.iter().all(|el| el.is_none()) {
+            self.emit_require_object_coercible(src, span)?;
+        }
+        let mut index: u32 = 0;
+        for el in &arr.elements {
+            // `None` is an elision (`[a, , b]`): the slot is skipped.
+            let Some(el) = el else {
+                index += 1;
+                continue;
+            };
+            // `AssignmentTargetWithDefault` is a direct variant; the
+            // rest of the inner `AssignmentTarget` variants (simple
+            // identifiers/members) are flattened in. Nested patterns
+            // (`[[a]]`, `[{x}]`) recurse; the rest element lives in
+            // `arr.rest`, handled after the loop.
+            if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) = el {
+                // `[a = default]` / `[[a] = default]`: the default applies
+                // when the read is `undefined` (shared `lower_default`
+                // lowering), then the chosen value binds or recurses.
+                let raw = self.read_index(src, index, span)?;
+                let val = self.lower_default(raw, &d.init, span)?;
+                self.destructure_assign_target(&d.binding, val, span)?;
+            } else {
+                let raw = self.read_index(src, index, span)?;
+                if let Some(simple) = el.as_simple_assignment_target() {
+                    self.assign_simple(simple, raw, span)?;
+                } else if let Some(inner) = el.as_assignment_target() {
+                    self.destructure_assign_target(inner, raw, span)?;
+                }
+            }
+            index += 1;
+        }
+        // `...rest`: tail copy from the current index.
+        if let Some(rest) = &arr.rest {
+            let dst = self.new_temp();
+            self.emit_reg3(
+                Opcode::CopyArrayRest,
+                dst,
+                src,
+                index.min(u16::MAX as u32) as u16,
+                span,
+            );
+            self.destructure_assign_target(&rest.target, dst, span)?;
+        }
+        Ok(())
+    }
+
+    /// `{x, y: z} = src`: property `x` reads `src.x`. Shorthand defaults
+    /// (`{x = d}`) apply when the read is `undefined`; renamed defaults
+    /// (`{y: z = d}`) do the same before binding or recursing into `z`.
+    fn destructure_assign_object(
+        &mut self,
+        obj: &oxc_ast::ast::ObjectAssignmentTarget<'_>,
+        src: u16,
+        span: Span,
+    ) -> Res<()> {
+        // An empty `({} = rhs)` emits zero reads: require
+        // coercibility so `null`/`undefined` still throw.
+        if obj.properties.is_empty() {
+            self.emit_require_object_coercible(src, span)?;
+        }
+        // `{x, y: z} = rhs`: property `x` reads `rhs.x`.
+        for prop in &obj.properties {
+            match prop {
+                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
+                    // `{x} = rhs`: property `x` → target variable `x`;
+                    // `{x = default} = rhs` applies the default when
+                    // the read is `undefined` (shared `lower_default`).
+                    let key = self.new_temp();
+                    self.load_str(key, id.binding.name.as_str(), span)?;
+                    let raw = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, raw, src, key, span);
+                    let val = match &id.init {
+                        Some(default) => self.lower_default(raw, default, span)?,
+                        None => raw,
+                    };
+                    let Some(sym) = self.comp.symbol_of(id.binding.reference_id.get()) else {
+                        let gid = self.global_name_id(id.binding.name.as_str());
+                        if self.comp.plans.units[self.unit].is_strict {
+                            self.emit_set_global_strict(gid, val, span);
+                        } else {
+                            self.emit_set_global(gid, val, span);
+                        }
+                        continue;
+                    };
+                    let access = self.access(sym);
+                    self.store_access(access, val, span);
+                }
+                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                    // `{y: z} = rhs`: property `y` → target `z`;
+                    // `{y: z = default} = rhs` applies the default when the
+                    // read is `undefined`, then binds or recurses into `z`.
+                    let key = self.property_key(&p.name)?;
+                    let raw = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, raw, src, key, span);
+                    if let oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(
+                        d,
+                    ) = &p.binding
+                    {
+                        let val = self.lower_default(raw, &d.init, span)?;
+                        self.destructure_assign_target(&d.binding, val, span)?;
+                    } else if let Some(simple) = p.binding.as_simple_assignment_target() {
+                        self.assign_simple(simple, raw, span)?;
+                    } else if let Some(inner) = p.binding.as_assignment_target() {
+                        self.destructure_assign_target(inner, raw, span)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reads `src[index]` into a temp (missing → undefined).
