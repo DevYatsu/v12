@@ -2,6 +2,18 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/class-fields (Phase B): `NamedEvaluation` function-name inference [lane/class-fields]
+
+- **Filter:** `language/statements/class` (4 369), `language/expressions` (11 128), `--jobs 8`, default `--format human`.
+- **Before (after Phase A, this branch):** class TOTAL 2 526 pass / 1 843 fail; expressions 7 194 pass / 3 892 fail / 16 skip.
+- **After:** class TOTAL **2 766 pass / 1 603 fail (63.3 %)**; expressions **7 707 pass / 3 379 fail / 16 skip (69.5 %)**. Net **+240** class, **+513** expressions, no regressions.
+- **Root cause:** the spec step `IsAnonymousFunctionDefinition(Initializer) → SetFunctionName(v, bindingId)` existed only for class fields (`class.rs::apply_field_function_name`). `var/let/const` declarators, simple assignment to an identifier, destructuring default values, formal-parameter defaults, and array-literal elements all left the anonymous function's `name` `undefined`.
+- **Fix:** generalized the class-field helper to `class::apply_function_name(cx, name, init)` + `class::anonymous_function_span` (peels parentheses/TS wrappers, matches anonymous fn-expr/arrow/class). Call sites: `stmt.rs` `var_decl` (declarator binding identifier), `lower_binding_pattern` `AssignmentPattern` (`binding_identifier_name`), `expr.rs` `assign` (plain `=` to an identifier only — compound ops never name), `array_literal` (non-spread path stamps `ToString(index)`), `model.rs::lower_default` (new `name: Option<&str>` parameter, threaded from the destructuring-assignment sites in `expr.rs` and formal-parameter defaults in `unit.rs`). The name is stamped on the planned unit before `cx.expr` compiles the closure, so `Closure` installs the own `name`; named function expressions are untouched.
+- **Files:** `crates/v12-bccompiler/src/class.rs`, `expr.rs`, `model.rs`, `stmt.rs`, `unit.rs`; `crates/v12-engine/tests/class_fields.rs` (+5 tests).
+- **Probe (`/tmp/infer.js`, `/tmp/infer2.js`):** `g.name: g`, `h.name: h`, `z.name: z`, `arr[0].name: 0`, `arr[1].name: 1`, `arr-default: a1`, `obj-default: b1`, `obj-rename-default: c2`, `param-default: p`, `let-assign: d1`, `class-decl: e1`; `k.name: named` unchanged.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-bccompiler -p v12-engine --check` clean.
+- **Known gap:** array elements in a *spread* literal (`[...xs, function(){}]`) are not named — the index is the runtime length; and computed Symbol class-element keys still rely on the pre-existing `SameValue(undefined, ...)` cluster.
+
 ### 2026-09-18 — lane/class-fields (Phase A): instance fields always become own properties [lane/class-fields]
 
 - **Filter:** `language/statements/class` (4 369), `--jobs 8`, default `--format human`.

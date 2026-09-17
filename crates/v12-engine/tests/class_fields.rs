@@ -50,3 +50,39 @@ fn derived_fields_visible_after_super_statement() {
         "2,2"
     );
 }
+
+#[test]
+fn var_declarator_infers_function_name() {
+    assert_eq!(
+        eval_display("var g = function(){}; var h = () => {}; [g.name, h.name].join(',')"),
+        "g,h"
+    );
+}
+
+#[test]
+fn simple_assignment_infers_function_name() {
+    assert_eq!(eval_display("var z; z = function(){}; z.name"), "z");
+}
+
+#[test]
+fn destructuring_default_infers_function_name() {
+    assert_eq!(
+        eval_display(
+            "var [a = function(){}] = []; var { b = () => {} } = {}; [a.name, b.name].join(',')"
+        ),
+        "a,b"
+    );
+}
+
+#[test]
+fn array_element_infers_index_name() {
+    assert_eq!(
+        eval_display("var arr = [function(){}, () => {}]; [arr[0].name, arr[1].name].join(',')"),
+        "0,1"
+    );
+}
+
+#[test]
+fn named_function_expression_keeps_own_name() {
+    assert_eq!(eval_display("var k = function named(){}; k.name"), "named");
+}

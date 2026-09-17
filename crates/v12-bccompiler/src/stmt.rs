@@ -280,8 +280,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         for d in &v.declarations {
             match &d.id {
-                BindingPattern::BindingIdentifier(_) => {
+                BindingPattern::BindingIdentifier(id) => {
                     if let Some(init) = &d.init {
+                        // ES `BindingInitialization`/`NamedEvaluation`:
+                        // `let f = function(){}` names the anonymous function
+                        // after the binding identifier. Must run before the
+                        // initializer is compiled.
+                        crate::class::apply_function_name(self, id.name.as_str(), init);
                         let val = self.expr(init)?;
                         let sym = binding_symbol(&d.id).ok_or_else(|| {
                             self.err(d.span, "internal: declarator without symbol")
@@ -479,6 +484,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_reg3(Opcode::StrictEq, cond, src, undef, ap.span);
                 self.emit_jump(Opcode::JumpIfFalse, cond, use_src);
                 // Default branch: evaluate default expression into chosen.
+                // ES `NamedEvaluation`: `[f = function(){}]` names the
+                // anonymous function after the binding identifier.
+                if let Some(name) = binding_identifier_name(&ap.left) {
+                    crate::class::apply_function_name(self, &name, &ap.right);
+                }
                 let def = self.expr(&ap.right)?;
                 self.move_reg(chosen, def, ap.span);
                 self.emit_jump(Opcode::Jump, 0, end);
@@ -1397,6 +1407,19 @@ fn fn_decl_of<'a, 'b>(s: &'b Statement<'a>) -> Option<&'b Function<'a>> {
             }
             None
         }
+    }
+}
+
+/// The binding identifier name of a binding target, peeling nested
+/// `AssignmentPattern` wrappers (`[f = fn]`). `None` for destructuring.
+fn binding_identifier_name(p: &BindingPattern<'_>) -> Option<String> {
+    let mut cur = p;
+    while let BindingPattern::AssignmentPattern(ap) = cur {
+        cur = &ap.left;
+    }
+    match cur {
+        BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+        _ => None,
     }
 }
 

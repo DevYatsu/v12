@@ -394,7 +394,13 @@ fn emit_prologue(
             // default first, then bind the (possibly destructuring) pattern
             // against the chosen value.
             if let Some(init) = &p.initializer {
-                let chosen = cx.lower_default(incoming, init, p.span)?;
+                // Formal-parameter default: `NamedEvaluation` names an
+                // anonymous function after the parameter binding.
+                let fname = match &p.pattern {
+                    BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                    _ => None,
+                };
+                let chosen = cx.lower_default(incoming, init, p.span, fname)?;
                 match &p.pattern {
                     BindingPattern::BindingIdentifier(id) => {
                         if let Some(sym) = id.symbol_id.get() {

@@ -778,11 +778,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// `src === undefined ? default : src` — the ES destructuring-default
     /// semantics. Evaluates `default` into a fresh temp only when `src` is
     /// `undefined`; returns the register holding the chosen value.
+    ///
+    /// `name` carries the spec `NamedEvaluation` binding identifier for a
+    /// destructuring default (`[f = function(){}]`); when present and
+    /// `default` is a syntactically anonymous function definition, the
+    /// planned unit is named after it.
     pub fn lower_default(
         &mut self,
         src: u16,
         default: &oxc_ast::ast::Expression<'_>,
         span: Span,
+        name: Option<&str>,
     ) -> Result<u16, CompileError> {
         let chosen = self.new_temp();
         let undef = self.new_temp();
@@ -792,6 +798,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let use_src = self.label();
         let end = self.label();
         self.emit_jump(Opcode::JumpIfFalse, cond, use_src);
+        if let Some(n) = name {
+            crate::class::apply_function_name(self, n, default);
+        }
         let def = self.expr(default)?;
         self.move_reg(chosen, def, span);
         self.emit_jump(Opcode::Jump, 0, end);
