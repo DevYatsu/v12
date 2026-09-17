@@ -510,5 +510,34 @@ Copy the block below for each fix. Keep it under 20 lines.
   - Remaining `all`/`race` fails are the documented next steps: general (non-array) iterables, iterator-close, `Symbol.species` subclassing, `this`-ctor species reads. `Promise[Symbol.species]` absent (pre-existing, symbol-lane surface).
   - Known pre-existing gap (not introduced): stateful-seam `TypeError`s carry no realm `constructor` link (`Ctx::new(heap, None, …)`), so `instanceof TypeError` is false for them — same for the older `then`/`resolve` errors.
   - Deferred to later lanes: async-generator `.next()` promise semantics (interp resume path, frozen), timers, async iteration.
+### 2026-09-17 — lane `method-name`: field-initializer + anonymous-class `name` inference
+
+- **Filter:** `language/expressions/class` (4 059 files, 4 jobs, `--format tap --tap-out`)
+- **Before:** 1 849 pass / 2 210 fail (45.6 %)
+- **After:** 1 851 pass / 2 208 fail (45.6 %) — fixed 2, regressed 0 (diffed fail sets)
+- **Triage note:** the brief's "~240 undefined-vs-fn/arrow/cls/cover/gen" does not
+  reproduce at HEAD `8722ba9` — plain/private/getter/setter/async/generator method
+  names already resolve via `collect.rs` `function_name` (verified by probe:
+  `fn/sfn/get g/set s/am/gm/agm/C` all correct). Remaining in-scope gaps were the
+  `DefineField` step-7 path and the anonymous-class `""` default.
+- **Engine change (compiler only, no interp/bytecode):**
+  - `crates/v12-bccompiler/src/class.rs`: new `apply_field_function_name` helper —
+    stamps the planned unit's `function_name` with the field-name text *before* the
+    initializer is lowered, only when the (paren/TS-wrapper-peeled) initializer is a
+    syntactically anonymous function/arrow/class (named functions keep their own name
+    via `collect`; identifier refs untouched). Wired into both field sites: private
+    fields (incl. `#field` text, per `static-field-anonymous-function-name`) and
+    static public fields. Computed keys stay unresolved (accepted gap).
+  - `crates/v12-bccompiler/src/unit.rs`: instance-field lowering calls the same helper;
+    anonymous `Class` units default `function_name` to `""` (fixes `class/name.js` —
+    `verifyProperty(class {}, "name", {value: ""})`).
+- **Probes (`target/runner/v12`):** static fields `fn/arrow/cls/gen/cover` named;
+  instance fields `instFn/instArrow/instCls/instGen` named; `named` keeps `"g"`,
+  `ref` keeps `"max"`; `(class {}).name === ""`; `(class Foo {}).name === "Foo"`;
+  `static #method` name `"#method"`, `static get #sg` name `"get #sg"`.
+- **Accepted gaps (not fixed):** computed/symbol method `name` (ROADMAP §3 milestone);
+  `let C = class {}` binding-name inference (needs `expr.rs` NamedEvaluation — lane A2);
+  valueless instance fields (`a;` — no own property on instance, the
+   `after-same-line-*` failures) — installation gap, not name inference.
 
 <!-- Future entries go above this line -->
