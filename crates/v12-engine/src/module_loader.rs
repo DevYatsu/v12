@@ -163,7 +163,15 @@ pub(crate) fn load_and_evaluate(
         return Ok(*ns);
     }
     if state.borrow().loading.contains(path) {
-        // Cycle: return an empty placeholder (no live bindings in v1).
+        // Cycle: the namespace was allocated and registered *before* this
+        // module's dependencies were evaluated (see below), so a cyclic or
+        // self importer resolves to that same object. A registered-but-empty
+        // namespace is the v1 snapshot contract: exports fill in once the
+        // module body completes. Defensive fallback for an unregistered
+        // re-entry (no live bindings either way).
+        if let Some(ns) = state.borrow().modules.get(path) {
+            return Ok(*ns);
+        }
         let placeholder = interp.heap_mut().alloc(v12_heap::JsObject::ordinary(
             Default::default(),
             Default::default(),
@@ -184,13 +192,35 @@ pub(crate) fn load_and_evaluate(
             )
         })?;
     state.borrow_mut().loading.insert(path.to_path_buf());
+    // Allocate and register the namespace *before* evaluating static
+    // dependencies: a self-import (`import * as ns from './self.js'`) or a
+    // cyclic importer hits `handle_import`, which answers from
+    // `state.modules`; without early registration it throws
+    // `Unlinked module import`. Exports populate after the body runs.
+    let namespace = super::module_namespace::alloc_namespace(interp.heap_mut());
+    state
+        .borrow_mut()
+        .modules
+        .insert(path.to_path_buf(), JsValue::object(namespace));
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // Install the statically-known export keys (values snapshot later) so
+    // `in`/`hasOwnProperty`/enumeration observe the exports even for a
+    // cyclic/self importer that reads the namespace while this body (or a
+    // dependency's body) is still executing.
+    let export_names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
+    super::module_namespace::seed_export_keys(interp.heap_mut(), namespace, &export_names);
     // Evaluate static dependencies first (dedup, source order).
     let mut seen: HashSet<String> = HashSet::new();
     for entry in &module.imports {
         if seen.insert(entry.specifier.clone()) {
             let child = resolve_specifier(&dir, &entry.specifier);
-            load_and_evaluate(interp, state, &child)?;
+            if let Err(reason) = load_and_evaluate(interp, state, &child) {
+                // Do not cache a partially-linked namespace: a later dynamic
+                // import of this path must retry rather than observe it.
+                state.borrow_mut().loading.remove(path);
+                state.borrow_mut().modules.remove(path);
+                return Err(reason);
+            }
         }
     }
     // Evaluate this module's body with the referrer pointing at its own
@@ -208,27 +238,29 @@ pub(crate) fn load_and_evaluate(
     state.borrow_mut().referrer = prev_referrer;
     // The compiler epilogue makes the module main's completion the exports
     // object; that snapshot is the namespace.
-    let namespace = result.map_err(|exc| exc.0)?;
+    let exports = result.map_err(|exc| {
+        state.borrow_mut().loading.remove(path);
+        state.borrow_mut().modules.remove(path);
+        exc.0
+    })?;
     // Top-level await: an async main returns its evaluation promise, not
     // the namespace. Drain interpreter awaits inline until that promise's
-    // completion settles, then take the settlement value as the namespace
-    // (rejections become evaluation errors). Settlements for any other
+    // completion settles, then take the settlement value as the exports
+    // object (rejections become evaluation errors). Settlements for any other
     // promise are handed back for the engine's checkpoint drain. Host jobs
     // (promise reactions, dynamic-import loads) are engine-side and cannot
     // run here: an evaluation promise parked on one stays pending and the
     // loop exits quiescent, falling back to the promise object.
-    let namespace = if main_is_async && namespace.as_object().is_some() {
-        settle_evaluation_promise(interp, namespace)?
+    let exports = if main_is_async && exports.as_object().is_some() {
+        settle_evaluation_promise(interp, exports)?
     } else {
-        namespace
+        exports
     };
+    if let Some(exports) = exports.as_object() {
+        super::module_namespace::populate_namespace(interp.heap_mut(), namespace, exports);
+    }
     state.borrow_mut().loading.remove(path);
-    interp.heap_mut().add_root(namespace);
-    state
-        .borrow_mut()
-        .modules
-        .insert(path.to_path_buf(), namespace);
-    Ok(namespace)
+    Ok(JsValue::object(namespace))
 }
 
 /// Drains interpreter awaits until async module `main_promise` settles.

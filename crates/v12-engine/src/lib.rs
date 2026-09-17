@@ -11,6 +11,7 @@ pub mod internal_methods;
 pub mod jit_tier;
 pub mod job_queue;
 pub(crate) mod module_loader;
+pub(crate) mod module_namespace;
 pub mod realm;
 pub mod value;
 

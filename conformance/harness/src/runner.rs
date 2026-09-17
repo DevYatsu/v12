@@ -366,7 +366,7 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
         // global; ignore the result either way — createRealm then throws.
         let _ = engine.install_create_realm_function("__v12CreateRealm__");
         let res = if is_module {
-            engine.eval_module_source(&combined, base_path)
+            engine.eval_module_source_at(&combined, base_path, Some(file_path))
         } else {
             engine.eval(&combined)
         };
