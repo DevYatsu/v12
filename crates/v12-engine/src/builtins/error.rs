@@ -50,6 +50,73 @@ pub fn syntax_error_create(
     error_create_named(ctx, "SyntaxError", args)
 }
 
+/// `EvalError(message)` – same construction, `EvalError` class.
+///
+/// Dispatch-only until the realm materializes the global (needs a new
+/// `GLOBAL_INTRINSICS` slot plus realm wiring — PENDING-WIRING).
+pub fn eval_error_create(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    error_create_named(ctx, "EvalError", args)
+}
+
+/// `URIError(message)` – same construction, `URIError` class.
+///
+/// Dispatch-only until the realm materializes the global (needs a new
+/// `GLOBAL_INTRINSICS` slot plus realm wiring — PENDING-WIRING).
+pub fn uri_error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    error_create_named(ctx, "URIError", args)
+}
+
+/// `Error.isError(value)` – whether `value` is an error object (any class).
+///
+/// Dispatch-only until the static is installed on the `Error` constructor
+/// (needs realm wiring — PENDING-WIRING).
+pub fn error_is_error(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let is_error = args
+        .first()
+        .and_then(|v| v.as_object())
+        .is_some_and(|obj| ctx.heap.get(obj).kind == v12_heap::Kind::Error);
+    Ok(JsValue::from_bool(is_error))
+}
+
+/// `Error.prototype.toString()` – `"name: message"` (either side omitted
+/// when empty).
+///
+/// Dispatch-only until it is installed on `Error.prototype` (needs realm
+/// wiring — PENDING-WIRING).
+pub fn error_proto_to_string(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let Some(obj) = this.as_object() else {
+        return Err(ctx.type_error("TypeError: Error.prototype.toString called on non-object"));
+    };
+    let get_str = |ctx: &mut Ctx, name: &str, fallback: &str| -> Result<String, Throw> {
+        let key = v12_heap::PropKey::from_string(ctx.heap.intern_text(name));
+        let got =
+            crate::internal_methods::dispatch_get(&mut *ctx.heap, obj, key, JsValue::object(obj))
+                .map_err(Throw::Value)?;
+        if got.is_undefined() {
+            return Ok(fallback.to_string());
+        }
+        Ok(ctx.to_string(got))
+    };
+    let name = get_str(ctx, "name", "Error")?;
+    let message = get_str(ctx, "message", "")?;
+    let text = if name.is_empty() {
+        message
+    } else if message.is_empty() {
+        name
+    } else {
+        format!("{name}: {message}")
+    };
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
+}
+
 fn error_create_named(ctx: &mut Ctx, kind: &str, args: &[JsValue]) -> Result<JsValue, Throw> {
     let message = args.first().copied().unwrap_or(JsValue::undefined());
     let text: String = if message.is_undefined() {
@@ -68,10 +135,22 @@ fn error_create_named(ctx: &mut Ctx, kind: &str, args: &[JsValue]) -> Result<JsV
     let global = ctx
         .global()
         .or_else(|| ctx.heap.realm_globals().first().copied());
-    Ok(super::registry::error_object(
-        &mut *ctx.heap,
-        global,
-        kind,
-        &text,
-    ))
+    let value = super::registry::error_object(&mut *ctx.heap, global, kind, &text);
+    // ES `InstallErrorCause`: when `options` (2nd arg) is an object with a
+    // non-`undefined` `cause`, install it as an own data property.
+    if let Some(options) = args.get(1).and_then(|v| v.as_object()) {
+        let key = v12_heap::PropKey::from_string(ctx.heap.intern_text("cause"));
+        let cause = crate::internal_methods::dispatch_get(
+            &mut *ctx.heap,
+            options,
+            key,
+            JsValue::object(options),
+        )
+        .map_err(Throw::Value)?;
+        if !cause.is_undefined() {
+            let obj = value.as_object().expect("error_object returns an object");
+            super::builtin_install_prop(&mut *ctx.heap, obj, "cause", cause);
+        }
+    }
+    Ok(value)
 }

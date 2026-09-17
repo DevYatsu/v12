@@ -210,6 +210,10 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
                 string::string_split(&mut ctx, this, args)
             }
+            NativeId::StringMatchAll => {
+                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                string::string_match_all(&mut ctx, this, args)
+            }
             // Module import seam: loader-aware when installed (static imports
             // answer from the module map; dynamic `import()` returns a
             // promise backed by a load job), otherwise the spec-shaped

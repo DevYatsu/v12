@@ -742,18 +742,46 @@ pub fn own_property_names(ctx: &mut Ctx, obj: Handle<v12_heap::JsObject>) -> Vec
         named.push(ctx.string_text(h));
     }
     names.extend(named);
+    // Dictionary-rung overflow keys in insertion order (same order as
+    // `collect_own_string_keys`, so the two stay aligned).
+    if let Some(map) = ctx.heap.get(obj).dictionary.as_ref() {
+        let mut overflow: Vec<(u32, v12_heap::Handle<v12_heap::V12Str>)> = map
+            .iter()
+            .filter_map(|(k, e)| k.string().map(|h| (e.seq, h)))
+            .collect();
+        overflow.sort_by_key(|&(seq, _)| seq);
+        names.extend(overflow.into_iter().map(|(_, h)| ctx.string_text(h)));
+    }
     names
 }
 
 /// `Object.getOwnPropertyNames(obj)` – own string-keyed properties.
+///
+/// ES `ToObject` coercion: a string primitive contributes its indices plus
+/// `"length"`; other primitives contribute nothing; `null`/`undefined`
+/// throw `TypeError`.
 pub fn object_get_own_property_names(
     ctx: &mut Ctx,
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let obj = args.first().and_then(|v| v.as_object()).ok_or_else(|| {
-        ctx.type_error("TypeError: Object.getOwnPropertyNames called on non-object")
-    })?;
+    let arg = args.first().copied().unwrap_or(JsValue::undefined());
+    if arg.is_null() || arg.is_undefined() {
+        return Err(ctx.type_error("TypeError: Object.getOwnPropertyNames called on non-object"));
+    }
+    if let Some(h) = arg.as_string() {
+        let len = ctx.heap.get(h).len();
+        let mut items: Vec<JsValue> = (0..len)
+            .map(|i| JsValue::string(ctx.heap.intern_text(&i.to_string())))
+            .collect();
+        items.push(JsValue::string(ctx.heap.intern_text("length")));
+        return Ok(array_value(ctx, items));
+    }
+    if arg.as_object().is_none() {
+        // Number/boolean/symbol/bigint wrappers carry no own properties.
+        return Ok(array_value(ctx, Vec::new()));
+    }
+    let obj = arg.as_object().unwrap();
     let names = own_property_names(ctx, obj);
     let items: Vec<JsValue> = names
         .iter()
