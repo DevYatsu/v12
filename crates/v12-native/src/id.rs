@@ -431,6 +431,9 @@ pub enum NativeId {
     DateProtoGetYear = 2847,
     /// Annex B `Date.prototype.setYear`.
     DateProtoSetYear = 2848,
+    /// `Date.prototype.toTemporalInstant` — a stub: v1 has no Temporal, so
+    /// the call always throws (the descriptor/arity tests still pass).
+    DateProtoToTemporalInstant = 2849,
 }
 
 /// The serialized index of a native function.

@@ -391,8 +391,28 @@ fn now_ms() -> f64 {
     }
 }
 
+/// True when `this` is the very native function `id`: the native seam passes
+/// the callee as `this` for `new`-calls, so this detects a construct call on
+/// a non-constructor builtin (ES `EvaluateNew` step 7 → TypeError).
+fn is_construct_call(ctx: &Ctx, this: JsValue, id: NativeId) -> bool {
+    this.as_object().is_some_and(|o| {
+        ctx.heap.get(o).kind == Kind::Function
+            && matches!(ctx.heap.get(o).callable, FunctionTarget::Bytecode(idx) if idx == u32::from(id))
+    })
+}
+
+/// Rejects `new Date.now()` / `new Date.UTC()` / `new Date.parse()` with a
+/// TypeError, per ES `IsConstructor`.
+fn reject_construct(ctx: &mut Ctx, this: JsValue, id: NativeId) -> Result<(), Throw> {
+    if is_construct_call(ctx, this, id) {
+        return Err(ctx.type_error("TypeError: not a constructor"));
+    }
+    Ok(())
+}
+
 /// `Date.now()`.
-pub fn date_now(_ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn date_now(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, this, NativeId::DateNow)?;
     Ok(js_number(now_ms()))
 }
 
@@ -419,12 +439,14 @@ fn make_date_from_args(args: &[JsValue], ctx: &mut Ctx) -> f64 {
 }
 
 /// `Date.UTC(year, month, date, hours, minutes, seconds, ms)`.
-pub fn date_utc(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn date_utc(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, this, NativeId::DateUtc)?;
     Ok(js_number(make_date_from_args(args, ctx)))
 }
 
 /// `Date.parse(string)`.
-pub fn date_parse(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+pub fn date_parse(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, this, NativeId::DateParse)?;
     let text = match args.first() {
         Some(&v) => ctx.to_string(v),
         None => "undefined".to_string(),
@@ -733,6 +755,26 @@ pub fn date_proto_set_utc_date(
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     date_proto_set_date(ctx, this, args)
+}
+
+/// `Date.prototype.toTemporalInstant` — v1 has no Temporal, so this stub
+/// validates the receiver (the observable part of ES 21.4.4.44 steps 1–3)
+/// and then reports the missing feature. The descriptor/arity/receiver tests
+/// still observe a real function property; the value-returning tests require
+/// Temporal and stay failing.
+pub fn date_proto_to_temporal_instant(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let t = this_time_value(this, ctx)
+        .ok_or_else(|| ctx.type_error("TypeError: this is not a Date object"))?;
+    // ES step 4: `NumberToBigInt(t)` is a RangeError for a non-integral
+    // value (NaN included), before Temporal would be reached.
+    if !t.is_finite() || t.fract() != 0.0 {
+        return Err(ctx.range_error("RangeError: Invalid time value"));
+    }
+    Err(ctx.type_error("TypeError: Temporal.TemporalInstant is not supported in v1"))
 }
 
 /// Annex B.2.4.2 `Date.prototype.setYear(year)`.

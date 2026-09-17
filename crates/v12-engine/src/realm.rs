@@ -392,6 +392,14 @@ impl Realm {
                 .expect("toUTCString installed by the DateProto group");
             let utc_fn = heap.get(date_proto).properties[utc_slot as usize];
             crate::builtins::builtin_install_prop(heap, date_proto, "toGMTString", utc_fn);
+            // `Date.prototype.toTemporalInstant`: a v1 stub (no Temporal).
+            crate::builtins::install_native_with_length(
+                heap,
+                Some(date_proto),
+                "toTemporalInstant",
+                NativeId::DateProtoToTemporalInstant,
+                Some(0),
+            );
             // `Date.prototype[Symbol.toPrimitive]`: needs a symbol key, so it
             // cannot ride the macro's string install. The realm's
             // `Symbol.toPrimitive` value must itself be a symbol; the macro

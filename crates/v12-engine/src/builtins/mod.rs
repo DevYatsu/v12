@@ -307,6 +307,7 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::DateProtoToPrimitive => Some(1),
         NativeId::DateProtoGetYear => Some(0),
         NativeId::DateProtoSetYear => Some(1),
+        NativeId::DateProtoToTemporalInstant => Some(0),
         NativeId::PromiseAll => Some(1),
         NativeId::PromiseRace => Some(1),
         NativeId::PromiseFinally => Some(1),
@@ -1042,6 +1043,7 @@ define_builtins! {
     // cannot express.
     DateProtoToGmtString => |heap, this, args| call_ctx(date::date_proto_to_utc_string, heap, this, args),
     DateProtoToPrimitive => |heap, this, args| call_ctx(date::date_proto_to_primitive, heap, this, args),
+    DateProtoToTemporalInstant => |heap, this, args| call_ctx(date::date_proto_to_temporal_instant, heap, this, args),
 }
 
 /// Installs the core built-ins into `registry`.
