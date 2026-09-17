@@ -49,11 +49,7 @@ fn plain(ctx: &mut Ctx, obj: Handle<JsObject>, name: &str, value: JsValue) {
 /// `pk`, or `None` when the property is absent. Mirrors the descriptor reader
 /// used by `Object.getOwnPropertyDescriptor` but kept local to `Reflect`
 /// because the shared one is private to `object.rs`.
-fn build_descriptor(
-    ctx: &mut Ctx,
-    obj: Handle<JsObject>,
-    pk: PropKey,
-) -> Option<JsValue> {
+fn build_descriptor(ctx: &mut Ctx, obj: Handle<JsObject>, pk: PropKey) -> Option<JsValue> {
     let kind = ctx.heap.get(obj).kind;
     if (kind == v12_heap::Kind::Array || kind == v12_heap::Kind::Arguments)
         && let Some(idx) = crate::internal_methods::prop_key_to_index(ctx.heap, pk)
@@ -127,8 +123,12 @@ fn build_descriptor(
             ));
         } else {
             accessor = Some((
-                desc.getter().map(JsValue::object).unwrap_or(JsValue::undefined()),
-                desc.setter().map(JsValue::object).unwrap_or(JsValue::undefined()),
+                desc.getter()
+                    .map(JsValue::object)
+                    .unwrap_or(JsValue::undefined()),
+                desc.setter()
+                    .map(JsValue::object)
+                    .unwrap_or(JsValue::undefined()),
                 desc.attrs().enumerable(),
                 desc.attrs().configurable(),
             ));
@@ -167,22 +167,27 @@ fn own_keys_ordered(heap: &mut Heap, obj: Handle<JsObject>) -> Vec<PropKey> {
     }
 
     let shape = heap.shape_of(obj);
-    let mut string_keys: Vec<PropKey> = heap
-        .get(shape)
-        .descriptors
-        .as_slice()
-        .iter()
-        .map(|d| d.key())
-        .filter(|k| !k.is_symbol())
-        .collect();
-    let mut symbol_keys: Vec<PropKey> = heap
-        .get(shape)
-        .descriptors
-        .as_slice()
-        .iter()
-        .map(|d| d.key())
-        .filter(|k| k.is_symbol())
-        .collect();
+    let shape_for_keys = heap.get(shape);
+    let mut string_keys: Vec<PropKey> = Vec::new();
+    let mut symbol_keys: Vec<PropKey> = Vec::new();
+    for d in shape_for_keys.descriptors.as_slice() {
+        // A deleted data property keeps its shared shape descriptor with a
+        // holed slot; it is not own-observable.
+        if let Some(slot) = d.slot()
+            && !heap
+                .get(obj)
+                .properties
+                .get(slot as usize)
+                .is_some_and(|v| !v.is_hole())
+        {
+            continue;
+        }
+        if d.key().is_symbol() {
+            symbol_keys.push(d.key());
+        } else {
+            string_keys.push(d.key());
+        }
+    }
     if let Some(map) = heap.get(obj).dictionary.as_ref() {
         let mut overflow: Vec<(u32, PropKey)> = map.iter().map(|(k, e)| (e.seq, *k)).collect();
         overflow.sort_by_key(|&(seq, _)| seq);
@@ -227,13 +232,23 @@ fn array_value(ctx: &mut Ctx, items: Vec<JsValue>) -> JsValue {
     JsValue::object(arr)
 }
 
+/// `Reflect` methods have no `[[Construct]]`. The interpreter's native
+/// construct path hands the *callee function object* as `this` (an ordinary
+/// call hands the real receiver, never a `Kind::Function` here), so a
+/// `Kind::Function` receiver means `new Reflect.method(...)` and must throw.
+fn reject_construct(ctx: &mut Ctx, this: JsValue, name: &str) -> Result<(), Throw> {
+    if this
+        .as_object()
+        .is_some_and(|o| ctx.heap.get(o).kind == v12_heap::Kind::Function)
+    {
+        return Err(ctx.type_error(format!("Reflect.{name} is not a constructor")));
+    }
+    Ok(())
+}
+
 /// Requires an object target per the spec's `Type(target) is not Object`
 /// guard; `name` names the method in the thrown `TypeError`.
-fn require_object(
-    ctx: &mut Ctx,
-    args: &[JsValue],
-    name: &str,
-) -> Result<Handle<JsObject>, Throw> {
+fn require_object(ctx: &mut Ctx, args: &[JsValue], name: &str) -> Result<Handle<JsObject>, Throw> {
     args.first()
         .and_then(|v| v.as_object())
         .ok_or_else(|| ctx.type_error(format!("Reflect.{name} target is not an object")))
@@ -262,8 +277,8 @@ pub(crate) fn to_property_descriptor(
     ] {
         let key = ctx.heap.intern_text(name);
         let pk = PropKey::from_string(key);
-        let present = crate::internal_methods::dispatch_has(&mut *ctx.heap, obj, pk)
-            .map_err(Throw::Value)?;
+        let present =
+            crate::internal_methods::dispatch_has(&mut *ctx.heap, obj, pk).map_err(Throw::Value)?;
         if !present {
             continue;
         }
@@ -310,6 +325,7 @@ pub fn reflect_get_prototype_of(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "getPrototypeOf")?;
     let obj = require_object(ctx, args, "getPrototypeOf")?;
     match ctx.heap.get(obj).prototype {
         Some(p) => Ok(JsValue::object(p)),
@@ -324,6 +340,7 @@ pub fn reflect_set_prototype_of(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "setPrototypeOf")?;
     let obj = require_object(ctx, args, "setPrototypeOf")?;
     let proto = args.get(1).copied().unwrap_or(JsValue::undefined());
     let link = if proto.is_null() {
@@ -363,6 +380,7 @@ pub fn reflect_is_extensible(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "isExtensible")?;
     let obj = require_object(ctx, args, "isExtensible")?;
     let ext = ctx.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE == 0;
     Ok(JsValue::from_bool(ext))
@@ -374,6 +392,7 @@ pub fn reflect_prevent_extensions(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "preventExtensions")?;
     let obj = require_object(ctx, args, "preventExtensions")?;
     ctx.heap.get_mut(obj).flags |= JsObject::FLAG_NOT_EXTENSIBLE;
     let cell = ctx.heap.validity_cell_of(obj);
@@ -383,6 +402,7 @@ pub fn reflect_prevent_extensions(
 
 /// `Reflect.has(target, key)`.
 pub fn reflect_has(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "has")?;
     let obj = require_object(ctx, args, "has")?;
     let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v)?;
@@ -397,6 +417,7 @@ pub fn reflect_delete_property(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "deleteProperty")?;
     let obj = require_object(ctx, args, "deleteProperty")?;
     let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v)?;
@@ -408,6 +429,7 @@ pub fn reflect_delete_property(
 
 /// `Reflect.ownKeys(target)`.
 pub fn reflect_own_keys(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "ownKeys")?;
     let obj = require_object(ctx, args, "ownKeys")?;
     let keys = own_keys_ordered(ctx.heap, obj);
     let items: Vec<JsValue> = keys
@@ -426,6 +448,7 @@ pub fn reflect_get_own_property_descriptor(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "getOwnPropertyDescriptor")?;
     let obj = require_object(ctx, args, "getOwnPropertyDescriptor")?;
     let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v)?;
@@ -439,6 +462,7 @@ pub fn reflect_define_property(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "defineProperty")?;
     let obj = require_object(ctx, args, "defineProperty")?;
     let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v)?;
@@ -455,6 +479,7 @@ pub fn reflect_define_property(
 
 /// `Reflect.get(target, key[, receiver])`.
 pub fn reflect_get(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "get")?;
     let obj = require_object(ctx, args, "get")?;
     let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v)?;
@@ -543,6 +568,7 @@ fn inherited_own_desc(heap: &mut Heap, obj: Handle<JsObject>, pk: PropKey) -> Ow
 
 /// `Reflect.set(target, key, value[, receiver])`.
 pub fn reflect_set(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "set")?;
     let target = require_object(ctx, args, "set")?;
     let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
     let pk = property_key(ctx, key_v)?;
@@ -631,23 +657,16 @@ fn is_constructor(heap: &Heap, obj: Handle<JsObject>) -> bool {
 
 /// `CreateListFromArrayLike(argumentsList)` for `Reflect.apply`/`construct`:
 /// requires an object, reads `length`, then indices `0..len`.
-pub fn create_list_from_array_like(
-    ctx: &mut Ctx,
-    v: JsValue,
-) -> Result<Vec<JsValue>, Throw> {
+pub fn create_list_from_array_like(ctx: &mut Ctx, v: JsValue) -> Result<Vec<JsValue>, Throw> {
     let Some(obj) = v.as_object() else {
         return Err(Throw::Message(
             "TypeError: CreateListFromArrayLike called on non-object".to_string(),
         ));
     };
     let len_key = PropKey::from_string(ctx.heap.intern_text("length"));
-    let len_v = crate::internal_methods::dispatch_get(
-        &mut *ctx.heap,
-        obj,
-        len_key,
-        JsValue::object(obj),
-    )
-    .map_err(Throw::Value)?;
+    let len_v =
+        crate::internal_methods::dispatch_get(&mut *ctx.heap, obj, len_key, JsValue::object(obj))
+            .map_err(Throw::Value)?;
     let len = ctx.to_number(len_v);
     let len = if len.is_finite() && len > 0.0 {
         len.trunc() as usize
@@ -657,13 +676,9 @@ pub fn create_list_from_array_like(
     let mut out = Vec::with_capacity(len.min(1024));
     for i in 0..len {
         let key = PropKey::from_string(ctx.heap.intern_text(&i.to_string()));
-        let v = crate::internal_methods::dispatch_get(
-            &mut *ctx.heap,
-            obj,
-            key,
-            JsValue::object(obj),
-        )
-        .map_err(Throw::Value)?;
+        let v =
+            crate::internal_methods::dispatch_get(&mut *ctx.heap, obj, key, JsValue::object(obj))
+                .map_err(Throw::Value)?;
         out.push(v);
     }
     Ok(out)
@@ -671,6 +686,7 @@ pub fn create_list_from_array_like(
 
 /// `Reflect.apply(target, thisArgument, argumentsList)`.
 pub fn reflect_apply(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "apply")?;
     let target_v = args.first().copied().unwrap_or(JsValue::undefined());
     let Some(target) = target_v.as_object() else {
         return Err(ctx.type_error("Reflect.apply target is not a function"));
@@ -701,6 +717,7 @@ pub fn reflect_construct(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
+    reject_construct(ctx, _this, "construct")?;
     let target_v = args.first().copied().unwrap_or(JsValue::undefined());
     let Some(target) = target_v.as_object() else {
         return Err(ctx.type_error("Reflect.construct target is not a constructor"));

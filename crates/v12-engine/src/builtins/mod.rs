@@ -19,8 +19,8 @@ pub mod number;
 pub mod object;
 pub mod promise;
 pub mod proxy;
-pub mod regexp;
 pub mod reflect;
+pub mod regexp;
 pub mod registry;
 pub mod string;
 pub mod symbol;
@@ -1099,7 +1099,9 @@ define_builtins! {
 /// The dispatch arms still live in the macro's `Reflect` group — this only
 /// performs the installs.
 pub fn install_reflect_builtins(heap: &mut Heap, targets: &BuiltinTargets) {
-    let Some(reflect) = targets.reflect else { return };
+    let Some(reflect) = targets.reflect else {
+        return;
+    };
     for (name, id) in [
         ("getPrototypeOf", NativeId::ReflectGetPrototypeOf),
         ("setPrototypeOf", NativeId::ReflectSetPrototypeOf),

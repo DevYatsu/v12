@@ -465,11 +465,7 @@ impl Realm {
             if let Some(symbol_ctor) = symbol_ctor {
                 let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
                 let tag_sym = ctx.fresh_symbol();
-                ctx.overwrite_data_prop(
-                    symbol_ctor,
-                    "toStringTag",
-                    JsValue::symbol(tag_sym),
-                );
+                ctx.overwrite_data_prop(symbol_ctor, "toStringTag", JsValue::symbol(tag_sym));
                 let reflect_name = ctx.heap.intern_text("Reflect");
                 ctx.define_symbol_data_prop_with_attrs(
                     reflect,
@@ -503,12 +499,7 @@ impl Realm {
         crate::builtins::install_reflect_builtins(heap, &reflect_targets);
         // `Reflect` is a global property with the standard builtin attrs
         // (writable, non-enumerable, configurable).
-        crate::builtins::builtin_install_prop(
-            heap,
-            global,
-            "Reflect",
-            JsValue::object(reflect),
-        );
+        crate::builtins::builtin_install_prop(heap, global, "Reflect", JsValue::object(reflect));
 
         // The `Function` constructor: not a `GLOBAL_INTRINSICS` slot (so the
         // compiler still refuses a bare `Function` identifier), but installed
