@@ -75,7 +75,9 @@ use std::time::Instant;
 
 use v12_bytecode::{FunctionBytecode, Opcode};
 use v12_bytecode::{GLOBAL_INTRINSICS as GLOBAL_INTRINSIC_NAMES, GLOBAL_VAR_OFFSET};
-use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str};
+use v12_heap::{
+    Attrs, Handle, Heap, HeapExt, JsObject, JsValue, Kind, PropKey, ShapeHandle, V12Str,
+};
 
 #[cfg(test)]
 use crate::feedback::Lattice;
@@ -1076,6 +1078,58 @@ impl<'a> Interp<'a> {
         let main_funcs = self.functions_for_program(self.program_id);
         let main_regs =
             main_funcs[usize::try_from(self.main).expect("function index fits usize")].max_regs;
+        // Top-level await: a module main compiled as async (see
+        // `v12_bccompiler::unit::compile_unit`) does not execute inline.
+        // Like an async-function call it defers: a pending promise plus a
+        // generator holding the initial register window are installed and
+        // the body starts at the next microtask checkpoint (`run_jobs` /
+        // the engine's `drain_checkpoint`), where the resume path pushes a
+        // `generator: Some` frame that the `Await` arm accepts. Completion
+        // settles through `pending_settlements`; the promise itself is the
+        // module's evaluation promise.
+        let main_is_async = main_funcs
+            .get(usize::try_from(self.main).expect("function index fits usize"))
+            .is_some_and(|f| f.is_async && !f.is_generator);
+        if main_is_async {
+            self.ensure_default_global();
+            let this_v = self
+                .global
+                .map(JsValue::object)
+                .unwrap_or(JsValue::undefined());
+            self.gc_protect();
+            let promise = self.heap.alloc_pending_promise();
+            if let Some(g) = self.global {
+                let promise_proto = self
+                    .heap
+                    .get(g)
+                    .properties
+                    .get(PROMISE_IDX.expect("intrinsic 'Promise' present"))
+                    .and_then(|v| v.as_object())
+                    .and_then(|ctor| self.heap.get(ctor).prototype);
+                if let Some(pp) = promise_proto {
+                    self.heap.get_mut(promise).prototype = Some(pp);
+                }
+            }
+            let mut window = vec![JsValue::undefined(); usize::from(main_regs)];
+            if !window.is_empty() {
+                window[0] = this_v;
+            }
+            let mut g_obj = JsObject::generator_with(
+                self.main,
+                0,
+                0.0,
+                0,
+                window,
+                None,
+                Some(JsValue::object(promise)),
+            );
+            g_obj.program_id = self.program_id;
+            let r#gen = self.heap.alloc(g_obj);
+            self.heap.add_root(JsValue::object(r#gen));
+            self.pending_awaits
+                .push_back((r#gen, JsValue::undefined(), false));
+            return Ok(());
+        }
         debug_assert!(self.frames.is_empty(), "run() is not reentrant");
         self.stack.clear();
         self.stack
@@ -2105,6 +2159,20 @@ impl<'a> Interp<'a> {
     /// capability/reaction settlement path.
     pub fn take_pending_settlements(&mut self) -> Vec<(Handle<JsObject>, JsValue, bool)> {
         std::mem::take(&mut self.pending_settlements)
+    }
+
+    /// Re-queues an async-completion settlement previously taken with
+    /// [`Self::take_pending_settlements`]. The module loader's synchronous
+    /// settle loop consumes settlements to find its own main promise and
+    /// hands every other one back, so the engine's checkpoint drain still
+    /// settles nested async completions through the full path.
+    pub fn push_pending_settlement(
+        &mut self,
+        promise: Handle<JsObject>,
+        value: JsValue,
+        rejecting: bool,
+    ) {
+        self.pending_settlements.push((promise, value, rejecting));
     }
 
     /// Number of pending async jobs.

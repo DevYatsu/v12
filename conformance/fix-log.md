@@ -67,6 +67,18 @@ Copy the block below for each fix. Keep it under 20 lines.
 - **Runner:** `./conformance/run.sh --filter built-ins/Proxy --jobs 8` (default human format; tap to `/tmp/proxy-after2.tap`)
 - **Notes:** remaining get/set/has failures are out-of-scope engine gaps, not dispatch bugs: RegExp exotics, String-primitive length/indices, Array.prototype.length, Reflect.* missing, trap-invariant checks, forward-receiver threading, strict-mode set throw. Verified: `cargo nextest run --workspace` exit 0; `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean.
 
+### 2026-09-17 — [lane/g-top-level-await] Module mains compile as async when the body contains await; evaluation promise settles
+
+- **Filter:** `language/module-code/top-level-await` (runs as suite `language/module-code`, 251 tests) `--jobs 1`
+- **Before:** 11 pass / 240 fail / 0 skip, 4.4 % pass (every executing TLA test threw `SyntaxError: await outside async`)
+- **After:**  195 pass / 56 fail / 0 skip, 77.7 % pass; zero `await outside async` failures remain
+- **Delta:** +184 pass, −184 fail, +73.3 pts
+- **Engine change:** `UnitNode::Main` marks module mains `is_async` when their own instruction stream contains `Await`; `Interp::run` defers async mains to the microtask checkpoint; `load_and_evaluate` drains awaits until the evaluation promise settles
+- **Files:** `crates/v12-bccompiler/src/unit.rs`, `crates/v12-interp/src/lib.rs`, `crates/v12-engine/src/module_loader.rs`, `crates/v12-engine/tests/engine_async.rs`
+- **Bucket:** ROADMAP item G (top-level await) — shrank (remaining: thenable assimilation hangs, dynamic-import-in-TLA, class declarations, cycle ordering, import-rejection expectations)
+- **Runner:** `./conformance/run.sh --filter language/module-code/top-level-await --jobs 1`
+- **Notes:** baseline measured in a detached `8722ba9` worktree (same test files). Nextest gate 585 passed / 0 failed; clippy 0 errors; `cargo fmt --check` clean. PENDING (other lanes): `run_compiled` module-env capture still returns empty namespaces; TLA parked on dynamic-import promises stays pending in `load_and_evaluate` (host jobs only run at the engine checkpoint).
+
 ### 2026-09-14 — Shape lookup: drop redundant parent walk + skip TCO-feature tests (kills the STALLED class)
 
 - **Filter:** `language` (full, 24 590), targeted: `language/identifiers`, `tco-`

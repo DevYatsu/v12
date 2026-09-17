@@ -287,6 +287,17 @@ pub fn compile_unit(
     }
     let mut fb = cx.finish()?;
     fb.name_hint = Some(comp.plans.units[idx].name_hint.clone());
+    // Top-level await: nested functions compile to their own units, so any
+    // `Await` in the main unit's own instruction stream is a module-body
+    // await. Mark such module mains async so the interpreter's `Await`
+    // path treats them as async functions instead of throwing
+    // `await outside async`. Scripts keep `is_async=false` (a script-level
+    // `await` is still a SyntaxError at runtime).
+    if idx == 0 && comp.plans.is_module && !fb.is_async {
+        if fb.instrs.iter().any(|ins| ins.op() == Some(Opcode::Await)) {
+            fb.is_async = true;
+        }
+    }
     fb.function_name = comp.plans.units[idx].function_name.clone();
     fb.is_strict = strict;
     let plan = &comp.plans.units[idx];

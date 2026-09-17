@@ -198,12 +198,30 @@ pub(crate) fn load_and_evaluate(
     let prev_referrer = state.borrow().referrer.clone();
     state.borrow_mut().referrer = dir;
     let main = module.program.main;
+    let main_is_async = module
+        .program
+        .functions
+        .get(main as usize)
+        .is_some_and(|f| f.is_async);
     let functions: Rc<[v12_bytecode::FunctionBytecode]> = module.program.functions.into();
     let result = interp.call_program_main(functions, strings, main);
     state.borrow_mut().referrer = prev_referrer;
     // The compiler epilogue makes the module main's completion the exports
     // object; that snapshot is the namespace.
     let namespace = result.map_err(|exc| exc.0)?;
+    // Top-level await: an async main returns its evaluation promise, not
+    // the namespace. Drain interpreter awaits inline until that promise's
+    // completion settles, then take the settlement value as the namespace
+    // (rejections become evaluation errors). Settlements for any other
+    // promise are handed back for the engine's checkpoint drain. Host jobs
+    // (promise reactions, dynamic-import loads) are engine-side and cannot
+    // run here: an evaluation promise parked on one stays pending and the
+    // loop exits quiescent, falling back to the promise object.
+    let namespace = if main_is_async && namespace.as_object().is_some() {
+        settle_evaluation_promise(interp, namespace)?
+    } else {
+        namespace
+    };
     state.borrow_mut().loading.remove(path);
     interp.heap_mut().add_root(namespace);
     state
@@ -211,6 +229,43 @@ pub(crate) fn load_and_evaluate(
         .modules
         .insert(path.to_path_buf(), namespace);
     Ok(namespace)
+}
+
+/// Drains interpreter awaits until async module `main_promise` settles.
+///
+/// Returns the fulfillment value, or the rejection reason as `Err`. Exits
+/// quiescent (returning the still-pending promise) when no pass resumes or
+/// settles anything: the remaining awaits are parked on promises only host
+/// jobs can settle, which run at the engine's checkpoint drain.
+fn settle_evaluation_promise(
+    interp: &mut Interp<'_>,
+    main_promise: JsValue,
+) -> Result<JsValue, JsValue> {
+    let target = main_promise.as_object();
+    for _ in 0..10_000 {
+        let resumed = interp.run_jobs();
+        let settlements = interp.take_pending_settlements();
+        let mut outcome: Option<Result<JsValue, JsValue>> = None;
+        for (promise, value, rejecting) in settlements {
+            if Some(promise) == target {
+                if outcome.is_none() {
+                    outcome = Some(if rejecting { Err(value) } else { Ok(value) });
+                }
+            } else {
+                interp.push_pending_settlement(promise, value, rejecting);
+            }
+        }
+        if let Some(result) = outcome {
+            return result;
+        }
+        if resumed == 0 && !interp.has_pending_awaits() && !interp.has_pending_settlements() {
+            break;
+        }
+        if resumed == 0 && !interp.has_pending_awaits() {
+            break;
+        }
+    }
+    Ok(main_promise)
 }
 
 /// Dynamic-import load job: evaluate the graph, then settle `promise`.
