@@ -745,6 +745,15 @@ impl Interp<'_> {
                     self.stack[base + usize::from(ra)] = iter;
                     self.set_pc(pc + op_width);
                 }
+                Opcode::GetAsyncIterator => {
+                    // ES GetIterator with the async hint: prefer
+                    // `@@asyncIterator`, fall back to `@@iterator`.
+                    let src_v = self.stack[base + usize::from(rb)];
+                    self.gc_protect();
+                    let iter = attempt!(self.get_iterator(src_v, true));
+                    self.stack[base + usize::from(ra)] = iter;
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::GenResumeMode => {
                     // Loads the resumed generator's pending-mode slot: 0 =
                     // normal `next()` resume, 1 = `return(v)` completion (the
@@ -952,6 +961,16 @@ impl Interp<'_> {
                         throw_js!(exc);
                     }
                     let resume_pc = pc + op_width;
+                    // Async generators distinguish a real `yield` suspension
+                    // (settles the pending request promise now) from an
+                    // internal `await` suspension (promise stays parked). Mark
+                    // the flag before `suspend` pops the frame; `Await`
+                    // clears it.
+                    if let Some(g) = self.frames.last().and_then(|f| f.generator)
+                        && self.is_async_generator_for(g)
+                    {
+                        self.set_async_gen_suspended_on_yield(g, true);
+                    }
                     self.suspend(dst, yielded, resume_pc)?;
                     return Ok(());
                 }
@@ -1006,6 +1025,14 @@ impl Interp<'_> {
                         self.heap.add_root(JsValue::object(ph));
                     }
                     let resume_pc = pc + op_width;
+                    // An async-generator body awaiting parks on the awaited
+                    // promise without settling the pending request promise
+                    // (`AsyncGeneratorYield(value)` awaits the value before
+                    // yielding). Clear the yield flag so the resume path keeps
+                    // the request promise pending until a real yield.
+                    if !frame_is_async_fn && self.is_async_generator_for(r#gen) {
+                        self.set_async_gen_suspended_on_yield(r#gen, false);
+                    }
                     let _rgen = self.suspend(u16::from(dst), arg, resume_pc)?;
                     self.pending_awaits.push_back((r#gen, payload, is_rejected));
                     self.top_result = None;

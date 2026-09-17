@@ -150,6 +150,12 @@ pub enum Opcode {
     GenResumeMode = 74,
     /// ES ToPropertyKey: `r{a} = ToPropertyKey(r{b})`. Materialises the property key so a key object's `toString`/`valueOf` runs at a defined point.
     ToPropertyKey = 75,
+    /// ES GetIterator with the async hint: `r{a} = GetIterator(r{b}, async)`.
+    /// Reads `r{b}[@@asyncIterator]` and calls it; when that method is
+    /// absent, falls back to the sync `@@iterator` (the for-await lowering
+    /// awaits the results itself). Validates that the result is an object.
+    /// `r{c}` is unused.
+    GetAsyncIterator = 76,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -228,6 +234,7 @@ impl TryFrom<u8> for Opcode {
             73 => Ok(Self::GetGlobalLenient),
             74 => Ok(Self::GenResumeMode),
             75 => Ok(Self::ToPropertyKey),
+            76 => Ok(Self::GetAsyncIterator),
             other => Err(other),
         }
     }

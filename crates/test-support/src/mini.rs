@@ -407,6 +407,7 @@ impl<'p> Mini<'p> {
                 | Opcode::DefineMethod
                 | Opcode::GenResumeMode
                 | Opcode::GetIterator
+                | Opcode::GetAsyncIterator
                 | Opcode::IteratorNext
                 | Opcode::IteratorClose
                 | Opcode::GetNewTarget => {
