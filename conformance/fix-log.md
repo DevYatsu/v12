@@ -2,6 +2,27 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-17 — lane/early-errors: static-semantics (early-error) validations [lane/early-errors]
+
+- **Filter:** `language/expressions` (11 128 files), `--jobs 8`, `--format human`; TAP used only for pass-set diffs.
+- **Before:** expressions 7 122 pass / 3 964 fail / 16 skip (64.2 %) — pristine master worktree at 46f3186.
+- **After:** expressions 7 126 pass / 3 960 fail / 16 skip (64.3 %). The +4 are four `class/cpn-class-expr-*` computed-name tests fixed as a side effect of walking computed class-element keys. TAP pass-set diff against the master baseline shows exactly those 4 additions and **zero regressed tests**.
+- **Metric caveat (important):** the harness (`conformance/harness/src/runner.rs:852-896`) accepts *any* thrown error for a `phase: parse` negative, and `$DONOTEVALUATE()` throws `Test262Error` only when reached. So a build that executes a negative test still scores it as a pass, and these checks mostly do not move the score. The honest measure is how many parse-phase negatives still *execute*: at lane start 644 of the 2 034 did; after all six commits **1** does (a `flags: [module]` test the runner skips anyway), i.e. 643 invalid programs now throw at compile time instead of running.
+- **Engine change:** `crates/v12-bccompiler/src/{collect,expr,model}.rs`.
+  - **Strict bindings/references** (ES §12.1.1): the nine FutureReservedWords (`implements`/`interface`/`let`/`package`/`private`/`protected`/`public`/`static`/`yield`) are rejected as strict-mode binding names *and* as strict `IdentifierReference`s — bare reads, assignment/update targets, object shorthand, and destructuring shorthands/defaults. Property keys and member names stay `IdentifierName`.
+  - **`use strict` + non-simple parameters** (§14.1.2/§14.2.1): a `"use strict"` directive over a rest/default/destructuring parameter list is an early error.
+  - **Strict assignment targets** (§13.15.1/§13.4.1): `eval`/`arguments` as assignment, update, compound/logical-assignment, or destructuring targets.
+  - **`delete`** (§13.15.1): `delete obj.#x` (parens peeled) and `delete (ident)` in strict mode.
+  - **Classes** (§10.2.1/§15.7.1): class bodies are now always strict; a `FutureReservedWord` class name; duplicate `constructor`; duplicate private names (get/set pairs excepted); unresolved `#name` references validated against a lexical class private-name scope stack; `arguments` in a field initializer; `super.x` and `super()` context legality (`super()` only in a derived constructor, `super.x` also in object-literal methods and field initializers); computed class-element keys walked in the strict, private-aware context.
+  - **`yield`/`await` in parameter lists** (§14.1.2/§14.2.1/§14.4): rejected in generator/async/arrow/method formals while a nested function's own body stays legal.
+  - **Annex B.3.1:** two `__proto__: value` entries in one object literal.
+- **Not done / out of reach:** duplicate labels and `break`/`continue` to an undefined label have no positive corpus on this slice (the emitter already rejects an unresolvable target as a compile error, which the lenient runner passes). Module code `await`-as-identifier (`class-name-ident-await-module`) needs the module entry point's strict/await context; `import(source, options)`'s second argument had no walk path before this entry (now added for `yield`, but the test is module-flag-skipped). Octal literals/escapes in strict strings are already rejected by oxc's parser.
+- **Files:** `crates/v12-bccompiler/src/{collect,expr,model,tests}.rs`, conformance/fix-log.md (this entry)
+- **Bucket:** B — missing early-error validations (ROADMAP)
+- **Runner:** `./conformance/run.sh --filter language/expressions --jobs 8`
+- **Verification:** `cargo nextest run --workspace` 617 passed / 0 failed; `cargo clippy --workspace --all-targets` 0 errors; `cargo fmt --check` clean; 15 new bccompiler unit tests (one per early-error class, each paired with a legal counterpart to guard against over-rejection). Six commits: `58dbd12` (A+B strict bindings/references/targets/delete), `65d7c84` (C super/super() context), `d57beb8` (D class private names/ctor/field-init arguments/object-method super), `b546b17` (E strict references/`__proto__`/computed keys), `20b7ce3` (F yield/await in parameter lists), plus a follow-up for the `import()` options walk.
+- **Notes:** two regressions were found and fixed within the lane before landing (batch C's stricter `super` check initially rejected object-literal methods, which have a HomeObject and may use `super.x`; the batch-D commit recovers those two `language/expressions/super/prop-expr-obj-*` tests). Did not touch `crates/v12-bytecode/**`, `crates/v12-engine/**`, or the dirty `conformance/test262` submodule pointer.
+
 ### 2026-09-17 — lane/realm-wiring: `EvalError`/`URIError` globals + `Error.isError` static [lane/realm-wiring]
 
 - **Filter:** `built-ins/NativeErrors` (94 files), `built-ins/Error` (93), `--jobs 4`, `--format human`

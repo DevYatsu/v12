@@ -1985,6 +1985,11 @@ fn strict_reserved_word_reference_is_syntax_error() {
     compile_source_with_strings("\"use strict\"; var o = {package: 1}; o.package;")
         .expect("property keys are IdentifierName, not references");
     compile_source_with_strings("package;").expect("sloppy reserved-word reference compiles");
+    // The optional second argument of `import()` is an AssignmentExpression.
+    let err = compile_source_with_strings("\"use strict\"; import(\"./x.js\", yield);")
+        .map_err(|e| e.message)
+        .expect_err("reserved word in import() options should fail");
+    assert!(err.contains("reserved word"), "got: {err}");
 }
 
 /// Annex B.3.1: two `__proto__: value` entries in one object literal are an

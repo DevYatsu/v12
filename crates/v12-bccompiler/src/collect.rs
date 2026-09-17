@@ -1594,7 +1594,14 @@ impl<'s> Collector<'s> {
                 }
             }
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression),
-            Expression::ImportExpression(i) => self.expr(&i.source),
+            Expression::ImportExpression(i) => {
+                self.expr(&i.source);
+                // `import(source, options)`: the optional second argument is a
+                // full AssignmentExpression and is validated like any other.
+                if let Some(opts) = &i.options {
+                    self.expr(opts);
+                }
+            }
             _ => {}
         }
     }
