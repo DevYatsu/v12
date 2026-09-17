@@ -1830,6 +1830,52 @@ fn class_name_strict_reserved_word_is_syntax_error() {
     compile_source_with_strings("class C {}").expect("plain class name compiles");
 }
 
+/// ES §15.7.1: `super` is only legal in a class method or an arrow lexically
+/// inside one. Nested ordinary functions reset the scope.
+#[test]
+fn super_outside_class_method_is_syntax_error() {
+    for src in [
+        "super.x;",
+        "super();",
+        "function f() { super.x; }",
+        "var f = () => super.x;",
+        "class C extends Object { constructor() { function g() { super.x; } } }",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("super outside a class method should fail");
+        assert!(err.contains("super"), "for {src}: got {err}");
+    }
+    // Legal contexts: base/derived methods, arrows in methods, field inits.
+    for src in [
+        "class C { m() { return super.x; } }",
+        "class C extends Object { constructor() { super(); } }",
+        "class C { m() { var f = () => super.x; return f(); } }",
+        "class C extends Object { x = super.y; }",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
+/// ES §15.7.1: the `super()` *call* form is constructor-of-a-derived-class only.
+#[test]
+fn super_call_outside_derived_constructor_is_syntax_error() {
+    for src in [
+        "class C { m() { super(); } }",
+        "class C { static m() { super(); } }",
+        "class C { constructor() { super(); } }",
+        "class C extends Object { x = super(); }",
+        "class C { m() { var f = () => super(); } }",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("illegal super() call should fail");
+        assert!(err.contains("super()"), "for {src}: got {err}");
+    }
+    compile_source_with_strings("class C extends Object { constructor() { super(); } }")
+        .expect("derived constructor super() is legal");
+}
+
 #[test]
 fn annex_b_sloppy_block_function_compiles() {
     let src = "if (true) function f(){ return 1; }";

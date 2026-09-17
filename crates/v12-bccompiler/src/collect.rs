@@ -63,6 +63,8 @@ fn collect_inner(
         strict_stack: Vec::new(),
         ref_sites: Vec::new(),
         unit_stack: Vec::new(),
+        super_allowed_stack: Vec::new(),
+        super_call_allowed_stack: Vec::new(),
         early_error: None,
     };
     c.plans.is_module = is_module;
@@ -72,6 +74,8 @@ fn collect_inner(
     c.plans.units.push(main_plan);
     c.unit_stack.push(0);
     c.strict_stack.push(is_strict);
+    c.super_allowed_stack.push(false);
+    c.super_call_allowed_stack.push(false);
     c.stmt_list(&program.body);
     if let Some(err) = c.early_error {
         return Err(err);
@@ -139,6 +143,15 @@ struct Collector<'s> {
     /// `(symbol, referencing unit)` pairs; joined against homes in `finalize`.
     ref_sites: Vec<(SymbolId, usize)>,
     unit_stack: Vec<usize>,
+    /// Per-unit `super` legality: `true` inside a class constructor, method,
+    /// or field initializer. A nested ordinary function pushes `false`; a
+    /// nested arrow inherits the enclosing value (ES §15.7.1). `super` outside
+    /// any such context is an early SyntaxError.
+    super_allowed_stack: Vec<bool>,
+    /// Per-unit `super()` *call* legality: `true` only directly inside a
+    /// derived constructor. `super()` in a method, a base-class constructor,
+    /// or a field initializer is an early SyntaxError (ES §15.7.1).
+    super_call_allowed_stack: Vec<bool>,
     /// First early-error found during the walk; aborts collection after the
     /// current subtree so one bad construct yields one diagnostic.
     early_error: Option<CompileError>,
@@ -255,6 +268,10 @@ impl<'s> Collector<'s> {
         self.plans.fn_index.insert(f.span(), idx);
         self.unit_stack.push(idx);
         self.strict_stack.push(is_strict);
+        // An ordinary (non-arrow) function is a new `super` scope: `super` is
+        // not allowed inside it even when it is textually nested in a method.
+        self.super_allowed_stack.push(false);
+        self.super_call_allowed_stack.push(false);
 
         // Params register first; they occupy the incoming-argument window.
         self.register_formals(idx, &f.params);
@@ -273,6 +290,8 @@ impl<'s> Collector<'s> {
         }
         self.unit_stack.pop();
         self.strict_stack.pop();
+        self.super_allowed_stack.pop();
+        self.super_call_allowed_stack.pop();
         idx
     }
 
@@ -295,6 +314,13 @@ impl<'s> Collector<'s> {
         self.plans.fn_index.insert(a.span(), idx);
         self.unit_stack.push(idx);
         self.strict_stack.push(is_strict);
+        // An arrow inherits the enclosing `super` scope (ES §15.7.1), both for
+        // property references and for the `super()` call form.
+        let inherited_super = *self.super_allowed_stack.last().unwrap_or(&false);
+        let inherited_super_call = *self.super_call_allowed_stack.last().unwrap_or(&false);
+        self.plans.units[idx].allows_super = inherited_super;
+        self.super_allowed_stack.push(inherited_super);
+        self.super_call_allowed_stack.push(inherited_super_call);
         self.register_formals(idx, &a.params);
         match a.get_function_body() {
             Some(body) => self.stmt_list(&body.statements),
@@ -306,6 +332,8 @@ impl<'s> Collector<'s> {
         }
         self.unit_stack.pop();
         self.strict_stack.pop();
+        self.super_allowed_stack.pop();
+        self.super_call_allowed_stack.pop();
         idx
     }
 
@@ -509,12 +537,16 @@ impl<'s> Collector<'s> {
             ),
         );
         plan.is_strict = true;
+        plan.allows_super = true;
         self.plans.units.push(plan);
         self.plans.fn_index.insert(c.span, idx);
         // The constructor's params/body come from the explicit `constructor`
         // element; register them in the constructor unit.
         self.unit_stack.push(idx);
         self.strict_stack.push(true);
+        self.super_allowed_stack.push(true);
+        // `super()` may only be called in a constructor of a derived class.
+        self.super_call_allowed_stack.push(c.heritage.is_some());
         let ctor_el = c.body.body.iter().find_map(|el| match el {
             oxc_ast::ast::ClassElement::MethodDefinition(m)
                 if m.kind == oxc_ast::ast::MethodDefinitionKind::Constructor =>
@@ -547,7 +579,12 @@ impl<'s> Collector<'s> {
             self.plans.units[idx].function_name = Some(id.name.to_string());
         }
         self.unit_stack.pop();
+        self.super_allowed_stack.pop();
+        self.super_call_allowed_stack.pop();
         // Walk field initializers for `this`/`super`/captures (e.g. `#x = () => this.#y`).
+        // The initializer runs in the class's strict context; `super` property
+        // access is legal there but a `super()` *call* is not (checked in the
+        // emitter, which has the parent-heritage information).
         for el in &c.body.body {
             if let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el
                 && let Some(init) = &p.value
@@ -555,8 +592,14 @@ impl<'s> Collector<'s> {
                 // Instance field initializers conceptually run in constructor;
                 // attribute any `this` inside them to the constructor unit so
                 // `this` slot is planned. We push constructor idx as current.
+                // A field initializer may read `super.x` but may never call
+                // `super()` (ES §15.7.1: `Initializer Contains SuperCall`).
                 self.unit_stack.push(idx);
+                self.super_allowed_stack.push(true);
+                self.super_call_allowed_stack.push(false);
                 self.expr(init);
+                self.super_call_allowed_stack.pop();
+                self.super_allowed_stack.pop();
                 self.unit_stack.pop();
             }
         }
@@ -584,19 +627,35 @@ impl<'s> Collector<'s> {
                         .iter()
                         .any(|d| d.expression.value == "use strict")
                 });
-                mplan.is_strict = parent_strict || own_strict;
+                // Class methods are always strict code (ES §10.2.1), so the
+                // surrounding `parent_strict`/`own_strict` values are not
+                // consulted; a redundant `"use strict"` directive still
+                // triggers the non-simple-parameter early error below.
+                let _ = (parent_strict, own_strict);
+                mplan.is_strict = true;
                 mplan.static_method = m.r#static;
-                let m_strict = mplan.is_strict;
+                mplan.allows_super = true;
+                self.check_use_strict_with_non_simple_params(
+                    &m.value.params,
+                    own_strict,
+                    m.value.span,
+                );
                 self.plans.units.push(mplan);
                 self.plans.fn_index.insert(m.value.span, midx);
                 self.unit_stack.push(midx);
-                self.strict_stack.push(m_strict);
+                self.strict_stack.push(true);
+                self.super_allowed_stack.push(true);
+                // A method (including a getter/setter) may use `super.x` but
+                // may not call `super()` — that is constructor-only.
+                self.super_call_allowed_stack.push(false);
                 self.register_formals(midx, &m.value.params);
                 if let Some(body) = m.value.body.as_deref() {
                     self.stmt_list(&body.statements);
                 }
                 self.unit_stack.pop();
                 self.strict_stack.pop();
+                self.super_allowed_stack.pop();
+                self.super_call_allowed_stack.pop();
             }
         }
         // Pop the class-body strict frame pushed above.
@@ -977,7 +1036,15 @@ impl<'s> Collector<'s> {
                 }
                 self.plans.units[owner].needs_this = true;
             }
-            Expression::Super(_) => {
+            Expression::Super(sup) => {
+                // ES §15.7.1: `SuperProperty`/`SuperCall` are only legal in a
+                // class method (or an arrow lexically inside one). Anywhere
+                // else — a plain function, the top level, a `extends` clause —
+                // is an early SyntaxError.
+                if !*self.super_allowed_stack.last().unwrap_or(&false) {
+                    self.record_early_error(sup.span, "`super` outside a class method");
+                    return;
+                }
                 // `super` resolves through the class env captured by the
                 // nearest enclosing method/constructor unit.
                 let mut owner = self.cur_unit();
@@ -1025,6 +1092,16 @@ impl<'s> Collector<'s> {
                 }
             }
             Expression::CallExpression(c) => {
+                // ES §15.7.1: `SuperCall` is only legal in a derived-class
+                // constructor. Report before walking the callee so the
+                // specialized message wins over the generic one.
+                if c.callee.is_super() && !*self.super_call_allowed_stack.last().unwrap_or(&false) {
+                    self.record_early_error(
+                        c.span,
+                        "`super()` is only allowed in a derived class constructor",
+                    );
+                    return;
+                }
                 self.expr(&c.callee);
                 for arg in &c.arguments {
                     if let Some(x) = arg.as_expression() {
