@@ -2,6 +2,17 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/call-window: extra actuals no longer clobber the reserved `undefined` register [lane/call-window]
+
+- **Filter:** `language/arguments-object` (263), `language/expressions` (11 128), `language/statements/class` (4 369), `--jobs 8`, default `--format human`, plus a per-test TAP diff (`--tap-out`) to prove zero lost passes.
+- **Before (clean master `0642abb`, main worktree):** arguments-object **75 pass / 188 fail / 0 skip (28.5 %)**; expressions **7 715 / 3 397 / 16 skip (69.4 %)**; class **2 766 / 1 603 / 0 skip (63.3 %)**.
+- **After:** arguments-object **86 / 177 / 0 (32.7 %)**; expressions **7 737 / 3 375 / 16 (69.6 %)**; class **2 776 / 1 593 / 0 (63.5 %)**. Net **+43** (+11 / +22 / +10), **0 lost passes** on every filter (TAP pass-set diff).
+- **Root cause:** each frame's register window is filled from the caller's actuals starting at `r1`. The compiler reserves the register at `locals_end` (`FnCtx::undef_reg`, `model.rs:582`) as the never-written source of the literal `undefined` and of uninitialized locals. The non-rest copy branches of the three window fillers copied **all** actuals, so any actual at index ≥ the declared formal count overwrote that reserved register and every later local. The `has_rest` branches already copied only `fixed` — that asymmetry is why rest-parameter functions were immune.
+- **Fix:** in `crates/v12-interp/src/call.rs`, bound the non-rest copy to `fixed` actuals in all three helpers (`fill_call_window`, `fill_stack_call_window`, `fill_stack_window_from_slice`), mirroring the existing `has_rest` bound exactly. The `has_rest` branches are untouched. `arguments` retains all actuals because `call_setup.rs:253` snapshots the full `passed` slice before the window copy.
+- **Files:** `crates/v12-interp/src/call.rs` (+17/−3). No other source file changed.
+- **Probe (`/tmp/t_collide3.js`):** before `u=43 a=42` / `u=44` / `u=42` / `q=7`; after `u=undefined a=42` / `u=undefined` / `u=undefined` / `q=undefined`. Extra cases (`/tmp/t_extra.js`): `arguments.length:arguments[1]` → `3:2`; rest → `undefined,2`; declared params → `1,2`; later local after extra actual → `5`; arity-0 → `undefined`.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-interp --check` clean.
+
 ### 2026-09-18 — lane/class-fields (Phase B): `NamedEvaluation` function-name inference [lane/class-fields]
 
 - **Filter:** `language/statements/class` (4 369), `language/expressions` (11 128), `--jobs 8`, default `--format human`.
