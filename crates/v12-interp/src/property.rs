@@ -1096,11 +1096,23 @@ impl Interp<'_> {
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
-            // Arguments exotic: if mapped, the element mirrors the parameter
-            // slot (v1 keeps the element store authoritative; callers inspect
-            // `heap.get(obj).arguments_mapped` directly).
-            self.array_set_element(obj, idx, value);
-            return Ok(());
+            // An existing own element is a writable data property: write it.
+            // A hole is *absent*, so the write must fall through to the
+            // prototype walk below (ES OrdinarySet): a setter or a proxy
+            // `set` trap on `Array.prototype` must be observed
+            // (built-ins/Proxy/set/call-parameters-prototype-index).
+            if self
+                .heap
+                .get(obj)
+                .get_element(idx)
+                .is_some_and(|v| !v.is_hole())
+            {
+                // Arguments exotic: if mapped, the element mirrors the
+                // parameter slot (v1 keeps the element store authoritative;
+                // callers inspect `heap.get(obj).arguments_mapped` directly).
+                self.array_set_element(obj, idx, value);
+                return Ok(());
+            }
         }
         // RegExp `lastIndex` write: stores into the internal slot. Per spec
         // the value is coerced via ToNumber.
@@ -1240,6 +1252,18 @@ impl Interp<'_> {
                     "TypeError: cannot add property to non-extensible object",
                 )));
             }
+            return Ok(());
+        }
+
+        // A holed array/arguments index whose prototype walk found no
+        // blocker (step 4/5): extend the element store. `OrdinarySet` step
+        // 2.e would create an own data property; for the element exotic that
+        // is the element store.
+        if (self.heap.get(obj).kind == Kind::Array
+            || self.heap.get(obj).kind == Kind::Arguments)
+            && let Some(idx) = self.array_index_of(key_v)
+        {
+            self.array_set_element(obj, idx, value);
             return Ok(());
         }
 
