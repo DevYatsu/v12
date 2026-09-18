@@ -1628,8 +1628,120 @@ impl Interp<'_> {
             | NativeId::ReflectSetPrototypeOf
             | NativeId::ReflectIsExtensible
             | NativeId::ReflectPreventExtensions => self.run_proxy_static(id, this_v, args),
+            NativeId::ReflectApply => Some(self.run_reflect_apply(this_v, args)),
+            NativeId::ReflectConstruct => Some(self.run_reflect_construct(this_v, args)),
             _ => None,
         }
+    }
+
+    /// `Reflect.apply`/`Reflect.construct` are not constructors; invoking
+    /// either with `new` presents the method itself as `this`.
+    fn reject_reflect_construct(&mut self, this_v: JsValue, name: &str) -> Result<(), JSException> {
+        if this_v
+            .as_object()
+            .is_some_and(|o| self.heap.get(o).kind == Kind::Function)
+        {
+            return Err(JSException(self.error_value(&format!(
+                "TypeError: Reflect.{name} is not a constructor"
+            ))));
+        }
+        Ok(())
+    }
+
+    /// ES `CreateListFromArrayLike(argumentsList)`: an object with a `length`,
+    /// then indices `0..len`. A missing/undefined list is an empty list only
+    /// when the caller passes `undefined`; a non-object throws.
+    fn create_list_from_array_like(
+        &mut self,
+        v: JsValue,
+    ) -> Result<Vec<JsValue>, JSException> {
+        let Some(obj) = v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: CreateListFromArrayLike called on non-object"),
+            ));
+        };
+        let len_key = self.new_temp_key("length");
+        let len_v = self.get_property(0, 0, JsValue::object(obj), len_key)?;
+        let len_f = ops::to_number(self.heap, len_v);
+        let len = if len_f.is_finite() && len_f > 0.0 {
+            len_f.trunc() as usize
+        } else {
+            0
+        };
+        let mut out = Vec::with_capacity(len.min(1024));
+        for i in 0..len {
+            let key = JsValue::string(self.heap.intern_text(&i.to_string()));
+            out.push(self.get_property(0, 0, JsValue::object(obj), key)?);
+        }
+        Ok(out)
+    }
+
+    /// `Reflect.apply(target, thisArgument, argumentsList)` (ES 28.1.1):
+    /// `Call(target, thisArgument, args)`. Runs here because a proxy or a
+    /// bytecode target needs the interpreter; the registry native cannot
+    /// re-enter the machine.
+    fn run_reflect_apply(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        self.reject_reflect_construct(this_v, "apply")?;
+        let target_v = args.first().copied().unwrap_or(JsValue::undefined());
+        let Some(target) = target_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: Reflect.apply target is not a function"),
+            ));
+        };
+        // `IsCallable` includes a proxy whose target is callable; a revoked
+        // proxy is not callable (ES 10.5.12 step 1 uses the resolved target).
+        if !self.is_callable_object(target) {
+            return Err(JSException(
+                self.error_value("TypeError: Reflect.apply target is not a function"),
+            ));
+        }
+        let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
+        let list = self.create_list_from_array_like(
+            args.get(2).copied().unwrap_or(JsValue::undefined()),
+        )?;
+        // `call_object` routes a proxy through its `apply` trap.
+        self.call_object(target, this_arg, &list)
+    }
+
+    /// `Reflect.construct(target, argumentsList[, newTarget])` (ES 28.1.2):
+    /// `Construct(target, args, newTarget)`. Same interpreter requirement as
+    /// `Reflect.apply`.
+    fn run_reflect_construct(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        self.reject_reflect_construct(this_v, "construct")?;
+        let target_v = args.first().copied().unwrap_or(JsValue::undefined());
+        let Some(target) = target_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: Reflect.construct target is not a constructor"),
+            ));
+        };
+        if !self.is_constructor_object(target) {
+            return Err(JSException(
+                self.error_value("TypeError: Reflect.construct target is not a constructor"),
+            ));
+        }
+        let list = self.create_list_from_array_like(
+            args.get(1).copied().unwrap_or(JsValue::undefined()),
+        )?;
+        let new_target = args.get(2).copied().unwrap_or(target_v);
+        let Some(nt) = new_target.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: Reflect.construct newTarget is not a constructor",
+            )));
+        };
+        if !self.is_constructor_object(nt) {
+            return Err(JSException(self.error_value(
+                "TypeError: Reflect.construct newTarget is not a constructor",
+            )));
+        }
+        self.construct_object(target, &list, new_target)
     }
 
     /// Proxy `[[Call]]` (ES 10.5.12): the `apply` trap, or a forward to the
@@ -1799,23 +1911,33 @@ impl Interp<'_> {
                 self.error_value("TypeError: target is not a constructor"),
             ));
         }
+        // A native/host constructor invoked without a parked `Construct`
+        // opcode: call its handler directly and take its object result (the
+        // engine's native constructors return the fresh instance). Mirrors
+        // `prepare_construct`'s `Native`/`Host` arms.
+        match self.heap.get(target).callable {
+            v12_heap::FunctionTarget::Native(f) => {
+                self.gc_protect();
+                return f(self.heap, target_v, args).map_err(JSException);
+            }
+            v12_heap::FunctionTarget::Host(c) => {
+                self.gc_protect();
+                return c.call(self.heap, target_v, args).map_err(JSException);
+            }
+            _ => {}
+        }
         let program = self.heap.get(target).program_id;
         let idx = match self.heap.get(target).callable {
             v12_heap::FunctionTarget::Bytecode(i) => i,
-            v12_heap::FunctionTarget::Native(_) | v12_heap::FunctionTarget::Host(_) => {
-                // Native/host constructors cannot be entered here; the
-                // registry native path (below) does not know them. Report as
-                // non-constructible rather than mis-dispatching.
-                return Err(JSException(
-                    self.error_value("TypeError: target is not a constructor"),
-                ));
-            }
             v12_heap::FunctionTarget::RealmEval(_) => {
                 return Err(JSException(
                     self.error_value("TypeError: target is not a constructor"),
                 ));
             }
             v12_heap::FunctionTarget::Bound(_) => unreachable!("handled above"),
+            v12_heap::FunctionTarget::Native(_) | v12_heap::FunctionTarget::Host(_) => {
+                unreachable!("handled above")
+            }
         };
         if (idx as usize) >= self.functions_for_program(program).len() {
             // Out-of-range bytecode index: an engine-installed native
