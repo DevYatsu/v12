@@ -142,6 +142,73 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    // -- prototype linking for engine-allocated objects ---------------------
+
+    /// Stamps `%Array.prototype%` as `h`'s `[[Prototype]]` (spec
+    /// `ArrayCreate` → `OrdinaryCreateFromConstructor`). Engine-allocated
+    /// arrays (`Array.of`, `slice`, `splice`, `flat`, `Array.from`,
+    /// `String.prototype.split`/`match`, …) bypass the interpreter's
+    /// `NewArray` arm, which is where literal arrays get linked; without
+    /// this they have a `null` prototype, so `result.constructor === Array`
+    /// fails and inherited methods are unreachable.
+    ///
+    /// Resolved through the realm `Array` constructor's `prototype` field
+    /// exactly like [`super::regexp::link_regexp_proto`]. No-op when the
+    /// realm cannot be resolved (bare-heap engine tests). Allocation-time
+    /// only — never per element.
+    pub fn link_array_proto(&mut self, h: Handle<JsObject>) {
+        let Some(ctor) = self.intrinsic("Array").and_then(|v| v.as_object()) else {
+            return;
+        };
+        if let Some(proto) = self.heap.get(ctor).prototype {
+            self.heap.get_mut(h).prototype = Some(proto);
+        }
+    }
+
+    /// Allocates an array from `elements`, roots it, links it to
+    /// `%Array.prototype%`, and binds the canonical `root --length--> child`
+    /// array shape. The single canonical allocator for engine-created arrays;
+    /// call sites should prefer this over `JsObject::array` + `alloc_obj` so
+    /// none is missed.
+    ///
+    /// Binding the length shape matters beyond `length`: without it the
+    /// fresh object keeps the empty-object root shape while its
+    /// `properties[0]` already holds the length Smi, so the first added
+    /// property allocates slot 0 and its read returns the length
+    /// (`[1,2,3].slice(1).foo = 42; .foo` read back `2`).
+    pub fn alloc_array(&mut self, elements: Vec<JsValue>) -> Handle<JsObject> {
+        let h = self.alloc_obj(JsObject::array(elements));
+        self.finish_array(h);
+        h
+    }
+
+    /// Allocates a sparse (`new Array(len)`) array with the same prototype and
+    /// length-shape treatment as [`Self::alloc_array`].
+    pub fn alloc_array_sparse(&mut self, len: u32) -> Handle<JsObject> {
+        let h = self.alloc_obj(JsObject::array_sparse(len));
+        self.finish_array(h);
+        h
+    }
+
+    /// Shared tail for the array allocators: link `%Array.prototype%` and
+    /// bind the canonical length shape (see [`Self::alloc_array`]).
+    fn finish_array(&mut self, h: Handle<JsObject>) {
+        self.link_array_proto(h);
+        let key = v12_heap::PropKey::from_string(
+            self.heap
+                .intern_string(v12_heap::V12Str::latin1_slice(b"length")),
+        );
+        // ES `ArrayCreate`: `length` is writable, non-enumerable,
+        // non-configurable — the same transition the interpreter's
+        // `array_shape` installs for literal/rest arrays.
+        let shape = self.heap.add_property(
+            self.heap.root_shape(),
+            key,
+            v12_heap::Attrs::new(true, false, false),
+        );
+        self.heap.bind_shape(h, shape);
+    }
+
     // -- errors (real `Kind::Error` objects, plan §4.2) ---------------------
 
     /// Real `TypeError` object: own `name`/`message` plus the realm
