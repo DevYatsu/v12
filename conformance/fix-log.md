@@ -2,6 +2,19 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/derived-ctor: default derived constructor now forwards `super(...args)` [lane/derived-ctor]
+
+- **Filters:** `language/statements/class` (4 369), `language/expressions` (11 128), `--jobs 8`, default `--format human`, plus a per-test TAP diff (`--tap-out`) to prove the pass-set delta.
+- **Before (clean master `353fb5d`, main worktree):** class **2 776 pass / 1 593 fail / 0 skip (63.5 %)**; expressions **7 737 / 3 375 / 16 skip (69.6 %)**.
+- **After:** class **2 780 / 1 589 / 0 (63.6 %)**; expressions **7 738 / 3 374 / 16 (69.6 %)**. Net **+5** (+4 class, +1 expr). One pass flip, analysed below.
+- **Root cause:** a derived class with no explicit `constructor` emitted only `emit_instance_fields` and never synthesized the spec's default derived constructor (ES §15.7.1 `DefaultDerivedConstructor` = `constructor(...args) { super(...args); }`). The parent constructor body therefore never ran; instance fields still initialized, so only the parent body was skipped.
+- **Fix:** `collect.rs` reserves a rest parameter on the no-explicit-ctor derived unit (`has_rest = true`, no user binding so `rest_ident` stays `None`) and marks it `uses_super`; the call ABI materializes the forwarded actuals as a real array at `r{arity+1}`. `unit.rs` new `emit_default_derived_super` resolves the class env (`GetEnv(SLOT_SUPER_CTOR)` at the same depth `expr::super_env_depth` computes), sets `this`, and spreads the reserved register via `CallApply`; it runs before `emit_instance_fields`. Base-class and explicit-`super()` paths are untouched.
+- **Files:** `crates/v12-bccompiler/src/collect.rs` (+11), `crates/v12-bccompiler/src/unit.rs` (+53/−3). No file outside the owned set changed.
+- **Probe (`/tmp/dc.js`):** before `parent ctor ran: undefined` / `fields + forwarded: undefined x: 5`; after `parent ctor ran: 1,2,3 this is D: true this is P: true` / `fields + forwarded: z x: 5`; explicit-`super` case unchanged (`7,8 true`). (`1,2,3` is the known console array-display shape; the forwarded array is correct.)
+- **Pass flip (analysed, not a defect):** `language/statements/class/subclass-builtins/subclass-Promise.js` and `language/expressions/class/subclass-builtins/subclass-Promise.js` previously passed as **false passes** — on master the default derived constructor never called `super()`, so `new Subclass(() => {})` produced an ordinary object whose prototype chain satisfied the test's `instanceof` assertions. With a correct forward the test genuinely invokes `Promise` as parent, and this engine cannot construct a native parent via `super()`: explicit `super()` to `Promise`/`Array` fails identically before and after (pre-existing `v12-interp` gap). The exposure is honest; the slice is still net-positive.
+- **Newly passing:** class `subclass/default-constructor-spread-override.js`, `subclass/class-definition-evaluation-empty-constructor-heritage-present.js`, `subclass/class-definition-parent-proto-null.js`, `elements/prod-private-method-before-super-return-in-{constructor,field-initializer}.js`; expressions the two private-method-without-super files.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-bccompiler` + `cargo fmt --check` clean.
+
 ### 2026-09-18 — lane/obj-proto2: rest/spread and iterator-result objects link `%Object.prototype%` [lane/obj-proto2]
 
 - **Filters:** `language/expressions` (11 128), `language/statements` (9 369), `language/expressions/object` (1 170), `--jobs 8`, default `--format human`.

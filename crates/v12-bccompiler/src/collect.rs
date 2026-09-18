@@ -869,6 +869,17 @@ impl<'s> Collector<'s> {
                 self.stmt_list(&body.statements);
             }
             self.walking_params = prev_params;
+        } else if c.heritage.is_some() {
+            // Default derived constructor. ES §15.7.1 synthesizes
+            // `constructor(...args) { super(...args); }`, so the emitter must
+            // forward every argument to the parent. Reserving a rest
+            // parameter (with no user binding: `rest_ident` stays `None`)
+            // makes the call ABI materialize the argument list as a real
+            // array at `r{arity+1}`, which `Opcode::CallApply` can spread.
+            // Marking the unit as using `super` lets the emitter resolve the
+            // parent constructor from the class environment.
+            self.plans.units[idx].has_rest = true;
+            self.plans.units[idx].uses_super = true;
         }
         if let Some(id) = &c.id {
             self.plans.units[idx].function_name = Some(id.name.to_string());
