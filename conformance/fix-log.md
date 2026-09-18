@@ -2,6 +2,21 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/eval-script-shim: `$262.evalScript` host contract [lane/eval-script-shim]
+
+- **Filter:** `annexB/language/global-code` (153), `language/global-code` (195), `--jobs 4`/`8`, default `--format human`.
+- **Before (master `920fc80`):** `annexB/language/global-code` **67 pass / 86 fail (43.8 %)**; `language/global-code` **90 pass / 105 fail (46.2 %)**.
+- **After:** `annexB/language/global-code` **67 pass / 86 fail (43.8 %)** (unchanged); `language/global-code` **88 pass / 107 fail (45.1 %)**.
+- **Root cause:** `TEST262_HOST_SHIM` in `conformance/harness/src/runner.rs` defined `$262` without `evalScript` (INTERPRETING.md requires `$262.evalScript(src)` → compile+run `src` as a script in the current realm, returning its completion value). Tests calling it hit `TypeError: $262.evalScript is not a function`.
+- **Fix:** added `evalScript: function (src) { return globalThis.eval(String(src)); }` to the `$262` object. This delegates to the realm-bound `globalThis.eval` intrinsic (a `FunctionTarget::RealmEval` carrying the realm's global), which compiles via `compile_eval_source_with_strings` and maps a compile failure to a `SyntaxError`; runtime failures propagate their thrown value — exactly the INTERPRETING.md contract. A Rust host closure was not used: host closures cannot re-enter the interpreter, and adding an engine installer would require editing `crates/`, outside this lane's ownership.
+- **Files:** `conformance/harness/src/runner.rs` (+7).
+- **Semantics probe (`/tmp/t262probe`, run through the runner):** `ok - probe.js` — completion value `3`, `var` body completion `7`, bad source → `SyntaxError`, `null.x` → `TypeError`.
+- **Flipped test:** `annexB/language/global-code/script-decl-lex-collision.js` — before: `Expected a SyntaxError but got a TypeError`; after: `Expected a SyntaxError to be thrown but no exception was thrown at all`. The shim gap is closed; the remaining failure is a **second, engine-side blocker** (no global lexical-environment tracking across scripts, so the Annex B `HasVarDeclaration` collision is not raised). Fixing it needs `crates/v12-interp`/`crates/v12-engine` global-environment changes, outside this lane.
+- **False-pass exposure (3, `language/global-code`):** `script-decl-func-err-non-configurable.js`, `script-decl-func-err-non-extensible.js`, `script-decl-var-err.js` call `$262.evalScript` solely inside `assert.throws(TypeError, …)`. With `evalScript` undefined the call itself threw `TypeError`, satisfying the assertion vacuously. Now the call runs and the engine does not raise the (correct) `TypeError` for a non-extensible/non-configurable global, so they fail honestly. This is the same false-pass-exposure pattern recorded by `lane/obj-proto`; the shim is correct and the engine gap is reported, not regressed.
+- **Flip forward (1, `language/global-code`):** `script-decl-func-dups.js` — before `TypeError: callee is not a function`; after pass (it only needed `evalScript` to exist).
+- **Net:** `annexB/language/global-code` 0; `language/global-code` −2 (1 real flip forward, 3 vacuous false passes exposed).
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt --check` clean.
+
 ### 2026-09-18 — lane/derived-ctor: default derived constructor now forwards `super(...args)` [lane/derived-ctor]
 
 - **Filters:** `language/statements/class` (4 369), `language/expressions` (11 128), `--jobs 8`, default `--format human`, plus a per-test TAP diff (`--tap-out`) to prove the pass-set delta.

@@ -59,8 +59,15 @@ function __isHTMLDDA__() {
     if (arguments.length === 0 || arguments[0] === "") return null;
     return undefined;
 }
+// `$262.evalScript(src)` (INTERPRETING.md): compile `src` as a script in the
+// current realm and return its completion value. Delegates to the realm-bound
+// `globalThis.eval` intrinsic (a `FunctionTarget::RealmEval` carrying this
+// realm's global), which compiles with `compile_eval_source_with_strings` and
+// maps a compile failure to a `SyntaxError`; runtime failures propagate their
+// thrown value. A non-string argument is coerced, per the host contract.
 var $262 = {
     createRealm: function () { return globalThis.__v12CreateRealm__(); },
+    evalScript: function (src) { return globalThis.eval(String(src)); },
     detachArrayBuffer: function (b) { return b; },
     getReport: function () { return null; },
     destroy: function () {},
