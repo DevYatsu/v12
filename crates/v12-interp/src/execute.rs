@@ -669,6 +669,13 @@ impl Interp<'_> {
                     let obj_v = self.stack[base + usize::from(rb)];
                     let key_v = self.stack[base + usize::from(rc)];
                     let deleted = attempt!(self.delete_property(obj_v, key_v));
+                    // ES 13.5.1.2: a strict-mode `delete` of a member whose
+                    // [[Delete]] returns false throws a TypeError.
+                    if !deleted && funcs[fn_idx as usize].is_strict {
+                        let exc =
+                            self.error_value("TypeError: Cannot delete property of an object");
+                        throw_js!(exc);
+                    }
                     self.write_bool(base, ra, deleted);
                     self.set_pc(pc + op_width);
                 }
