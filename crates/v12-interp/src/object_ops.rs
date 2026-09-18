@@ -58,6 +58,8 @@ impl Interp<'_> {
             // Primitives in object rest: spec coerces to object, but our subset treats as empty.
             self.gc_protect();
             let h = self.heap.alloc(JsObject::default());
+            // Rest-result objects are ordinary: inherit `%Object.prototype%`.
+            self.link_object_proto(h);
             let shape = self.heap.root_shape();
             self.bind_shape(h, shape);
             return Ok(JsValue::object(h));
@@ -113,6 +115,8 @@ impl Interp<'_> {
         let src_props: Vec<JsValue> = self.heap.get(src_obj).properties.as_slice().to_vec();
         self.gc_protect();
         let dst_h = self.heap.alloc(JsObject::default());
+        // Rest-result objects are ordinary: inherit `%Object.prototype%`.
+        self.link_object_proto(dst_h);
         let mut cur_shape = self.heap.root_shape();
         self.bind_shape(dst_h, cur_shape);
         for desc in descs {
