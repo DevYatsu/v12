@@ -29,7 +29,15 @@ pub(crate) fn fill_call_window(
             window[rest_reg as usize] = arr;
         }
     } else {
-        let copied = args_src.len().min(window.len().saturating_sub(1));
+        // Copy only declared formals. Extra actuals must NOT land in the
+        // window: the register just past the locals is the compiler's
+        // reserved never-written `undefined` source (and the frame abi
+        // pre-fills it), so letting actuals spill there corrupts `undefined`
+        // and uninitialized locals. The `has_rest` branch above is the
+        // reference bound; `arguments` is snapshotted by the caller.
+        let copied = (fixed as usize)
+            .min(args_src.len())
+            .min(window.len().saturating_sub(1));
         window[1..1 + copied].copy_from_slice(&args_src[..copied]);
     }
 }
@@ -75,7 +83,10 @@ pub(crate) fn fill_stack_call_window(
             interp.stack[new_base + rest_reg as usize] = arr;
         }
     } else {
-        let copied = argc.min(window_len.saturating_sub(1));
+        // See `fill_call_window`: bound the copy by declared formals so extra
+        // actuals cannot overwrite the reserved `undefined`/uninitialized
+        // register past the locals.
+        let copied = (fixed as usize).min(argc).min(window_len.saturating_sub(1));
         let dst_start = new_base + 1;
         if arg_src < dst_start {
             let (left, right) = interp.stack.split_at_mut(dst_start);
@@ -126,7 +137,10 @@ pub(crate) fn fill_stack_window_from_slice(
             interp.stack[new_base + rest_reg as usize] = arr;
         }
     } else {
-        let copied = args.len().min(window_len.saturating_sub(1));
+        // Same bound as the two helpers above: only declared formals.
+        let copied = (fixed as usize)
+            .min(args.len())
+            .min(window_len.saturating_sub(1));
         interp.stack[new_base + 1..new_base + 1 + copied].copy_from_slice(&args[..copied]);
     }
 }
