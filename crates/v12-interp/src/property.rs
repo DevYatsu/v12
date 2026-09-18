@@ -1697,7 +1697,9 @@ impl Interp<'_> {
     }
 
     /// Materializes [`OwnDesc`] as a plain descriptor object for a trap
-    /// argument (ES `FromPropertyDescriptor`).
+    /// argument (ES `FromPropertyDescriptor`). Only the fields the descriptor
+    /// actually carries are installed; absent fields stay absent, so a partial
+    /// descriptor does not read as `writable: false` to the trap.
     pub(crate) fn own_desc_to_object(&mut self, desc: OwnDesc) -> JsValue {
         self.gc_protect();
         let d = self.heap.alloc(JsObject::default());
@@ -1707,14 +1709,26 @@ impl Interp<'_> {
             let _ = this.define_own_data_attrs(JsValue::object(d), key, v, Attrs::DEFAULT);
         };
         if desc.is_accessor() {
-            put(self, "get", desc.get);
-            put(self, "set", desc.set);
+            if desc.has_get {
+                put(self, "get", desc.get);
+            }
+            if desc.has_set {
+                put(self, "set", desc.set);
+            }
         } else {
-            put(self, "value", desc.value);
-            put(self, "writable", JsValue::from_bool(desc.writable));
+            if desc.has_value {
+                put(self, "value", desc.value);
+            }
+            if desc.has_writable {
+                put(self, "writable", JsValue::from_bool(desc.writable));
+            }
         }
-        put(self, "enumerable", JsValue::from_bool(desc.enumerable));
-        put(self, "configurable", JsValue::from_bool(desc.configurable));
+        if desc.has_enumerable {
+            put(self, "enumerable", JsValue::from_bool(desc.enumerable));
+        }
+        if desc.has_configurable {
+            put(self, "configurable", JsValue::from_bool(desc.configurable));
+        }
         JsValue::object(d)
     }
 
@@ -2464,6 +2478,8 @@ impl Interp<'_> {
                     if d.has_writable && !d.writable {
                         return Ok(false);
                     }
+                    // Step 2.d.iii: `{ [[Value]]: V }` — absent attribute
+                    // fields keep the receiver's current attributes.
                     self.object_define_own_property(
                         receiver_obj,
                         key,
@@ -2474,12 +2490,20 @@ impl Interp<'_> {
                         },
                     )
                 }
+                // Step 2.e: `CreateDataProperty(Receiver, P, V)` — a *full*
+                // all-true data descriptor, not a partial one.
                 None => self.object_define_own_property(
                     receiver_obj,
                     key,
                     OwnDesc {
                         has_value: true,
                         value,
+                        has_writable: true,
+                        writable: true,
+                        has_enumerable: true,
+                        enumerable: true,
+                        has_configurable: true,
+                        configurable: true,
                         ..Default::default()
                     },
                 ),
