@@ -1854,20 +1854,39 @@ impl Interp<'_> {
 
     /// True when `obj` has a `[[Construct]]` (a `Kind::Function` that is not
     /// an arrow/method, or a proxy whose target is a constructor).
-    fn is_constructor_object(&mut self, obj: Handle<JsObject>) -> bool {
+    ///
+    /// A `Native`/`Host` callable is a built-in function object and has no
+    /// `[[Construct]]` unless it is one of the engine's registered
+    /// constructor-shaped natives (mirrors `builtins::reflect::is_constructor`
+    /// and the `prepare_construct` native seam). An out-of-range bytecode
+    /// index names an engine-installed native, so it is constructible only
+    /// when it maps to one of those ids.
+    pub(crate) fn is_constructor_object(&mut self, obj: Handle<JsObject>) -> bool {
         match self.heap.get(obj).kind {
             Kind::Function => {
                 let program = self.heap.get(obj).program_id;
-                let idx = self
-                    .heap
-                    .get(obj)
-                    .callable
-                    .bytecode_index()
-                    .unwrap_or(u32::MAX);
-                self.functions_for_program(program)
-                    .get(idx as usize)
-                    .map(|f| !f.is_arrow)
-                    .unwrap_or(true)
+                let callable = self.heap.get(obj).callable;
+                match callable {
+                    v12_heap::FunctionTarget::Native(_) | v12_heap::FunctionTarget::Host(_) => {
+                        false
+                    }
+                    v12_heap::FunctionTarget::RealmEval(_) => false,
+                    v12_heap::FunctionTarget::Bound(state_h) => {
+                        // A bound function is constructible iff its target is.
+                        let inner = self.heap.get(state_h).elements[0].as_object();
+                        inner.is_some_and(|t| self.is_constructor_object(t))
+                    }
+                    v12_heap::FunctionTarget::Bytecode(idx) => {
+                        let funcs = self.functions_for_program(program);
+                        if (idx as usize) < funcs.len() {
+                            !funcs[idx as usize].is_arrow
+                        } else {
+                            // Out-of-range index: an engine native. Only the
+                            // registered constructor-shaped ids qualify.
+                            self.native_constructor_id(idx)
+                        }
+                    }
+                }
             }
             Kind::Proxy => {
                 let target = self.heap.get(obj).proxy_target;
@@ -1875,6 +1894,24 @@ impl Interp<'_> {
             }
             _ => false,
         }
+    }
+
+    /// True when a bytecode-table index names one of the engine's
+    /// constructor-shaped natives (`new Object/Array/Boolean/Error/…`).
+    fn native_constructor_id(&self, idx: u32) -> bool {
+        matches!(
+            NativeId::try_from(idx),
+            Ok(NativeId::ObjectConstruct
+                | NativeId::ArrayConstruct
+                | NativeId::BooleanConstruct
+                | NativeId::ErrorCreate
+                | NativeId::TypeErrorCreate
+                | NativeId::RangeErrorCreate
+                | NativeId::ReferenceErrorCreate
+                | NativeId::SyntaxErrorCreate
+                | NativeId::EvalErrorCreate
+                | NativeId::UriErrorCreate)
+        )
     }
 
     /// `Construct(target, args, new_target)`: the interpreter's construct

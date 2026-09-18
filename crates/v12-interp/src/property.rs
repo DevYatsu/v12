@@ -1364,6 +1364,21 @@ impl Interp<'_> {
             }
         }
         let shape = self.shape_of(obj);
+        // Existing shape-backed key: update in place. `add_property` would
+        // append a *duplicate* descriptor at a fresh slot, and `find(key)`
+        // returns the first (stale) one — the redefine would be invisible.
+        if let Some(Descriptor::Data { slot, .. }) = self.heap.lookup_property(shape, key).copied()
+        {
+            let idx = slot as usize;
+            let settings = &mut self.heap.get_mut(obj);
+            if settings.properties.len() <= idx {
+                settings.properties.resize(idx + 1, JsValue::hole());
+            }
+            settings.properties[idx] = value;
+            let child = self.heap.update_data_attrs(shape, key, attrs);
+            self.bind_shape(obj, child);
+            return Ok(());
+        }
         let child = self.heap.add_property(shape, key, attrs);
         self.bind_shape(obj, child);
         let slot = child_slot(self.heap, child);
@@ -2349,32 +2364,24 @@ impl Interp<'_> {
         }
         // ES steps 12-16: read the target state *after* the trap (a trap that
         // mutates the target must be observed). A true result demands the
-        // target property be compatible with the write.
+        // target property be compatible with the write; a *configurable*
+        // target property never constrains the result.
         let target_desc = self.object_get_own_property(target, key)?;
-        match target_desc {
-            Some(desc) if desc.is_data() && desc.has_writable && !desc.writable => {
-                if desc.has_value && desc.value != value {
+        if let Some(desc) = target_desc
+            && desc.has_configurable
+            && !desc.configurable
+        {
+            if desc.is_data() {
+                if desc.has_writable && !desc.writable && !ops::strict_equals(self.heap, desc.value, value) {
                     return Err(JSException(self.error_value(
                         "TypeError: 'set' trap returned true for a non-configurable non-writable target property with a different value",
                     )));
                 }
+            } else if !desc.has_set || desc.set.is_undefined() {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'set' trap returned true for a non-configurable accessor without a setter",
+                )));
             }
-            Some(desc) if desc.is_accessor() => {
-                let no_setter = !desc.has_set || desc.set.is_undefined();
-                if no_setter {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'set' trap returned true for a non-configurable accessor without a setter",
-                    )));
-                }
-            }
-            None => {
-                if !self.object_is_extensible(target)? {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'set' trap returned true for an absent property of a non-extensible target",
-                    )));
-                }
-            }
-            _ => {}
         }
         Ok(true)
     }
@@ -2529,7 +2536,9 @@ impl Interp<'_> {
         let Some(trap) = trap_v.as_object() else {
             if trap_v.is_undefined() || trap_v.is_null() {
                 // No trap (`GetMethod` maps null to undefined): forward to
-                // the target through the ordinary path.
+                // the target's ordinary `HasProperty`, which walks the chain
+                // and dispatches a proxy ancestor while still covering array
+                // element storage.
                 return self.op_in(key_v, JsValue::object(target));
             }
             return Err(JSException(
@@ -2547,20 +2556,35 @@ impl Interp<'_> {
             JsValue::object(handler),
             &[JsValue::object(target), key_v],
         )?;
-        Ok(ops::to_boolean(self.heap, result))
+        let boolean = ops::to_boolean(self.heap, result);
+        if !boolean {
+            // ES steps 8-10: a `false` result demands the target own no
+            // non-configurable property of that name, nor any property at
+            // all when the target is non-extensible.
+            if let Some(desc) = self.object_get_own_property(target, key)?
+                && desc.has_configurable
+                && !desc.configurable
+            {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'has' trap returned false for a non-configurable target property",
+                )));
+            }
+            if !self.object_is_extensible(target)? {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'has' trap returned false for a non-extensible target",
+                )));
+            }
+        }
+        Ok(boolean)
     }
 
     /// Proxy `[[Get]]` (ES 10.5.8): consult the handler's `get` trap.
     ///
-    /// Absent or `undefined` trap forwards to the target's ordinary read
-    /// (which recursively handles a proxy target). A present non-callable trap
-    /// is a `TypeError`. The trap result returns uncoerced.
-    ///
-    /// Deliberate limitations: the spec's invariant checks (trap result vs. a
-    /// non-configurable non-writable target data property, or vs. a
-    /// non-configurable target accessor with undefined `get`) are not applied;
-    /// and a forward passes the target (not the proxy) as receiver, so an
-    /// inherited target getter observes the target as `this`.
+    /// Absent or `undefined` trap forwards to the target's ordinary read with
+    /// the *original* receiver threaded through (ES step 10), so an inherited
+    /// target getter observes the proxy as `this`. A present non-callable trap
+    /// is a `TypeError`. The trap result is returned uncoerced, after the
+    /// ES steps 11-15 invariant checks against the target descriptor.
     fn proxy_op_get(
         &mut self,
         proxy: Handle<JsObject>,
@@ -2580,21 +2604,19 @@ impl Interp<'_> {
         // ToPropertyKey before the trap sees the key (spec step order: the
         // key is materialised once, ahead of the handler lookup).
         let key = self.property_key(key_v)?;
-        let key_v = if let Some(h) = key.string() {
-            JsValue::string(h)
-        } else if let Some(y) = key.symbol() {
-            JsValue::symbol(y)
-        } else {
-            // Unreachable: `property_key` is string-or-symbol by construction.
-            JsValue::undefined()
-        };
+        let key_v = prop_key_value(key);
         let get_key = self.new_temp_key("get");
         let trap_v = self.get_property(0, 0, JsValue::object(handler), get_key)?;
         let Some(trap) = trap_v.as_object() else {
             if trap_v.is_undefined() || trap_v.is_null() {
                 // No trap (`GetMethod` maps null to undefined): forward to
-                // the target through the ordinary path.
-                return self.get_property(0, 0, JsValue::object(target), key_v);
+                // the target's `[[Get]]` with the original receiver. A proxy
+                // target recurses through its own `get` trap; an ordinary one
+                // resolves with the receiver for inherited accessors.
+                if self.heap.get(target).kind == Kind::Proxy {
+                    return self.proxy_op_get(target, receiver, key_v);
+                }
+                return self.ordinary_get_with_receiver(target, receiver, key, key_v);
             }
             return Err(JSException(
                 self.error_value("TypeError: 'get' trap must be a function"),
@@ -2606,11 +2628,76 @@ impl Interp<'_> {
             ));
         }
         self.gc_protect();
-        self.call_inline(
+        let result = self.call_inline(
             trap,
             JsValue::object(handler),
             &[JsValue::object(target), key_v, receiver],
-        )
+        )?;
+        // ES steps 11-15: read the target descriptor *after* the trap. A
+        // non-configurable non-writable data property pins the result; a
+        // non-configurable setterless accessor fixes it at `undefined`.
+        if let Some(desc) = self.object_get_own_property(target, key)?
+            && desc.has_configurable
+            && !desc.configurable
+        {
+            if desc.is_data()
+                && desc.has_writable
+                && !desc.writable
+                && !ops::strict_equals(self.heap, desc.value, result)
+            {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'get' trap result differs from a non-configurable non-writable target property",
+                )));
+            }
+            if desc.is_accessor()
+                && (!desc.has_get || desc.get.is_undefined())
+                && !result.is_undefined()
+            {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'get' trap result differs from a non-configurable accessor with an undefined getter",
+                )));
+            }
+        }
+        Ok(result)
+    }
+
+    /// `OrdinaryGet` with an explicit receiver (ES 10.1.8): walk the chain,
+    /// invoking a found accessor with the receiver; a data property returns
+    /// the holder's stored value. When the walk finds no own descriptor the
+    /// engine's synthesized surfaces (string indices/length, RegExp and
+    /// method tables) are reached through the ordinary `get_property` path.
+    fn ordinary_get_with_receiver(
+        &mut self,
+        obj: Handle<JsObject>,
+        receiver: JsValue,
+        key: PropKey,
+        key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        // No proxy at `obj` (callers guarantee this); proxy ancestors are
+        // handled by recursing instead of walking through them.
+        let mut cur = Some(obj);
+        while let Some(o) = cur {
+            if self.heap.get(o).kind == Kind::Proxy {
+                return self.proxy_op_get(o, receiver, key_v);
+            }
+            if let Some(desc) = self.ordinary_own_descriptor(o, key) {
+                if desc.is_accessor() {
+                    if desc.has_get && !desc.get.is_undefined() {
+                        if let Some(getter) = desc.get.as_object() {
+                            return self.call_accessor(getter, receiver);
+                        }
+                    }
+                    return Ok(JsValue::undefined());
+                }
+                // Data descriptor: the stored value is read from the holder.
+                return Ok(desc.value);
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        // No real own data/accessor descriptor anywhere: fall back to the
+        // ordinary read so synthesized surfaces (string indices, RegExp
+        // `lastIndex`/well-known symbols, function `length`) still resolve.
+        self.get_property(0, 0, JsValue::object(obj), key_v)
     }
 
     /// Proxy `[[OwnPropertyKeys]]` (ES 10.5.11): consult the handler's
