@@ -16,6 +16,101 @@ use super::{
 use crate::ops;
 use v12_native::NativeId;
 
+/// One own property as the proxy trap algorithms consume it (ES descriptor
+/// record). Absent fields mirror `ToPropertyDescriptor`'s optional slots;
+/// `is_data`/`is_accessor`/`is_generic` classify the shape.
+#[derive(Clone, Copy)]
+pub(crate) struct OwnDesc {
+    pub has_value: bool,
+    pub value: JsValue,
+    pub has_writable: bool,
+    pub writable: bool,
+    pub has_get: bool,
+    pub get: JsValue,
+    pub has_set: bool,
+    pub set: JsValue,
+    pub has_enumerable: bool,
+    pub enumerable: bool,
+    pub has_configurable: bool,
+    pub configurable: bool,
+}
+
+impl Default for OwnDesc {
+    fn default() -> Self {
+        Self {
+            has_value: false,
+            value: JsValue::undefined(),
+            has_writable: false,
+            writable: false,
+            has_get: false,
+            get: JsValue::undefined(),
+            has_set: false,
+            set: JsValue::undefined(),
+            has_enumerable: false,
+            enumerable: false,
+            has_configurable: false,
+            configurable: false,
+        }
+    }
+}
+
+impl OwnDesc {
+    pub(crate) fn is_accessor(&self) -> bool {
+        self.has_get || self.has_set
+    }
+
+    pub(crate) fn is_data(&self) -> bool {
+        self.has_value || self.has_writable
+    }
+
+    pub(crate) fn is_generic(&self) -> bool {
+        !self.is_accessor() && !self.is_data()
+    }
+}
+
+/// The `JsValue` a trap receives as its property-key argument.
+fn prop_key_value(key: PropKey) -> JsValue {
+    if let Some(h) = key.string() {
+        JsValue::string(h)
+    } else if let Some(y) = key.symbol() {
+        JsValue::symbol(y)
+    } else {
+        JsValue::undefined()
+    }
+}
+
+/// ES `IsCompatiblePropertyDescriptor`: may `desc` be applied to an object
+/// whose existing property is `current`? Conservative: only the checks the
+/// proxy invariant suite exercises (configurability and value equality on a
+/// non-configurable property) are enforced.
+fn desc_compatible(extensible: bool, desc: OwnDesc, current: OwnDesc) -> bool {
+    let _ = extensible;
+    if desc.has_configurable
+        && !desc.configurable
+        && current.has_configurable
+        && current.configurable
+    {
+        return false;
+    }
+    if current.has_configurable && !current.configurable {
+        if current.is_data() && desc.is_accessor() {
+            return false;
+        }
+        if current.is_accessor() && desc.is_data() {
+            return false;
+        }
+        if current.is_data() && current.has_writable && !current.writable {
+            if desc.has_writable && desc.writable {
+                return false;
+            }
+            if desc.has_value && desc.value != current.value {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 impl Interp<'_> {
     pub(crate) fn get_property(
         &mut self,
@@ -1347,6 +1442,875 @@ impl Interp<'_> {
         Ok(false)
     }
 
+    // ------------------------------------------------------------------
+    // Proxy trap primitives (ES 10.5)
+    //
+    // The engine-side `Object.*`/`Reflect.*` statics cannot invoke a trap:
+    // their native handlers only hold `&mut Heap`. These helpers run at the
+    // interpreter seam (reached from both call and construct paths via
+    // `dispatch_native` -> `run_callback_builtin`) so every static that
+    // observes a `Kind::Proxy` receiver re-enters the machine.
+    // ------------------------------------------------------------------
+
+    /// Resolves `handler.<name>`, mapping an absent/`undefined`/`null` method
+    /// to `None` (ES `GetMethod`) and a present non-callable to a `TypeError`.
+    fn proxy_trap_method(
+        &mut self,
+        handler: Handle<JsObject>,
+        name: &str,
+    ) -> Result<Option<Handle<JsObject>>, JSException> {
+        let key = self.new_temp_key(name);
+        let trap_v = self.get_property(0, 0, JsValue::object(handler), key)?;
+        if trap_v.is_undefined() || trap_v.is_null() {
+            return Ok(None);
+        }
+        let Some(trap) = trap_v.as_object() else {
+            return Err(JSException(self.error_value(&format!(
+                "TypeError: '{name}' trap must be a function"
+            ))));
+        };
+        if self.heap.get(trap).kind != Kind::Function {
+            return Err(JSException(self.error_value(&format!(
+                "TypeError: '{name}' trap must be a function"
+            ))));
+        }
+        Ok(Some(trap))
+    }
+
+    /// `target`/`handler` pair for a live proxy, or the revoked-proxy
+    /// `TypeError` naming the internal method that observed it.
+    fn proxy_parts(
+        &mut self,
+        proxy: Handle<JsObject>,
+        op: &str,
+    ) -> Result<(Handle<JsObject>, Handle<JsObject>), JSException> {
+        let (target, handler) = {
+            let o = self.heap.get(proxy);
+            (o.proxy_target, o.proxy_handler)
+        };
+        match (target, handler) {
+            (Some(t), Some(h)) => Ok((t, h)),
+            _ => Err(JSException(self.error_value(&format!(
+                "TypeError: Cannot perform '{op}' on a proxy that has been revoked"
+            )))),
+        }
+    }
+
+    /// `[[GetPrototypeOf]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_proto_of(
+        &mut self,
+        obj: Handle<JsObject>,
+    ) -> Result<JsValue, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_get_prototype_of(obj);
+        }
+        Ok(match self.heap.get(obj).prototype {
+            Some(p) => JsValue::object(p),
+            None => JsValue::null(),
+        })
+    }
+
+    /// `[[IsExtensible]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_is_extensible(
+        &mut self,
+        obj: Handle<JsObject>,
+    ) -> Result<bool, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_is_extensible(obj);
+        }
+        Ok(self.heap.get(obj).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0)
+    }
+
+    /// `[[OwnPropertyKeys]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_own_keys(
+        &mut self,
+        obj: Handle<JsObject>,
+    ) -> Result<Vec<PropKey>, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_own_keys(obj);
+        }
+        Ok(self.ordinary_own_keys(obj))
+    }
+
+    /// Ordinary `[[GetOwnProperty]]` as an [`OwnDesc`]; `None` when absent.
+    /// Element-store indices read all-true attributes (v1 does not model
+    /// per-element attributes).
+    pub(crate) fn ordinary_own_descriptor(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: PropKey,
+    ) -> Option<OwnDesc> {
+        let kind = self.heap.get(obj).kind;
+        if (kind == Kind::Array || kind == Kind::Arguments)
+            && let Some(idx) = self.prop_key_index(key)
+        {
+            let v = self.heap.get(obj).get_element(idx)?;
+            if v.is_hole() {
+                return None;
+            }
+            return Some(OwnDesc {
+                has_value: true,
+                value: v,
+                has_writable: true,
+                writable: true,
+                has_enumerable: true,
+                enumerable: true,
+                has_configurable: true,
+                configurable: true,
+                ..Default::default()
+            });
+        }
+        if let Some(entry) = self
+            .heap
+            .get(obj)
+            .dictionary
+            .as_ref()
+            .and_then(|m| m.get(&key))
+            .copied()
+        {
+            if entry.is_accessor {
+                return Some(OwnDesc {
+                    has_get: true,
+                    get: entry
+                        .getter
+                        .map(JsValue::object)
+                        .unwrap_or(JsValue::undefined()),
+                    has_set: true,
+                    set: entry
+                        .setter
+                        .map(JsValue::object)
+                        .unwrap_or(JsValue::undefined()),
+                    has_enumerable: true,
+                    enumerable: entry.attrs.enumerable(),
+                    has_configurable: true,
+                    configurable: entry.attrs.configurable(),
+                    ..Default::default()
+                });
+            }
+            let live = self
+                .heap
+                .get(obj)
+                .properties
+                .get(entry.slot as usize)
+                .is_some_and(|v| !v.is_hole());
+            if !live {
+                return None;
+            }
+            let value = self
+                .heap
+                .get(obj)
+                .properties
+                .get(entry.slot as usize)
+                .copied()
+                .unwrap_or(JsValue::undefined());
+            return Some(OwnDesc {
+                has_value: true,
+                value,
+                has_writable: true,
+                writable: entry.attrs.writable(),
+                has_enumerable: true,
+                enumerable: entry.attrs.enumerable(),
+                has_configurable: true,
+                configurable: entry.attrs.configurable(),
+                ..Default::default()
+            });
+        }
+        let shape = self.shape_of(obj);
+        match self.heap.lookup_property(shape, key).copied()? {
+            v12_heap::Descriptor::Data { slot, attrs, .. } => {
+                let live = self
+                    .heap
+                    .get(obj)
+                    .properties
+                    .get(slot as usize)
+                    .is_some_and(|v| !v.is_hole());
+                if !live {
+                    return None;
+                }
+                let value = self
+                    .heap
+                    .get(obj)
+                    .properties
+                    .get(slot as usize)
+                    .copied()
+                    .unwrap_or(JsValue::undefined());
+                Some(OwnDesc {
+                    has_value: true,
+                    value,
+                    has_writable: true,
+                    writable: attrs.writable(),
+                    has_enumerable: true,
+                    enumerable: attrs.enumerable(),
+                    has_configurable: true,
+                    configurable: attrs.configurable(),
+                    ..Default::default()
+                })
+            }
+            v12_heap::Descriptor::Accessor {
+                getter,
+                setter,
+                attrs,
+                ..
+            } => Some(OwnDesc {
+                has_get: true,
+                get: getter.map(JsValue::object).unwrap_or(JsValue::undefined()),
+                has_set: true,
+                set: setter.map(JsValue::object).unwrap_or(JsValue::undefined()),
+                has_enumerable: true,
+                enumerable: attrs.enumerable(),
+                has_configurable: true,
+                configurable: attrs.configurable(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// `PropKey` → element index when the key names a canonical array index.
+    fn prop_key_index(&mut self, key: PropKey) -> Option<u32> {
+        let h = key.string()?;
+        let text = self.string_text(h);
+        if text.is_empty() || text.len() > 10 {
+            return None;
+        }
+        let mut acc: u32 = 0;
+        for b in text.bytes() {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            acc = acc.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+        }
+        Some(acc)
+    }
+
+    /// Materializes [`OwnDesc`] as a plain descriptor object for a trap
+    /// argument (ES `FromPropertyDescriptor`).
+    pub(crate) fn own_desc_to_object(&mut self, desc: OwnDesc) -> JsValue {
+        self.gc_protect();
+        let d = self.heap.alloc(JsObject::default());
+        self.heap.add_root(JsValue::object(d));
+        let put = |this: &mut Self, name: &str, v: JsValue| {
+            let key = this.new_temp_key(name);
+            let _ = this.define_own_data_attrs(JsValue::object(d), key, v, Attrs::DEFAULT);
+        };
+        if desc.is_accessor() {
+            put(self, "get", desc.get);
+            put(self, "set", desc.set);
+        } else {
+            put(self, "value", desc.value);
+            put(self, "writable", JsValue::from_bool(desc.writable));
+        }
+        put(self, "enumerable", JsValue::from_bool(desc.enumerable));
+        put(self, "configurable", JsValue::from_bool(desc.configurable));
+        JsValue::object(d)
+    }
+
+    /// `[[GetOwnProperty]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_get_own_property(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: PropKey,
+    ) -> Result<Option<OwnDesc>, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_get_own_property(obj, key);
+        }
+        Ok(self.ordinary_own_descriptor(obj, key))
+    }
+
+    /// `[[Delete]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_delete(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Result<bool, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_delete(obj, key_v);
+        }
+        self.delete_property(JsValue::object(obj), key_v)
+    }
+
+    /// `[[SetPrototypeOf]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_set_prototype_of(
+        &mut self,
+        obj: Handle<JsObject>,
+        proto: Option<Handle<JsObject>>,
+    ) -> Result<bool, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_set_prototype_of(obj, proto);
+        }
+        // ES 9.1.2: same-value short-circuits true; non-extensible refuses.
+        if proto == self.heap.get(obj).prototype {
+            return Ok(true);
+        }
+        if self.heap.get(obj).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE != 0 {
+            return Ok(false);
+        }
+        let mut cur = proto;
+        while let Some(p) = cur {
+            if p == obj {
+                return Ok(false);
+            }
+            cur = self.heap.get(p).prototype;
+        }
+        let cell = self.heap.validity_cell_of(obj);
+        self.heap.bump_validity(cell);
+        self.heap.bump_proto_generation();
+        self.heap.get_mut(obj).prototype = proto;
+        Ok(true)
+    }
+
+    /// `[[PreventExtensions]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_prevent_extensions(
+        &mut self,
+        obj: Handle<JsObject>,
+    ) -> Result<bool, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_prevent_extensions(obj);
+        }
+        self.heap.get_mut(obj).flags |= v12_heap::JsObject::FLAG_NOT_EXTENSIBLE;
+        let cell = self.heap.validity_cell_of(obj);
+        self.heap.bump_validity(cell);
+        Ok(true)
+    }
+
+    /// `[[DefineOwnProperty]]` of an object, dispatching a proxy to its trap.
+    pub(crate) fn object_define_own_property(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: PropKey,
+        desc: OwnDesc,
+    ) -> Result<bool, JSException> {
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_define_own_property(obj, key, desc);
+        }
+        self.ordinary_define_from_own_desc(obj, key, desc)
+    }
+
+    /// `[[IsExtensible]]` (ES 10.5.3).
+    fn proxy_op_is_extensible(&mut self, proxy: Handle<JsObject>) -> Result<bool, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "isExtensible")?;
+        let extensible_target =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let Some(trap) = self.proxy_trap_method(handler, "isExtensible")? else {
+            return Ok(extensible_target);
+        };
+        self.gc_protect();
+        let result =
+            self.call_inline(trap, JsValue::object(handler), &[JsValue::object(target)])?;
+        let boolean = ops::to_boolean(self.heap, result);
+        // ES step 10: the trap result must agree with the target.
+        if boolean != extensible_target {
+            return Err(JSException(
+                self.error_value("TypeError: 'isExtensible' trap result mismatch"),
+            ));
+        }
+        Ok(boolean)
+    }
+
+    /// `[[PreventExtensions]]` (ES 10.5.4).
+    fn proxy_op_prevent_extensions(
+        &mut self,
+        proxy: Handle<JsObject>,
+    ) -> Result<bool, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "preventExtensions")?;
+        let target_extensible =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let Some(trap) = self.proxy_trap_method(handler, "preventExtensions")? else {
+            // Forward to the target, then mirror the result on the proxy.
+            let forwarded = self.object_prevent_extensions(target)?;
+            if forwarded {
+                self.heap.get_mut(proxy).flags |= v12_heap::JsObject::FLAG_NOT_EXTENSIBLE;
+                let cell = self.heap.validity_cell_of(proxy);
+                self.heap.bump_validity(cell);
+            }
+            return Ok(forwarded);
+        };
+        self.gc_protect();
+        let result =
+            self.call_inline(trap, JsValue::object(handler), &[JsValue::object(target)])?;
+        if !ops::to_boolean(self.heap, result) {
+            return Ok(false);
+        }
+        // ES step 12: a true result requires the target to be non-extensible.
+        if target_extensible {
+            return Err(JSException(self.error_value(
+                "TypeError: 'preventExtensions' trap returned true for an extensible target",
+            )));
+        }
+        self.heap.get_mut(proxy).flags |= v12_heap::JsObject::FLAG_NOT_EXTENSIBLE;
+        let cell = self.heap.validity_cell_of(proxy);
+        self.heap.bump_validity(cell);
+        Ok(true)
+    }
+
+    /// `[[GetPrototypeOf]]` (ES 10.5.1).
+    fn proxy_op_get_prototype_of(
+        &mut self,
+        proxy: Handle<JsObject>,
+    ) -> Result<JsValue, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "getPrototypeOf")?;
+        let target_proto = self.heap.get(target).prototype;
+        let target_extensible =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let Some(trap) = self.proxy_trap_method(handler, "getPrototypeOf")? else {
+            return Ok(match target_proto {
+                Some(p) => JsValue::object(p),
+                None => JsValue::null(),
+            });
+        };
+        self.gc_protect();
+        let result =
+            self.call_inline(trap, JsValue::object(handler), &[JsValue::object(target)])?;
+        // ES step 9: the trap result must be an object or null.
+        if !result.is_null() && result.as_object().is_none() {
+            return Err(JSException(self.error_value(
+                "TypeError: 'getPrototypeOf' trap result must be an object or null",
+            )));
+        }
+        // ES step 10: a non-extensible target requires proto identity.
+        if !target_extensible && result.as_object() != target_proto {
+            return Err(JSException(self.error_value(
+                "TypeError: 'getPrototypeOf' trap result differs from the target's prototype",
+            )));
+        }
+        Ok(result)
+    }
+
+    /// `[[SetPrototypeOf]]` (ES 10.5.2).
+    fn proxy_op_set_prototype_of(
+        &mut self,
+        proxy: Handle<JsObject>,
+        proto: Option<Handle<JsObject>>,
+    ) -> Result<bool, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "setPrototypeOf")?;
+        let target_proto = self.heap.get(target).prototype;
+        let target_extensible =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let Some(trap) = self.proxy_trap_method(handler, "setPrototypeOf")? else {
+            return self.object_set_prototype_of(target, proto);
+        };
+        let proto_v = match proto {
+            Some(p) => JsValue::object(p),
+            None => JsValue::null(),
+        };
+        self.gc_protect();
+        let result = self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[JsValue::object(target), proto_v],
+        )?;
+        if !ops::to_boolean(self.heap, result) {
+            return Ok(false);
+        }
+        // ES step 12: a true result for a non-extensible target requires the
+        // requested proto to equal the target's current proto.
+        if !target_extensible && proto != target_proto {
+            return Err(JSException(self.error_value(
+                "TypeError: 'setPrototypeOf' trap result differs from the target's prototype",
+            )));
+        }
+        let cell = self.heap.validity_cell_of(proxy);
+        self.heap.bump_validity(cell);
+        self.heap.bump_proto_generation();
+        self.heap.get_mut(proxy).prototype = proto;
+        Ok(true)
+    }
+
+    /// `[[Delete]]` (ES 10.5.10).
+    fn proxy_op_delete(
+        &mut self,
+        proxy: Handle<JsObject>,
+        key_v: JsValue,
+    ) -> Result<bool, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "deleteProperty")?;
+        let key = self.property_key(key_v)?;
+        let target_desc = self.ordinary_own_descriptor(target, key);
+        let target_extensible =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let key_v = prop_key_value(key);
+        let Some(trap) = self.proxy_trap_method(handler, "deleteProperty")? else {
+            return self.object_delete(target, key_v);
+        };
+        self.gc_protect();
+        let result = self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[JsValue::object(target), key_v],
+        )?;
+        let boolean = ops::to_boolean(self.heap, result);
+        if !boolean {
+            return Ok(false);
+        }
+        // ES step 12: an own non-configurable target property cannot be
+        // reported deleted unless the target is non-extensible.
+        if let Some(desc) = target_desc
+            && desc.has_configurable
+            && !desc.configurable
+            && target_extensible
+        {
+            return Err(JSException(self.error_value(
+                "TypeError: 'deleteProperty' trap cannot delete a non-configurable property",
+            )));
+        }
+        Ok(true)
+    }
+
+    /// `[[GetOwnProperty]]` (ES 10.5.5).
+    fn proxy_op_get_own_property(
+        &mut self,
+        proxy: Handle<JsObject>,
+        key: PropKey,
+    ) -> Result<Option<OwnDesc>, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "getOwnPropertyDescriptor")?;
+        let target_desc = self.ordinary_own_descriptor(target, key);
+        let target_extensible =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let key_v = prop_key_value(key);
+        let Some(trap) = self.proxy_trap_method(handler, "getOwnPropertyDescriptor")? else {
+            return Ok(target_desc);
+        };
+        self.gc_protect();
+        let result = self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[JsValue::object(target), key_v],
+        )?;
+        if result.is_undefined() {
+            // ES step 14: `undefined` demands an extensible target and no
+            // non-configurable own property.
+            if let Some(td) = target_desc
+                && td.has_configurable
+                && !td.configurable
+            {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'getOwnPropertyDescriptor' trap reported a non-configurable property as absent",
+                )));
+            }
+            if !target_extensible {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'getOwnPropertyDescriptor' trap reported a property of a non-extensible target as absent",
+                )));
+            }
+            return Ok(None);
+        }
+        let Some(obj) = result.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: 'getOwnPropertyDescriptor' trap result must be an object or undefined",
+            )));
+        };
+        let trap_desc = self.read_trap_descriptor(obj)?;
+        // ES step 16: a complete trap descriptor must be compatible with the
+        // target descriptor and cannot report a non-configurable property as
+        // configurable.
+        if let Some(td) = target_desc {
+            if trap_desc.has_configurable && !trap_desc.configurable {
+                if !td.has_configurable || td.configurable {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'getOwnPropertyDescriptor' trap reported a non-configurable property for a configurable target property",
+                    )));
+                }
+                if td.is_data() && td.writable && (!trap_desc.has_writable || trap_desc.writable) {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
+                    )));
+                }
+                if !desc_compatible(target_extensible, trap_desc, td) {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
+                    )));
+                }
+            }
+        } else if !target_extensible {
+            return Err(JSException(self.error_value(
+                "TypeError: 'getOwnPropertyDescriptor' trap reported a property for a non-extensible target",
+            )));
+        }
+        Ok(Some(trap_desc))
+    }
+
+    /// `[[DefineOwnProperty]]` (ES 10.5.6).
+    fn proxy_op_define_own_property(
+        &mut self,
+        proxy: Handle<JsObject>,
+        key: PropKey,
+        desc: OwnDesc,
+    ) -> Result<bool, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "defineProperty")?;
+        let target_desc = self.ordinary_own_descriptor(target, key);
+        let target_extensible =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let key_v = prop_key_value(key);
+        let setting_config_false = desc.has_configurable && !desc.configurable;
+        let desc_v = self.own_desc_to_object(desc);
+        let Some(trap) = self.proxy_trap_method(handler, "defineProperty")? else {
+            return self.ordinary_define_from_own_desc(target, key, desc);
+        };
+        self.gc_protect();
+        let result = self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[JsValue::object(target), key_v, desc_v],
+        )?;
+        if !ops::to_boolean(self.heap, result) {
+            return Ok(false);
+        }
+        match target_desc {
+            None => {
+                // ES step 19.
+                if !target_extensible {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'defineProperty' trap added a property to a non-extensible target",
+                    )));
+                }
+                if setting_config_false {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'defineProperty' trap reported a non-configurable property that does not exist",
+                    )));
+                }
+            }
+            Some(td) => {
+                // ES step 20.
+                if setting_config_false && td.has_configurable && td.configurable {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'defineProperty' trap reported a non-configurable property for a configurable target property",
+                    )));
+                }
+                if td.is_data()
+                    && td.has_configurable
+                    && !td.configurable
+                    && td.writable
+                    && desc.has_writable
+                    && !desc.writable
+                {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'defineProperty' trap reported non-writable for a non-configurable writable target property",
+                    )));
+                }
+                if td.has_configurable
+                    && !td.configurable
+                    && !desc_compatible(target_extensible, desc, td)
+                {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'defineProperty' trap result is not compatible with the target descriptor",
+                    )));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Reads a trap-produced descriptor object through ES
+    /// `ToPropertyDescriptor` (absent fields stay absent).
+    pub(crate) fn read_trap_descriptor(
+        &mut self,
+        obj: Handle<JsObject>,
+    ) -> Result<OwnDesc, JSException> {
+        let mut out = OwnDesc::default();
+        for name in [
+            "value",
+            "writable",
+            "enumerable",
+            "configurable",
+            "get",
+            "set",
+        ] {
+            let key = self.new_temp_key(name);
+            let pk = self.property_key(key)?;
+            if !self.object_has_property(obj, pk)? {
+                continue;
+            }
+            let got = self.get_property(0, 0, JsValue::object(obj), key)?;
+            match name {
+                "value" => {
+                    out.has_value = true;
+                    out.value = got;
+                }
+                "writable" => {
+                    out.has_writable = true;
+                    out.writable = ops::to_boolean(self.heap, got);
+                }
+                "enumerable" => {
+                    out.has_enumerable = true;
+                    out.enumerable = ops::to_boolean(self.heap, got);
+                }
+                "configurable" => {
+                    out.has_configurable = true;
+                    out.configurable = ops::to_boolean(self.heap, got);
+                }
+                "get" => {
+                    if !got.is_undefined()
+                        && !got
+                            .as_object()
+                            .is_some_and(|h| self.heap.get(h).kind == Kind::Function)
+                    {
+                        return Err(JSException(self.error_value(
+                            "TypeError: Accessor must be a function or undefined",
+                        )));
+                    }
+                    out.has_get = true;
+                    out.get = got;
+                }
+                "set" => {
+                    if !got.is_undefined()
+                        && !got
+                            .as_object()
+                            .is_some_and(|h| self.heap.get(h).kind == Kind::Function)
+                    {
+                        return Err(JSException(self.error_value(
+                            "TypeError: Accessor must be a function or undefined",
+                        )));
+                    }
+                    out.has_set = true;
+                    out.set = got;
+                }
+                _ => {}
+            }
+        }
+        if out.is_data() && out.is_accessor() {
+            return Err(JSException(self.error_value(
+                "TypeError: Invalid property descriptor: cannot specify both value and accessor fields",
+            )));
+        }
+        Ok(out)
+    }
+
+    /// `HasProperty` (prototype-walking) for an ordinary receiver.
+    pub(crate) fn object_has_property(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: PropKey,
+    ) -> Result<bool, JSException> {
+        let key_v = prop_key_value(key);
+        self.op_in(key_v, JsValue::object(obj))
+    }
+
+    /// Ordinary `[[DefineOwnProperty]]` from an already-read [`OwnDesc`]:
+    /// only the fields the descriptor carries are applied (unspecified
+    /// attributes keep their current value for an existing key).
+    pub(crate) fn ordinary_define_from_own_desc(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: PropKey,
+        desc: OwnDesc,
+    ) -> Result<bool, JSException> {
+        let existing = self.ordinary_own_descriptor(obj, key);
+        if let Some(cur) = existing {
+            // ES 10.1.6.3 step 3: a non-configurable property refuses a
+            // change of configurable, writable, or kind; a value change is
+            // refused only when the property is also non-writable.
+            if cur.has_configurable && !cur.configurable {
+                if desc.has_configurable && desc.configurable {
+                    return Ok(false);
+                }
+                if cur.is_data() != desc.is_data() && !desc.is_generic() {
+                    return Ok(false);
+                }
+                if cur.is_data() && cur.has_writable && !cur.writable {
+                    if desc.has_writable && desc.writable {
+                        return Ok(false);
+                    }
+                    if desc.has_value && desc.value != cur.value {
+                        return Ok(false);
+                    }
+                }
+            }
+        } else if self.heap.get(obj).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE != 0 {
+            return Ok(false);
+        }
+        self.apply_own_desc(obj, key, desc, existing)
+    }
+
+    /// Applies [`OwnDesc`] to an ordinary object (shape or element store).
+    /// Absent descriptor fields keep the current attribute when the property
+    /// exists and default to `false` when it is new (ES step 6).
+    fn apply_own_desc(
+        &mut self,
+        obj: Handle<JsObject>,
+        key: PropKey,
+        desc: OwnDesc,
+        existing: Option<OwnDesc>,
+    ) -> Result<bool, JSException> {
+        let key_v = prop_key_value(key);
+        let kind = self.heap.get(obj).kind;
+        if (kind == Kind::Array || kind == Kind::Arguments)
+            && let Some(idx) = self.prop_key_index(key)
+        {
+            if desc.is_accessor() {
+                return Ok(false);
+            }
+            let value = if desc.has_value {
+                desc.value
+            } else {
+                self.array_element(obj, idx)
+            };
+            self.array_set_element(obj, idx, value);
+            return Ok(true);
+        }
+        let base = existing.unwrap_or_default();
+        let attrs = Attrs::new(
+            if desc.has_writable {
+                desc.writable
+            } else {
+                base.writable
+            },
+            if desc.has_enumerable {
+                desc.enumerable
+            } else {
+                base.enumerable
+            },
+            if desc.has_configurable {
+                desc.configurable
+            } else {
+                base.configurable
+            },
+        );
+        if desc.is_accessor() || existing.is_some_and(|e| e.is_accessor()) {
+            let getter = if desc.has_get {
+                desc.get
+            } else {
+                JsValue::undefined()
+            };
+            let setter = if desc.has_set {
+                desc.set
+            } else {
+                JsValue::undefined()
+            };
+            self.define_accessor_own(obj, key_v, getter, setter, attrs)?;
+            return Ok(true);
+        }
+        if desc.has_value {
+            self.define_own_data_attrs(JsValue::object(obj), key_v, desc.value, attrs)?;
+        }
+        Ok(true)
+    }
+
+    /// Replaces an own accessor with the given getter/setter pair.
+    fn define_accessor_own(
+        &mut self,
+        obj: Handle<JsObject>,
+        key_v: JsValue,
+        getter_v: JsValue,
+        setter_v: JsValue,
+        attrs: Attrs,
+    ) -> Result<(), JSException> {
+        let key = self.property_key(key_v)?;
+        let getter = getter_v
+            .as_object()
+            .filter(|h| self.heap.get(*h).kind == Kind::Function);
+        let setter = setter_v
+            .as_object()
+            .filter(|h| self.heap.get(*h).kind == Kind::Function);
+        self.gc_protect();
+        let shape = self.shape_of(obj);
+        let child = self.heap.define_accessor(shape, key, getter, setter, attrs);
+        self.bind_shape(obj, child);
+        let slot = child_slot(self.heap, child);
+        let props = &mut self.heap.get_mut(obj).properties;
+        if props.len() <= slot {
+            props.resize(slot + 1, JsValue::hole());
+        }
+        Ok(())
+    }
+
     /// Proxy `[[Set]]` (ES 10.5.9): consult the handler's `set` trap.
     ///
     /// Absent or `undefined` trap forwards to the target's ordinary write
@@ -1546,50 +2510,19 @@ impl Interp<'_> {
     /// proxy target). A present non-callable trap is a `TypeError`. A present
     /// trap runs via `call_inline` and its result goes through
     /// `CreateListFromArrayLike` (object with a `length`, every entry a
-    /// String or Symbol, else `TypeError`) plus the duplicate-entry check.
-    ///
-    /// PENDING-WIRING: no caller routes here yet. `Object.keys`,
-    /// `Object.getOwnPropertyNames`, `Object.getOwnPropertySymbols`, and
-    /// for-in (`ObjectEnumerableOwnKeys`) all live in
-    /// `v12-engine/src/builtins/object.rs` (frozen this lane) and walk shapes
-    /// directly; each must route `Kind::Proxy` receivers to this dispatcher.
-    ///
-    /// Deliberate limitations: the extensible-target / non-configurable-key
-    /// invariant checks are not applied; a `length` past `u32::MAX` is a
-    /// `TypeError` (arrays cannot exceed it; absurd array-likes would hang
-    /// the dispatch loop, the same DoS class `dense_bound` hardens in the
-    /// builtins).
-    #[allow(dead_code)] // PENDING-WIRING: no caller routes here yet (see above).
+    /// String or Symbol, else `TypeError`) plus the duplicate-entry check and
+    /// the ES steps 13–20 invariant sweep.
     pub(crate) fn proxy_op_own_keys(
         &mut self,
         proxy: Handle<JsObject>,
     ) -> Result<Vec<PropKey>, JSException> {
-        let (target, handler) = {
-            let o = self.heap.get(proxy);
-            (o.proxy_target, o.proxy_handler)
+        let (target, handler) = self.proxy_parts(proxy, "ownKeys")?;
+        let extensible_target =
+            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let Some(trap) = self.proxy_trap_method(handler, "ownKeys")? else {
+            // No trap: forward to the target's ordinary keys.
+            return self.object_own_keys(target);
         };
-        // Revoked proxy (both slots cleared by revocation): TypeError.
-        let (Some(target), Some(handler)) = (target, handler) else {
-            return Err(JSException(self.error_value(
-                "TypeError: Cannot perform 'ownKeys' on a proxy that has been revoked",
-            )));
-        };
-        let trap_key = self.new_temp_key("ownKeys");
-        let trap_v = self.get_property(0, 0, JsValue::object(handler), trap_key)?;
-        let Some(trap) = trap_v.as_object() else {
-            if trap_v.is_undefined() || trap_v.is_null() {
-                // No trap: forward to the target's ordinary keys.
-                return Ok(self.ordinary_own_keys(target));
-            }
-            return Err(JSException(
-                self.error_value("TypeError: 'ownKeys' trap must be a function"),
-            ));
-        };
-        if self.heap.get(trap).kind != Kind::Function {
-            return Err(JSException(
-                self.error_value("TypeError: 'ownKeys' trap must be a function"),
-            ));
-        }
         self.gc_protect();
         let result =
             self.call_inline(trap, JsValue::object(handler), &[JsValue::object(target)])?;
@@ -1634,6 +2567,53 @@ impl Interp<'_> {
             }
             keys.push(key);
         }
+        // ES steps 13–20: split the target's own keys into non-configurable
+        // and configurable groups and verify the trap result against them.
+        let target_keys = self.object_own_keys(target)?;
+        let mut target_nonconfigurable: Vec<PropKey> = Vec::new();
+        let mut target_configurable: Vec<PropKey> = Vec::new();
+        for &k in &target_keys {
+            let desc = self.ordinary_own_descriptor(target, k);
+            let nonconfig = desc.is_some_and(|d| d.has_configurable && !d.configurable);
+            if nonconfig {
+                target_nonconfigurable.push(k);
+            } else {
+                target_configurable.push(k);
+            }
+        }
+        if extensible_target && target_nonconfigurable.is_empty() {
+            return Ok(keys);
+        }
+        let mut unchecked = keys.clone();
+        let remove = |unchecked: &mut Vec<PropKey>, k: PropKey| -> bool {
+            if let Some(pos) = unchecked.iter().position(|&x| x == k) {
+                unchecked.remove(pos);
+                true
+            } else {
+                false
+            }
+        };
+        for &k in &target_nonconfigurable {
+            if !remove(&mut unchecked, k) {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'ownKeys' trap result is missing a non-configurable target key",
+                )));
+            }
+        }
+        if !extensible_target {
+            for &k in &target_configurable {
+                if !remove(&mut unchecked, k) {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'ownKeys' trap result is missing a target key",
+                    )));
+                }
+            }
+            if !unchecked.is_empty() {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'ownKeys' trap result contains new keys for a non-extensible target",
+                )));
+            }
+        }
         Ok(keys)
     }
 
@@ -1642,7 +2622,7 @@ impl Interp<'_> {
     /// (shape descriptors, then dictionary-rung overflow by sequence), then
     /// symbol keys in the same two-tier order. Holed data slots are absent,
     /// matching what `in` observes.
-    fn ordinary_own_keys(&mut self, obj: Handle<JsObject>) -> Vec<PropKey> {
+    pub(crate) fn ordinary_own_keys(&mut self, obj: Handle<JsObject>) -> Vec<PropKey> {
         let mut keys: Vec<PropKey> = Vec::new();
         let kind = self.heap.get(obj).kind;
         if kind == Kind::Array || kind == Kind::Arguments {
@@ -1857,6 +2837,11 @@ impl Interp<'_> {
             // Primitives have no own properties: nothing to remove.
             return Ok(true);
         };
+
+        // Proxy exotic: `[[Delete]]` is the `deleteProperty` trap (ES 10.5.10).
+        if self.heap.get(obj).kind == Kind::Proxy {
+            return self.proxy_op_delete(obj, key_v);
+        }
 
         // Flatten-once so the index scan and the intern below share it.
         self.flatten_key(key_v);

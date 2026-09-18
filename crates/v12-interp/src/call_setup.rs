@@ -7,6 +7,7 @@ use v12_heap::{Attrs, Descriptor, Handle, HeapExt, JsObject, JsValue, Kind, Prop
 use super::{CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH};
 use crate::execute::decode_parked_call;
 use crate::ops;
+use crate::property::OwnDesc;
 use v12_native::NativeId;
 
 /// Resolves `[callee][this][args…]` at `callee_reg` in the current frame
@@ -1555,8 +1556,320 @@ impl Interp<'_> {
             | NativeId::IteratorSome
             | NativeId::IteratorEvery
             | NativeId::IteratorFind => Some(self.run_iterator_callback(id, this_v, args)),
+            // Object/Reflect statics whose spec algorithm invokes a Proxy
+            // handler trap: only intercepted when the receiver is a proxy
+            // (otherwise the registry native stays authoritative).
+            NativeId::ObjectKeys
+            | NativeId::ObjectGetOwnPropertyNames
+            | NativeId::ObjectGetOwnPropertySymbols
+            | NativeId::ObjectValues
+            | NativeId::ObjectEntries
+            | NativeId::ObjectGetOwnPropertyDescriptor
+            | NativeId::ObjectGetOwnPropertyDescriptors
+            | NativeId::ObjectDefineProperty
+            | NativeId::ObjectDefineProperties
+            | NativeId::ObjectGetPrototypeOf
+            | NativeId::ObjectSetPrototypeOf
+            | NativeId::ObjectIsExtensible
+            | NativeId::ObjectPreventExtensions
+            | NativeId::ObjectFreeze
+            | NativeId::ObjectSeal
+            | NativeId::ReflectGet
+            | NativeId::ReflectSet
+            | NativeId::ReflectHas
+            | NativeId::ReflectDeleteProperty
+            | NativeId::ReflectOwnKeys
+            | NativeId::ReflectGetOwnPropertyDescriptor
+            | NativeId::ReflectDefineProperty
+            | NativeId::ReflectGetPrototypeOf
+            | NativeId::ReflectSetPrototypeOf
+            | NativeId::ReflectIsExtensible
+            | NativeId::ReflectPreventExtensions => self.run_proxy_static(id, this_v, args),
             _ => None,
         }
+    }
+
+    /// Routes an `Object.*`/`Reflect.*` static through the interpreter only
+    /// when its receiver is a proxy; every other receiver returns `None` so
+    /// the registry native stays the single implementation.
+    fn run_proxy_static(
+        &mut self,
+        id: NativeId,
+        _this_v: JsValue,
+        args: &[JsValue],
+    ) -> Option<Result<JsValue, JSException>> {
+        let arg = args.first().copied().unwrap_or(JsValue::undefined());
+        // Primitive receivers keep the registry native's behavior.
+        let obj = arg.as_object()?;
+        if self.heap.get(obj).kind != Kind::Proxy {
+            return None;
+        }
+        Some(self.run_proxy_static_inner(id, obj, args))
+    }
+
+    fn run_proxy_static_inner(
+        &mut self,
+        id: NativeId,
+        proxy: Handle<JsObject>,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        match id {
+            NativeId::ObjectKeys
+            | NativeId::ObjectGetOwnPropertyNames
+            | NativeId::ObjectGetOwnPropertySymbols
+            | NativeId::ObjectValues
+            | NativeId::ObjectEntries => self.proxy_enumerate(id, proxy),
+            NativeId::ObjectGetOwnPropertyDescriptor
+            | NativeId::ReflectGetOwnPropertyDescriptor => {
+                let key =
+                    self.property_key(args.get(1).copied().unwrap_or(JsValue::undefined()))?;
+                Ok(match self.object_get_own_property(proxy, key)? {
+                    Some(desc) => self.own_desc_to_object(desc),
+                    None => JsValue::undefined(),
+                })
+            }
+            NativeId::ObjectGetOwnPropertyDescriptors => {
+                let keys = self.object_own_keys(proxy)?;
+                self.gc_protect();
+                let out = self.heap.alloc(JsObject::default());
+                self.heap.add_root(JsValue::object(out));
+                for k in keys {
+                    let Some(desc) = self.object_get_own_property(proxy, k)? else {
+                        continue;
+                    };
+                    let d = self.own_desc_to_object(desc);
+                    let _ = self.define_own_data_attrs(
+                        JsValue::object(out),
+                        prop_key_value(k),
+                        d,
+                        Attrs::DEFAULT,
+                    );
+                }
+                Ok(JsValue::object(out))
+            }
+            NativeId::ObjectDefineProperty | NativeId::ReflectDefineProperty => {
+                let key =
+                    self.property_key(args.get(1).copied().unwrap_or(JsValue::undefined()))?;
+                let desc_v = args.get(2).copied().unwrap_or(JsValue::undefined());
+                let desc = self.to_property_descriptor(desc_v)?;
+                let defined = self.object_define_own_property(proxy, key, desc)?;
+                if id == NativeId::ReflectDefineProperty {
+                    return Ok(JsValue::from_bool(defined));
+                }
+                if defined {
+                    Ok(JsValue::object(proxy))
+                } else {
+                    Err(JSException(
+                        self.error_value("TypeError: Cannot redefine property"),
+                    ))
+                }
+            }
+            NativeId::ObjectDefineProperties => {
+                let props_v = args.get(1).copied().unwrap_or(JsValue::undefined());
+                self.define_properties_on(proxy, props_v)?;
+                Ok(JsValue::object(proxy))
+            }
+            NativeId::ObjectGetPrototypeOf | NativeId::ReflectGetPrototypeOf => {
+                self.object_proto_of(proxy)
+            }
+            NativeId::ObjectSetPrototypeOf | NativeId::ReflectSetPrototypeOf => {
+                let proto = self.set_proto_arg(args.get(1).copied())?;
+                let ok = self.object_set_prototype_of(proxy, proto)?;
+                if id == NativeId::ReflectSetPrototypeOf {
+                    return Ok(JsValue::from_bool(ok));
+                }
+                if ok {
+                    Ok(JsValue::object(proxy))
+                } else {
+                    Err(JSException(self.error_value(
+                        "TypeError: cannot set prototype of a non-extensible object",
+                    )))
+                }
+            }
+            NativeId::ObjectIsExtensible | NativeId::ReflectIsExtensible => {
+                Ok(JsValue::from_bool(self.object_is_extensible(proxy)?))
+            }
+            NativeId::ObjectPreventExtensions | NativeId::ReflectPreventExtensions => {
+                let ok = self.object_prevent_extensions(proxy)?;
+                if id == NativeId::ReflectPreventExtensions {
+                    return Ok(JsValue::from_bool(ok));
+                }
+                Ok(JsValue::object(proxy))
+            }
+            NativeId::ObjectFreeze | NativeId::ObjectSeal => {
+                self.set_integrity_on(proxy, id == NativeId::ObjectFreeze)?;
+                Ok(JsValue::object(proxy))
+            }
+            NativeId::ReflectHas => {
+                let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
+                Ok(JsValue::from_bool(
+                    self.op_in(key_v, JsValue::object(proxy))?,
+                ))
+            }
+            NativeId::ReflectDeleteProperty => {
+                let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
+                Ok(JsValue::from_bool(self.object_delete(proxy, key_v)?))
+            }
+            NativeId::ReflectOwnKeys => {
+                let keys = self.object_own_keys(proxy)?;
+                let items: Vec<JsValue> = keys.into_iter().map(prop_key_value).collect();
+                Ok(JsValue::object(self.heap.alloc(JsObject::array(items))))
+            }
+            NativeId::ReflectGet => {
+                let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
+                self.get_property(0, 0, JsValue::object(proxy), key_v)
+            }
+            NativeId::ReflectSet => {
+                let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
+                let value = args.get(2).copied().unwrap_or(JsValue::undefined());
+                self.set_property(JsValue::object(proxy), key_v, value, false)?;
+                Ok(JsValue::from_bool(true))
+            }
+            _ => Ok(JsValue::undefined()),
+        }
+    }
+
+    /// `EnumerableOwnProperties`-style read over a proxy (ES 7.3.24): for each
+    /// `ownKeys` result, consult `[[GetOwnProperty]]` on the proxy itself (so
+    /// the `getOwnPropertyDescriptor` trap fires) and collect by kind.
+    fn proxy_enumerate(
+        &mut self,
+        id: NativeId,
+        proxy: Handle<JsObject>,
+    ) -> Result<JsValue, JSException> {
+        let keys = self.object_own_keys(proxy)?;
+        let mut names: Vec<JsValue> = Vec::new();
+        let mut values: Vec<JsValue> = Vec::new();
+        for k in keys {
+            let Some(desc) = self.object_get_own_property(proxy, k)? else {
+                continue;
+            };
+            let wanted = match id {
+                NativeId::ObjectKeys | NativeId::ObjectValues | NativeId::ObjectEntries => {
+                    desc.enumerable
+                }
+                NativeId::ObjectGetOwnPropertyNames => !k.is_symbol(),
+                NativeId::ObjectGetOwnPropertySymbols => k.is_symbol(),
+                _ => false,
+            };
+            if !wanted {
+                continue;
+            }
+            if id == NativeId::ObjectGetOwnPropertyNames
+                || id == NativeId::ObjectGetOwnPropertySymbols
+            {
+                names.push(prop_key_value(k));
+                continue;
+            }
+            if id == NativeId::ObjectValues || id == NativeId::ObjectEntries {
+                let v = self.get_property(0, 0, JsValue::object(proxy), prop_key_value(k))?;
+                values.push(v);
+            }
+            names.push(prop_key_value(k));
+        }
+        match id {
+            NativeId::ObjectKeys => Ok(JsValue::object(self.heap.alloc(JsObject::array(names)))),
+            NativeId::ObjectGetOwnPropertyNames | NativeId::ObjectGetOwnPropertySymbols => {
+                Ok(JsValue::object(self.heap.alloc(JsObject::array(names))))
+            }
+            NativeId::ObjectValues => Ok(JsValue::object(self.heap.alloc(JsObject::array(values)))),
+            NativeId::ObjectEntries => {
+                let mut entries: Vec<JsValue> = Vec::with_capacity(names.len());
+                for (k, v) in names.into_iter().zip(values) {
+                    let pair = self.heap.alloc(JsObject::array(vec![k, v]));
+                    entries.push(JsValue::object(pair));
+                }
+                Ok(JsValue::object(self.heap.alloc(JsObject::array(entries))))
+            }
+            _ => Ok(JsValue::undefined()),
+        }
+    }
+
+    /// ES `ToPropertyDescriptor` over a descriptor object (traps on its
+    /// getters are not a concern for the descriptor objects the suite uses).
+    fn to_property_descriptor(&mut self, v: JsValue) -> Result<OwnDesc, JSException> {
+        let Some(obj) = v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: Property description must be an object"),
+            ));
+        };
+        self.read_trap_descriptor(obj)
+    }
+
+    /// Normalizes the `Object.setPrototypeOf`/`Reflect.setPrototypeOf` proto
+    /// argument (object or null, else TypeError).
+    fn set_proto_arg(
+        &mut self,
+        v: Option<JsValue>,
+    ) -> Result<Option<Handle<JsObject>>, JSException> {
+        let v = v.unwrap_or(JsValue::undefined());
+        if v.is_null() {
+            return Ok(None);
+        }
+        v.as_object().map(Some).ok_or_else(|| {
+            JSException(self.error_value("TypeError: prototype must be an object or null"))
+        })
+    }
+
+    /// ES `DefineProperties` over a proxy target.
+    fn define_properties_on(
+        &mut self,
+        obj: Handle<JsObject>,
+        props_v: JsValue,
+    ) -> Result<(), JSException> {
+        let Some(props) = props_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: properties must be an object"),
+            ));
+        };
+        let keys = self.ordinary_own_keys(props);
+        for k in keys {
+            let Some(entry) = self.ordinary_own_descriptor(props, k) else {
+                continue;
+            };
+            if !entry.enumerable {
+                continue;
+            }
+            let key_v = prop_key_value(k);
+            let desc_v = self.get_property(0, 0, JsValue::object(props), key_v)?;
+            let desc = self.to_property_descriptor(desc_v)?;
+            let _ = self.object_define_own_property(obj, k, desc)?;
+        }
+        Ok(())
+    }
+
+    /// ES `SetIntegrityLevel`: `[[PreventExtensions]]` then freeze/seal every
+    /// own property through the proxy's own traps.
+    fn set_integrity_on(&mut self, obj: Handle<JsObject>, frozen: bool) -> Result<(), JSException> {
+        if !self.object_prevent_extensions(obj)? {
+            return Ok(());
+        }
+        let keys = self.object_own_keys(obj)?;
+        for k in keys {
+            let Some(cur) = self.object_get_own_property(obj, k)? else {
+                continue;
+            };
+            let mut desc = cur;
+            if desc.is_accessor() {
+                desc.has_configurable = true;
+                desc.configurable = false;
+            } else {
+                if frozen {
+                    desc.has_writable = true;
+                    desc.writable = false;
+                }
+                desc.has_configurable = true;
+                desc.configurable = false;
+            }
+            let _ = self.object_define_own_property(obj, k, desc)?;
+        }
+        let flag = if frozen {
+            v12_heap::JsObject::FLAG_SEALED | v12_heap::JsObject::FLAG_FROZEN
+        } else {
+            v12_heap::JsObject::FLAG_SEALED
+        };
+        self.heap.get_mut(obj).flags |= flag;
+        Ok(())
     }
 
     /// ES `String(value)` with the string-hint ToPrimitive so a user
@@ -2119,5 +2432,16 @@ impl Interp<'_> {
         elems.extend(undefineds);
         self.heap.get_mut(obj).replace_elements(elems);
         Ok(JsValue::object(obj))
+    }
+}
+
+/// The `JsValue` a trap receives as its property-key argument.
+fn prop_key_value(key: PropKey) -> JsValue {
+    if let Some(h) = key.string() {
+        JsValue::string(h)
+    } else if let Some(y) = key.symbol() {
+        JsValue::symbol(y)
+    } else {
+        JsValue::undefined()
     }
 }
