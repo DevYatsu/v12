@@ -2157,8 +2157,11 @@ impl Interp<'_> {
             NativeId::ReflectSet => {
                 let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
                 let value = args.get(2).copied().unwrap_or(JsValue::undefined());
-                self.set_property(JsValue::object(proxy), key_v, value, false)?;
-                Ok(JsValue::from_bool(true))
+                let receiver = args.get(3).copied().unwrap_or(JsValue::object(proxy));
+                // `Reflect.set` reports the `[[Set]]` boolean rather than
+                // throwing; the receiver defaults to the proxy itself.
+                let ok = self.proxy_op_set(proxy, receiver, key_v, value)?;
+                Ok(JsValue::from_bool(ok))
             }
             _ => Ok(JsValue::undefined()),
         }

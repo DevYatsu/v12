@@ -1072,9 +1072,16 @@ impl Interp<'_> {
 
         // Proxy exotic: `[[Set]]` is the `set` trap (ES 10.5.9). Checked
         // before the element fast path and the RegExp slot so a proxy is
-        // never treated as an ordinary object.
+        // never treated as an ordinary object. A `false` result is the spec's
+        // `[[Set]]` failure: strict mode throws, sloppy drops the write.
         if self.heap.get(obj).kind == Kind::Proxy {
-            return self.proxy_op_set(obj, obj_v, key_v, value);
+            let ok = self.proxy_op_set(obj, obj_v, key_v, value)?;
+            if !ok && strict {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'set' on proxy returned false",
+                )));
+            }
+            return Ok(());
         }
 
         // Flatten-once (same contract as `get_property`): the element fast
@@ -1173,37 +1180,52 @@ impl Interp<'_> {
             return Ok(());
         }
 
-        // An inherited non-writable data property or accessor without setter
-        // blocks shadowing (ES OrdinarySet): silent in sloppy, TypeError in
-        // strict.
-        if let Some(d) = self.inherited_descriptor(obj, key) {
-            match d {
-                Descriptor::Data { attrs, .. } if !attrs.writable() => {
-                    if strict {
+        // ES 10.1.9 `OrdinarySet` step 1: walk the prototype chain one level
+        // at a time. A proxy ancestor answers via its own `[[Set]]` (`set`
+        // trap) with the original receiver; an ordinary ancestor's first own
+        // descriptor governs — a non-writable data property or a setterless
+        // accessor blocks the write (silent in sloppy, TypeError in strict),
+        // an accessor with a setter is invoked with the receiver.
+        {
+            let mut cur = self.heap.get(obj).prototype;
+            while let Some(p) = cur {
+                if self.heap.get(p).kind == Kind::Proxy {
+                    let ok = self.proxy_op_set(p, JsValue::object(obj), key_v, value)?;
+                    if !ok && strict {
                         return Err(JSException(
-                            self.error_value("TypeError: cannot assign to read-only property"),
+                            self.error_value("TypeError: 'set' on proxy returned false"),
                         ));
                     }
                     return Ok(());
                 }
-                Descriptor::Accessor { setter, .. } if setter.is_none() => {
-                    if strict {
-                        return Err(JSException(self.error_value(
-                            "TypeError: cannot assign to accessor without setter",
-                        )));
+                if let Some(d) = self.ordinary_own_descriptor(p, key) {
+                    if d.is_accessor() {
+                        if !d.has_set || d.set.is_undefined() {
+                            if strict {
+                                return Err(JSException(self.error_value(
+                                    "TypeError: cannot assign to accessor without setter",
+                                )));
+                            }
+                            return Ok(());
+                        }
+                        if let Some(setter) = d.set.as_object() {
+                            self.call_accessor_with(setter, JsValue::object(obj), &[value])?;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    if d.has_writable && !d.writable {
+                        if strict {
+                            return Err(JSException(
+                                self.error_value("TypeError: cannot assign to read-only property"),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    // A writable inherited data property falls through to the
+                    // own-property creation below.
+                    break;
                 }
-                Descriptor::Accessor {
-                    setter: Some(setter),
-                    ..
-                } => {
-                    // Inherited accessor with setter: invoke it with the
-                    // receiver and the assigned value.
-                    self.call_accessor_with(setter, JsValue::object(obj), &[value])?;
-                    return Ok(());
-                }
-                _ => {}
+                cur = self.heap.get(p).prototype;
             }
         }
 
@@ -1355,46 +1377,6 @@ impl Interp<'_> {
         }
         settings.property_keys[slot] = Some(key);
         Ok(())
-    }
-
-    /// First descriptor naming `key` along `obj`'s prototype chain.
-    pub(crate) fn inherited_descriptor(
-        &mut self,
-        obj: Handle<JsObject>,
-        key: PropKey,
-    ) -> Option<Descriptor> {
-        let mut cur = self.heap.get(obj).prototype;
-        while let Some(o) = cur {
-            // Dictionary rung first (overflow keys live only here).
-            if let Some(entry) = self
-                .heap
-                .get(o)
-                .dictionary
-                .as_ref()
-                .and_then(|m| m.get(&key))
-                .copied()
-            {
-                if entry.is_accessor {
-                    return Some(Descriptor::Accessor {
-                        key,
-                        getter: entry.getter,
-                        setter: entry.setter,
-                        attrs: entry.attrs,
-                    });
-                }
-                return Some(Descriptor::Data {
-                    key,
-                    slot: entry.slot,
-                    attrs: entry.attrs,
-                });
-            }
-            let sh = self.shape_of(o);
-            if let Some(d) = self.heap.lookup_property(sh, key) {
-                return Some(*d);
-            }
-            cur = self.heap.get(o).prototype;
-        }
-        None
     }
 
     /// `in` operator: `key in obj`. Throws TypeError if `obj` is not an
@@ -2313,22 +2295,19 @@ impl Interp<'_> {
 
     /// Proxy `[[Set]]` (ES 10.5.9): consult the handler's `set` trap.
     ///
-    /// Absent or `undefined` trap forwards to the target's ordinary write
-    /// (which recursively handles a proxy target). A present non-callable trap
-    /// is a `TypeError`. The trap result is coerced with ToBoolean; sloppy
-    /// `set_property` has no boolean channel, so a falsy result is a silent
-    /// no-op (strict-mode throw is a v1 gap, documented here).
-    ///
-    /// Deliberate limitation: the spec's invariant checks (falsy result for a
-    /// non-configurable non-writable target data property, etc.) are not
-    /// applied.
-    fn proxy_op_set(
+    /// Returns the boolean result the spec's `[[Set]]` yields so
+    /// `Reflect.set` can report it and strict-mode assignment can throw on
+    /// `false`. Absent or `undefined` trap forwards to the target's ordinary
+    /// write with the *original* receiver (ES step 11). A present non-callable
+    /// trap is a `TypeError`. The trap result is coerced with ToBoolean, then
+    /// the ES steps 12-16 invariants are checked against the target.
+    pub(crate) fn proxy_op_set(
         &mut self,
         proxy: Handle<JsObject>,
         receiver: JsValue,
         key_v: JsValue,
         value: JsValue,
-    ) -> Result<(), JSException> {
+    ) -> Result<bool, JSException> {
         let (target, handler) = {
             let o = self.heap.get(proxy);
             (o.proxy_target, o.proxy_handler)
@@ -2341,21 +2320,14 @@ impl Interp<'_> {
         };
         // ToPropertyKey before the trap sees the key (spec step order).
         let key = self.property_key(key_v)?;
-        let key_v = if let Some(h) = key.string() {
-            JsValue::string(h)
-        } else if let Some(y) = key.symbol() {
-            JsValue::symbol(y)
-        } else {
-            // Unreachable: `property_key` is string-or-symbol by construction.
-            JsValue::undefined()
-        };
+        let key_v = prop_key_value(key);
         let set_key = self.new_temp_key("set");
         let trap_v = self.get_property(0, 0, JsValue::object(handler), set_key)?;
         let Some(trap) = trap_v.as_object() else {
             if trap_v.is_undefined() || trap_v.is_null() {
                 // No trap (`GetMethod` maps null to undefined): forward to
-                // the target through the ordinary path.
-                return self.set_property(JsValue::object(target), key_v, value, false);
+                // the target through `target.[[Set]](P, V, Receiver)`.
+                return self.ordinary_set_with_receiver(target, key, value, receiver);
             }
             return Err(JSException(
                 self.error_value("TypeError: 'set' trap must be a function"),
@@ -2372,8 +2344,147 @@ impl Interp<'_> {
             JsValue::object(handler),
             &[JsValue::object(target), key_v, value, receiver],
         )?;
-        let _ = ops::to_boolean(self.heap, result);
-        Ok(())
+        if !ops::to_boolean(self.heap, result) {
+            return Ok(false);
+        }
+        // ES steps 12-16: read the target state *after* the trap (a trap that
+        // mutates the target must be observed). A true result demands the
+        // target property be compatible with the write.
+        let target_desc = self.object_get_own_property(target, key)?;
+        match target_desc {
+            Some(desc) if desc.is_data() && desc.has_writable && !desc.writable => {
+                if desc.has_value && desc.value != value {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'set' trap returned true for a non-configurable non-writable target property with a different value",
+                    )));
+                }
+            }
+            Some(desc) if desc.is_accessor() => {
+                let no_setter = !desc.has_set || desc.set.is_undefined();
+                if no_setter {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'set' trap returned true for a non-configurable accessor without a setter",
+                    )));
+                }
+            }
+            None => {
+                if !self.object_is_extensible(target)? {
+                    return Err(JSException(self.error_value(
+                        "TypeError: 'set' trap returned true for an absent property of a non-extensible target",
+                    )));
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// ES 10.1.9 `OrdinarySetWithOwnDescriptor`, reduced to the target walk
+    /// `[[Set]]` needs when no `set` trap is installed: `target.[[Set]](P, V,
+    /// Receiver)` with the receiver threaded through, so a receiver distinct
+    /// from the target consults the receiver's own `[[GetOwnProperty]]` /
+    /// `[[DefineOwnProperty]]` (which may themselves be proxy traps).
+    fn ordinary_set_with_receiver(
+        &mut self,
+        target: Handle<JsObject>,
+        key: PropKey,
+        value: JsValue,
+        receiver: JsValue,
+    ) -> Result<bool, JSException> {
+        // Step 1: own descriptor, else recurse into the prototype; a null
+        // prototype falls back to a writable data descriptor (step 1.c).
+        let own = self.object_get_own_property(target, key)?;
+        let own = match own {
+            Some(d) => d,
+            None => {
+                let parent_v = self.object_proto_of(target)?;
+                let Some(parent) = parent_v.as_object() else {
+                    let default = OwnDesc {
+                        has_value: true,
+                        value: JsValue::undefined(),
+                        has_writable: true,
+                        writable: true,
+                        has_enumerable: true,
+                        enumerable: true,
+                        has_configurable: true,
+                        configurable: true,
+                        ..Default::default()
+                    };
+                    return self.receiver_store(&default, key, value, receiver);
+                };
+                // A proxy parent recurses through its own `[[Set]]` (step
+                // 1.b.i); an ordinary parent recurses as `OrdinarySet`.
+                if self.heap.get(parent).kind == Kind::Proxy {
+                    return self.proxy_op_set(parent, receiver, prop_key_value(key), value);
+                }
+                return self.ordinary_set_with_receiver(parent, key, value, receiver);
+            }
+        };
+        self.receiver_store(&own, key, value, receiver)
+    }
+
+    /// ES 10.1.9 steps 2-7 over the resolved `ownDesc`: a writable data
+    /// descriptor writes through the receiver's own `[[GetOwnProperty]]` +
+    /// `[[DefineOwnProperty]]`; an accessor without a setter fails; an
+    /// accessor with one is invoked with the receiver.
+    fn receiver_store(
+        &mut self,
+        own: &OwnDesc,
+        key: PropKey,
+        value: JsValue,
+        receiver: JsValue,
+    ) -> Result<bool, JSException> {
+        if own.is_data() {
+            // Step 2.a.
+            if own.has_writable && !own.writable {
+                return Ok(false);
+            }
+            // Step 2.b.
+            let Some(receiver_obj) = receiver.as_object() else {
+                return Ok(false);
+            };
+            // Steps 2.c-2.d: a distinct receiver is written through its own
+            // `[[GetOwnProperty]]` + `[[DefineOwnProperty]]`.
+            let existing = self.object_get_own_property(receiver_obj, key)?;
+            match existing {
+                Some(d) => {
+                    if d.is_accessor() {
+                        return Ok(false);
+                    }
+                    if d.has_writable && !d.writable {
+                        return Ok(false);
+                    }
+                    self.object_define_own_property(
+                        receiver_obj,
+                        key,
+                        OwnDesc {
+                            has_value: true,
+                            value,
+                            ..Default::default()
+                        },
+                    )
+                }
+                None => self.object_define_own_property(
+                    receiver_obj,
+                    key,
+                    OwnDesc {
+                        has_value: true,
+                        value,
+                        ..Default::default()
+                    },
+                ),
+            }
+        } else {
+            // Steps 4-7: an accessor without a setter fails; one with a
+            // setter is invoked with the receiver.
+            if !own.has_set || own.set.is_undefined() {
+                return Ok(false);
+            }
+            if let Some(setter) = own.set.as_object() {
+                self.call_accessor_with(setter, receiver, &[value])?;
+            }
+            Ok(true)
+        }
     }
 
     /// Proxy `[[HasProperty]]` (ES 10.5.6): consult the handler's `has` trap.
