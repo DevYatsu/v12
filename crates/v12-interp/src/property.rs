@@ -2013,31 +2013,33 @@ impl Interp<'_> {
             )));
         };
         let trap_desc = self.read_trap_descriptor(obj)?;
-        // ES step 16: a complete trap descriptor must be compatible with the
-        // target descriptor and cannot report a non-configurable property as
-        // configurable.
-        if let Some(td) = target_desc {
-            if trap_desc.has_configurable && !trap_desc.configurable {
-                if !td.has_configurable || td.configurable {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'getOwnPropertyDescriptor' trap reported a non-configurable property for a configurable target property",
-                    )));
-                }
-                if td.is_data() && td.writable && (!trap_desc.has_writable || trap_desc.writable) {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
-                    )));
-                }
-                if !desc_compatible(target_extensible, trap_desc, td) {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
-                    )));
-                }
-            }
-        } else if !target_extensible {
+        // ES 10.5.5 step 17: a reported property of a non-extensible target
+        // with no matching own target descriptor is a TypeError.
+        if target_desc.is_none() && !target_extensible {
             return Err(JSException(self.error_value(
                 "TypeError: 'getOwnPropertyDescriptor' trap reported a property for a non-extensible target",
             )));
+        }
+        // ES 10.5.5 step 16: a non-configurable trap result demands an
+        // existing, non-configurable, compatible target descriptor.
+        if trap_desc.has_configurable && !trap_desc.configurable {
+            let Some(td) = target_desc.filter(|td| td.has_configurable && !td.configurable) else {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'getOwnPropertyDescriptor' trap reported a non-configurable property that is absent or configurable on the target",
+                )));
+            };
+            // Step 16.c.ii.2: a non-configurable, writable target data
+            // property may not be reported as non-writable.
+            if td.is_data() && td.writable && trap_desc.has_writable && !trap_desc.writable {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
+                )));
+            }
+            if !desc_compatible(target_extensible, trap_desc, td) {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
+                )));
+            }
         }
         Ok(Some(trap_desc))
     }
