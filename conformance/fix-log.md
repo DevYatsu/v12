@@ -2,6 +2,18 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/sloppy-this: sloppy-mode `this` binds the global object [lane/sloppy-this]
+
+- **Filters:** `language` (24 590), `--jobs 8`, TAP to file for the pass-set diff; base master `9dc28b6`.
+- **Before (master `9dc28b6`):** `language` **17 219 pass / 7 330 fail / 41 skip (70.1 %)**.
+- **After:** `language` **17 318 pass / 7 231 fail / 41 skip (70.5 %, +99)**. Panic count `grep -c 'panicked at'` = 0 in both TAPs.
+- **Root cause:** `OrdinaryCallBindThis` (ES 10.2.1.2) was not implemented for *function calls*: `call_setup.rs:24` read `this_v` raw and the frame's `this` slot was written unchanged, so a sloppy call with `this === undefined`/`null` (plain `f()`, `f.call(null)`) left `this` as `undefined` instead of the realm global object. The script/global path (`interp/lib.rs:1145-1154`) already installed the global correctly, so only calls were wrong. Harness-wide ripple: `fnGlobalObject.js` is `Function("return this;")()`, so every test relying on it received `undefined`.
+- **Fix:** new `Interp::bind_this(&self, fn_idx, program, this_v) -> JsValue` (ES 10.2.1.2, global mode): returns `this_v` verbatim when `f.is_strict || f.is_arrow` (arrows carry no own `this`); returns `JsValue::object(g)` when `this_v.is_null() || this_v.is_undefined()` and `self.global` is `Some`; otherwise `this_v`. Applied at the **four** call sites in `call_setup.rs`: the generator branch (`gen_this` before `create_generator_object`), the `fill_call_window` vector-call path (`window[0]`), the stack call path (`self.stack[new_base]`), and the nested/closure path (`self.stack[new_base]`). v1 has no primitive wrapper objects, so primitives are left unboxed (documented engine-wide gap).
+- **Files:** `crates/v12-interp/src/call_setup.rs` (+38/−5). No other file changed.
+- **Probes (`/tmp/this3.js`, all six pass):** sloppy plain call → global; `call(null)` → global; `call(undefined)` → global; strict keeps `null`; arrow inherits; `bind(undefined)` → global.
+- **Pass flip (analysed, not a defect, 1 test):** `language/expressions/object/method-definition/generator-invoke-fn-no-strict.js` previously passed as a **vacuous false pass** — the test asserts `assert.sameValue(thisValue, global)` where both came out `undefined` on master. With `global` now correctly the realm global object, the assertion exposes a **separate pre-existing generator bug**: a generator body still reads `this` as `undefined` (root-caused: the compiler emits `Opcode::CreateGenerator` in the generator wrapper prologue, and the interp arm at `execute.rs:912-940` — whose comment wrongly claims it is no longer emitted — allocates a **fresh** generator from the live frame instead of reusing the one `prepare_call` already built with the bound `this`, so the resumed frame's `r0` is `undefined`). The exposure is honest and the slice is net-positive (+99). Documented in `.orchestrator-notes.md`.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt --check` clean. TAP pass-set diff (`comm -23` before/after) is exactly the one flip above.
+
 ### 2026-09-18 — lane/eval-script-shim: `$262.evalScript` host contract [lane/eval-script-shim]
 
 - **Filter:** `annexB/language/global-code` (153), `language/global-code` (195), `--jobs 4`/`8`, default `--format human`.
