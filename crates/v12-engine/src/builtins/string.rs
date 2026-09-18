@@ -10,10 +10,53 @@ use v12_native::Throw;
 
 use super::{ctx::Ctx, helpers, iterator, regexp};
 
-/// The `this` string primitive, or a `TypeError` naming `method`.
+/// The `this` receiver coerced to a heap string via ES `RequireObjectCoercible`
+/// + `ToString` (ES §22.1.3): `String.prototype` methods are generic. A
+/// `undefined`/`null` receiver throws `TypeError`; a Symbol receiver also
+/// throws (`ToString` of a Symbol is a `TypeError`) — the one place the
+/// `String(x)` constructor intentionally differs.
 fn this_string(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<Handle<V12Str>, Throw> {
-    this.as_string()
-        .ok_or_else(|| ctx.type_error(format!("{method} called on non-string")))
+    if let Some(h) = this.as_string() {
+        return Ok(h);
+    }
+    if let Some(text) = primitive_this_text(ctx, this) {
+        return Ok(ctx.heap.intern_text(&text));
+    }
+    Err(receiver_type_error(ctx, method))
+}
+
+/// Error constructor the receiver check raises, with the realm global attached
+/// when the dispatcher left it out. The regexp-backed methods
+/// (`match`/`matchAll`/`replace`/`search`/`split`) are dispatched through
+/// `NativeRegistry::call_native`'s step-2 arms, which build `Ctx::new(heap,
+/// None, None)` and so would otherwise produce a `TypeError` with no
+/// `constructor` link — test262's `assert.throws` compares
+/// `thrown.constructor`, so the check must still see the realm class.
+fn receiver_type_error(ctx: &mut Ctx, method: &str) -> Throw {
+    if ctx.global.is_none() {
+        ctx.global = ctx.heap.realm_globals().first().copied();
+    }
+    ctx.type_error(format!(
+        "String.prototype.{method} requires that 'this' be coercible to a string"
+    ))
+}
+
+/// ES `ToString` for a non-string *primitive* receiver (`String.prototype`
+/// methods are generic). Returns `None` for `undefined`/`null` and Symbols
+/// (which throw `TypeError`, the spec `ToString` outcome) and for objects.
+///
+/// Object receivers stay rejected here: full spec coercion is `ToPrimitive`
+/// (which must invoke a user `toString`/`valueOf`), and the engine's current
+/// `Ctx::to_string` fallback renders `[object Object]` without that call.
+/// That gap is deliberate — coercing objects would also make
+/// `new String.prototype.charAt()` succeed, since the construct path hands
+/// the native the callee object as `this`; the `not-a-constructor` tests
+/// depend on that throw. Both need engine-level changes outside this lane.
+fn primitive_this_text(ctx: &mut Ctx, this: JsValue) -> Option<String> {
+    if this.is_undefined() || this.is_null() || this.is_symbol() || this.is_object() {
+        return None;
+    }
+    Some(ctx.to_string(this))
 }
 
 /// The regexp argument as a compiled-regexp object, or `None` when the
@@ -490,15 +533,18 @@ fn expand_replacement(template: &str, whole: &str, groups: &[&str]) -> String {
 // `StringPrim` const method table; `this` is the primitive itself).
 // ---------------------------------------------------------------------------
 
-/// The `this` receiver's text (string primitives only; wrapper objects are
-/// not modeled).
+/// The `this` receiver's text via ES `RequireObjectCoercible` + `ToString`
+/// (ES §22.1.3): the generic `String.prototype` receiver rule. A
+/// `undefined`/`null` receiver throws `TypeError`; a Symbol receiver also
+/// throws (`ToString` of a Symbol is a `TypeError`).
 fn this_text(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<String, Throw> {
-    match this.as_string() {
-        Some(h) => Ok(ctx.string_text(h)),
-        None => Err(ctx.type_error(format!(
-            "TypeError: String.prototype.{method} requires that 'this' be a String"
-        ))),
+    if let Some(h) = this.as_string() {
+        return Ok(ctx.string_text(h));
     }
+    if let Some(text) = primitive_this_text(ctx, this) {
+        return Ok(text);
+    }
+    Err(receiver_type_error(ctx, method))
 }
 
 /// Integer coercion shared by the index arguments (NaN → 0, truncation).
