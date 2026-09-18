@@ -166,11 +166,14 @@ impl Interp<'_> {
 
         // Generator function: calling it returns a generator object without executing body.
         if self.is_generator_fn_for(target_idx, callee_program) {
+            // Bind `this` at call time (OrdinaryCallBindThis); the generator
+            // body observes the bound receiver when resumed.
+            let gen_this = self.bind_this(target_idx, callee_program, this_v);
             let r#gen = self.create_generator_object(
                 target_idx,
                 callee_program,
                 captured_env,
-                this_v,
+                gen_this,
                 callee_slot,
                 argc,
             )?;
@@ -221,7 +224,7 @@ impl Interp<'_> {
                 (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
             };
             let mut window = vec![JsValue::undefined(); usize::from(callee_max_regs)];
-            window[0] = this_v;
+            window[0] = self.bind_this(target_idx, callee_program, this_v);
             let arg_src = callee_slot + 2;
             self.fill_call_window(
                 &mut window,
@@ -262,7 +265,10 @@ impl Interp<'_> {
         let arg_src = callee_slot + 2;
         let passed: Vec<JsValue> = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
         self.stack.resize(window_end, JsValue::undefined());
-        self.stack[new_base] = this_v;
+        // ES OrdinaryCallBindThis: resolve the frame's `this` binding for the
+        // callee's strictness *before* the frame runs.
+        let bound_this = self.bind_this(target_idx, callee_program, this_v);
+        self.stack[new_base] = bound_this;
         crate::call::fill_stack_call_window(
             self,
             new_base,
@@ -491,7 +497,7 @@ impl Interp<'_> {
                 let new_base = self.stack.len();
                 let window_end = new_base + usize::from(callee_max_regs);
                 self.stack.resize(window_end, JsValue::undefined());
-                self.stack[new_base] = this;
+                self.stack[new_base] = self.bind_this(fn_idx, func_program, this);
                 let (callee_has_rest, callee_fixed, callee_rest_reg) = {
                     let f = &funcs[fn_idx as usize];
                     (f.has_rest, f.fixed_params, f.rest_reg)
@@ -532,6 +538,32 @@ impl Interp<'_> {
                 Ok(self.top_result.take().unwrap_or(JsValue::undefined()))
             }
         }
+    }
+
+    /// ES 10.2.1.2 `OrdinaryCallBindThis`, global-`this` mode: a *sloppy*
+    /// function called with `undefined`/`null` binds the realm's global
+    /// object. Strict functions keep the receiver verbatim. Arrow functions
+    /// are skipped: they have no own `this` binding (their `ThisExpression`
+    /// resolves to the lexically enclosing home unit's `this`, so this slot
+    /// is never read for them).
+    ///
+    /// v1 has no primitive wrapper objects (`String`/`Number`/`Boolean`
+    /// boxing is a documented engine-wide gap), so a primitive receiver is
+    /// left as the primitive rather than boxed.
+    fn bind_this(&self, fn_idx: u32, program: u32, this_v: JsValue) -> JsValue {
+        let funcs = self.functions_for_program(program);
+        let Some(f) = funcs.get(fn_idx as usize) else {
+            return this_v;
+        };
+        if f.is_strict || f.is_arrow {
+            return this_v;
+        }
+        if (this_v.is_null() || this_v.is_undefined())
+            && let Some(g) = self.global
+        {
+            return JsValue::object(g);
+        }
+        this_v
     }
 
     /// Completes the top frame with `result`: deposits it into the caller's
@@ -995,7 +1027,8 @@ impl Interp<'_> {
         let new_base = caller_base + usize::from(caller_frame_regs);
         let window_end = new_base + usize::from(callee_max_regs);
         self.stack.resize(window_end, JsValue::undefined());
-        self.stack[new_base] = this_v;
+        let bound_this = self.bind_this(target_idx, callee_program, this_v);
+        self.stack[new_base] = bound_this;
         // Handle rest param for callee if present.
         let has_rest = callee_has_rest;
         let fixed = callee_fixed as usize;
