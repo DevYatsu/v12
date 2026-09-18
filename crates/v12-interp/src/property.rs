@@ -1259,8 +1259,7 @@ impl Interp<'_> {
         // blocker (step 4/5): extend the element store. `OrdinarySet` step
         // 2.e would create an own data property; for the element exotic that
         // is the element store.
-        if (self.heap.get(obj).kind == Kind::Array
-            || self.heap.get(obj).kind == Kind::Arguments)
+        if (self.heap.get(obj).kind == Kind::Array || self.heap.get(obj).kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
             self.array_set_element(obj, idx, value);
