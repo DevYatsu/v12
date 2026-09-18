@@ -60,6 +60,48 @@ pub(crate) fn emit_instance_fields(
     Ok(())
 }
 
+/// Emits the forwarding step of a class's spec-mandated default derived
+/// constructor: `super(...args)` (ES §15.7.1, `DefaultDerivedConstructor`).
+///
+/// The unit has no AST `super` node to lower, so this mirrors
+/// [`crate::expr`]'s `super_ctor`/`super_env_depth` pair directly. `collect`
+/// reserved a rest register for the unit (arity 0, so `r1`); the call ABI
+/// materializes the forwarded arguments there as a real array, which
+/// `CallApply` spreads into the parent constructor with the current `this`.
+fn emit_default_derived_super(
+    cx: &mut FnCtx<'_, '_, '_, '_>,
+    c: &Class<'_>,
+) -> Result<(), CompileError> {
+    // Env depth from this frame to the class scope captured by the nearest
+    // non-arrow unit that uses `super` (this constructor). Mirrors
+    // `expr::FnCtx::super_env_depth`; each env-bearing unit on the path
+    // contributes one parent link.
+    let depth = {
+        let units = &cx.comp.plans.units;
+        let mut depth = 0u8;
+        let mut cur = Some(cx.unit);
+        while let Some(u) = cur {
+            if units[u].has_env {
+                depth += 1;
+            }
+            if !units[u].is_arrow && units[u].uses_super {
+                break;
+            }
+            cur = units[u].parent;
+        }
+        depth
+    };
+    // Layout: [callee][this]; `CallApply` reads the args array from its third
+    // operand. `collect` set `has_rest`, so `r{arity+1}` holds the forwarded
+    // argument list (arity is 0 for the synthesised constructor).
+    let rest_reg = cx.comp.plans.units[cx.unit].arity as u16 + 1;
+    let block = cx.new_temps(crate::model::CALL_HEADER_REGS);
+    cx.emit_get_env(block, depth, crate::class::SLOT_SUPER_CTOR, c.span);
+    cx.move_reg(block + 1, REG_THIS, c.span);
+    cx.emit_reg3(Opcode::CallApply, block, block, rest_reg, c.span);
+    Ok(())
+}
+
 fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
     let mut fb = FunctionBytecode::with_instructions(Vec::new(), 1);
     fb.name_hint = name_hint;
@@ -299,9 +341,14 @@ pub fn compile_unit(
                     cx.ctor_body_f(&body.statements, |cx| emit_instance_fields(cx, c))?;
                 }
             } else if c.heritage.is_some() {
-                // Default derived constructor: `constructor(...args) {
-                // super(...args); }` — initialize fields after the (absent,
-                // not-yet-forwarded) super step.
+                // Default derived constructor (ES §15.7.1):
+                // `constructor(...args) { super(...args); }`. `collect`
+                // reserved a rest register for this unit, so the call ABI
+                // materialized the forwarded arguments into `r{arity+1}`
+                // (arity 0 here, so `r1`). Emit the parent-constructor call
+                // with `this`, then initialize instance fields after it
+                // returns (ES `InitializeInstanceElements`).
+                emit_default_derived_super(&mut cx, c)?;
                 emit_instance_fields(&mut cx, c)?;
             }
             // Default base constructor: field initializers above, then `return undefined`.
