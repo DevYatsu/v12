@@ -2,6 +2,28 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/obj-proto2: rest/spread and iterator-result objects link `%Object.prototype%` [lane/obj-proto2]
+
+- **Filters:** `language/expressions` (11 128), `language/statements` (9 369), `language/expressions/object` (1 170), `--jobs 8`, default `--format human`.
+- **Before (master `0642abb`, main worktree):** expressions 7 715 pass / 3 397 fail / 16 skip (69.4 %); statements 6 584 pass / 2 761 fail / 24 skip (70.5 %); expressions/object 845 pass / 325 fail / 0 skip (72.2 %).
+- **After:** expressions **7 715 / 3 397 / 16**; statements **6 584 / 2 761 / 24**; expressions/object **845 / 325 / 0** — counts identical, failure-name sets diffed clean (no previously-passing regressions). The two sites are exercised by passing tests whose prototype read is unrelated to the slice's failure clusters.
+- **Root cause:** allocations that build ordinary result objects skipped the `%Object.prototype%` link added for `Opcode::NewObject` by `lane/obj-proto`. Two remained: (1) `op_copy_object_rest` (`object_ops.rs`) allocated the source-coercion fallback and the destination with a default (null) `prototype`; (2) `make_iterator_result` (`generator_async.rs`) allocated the generator `.next()` `{value, done}` result the same way.
+- **Fix:** call the existing `self.link_object_proto(h)` immediately after each `heap.alloc(JsObject::default())`, before publishing/setting shape — mirroring `execute.rs` `Opcode::NewObject` ordering. Arguments precede roots, so the pre-alloc `gc_protect()` still covers each fresh handle.
+- **Files:** `crates/v12-interp/src/object_ops.rs` (2 sites), `crates/v12-interp/src/generator_async.rs` (1 site).
+- **Probe (`/tmp/repro.js`):** all `true` — `{...{a:1}}` proto, `{a,...r}` proto, `g().next()` proto, `Object.create(null)` proto is `null`, `{}` proto is `Object.prototype`.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt --check` clean.
+
+### 2026-09-18 — lane/call-window: extra actuals no longer clobber the reserved `undefined` register [lane/call-window]
+
+- **Filter:** `language/arguments-object` (263), `language/expressions` (11 128), `language/statements/class` (4 369), `--jobs 8`, default `--format human`, plus a per-test TAP diff (`--tap-out`) to prove zero lost passes.
+- **Before (clean master `0642abb`, main worktree):** arguments-object **75 pass / 188 fail / 0 skip (28.5 %)**; expressions **7 715 / 3 397 / 16 skip (69.4 %)**; class **2 766 / 1 603 / 0 skip (63.3 %)**.
+- **After:** arguments-object **86 / 177 / 0 (32.7 %)**; expressions **7 737 / 3 375 / 16 (69.6 %)**; class **2 776 / 1 593 / 0 (63.5 %)**. Net **+43** (+11 / +22 / +10), **0 lost passes** on every filter (TAP pass-set diff).
+- **Root cause:** each frame's register window is filled from the caller's actuals starting at `r1`. The compiler reserves the register at `locals_end` (`FnCtx::undef_reg`, `model.rs:582`) as the never-written source of the literal `undefined` and of uninitialized locals. The non-rest copy branches of the three window fillers copied **all** actuals, so any actual at index ≥ the declared formal count overwrote that reserved register and every later local. The `has_rest` branches already copied only `fixed` — that asymmetry is why rest-parameter functions were immune.
+- **Fix:** in `crates/v12-interp/src/call.rs`, bound the non-rest copy to `fixed` actuals in all three helpers (`fill_call_window`, `fill_stack_call_window`, `fill_stack_window_from_slice`), mirroring the existing `has_rest` bound exactly. The `has_rest` branches are untouched. `arguments` retains all actuals because `call_setup.rs:253` snapshots the full `passed` slice before the window copy.
+- **Files:** `crates/v12-interp/src/call.rs` (+17/−3). No other source file changed.
+- **Probe (`/tmp/t_collide3.js`):** before `u=43 a=42` / `u=44` / `u=42` / `q=7`; after `u=undefined a=42` / `u=undefined` / `u=undefined` / `q=undefined`. Extra cases (`/tmp/t_extra.js`): `arguments.length:arguments[1]` → `3:2`; rest → `undefined,2`; declared params → `1,2`; later local after extra actual → `5`; arity-0 → `undefined`.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-interp --check` clean.
+
 ### 2026-09-18 — lane/class-fields (Phase B): `NamedEvaluation` function-name inference [lane/class-fields]
 
 - **Filter:** `language/statements/class` (4 369), `language/expressions` (11 128), `--jobs 8`, default `--format human`.
