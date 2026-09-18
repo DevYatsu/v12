@@ -3040,9 +3040,13 @@ impl Interp<'_> {
         let Some(mut cur) = lhs_v.as_object() else {
             return Ok(false);
         };
+        // `OrdinaryHasInstance` walks `[[GetPrototypeOf]]`, so a proxy in the
+        // left operand's chain dispatches its `getPrototypeOf` trap and its
+        // `TypeError` on a non-extensible/mismatched target propagates
+        // (built-ins/Proxy/getPrototypeOf/instanceof-*).
         loop {
-            let next = self.heap.get(cur).prototype;
-            match next {
+            let next_v = self.object_proto_of(cur)?;
+            match next_v.as_object() {
                 None => return Ok(false),
                 Some(p) if p == proto_obj => return Ok(true),
                 Some(p) => cur = p,
