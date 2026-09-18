@@ -1788,16 +1788,15 @@ impl Interp<'_> {
     /// `[[IsExtensible]]` (ES 10.5.3).
     fn proxy_op_is_extensible(&mut self, proxy: Handle<JsObject>) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "isExtensible")?;
-        let extensible_target = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "isExtensible")? else {
-            return Ok(extensible_target);
+            return self.object_is_extensible(target);
         };
         self.gc_protect();
         let result =
             self.call_inline(trap, JsValue::object(handler), &[JsValue::object(target)])?;
         let boolean = ops::to_boolean(self.heap, result);
-        // ES step 10: the trap result must agree with the target.
-        if boolean != extensible_target {
+        // ES step 5: the target is read *after* the trap.
+        if boolean != self.object_is_extensible(target)? {
             return Err(JSException(
                 self.error_value("TypeError: 'isExtensible' trap result mismatch"),
             ));
@@ -1811,16 +1810,8 @@ impl Interp<'_> {
         proxy: Handle<JsObject>,
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "preventExtensions")?;
-        let target_extensible = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "preventExtensions")? else {
-            // Forward to the target, then mirror the result on the proxy.
-            let forwarded = self.object_prevent_extensions(target)?;
-            if forwarded {
-                self.heap.get_mut(proxy).flags |= v12_heap::JsObject::FLAG_NOT_EXTENSIBLE;
-                let cell = self.heap.validity_cell_of(proxy);
-                self.heap.bump_validity(cell);
-            }
-            return Ok(forwarded);
+            return self.object_prevent_extensions(target);
         };
         self.gc_protect();
         let result =
@@ -1828,15 +1819,13 @@ impl Interp<'_> {
         if !ops::to_boolean(self.heap, result) {
             return Ok(false);
         }
-        // ES step 12: a true result requires the target to be non-extensible.
-        if target_extensible {
+        // ES step 9: the target is re-read *after* the trap (a trap that calls
+        // `preventExtensions(target)` must be observed).
+        if self.object_is_extensible(target)? {
             return Err(JSException(self.error_value(
                 "TypeError: 'preventExtensions' trap returned true for an extensible target",
             )));
         }
-        self.heap.get_mut(proxy).flags |= v12_heap::JsObject::FLAG_NOT_EXTENSIBLE;
-        let cell = self.heap.validity_cell_of(proxy);
-        self.heap.bump_validity(cell);
         Ok(true)
     }
 
@@ -1846,10 +1835,8 @@ impl Interp<'_> {
         proxy: Handle<JsObject>,
     ) -> Result<JsValue, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "getPrototypeOf")?;
-        let target_proto_v = self.object_proto_of(target)?;
-        let target_extensible = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "getPrototypeOf")? else {
-            return Ok(target_proto_v);
+            return self.object_proto_of(target);
         };
         self.gc_protect();
         let result =
@@ -1860,11 +1847,14 @@ impl Interp<'_> {
                 "TypeError: 'getPrototypeOf' trap result must be an object or null",
             )));
         }
-        // ES step 10: a non-extensible target requires proto identity.
-        if !target_extensible && result.as_object() != target_proto_v.as_object() {
-            return Err(JSException(self.error_value(
-                "TypeError: 'getPrototypeOf' trap result differs from the target's prototype",
-            )));
+        // ES steps 10-13: read the target state *after* the trap.
+        if !self.object_is_extensible(target)? {
+            let target_proto_v = self.object_proto_of(target)?;
+            if result.as_object() != target_proto_v.as_object() {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'getPrototypeOf' trap result differs from the target's prototype",
+                )));
+            }
         }
         Ok(result)
     }
@@ -1876,8 +1866,6 @@ impl Interp<'_> {
         proto: Option<Handle<JsObject>>,
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "setPrototypeOf")?;
-        let target_proto_v = self.object_proto_of(target)?;
-        let target_extensible = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "setPrototypeOf")? else {
             return self.object_set_prototype_of(target, proto);
         };
@@ -1894,17 +1882,15 @@ impl Interp<'_> {
         if !ops::to_boolean(self.heap, result) {
             return Ok(false);
         }
-        // ES step 12: a true result for a non-extensible target requires the
-        // requested proto to equal the target's current proto.
-        if !target_extensible && proto != target_proto_v.as_object() {
-            return Err(JSException(self.error_value(
-                "TypeError: 'setPrototypeOf' trap result differs from the target's prototype",
-            )));
+        // ES steps 9-13: read the target state *after* the trap.
+        if !self.object_is_extensible(target)? {
+            let target_proto_v = self.object_proto_of(target)?;
+            if proto != target_proto_v.as_object() {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'setPrototypeOf' trap result differs from the target's prototype",
+                )));
+            }
         }
-        let cell = self.heap.validity_cell_of(proxy);
-        self.heap.bump_validity(cell);
-        self.heap.bump_proto_generation();
-        self.heap.get_mut(proxy).prototype = proto;
         Ok(true)
     }
 
@@ -1916,8 +1902,6 @@ impl Interp<'_> {
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "deleteProperty")?;
         let key = self.property_key(key_v)?;
-        let target_desc = self.object_get_own_property(target, key)?;
-        let target_extensible = self.object_is_extensible(target)?;
         let key_v = prop_key_value(key);
         let Some(trap) = self.proxy_trap_method(handler, "deleteProperty")? else {
             return self.object_delete(target, key_v);
@@ -1932,16 +1916,21 @@ impl Interp<'_> {
         if !boolean {
             return Ok(false);
         }
-        // ES step 12: an own non-configurable target property cannot be
-        // reported deleted unless the target is non-extensible.
-        if let Some(desc) = target_desc
-            && desc.has_configurable
-            && !desc.configurable
-            && target_extensible
-        {
-            return Err(JSException(self.error_value(
-                "TypeError: 'deleteProperty' trap cannot delete a non-configurable property",
-            )));
+        // ES steps 8-13: read the target state *after* the trap (the trap may
+        // mutate the target). An absent target property deletes successfully
+        // (step 9) regardless of extensibility.
+        let target_desc = self.object_get_own_property(target, key)?;
+        if let Some(desc) = target_desc {
+            if desc.has_configurable && !desc.configurable {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'deleteProperty' trap cannot delete a non-configurable property",
+                )));
+            }
+            if !self.object_is_extensible(target)? {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'deleteProperty' trap cannot delete from a non-extensible target",
+                )));
+            }
         }
         Ok(true)
     }
@@ -1953,11 +1942,9 @@ impl Interp<'_> {
         key: PropKey,
     ) -> Result<Option<OwnDesc>, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "getOwnPropertyDescriptor")?;
-        let target_desc = self.object_get_own_property(target, key)?;
-        let target_extensible = self.object_is_extensible(target)?;
         let key_v = prop_key_value(key);
         let Some(trap) = self.proxy_trap_method(handler, "getOwnPropertyDescriptor")? else {
-            return Ok(target_desc);
+            return self.object_get_own_property(target, key);
         };
         self.gc_protect();
         let result = self.call_inline(
@@ -1965,6 +1952,10 @@ impl Interp<'_> {
             JsValue::object(handler),
             &[JsValue::object(target), key_v],
         )?;
+        // ES steps 8-16: read the target state *after* the trap (the trap may
+        // mutate the target).
+        let target_desc = self.object_get_own_property(target, key)?;
+        let target_extensible = self.object_is_extensible(target)?;
         if result.is_undefined() {
             // ES step 14: `undefined` demands an extensible target and no
             // non-configurable own property.
@@ -2026,8 +2017,6 @@ impl Interp<'_> {
         desc: OwnDesc,
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "defineProperty")?;
-        let target_desc = self.object_get_own_property(target, key)?;
-        let target_extensible = self.object_is_extensible(target)?;
         let key_v = prop_key_value(key);
         let setting_config_false = desc.has_configurable && !desc.configurable;
         let desc_v = self.own_desc_to_object(desc);
@@ -2043,6 +2032,10 @@ impl Interp<'_> {
         if !ops::to_boolean(self.heap, result) {
             return Ok(false);
         }
+        // ES steps 15-20: read the target state *after* the trap (the trap may
+        // mutate the target).
+        let target_desc = self.object_get_own_property(target, key)?;
+        let target_extensible = self.object_is_extensible(target)?;
         match target_desc {
             None => {
                 // ES step 19.
