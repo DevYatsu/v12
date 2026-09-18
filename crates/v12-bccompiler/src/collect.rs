@@ -22,8 +22,8 @@
 
 use oxc_ast::ast::{
     ArrayExpressionElement, ArrowFunctionExpression, AssignmentTarget, BindingPattern, Expression,
-    ForStatementInit, FormalParameters, Function, ModuleDeclaration, ModuleExportName, Program,
-    PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
+    ForStatementInit, FormalParameters, Function, ImportPhase, ModuleDeclaration, ModuleExportName,
+    Program, PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
 };
 use oxc_semantic::{Scoping, SymbolId};
 use oxc_span::GetSpan;
@@ -1004,6 +1004,12 @@ impl<'s> Collector<'s> {
     fn import_decl(&mut self, d: &oxc_ast::ast::ImportDeclaration<'_>) {
         let specifier = d.source.value.to_string();
         let span = Some((d.span.start, d.span.end));
+        // `import defer * as ns from "x"` (defer-import-eval): the dependency
+        // links but its evaluation is postponed until an export is read. The
+        // parser admits `defer` only on a namespace form (the invalid named/
+        // default spellings are early errors), so one flag on every entry of
+        // the declaration is sufficient.
+        let deferred = matches!(d.phase, Some(ImportPhase::Defer));
         if let Some(specs) = &d.specifiers {
             if specs.is_empty() {
                 // `import {} from "x"` – no bindings, but still a module dependency.
@@ -1012,6 +1018,7 @@ impl<'s> Collector<'s> {
                     imported: String::new(),
                     local: None,
                     span,
+                    deferred,
                 });
             }
             for s in specs {
@@ -1027,6 +1034,7 @@ impl<'s> Collector<'s> {
                             imported,
                             local: local_sym,
                             span: Some((sp.span.start, sp.span.end)),
+                            deferred,
                         });
                     }
                     oxc_ast::ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(sp) => {
@@ -1039,6 +1047,7 @@ impl<'s> Collector<'s> {
                             imported: "default".to_string(),
                             local: local_sym,
                             span: Some((sp.span.start, sp.span.end)),
+                            deferred,
                         });
                     }
                     oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(sp) => {
@@ -1051,6 +1060,7 @@ impl<'s> Collector<'s> {
                             imported: "*".to_string(),
                             local: local_sym,
                             span: Some((sp.span.start, sp.span.end)),
+                            deferred,
                         });
                     }
                 }
@@ -1062,6 +1072,7 @@ impl<'s> Collector<'s> {
                 imported: String::new(),
                 local: None,
                 span,
+                deferred,
             });
         }
     }

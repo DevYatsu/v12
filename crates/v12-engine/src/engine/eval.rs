@@ -344,15 +344,20 @@ impl Engine {
             Rc::clone(programs),
         );
         // Pre-evaluate the static import graph on this interpreter (the
-        // dynamic-import path is runtime-driven and does not need it).
+        // dynamic-import path is runtime-driven and does not need it). A
+        // `defer` request is linked but not evaluated here: its body runs
+        // only when an export is read through the deferred namespace.
         if let Some(loader) = registry.loader() {
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             for entry in &module.imports {
                 if seen.insert(entry.specifier.clone()) {
                     let child = crate::module_loader::resolve_specifier(base, &entry.specifier);
-                    if let Err(reason) =
+                    let result = if entry.deferred {
+                        crate::module_loader::load_deferred(&mut interp, &loader, &child)
+                    } else {
                         crate::module_loader::load_and_evaluate(&mut interp, &loader, &child)
-                    {
+                    };
+                    if let Err(reason) = result {
                         drop(interp); // releases the `&mut heap` borrow
                         return Err(reason);
                     }
