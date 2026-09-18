@@ -231,14 +231,18 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::StringLastIndexOf => Some(1),
         NativeId::StringLink => Some(1),
         NativeId::StringLocaleCompare => Some(1),
+        NativeId::StringMatch => Some(1),
         NativeId::StringMatchAll => Some(1),
         NativeId::StringPadEnd => Some(1),
         NativeId::StringPadStart => Some(1),
         NativeId::StringRaw => Some(1),
         NativeId::StringRepeat => Some(1),
+        NativeId::StringReplace => Some(2),
         NativeId::StringReplaceAll => Some(2),
+        NativeId::StringSearch => Some(1),
         NativeId::StringSlice => Some(2),
         NativeId::StringSmall => Some(0),
+        NativeId::StringSplit => Some(2),
         NativeId::StringStartsWith => Some(1),
         NativeId::StringStrike => Some(0),
         NativeId::StringSub => Some(0),
@@ -367,6 +371,28 @@ pub(crate) fn install_native(
 ) -> Option<v12_heap::Handle<v12_heap::JsObject>> {
     let length = builtin_length(id);
     install_native_with_length(heap, target, name, id, length)
+}
+
+/// Installs the regexp-backed `String.prototype` methods
+/// (`match`/`matchAll`/`replace`/`search`/`split`).
+///
+/// They have handlers and registry dispatch arms
+/// ([`NativeRegistry::call_native`] step 2), but were never installed on
+/// `String.prototype`. They are intentionally NOT `define_builtins!` entries:
+/// a compile-time dispatch arm would pre-empt the registry's step-2 arm,
+/// which is the only path that supplies the per-registry compiled-pattern
+/// cache (`Ctx::regex_cache`) these bodies require — without it
+/// `regexp.rs::regexp_exec` panics. The arities live in [`builtin_length`].
+fn install_string_regex_methods(heap: &mut Heap, targets: &BuiltinTargets) {
+    for (name, id) in [
+        ("match", NativeId::StringMatch),
+        ("matchAll", NativeId::StringMatchAll),
+        ("replace", NativeId::StringReplace),
+        ("search", NativeId::StringSearch),
+        ("split", NativeId::StringSplit),
+    ] {
+        install_native(heap, Some(targets.string_proto), name, id);
+    }
 }
 
 /// Constructor/prototype linkage for an already-materialized pair (realm
@@ -705,6 +731,13 @@ macro_rules! define_builtins {
             $( $( $crate::__builtin_emit_install!($target, heap, targets, $name, NativeId::$id $(, $len)?); )* )*
             // Bare ids are dispatch-only; silence unused warnings.
             $( let _ = NativeId::$bare_id; )*
+            // Regex-backed `String.prototype` methods: installed here, but
+            // deliberately absent from the dispatch table above so
+            // `builtin_dispatch` returns `None` for their ids. That routes
+            // them through `NativeRegistry::call_native`'s step-2 arms, which
+            // supply the per-registry compiled-pattern cache these bodies
+            // require (`Ctx::regex_cache`).
+            install_string_regex_methods(heap, targets);
         }
     };
 }

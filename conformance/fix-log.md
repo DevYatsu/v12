@@ -2,6 +2,19 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/string-methods: generic String receiver + regex proto methods [lane/string-methods]
+
+- **Filter:** `built-ins/String` (1341), `--jobs 8`, default `--format human`.
+- **Before (base `d7ef17e`):** `built-ins/String` **681 pass / 660 fail / 0 skip (50.8 %)**.
+- **After:** `built-ins/String` **759 pass / 582 fail / 0 skip (56.6 %)** — **+78**, zero regressions (TAP per-test diff: 0 tests that passed at base now fail). Sub-filter `built-ins/String/prototype/trim`: **113 → 148 pass** (+35).
+- **Root cause A (receiver):** `this_string`/`this_text` (`crates/v12-engine/src/builtins/string.rs`) required `this.as_string()`, so every non-string receiver threw. ES §22.1.3 says `String.prototype` methods are generic: `RequireObjectCoercible(this)` then `ToString(this)` — only `undefined`/`null` and Symbols throw.
+- **Root cause B (install):** `match`/`matchAll`/`replace`/`search`/`split` had handlers (`string.rs`) and dispatch arms (`registry.rs` step 2) but were never installed on `String.prototype`, so they read `undefined`.
+- **Fix A:** rewrote the two shared helpers to return the string primitive directly, else consult `primitive_this_text` (`ToString` for non-string primitives), else throw `receiver_type_error`. `receiver_type_error` back-fills `ctx.global` from `ctx.heap.realm_globals().first()` when the dispatcher built `Ctx::new(heap, None, None)`, so the `TypeError` carries the realm `constructor` link that test262's `assert.throws` compares.
+- **Fix B:** added the four missing `builtin_length` entries and a new `install_string_regex_methods(heap, targets)` (`crates/v12-engine/src/builtins/mod.rs`) that installs the five methods on `String.prototype` only. They are deliberately kept out of the `define_builtins!` dispatch table so `builtin_dispatch` returns `None` and calls route through `NativeRegistry::call_native`'s step-2 arms, which supply the per-registry compiled-pattern cache (`Ctx::regex_cache`); a compile-time arm would panic in `regexp_exec`.
+- **Files:** `crates/v12-engine/src/builtins/string.rs`, `crates/v12-engine/src/builtins/mod.rs`.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped / 0 failed**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-engine --check` clean; `grep -c 'panicked at'` on the run log **0**. Probes: `"  x ".trim()` → `"x"`; `trim.call(123)` → `"123"`; `trim.call(null)`/`call(undefined)`/`call(Symbol())` → `TypeError` with `constructor === TypeError`; `"a,b".split(",")` → `["a","b"]`; `match`/`replace`/`search`/`matchAll` all `function` and functional.
+- **Remaining gap (deliberate, not regressed):** object receivers are still rejected. Full spec coercion is `ToPrimitive` invoking a user `toString`/`valueOf`, which the engine lacks; coercing objects would also make `new String.prototype.charAt()` succeed and break the `not-a-constructor` family. Fixing it needs `ToPrimitive` + non-constructible-builtin support outside these two files. `matchAll` results are iterable via `.next()` but not spreadable (`[...it]`) — that is the general iterator-protocol gap, unrelated to the method install.
+
 ### 2026-09-18 — lane/sloppy-this: sloppy-mode `this` binds the global object [lane/sloppy-this]
 
 - **Filters:** `language` (24 590), `--jobs 8`, TAP to file for the pass-set diff; base master `9dc28b6`.
