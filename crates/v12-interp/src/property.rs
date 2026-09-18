@@ -1077,9 +1077,9 @@ impl Interp<'_> {
         if self.heap.get(obj).kind == Kind::Proxy {
             let ok = self.proxy_op_set(obj, obj_v, key_v, value)?;
             if !ok && strict {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'set' on proxy returned false",
-                )));
+                return Err(JSException(
+                    self.error_value("TypeError: 'set' on proxy returned false"),
+                ));
             }
             return Ok(());
         }
@@ -2372,7 +2372,10 @@ impl Interp<'_> {
             && !desc.configurable
         {
             if desc.is_data() {
-                if desc.has_writable && !desc.writable && !ops::strict_equals(self.heap, desc.value, value) {
+                if desc.has_writable
+                    && !desc.writable
+                    && !ops::strict_equals(self.heap, desc.value, value)
+                {
                     return Err(JSException(self.error_value(
                         "TypeError: 'set' trap returned true for a non-configurable non-writable target property with a different value",
                     )));

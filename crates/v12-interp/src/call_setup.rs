@@ -1651,14 +1651,11 @@ impl Interp<'_> {
     /// ES `CreateListFromArrayLike(argumentsList)`: an object with a `length`,
     /// then indices `0..len`. A missing/undefined list is an empty list only
     /// when the caller passes `undefined`; a non-object throws.
-    fn create_list_from_array_like(
-        &mut self,
-        v: JsValue,
-    ) -> Result<Vec<JsValue>, JSException> {
+    fn create_list_from_array_like(&mut self, v: JsValue) -> Result<Vec<JsValue>, JSException> {
         let Some(obj) = v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: CreateListFromArrayLike called on non-object"),
-            ));
+            return Err(JSException(self.error_value(
+                "TypeError: CreateListFromArrayLike called on non-object",
+            )));
         };
         let len_key = self.new_temp_key("length");
         let len_v = self.get_property(0, 0, JsValue::object(obj), len_key)?;
@@ -1700,9 +1697,8 @@ impl Interp<'_> {
             ));
         }
         let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
-        let list = self.create_list_from_array_like(
-            args.get(2).copied().unwrap_or(JsValue::undefined()),
-        )?;
+        let list =
+            self.create_list_from_array_like(args.get(2).copied().unwrap_or(JsValue::undefined()))?;
         // `call_object` routes a proxy through its `apply` trap.
         self.call_object(target, this_arg, &list)
     }
@@ -1718,18 +1714,17 @@ impl Interp<'_> {
         self.reject_reflect_construct(this_v, "construct")?;
         let target_v = args.first().copied().unwrap_or(JsValue::undefined());
         let Some(target) = target_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: Reflect.construct target is not a constructor"),
-            ));
+            return Err(JSException(self.error_value(
+                "TypeError: Reflect.construct target is not a constructor",
+            )));
         };
         if !self.is_constructor_object(target) {
-            return Err(JSException(
-                self.error_value("TypeError: Reflect.construct target is not a constructor"),
-            ));
+            return Err(JSException(self.error_value(
+                "TypeError: Reflect.construct target is not a constructor",
+            )));
         }
-        let list = self.create_list_from_array_like(
-            args.get(1).copied().unwrap_or(JsValue::undefined()),
-        )?;
+        let list =
+            self.create_list_from_array_like(args.get(1).copied().unwrap_or(JsValue::undefined()))?;
         let new_target = args.get(2).copied().unwrap_or(target_v);
         let Some(nt) = new_target.as_object() else {
             return Err(JSException(self.error_value(
@@ -1934,7 +1929,9 @@ impl Interp<'_> {
             let (inner, _this_arg, prefix) = {
                 let st = self.heap.get(state_h);
                 (
-                    st.elements[0].as_object().expect("bound target is an object"),
+                    st.elements[0]
+                        .as_object()
+                        .expect("bound target is an object"),
                     st.elements[1],
                     st.elements[2..].to_vec(),
                 )
@@ -2219,8 +2216,7 @@ impl Interp<'_> {
         proxy: Handle<JsObject>,
     ) -> Result<JsValue, JSException> {
         let keys = self.object_own_keys(proxy)?;
-        if id == NativeId::ObjectGetOwnPropertyNames
-            || id == NativeId::ObjectGetOwnPropertySymbols
+        if id == NativeId::ObjectGetOwnPropertyNames || id == NativeId::ObjectGetOwnPropertySymbols
         {
             let want_symbols = id == NativeId::ObjectGetOwnPropertySymbols;
             let names: Vec<JsValue> = keys
