@@ -29,6 +29,15 @@ impl Interp<'_> {
                 self.error_value("TypeError: callee is not a function"),
             ));
         };
+        // Proxy exotic: `[[Call]]` is the `apply` trap (ES 10.5.12).
+        if self.heap.get(callee_obj).kind == Kind::Proxy {
+            let args_start = callee_slot + 2;
+            let args_end = args_start + usize::from(argc);
+            let args_vec = self.stack[args_start..args_end].to_vec();
+            return self
+                .proxy_call(callee_obj, this_v, &args_vec)
+                .map(CallOutcome::Value);
+        }
         if self.heap.get(callee_obj).kind != Kind::Function {
             return Err(JSException(
                 self.error_value("TypeError: callee is not a function"),
@@ -869,6 +878,25 @@ impl Interp<'_> {
                 self.error_value("TypeError: callee is not a function"),
             ));
         };
+        // Proxy exotic: `[[Call]]` is the `apply` trap (ES 10.5.12).
+        if self.heap.get(callee_obj).kind == Kind::Proxy {
+            // Materialize the spread args first: `proxy_call` takes a slice.
+            let Some(args_obj) = args_arr_v.as_object() else {
+                return Err(JSException(
+                    self.error_value("TypeError: args is not an array"),
+                ));
+            };
+            let args_vec: Vec<JsValue> = self
+                .heap
+                .get(args_obj)
+                .elements_array
+                .iter()
+                .map(|v| if v.is_hole() { JsValue::undefined() } else { v })
+                .collect();
+            return self
+                .proxy_call(callee_obj, this_v, &args_vec)
+                .map(CallOutcome::Value);
+        }
         if self.heap.get(callee_obj).kind != Kind::Function {
             return Err(JSException(
                 self.error_value("TypeError: callee is not a function"),
@@ -889,11 +917,6 @@ impl Interp<'_> {
                 self.error_value("TypeError: args is not an array"),
             ));
         };
-        if self.heap.get(args_obj).kind != Kind::Array {
-            return Err(JSException(
-                self.error_value("TypeError: spread args is not an array"),
-            ));
-        }
         let args_slice: Vec<JsValue> = self.heap.get(args_obj).elements_array.iter().collect();
         // Holes become undefined for call.
         let args_vec: Vec<JsValue> = args_slice
@@ -1050,17 +1073,30 @@ impl Interp<'_> {
 
         let Some(callee_obj) = callee_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: value is not a constructor"),
+                self.error_value("TypeError: callee is not a function"),
             ));
         };
+        // Proxy exotic: `[[Construct]]` is the `construct` trap (ES 10.5.13).
+        if self.heap.get(callee_obj).kind == Kind::Proxy {
+            let args_start = callee_slot + 2;
+            let args_end = args_start + usize::from(argc);
+            let args_vec = self.stack[args_start..args_end].to_vec();
+            return self
+                .proxy_construct(callee_obj, &args_vec, callee_v)
+                .map(CallOutcome::Value);
+        }
         if self.heap.get(callee_obj).kind != Kind::Function {
             return Err(JSException(
                 self.error_value("TypeError: value is not a constructor"),
             ));
         }
-        // Read the callable target from the object.
-        let callee_program = self.heap.get(callee_obj).program_id;
-        let target = self.heap.get(callee_obj).callable;
+        // Read the callable target, captured environment, and program id
+        // from the object. The program id lets a closure created in another
+        // program (eval) resolve its bytecode against the right table.
+        let (target, _captured_env, callee_program) = {
+            let c = self.heap.get(callee_obj);
+            (c.callable, c.captured_env, c.program_id)
+        };
 
         // Native seam: constructor-shaped natives (Boolean, Error) dispatch
         // their handler directly. Out-of-range bytecode indices (placeholders,
@@ -1320,17 +1356,21 @@ impl Interp<'_> {
                         "TypeError: Function.prototype.call called on non-function",
                     )));
                 };
-                if self.heap.get(target).kind != Kind::Function {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.call called on non-function",
-                    )));
-                }
                 let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
                 let fwd = if args.len() > 1 {
                     &args[1..]
                 } else {
                     &[] as &[JsValue]
                 };
+                // A proxy receiver dispatches `[[Call]]` through its trap.
+                if self.heap.get(target).kind == Kind::Proxy {
+                    return self.proxy_call(target, this_arg, fwd);
+                }
+                if self.heap.get(target).kind != Kind::Function {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.call called on non-function",
+                    )));
+                }
                 self.call_object(target, this_arg, fwd)
             }
             NativeId::FunctionApply => {
@@ -1339,11 +1379,6 @@ impl Interp<'_> {
                         "TypeError: Function.prototype.apply called on non-function",
                     )));
                 };
-                if self.heap.get(target).kind != Kind::Function {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.apply called on non-function",
-                    )));
-                }
                 let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
                 let fwd: Vec<JsValue> = if let Some(arr_v) = args.get(1) {
                     if arr_v.is_null() || arr_v.is_undefined() {
@@ -1367,6 +1402,14 @@ impl Interp<'_> {
                 } else {
                     Vec::new()
                 };
+                if self.heap.get(target).kind == Kind::Proxy {
+                    return self.proxy_call(target, this_arg, &fwd);
+                }
+                if self.heap.get(target).kind != Kind::Function {
+                    return Err(JSException(self.error_value(
+                        "TypeError: Function.prototype.apply called on non-function",
+                    )));
+                }
                 self.call_object(target, this_arg, &fwd)
             }
             NativeId::FunctionBind => {
@@ -1587,6 +1630,276 @@ impl Interp<'_> {
             | NativeId::ReflectPreventExtensions => self.run_proxy_static(id, this_v, args),
             _ => None,
         }
+    }
+
+    /// Proxy `[[Call]]` (ES 10.5.12): the `apply` trap, or a forward to the
+    /// target (which may itself be a proxy). A revoked proxy throws; a
+    /// non-callable target is a `TypeError`.
+    pub(crate) fn proxy_call(
+        &mut self,
+        proxy: Handle<JsObject>,
+        this_arg: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "call")?;
+        if !self.is_callable_object(target) {
+            return Err(JSException(
+                self.error_value("TypeError: target is not a function"),
+            ));
+        }
+        let apply_key = self.new_temp_key("apply");
+        let trap_v = self.get_property(0, 0, JsValue::object(handler), apply_key)?;
+        if trap_v.is_undefined() || trap_v.is_null() {
+            return self.call_object(target, this_arg, args);
+        }
+        let Some(trap) = trap_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: 'apply' trap must be a function"),
+            ));
+        };
+        if self.heap.get(trap).kind != Kind::Function {
+            return Err(JSException(
+                self.error_value("TypeError: 'apply' trap must be a function"),
+            ));
+        }
+        // `CreateArrayFromList` for the trap's third argument.
+        self.gc_protect();
+        let arg_array = self.heap.alloc(JsObject::array(args.to_vec()));
+        self.heap.add_root(JsValue::object(arg_array));
+        self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[
+                JsValue::object(target),
+                this_arg,
+                JsValue::object(arg_array),
+            ],
+        )
+    }
+
+    /// Proxy `[[Construct]]` (ES 10.5.13): the `construct` trap, or a
+    /// forward to the target via `Construct(target, args, new_target)`.
+    pub(crate) fn proxy_construct(
+        &mut self,
+        proxy: Handle<JsObject>,
+        args: &[JsValue],
+        new_target: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let (target, handler) = self.proxy_parts(proxy, "construct")?;
+        if !self.is_constructor_object(target) {
+            return Err(JSException(
+                self.error_value("TypeError: target is not a constructor"),
+            ));
+        }
+        let construct_key = self.new_temp_key("construct");
+        let trap_v = self.get_property(0, 0, JsValue::object(handler), construct_key)?;
+        if trap_v.is_undefined() || trap_v.is_null() {
+            return self.construct_object(target, args, new_target);
+        }
+        let Some(trap) = trap_v.as_object() else {
+            return Err(JSException(
+                self.error_value("TypeError: 'construct' trap must be a function"),
+            ));
+        };
+        if self.heap.get(trap).kind != Kind::Function {
+            return Err(JSException(
+                self.error_value("TypeError: 'construct' trap must be a function"),
+            ));
+        }
+        self.gc_protect();
+        let arg_array = self.heap.alloc(JsObject::array(args.to_vec()));
+        self.heap.add_root(JsValue::object(arg_array));
+        let result = self.call_inline(
+            trap,
+            JsValue::object(handler),
+            &[
+                JsValue::object(target),
+                JsValue::object(arg_array),
+                new_target,
+            ],
+        )?;
+        // ES step 12: the trap result must be an object.
+        if result.as_object().is_none() {
+            return Err(JSException(self.error_value(
+                "TypeError: 'construct' trap result must be an object",
+            )));
+        }
+        Ok(result)
+    }
+
+    /// True when `obj` is a `Kind::Function` (a proxy is callable iff its
+    /// target is, so a proxy reaching here is handled by its own trap).
+    fn is_callable_object(&mut self, obj: Handle<JsObject>) -> bool {
+        match self.heap.get(obj).kind {
+            Kind::Function => true,
+            Kind::Proxy => {
+                let target = self.heap.get(obj).proxy_target;
+                target.is_some_and(|t| self.is_callable_object(t))
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `obj` has a `[[Construct]]` (a `Kind::Function` that is not
+    /// an arrow/method, or a proxy whose target is a constructor).
+    fn is_constructor_object(&mut self, obj: Handle<JsObject>) -> bool {
+        match self.heap.get(obj).kind {
+            Kind::Function => {
+                let program = self.heap.get(obj).program_id;
+                let idx = self
+                    .heap
+                    .get(obj)
+                    .callable
+                    .bytecode_index()
+                    .unwrap_or(u32::MAX);
+                self.functions_for_program(program)
+                    .get(idx as usize)
+                    .map(|f| !f.is_arrow)
+                    .unwrap_or(true)
+            }
+            Kind::Proxy => {
+                let target = self.heap.get(obj).proxy_target;
+                target.is_some_and(|t| self.is_constructor_object(t))
+            }
+            _ => false,
+        }
+    }
+
+    /// `Construct(target, args, new_target)`: the interpreter's construct
+    /// entry for a callable handle (mirrors the `new` bytecode arm). The
+    /// instance's `[[Prototype]]` comes from `new_target.prototype`.
+    pub(crate) fn construct_object(
+        &mut self,
+        target: Handle<JsObject>,
+        args: &[JsValue],
+        new_target: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let target_v = JsValue::object(target);
+        // A proxy target recurses through its own `[[Construct]]`.
+        if self.heap.get(target).kind == Kind::Proxy {
+            return self.proxy_construct(target, args, new_target);
+        }
+        // Bound-function targets: forward with the bound prefix and clear
+        // `this` (the constructed instance wins).
+        if let v12_heap::FunctionTarget::Bound(state_h) = self.heap.get(target).callable {
+            let (inner, _this_arg, prefix) = {
+                let st = self.heap.get(state_h);
+                (
+                    st.elements[0].as_object().expect("bound target is an object"),
+                    st.elements[1],
+                    st.elements[2..].to_vec(),
+                )
+            };
+            let mut call_args = prefix;
+            call_args.extend_from_slice(args);
+            return self.construct_object(inner, &call_args, new_target);
+        }
+        if self.heap.get(target).kind != Kind::Function {
+            return Err(JSException(
+                self.error_value("TypeError: target is not a constructor"),
+            ));
+        }
+        let program = self.heap.get(target).program_id;
+        let idx = match self.heap.get(target).callable {
+            v12_heap::FunctionTarget::Bytecode(i) => i,
+            v12_heap::FunctionTarget::Native(_) | v12_heap::FunctionTarget::Host(_) => {
+                // Native/host constructors cannot be entered here; the
+                // registry native path (below) does not know them. Report as
+                // non-constructible rather than mis-dispatching.
+                return Err(JSException(
+                    self.error_value("TypeError: target is not a constructor"),
+                ));
+            }
+            v12_heap::FunctionTarget::RealmEval(_) => {
+                return Err(JSException(
+                    self.error_value("TypeError: target is not a constructor"),
+                ));
+            }
+            v12_heap::FunctionTarget::Bound(_) => unreachable!("handled above"),
+        };
+        if (idx as usize) >= self.functions_for_program(program).len() {
+            // Out-of-range bytecode index: an engine-installed native
+            // constructor (Boolean/Error/…). Route through the registry.
+            let id = self.native_id_for(idx)?;
+            return self.dispatch_native(id, target_v, args);
+        }
+        // Instance `[[Prototype]]` = `new_target.prototype` (ES 10.2.2 step 9).
+        // The read goes through `[[Get]]` so a proxy new_target resolves its
+        // own `get` trap; a non-object `new_target` falls back to the target.
+        let nt = new_target.as_object().unwrap_or(target);
+        let proto = {
+            let proto_key_v = self.new_temp_key("prototype");
+            let pv = self.get_property(0, 0, JsValue::object(nt), proto_key_v)?;
+            pv.as_object().or_else(|| self.object_prototype())
+        };
+        // Lay out `[callee][instance][args…]` and reuse `prepare_construct`.
+        let base = self.stack.len();
+        self.stack.push(target_v);
+        self.stack.push(JsValue::undefined());
+        self.stack.extend_from_slice(args);
+        let caller_max_regs =
+            u16::try_from(self.stack.len() - base).expect("arguments fit a frame window");
+        let argc = u16::try_from(args.len()).expect("argument count fits u16");
+        let saved = self.stop_at_frames;
+        self.stop_at_frames = Some(self.frames.len());
+        let boundary = self.stop_at_frames;
+        self.top_result = None;
+        let outcome = self.prepare_construct(base, caller_max_regs, 0, argc);
+        let result = match outcome {
+            Ok(CallOutcome::Pushed) => {
+                // The instance prepared by `prepare_construct` sits in r0 of
+                // the new frame. The nested `complete_frame` boundary exit
+                // cannot apply the construct return-value adjustment (there is
+                // no parked `Construct` header), so capture it here and apply
+                // ES 10.2.2 step 12 below.
+                let instance_v = self
+                    .frames
+                    .last()
+                    .and_then(|f| self.stack.get(f.base).copied())
+                    .unwrap_or(JsValue::undefined());
+                // Override the instance prototype to `new_target.prototype`.
+                if let Some(primary) = proto
+                    && let Some(inst) = instance_v.as_object()
+                {
+                    self.heap.get_mut(inst).prototype = Some(primary);
+                }
+                let exec = self.execute();
+                let returned = match exec {
+                    Ok(()) => self.top_result.take(),
+                    Err(e) => {
+                        if let Some(b) = boundary
+                            && self.frames.len() > b
+                        {
+                            while self.frames.len() > b {
+                                if let Some(f) = self.frames.pop() {
+                                    self.drop_frame_arguments(&f);
+                                }
+                            }
+                        }
+                        self.stack.truncate(base);
+                        self.stop_at_frames = saved;
+                        return Err(e);
+                    }
+                };
+                // ES step 12: an object result replaces the instance.
+                let result = match returned {
+                    Some(v) if v.as_object().is_some() => v,
+                    _ => instance_v,
+                };
+                self.stack.truncate(base);
+                Ok(result)
+            }
+            Ok(CallOutcome::Value(v)) => {
+                self.stack.truncate(base);
+                Ok(v)
+            }
+            Err(e) => {
+                self.stack.truncate(base);
+                Err(e)
+            }
+        };
+        self.stop_at_frames = saved;
+        result
     }
 
     /// Routes an `Object.*`/`Reflect.*` static through the interpreter only

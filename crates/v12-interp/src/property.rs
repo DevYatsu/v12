@@ -1479,7 +1479,7 @@ impl Interp<'_> {
 
     /// `target`/`handler` pair for a live proxy, or the revoked-proxy
     /// `TypeError` naming the internal method that observed it.
-    fn proxy_parts(
+    pub(crate) fn proxy_parts(
         &mut self,
         proxy: Handle<JsObject>,
         op: &str,
