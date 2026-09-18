@@ -1073,7 +1073,7 @@ impl Interp<'_> {
 
         let Some(callee_obj) = callee_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: callee is not a function"),
+                self.error_value("TypeError: value is not a constructor"),
             ));
         };
         // Proxy exotic: `[[Construct]]` is the `construct` trap (ES 10.5.13).
