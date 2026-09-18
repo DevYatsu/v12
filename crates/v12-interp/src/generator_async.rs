@@ -563,7 +563,11 @@ impl Interp<'_> {
             .get(3)
             .and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64()))
             .unwrap_or(0.0) as u16;
-        if (yield_dst as usize) < usize::from(f_max_regs) {
+        if resume_pc != 0 && (yield_dst as usize) < usize::from(f_max_regs) {
+            // First entry (`resume_pc == 0`) must not stash the `next()` payload
+            // into the generator's stale `yield_dst` (initialized to 0, which
+            // aliases register 0 = bound `this`): the body runs its prologue
+            // from pc 0, so there is no pending yield destination yet.
             self.stack[new_base + usize::from(yield_dst)] = value;
         }
         // Display snapshot from the generator's live env chain (rebuilt
