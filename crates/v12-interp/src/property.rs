@@ -1788,8 +1788,7 @@ impl Interp<'_> {
     /// `[[IsExtensible]]` (ES 10.5.3).
     fn proxy_op_is_extensible(&mut self, proxy: Handle<JsObject>) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "isExtensible")?;
-        let extensible_target =
-            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let extensible_target = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "isExtensible")? else {
             return Ok(extensible_target);
         };
@@ -1812,8 +1811,7 @@ impl Interp<'_> {
         proxy: Handle<JsObject>,
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "preventExtensions")?;
-        let target_extensible =
-            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let target_extensible = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "preventExtensions")? else {
             // Forward to the target, then mirror the result on the proxy.
             let forwarded = self.object_prevent_extensions(target)?;
@@ -1848,14 +1846,10 @@ impl Interp<'_> {
         proxy: Handle<JsObject>,
     ) -> Result<JsValue, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "getPrototypeOf")?;
-        let target_proto = self.heap.get(target).prototype;
-        let target_extensible =
-            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let target_proto_v = self.object_proto_of(target)?;
+        let target_extensible = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "getPrototypeOf")? else {
-            return Ok(match target_proto {
-                Some(p) => JsValue::object(p),
-                None => JsValue::null(),
-            });
+            return Ok(target_proto_v);
         };
         self.gc_protect();
         let result =
@@ -1867,7 +1861,7 @@ impl Interp<'_> {
             )));
         }
         // ES step 10: a non-extensible target requires proto identity.
-        if !target_extensible && result.as_object() != target_proto {
+        if !target_extensible && result.as_object() != target_proto_v.as_object() {
             return Err(JSException(self.error_value(
                 "TypeError: 'getPrototypeOf' trap result differs from the target's prototype",
             )));
@@ -1882,9 +1876,8 @@ impl Interp<'_> {
         proto: Option<Handle<JsObject>>,
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "setPrototypeOf")?;
-        let target_proto = self.heap.get(target).prototype;
-        let target_extensible =
-            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let target_proto_v = self.object_proto_of(target)?;
+        let target_extensible = self.object_is_extensible(target)?;
         let Some(trap) = self.proxy_trap_method(handler, "setPrototypeOf")? else {
             return self.object_set_prototype_of(target, proto);
         };
@@ -1903,7 +1896,7 @@ impl Interp<'_> {
         }
         // ES step 12: a true result for a non-extensible target requires the
         // requested proto to equal the target's current proto.
-        if !target_extensible && proto != target_proto {
+        if !target_extensible && proto != target_proto_v.as_object() {
             return Err(JSException(self.error_value(
                 "TypeError: 'setPrototypeOf' trap result differs from the target's prototype",
             )));
@@ -1923,9 +1916,8 @@ impl Interp<'_> {
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "deleteProperty")?;
         let key = self.property_key(key_v)?;
-        let target_desc = self.ordinary_own_descriptor(target, key);
-        let target_extensible =
-            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let target_desc = self.object_get_own_property(target, key)?;
+        let target_extensible = self.object_is_extensible(target)?;
         let key_v = prop_key_value(key);
         let Some(trap) = self.proxy_trap_method(handler, "deleteProperty")? else {
             return self.object_delete(target, key_v);
@@ -1961,9 +1953,8 @@ impl Interp<'_> {
         key: PropKey,
     ) -> Result<Option<OwnDesc>, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "getOwnPropertyDescriptor")?;
-        let target_desc = self.ordinary_own_descriptor(target, key);
-        let target_extensible =
-            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let target_desc = self.object_get_own_property(target, key)?;
+        let target_extensible = self.object_is_extensible(target)?;
         let key_v = prop_key_value(key);
         let Some(trap) = self.proxy_trap_method(handler, "getOwnPropertyDescriptor")? else {
             return Ok(target_desc);
@@ -2035,14 +2026,13 @@ impl Interp<'_> {
         desc: OwnDesc,
     ) -> Result<bool, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "defineProperty")?;
-        let target_desc = self.ordinary_own_descriptor(target, key);
-        let target_extensible =
-            self.heap.get(target).flags & v12_heap::JsObject::FLAG_NOT_EXTENSIBLE == 0;
+        let target_desc = self.object_get_own_property(target, key)?;
+        let target_extensible = self.object_is_extensible(target)?;
         let key_v = prop_key_value(key);
         let setting_config_false = desc.has_configurable && !desc.configurable;
         let desc_v = self.own_desc_to_object(desc);
         let Some(trap) = self.proxy_trap_method(handler, "defineProperty")? else {
-            return self.ordinary_define_from_own_desc(target, key, desc);
+            return self.object_define_own_property(target, key, desc);
         };
         self.gc_protect();
         let result = self.call_inline(
@@ -2573,7 +2563,7 @@ impl Interp<'_> {
         let mut target_nonconfigurable: Vec<PropKey> = Vec::new();
         let mut target_configurable: Vec<PropKey> = Vec::new();
         for &k in &target_keys {
-            let desc = self.ordinary_own_descriptor(target, k);
+            let desc = self.object_get_own_property(target, k)?;
             let nonconfig = desc.is_some_and(|d| d.has_configurable && !d.configurable);
             if nonconfig {
                 target_nonconfigurable.push(k);
