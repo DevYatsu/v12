@@ -283,6 +283,8 @@ impl Interp<'_> {
     pub(crate) fn make_iterator_result(&mut self, value: JsValue, done: bool) -> JsValue {
         self.gc_protect();
         let h = self.heap.alloc(JsObject::default());
+        // Iterator-result objects are ordinary: inherit `%Object.prototype%`.
+        self.link_object_proto(h);
         self.heap.add_root(JsValue::object(h));
         // Avoid set_property recursion issues for now: store directly via properties vec and shape binding via heap
         // Use minimal shape: add properties via heap without interpreter's set_property
