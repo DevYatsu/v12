@@ -2,6 +2,17 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/obj-proto2: rest/spread and iterator-result objects link `%Object.prototype%` [lane/obj-proto2]
+
+- **Filters:** `language/expressions` (11 128), `language/statements` (9 369), `language/expressions/object` (1 170), `--jobs 8`, default `--format human`.
+- **Before (master `0642abb`, main worktree):** expressions 7 715 pass / 3 397 fail / 16 skip (69.4 %); statements 6 584 pass / 2 761 fail / 24 skip (70.5 %); expressions/object 845 pass / 325 fail / 0 skip (72.2 %).
+- **After:** expressions **7 715 / 3 397 / 16**; statements **6 584 / 2 761 / 24**; expressions/object **845 / 325 / 0** — counts identical, failure-name sets diffed clean (no previously-passing regressions). The two sites are exercised by passing tests whose prototype read is unrelated to the slice's failure clusters.
+- **Root cause:** allocations that build ordinary result objects skipped the `%Object.prototype%` link added for `Opcode::NewObject` by `lane/obj-proto`. Two remained: (1) `op_copy_object_rest` (`object_ops.rs`) allocated the source-coercion fallback and the destination with a default (null) `prototype`; (2) `make_iterator_result` (`generator_async.rs`) allocated the generator `.next()` `{value, done}` result the same way.
+- **Fix:** call the existing `self.link_object_proto(h)` immediately after each `heap.alloc(JsObject::default())`, before publishing/setting shape — mirroring `execute.rs` `Opcode::NewObject` ordering. Arguments precede roots, so the pre-alloc `gc_protect()` still covers each fresh handle.
+- **Files:** `crates/v12-interp/src/object_ops.rs` (2 sites), `crates/v12-interp/src/generator_async.rs` (1 site).
+- **Probe (`/tmp/repro.js`):** all `true` — `{...{a:1}}` proto, `{a,...r}` proto, `g().next()` proto, `Object.create(null)` proto is `null`, `{}` proto is `Object.prototype`.
+- **Verification:** `cargo build --workspace` clean; `cargo nextest run --workspace` **640 passed / 0 skipped**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt --check` clean.
+
 ### 2026-09-18 — lane/class-fields (Phase B): `NamedEvaluation` function-name inference [lane/class-fields]
 
 - **Filter:** `language/statements/class` (4 369), `language/expressions` (11 128), `--jobs 8`, default `--format human`.
