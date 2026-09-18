@@ -93,6 +93,11 @@ fn desc_compatible(extensible: bool, desc: OwnDesc, current: OwnDesc) -> bool {
         return false;
     }
     if current.has_configurable && !current.configurable {
+        // ES ValidateAndApplyPropertyDescriptor step 8: a non-configurable
+        // property cannot become configurable.
+        if desc.has_configurable && desc.configurable {
+            return false;
+        }
         if current.is_data() && desc.is_accessor() {
             return false;
         }
