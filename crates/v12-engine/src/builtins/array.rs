@@ -220,9 +220,7 @@ pub fn array_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
     } else {
         elems[start as usize..end as usize].to_vec()
     };
-    let arr = heap.alloc(JsObject::array(slice));
-    heap.add_root(JsValue::object(arr));
-    Ok(JsValue::object(arr))
+    Ok(new_array(ctx, slice))
 }
 
 pub fn array_sort(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
@@ -407,10 +405,11 @@ fn relative_index(v: Option<JsValue>, len: i64, default: i64) -> i64 {
     if n < 0 { (len + n).max(0) } else { n.min(len) }
 }
 
-fn new_array(heap: &mut Heap, elements: Vec<JsValue>) -> JsValue {
-    let arr = heap.alloc(JsObject::array(elements));
-    heap.add_root(JsValue::object(arr));
-    JsValue::object(arr)
+/// Allocates an array and links it to `%Array.prototype%` (agent-created
+/// arrays must carry the realm prototype, like literal arrays do through the
+/// interpreter's `NewArray` arm). Roots it too.
+fn new_array(ctx: &mut Ctx, elements: Vec<JsValue>) -> JsValue {
+    JsValue::object(ctx.alloc_array(elements))
 }
 
 /// `Array.prototype.indexOf(search, fromIndex?)` – strict-equality scan;
@@ -580,7 +579,7 @@ pub fn array_concat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
             out.push(item);
         }
     }
-    Ok(new_array(heap, out))
+    Ok(new_array(ctx, out))
 }
 
 /// `Array.prototype.at(index)` – relative indexing, out-of-range → undefined.
@@ -672,7 +671,7 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     let new_len = (len - delete_count as i64 + args.len().saturating_sub(2) as i64)
         .clamp(0, i64::from(u32::MAX)) as u32;
     set_array_len(heap, obj, new_len);
-    Ok(new_array(heap, removed))
+    Ok(new_array(ctx, removed))
 }
 
 /// Upper bound on entries a single `fill`/`copyWithin` call materializes in
@@ -759,7 +758,7 @@ pub fn array_flat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVa
     let heap = &mut *ctx.heap;
     let mut out: Vec<JsValue> = Vec::new();
     flatten_into(heap, obj, depth, &mut out);
-    Ok(new_array(heap, out))
+    Ok(new_array(ctx, out))
 }
 
 fn flatten_into(heap: &mut Heap, obj: Handle<JsObject>, depth: f64, out: &mut Vec<JsValue>) {
@@ -786,7 +785,7 @@ pub fn array_to_string(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Resul
 
 /// `Array.of(...items)` – a new array from the argument list.
 pub fn array_of(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    Ok(new_array(&mut *ctx.heap, args.to_vec()))
+    Ok(new_array(ctx, args.to_vec()))
 }
 
 /// `Array.from(arrayLike)` – array-likes (via `length` + indexed reads) and
@@ -795,7 +794,7 @@ pub fn array_of(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsVal
 pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let heap = &mut *ctx.heap;
     let Some(&source) = args.first() else {
-        return Ok(new_array(heap, Vec::new()));
+        return Ok(new_array(ctx, Vec::new()));
     };
     if let Some(h) = source.as_string() {
         let text = helpers::string_text(heap, h);
@@ -803,10 +802,10 @@ pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsV
             .chars()
             .map(|c| JsValue::string(heap.intern_text(&c.to_string())))
             .collect();
-        return Ok(new_array(heap, chars));
+        return Ok(new_array(ctx, chars));
     }
     let Some(obj) = source.as_object() else {
-        return Ok(new_array(heap, Vec::new()));
+        return Ok(new_array(ctx, Vec::new()));
     };
     let len = i64::from(array_len(heap, obj));
     // A huge `length` property on a sparse receiver describes mostly holes;
@@ -817,9 +816,9 @@ pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsV
     let items: Vec<JsValue> = (0..dense)
         .map(|i| read_index(heap, obj, i as u32).unwrap_or(JsValue::undefined()))
         .collect();
-    let arr_v = new_array(heap, items);
+    let arr_v = new_array(ctx, items);
     if let Some(arr) = arr_v.as_object() {
-        set_array_len(heap, arr, len as u32);
+        set_array_len(&mut *ctx.heap, arr, len as u32);
     }
     Ok(arr_v)
 }
@@ -834,17 +833,9 @@ pub fn array_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resul
                 // Spec: only the "length" property is defined; no index
                 // properties are created. Materializing `len` elements would
                 // explode on huge lengths (test262 uses 2**32 - 1).
-                let arr = ctx.heap.alloc(JsObject::array_sparse(len as u32));
-                // Bind the canonical `root --length--> child` array shape so
-                // later `array_length`/`sync_length` lookups resolve the
-                // length slot (sparse arrays can't fall back to the store
-                // length, which stays empty).
-                let key = length_prop(&mut *ctx.heap);
-                let shape =
-                    ctx.heap
-                        .add_property(ctx.heap.root_shape(), key, v12_heap::Attrs::DEFAULT);
-                ctx.heap.bind_shape(arr, shape);
-                ctx.add_root(JsValue::object(arr));
+                // `alloc_array_sparse` links `%Array.prototype%` and binds
+                // the canonical length shape.
+                let arr = ctx.alloc_array_sparse(len as u32);
                 return Ok(JsValue::object(arr));
             }
             _ => args.to_vec(),
@@ -852,7 +843,5 @@ pub fn array_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resul
     } else {
         args.to_vec()
     };
-    let arr = ctx.heap.alloc(JsObject::array(items));
-    ctx.add_root(JsValue::object(arr));
-    Ok(JsValue::object(arr))
+    Ok(new_array(ctx, items))
 }

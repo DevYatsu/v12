@@ -251,7 +251,7 @@ pub fn string_match(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
             .iter()
             .map(|&(s, e, _)| JsValue::string(ctx.heap.intern_text(&text[s..e])))
             .collect();
-        let arr = ctx.alloc_obj(v12_heap::JsObject::array(matches));
+        let arr = ctx.alloc_array(matches);
         Ok(JsValue::object(arr))
     } else {
         regexp::regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)])
@@ -481,7 +481,7 @@ fn array_of_strings(ctx: &mut Ctx, strs: Vec<&str>, limit: i64) -> JsValue {
         }
         out.push(JsValue::string(ctx.heap.intern_text(s)));
     }
-    let arr = ctx.alloc_obj(v12_heap::JsObject::array(out));
+    let arr = ctx.alloc_array(out);
     JsValue::object(arr)
 }
 
@@ -489,7 +489,7 @@ fn match_text_to_array(ctx: &mut Ctx, text: &str, found: Option<(usize, usize)>)
     match found {
         Some((s, e)) => {
             let matched_h = ctx.heap.intern_text(&text[s..e]);
-            let arr = ctx.alloc_obj(v12_heap::JsObject::array(vec![JsValue::string(matched_h)]));
+            let arr = ctx.alloc_array(vec![JsValue::string(matched_h)]);
             JsValue::object(arr)
         }
         None => JsValue::null(),
@@ -1102,7 +1102,7 @@ pub fn string_match_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resul
             break;
         }
     }
-    let arr = ctx.alloc_obj(v12_heap::JsObject::array(matches));
+    let arr = ctx.alloc_array(matches);
     iterator::array_iterator(ctx, JsValue::object(arr), &[])
 }
 
