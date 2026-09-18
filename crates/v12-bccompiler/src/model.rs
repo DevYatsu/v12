@@ -140,12 +140,18 @@ pub(crate) fn spur_of_str_id(id: u32) -> Option<lasso::Spur> {
 ///
 /// Namespace imports (`import * as ns from`) are represented with
 /// `imported == "*"`.
+///
+/// `deferred` is set for `import defer * as ns from` (the defer-import-eval
+/// proposal): the dependency is linked but its evaluation is postponed until
+/// an export is read through the namespace. The loader skips evaluating
+/// deferred dependencies; ordinary imports keep `deferred == false`.
 #[derive(Debug, Clone)]
 pub struct ImportEntry {
     pub specifier: String,
     pub imported: String,
     pub local: Option<SymbolId>,
     pub span: Option<(u32, u32)>,
+    pub deferred: bool,
 }
 
 /// One exported binding.

@@ -70,6 +70,15 @@ pub(crate) struct LoaderState {
     pub referrer: PathBuf,
     /// Evaluated modules: canonical path → namespace snapshot.
     pub modules: HashMap<PathBuf, JsValue>,
+    /// Deferred modules: canonical path → *linked-only* deferred namespace.
+    ///
+    /// `import defer * as ns from` links the dependency (compile + export
+    /// keys) but must not evaluate it. The namespace is registered here so
+    /// the importer's lowered static-import call resolves to a real object;
+    /// [`Self::modules`] stays reserved for evaluated modules so an eager
+    /// import of the same path still evaluates rather than observing the
+    /// placeholder.
+    pub deferred: HashMap<PathBuf, JsValue>,
     /// Canonical paths currently loading (cycle detection).
     loading: HashSet<PathBuf>,
 }
@@ -135,6 +144,10 @@ pub(crate) fn handle_import(
         if let Some(ns) = state.borrow().modules.get(&path) {
             return Ok(*ns);
         }
+        // A `defer` dependency is linked into `deferred`, not `modules`.
+        if let Some(ns) = state.borrow().deferred.get(&path) {
+            return Ok(*ns);
+        }
         return Err(ctx.type_error(format!("Unlinked module import: '{spec_text}'")));
     }
     let proto = ctx
@@ -145,6 +158,122 @@ pub(crate) fn handle_import(
     let job = make_load_job(Rc::clone(state), path, promise);
     ctx.enqueue_job(job);
     Ok(JsValue::object(promise))
+}
+
+/// Reads and compiles the module at `path`, or returns the throw value for a
+/// missing file / syntax error. Shared by eager evaluation and link-only
+/// deferred loading.
+fn read_and_compile(
+    interp: &mut Interp<'_>,
+    path: &Path,
+) -> Result<(v12_bccompiler::Module, Vec<String>), JsValue> {
+    let source = std::fs::read_to_string(path).map_err(|e| {
+        string_value(
+            interp.heap_mut(),
+            &format!("Cannot find module '{}': {e}", path.display()),
+        )
+    })?;
+    v12_bccompiler::compile_source_as_module_with_strings(&source).map_err(|e| {
+        string_value(
+            interp.heap_mut(),
+            &format!("SyntaxError: {}: {}", path.display(), e.message),
+        )
+    })
+}
+
+/// Recursively collects the modules a `defer` request must still evaluate
+/// eagerly: the spec's `GatherAsynchronousTransitiveDependencies`.
+///
+/// A deferred module is evaluated eagerly exactly when it (or a transitively
+/// reached dependency) has top-level await. The deferred module itself is
+/// only included when its own main is async; a sync deferred module with an
+/// async descendant contributes that descendant, not itself, so reading an
+/// export still triggers the deferred body later.
+fn gather_async_targets(
+    interp: &mut Interp<'_>,
+    state: &Loader,
+    path: &Path,
+    seen: &mut HashSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), JsValue> {
+    if !seen.insert(path.to_path_buf()) {
+        return Ok(());
+    }
+    {
+        let s = state.borrow();
+        // Already evaluated / currently evaluating: nothing more to gather.
+        if s.modules.contains_key(path) || s.loading.contains(path) {
+            return Ok(());
+        }
+    }
+    let (module, _strings) = read_and_compile(interp, path)?;
+    let main = module.program.main;
+    let main_is_async = module
+        .program
+        .functions
+        .get(main as usize)
+        .is_some_and(|f| f.is_async);
+    if main_is_async {
+        out.push(path.to_path_buf());
+        return Ok(());
+    }
+    let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut seen_spec: HashSet<String> = HashSet::new();
+    for entry in &module.imports {
+        if seen_spec.insert(entry.specifier.clone()) {
+            let child = resolve_specifier(&dir, &entry.specifier);
+            gather_async_targets(interp, state, &child, seen, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Links the module at `path` without evaluating it (the `import defer`
+/// contract): compiles it, allocates a namespace, seeds the statically-known
+/// export keys, and registers it in [`LoaderState::deferred`].
+///
+/// The deferred namespace deliberately lives in a separate map from
+/// [`LoaderState::modules`]: an eager import of the same path must still
+/// evaluate it rather than observe this unevaluated placeholder.
+///
+/// Exception (ES `InnerModuleEvaluation` / `GatherAsynchronousTransitiveDependencies`):
+/// asynchronous transitive dependencies are evaluated eagerly — a module with
+/// top-level await cannot be deferred, so each gathered target runs through
+/// [`load_and_evaluate`] here.
+pub(crate) fn load_deferred(
+    interp: &mut Interp<'_>,
+    state: &Loader,
+    path: &Path,
+) -> Result<JsValue, JsValue> {
+    if let Some(ns) = state.borrow().modules.get(path) {
+        return Ok(*ns);
+    }
+    if let Some(ns) = state.borrow().deferred.get(path) {
+        return Ok(*ns);
+    }
+    let (module, _strings) = read_and_compile(interp, path)?;
+    let namespace = super::module_namespace::alloc_namespace(interp.heap_mut());
+    let export_names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
+    super::module_namespace::seed_export_keys(interp.heap_mut(), namespace, &export_names);
+    state
+        .borrow_mut()
+        .deferred
+        .insert(path.to_path_buf(), JsValue::object(namespace));
+    // Gather then evaluate the async transitive dependencies. Gathering must
+    // complete before any of them evaluates: evaluating one may add its own
+    // namespaces to `modules`, which would prune the walk.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut targets: Vec<PathBuf> = Vec::new();
+    gather_async_targets(interp, state, path, &mut seen, &mut targets)?;
+    for target in targets {
+        load_and_evaluate(interp, state, &target)?;
+    }
+    // An async deferred module was evaluated above; hand back its real
+    // namespace so the importer observes populated exports immediately.
+    if let Some(ns) = state.borrow().modules.get(path) {
+        return Ok(*ns);
+    }
+    Ok(JsValue::object(namespace))
 }
 
 /// Evaluates the module at `path` (loading its static dependency graph first,
@@ -178,19 +307,7 @@ pub(crate) fn load_and_evaluate(
         ));
         return Ok(JsValue::object(placeholder));
     }
-    let source = std::fs::read_to_string(path).map_err(|e| {
-        string_value(
-            interp.heap_mut(),
-            &format!("Cannot find module '{}': {e}", path.display()),
-        )
-    })?;
-    let (module, strings) = v12_bccompiler::compile_source_as_module_with_strings(&source)
-        .map_err(|e| {
-            string_value(
-                interp.heap_mut(),
-                &format!("SyntaxError: {}: {}", path.display(), e.message),
-            )
-        })?;
+    let (module, strings) = read_and_compile(interp, path)?;
     state.borrow_mut().loading.insert(path.to_path_buf());
     // Allocate and register the namespace *before* evaluating static
     // dependencies: a self-import (`import * as ns from './self.js'`) or a
@@ -209,12 +326,20 @@ pub(crate) fn load_and_evaluate(
     // dependency's body) is still executing.
     let export_names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
     super::module_namespace::seed_export_keys(interp.heap_mut(), namespace, &export_names);
-    // Evaluate static dependencies first (dedup, source order).
+    // Evaluate static dependencies first (dedup, source order). A `defer`
+    // dependency is *linked* (namespace allocated, export keys seeded) but
+    // not evaluated here: its body runs only when an export is read through
+    // the deferred namespace, per the defer-import-eval proposal.
     let mut seen: HashSet<String> = HashSet::new();
     for entry in &module.imports {
         if seen.insert(entry.specifier.clone()) {
             let child = resolve_specifier(&dir, &entry.specifier);
-            if let Err(reason) = load_and_evaluate(interp, state, &child) {
+            let result = if entry.deferred {
+                load_deferred(interp, state, &child)
+            } else {
+                load_and_evaluate(interp, state, &child)
+            };
+            if let Err(reason) = result {
                 // Do not cache a partially-linked namespace: a later dynamic
                 // import of this path must retry rather than observe it.
                 state.borrow_mut().loading.remove(path);
