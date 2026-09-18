@@ -910,10 +910,24 @@ impl Interp<'_> {
                 }
 
                 Opcode::CreateGenerator => {
-                    // No longer emitted by compiler; generator creation is handled in prepare_call.
-                    // Keep stub for manual bytecode: create dormant generator capturing current frame state after this pc.
+                    // Emitted by the compiler in the prologue of every generator
+                    // unit (`v12-bccompiler/src/unit.rs`). The call path
+                    // (`prepare_call`) already built and saved a generator whose
+                    // window[0] holds the bound `this`; reuse that handle rather
+                    // than allocating a fresh generator that discards the
+                    // binding. Fall back to allocating a dormant generator for
+                    // hand-built bytecode with no generator on the frame.
                     let dst = ra;
                     let src = rb;
+                    if let Some(r#gen) = self.frames.last().and_then(|f| f.generator) {
+                        let idx = base + usize::from(dst);
+                        if idx >= self.stack.len() {
+                            self.stack.resize(idx + 1, JsValue::undefined());
+                        }
+                        self.stack[idx] = JsValue::object(r#gen);
+                        self.set_pc(pc + op_width);
+                        continue 'drive;
+                    }
                     // Bounds-checked: OOB stack read yields undefined (JS semantics for array OOB is undefined; for register window treat OOB as undefined rather than panic)
                     let func_idx = self
                         .stack

@@ -2,6 +2,18 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/gen-this: generator body reads the bound `this` [lane/gen-this]
+
+- **Filters:** `language/expressions` (11 128), `language/statements/function` (452), `language/expressions/object` (1 170), `--jobs 8`, base master `4f2f788`.
+- **Before (master `4f2f788`):** `language/expressions` **7 742 pass / 3 370 fail / 16 skip**; `language/expressions/object/method-definition/generator-invoke-fn-no-strict.js` **fail** (exposed by `lane/sloppy-this`).
+- **After:** `language/expressions` **7 755 pass / 3 357 fail / 16 skip (69.9 %, +13)**; the exposing test **passes 1/1**. Panic count `grep -c 'panicked at'` = 0. `language/statements/function` 370/452 (81.9 %), `language/expressions/object` 852/1170 (72.8 %).
+- **Root cause (two parts):** A sloppy generator called as `g()` must see the realm global object as `this` (ES 10.2.1.2 OrdinaryCallBindThis), but read `undefined`. (1) `generator_async.rs::resume_generator_nested` unconditionally wrote the resume value into the generator's `yield_dst` slot; a fresh generator has `yield_dst == 0`, so the first `.next()` (`resume_pc == 0`) overwrote register 0 — the bound-`this` slot `prepare_call` had installed — with the `next()` payload. (2) `execute.rs`'s `Opcode::CreateGenerator` arm (comment wrongly claimed "no longer emitted by compiler") allocated a brand-new generator from the live frame window, discarding the one `prepare_call` built with the bound `this`; `unit.rs` emits this opcode in every generator unit prologue.
+- **Fix:** (1) Guard the yield-dst write with `resume_pc != 0`: the body's prologue runs from pc 0, so no yield destination exists yet. (2) `CreateGenerator` reuses `frame.generator` (the activation's existing generator) instead of re-allocating; allocation fallback retained for hand-built bytecode with no generator frame. Doc comment corrected to state the opcode **is** emitted. Lazy creation preserved — `prepare_call` still returns without running the body.
+- **Files:** `crates/v12-interp/src/generator_async.rs`, `crates/v12-interp/src/execute.rs`.
+- **Probes:** `/tmp/gen.js` prints `true`; strict keeps `undefined`; arrow inherits; `obj.gen()` / `{*m(){}}` keep `obj`; nested generator; parameters; `this` across multiple `next()`; for-of; throw/catch paths; laziness (`ran === false` before first `.next()`); independent generators; `return()` path — all pass.
+- **Known pre-existing gap (not a regression):** `arguments` inside a generator throws (`ReferenceError: arguments is not defined`) on master too; out of this lane's scope.
+- **Verification:** `cargo nextest run --workspace` **640 passed / 0 skipped / 0 failed**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-interp --check` clean.
+
 ### 2026-09-18 — lane/sloppy-this: sloppy-mode `this` binds the global object [lane/sloppy-this]
 
 - **Filters:** `language` (24 590), `--jobs 8`, TAP to file for the pass-set diff; base master `9dc28b6`.
