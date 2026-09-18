@@ -2045,12 +2045,29 @@ impl Interp<'_> {
     /// `EnumerableOwnProperties`-style read over a proxy (ES 7.3.24): for each
     /// `ownKeys` result, consult `[[GetOwnProperty]]` on the proxy itself (so
     /// the `getOwnPropertyDescriptor` trap fires) and collect by kind.
+    ///
+    /// `Object.getOwnPropertyNames`/`getOwnPropertySymbols` take the
+    /// `GetOwnPropertyKeys` path instead (ES 20.1.2.8): they filter
+    /// `[[OwnPropertyKeys]]` by key type and never consult
+    /// `[[GetOwnProperty]]`, so a handler with only `ownKeys` installed must
+    /// not trigger the descriptor trap.
     fn proxy_enumerate(
         &mut self,
         id: NativeId,
         proxy: Handle<JsObject>,
     ) -> Result<JsValue, JSException> {
         let keys = self.object_own_keys(proxy)?;
+        if id == NativeId::ObjectGetOwnPropertyNames
+            || id == NativeId::ObjectGetOwnPropertySymbols
+        {
+            let want_symbols = id == NativeId::ObjectGetOwnPropertySymbols;
+            let names: Vec<JsValue> = keys
+                .into_iter()
+                .filter(|k| k.is_symbol() == want_symbols)
+                .map(prop_key_value)
+                .collect();
+            return Ok(JsValue::object(self.heap.alloc(JsObject::array(names))));
+        }
         let mut names: Vec<JsValue> = Vec::new();
         let mut values: Vec<JsValue> = Vec::new();
         for k in keys {
@@ -2061,17 +2078,9 @@ impl Interp<'_> {
                 NativeId::ObjectKeys | NativeId::ObjectValues | NativeId::ObjectEntries => {
                     desc.enumerable
                 }
-                NativeId::ObjectGetOwnPropertyNames => !k.is_symbol(),
-                NativeId::ObjectGetOwnPropertySymbols => k.is_symbol(),
                 _ => false,
             };
             if !wanted {
-                continue;
-            }
-            if id == NativeId::ObjectGetOwnPropertyNames
-                || id == NativeId::ObjectGetOwnPropertySymbols
-            {
-                names.push(prop_key_value(k));
                 continue;
             }
             if id == NativeId::ObjectValues || id == NativeId::ObjectEntries {
@@ -2082,9 +2091,6 @@ impl Interp<'_> {
         }
         match id {
             NativeId::ObjectKeys => Ok(JsValue::object(self.heap.alloc(JsObject::array(names)))),
-            NativeId::ObjectGetOwnPropertyNames | NativeId::ObjectGetOwnPropertySymbols => {
-                Ok(JsValue::object(self.heap.alloc(JsObject::array(names))))
-            }
             NativeId::ObjectValues => Ok(JsValue::object(self.heap.alloc(JsObject::array(values)))),
             NativeId::ObjectEntries => {
                 let mut entries: Vec<JsValue> = Vec::with_capacity(names.len());

@@ -945,6 +945,15 @@ impl Interp<'_> {
         let mut hit: Option<(Handle<JsObject>, Descriptor)> = None;
         let mut dict_hit: Option<(Handle<JsObject>, v12_heap::DictEntry)> = None;
         while let Some(o) = cur {
+            // Proxy exotic in the prototype chain: `[[Get]]` recurses through
+            // the receiver's `[[Prototype]]`, and a proxy there resolves via
+            // its own `get` trap with the *original* receiver (ES 10.5.8;
+            // OrdinaryGet step 3 propagates the receiver unchanged). Without
+            // this the walk would treat the proxy's empty shared shape as
+            // ordinary and answer `undefined`.
+            if self.heap.get(o).kind == Kind::Proxy {
+                return self.proxy_op_get(o, JsValue::object(obj), key_v);
+            }
             if let Some(entry) = self
                 .heap
                 .get(o)
@@ -1417,6 +1426,14 @@ impl Interp<'_> {
         let key = self.property_key(key_v)?;
         let mut cur = Some(obj);
         while let Some(o) = cur {
+            // Proxy exotic in the prototype chain: `HasProperty` recurses
+            // through the receiver's `[[Prototype]]`, and a proxy there
+            // answers via its own `has` trap (ES 10.5.6, `HasProperty` step
+            // 1). Without this the walk would treat the proxy's empty shared
+            // shape as ordinary and answer `false`.
+            if self.heap.get(o).kind == Kind::Proxy {
+                return self.proxy_op_has(prop_key_value(key), o);
+            }
             // Dictionary rung: overflow keys live only here.
             if self
                 .heap
