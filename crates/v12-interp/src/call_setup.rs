@@ -1804,16 +1804,12 @@ impl Interp<'_> {
         }
         // `CreateArrayFromList` for the trap's third argument.
         self.gc_protect();
-        let arg_array = self.heap.alloc(JsObject::array(args.to_vec()));
-        self.heap.add_root(JsValue::object(arg_array));
+        let arg_array = crate::call::alloc_array(self, args.to_vec());
+        self.heap.add_root(arg_array);
         self.call_inline(
             trap,
             JsValue::object(handler),
-            &[
-                JsValue::object(target),
-                this_arg,
-                JsValue::object(arg_array),
-            ],
+            &[JsValue::object(target), this_arg, arg_array],
         )
     }
 
@@ -1847,16 +1843,12 @@ impl Interp<'_> {
             ));
         }
         self.gc_protect();
-        let arg_array = self.heap.alloc(JsObject::array(args.to_vec()));
-        self.heap.add_root(JsValue::object(arg_array));
+        let arg_array = crate::call::alloc_array(self, args.to_vec());
+        self.heap.add_root(arg_array);
         let result = self.call_inline(
             trap,
             JsValue::object(handler),
-            &[
-                JsValue::object(target),
-                JsValue::object(arg_array),
-                new_target,
-            ],
+            &[JsValue::object(target), arg_array, new_target],
         )?;
         // ES step 12: the trap result must be an object.
         if result.as_object().is_none() {
@@ -2215,7 +2207,7 @@ impl Interp<'_> {
             NativeId::ReflectOwnKeys => {
                 let keys = self.object_own_keys(proxy)?;
                 let items: Vec<JsValue> = keys.into_iter().map(prop_key_value).collect();
-                Ok(JsValue::object(self.heap.alloc(JsObject::array(items))))
+                Ok(crate::call::alloc_array(self, items))
             }
             NativeId::ReflectGet => {
                 let key_v = args.get(1).copied().unwrap_or(JsValue::undefined());
@@ -2257,7 +2249,7 @@ impl Interp<'_> {
                 .filter(|k| k.is_symbol() == want_symbols)
                 .map(prop_key_value)
                 .collect();
-            return Ok(JsValue::object(self.heap.alloc(JsObject::array(names))));
+            return Ok(crate::call::alloc_array(self, names));
         }
         let mut names: Vec<JsValue> = Vec::new();
         let mut values: Vec<JsValue> = Vec::new();
@@ -2281,15 +2273,15 @@ impl Interp<'_> {
             names.push(prop_key_value(k));
         }
         match id {
-            NativeId::ObjectKeys => Ok(JsValue::object(self.heap.alloc(JsObject::array(names)))),
-            NativeId::ObjectValues => Ok(JsValue::object(self.heap.alloc(JsObject::array(values)))),
+            NativeId::ObjectKeys => Ok(crate::call::alloc_array(self, names)),
+            NativeId::ObjectValues => Ok(crate::call::alloc_array(self, values)),
             NativeId::ObjectEntries => {
                 let mut entries: Vec<JsValue> = Vec::with_capacity(names.len());
                 for (k, v) in names.into_iter().zip(values) {
-                    let pair = self.heap.alloc(JsObject::array(vec![k, v]));
-                    entries.push(JsValue::object(pair));
+                    let pair = crate::call::alloc_array(self, vec![k, v]);
+                    entries.push(pair);
                 }
-                Ok(JsValue::object(self.heap.alloc(JsObject::array(entries))))
+                Ok(crate::call::alloc_array(self, entries))
             }
             _ => Ok(JsValue::undefined()),
         }
@@ -2619,15 +2611,15 @@ impl Interp<'_> {
         match id {
             NativeId::ArrayMap => {
                 self.gc_protect();
-                let arr = self.heap.alloc(JsObject::array(mapped));
-                self.heap.add_root(JsValue::object(arr));
-                Ok(JsValue::object(arr))
+                let arr = crate::call::alloc_array(self, mapped);
+                self.heap.add_root(arr);
+                Ok(arr)
             }
             NativeId::ArrayFilter => {
                 self.gc_protect();
-                let arr = self.heap.alloc(JsObject::array(mapped));
-                self.heap.add_root(JsValue::object(arr));
-                Ok(JsValue::object(arr))
+                let arr = crate::call::alloc_array(self, mapped);
+                self.heap.add_root(arr);
+                Ok(arr)
             }
             NativeId::ArraySome => Ok(JsValue::from_bool(false)),
             NativeId::ArrayEvery => Ok(JsValue::from_bool(true)),
@@ -2665,9 +2657,9 @@ impl Interp<'_> {
                         flat.push(*v);
                     }
                 }
-                let arr = self.heap.alloc(JsObject::array(flat));
-                self.heap.add_root(JsValue::object(arr));
-                Ok(JsValue::object(arr))
+                let arr = crate::call::alloc_array(self, flat);
+                self.heap.add_root(arr);
+                Ok(arr)
             }
             _ => Ok(JsValue::undefined()),
         }
@@ -2851,15 +2843,15 @@ impl Interp<'_> {
         match id {
             NativeId::IteratorMap => {
                 self.gc_protect();
-                let arr = self.heap.alloc(JsObject::array(mapped));
-                self.heap.add_root(JsValue::object(arr));
-                Ok(JsValue::object(arr))
+                let arr = crate::call::alloc_array(self, mapped);
+                self.heap.add_root(arr);
+                Ok(arr)
             }
             NativeId::IteratorFilter => {
                 self.gc_protect();
-                let arr = self.heap.alloc(JsObject::array(mapped));
-                self.heap.add_root(JsValue::object(arr));
-                Ok(JsValue::object(arr))
+                let arr = crate::call::alloc_array(self, mapped);
+                self.heap.add_root(arr);
+                Ok(arr)
             }
             NativeId::IteratorFlatMap => {
                 self.gc_protect();
@@ -2874,9 +2866,9 @@ impl Interp<'_> {
                         flat.push(*v);
                     }
                 }
-                let arr = self.heap.alloc(JsObject::array(flat));
-                self.heap.add_root(JsValue::object(arr));
-                Ok(JsValue::object(arr))
+                let arr = crate::call::alloc_array(self, flat);
+                self.heap.add_root(arr);
+                Ok(arr)
             }
             NativeId::IteratorReduce => match acc {
                 Some(v) => Ok(v),

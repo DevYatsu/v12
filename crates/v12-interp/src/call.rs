@@ -98,12 +98,26 @@ pub(crate) fn fill_stack_call_window(
     }
 }
 
-pub(crate) fn alloc_rest_array(interp: &mut Interp<'_>, elements: Vec<JsValue>) -> JsValue {
+/// Allocates a JavaScript-visible array from `elements`, stamping the
+/// canonical length shape and linking `%Array.prototype%`.
+///
+/// This is the one place the three-step array-allocation idiom lives (mirrors
+/// `Opcode::NewArray` in `execute.rs` and `object_ops.rs`). Every engine
+/// allocation that produces an array observable from JavaScript must go
+/// through here, or `result.constructor === Array` and inherited methods
+/// (`join`, `includes`, …) resolve against no prototype.
+pub(crate) fn alloc_array(interp: &mut Interp<'_>, elements: Vec<JsValue>) -> JsValue {
     let shape = interp.array_shape();
     let h = interp.heap_mut().alloc(JsObject::array(elements));
     interp.bind_shape(h, shape);
     interp.link_array_proto(h);
     JsValue::object(h)
+}
+
+/// Rest-parameter array (`FunctionDeclarationInstantiation`). Delegates to
+/// [`alloc_array`]; kept as a named entry point for its call sites.
+pub(crate) fn alloc_rest_array(interp: &mut Interp<'_>, elements: Vec<JsValue>) -> JsValue {
+    alloc_array(interp, elements)
 }
 
 /// Fill the callee stack window at `new_base` from a caller-side arg slice

@@ -2,6 +2,19 @@
 
 Append-only log. Each entry records one fix, its before/after harness numbers, and which bucket in `ROADMAP.md` it closed or shrank.
 
+### 2026-09-18 — lane/array-callback: callback-seam array results link %Array.prototype% [lane/array-callback]
+
+- **Filters:** `built-ins/Array` (3 332), `built-ins/Object` (3 414), `language/expressions` (11 128), `--jobs 8`, default `--format human`; base master `e41c34e`.
+- **Before (master `e41c34e`, runner rebuilt in the main worktree):** `built-ins/Array` **1 235 pass / 1 943 fail / 154 skip (38.9 %)**; `built-ins/Object` **2 326 / 1 081 / 7 (68.3 %)**; `language/expressions` **7 755 / 3 357 / 16 (69.8 %)**.
+- **After:** `built-ins/Array` **1 243 / 1 935 / 154 (39.1 %, +8)**; `built-ins/Object` **2 326 / 1 081 / 7** (byte-identical TAP pass set); `language/expressions` **7 755 / 3 357 / 16** (unchanged). TAP pass-set diff on `built-ins/Array`: **0 lost, 8 gained**. Panics: 0 in all three logs.
+- **Root cause:** the lane/array-proto fix (`c5c3a5b`) routed the builtins-layer allocators through `Ctx::alloc_array`, but arrays allocated at the interpreter callback seam in `call_setup.rs` still called `JsObject::array` directly. They received no `%Array.prototype%` link and no canonical `length` shape, so `[1,2,3].map(x => x).constructor` was `undefined` and a set property on a callback result did not round-trip (without the length shape the first added property took slot 0 and read back the length Smi).
+- **Fix:** generalized the existing three-step helper `call.rs::alloc_rest_array` into `call.rs::alloc_array` (single home of `array_shape` + `bind_shape` + `link_array_proto`); `alloc_rest_array` now delegates to it, so rest-parameter behavior is unchanged. Routed every JS-visible array result in `call_setup.rs` through it: proxy `apply` trap `argumentsList` (~1807), proxy `construct` trap `argumentsList` (~1850), `Reflect.ownKeys` (~2218), proxy `getOwnPropertyNames`/`getOwnPropertySymbols` (~2260), proxy `ObjectKeys`/`ObjectValues`/`ObjectEntries` outer + inner pairs (~2284-2292), `Array.prototype.map`/`filter` (~2622/2628), `Array.prototype.flatMap` (~2668), Iterator helpers `map`/`filter` (~2854/2860) and `flatMap` (~2877). Element and length computation untouched.
+- **`arg_array` decision:** the ~1807/~1850 sites are **JavaScript-visible** and were linked. They are the `argumentsList` passed to a user proxy trap (`apply`/`construct`), which ES `CreateArrayFromList` requires to be an ordinary Array; the trap can observe `Array.isArray(argsList)`, `argsList.constructor`, and its prototype.
+- **Out of scope (reported):** the **plain-object** `Object.keys` result (~`built-ins/Object/keys`) and the inner pair of plain-object `Object.entries()` are allocated in `crates/v12-engine/src/builtins/object.rs` (`object_keys` line 326, `object_entries` pair line 402, `array_value` line 810 links the prototype but not the length shape). Those files are outside this lane's write scope; only the **proxy** path in `call_setup.rs` is fixed.
+- **Files:** `crates/v12-interp/src/call.rs`, `crates/v12-interp/src/call_setup.rs`.
+- **Probes (`/tmp/arrcb.js`, `/tmp/arrcb-traps.js`):** all pass (constructor, `Array.isArray`, prototype identity, property round-trip, inherited `join`/`includes`, proxy apply/construct trap argument arrays).
+- **Verification:** `cargo nextest run --workspace` **640 passed / 0 skipped / 0 failed**; `cargo clippy --workspace --all-targets` **0 errors**; `cargo fmt -p v12-interp --check` clean.
+
 ### 2026-09-18 — lane/array-proto: engine-allocated arrays link %Array.prototype% [lane/array-proto]
 
 - **Filter:** `built-ins/Array` (3 332 incl. ArrayBuffer/ArrayIteratorPrototype; 3 082 under `built-ins/Array`), `built-ins/String` (1 341), `--jobs 8`, default `--format human`.
