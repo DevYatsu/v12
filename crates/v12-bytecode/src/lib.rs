@@ -204,6 +204,7 @@ pub struct EvalFunctionMetadata {
     pub direct_eval_sites: Vec<EvalSiteFacts>,
     pub var_declared_names: Vec<String>,
     pub eval_reachable: bool,
+    pub is_eval_payload: bool,
 }
 
 /// Fully assembled bytecode for one function.

@@ -58,6 +58,50 @@ fn nested_arrow_rejects_var_arguments_from_non_simple_owner() {
 }
 
 #[test]
+fn eval_owned_vars_route_to_caller_or_eval_local_storage() {
+    assert_eq!(
+        result("((a = 1) => eval(\"var arguments; 1\"))() + ':' + (typeof globalThis.arguments)"),
+        "1:undefined"
+    );
+    assert_eq!(
+        result(
+            "function f() { return eval(\"var arguments; return 1;\"); } f() + ':' + (typeof globalThis.arguments)"
+        ),
+        "1:undefined"
+    );
+    assert_eq!(
+        result("function f() { return eval(\"var n = 1; eval('n = 2; n')\"); } f()"),
+        "2"
+    );
+    assert_eq!(
+        result("function f() { var x = 1; eval(\"var x = 2; x\"); return x; } f()"),
+        "2"
+    );
+    assert_eq!(
+        result("function f() { eval(\"var n = 1\"); return typeof globalThis.n; } f()"),
+        "undefined"
+    );
+}
+
+#[test]
+fn top_level_and_indirect_eval_keep_global_var_scope() {
+    assert_eq!(
+        result("eval(\"var topLevelProbe = 7\"); topLevelProbe"),
+        "7"
+    );
+    assert_eq!(
+        result("function f() { return (0, eval)(\"var indirectProbe = 2; indirectProbe\"); } f()"),
+        "2"
+    );
+    assert_eq!(
+        result(
+            "function f() { return (0, eval)(\"var indirectProbe = 2; indirectProbe\") + ':' + (typeof globalThis.indirectProbe); } f()"
+        ),
+        "2:number"
+    );
+}
+
+#[test]
 fn direct_eval_keeps_legal_argument_and_eval_bindings() {
     assert_eq!(result("((a = 1) => eval(\"var arguments; 1\"))()"), "1");
     assert_eq!(

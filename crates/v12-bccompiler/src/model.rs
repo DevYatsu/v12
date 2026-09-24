@@ -431,6 +431,7 @@ pub struct Compiler<'s, 'i> {
     pub functions: Vec<v12_bytecode::FunctionBytecode>,
     /// Emit binding metadata for every unit in a compiled eval payload.
     pub emit_eval_metadata: bool,
+    pub is_eval_payload: bool,
 }
 
 impl<'s, 'i> Compiler<'s, 'i> {

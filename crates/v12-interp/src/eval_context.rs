@@ -10,12 +10,15 @@ use super::{Frame, Interp, JSException};
 pub(crate) enum EvalBindingRef {
     Register { base: usize, reg: u16 },
     Env { env: Handle<JsObject>, slot: u16 },
+    EvalLocal { env: Handle<JsObject>, slot: u16 },
     Global,
     Arguments { frame: usize },
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EvalCallerContext {
+    pub local_env: Option<Handle<JsObject>>,
+    pub eval_local_owner: bool,
     pub this: JsValue,
     pub env: Option<Handle<JsObject>>,
     pub new_target: Option<JsValue>,
@@ -80,6 +83,8 @@ impl Interp<'_> {
                     .map(|function| !function.is_arrow && frame.fn_idx != 0)
             })
             .unwrap_or(false);
+        let local_env = self.frames.get(owner).and_then(|frame| frame.env);
+        let eval_local_owner = is_arrow && !owner_is_ordinary;
         let inherited = self
             .frames
             .get(frame_idx)
@@ -176,6 +181,8 @@ impl Interp<'_> {
             bindings.push(("arguments".to_string(), arguments.clone()));
         }
         EvalCallerContext {
+            local_env,
+            eval_local_owner,
             this,
             env,
             new_target,
@@ -203,6 +210,37 @@ impl Interp<'_> {
             .get(compiled.main as usize)
             .ok_or_else(|| JSException(self.error_value("TypeError: invalid eval program")))?;
         let max_regs = function.max_regs;
+        let var_names = function
+            .eval_metadata
+            .as_ref()
+            .map(|metadata| metadata.var_declared_names.clone())
+            .unwrap_or_default();
+        let caller_base = self.frames.last().map(|frame| frame.base);
+        let local_env = if context.eval_local_owner {
+            Some(home_env)
+        } else {
+            context.local_env
+        };
+        if let Some(local_env) = local_env {
+            for name in var_names {
+                if context.bindings.iter().any(|(old, _)| old == &name) {
+                    continue;
+                }
+                let slot = u16::try_from(self.heap.get(local_env).properties.len())
+                    .expect("eval-local environment fits u16");
+                self.heap
+                    .get_mut(local_env)
+                    .properties
+                    .push(JsValue::undefined());
+                context.bindings.push((
+                    name,
+                    EvalBindingRef::EvalLocal {
+                        env: local_env,
+                        slot,
+                    },
+                ));
+            }
+        }
         let new_base = self.stack.len();
         let end = new_base + usize::from(max_regs);
         self.stack.resize(end, JsValue::undefined());
@@ -222,7 +260,16 @@ impl Interp<'_> {
             arguments: None,
         });
         self.eval_contexts
-            .insert(home_env.index() as usize, context);
+            .insert(home_env.index() as usize, context.clone());
+        if let Some(local_env) = local_env
+            && local_env != home_env
+        {
+            self.eval_contexts
+                .insert(local_env.index() as usize, context.clone());
+        }
+        if let Some(caller_base) = caller_base {
+            self.eval_contexts.insert(caller_base, context.clone());
+        }
         let saved_program = self.program_id;
         self.program_id = program_id;
         let saved_stop = self.stop_at_frames;
@@ -235,17 +282,17 @@ impl Interp<'_> {
     }
 
     fn eval_binding(&self, name: &str) -> Option<EvalBindingRef> {
-        self.frames
-            .last()
-            .and_then(|f| f.env)
+        let frame = self.frames.last()?;
+        let context = frame
+            .env
             .and_then(|env| self.eval_contexts.get(&(env.index() as usize)))
-            .and_then(|ctx| {
-                ctx.bindings
-                    .iter()
-                    .rev()
-                    .find(|(key, _)| key == name)
-                    .map(|(_, value)| value.clone())
-            })
+            .or_else(|| self.eval_contexts.get(&frame.base))?;
+        context
+            .bindings
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
     }
 
     pub(crate) fn eval_read_global(
@@ -264,6 +311,15 @@ impl Interp<'_> {
                     .unwrap_or_else(JsValue::undefined),
             )),
             EvalBindingRef::Env { env, slot } => {
+                let value = self
+                    .heap
+                    .get(env)
+                    .properties
+                    .get(usize::from(slot))
+                    .copied();
+                Ok(Some(value.unwrap_or_else(JsValue::undefined)))
+            }
+            EvalBindingRef::EvalLocal { env, slot } => {
                 let value = self
                     .heap
                     .get(env)
@@ -308,6 +364,15 @@ impl Interp<'_> {
                 if idx >= self.heap.get(env).properties.len() {
                     return Err(JSException(
                         self.error_value("ReferenceError: invalid eval binding"),
+                    ));
+                }
+                self.heap.get_mut(env).properties[idx] = value;
+            }
+            EvalBindingRef::EvalLocal { env, slot } => {
+                let idx = usize::from(slot);
+                if idx >= self.heap.get(env).properties.len() {
+                    return Err(JSException(
+                        self.error_value("ReferenceError: invalid eval-local binding"),
                     ));
                 }
                 self.heap.get_mut(env).properties[idx] = value;

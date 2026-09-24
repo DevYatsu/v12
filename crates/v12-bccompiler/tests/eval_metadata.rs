@@ -96,7 +96,25 @@ fn eval_source_directive_wins_over_false_caller_strictness() {
         },
     )
     .unwrap();
-    assert!(program.functions[program.main as usize].is_strict);
+    let main = &program.functions[program.main as usize];
+    assert!(main.is_strict);
+    assert!(main.eval_metadata.as_ref().unwrap().is_eval_payload);
+    let nested = compile_eval_source_with_interner_facts(
+        "function nested() {} 1",
+        &mut interner,
+        &EvalCompileFacts {
+            direct: true,
+            ..EvalCompileFacts::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !nested.functions[1]
+            .eval_metadata
+            .as_ref()
+            .unwrap()
+            .is_eval_payload
+    );
 }
 
 #[test]

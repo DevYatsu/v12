@@ -492,6 +492,7 @@ fn compile_ast_inner(
         plans,
         functions: Vec::new(),
         emit_eval_metadata,
+        is_eval_payload: eval_caller_facts.is_some(),
     };
     unit::compile_unit(&mut comp, 0, unit::UnitNode::Main(program))?;
     for fb in &comp.functions {
@@ -522,6 +523,7 @@ fn compile_ast_as_module_inner(
         plans,
         functions: Vec::new(),
         emit_eval_metadata: false,
+        is_eval_payload: false,
     };
     unit::compile_unit(&mut comp, 0, unit::UnitNode::Main(program))?;
     for fb in &comp.functions {

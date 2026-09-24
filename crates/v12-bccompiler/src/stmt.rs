@@ -129,7 +129,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Statement::BreakStatement(b) => self.jump_out(b.label.as_ref(), false, b.span),
             Statement::ContinueStatement(c) => self.jump_out(c.label.as_ref(), true, c.span),
             Statement::ReturnStatement(r) => {
-                if self.unit == 0 {
+                if self.unit == 0 && !self.comp.is_eval_payload {
                     return Err(self.err(r.span, "`return` at the top level is not supported"));
                 }
                 let v = match &r.argument {
