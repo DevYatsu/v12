@@ -877,13 +877,26 @@ impl<'a> Interp<'a> {
     /// function whose `arguments` never aliases parameters here — observe
     /// this unmapped form, so element writes never touch parameter registers.
     pub(crate) fn make_arguments_object(&mut self, args: &[JsValue]) -> JsValue {
+        self.make_arguments_object_with_callee(args, None, false)
+    }
+
+    pub(crate) fn make_arguments_object_with_callee(
+        &mut self,
+        args: &[JsValue],
+        callee: Option<JsValue>,
+        strict: bool,
+    ) -> JsValue {
         self.gc_protect();
         let elements: Vec<JsValue> = args
             .iter()
             .map(|&v| if v.is_hole() { JsValue::undefined() } else { v })
             .collect();
         let len = elements.len();
-        let shape = self.array_shape();
+        let length_key = self.heap.intern_text("length");
+        let shape = self.named_child_shape_with_attrs(
+            PropKey::from_string(length_key),
+            Attrs::new(true, false, true),
+        );
         let h = self.heap.alloc(JsObject::arguments(
             smallvec::smallvec![
                 JsValue::from_i32_smi(len as i32).expect("arguments length fits Smi"),
@@ -891,7 +904,33 @@ impl<'a> Interp<'a> {
             elements,
             None,
         ));
+        self.stack.push(JsValue::object(h));
+        self.gc_protect();
         self.bind_shape(h, shape);
+        self.link_object_proto(h);
+        {
+            let object = self.heap.get_mut(h);
+            object.arguments_callee = callee;
+            object.arguments_strict = strict;
+        }
+        if let Some(callee) = callee {
+            let key = self.heap.intern_text("callee");
+            let _ = self.define_own_data_attrs(
+                JsValue::object(h),
+                JsValue::string(key),
+                callee,
+                Attrs::new(true, false, true),
+            );
+        }
+        let iterator = self.map_set_method(NativeId::ArrayIterator);
+        let iterator_key = self.symbol_iterator_key();
+        let _ = self.define_own_data_attrs(
+            JsValue::object(h),
+            JsValue::symbol(iterator_key),
+            iterator,
+            Attrs::new(true, false, true),
+        );
+        self.stack.pop();
         JsValue::object(h)
     }
 
@@ -905,15 +944,17 @@ impl<'a> Interp<'a> {
         fn_idx: u32,
         program: u32,
         args: &[JsValue],
+        callee: JsValue,
     ) -> Option<JsValue> {
-        let needs = self
+        let (needs, strict) = self
             .functions_for_program(program)
             .get(fn_idx as usize)
-            .is_some_and(|f| f.needs_arguments);
+            .map(|f| (f.needs_arguments, f.is_strict))
+            .unwrap_or((false, false));
         if !needs {
             return None;
         }
-        let obj = self.make_arguments_object(args);
+        let obj = self.make_arguments_object_with_callee(args, Some(callee), strict);
         self.heap.add_root(obj);
         Some(obj)
     }

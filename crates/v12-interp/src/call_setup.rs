@@ -264,6 +264,9 @@ impl Interp<'_> {
             let mut window = vec![JsValue::undefined(); usize::from(callee_max_regs)];
             window[0] = self.bind_this(target_idx, callee_program, this_v);
             let arg_src = callee_slot + 2;
+            let actuals = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
+            let arguments =
+                self.frame_arguments_for(target_idx, callee_program, &actuals, callee_v);
             self.fill_call_window(
                 &mut window,
                 arg_src,
@@ -283,6 +286,12 @@ impl Interp<'_> {
             );
             g_obj.program_id = callee_program;
             let g = self.heap.alloc(g_obj);
+            let retained_arguments = arguments.unwrap_or(JsValue::undefined());
+            self.set_generator_header_value(g, Self::GENERATOR_ARGUMENTS_SLOT, retained_arguments);
+            if let Some(arguments) = self.generator_header_value(g, Self::GENERATOR_ARGUMENTS_SLOT)
+            {
+                self.heap.remove_root(arguments);
+            }
             self.heap.add_root(JsValue::object(g));
             // Defer: enqueue resume at pc 0
             self.pending_awaits
@@ -317,7 +326,7 @@ impl Interp<'_> {
             callee_fixed,
             callee_rest_reg,
         );
-        let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed);
+        let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed, callee_v);
 
         // Display snapshot for the fresh frame (bounded O(8) walk; calls
         // are cold, slot accesses hot).
@@ -433,7 +442,8 @@ impl Interp<'_> {
                     callee_fixed,
                     callee_rest_reg,
                 );
-                let frame_args = self.frame_arguments_for(fn_idx, func_program, args);
+                let frame_args =
+                    self.frame_arguments_for(fn_idx, func_program, args, JsValue::object(func));
                 let env_display = self.env_display_for(captured_env);
                 self.frames.push(Frame {
                     fn_idx,
@@ -551,7 +561,8 @@ impl Interp<'_> {
                     callee_fixed,
                     callee_rest_reg,
                 );
-                let frame_args = self.frame_arguments_for(fn_idx, func_program, args);
+                let frame_args =
+                    self.frame_arguments_for(fn_idx, func_program, args, JsValue::object(func));
                 let env_display = self.env_display_for(captured_env);
                 self.frames.push(Frame {
                     fn_idx,
@@ -640,14 +651,15 @@ impl Interp<'_> {
             // settlement; the engine's checkpoint drain settles it through
             // the full capability/reaction path so `.then` observers run.
             let is_async = self.is_async_fn_for(finished.fn_idx, finished.program);
-            let has_promise_slot = self.heap.get(r#gen).properties.len() > 4;
-            if is_async && has_promise_slot {
-                if let Some(ph) = self.heap.get(r#gen).properties[4].as_object() {
+            let completion_promise = self.generator_completion_promise(r#gen);
+            let has_completion_promise = completion_promise.is_some();
+            if is_async && has_completion_promise {
+                if let Some(ph) = completion_promise {
                     self.pending_settlements.push((ph, result, false));
                 }
                 // Prevent Heap::roots leak: promise was roots-pinned at creation/await; after settling
                 // it remains reachable via generator properties[4] until GC, so drop the extra root.
-                if let Some(ph_val) = self.heap.get(r#gen).properties.get(4).copied() {
+                if let Some(ph_val) = self.generator_header_value(r#gen, 4) {
                     self.heap.remove_root(ph_val);
                 }
             }
@@ -656,7 +668,7 @@ impl Interp<'_> {
                 self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
             }
             // For async jobs, caller already resumed with Promise; just settle and resume caller
-            if is_async && has_promise_slot {
+            if is_async && has_completion_promise {
                 // If this was a direct call without prior await suspension (no caller advancement),
                 // ensure caller gets the promise
                 // Snapshot the caller's identity before any program-table
@@ -1104,7 +1116,7 @@ impl Interp<'_> {
                 self.stack[new_base + 1 + i] = if v.is_hole() { JsValue::undefined() } else { v };
             }
         }
-        let frame_args = self.frame_arguments_for(target_idx, callee_program, &elements);
+        let frame_args = self.frame_arguments_for(target_idx, callee_program, &elements, callee_v);
         let env_display = self.env_display_for(captured_env);
         self.frames.push(Frame {
             fn_idx: target_idx,
@@ -1333,7 +1345,7 @@ impl Interp<'_> {
             }
         }
 
-        let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed);
+        let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed, callee_v);
         let captured_env = self.heap.get(callee_obj).captured_env;
         let env_display = self.env_display_for(captured_env);
         self.frames.push(Frame {

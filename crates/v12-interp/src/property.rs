@@ -172,6 +172,23 @@ impl Interp<'_> {
         // code always resolved them at `element_surface` — same answer,
         // reached in one probe instead of ~15.
         let kind = self.heap.get(obj).kind;
+        if kind == Kind::Arguments
+            && key_v.as_string().is_some_and(|key| {
+                let callee_key = self.heap.intern_text("callee");
+                self.heap.strings_equal(key, callee_key)
+            })
+        {
+            if self.heap.get(obj).arguments_strict {
+                return Err(JSException(self.error_value(
+                    "TypeError: 'caller' may not be accessed in strict mode",
+                )));
+            }
+            return Ok(self
+                .heap
+                .get(obj)
+                .arguments_callee
+                .unwrap_or(JsValue::undefined()));
+        }
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
         {
@@ -1583,6 +1600,22 @@ impl Interp<'_> {
         key: PropKey,
     ) -> Option<OwnDesc> {
         let kind = self.heap.get(obj).kind;
+        if kind == Kind::Arguments
+            && self.heap.get(obj).arguments_strict
+            && key == PropKey::from_string(self.heap.intern_text("callee"))
+        {
+            return Some(OwnDesc {
+                has_get: true,
+                get: JsValue::undefined(),
+                has_set: true,
+                set: JsValue::undefined(),
+                has_enumerable: true,
+                enumerable: false,
+                has_configurable: true,
+                configurable: false,
+                ..Default::default()
+            });
+        }
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.prop_key_index(key)
         {

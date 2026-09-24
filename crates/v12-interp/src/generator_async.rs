@@ -18,6 +18,43 @@ impl Interp<'_> {
     /// async generators; the resume path reads it to decide whether the
     /// pending request promise settles now or stays parked on the await.
     pub(crate) const ASYNC_GEN_YIELD_SLOT: usize = 7;
+    /// Retained materialized arguments value for every generator/async header.
+    pub(crate) const GENERATOR_ARGUMENTS_SLOT: usize = 8;
+
+    pub(crate) fn generator_header_value(
+        &self,
+        r#gen: Handle<JsObject>,
+        slot: usize,
+    ) -> Option<JsValue> {
+        self.heap
+            .get(r#gen)
+            .properties
+            .get(slot)
+            .copied()
+            .filter(|value| !value.is_undefined())
+    }
+
+    pub(crate) fn generator_completion_promise(
+        &self,
+        r#gen: Handle<JsObject>,
+    ) -> Option<Handle<JsObject>> {
+        self.generator_header_value(r#gen, 4)
+            .and_then(|value| value.as_object())
+    }
+
+    pub(crate) fn set_generator_header_value(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        slot: usize,
+        value: JsValue,
+    ) {
+        let object = self.heap.get_mut(r#gen);
+        if object.properties.len() <= slot {
+            object.properties.resize(slot + 1, JsValue::undefined());
+            object.property_keys.resize(slot + 1, None);
+        }
+        object.properties[slot] = value;
+    }
 
     pub(crate) fn is_generator_fn_for(&self, fn_idx: u32, program: u32) -> bool {
         let funcs = self.functions_for_program(program);
@@ -72,6 +109,9 @@ impl Interp<'_> {
         let mut window = vec![JsValue::undefined(); usize::from(max_regs)];
         window[0] = this_v;
         let arg_src = callee_slot + 2;
+        let actuals = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
+        let arguments =
+            self.frame_arguments_for(fn_idx, callee_program, &actuals, self.stack[callee_slot]);
         self.fill_call_window(
             &mut window,
             arg_src,
@@ -88,6 +128,12 @@ impl Interp<'_> {
         // against the main program's table (see above).
         g_obj.program_id = callee_program;
         let r#gen = self.heap.alloc(g_obj);
+        let retained_arguments = arguments.unwrap_or(JsValue::undefined());
+        self.set_generator_header_value(r#gen, Self::GENERATOR_ARGUMENTS_SLOT, retained_arguments);
+        if let Some(arguments) = self.generator_header_value(r#gen, Self::GENERATOR_ARGUMENTS_SLOT)
+        {
+            self.heap.remove_root(arguments);
+        }
         self.heap.add_root(JsValue::object(r#gen));
         Ok(r#gen)
     }
@@ -573,6 +619,10 @@ impl Interp<'_> {
         // Display snapshot from the generator's live env chain (rebuilt
         // fresh at each resume; the chain may have grown before the yield).
         let env_display = self.env_display_for(env);
+        let arguments = self.generator_header_value(r#gen, Self::GENERATOR_ARGUMENTS_SLOT);
+        if let Some(arguments) = arguments {
+            self.heap.add_root(arguments);
+        }
         self.frames.push(Frame {
             fn_idx,
             program: gen_program,
@@ -584,7 +634,7 @@ impl Interp<'_> {
             generator: Some(r#gen),
             yield_dst: None,
             new_target: None,
-            arguments: None,
+            arguments,
         });
         self.top_result = None;
         let frames_before = self.frames.len();
@@ -680,6 +730,8 @@ impl Interp<'_> {
                 // Pop the generator frame if still there, mark done.
                 if self.frames.len() >= frames_before {
                     if let Some(frame) = self.frames.pop() {
+                        self.drop_frame_arguments(&frame);
+                        self.call_args.remove(&frame.base);
                         self.drop_frame_context(frame.base);
                     }
                     self.stack.truncate(new_base);

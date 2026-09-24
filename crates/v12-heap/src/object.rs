@@ -193,6 +193,10 @@ pub struct JsObject {
     ///
     /// Only meaningful when `kind == KIND_ARGUMENTS`.
     pub arguments_mapped: Option<Box<[Option<u32>]>>,
+    /// Own `callee` value for arguments objects; `None` for the strict form.
+    pub arguments_callee: Option<crate::JsValue>,
+    /// Strict arguments objects expose an own throwing `callee` accessor.
+    pub arguments_strict: bool,
 }
 
 impl Default for JsObject {
@@ -221,6 +225,8 @@ impl Default for JsObject {
             dictionary: None,
             dict_seq: 0,
             arguments_mapped: None,
+            arguments_callee: None,
+            arguments_strict: false,
         }
     }
 }
@@ -875,6 +881,7 @@ impl Trace for JsObject {
         self.elements.trace(sink);
         self.elements_array.trace(sink);
         self.prototype.trace(sink);
+        self.arguments_callee.trace(sink);
         // Proxy exotic slots: keep the target and handler alive for as long as
         // the proxy itself is reachable (a revoked proxy has both cleared).
         self.proxy_target.trace(sink);
