@@ -261,7 +261,7 @@ impl Interp<'_> {
                             attempt!(self.env_write(depth, slot, v));
                         }
                         WideOp::CallW { dst, func, argc } => {
-                            match attempt!(self.prepare_call(base, max_regs, func, argc)) {
+                            match attempt!(self.prepare_call(base, max_regs, func, argc, false)) {
                                 CallOutcome::Pushed => continue 'drive,
                                 CallOutcome::Value(v) => {
                                     let caller_base = base;
@@ -305,6 +305,12 @@ impl Interp<'_> {
                             let frame = self.frames.last_mut().expect("frame");
                             env_display_push(&mut frame.env_display, h);
                             frame.env = Some(h);
+                            if let Some(parent) = parent
+                                && let Some(ctx) =
+                                    self.eval_contexts.get(&(parent.index() as usize)).cloned()
+                            {
+                                self.eval_contexts.insert(h.index() as usize, ctx);
+                            }
                         }
                         WideOp::CopyObjectRestW {
                             dst,
@@ -582,7 +588,17 @@ impl Interp<'_> {
                 // ------------------------------------------------------
                 Opcode::Call => {
                     let argc = rc;
-                    match attempt!(self.prepare_call(base, max_regs, rb, argc)) {
+                    let direct_eval =
+                        funcs[fn_idx as usize]
+                            .eval_metadata
+                            .as_ref()
+                            .is_some_and(|m| {
+                                m.direct_eval_sites.iter().any(|site| {
+                                    let site = *site as usize;
+                                    site == pc || site + 1 == pc || site + 2 == pc
+                                })
+                            });
+                    match attempt!(self.prepare_call(base, max_regs, rb, argc, direct_eval)) {
                         CallOutcome::Pushed => continue 'drive,
                         CallOutcome::Value(v) => {
                             self.stack[base + usize::from(ra)] = v;
@@ -730,6 +746,12 @@ impl Interp<'_> {
                     let frame = self.frames.last_mut().expect("frame");
                     env_display_push(&mut frame.env_display, h);
                     frame.env = Some(h);
+                    if let Some(parent) = parent
+                        && let Some(ctx) =
+                            self.eval_contexts.get(&(parent.index() as usize)).cloned()
+                    {
+                        self.eval_contexts.insert(h.index() as usize, ctx);
+                    }
                     self.set_pc(pc + op_width);
                 }
                 Opcode::GetEnvSlot => {
@@ -880,14 +902,30 @@ impl Interp<'_> {
                     // read the wide header's mask byte for prefixed sites.
                     let dst = ra;
                     let const_id = u32::from(narrow.imm16());
-                    let val = attempt!(self.op_get_global(const_id, program));
+                    let name = self
+                        .strings_for_program(program)
+                        .get(const_id as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let val = match attempt!(self.eval_read_global(&name, false)) {
+                        Some(value) => value,
+                        None => attempt!(self.op_get_global(const_id, program)),
+                    };
                     self.stack[base + usize::from(dst)] = val;
                     self.set_pc(pc + op_width);
                 }
                 Opcode::GetGlobalLenient => {
                     let dst = ra;
                     let const_id = u32::from(narrow.imm16());
-                    let val = attempt!(self.op_get_global_lenient(const_id, program));
+                    let name = self
+                        .strings_for_program(program)
+                        .get(const_id as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    let val = match attempt!(self.eval_read_global(&name, true)) {
+                        Some(value) => value,
+                        None => attempt!(self.op_get_global_lenient(const_id, program)),
+                    };
                     self.stack[base + usize::from(dst)] = val;
                     self.set_pc(pc + op_width);
                 }
@@ -895,6 +933,15 @@ impl Interp<'_> {
                     let src = ra;
                     let const_id = u32::from(narrow.imm16());
                     let val = self.stack[base + usize::from(src)];
+                    let name = self
+                        .strings_for_program(program)
+                        .get(const_id as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    if attempt!(self.eval_write_global(&name, val)) {
+                        self.set_pc(pc + op_width);
+                        continue 'drive;
+                    }
                     // Guard: global base must be an object (invariant; defensive).
                     if let Some(global) = self.global {
                         let global_v = JsValue::object(global);

@@ -150,6 +150,23 @@ pub struct PcMapEntry {
     pub bc_pc: u32,
 }
 
+/// A binding location in an eval caller's lexical environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingLocation {
+    Register(u16),
+    Env(u16),
+    Global,
+}
+
+/// Metadata used by the interpreter to route syntactic direct-eval calls
+/// and the bindings visible to their child program.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvalFunctionMetadata {
+    pub bindings: Vec<(String, BindingLocation)>,
+    pub direct_eval_sites: Vec<u32>,
+    pub eval_reachable: bool,
+}
+
 /// Fully assembled bytecode for one function.
 ///
 /// Register conventions: binary ops write `r{a} <- r{b} op r{c}`; jumps
@@ -190,6 +207,7 @@ pub struct FunctionBytecode {
     /// Arrow functions lack a `prototype` property (they are not
     /// constructible). Set from the compiler's unit plan.
     pub is_arrow: bool,
+    pub eval_metadata: Option<EvalFunctionMetadata>,
 }
 
 impl FunctionBytecode {
@@ -215,6 +233,7 @@ impl FunctionBytecode {
             is_generator: false,
             is_async: false,
             is_arrow: false,
+            eval_metadata: None,
         }
     }
 

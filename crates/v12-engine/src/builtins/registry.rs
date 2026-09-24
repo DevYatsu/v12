@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use v12_heap::{Handle, Heap, JsObject, JsValue};
-use v12_native::{NativeId, Throw, parse_error_text};
+use v12_native::{CompiledEval, EvalCompileFacts, NativeId, Throw, parse_error_text};
 
 use super::{builtin_dispatch, ctx::Ctx, promise, regexp, string};
 use crate::job_queue::Job;
@@ -242,6 +242,32 @@ impl v12_native::NativeRegistry for NativeRegistry {
             // 3. Runtime map (host functions) or "not registered".
             _ => self.dispatch(heap, this, args, id),
         }
+    }
+
+    fn compile_eval(
+        &mut self,
+        heap: &mut Heap,
+        source: &str,
+        global: Option<Handle<JsObject>>,
+        facts: &EvalCompileFacts,
+    ) -> Result<CompiledEval, Throw> {
+        let mut interner = v12_bccompiler::Interner::default();
+        let program = v12_bccompiler::compile_eval_source_with_interner_facts(
+            source,
+            &mut interner,
+            facts.direct,
+            facts.strict,
+        )
+        .map_err(|err| Throw::Value(syntax_error_value(heap, global, &err.message)))?;
+        let strings: Vec<String> = v12_bccompiler::freeze_interner(interner)
+            .iter()
+            .map(|(_, s)| s.to_string())
+            .collect();
+        Ok(CompiledEval {
+            main: program.main,
+            functions: Rc::from(program.functions.into_boxed_slice()),
+            strings: Rc::from(strings.into_boxed_slice()),
+        })
     }
 
     /// Direct `eval`: compile and run `source` against the shared heap and

@@ -58,6 +58,7 @@
 
 pub(crate) mod call;
 mod call_setup;
+mod eval_context;
 mod execute;
 pub mod feedback;
 mod generator_async;
@@ -501,6 +502,8 @@ pub struct Interp<'a> {
     /// The one contiguous value stack; frames window slices of it.
     stack: Vec<JsValue>,
     frames: Vec<Frame>,
+    eval_contexts: std::collections::HashMap<usize, eval_context::EvalCallerContext>,
+    call_args: std::collections::HashMap<usize, (usize, usize)>,
     /// When set, `execute` returns as soon as the frame count drops to this
     /// value (a re-entrant accessor call stops after its own frame, leaving
     /// the caller's frames in place). `None` normally: `execute` runs to the
@@ -626,6 +629,8 @@ impl<'a> Interp<'a> {
             pinned_shapes: HashSet::new(),
             stack: Vec::with_capacity(INITIAL_STACK_CAPACITY),
             frames: Vec::new(),
+            eval_contexts: std::collections::HashMap::new(),
+            call_args: std::collections::HashMap::new(),
             stop_at_frames: None,
             resume_depth: 0,
             natives: Box::new(EmptyNativeRegistry),
@@ -1239,7 +1244,7 @@ impl<'a> Interp<'a> {
         self.stop_at_frames = Some(self.frames.len());
         let boundary = self.stop_at_frames;
         self.top_result = None;
-        let outcome = self.prepare_call(base, caller_max_regs, 0, argc);
+        let outcome = self.prepare_call(base, caller_max_regs, 0, argc, false);
         let result = match outcome {
             Ok(CallOutcome::Pushed) => {
                 let exec = self.execute();

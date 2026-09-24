@@ -251,6 +251,12 @@ pub struct UnitPlan {
     pub allows_super: bool,
     /// First free register above params + non-captured locals.
     pub locals_end: u16,
+    /// Syntactic `eval(...)` call-header PCs in this unit.
+    pub direct_eval_sites: Vec<u32>,
+    /// Whether this unit contains a syntactic direct eval call.
+    pub eval_reachable: bool,
+    /// Runtime binding descriptors emitted with the function bytecode.
+    pub binding_descriptors: Vec<(String, VarLoc)>,
 }
 
 impl UnitPlan {
@@ -278,6 +284,9 @@ impl UnitPlan {
             static_method: false,
             allows_super: false,
             locals_end: 1, // r0 = this
+            direct_eval_sites: Vec::new(),
+            eval_reachable: false,
+            binding_descriptors: Vec::new(),
         }
     }
 }
@@ -290,6 +299,8 @@ pub struct Plans {
     pub home_of: HashMap<SymbolId, usize>,
     /// Symbols referenced from a different unit than their home (escapes).
     pub captured: HashSet<SymbolId>,
+    /// Source names for declared symbols, used to emit eval binding metadata.
+    pub symbol_names: HashMap<SymbolId, String>,
     /// Function / arrow expression node span → program function index.
     pub fn_index: HashMap<Span, usize>,
     /// `(symbol, referencing unit)` pairs gathered during the walk; joined
@@ -385,6 +396,8 @@ pub struct Compiler<'s, 'i> {
     /// Assembled function bodies; index == program function index. Slots are
     /// placeholders between a nested unit's reservation and its completion.
     pub functions: Vec<v12_bytecode::FunctionBytecode>,
+    /// Emit binding metadata for every unit in a compiled eval payload.
+    pub emit_eval_metadata: bool,
 }
 
 impl<'s, 'i> Compiler<'s, 'i> {

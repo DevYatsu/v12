@@ -19,6 +19,7 @@ impl Interp<'_> {
         caller_max_regs: u16,
         callee_reg: u16,
         argc: u16,
+        direct_eval: bool,
     ) -> Result<CallOutcome, JSException> {
         let callee_slot = base + usize::from(callee_reg);
         let callee_v = self.stack[callee_slot];
@@ -50,6 +51,24 @@ impl Interp<'_> {
             let c = self.heap.get(callee_obj);
             (c.callable, c.captured_env, c.program_id)
         };
+
+        if direct_eval && matches!(target, v12_heap::FunctionTarget::RealmEval(_)) {
+            let args_start = callee_slot + 2;
+            let source = self
+                .stack
+                .get(args_start)
+                .and_then(|v| v.as_string())
+                .map(|h| self.string_text(h))
+                .unwrap_or_default();
+            let context = self.capture_eval_context();
+            let facts = context.compile_facts();
+            let compiled = self
+                .natives
+                .compile_eval(self.heap, &source, self.global, &facts)
+                .map_err(|t| JSException::from_throw(self.heap, t))?;
+            let result = self.run_compiled_child(compiled, context)?;
+            return Ok(CallOutcome::Value(result));
+        }
 
         // Dispatch on the callable. Bytecode targets below the program length
         // push a frame; out-of-range bytecode indices are the interpreter's
@@ -110,6 +129,24 @@ impl Interp<'_> {
                     .map(CallOutcome::Value);
             }
         };
+
+        if direct_eval && target_idx == u32::from(NativeId::Eval) {
+            let args_start = callee_slot + 2;
+            let source = self
+                .stack
+                .get(args_start)
+                .and_then(|v| v.as_string())
+                .map(|h| self.string_text(h))
+                .unwrap_or_default();
+            let context = self.capture_eval_context();
+            let facts = context.compile_facts();
+            let compiled = self
+                .natives
+                .compile_eval(self.heap, &source, self.global, &facts)
+                .map_err(|t| JSException::from_throw(self.heap, t))?;
+            let result = self.run_compiled_child(compiled, context)?;
+            return Ok(CallOutcome::Value(result));
+        }
 
         // Indices beyond the compiled program route to the native seam. The
         // interpreter's internal fallbacks are encoded as out-of-range
@@ -297,6 +334,8 @@ impl Interp<'_> {
             new_target: None,
             arguments: frame_args,
         });
+        self.call_args
+            .insert(new_base, (arg_src, usize::from(argc)));
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
     }
@@ -572,6 +611,7 @@ impl Interp<'_> {
     pub(crate) fn complete_frame(&mut self, result: JsValue) -> Result<bool, JSException> {
         let finished = self.frames.pop().expect("complete_frame requires a frame");
         self.drop_frame_arguments(&finished);
+        self.call_args.remove(&finished.base);
         self.notify_tier_ups();
         // A re-entrant accessor call stops the nested execute here: the
         // accessor's frame is done, and the caller's frames must remain
@@ -1305,6 +1345,8 @@ impl Interp<'_> {
             new_target: Some(callee_v),
             arguments: frame_args,
         });
+        self.call_args
+            .insert(new_base, (arg_src, usize::from(argc)));
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
     }

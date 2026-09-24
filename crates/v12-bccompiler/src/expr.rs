@@ -2082,7 +2082,15 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 };
                 self.expr_into(x, block + 2 + i as u16)?;
             }
+            let direct_eval =
+                matches!(&c.callee, Expression::Identifier(id) if id.name.as_str() == "eval");
+            let call_pc = self.b.pc();
             self.emit_call(block, block, argc, c.span);
+            if direct_eval {
+                self.comp.plans.units[self.unit]
+                    .direct_eval_sites
+                    .push(call_pc);
+            }
             return Ok(block);
         }
         // Spread path: build args array and use CallApply. Callee/receiver

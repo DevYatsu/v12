@@ -338,6 +338,9 @@ impl<'s> Collector<'s> {
     fn declare(&mut self, sym: SymbolId) {
         let unit = self.cur_unit();
         self.plans.home_of.insert(sym, unit);
+        self.plans
+            .symbol_names
+            .insert(sym, self.scoping.symbol_name(sym).to_string());
         self.plans.units[unit].decl_order.push(sym);
     }
 
@@ -1465,6 +1468,13 @@ impl<'s> Collector<'s> {
                 }
             }
             Expression::CallExpression(c) => {
+                if matches!(&c.callee, Expression::Identifier(id) if id.name.as_str() == "eval") {
+                    let mut unit = Some(self.cur_unit());
+                    while let Some(idx) = unit {
+                        self.plans.units[idx].eval_reachable = true;
+                        unit = self.plans.units[idx].parent;
+                    }
+                }
                 // ES §15.7.1: `SuperCall` is only legal in a derived-class
                 // constructor. Report before walking the callee so the
                 // specialized message wins over the generic one.
@@ -1833,17 +1843,17 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
 
     // 2. Per-unit storage layout.
     for ui in 0..plans.units.len() {
-        let (escapes_here, needs_this) = {
+        let (escapes_here, needs_this, eval_reachable) = {
             let unit = &plans.units[ui];
             let escapes = unit
                 .decl_order
                 .iter()
                 .any(|s| plans.captured.contains(s) && homes.get(s).is_some_and(|h| *h == ui));
-            (escapes, unit.needs_this)
+            (escapes, unit.needs_this, unit.eval_reachable)
         };
         {
             let unit = &mut plans.units[ui];
-            unit.has_env = escapes_here || needs_this;
+            unit.has_env = escapes_here || needs_this || eval_reachable;
         }
 
         let mut slot: u16 = 0;
@@ -1872,7 +1882,7 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
             if !homes.get(&sym).is_some_and(|h| *h == ui) {
                 continue;
             }
-            if plans.captured.contains(&sym) {
+            if plans.captured.contains(&sym) || plans.units[ui].eval_reachable {
                 plans.units[ui].env_slots.insert(sym, slot);
                 plans.units[ui].vars.insert(sym, VarLoc::Env(slot));
                 slot = slot.checked_add(1).ok_or_else(|| CompileError {
@@ -1893,7 +1903,7 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
             if let Some(sym) = rest_ident
                 && homes.get(&sym).is_some_and(|h| *h == ui)
             {
-                if plans.captured.contains(&sym) {
+                if plans.captured.contains(&sym) || plans.units[ui].eval_reachable {
                     plans.units[ui].env_slots.insert(sym, slot);
                     plans.units[ui].vars.insert(sym, VarLoc::Env(slot));
                     slot = slot.checked_add(1).ok_or_else(|| CompileError {
@@ -1924,7 +1934,7 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
                 plans.units[ui].vars.insert(sym, VarLoc::Global);
                 continue;
             }
-            if plans.captured.contains(&sym) {
+            if plans.captured.contains(&sym) || plans.units[ui].eval_reachable {
                 plans.units[ui].env_slots.insert(sym, slot);
                 plans.units[ui].vars.insert(sym, VarLoc::Env(slot));
                 slot = slot.checked_add(1).ok_or_else(|| CompileError {
@@ -1939,7 +1949,21 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
                 })?;
             }
         }
+        let descriptors = {
+            let unit = &plans.units[ui];
+            unit.decl_order
+                .iter()
+                .filter_map(|sym| {
+                    plans
+                        .symbol_names
+                        .get(sym)
+                        .cloned()
+                        .zip(unit.vars.get(sym).copied())
+                })
+                .collect::<Vec<_>>()
+        };
         let unit = &mut plans.units[ui];
+        unit.binding_descriptors = descriptors;
         if unit.needs_this && unit.has_env {
             unit.this_slot = Some(slot);
             slot = slot.checked_add(1).ok_or_else(|| CompileError {

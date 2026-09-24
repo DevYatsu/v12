@@ -152,7 +152,7 @@ pub fn compile_source_with_interner(
     src: &str,
     interner: &mut Interner,
 ) -> Result<Program, CompileError> {
-    compile_script_with_interner(src, interner, false)
+    compile_script_with_interner(src, interner, false, None)
 }
 
 /// Compiles direct-eval payload (the [`v12_native::NativeRegistry::eval`]
@@ -168,13 +168,26 @@ pub fn compile_eval_source_with_interner(
     src: &str,
     interner: &mut Interner,
 ) -> Result<Program, CompileError> {
-    compile_script_with_interner(src, interner, true)
+    compile_script_with_interner(src, interner, true, None)
+}
+
+/// Compiles an eval payload with the caller's effective strictness. The
+/// direct flag controls top-level `return` leniency; the remaining facts are
+/// carried by the native seam for future declaration-instantiation checks.
+pub fn compile_eval_source_with_interner_facts(
+    src: &str,
+    interner: &mut Interner,
+    direct: bool,
+    strict: bool,
+) -> Result<Program, CompileError> {
+    compile_script_with_interner(src, interner, direct, Some(strict))
 }
 
 fn compile_script_with_interner(
     src: &str,
     interner: &mut Interner,
     eval_leniency: bool,
+    strict_override: Option<bool>,
 ) -> Result<Program, CompileError> {
     // Cheap pre-check: module syntax is a strict superset of script syntax
     // for this subset, and `SourceType::script()` panics on `import` rather
@@ -231,7 +244,13 @@ fn compile_script_with_interner(
         });
     }
     let scoping = semantic.semantic.into_scoping();
-    let program = compile_ast_inner(&parsed.program, &scoping, interner)?;
+    let program = compile_ast_inner(
+        &parsed.program,
+        &scoping,
+        interner,
+        strict_override,
+        eval_leniency,
+    )?;
     // `collect` records imports/exports even for scripts; scripts must reject
     // them explicitly rather than silently ignoring (via
     // `early_module_syntax_error`).
@@ -415,15 +434,17 @@ pub fn compile_ast(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> Result<Program, CompileError> {
-    compile_ast_inner(program, scoping, &mut Interner::default())
+    compile_ast_inner(program, scoping, &mut Interner::default(), None, false)
 }
 
 fn compile_ast_inner(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
     interner: &mut Interner,
+    strict_override: Option<bool>,
+    emit_eval_metadata: bool,
 ) -> Result<Program, CompileError> {
-    let strict = has_use_strict(program);
+    let strict = strict_override.unwrap_or_else(|| has_use_strict(program));
     let plans = collect::collect(program, scoping, strict)?;
     // Scripts must not carry module linkage.
     if !plans.imports.is_empty() {
@@ -445,6 +466,7 @@ fn compile_ast_inner(
         strings: interner,
         plans,
         functions: Vec::new(),
+        emit_eval_metadata,
     };
     unit::compile_unit(&mut comp, 0, unit::UnitNode::Main(program))?;
     for fb in &comp.functions {
@@ -474,6 +496,7 @@ fn compile_ast_as_module_inner(
         strings: interner,
         plans,
         functions: Vec::new(),
+        emit_eval_metadata: false,
     };
     unit::compile_unit(&mut comp, 0, unit::UnitNode::Main(program))?;
     for fb in &comp.functions {

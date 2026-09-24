@@ -385,6 +385,29 @@ pub fn compile_unit(
     fb.has_rest = plan.has_rest;
     fb.expected_args = u16::try_from(plan.expected_args).unwrap_or(u16::MAX);
     fb.needs_arguments = plan.needs_arguments;
+    let eval_metadata =
+        if comp.emit_eval_metadata || plan.eval_reachable || !plan.direct_eval_sites.is_empty() {
+            let bindings = plan
+                .binding_descriptors
+                .iter()
+                .map(|(name, loc)| {
+                    let location = match loc {
+                        VarLoc::Reg(reg) => v12_bytecode::BindingLocation::Register(*reg),
+                        VarLoc::Env(slot) => v12_bytecode::BindingLocation::Env(*slot),
+                        VarLoc::Global => v12_bytecode::BindingLocation::Global,
+                    };
+                    (name.clone(), location)
+                })
+                .collect();
+            Some(v12_bytecode::EvalFunctionMetadata {
+                bindings,
+                direct_eval_sites: plan.direct_eval_sites.clone(),
+                eval_reachable: plan.eval_reachable,
+            })
+        } else {
+            None
+        };
+    fb.eval_metadata = eval_metadata;
     fb.fixed_params = plan.arity as u16;
     fb.rest_reg = if plan.has_rest {
         plan.arity as u16 + 1

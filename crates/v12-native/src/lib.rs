@@ -26,7 +26,9 @@ mod throw;
 pub use convert::DecodeError;
 pub use id::{NativeId, UnknownNativeId};
 pub use methods::lookup_method;
-pub use registry::{EmptyNativeRegistry, NativeRegistry, ProgramTable};
+pub use registry::{
+    CompiledEval, EmptyNativeRegistry, EvalCompileFacts, NativeRegistry, ProgramTable,
+};
 pub use throw::{Throw, error_object, parse_error_text};
 
 // Re-exported for the macros and downstream users.

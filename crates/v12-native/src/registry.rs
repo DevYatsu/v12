@@ -1,10 +1,29 @@
 //! The native dispatch seam: the [`NativeRegistry`] trait and the default
 //! empty registry.
 
+use v12_bytecode::FunctionBytecode;
 use v12_heap::{Heap, JsValue};
 
 use crate::id::NativeId;
 use crate::throw::Throw;
+
+/// Caller binding facts supplied to the compile-only direct-eval seam.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvalCompileFacts {
+    pub direct: bool,
+    pub strict: bool,
+    pub non_simple_parameters: bool,
+    pub bindings: Vec<(String, v12_bytecode::BindingLocation)>,
+}
+
+/// A compiled eval program. The registry only compiles; the interpreter owns
+/// registration and frame execution.
+#[derive(Debug, Clone)]
+pub struct CompiledEval {
+    pub main: u32,
+    pub functions: std::rc::Rc<[FunctionBytecode]>,
+    pub strings: std::rc::Rc<[String]>,
+}
 
 /// The dispatch seam between the interpreter and a native provider.
 ///
@@ -38,6 +57,19 @@ pub trait NativeRegistry {
         _global: Option<v12_heap::Handle<v12_heap::JsObject>>,
         _programs: std::rc::Rc<std::cell::RefCell<Vec<ProgramTable>>>,
     ) -> Result<JsValue, Throw> {
+        Err(Throw::Message("TypeError: eval is not supported".into()))
+    }
+
+    /// Compiles eval without executing it. Direct callers use the returned
+    /// program in the current interpreter; the existing `eval` method remains
+    /// the global/indirect execution seam.
+    fn compile_eval(
+        &mut self,
+        _heap: &mut Heap,
+        _source: &str,
+        _global: Option<v12_heap::Handle<v12_heap::JsObject>>,
+        _facts: &EvalCompileFacts,
+    ) -> Result<CompiledEval, Throw> {
         Err(Throw::Message("TypeError: eval is not supported".into()))
     }
 

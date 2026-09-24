@@ -174,6 +174,7 @@ impl FunctionBuilder {
             is_generator: self.is_generator,
             is_async: self.is_async,
             is_arrow: self.is_arrow,
+            eval_metadata: None,
         }
     }
 }
