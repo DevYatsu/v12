@@ -323,8 +323,7 @@ pub fn object_keys(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<Js
             .map(JsValue::string)
             .collect(),
     };
-    let arr = ctx.heap.alloc(v12_heap::JsObject::array(keys));
-    ctx.add_root(JsValue::object(arr));
+    let arr = ctx.alloc_array(keys);
     Ok(JsValue::object(arr))
 }
 
@@ -399,8 +398,7 @@ pub fn object_entries(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result
     let items: Vec<JsValue> = pairs
         .into_iter()
         .map(|(k, v)| {
-            let pair = ctx.heap.alloc(v12_heap::JsObject::array(vec![k, v]));
-            ctx.add_root(JsValue::object(pair));
+            let pair = ctx.alloc_array(vec![k, v]);
             JsValue::object(pair)
         })
         .collect();
@@ -804,20 +802,9 @@ fn to_string_handle(ctx: &mut Ctx, v: JsValue) -> Result<Handle<V12Str>, JsValue
 // Object statics
 // ---------------------------------------------------------------------------
 
-/// Allocates an array value from `items` (rooted, like every native-created
-/// object that outlives the call).
+/// Allocates an array value from `items` through the canonical array path.
 fn array_value(ctx: &mut Ctx, items: Vec<JsValue>) -> JsValue {
-    let arr = ctx.heap.alloc(v12_heap::JsObject::array(items));
-    // Link [[Prototype]] to %Array.prototype% (via the Array constructor's
-    // linked field) so `result.constructor === Array`; mirrors the
-    // error-instance linking in `builtins/registry.rs`.
-    if let Some(ctor) = ctx.intrinsic("Array").and_then(|v| v.as_object())
-        && let Some(proto) = ctx.heap.get(ctor).prototype
-    {
-        ctx.heap.get_mut(arr).prototype = Some(proto);
-    }
-    ctx.add_root(JsValue::object(arr));
-    JsValue::object(arr)
+    JsValue::object(ctx.alloc_array(items))
 }
 
 /// `Object.is(a, b)` – ES `SameValue`: NaN is NaN, and ±0 differ.

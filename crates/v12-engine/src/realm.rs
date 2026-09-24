@@ -164,6 +164,12 @@ impl Realm {
         if let Some(e) = intrinsics.get("Error").and_then(|v| v.as_object()) {
             crate::builtins::install_ctor(heap, e, error_proto);
         }
+        crate::builtins::install_native(
+            heap,
+            Some(error_proto),
+            "toString",
+            NativeId::ErrorProtoToString,
+        );
         wire_callable(heap, &intrinsics, "Error", NativeId::ErrorCreate);
         // `Error.isError` static (ES2026): shape-bound install on the Error
         // constructor (found by ordinary property lookup — no interpreter
