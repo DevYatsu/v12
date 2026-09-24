@@ -13,9 +13,11 @@ use std::collections::{HashMap, HashSet};
 
 use lasso::Key;
 use oxc_ast::ast::BlockStatement;
-use oxc_semantic::{ReferenceId, Scoping, SymbolId};
+use oxc_semantic::{ReferenceId, ScopeId, Scoping, SymbolId};
 use oxc_span::Span;
-use v12_bytecode::{Const, FunctionBuilder, Instr, Label, Opcode, WideOp};
+use v12_bytecode::{
+    Const, EvalCallerFacts, EvalPhase, FunctionBuilder, Instr, Label, Opcode, WideOp,
+};
 
 /// Register 0 of every frame holds `this` (main unit: `undefined`).
 pub const REG_THIS: u16 = 0;
@@ -195,6 +197,15 @@ pub enum VarLoc {
     Global,
 }
 
+#[derive(Debug)]
+pub(crate) struct EvalSitePlan {
+    pub span: Span,
+    pub phase: EvalPhase,
+    pub scope_id: Option<ScopeId>,
+    pub pc: Option<u32>,
+    pub caller: EvalCallerFacts,
+}
+
 /// Per-function-unit layout decided by the collect pass.
 #[derive(Debug)]
 pub struct UnitPlan {
@@ -251,8 +262,8 @@ pub struct UnitPlan {
     pub allows_super: bool,
     /// First free register above params + non-captured locals.
     pub locals_end: u16,
-    /// Syntactic `eval(...)` call-header PCs in this unit.
-    pub direct_eval_sites: Vec<u32>,
+    /// Syntactic `eval(...)` call sites in this unit.
+    pub direct_eval_sites: Vec<EvalSitePlan>,
     /// Whether this unit contains a syntactic direct eval call.
     pub eval_reachable: bool,
     /// Runtime binding descriptors emitted with the function bytecode.
@@ -265,6 +276,11 @@ pub struct UnitPlan {
     pub lexical_names: HashSet<String>,
     /// Whether this ordinary function has an implicit arguments binding.
     pub implicit_arguments: bool,
+    pub has_non_simple_parameters: bool,
+    pub var_declared_names: Vec<String>,
+    pub parameter_symbols: HashSet<SymbolId>,
+    pub var_symbols: HashSet<SymbolId>,
+    pub lexical_symbols: HashSet<SymbolId>,
 }
 
 impl UnitPlan {
@@ -299,6 +315,11 @@ impl UnitPlan {
             var_names: HashSet::new(),
             lexical_names: HashSet::new(),
             implicit_arguments: false,
+            has_non_simple_parameters: false,
+            var_declared_names: Vec::new(),
+            parameter_symbols: HashSet::new(),
+            var_symbols: HashSet::new(),
+            lexical_symbols: HashSet::new(),
         }
     }
 }

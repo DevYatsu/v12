@@ -2087,9 +2087,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             let call_pc = self.b.pc();
             self.emit_call(block, block, argc, c.span);
             if direct_eval {
-                self.comp.plans.units[self.unit]
+                let logical_pc = if self.b.pc() > call_pc + 1 {
+                    call_pc + 1
+                } else {
+                    call_pc
+                };
+                if let Some(site) = self.comp.plans.units[self.unit]
                     .direct_eval_sites
-                    .push(call_pc);
+                    .iter_mut()
+                    .rev()
+                    .find(|site| site.pc.is_none())
+                {
+                    site.pc = Some(logical_pc);
+                }
             }
             return Ok(block);
         }

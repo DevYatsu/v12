@@ -20,18 +20,20 @@
 //! Unsupported constructs are skipped here deliberately; the emitter rejects
 //! them with a `CompileError`.
 
+use oxc_ast::AstKind;
 use oxc_ast::ast::{
     ArrayExpressionElement, ArrowFunctionExpression, AssignmentTarget, BindingPattern, Expression,
     ForStatementInit, FormalParameters, Function, ImportPhase, ModuleDeclaration, ModuleExportName,
     Program, PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
 };
-use oxc_semantic::{Scoping, SymbolId};
+use oxc_semantic::{AstNodes, Scoping, SymbolId};
 use oxc_span::GetSpan;
-use v12_bytecode::EvalCallerFacts;
+use std::collections::HashSet;
+use v12_bytecode::{EvalBindingKind, EvalCallerFacts, EvalCompileFacts, EvalPhase};
 
 use crate::model::{
-    CompileError, ExportEntry, ImportEntry, MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan,
-    VarLoc,
+    CompileError, EvalSitePlan, ExportEntry, ImportEntry, MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS,
+    UnitPlan, VarLoc,
 };
 
 /// Entry point: produce finalized layout plans for a whole program.
@@ -40,16 +42,17 @@ pub fn collect(
     scoping: &Scoping,
     is_strict: bool,
 ) -> Result<Plans, CompileError> {
-    collect_inner(program, scoping, is_strict, false, None)
+    collect_inner(program, scoping, is_strict, false, None, None)
 }
 
 pub fn collect_with_eval_facts(
     program: &Program<'_>,
     scoping: &Scoping,
     is_strict: bool,
-    facts: &EvalCallerFacts,
+    facts: &EvalCompileFacts,
+    nodes: Option<&AstNodes<'_>>,
 ) -> Result<Plans, CompileError> {
-    collect_inner(program, scoping, is_strict, false, Some(facts))
+    collect_inner(program, scoping, is_strict, false, Some(facts), nodes)
 }
 
 /// Module-mode collection: top-level `var` stays module-scoped.
@@ -58,7 +61,7 @@ pub fn collect_module(
     scoping: &Scoping,
     is_strict: bool,
 ) -> Result<Plans, CompileError> {
-    collect_inner(program, scoping, is_strict, true, None)
+    collect_inner(program, scoping, is_strict, true, None, None)
 }
 
 fn collect_inner(
@@ -66,7 +69,8 @@ fn collect_inner(
     scoping: &Scoping,
     is_strict: bool,
     is_module: bool,
-    eval_caller_facts: Option<&EvalCallerFacts>,
+    eval_caller_facts: Option<&EvalCompileFacts>,
+    nodes: Option<&AstNodes<'_>>,
 ) -> Result<Plans, CompileError> {
     let mut c = Collector {
         scoping,
@@ -119,10 +123,19 @@ fn collect_inner(
             }
         }
     }
+    resolve_eval_sites(&mut plans, scoping, nodes);
     if !is_strict
         && let Some(facts) = eval_caller_facts
-        && plans.units[0].var_names.contains("arguments")
-        && facts.bindings.iter().any(|(name, _)| name == "arguments")
+        && facts.direct
+        && plans.units[0]
+            .var_declared_names
+            .iter()
+            .any(|name| name == "arguments")
+        && facts.caller.bindings.iter().any(|(name, kind)| {
+            name == "arguments"
+                && (*kind != EvalBindingKind::ImplicitArguments
+                    || facts.caller.arguments_object_needed)
+        })
     {
         return Err(CompileError {
             message: "SyntaxError: 'arguments' is not a valid var binding in direct eval".into(),
@@ -475,16 +488,18 @@ impl<'s> Collector<'s> {
         hint: &str,
         allows_super: bool,
     ) -> usize {
+        let parent = self.cur_unit();
         if declare_name_in_enclosing
             && let Some(id) = &f.id
             && let Some(sym) = id.symbol_id.get()
         {
             self.declare(sym);
-            if self.cur_unit() == 0 && !self.plans.is_module {
+            self.record_declared_names(parent, vec![id.name.to_string()], true);
+            self.plans.units[parent].var_symbols.insert(sym);
+            if parent == 0 && !self.plans.is_module {
                 self.plans.global_vars.insert(sym);
             }
         }
-        let parent = self.cur_unit();
         let idx = self.plans.units.len();
         let name_hint = match f.id.as_ref() {
             Some(id) => format!("{hint}:{}", id.name),
@@ -501,6 +516,7 @@ impl<'s> Collector<'s> {
         let mut plan = UnitPlan::new(Some(parent), false, name_hint);
         plan.is_strict = is_strict;
         plan.implicit_arguments = true;
+        plan.has_non_simple_parameters = !is_simple_parameter_list(&f.params);
         plan.allows_super = allows_super;
         // A named function's `name` own property (installed at closure alloc):
         // without this the name is unobservable (`f.name === undefined`).
@@ -564,6 +580,7 @@ impl<'s> Collector<'s> {
         self.check_use_strict_with_non_simple_params(&a.params, own_strict, a.span);
         let mut plan = UnitPlan::new(Some(parent), true, format!("<arrow>{}", idx));
         plan.is_strict = is_strict;
+        plan.has_non_simple_parameters = !is_simple_parameter_list(&a.params);
         self.plans.units.push(plan);
         self.plans.fn_index.insert(a.span(), idx);
         self.unit_stack.push(idx);
@@ -666,15 +683,7 @@ impl<'s> Collector<'s> {
                             matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
                         let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
                         for d in &v.declarations {
-                            if is_var {
-                                self.plans.units[unit]
-                                    .var_names
-                                    .extend(binding_names(&d.id));
-                            } else {
-                                self.plans.units[unit]
-                                    .lexical_names
-                                    .extend(binding_names(&d.id));
-                            }
+                            self.record_declared_names(unit, binding_names(&d.id), is_var);
                             if is_const && let Some(sym) = binding_symbol(&d.id) {
                                 self.plans.const_bindings.insert(sym);
                             }
@@ -703,15 +712,7 @@ impl<'s> Collector<'s> {
                             matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
                         let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
                         for d in &v.declarations {
-                            if is_var {
-                                self.plans.units[unit]
-                                    .var_names
-                                    .extend(binding_names(&d.id));
-                            } else {
-                                self.plans.units[unit]
-                                    .lexical_names
-                                    .extend(binding_names(&d.id));
-                            }
+                            self.record_declared_names(unit, binding_names(&d.id), is_var);
                             if is_const && let Some(sym) = binding_symbol(&d.id) {
                                 self.plans.const_bindings.insert(sym);
                             }
@@ -1272,20 +1273,37 @@ impl<'s> Collector<'s> {
         });
     }
 
+    fn record_declared_names(&mut self, unit: usize, names: Vec<String>, is_var: bool) {
+        let target = if is_var {
+            &mut self.plans.units[unit].var_names
+        } else {
+            &mut self.plans.units[unit].lexical_names
+        };
+        target.extend(names.iter().cloned());
+        if is_var {
+            for name in names {
+                if !self.plans.units[unit].var_declared_names.contains(&name) {
+                    self.plans.units[unit].var_declared_names.push(name);
+                }
+            }
+        }
+    }
+
     fn var_decl(&mut self, v: &VariableDeclaration<'_>) {
         let is_const = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
         let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
         let is_var_at_top = is_var && self.cur_unit() == 0 && !self.plans.is_module;
         let unit = self.cur_unit();
         for d in &v.declarations {
+            self.record_declared_names(unit, binding_names(&d.id), is_var);
             if is_var {
                 self.plans.units[unit]
-                    .var_names
-                    .extend(binding_names(&d.id));
+                    .var_symbols
+                    .extend(binding_symbols(&d.id));
             } else {
                 self.plans.units[unit]
-                    .lexical_names
-                    .extend(binding_names(&d.id));
+                    .lexical_symbols
+                    .extend(binding_symbols(&d.id));
             }
             if is_const {
                 if let Some(sym) = binding_symbol(&d.id) {
@@ -1431,11 +1449,17 @@ impl<'s> Collector<'s> {
             self.plans.units[idx]
                 .parameter_names
                 .extend(binding_names(&p.pattern));
+            self.plans.units[idx]
+                .parameter_symbols
+                .extend(binding_symbols(&p.pattern));
         }
         if let Some(rest) = &params.rest {
             self.plans.units[idx]
                 .parameter_names
                 .extend(binding_names(&rest.rest.argument));
+            self.plans.units[idx]
+                .parameter_symbols
+                .extend(binding_symbols(&rest.rest.argument));
         }
         self.walking_params = prev_params;
     }
@@ -1536,11 +1560,25 @@ impl<'s> Collector<'s> {
             }
             Expression::CallExpression(c) => {
                 if matches!(&c.callee, Expression::Identifier(id) if id.name.as_str() == "eval") {
-                    let mut unit = Some(self.cur_unit());
+                    let current = self.cur_unit();
+                    let mut unit = Some(current);
                     while let Some(idx) = unit {
                         self.plans.units[idx].eval_reachable = true;
                         unit = self.plans.units[idx].parent;
                     }
+                    self.plans.units[current]
+                        .direct_eval_sites
+                        .push(EvalSitePlan {
+                            span: c.span,
+                            phase: if self.walking_params {
+                                EvalPhase::Parameter
+                            } else {
+                                EvalPhase::Body
+                            },
+                            scope_id: None,
+                            pc: None,
+                            caller: EvalCallerFacts::default(),
+                        });
                 }
                 // ES §15.7.1: `SuperCall` is only legal in a derived-class
                 // constructor. Report before walking the callee so the
@@ -1856,10 +1894,128 @@ fn module_export_name_to_symbol(
     }
 }
 
+fn resolve_eval_sites(plans: &mut Plans, scoping: &Scoping, nodes: Option<&AstNodes<'_>>) {
+    let Some(nodes) = nodes else {
+        return;
+    };
+    for unit_index in 0..plans.units.len() {
+        let (strict, implicit_arguments, non_simple, needs_arguments) = {
+            let unit = &plans.units[unit_index];
+            (
+                unit.is_strict,
+                unit.implicit_arguments,
+                unit.has_non_simple_parameters,
+                unit.needs_arguments,
+            )
+        };
+        let mut owner_index = unit_index;
+        while plans.units[owner_index].is_arrow {
+            owner_index = plans.units[owner_index].parent.expect("arrow has owner");
+        }
+        for site_index in 0..plans.units[unit_index].direct_eval_sites.len() {
+            let span = plans.units[unit_index].direct_eval_sites[site_index].span;
+            let Some(node) = nodes.iter().find(
+                |node| matches!(node.kind(), AstKind::CallExpression(call) if call.span == span),
+            ) else {
+                continue;
+            };
+            let scope_id = node.scope_id();
+            plans.units[unit_index].direct_eval_sites[site_index].scope_id = Some(scope_id);
+            let mut seen = HashSet::new();
+            for scope in scoping.scope_ancestors(scope_id) {
+                for &symbol in scoping.get_bindings(scope).values() {
+                    let name = scoping.symbol_name(symbol).to_string();
+                    if !seen.insert(name.clone()) {
+                        continue;
+                    }
+                    let (kind, binding_unit) = plans
+                        .units
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, candidate)| {
+                            if candidate.parameter_symbols.contains(&symbol) {
+                                Some((EvalBindingKind::Parameter, index))
+                            } else if candidate.var_symbols.contains(&symbol) {
+                                Some((EvalBindingKind::Var, index))
+                            } else if candidate.lexical_symbols.contains(&symbol) {
+                                Some((EvalBindingKind::Lexical, index))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or((EvalBindingKind::Var, usize::MAX));
+                    let site = &plans.units[unit_index].direct_eval_sites[site_index];
+                    if site.phase == EvalPhase::Parameter
+                        && (kind == EvalBindingKind::Lexical
+                            || (kind == EvalBindingKind::Var && binding_unit == unit_index))
+                    {
+                        continue;
+                    }
+                    plans.units[unit_index].direct_eval_sites[site_index]
+                        .caller
+                        .bindings
+                        .push((name, kind));
+                }
+            }
+            let owner_strict = plans.units[owner_index].is_strict;
+            let implicit = owner_index != 0
+                && implicit_arguments
+                && (non_simple || needs_arguments)
+                && !plans.units[unit_index].direct_eval_sites[site_index]
+                    .caller
+                    .bindings
+                    .iter()
+                    .any(|(name, _)| name == "arguments");
+            if implicit {
+                plans.units[unit_index].direct_eval_sites[site_index]
+                    .caller
+                    .bindings
+                    .push(("arguments".to_string(), EvalBindingKind::ImplicitArguments));
+            }
+            plans.units[unit_index].direct_eval_sites[site_index]
+                .caller
+                .arguments_object_needed = implicit;
+            plans.units[unit_index].direct_eval_sites[site_index]
+                .caller
+                .strict = strict || owner_strict;
+        }
+    }
+}
+
 fn binding_symbol(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<SymbolId> {
     match p {
         oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
         _ => None,
+    }
+}
+
+fn binding_symbols(pattern: &BindingPattern<'_>) -> Vec<SymbolId> {
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => id.symbol_id.get().into_iter().collect(),
+        BindingPattern::ObjectPattern(object) => object
+            .properties
+            .iter()
+            .flat_map(|property| binding_symbols(&property.value))
+            .chain(
+                object
+                    .rest
+                    .iter()
+                    .flat_map(|rest| binding_symbols(&rest.argument)),
+            )
+            .collect(),
+        BindingPattern::ArrayPattern(array) => array
+            .elements
+            .iter()
+            .flatten()
+            .flat_map(binding_symbols)
+            .chain(
+                array
+                    .rest
+                    .iter()
+                    .flat_map(|rest| binding_symbols(&rest.argument)),
+            )
+            .collect(),
+        BindingPattern::AssignmentPattern(assignment) => binding_symbols(&assignment.left),
     }
 }
 

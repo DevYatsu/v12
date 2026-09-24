@@ -39,7 +39,7 @@ fn direct_eval_mutates_caller_register_and_reads_lexical_binding() {
 #[test]
 fn direct_eval_argument_early_errors_suppress_side_effects() {
     for source in [
-        "function f(a) { eval(\"marker = 1; var arguments = 'param'\"); } f(1)",
+        "function f(arguments) { eval(\"marker = 1; var arguments = 'param'\"); } f(1)",
         "function f() { let arguments; eval(\"marker = 1; var arguments = 'lexical'\"); } f()",
         "function f() { var arguments; eval(\"marker = 1; var arguments = 'var'\"); } f()",
     ] {

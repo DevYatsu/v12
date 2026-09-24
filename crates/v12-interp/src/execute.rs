@@ -261,7 +261,8 @@ impl Interp<'_> {
                             attempt!(self.env_write(depth, slot, v));
                         }
                         WideOp::CallW { dst, func, argc } => {
-                            match attempt!(self.prepare_call(base, max_regs, func, argc, false)) {
+                            match attempt!(self.prepare_call(base, max_regs, func, argc, false, 0))
+                            {
                                 CallOutcome::Pushed => continue 'drive,
                                 CallOutcome::Value(v) => {
                                     let caller_base = base;
@@ -593,12 +594,16 @@ impl Interp<'_> {
                             .eval_metadata
                             .as_ref()
                             .is_some_and(|m| {
-                                m.direct_eval_sites.iter().any(|site| {
-                                    let site = *site as usize;
-                                    site == pc || site + 1 == pc || site + 2 == pc
-                                })
+                                m.direct_eval_sites.iter().any(|site| site.pc == pc as u32)
                             });
-                    match attempt!(self.prepare_call(base, max_regs, rb, argc, direct_eval)) {
+                    match attempt!(self.prepare_call(
+                        base,
+                        max_regs,
+                        rb,
+                        argc,
+                        direct_eval,
+                        pc as u32,
+                    )) {
                         CallOutcome::Pushed => continue 'drive,
                         CallOutcome::Value(v) => {
                             self.stack[base + usize::from(ra)] = v;

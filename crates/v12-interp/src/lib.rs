@@ -1244,7 +1244,7 @@ impl<'a> Interp<'a> {
         self.stop_at_frames = Some(self.frames.len());
         let boundary = self.stop_at_frames;
         self.top_result = None;
-        let outcome = self.prepare_call(base, caller_max_regs, 0, argc, false);
+        let outcome = self.prepare_call(base, caller_max_regs, 0, argc, false, 0);
         let result = match outcome {
             Ok(CallOutcome::Pushed) => {
                 let exec = self.execute();

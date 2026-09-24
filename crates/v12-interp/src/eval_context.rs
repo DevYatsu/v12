@@ -1,6 +1,6 @@
 //! Direct-eval caller context and child-frame execution.
 
-use v12_bytecode::{BindingLocation, EvalBindingKind, EvalCallerFacts};
+use v12_bytecode::{BindingLocation, EvalBindingKind, EvalCallerFacts, EvalPhase};
 use v12_heap::{Handle, JsObject, JsValue};
 use v12_native::{CompiledEval, EvalCompileFacts};
 
@@ -36,13 +36,15 @@ impl EvalCallerContext {
 }
 
 impl Interp<'_> {
-    pub(crate) fn capture_eval_context(&mut self) -> EvalCallerContext {
+    pub(crate) fn capture_eval_context(&mut self, call_pc: u32) -> EvalCallerContext {
         let frame_idx = self.frames.len().saturating_sub(1);
-        let (this, env, new_target, strict, own_bindings, own_caller, is_arrow) = {
+        let (this, env, new_target, strict, own_bindings, site_caller, site_phase, is_arrow) = {
             let frame = &self.frames[frame_idx];
             let funcs = self.functions_for_program(frame.program);
             let function = funcs.get(frame.fn_idx as usize);
             let metadata = function.and_then(|f| f.eval_metadata.as_ref());
+            let site =
+                metadata.and_then(|m| m.direct_eval_sites.iter().find(|site| site.pc == call_pc));
             (
                 self.stack
                     .get(frame.base)
@@ -52,7 +54,8 @@ impl Interp<'_> {
                 frame.new_target,
                 function.is_some_and(|f| f.is_strict),
                 metadata.map(|m| m.bindings.clone()).unwrap_or_default(),
-                metadata.map(|m| m.caller_facts.clone()).unwrap_or_default(),
+                site.map(|site| site.caller.clone()).unwrap_or_default(),
+                site.map(|site| site.phase).unwrap_or(EvalPhase::Body),
                 function.is_some_and(|f| f.is_arrow),
             )
         };
@@ -68,6 +71,15 @@ impl Interp<'_> {
             })
             .map(|(idx, _)| idx)
             .unwrap_or(frame_idx);
+        let owner_is_ordinary = self
+            .frames
+            .get(owner)
+            .and_then(|frame| {
+                self.functions_for_program(frame.program)
+                    .get(frame.fn_idx as usize)
+                    .map(|function| !function.is_arrow && frame.fn_idx != 0)
+            })
+            .unwrap_or(false);
         let inherited = self
             .frames
             .get(frame_idx)
@@ -76,24 +88,13 @@ impl Interp<'_> {
         let mut bindings = inherited
             .map(|ctx| ctx.bindings.clone())
             .unwrap_or_default();
-        let mut caller =
-            inherited
-                .map(|ctx| ctx.caller.clone())
-                .unwrap_or_else(|| EvalCallerFacts {
-                    strict,
-                    ..EvalCallerFacts::default()
-                });
-        if !is_arrow {
-            caller.arguments_object_needed |= own_caller.arguments_object_needed;
-            if own_caller.bindings.iter().any(|(name, kind)| {
-                name == "arguments" && *kind == EvalBindingKind::ImplicitArguments
-            }) {
-                caller.bindings.retain(|(name, _)| name != "arguments");
-                caller
-                    .bindings
-                    .push(("arguments".to_string(), EvalBindingKind::ImplicitArguments));
-            }
+        let mut caller = inherited.map(|ctx| ctx.caller.clone()).unwrap_or_default();
+        for (name, kind) in &site_caller.bindings {
+            caller.bindings.retain(|(old, _)| old != name);
+            caller.bindings.push((name.clone(), *kind));
         }
+        caller.strict |= site_caller.strict || strict;
+        caller.arguments_object_needed |= site_caller.arguments_object_needed;
 
         // Arrows inherit the nearest ordinary owner's facts, not their own
         // parameter list's implicit arguments binding.  Keep lexical this/env
@@ -105,7 +106,7 @@ impl Interp<'_> {
                 .get(owner_frame.fn_idx as usize)
                 .and_then(|f| f.eval_metadata.as_ref());
             if let Some(metadata) = owner_metadata {
-                for (name, kind) in &metadata.caller_facts.bindings {
+                for (name, _) in &metadata.bindings {
                     let reference = metadata
                         .bindings
                         .iter()
@@ -124,16 +125,17 @@ impl Interp<'_> {
                         .unwrap_or_else(|| EvalBindingRef::Arguments { frame: owner });
                     bindings.retain(|(old, _)| old != name);
                     bindings.push((name.clone(), reference));
-                    caller.bindings.retain(|(old, _)| old != name);
-                    caller.bindings.push((name.clone(), *kind));
                 }
-                caller.strict = metadata.caller_facts.strict;
-                caller.arguments_object_needed |= metadata.caller_facts.arguments_object_needed;
             }
         }
 
         for (name, location) in own_bindings {
-            let kind = own_caller
+            if site_phase == EvalPhase::Parameter
+                && !site_caller.bindings.iter().any(|(old, _)| old == &name)
+            {
+                continue;
+            }
+            let kind = site_caller
                 .bindings
                 .iter()
                 .find(|(old, _)| old == &name)
@@ -166,14 +168,13 @@ impl Interp<'_> {
         }
 
         let arguments = EvalBindingRef::Arguments { frame: owner };
-        if !bindings.iter().any(|(name, _)| name == "arguments")
-            && caller.bindings.iter().any(|(name, kind)| {
-                name == "arguments" && *kind == EvalBindingKind::ImplicitArguments
-            })
-        {
+        if !bindings.iter().any(|(name, _)| name == "arguments") && owner_is_ordinary {
+            // Keep the runtime arguments binding available for eval reads even
+            // when the caller has no *declaration conflict* fact for a simple
+            // parameter list.  The fact remains separate so `var arguments`
+            // can stay legal in that case.
             bindings.push(("arguments".to_string(), arguments.clone()));
         }
-        caller.strict = strict;
         EvalCallerContext {
             this,
             env,

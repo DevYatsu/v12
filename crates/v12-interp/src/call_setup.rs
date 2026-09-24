@@ -20,6 +20,7 @@ impl Interp<'_> {
         callee_reg: u16,
         argc: u16,
         direct_eval: bool,
+        call_pc: u32,
     ) -> Result<CallOutcome, JSException> {
         let callee_slot = base + usize::from(callee_reg);
         let callee_v = self.stack[callee_slot];
@@ -60,7 +61,7 @@ impl Interp<'_> {
                 .and_then(|v| v.as_string())
                 .map(|h| self.string_text(h))
                 .unwrap_or_default();
-            let context = self.capture_eval_context();
+            let context = self.capture_eval_context(call_pc);
             let facts = context.compile_facts();
             let compiled = self
                 .natives
@@ -138,7 +139,7 @@ impl Interp<'_> {
                 .and_then(|v| v.as_string())
                 .map(|h| self.string_text(h))
                 .unwrap_or_default();
-            let context = self.capture_eval_context();
+            let context = self.capture_eval_context(call_pc);
             let facts = context.compile_facts();
             let compiled = self
                 .natives

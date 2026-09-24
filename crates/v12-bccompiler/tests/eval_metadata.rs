@@ -21,9 +21,9 @@ fn direct_eval_call_site_is_marked_without_new_opcode() {
             .unwrap()
             .direct_eval_sites
             .iter()
-            .any(|pc| {
+            .any(|site| {
                 f.instrs
-                    .get(*pc as usize)
+                    .get(site.pc as usize)
                     .is_some_and(|i| i.op() == Some(v12_bytecode::Opcode::Call))
             })
     );

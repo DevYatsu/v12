@@ -183,13 +183,26 @@ pub struct EvalCompileFacts {
     pub caller: EvalCallerFacts,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalPhase {
+    Parameter,
+    Body,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalSiteFacts {
+    pub pc: u32,
+    pub phase: EvalPhase,
+    pub caller: EvalCallerFacts,
+}
+
 /// Metadata used by the interpreter to route syntactic direct-eval calls
 /// and the bindings visible to their child program.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvalFunctionMetadata {
     pub bindings: Vec<(String, BindingLocation)>,
-    pub caller_facts: EvalCallerFacts,
-    pub direct_eval_sites: Vec<u32>,
+    pub direct_eval_sites: Vec<EvalSiteFacts>,
+    pub var_declared_names: Vec<String>,
     pub eval_reachable: bool,
 }
 

@@ -179,13 +179,7 @@ pub fn compile_eval_source_with_interner_facts(
     interner: &mut Interner,
     facts: &EvalCompileFacts,
 ) -> Result<Program, CompileError> {
-    compile_script_with_interner(
-        src,
-        interner,
-        facts.direct,
-        Some(facts.strict),
-        Some(&facts.caller),
-    )
+    compile_script_with_interner(src, interner, facts.direct, Some(facts.strict), Some(facts))
 }
 
 fn compile_script_with_interner(
@@ -193,7 +187,7 @@ fn compile_script_with_interner(
     interner: &mut Interner,
     eval_leniency: bool,
     strict_override: Option<bool>,
-    eval_caller_facts: Option<&EvalCallerFacts>,
+    eval_caller_facts: Option<&EvalCompileFacts>,
 ) -> Result<Program, CompileError> {
     // Cheap pre-check: module syntax is a strict superset of script syntax
     // for this subset, and `SourceType::script()` panics on `import` rather
@@ -239,7 +233,9 @@ fn compile_script_with_interner(
             span: None,
         });
     }
-    let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+    let semantic = oxc_semantic::SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program);
     if let Some(d) = semantic.diagnostics.errors().next() {
         return Err(CompileError {
             message: format!("semantic error: {d}"),
@@ -249,7 +245,7 @@ fn compile_script_with_interner(
             }),
         });
     }
-    let scoping = semantic.semantic.into_scoping();
+    let (scoping, nodes) = semantic.semantic.into_scoping_and_nodes();
     // A strict caller and a strict eval directive are both sources of strict
     // mode.  Only the absence of both may compile sloppy eval code; an
     // explicit `Some(false)` must not suppress a directive in the payload.
@@ -261,6 +257,7 @@ fn compile_script_with_interner(
         Some(effective_strict),
         eval_leniency,
         eval_caller_facts,
+        Some(&nodes),
     )?;
     // `collect` records imports/exports even for scripts; scripts must reject
     // them explicitly rather than silently ignoring (via
@@ -452,6 +449,7 @@ pub fn compile_ast(
         None,
         false,
         None,
+        None,
     )
 }
 
@@ -461,11 +459,16 @@ fn compile_ast_inner(
     interner: &mut Interner,
     strict_override: Option<bool>,
     emit_eval_metadata: bool,
-    eval_caller_facts: Option<&EvalCallerFacts>,
+    eval_caller_facts: Option<&EvalCompileFacts>,
+    nodes: Option<&oxc_semantic::AstNodes<'_>>,
 ) -> Result<Program, CompileError> {
     let strict = strict_override.unwrap_or_else(|| has_use_strict(program));
+    let empty_facts = EvalCompileFacts::default();
     let plans = match eval_caller_facts {
-        Some(facts) => collect::collect_with_eval_facts(program, scoping, strict, facts)?,
+        Some(facts) => collect::collect_with_eval_facts(program, scoping, strict, facts, nodes)?,
+        None if nodes.is_some() => {
+            collect::collect_with_eval_facts(program, scoping, strict, &empty_facts, nodes)?
+        }
         None => collect::collect(program, scoping, strict)?,
     };
     // Scripts must not carry module linkage.
