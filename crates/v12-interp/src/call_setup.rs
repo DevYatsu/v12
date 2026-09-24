@@ -126,7 +126,7 @@ impl Interp<'_> {
                 let mut call_args = prefix;
                 call_args.extend_from_slice(&self.stack[args_start..args_end]);
                 return self
-                    .call_object(target_fn, this_arg, &call_args)
+                    .call_value_nested(JsValue::object(target_fn), this_arg, &call_args)
                     .map(CallOutcome::Value);
             }
         };
@@ -1441,16 +1441,14 @@ impl Interp<'_> {
                 } else {
                     &[] as &[JsValue]
                 };
-                // A proxy receiver dispatches `[[Call]]` through its trap.
-                if self.heap.get(target).kind == Kind::Proxy {
-                    return self.proxy_call(target, this_arg, fwd);
-                }
-                if self.heap.get(target).kind != Kind::Function {
+                if self.heap.get(target).kind != Kind::Function
+                    && self.heap.get(target).kind != Kind::Proxy
+                {
                     return Err(JSException(self.error_value(
                         "TypeError: Function.prototype.call called on non-function",
                     )));
                 }
-                self.call_object(target, this_arg, fwd)
+                self.call_value(JsValue::object(target), this_arg, fwd)
             }
             NativeId::FunctionApply => {
                 let Some(target) = this_v.as_object() else {
@@ -1481,15 +1479,14 @@ impl Interp<'_> {
                 } else {
                     Vec::new()
                 };
-                if self.heap.get(target).kind == Kind::Proxy {
-                    return self.proxy_call(target, this_arg, &fwd);
-                }
-                if self.heap.get(target).kind != Kind::Function {
+                if self.heap.get(target).kind != Kind::Function
+                    && self.heap.get(target).kind != Kind::Proxy
+                {
                     return Err(JSException(self.error_value(
                         "TypeError: Function.prototype.apply called on non-function",
                     )));
                 }
-                self.call_object(target, this_arg, &fwd)
+                self.call_value(JsValue::object(target), this_arg, &fwd)
             }
             NativeId::FunctionBind => {
                 let Some(target) = this_v.as_object() else {
@@ -1779,7 +1776,7 @@ impl Interp<'_> {
         let list =
             self.create_list_from_array_like(args.get(2).copied().unwrap_or(JsValue::undefined()))?;
         // `call_object` routes a proxy through its `apply` trap.
-        self.call_object(target, this_arg, &list)
+        self.call_value(JsValue::object(target), this_arg, &list)
     }
 
     /// `Reflect.construct(target, argumentsList[, newTarget])` (ES 28.1.2):
@@ -2611,7 +2608,7 @@ impl Interp<'_> {
                 (elem, JsValue::from_f64(f64::from(i)))
             };
             let call_args: [JsValue; 3] = [first_arg, second_arg, this_v];
-            let result = self.call_object(cb, this_arg, &call_args)?;
+            let result = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
             // Results collected across calls must survive the next call's
             // collection safepoint; the engine roots liberally by design.
             self.heap.add_root(result);
@@ -2747,13 +2744,13 @@ impl Interp<'_> {
         if want_map {
             for pair in snapshot.chunks_exact(2) {
                 let call_args = [pair[1], pair[0], this_v];
-                let r = self.call_object(cb, this_arg, &call_args)?;
+                let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
                 self.heap.add_root(r);
             }
         } else {
             for v in &snapshot {
                 let call_args = [*v, *v, this_v];
-                let r = self.call_object(cb, this_arg, &call_args)?;
+                let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
                 self.heap.add_root(r);
             }
         }
@@ -2845,7 +2842,7 @@ impl Interp<'_> {
                 match acc {
                     Some(a) => {
                         let call_args = [a, *v, idx];
-                        let r = self.call_object(cb, this_arg, &call_args)?;
+                        let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
                         self.heap.add_root(r);
                         acc = Some(r);
                         continue;
@@ -2857,7 +2854,7 @@ impl Interp<'_> {
                 }
             } else {
                 let call_args = [*v, idx, this_v];
-                let r = self.call_object(cb, this_arg, &call_args)?;
+                let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
                 self.heap.add_root(r);
                 r
             };
@@ -2958,7 +2955,7 @@ impl Interp<'_> {
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     let a: [JsValue; 2] = [sorted[mid], v];
-                    let r = self.call_object(cb, JsValue::undefined(), &a)?;
+                    let r = self.call_value(JsValue::object(cb), JsValue::undefined(), &a)?;
                     let n = r
                         .as_smi()
                         .map(i64::from)

@@ -384,7 +384,7 @@ impl Interp<'_> {
             })?;
         self.stack.push(JsValue::object(method_obj));
         self.gc_protect();
-        let result = self.call_inline(method_obj, src_v, &[]);
+        let result = self.call_value(JsValue::object(method_obj), src_v, &[]);
         self.stack.pop();
         match result {
             Ok(v) if v.as_object().is_some() => Ok(v),
@@ -479,7 +479,7 @@ impl Interp<'_> {
         // discards).
         self.stack.push(JsValue::object(next_obj));
         self.gc_protect();
-        let result = self.call_inline(next_obj, iter_v, &[]);
+        let result = self.call_value(JsValue::object(next_obj), iter_v, &[]);
         self.stack.pop();
         match result {
             Ok(v) if v.as_object().is_some() => Ok(v),
@@ -548,7 +548,7 @@ impl Interp<'_> {
         };
         self.stack.push(JsValue::object(return_obj));
         self.gc_protect();
-        let inner = self.call_inline(return_obj, iter_v, &[]);
+        let inner = self.call_value(JsValue::object(return_obj), iter_v, &[]);
         self.stack.pop();
         match inner {
             Err(e) => Err(e),

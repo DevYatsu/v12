@@ -57,6 +57,7 @@
 //! object handle therefore cannot alias a stale entry.
 
 pub(crate) mod call;
+mod call_capability;
 mod call_setup;
 mod eval_context;
 mod execute;
@@ -1209,81 +1210,14 @@ impl<'a> Interp<'a> {
         self.call_object(callee, this, args)
     }
 
-    /// Calls an existing function object from outside the machine.
-    ///
-    /// Going through `prepare_call` (rather than pushing a frame by hand)
-    /// preserves closure environment capture and native routing; the captured
-    /// environment of a closure lives in the function object's `prototype`
-    /// slot. Unlike `run()`/`call_object`'s old contract, this is safe to
-    /// call with frames live on the stack (e.g. a microtask checkpoint drained
-    /// mid-evaluation during top-level `await`): the callee runs in a nested
-    /// `execute` bounded by `stop_at_frames`, so the caller's frames survive
-    /// untouched. Native/host callees return inline and never touch frames.
+    /// Compatibility adapter for callers that already hold an object handle.
     pub fn call_object(
         &mut self,
         callee: Handle<JsObject>,
         this: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        // Lay out `[callee][this][args…]` on top of the current window, mirroring
-        // exactly what a parked `Call` instruction deposits. `prepare_call`
-        // reads `callee`/`this`/args from `base + 0/1/2..`, so `base` is the
-        // current stack length and `callee_reg` is 0.
-        let base = self.stack.len();
-        self.stack.push(JsValue::object(callee));
-        self.stack.push(this);
-        self.stack.extend_from_slice(args);
-        let caller_max_regs =
-            u16::try_from(self.stack.len() - base).expect("arguments fit a frame window");
-        let argc = u16::try_from(args.len()).expect("argument count fits u16");
-        let saved = self.stop_at_frames;
-        // Bound the nested run at the current frame count so a throwing/nested
-        // callee unwinds only its own frame and returns to us — it must not
-        // drain the caller's frames (e.g. the module frame during TLA).
-        // `prepare_call` pushes exactly one callee frame on the `Pushed` path;
-        // `complete_frame`/`unwind` stop when the frame count falls back to
-        // this value (matching the accessor-call contract in `call_accessor_with`).
-        self.stop_at_frames = Some(self.frames.len());
-        let boundary = self.stop_at_frames;
-        self.top_result = None;
-        let outcome = self.prepare_call(base, caller_max_regs, 0, argc, false, 0);
-        let result = match outcome {
-            Ok(CallOutcome::Pushed) => {
-                let exec = self.execute();
-                // Some escape paths (the cooperative-deadline force-return;
-                // historically, bare `return Err` guards in the dispatch loop)
-                // leave frames live above the boundary. Shed them here so the
-                // stack truncation below cannot orphan a live register window —
-                // the corrupt machine state behind the register-window OOB
-                // panics.
-                if let Some(b) = boundary
-                    && self.frames.len() > b
-                {
-                    while self.frames.len() > b {
-                        if let Some(f) = self.frames.pop() {
-                            self.drop_frame_arguments(&f);
-                            self.drop_frame_context(f.base);
-                        }
-                    }
-                    self.stack.truncate(base);
-                }
-                exec.and_then(|()| {
-                    self.top_result.take().ok_or_else(|| {
-                        JSException(
-                            self.error_value("InternalError: call completed without a result"),
-                        )
-                    })
-                })
-            }
-            Ok(CallOutcome::Value(v)) => Ok(v),
-            Err(e) => Err(e),
-        };
-        self.stop_at_frames = saved;
-        // Shed the `[callee][this][args…]` window we appended (prepare_call's
-        // pushed frame already got popped by complete_frame/unwind; native and
-        // CallOutcome::Value paths leave the window untouched).
-        self.stack.truncate(base);
-        result
+        self.call_value(JsValue::object(callee), this, args)
     }
 
     /// Registers a compiled program in the cross-program table and runs its

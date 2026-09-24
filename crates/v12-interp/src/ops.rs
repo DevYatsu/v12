@@ -591,11 +591,7 @@ impl Interp<'_> {
             let key = self.new_temp_key(name);
             let m = self.get_property(0, 0, v, key)?;
             if let Some(f) = m.as_object() {
-                self.stack.push(JsValue::object(f));
-                self.gc_protect();
-                let r = self.call_inline(f, v, &[]);
-                self.stack.pop();
-                let r = r?;
+                let r = self.call_value(JsValue::object(f), v, &[])?;
                 if !r.is_object() {
                     return Ok(r);
                 }
