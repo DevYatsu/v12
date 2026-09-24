@@ -303,10 +303,18 @@ pub fn compile_unit(
                     "function declarations without a body are not supported",
                 ));
             };
-            cx.stmt_list(&body.statements)?;
+            cx.push_scope(f.scope_id.get());
+            let result = cx.stmt_list(&body.statements);
+            cx.pop_scope(f.scope_id.get());
+            result?;
         }
         UnitNode::Arrow(a) => match a.get_function_body() {
-            Some(body) => cx.stmt_list(&body.statements)?,
+            Some(body) => {
+                cx.push_scope(a.scope_id.get());
+                let result = cx.stmt_list(&body.statements);
+                cx.pop_scope(a.scope_id.get());
+                result?;
+            }
             None => {
                 let Some(expr) = a.get_expression() else {
                     return Err(cx.err(a.span(), "internal: arrow body missing"));
@@ -336,13 +344,19 @@ pub fn compile_unit(
                     return Err(cx.err(m.span, "constructor without a body is not supported"));
                 };
                 if c.heritage.is_none() {
-                    cx.stmt_list(&body.statements)?;
+                    cx.push_scope(m.value.scope_id.get());
+                    let result = cx.stmt_list(&body.statements);
+                    cx.pop_scope(m.value.scope_id.get());
+                    result?;
                 } else {
                     // Derived fields initialize only after `super()` returns
                     // (ES `InitializeInstanceElements` runs in the derived
                     // constructor after the super call). Hook the first
                     // top-level `super(...)` statement.
-                    cx.ctor_body_f(&body.statements, |cx| emit_instance_fields(cx, c))?;
+                    cx.push_scope(m.value.scope_id.get());
+                    let result = cx.ctor_body_f(&body.statements, |cx| emit_instance_fields(cx, c));
+                    cx.pop_scope(m.value.scope_id.get());
+                    result?;
                 }
             } else if c.heritage.is_some() {
                 // Default derived constructor (ES §15.7.1):
@@ -361,7 +375,10 @@ pub fn compile_unit(
             let Some(body) = f.body.as_deref() else {
                 return Err(cx.err(f.span(), "class method without a body is not supported"));
             };
-            cx.stmt_list(&body.statements)?;
+            cx.push_scope(f.scope_id.get());
+            let result = cx.stmt_list(&body.statements);
+            cx.pop_scope(f.scope_id.get());
+            result?;
         }
     }
     let mut fb = cx.finish()?;

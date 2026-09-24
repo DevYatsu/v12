@@ -32,8 +32,8 @@ use std::collections::HashSet;
 use v12_bytecode::{EvalBindingKind, EvalCallerFacts, EvalCompileFacts, EvalPhase};
 
 use crate::model::{
-    CompileError, EvalSitePlan, ExportEntry, ImportEntry, MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS,
-    UnitPlan, VarLoc,
+    BlockFunctionPlan, BlockFunctionSkip, CompileError, EvalSitePlan, ExportEntry, ImportEntry,
+    MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan, VarLoc,
 };
 
 /// Entry point: produce finalized layout plans for a whole program.
@@ -81,6 +81,8 @@ fn collect_inner(
         super_allowed_stack: Vec::new(),
         super_call_allowed_stack: Vec::new(),
         private_name_scopes: Vec::new(),
+        list_stack: Vec::new(),
+        control_depth: 0,
         walking_params: false,
         early_error: None,
     };
@@ -93,10 +95,11 @@ fn collect_inner(
     c.strict_stack.push(is_strict);
     c.super_allowed_stack.push(false);
     c.super_call_allowed_stack.push(false);
-    c.stmt_list(&program.body);
+    c.stmt_list_kind(&program.body, ListKind::FunctionBody);
     if let Some(err) = c.early_error {
         return Err(err);
     }
+    resolve_block_functions(&mut c.plans, c.scoping);
     let mut plans = c.plans;
     plans.ref_sites = c.ref_sites;
     // Strict-mode binding-name checks for declarations: `eval`/`arguments`
@@ -329,6 +332,13 @@ fn is_simple_parameter_list(params: &FormalParameters<'_>) -> bool {
         })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ListKind {
+    FunctionBody,
+    Block,
+    Control,
+}
+
 struct Collector<'s> {
     scoping: &'s Scoping,
     plans: Plans,
@@ -356,6 +366,8 @@ struct Collector<'s> {
     /// because parameters evaluate before the function is resumable
     /// (ES §14.1.2, §14.2.1, §14.4).
     walking_params: bool,
+    list_stack: Vec<ListKind>,
+    control_depth: usize,
     /// First early-error found during the walk; aborts collection after the
     /// current subtree so one bad construct yields one diagnostic.
     early_error: Option<CompileError>,
@@ -465,7 +477,7 @@ impl<'s> Collector<'s> {
     fn enter_object_method(&mut self, p: &oxc_ast::ast::ObjectProperty<'_>) {
         if let Expression::FunctionExpression(f) = &p.value {
             let hint = static_key_or_default(&p.key);
-            self.fn_unit_ext(f, false, &format!("<objmethod>:{hint}"), true);
+            self.fn_unit_ext(f, false, &format!("<objmethod>:{hint}"), true, false);
         }
     }
 
@@ -474,8 +486,14 @@ impl<'s> Collector<'s> {
     /// `declare_name_here` is `Some(())` for declarations (name binds in the
     /// enclosing unit) and `None` for expressions (named expressions bind
     /// their own name inside themselves).
-    fn fn_unit(&mut self, f: &Function<'_>, declare_name_in_enclosing: bool, hint: &str) -> usize {
-        self.fn_unit_ext(f, declare_name_in_enclosing, hint, false)
+    fn fn_unit(
+        &mut self,
+        f: &Function<'_>,
+        declare_name_in_enclosing: bool,
+        hint: &str,
+        block_candidate: bool,
+    ) -> usize {
+        self.fn_unit_ext(f, declare_name_in_enclosing, hint, false, block_candidate)
     }
 
     /// [`Self::fn_unit`] with an explicit HomeObject flag: `allows_super` is
@@ -487,6 +505,7 @@ impl<'s> Collector<'s> {
         declare_name_in_enclosing: bool,
         hint: &str,
         allows_super: bool,
+        block_candidate: bool,
     ) -> usize {
         let parent = self.cur_unit();
         if declare_name_in_enclosing
@@ -515,6 +534,7 @@ impl<'s> Collector<'s> {
         self.check_use_strict_with_non_simple_params(&f.params, own_strict, f.span());
         let mut plan = UnitPlan::new(Some(parent), false, name_hint);
         plan.is_strict = is_strict;
+        plan.function_scope = f.scope_id.get();
         plan.implicit_arguments = true;
         plan.has_non_simple_parameters = !is_simple_parameter_list(&f.params);
         plan.allows_super = allows_super;
@@ -525,6 +545,33 @@ impl<'s> Collector<'s> {
         }
         self.plans.units.push(plan);
         self.plans.fn_index.insert(f.span(), idx);
+        if block_candidate
+            && parent != 0
+            && !is_strict
+            && !f.generator
+            && !f.r#async
+            && let Some(symbol) = f.id.as_ref().and_then(|id| id.symbol_id.get())
+            && let Some(function_scope) = f.scope_id.get()
+        {
+            let declaration_scope = self
+                .scoping
+                .scope_parent_id(function_scope)
+                .unwrap_or_else(|| self.scoping.root_scope_id());
+            let order = self.plans.units[parent].block_functions.len();
+            self.plans.units[parent]
+                .block_functions
+                .push(BlockFunctionPlan {
+                    order,
+                    span: f.span(),
+                    declaration_scope,
+                    symbol,
+                    child_unit: idx,
+                    lexical_location: None,
+                    var_location: None,
+                    var_symbol: None,
+                    skip: BlockFunctionSkip::Eligible,
+                });
+        }
         self.unit_stack.push(idx);
         self.strict_stack.push(is_strict);
         // An ordinary (non-arrow) function is a new `super` scope: `super` is
@@ -555,7 +602,7 @@ impl<'s> Collector<'s> {
         let prev_params = self.walking_params;
         self.walking_params = false;
         if let Some(body) = f.body.as_deref() {
-            self.stmt_list(&body.statements);
+            self.stmt_list_kind(&body.statements, ListKind::FunctionBody);
         }
         self.walking_params = prev_params;
         self.unit_stack.pop();
@@ -580,6 +627,7 @@ impl<'s> Collector<'s> {
         self.check_use_strict_with_non_simple_params(&a.params, own_strict, a.span);
         let mut plan = UnitPlan::new(Some(parent), true, format!("<arrow>{}", idx));
         plan.is_strict = is_strict;
+        plan.function_scope = a.scope_id.get();
         plan.has_non_simple_parameters = !is_simple_parameter_list(&a.params);
         self.plans.units.push(plan);
         self.plans.fn_index.insert(a.span(), idx);
@@ -599,7 +647,7 @@ impl<'s> Collector<'s> {
         self.register_formals(idx, &a.params);
         self.walking_params = false;
         match a.get_function_body() {
-            Some(body) => self.stmt_list(&body.statements),
+            Some(body) => self.stmt_list_kind(&body.statements, ListKind::FunctionBody),
             None => {
                 if let Some(expr) = a.get_expression() {
                     self.expr(expr);
@@ -615,9 +663,15 @@ impl<'s> Collector<'s> {
     }
 
     fn stmt_list(&mut self, stmts: &[Statement<'_>]) {
+        self.stmt_list_kind(stmts, ListKind::Block);
+    }
+
+    fn stmt_list_kind(&mut self, stmts: &[Statement<'_>], kind: ListKind) {
+        self.list_stack.push(kind);
         for s in stmts {
             self.stmt(s);
         }
+        self.list_stack.pop();
     }
 
     fn stmt(&mut self, s: &Statement<'_>) {
@@ -641,17 +695,23 @@ impl<'s> Collector<'s> {
             Statement::ExpressionStatement(e) => self.expr(&e.expression),
             Statement::IfStatement(i) => {
                 self.expr(&i.test);
+                self.control_depth += 1;
                 self.stmt(&i.consequent);
                 if let Some(alt) = &i.alternate {
                     self.stmt(alt);
                 }
+                self.control_depth -= 1;
             }
             Statement::WhileStatement(w) => {
                 self.expr(&w.test);
+                self.control_depth += 1;
                 self.stmt(&w.body);
+                self.control_depth -= 1;
             }
             Statement::DoWhileStatement(d) => {
+                self.control_depth += 1;
                 self.stmt(&d.body);
+                self.control_depth -= 1;
                 self.expr(&d.test);
             }
             Statement::ForStatement(f) => {
@@ -671,7 +731,9 @@ impl<'s> Collector<'s> {
                 if let Some(u) = &f.update {
                     self.expr(u);
                 }
+                self.control_depth += 1;
                 self.stmt(&f.body);
+                self.control_depth -= 1;
             }
             Statement::ForInStatement(f) => {
                 // `for (const k in obj)`: declare the left binding pattern
@@ -699,7 +761,9 @@ impl<'s> Collector<'s> {
                     _ => {}
                 }
                 self.expr(&f.right);
+                self.control_depth += 1;
                 self.stmt(&f.body);
+                self.control_depth -= 1;
             }
             Statement::ForOfStatement(f) => {
                 // `for (const x of iterable)`: the left binding pattern is a
@@ -728,7 +792,9 @@ impl<'s> Collector<'s> {
                     _ => {}
                 }
                 self.expr(&f.right);
+                self.control_depth += 1;
                 self.stmt(&f.body);
+                self.control_depth -= 1;
             }
             Statement::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
@@ -752,9 +818,16 @@ impl<'s> Collector<'s> {
                     self.stmt_list(&fin.body);
                 }
             }
-            Statement::LabeledStatement(l) => self.stmt(&l.body),
+            Statement::LabeledStatement(l) => {
+                self.control_depth += 1;
+                self.stmt(&l.body);
+                self.control_depth -= 1;
+            }
             Statement::FunctionDeclaration(f) => {
-                self.fn_unit(f, true, "<fn>");
+                let block_candidate = self.cur_unit() != 0
+                    && (self.list_stack.last() != Some(&ListKind::FunctionBody)
+                        || self.control_depth != 0);
+                self.fn_unit(f, true, "<fn>", block_candidate);
             }
             Statement::ClassDeclaration(c) => {
                 self.class_unit(c);
@@ -766,7 +839,7 @@ impl<'s> Collector<'s> {
                     if let Some(t) = &case.test {
                         self.expr(t);
                     }
-                    self.stmt_list(&case.consequent);
+                    self.stmt_list_kind(&case.consequent, ListKind::Control);
                 }
             }
             Statement::WithStatement(w) => {
@@ -918,7 +991,7 @@ impl<'s> Collector<'s> {
             self.register_formals(idx, &m.value.params);
             self.walking_params = false;
             if let Some(body) = m.value.body.as_deref() {
-                self.stmt_list(&body.statements);
+                self.stmt_list_kind(&body.statements, ListKind::FunctionBody);
             }
             self.walking_params = prev_params;
         } else if c.heritage.is_some() {
@@ -1038,7 +1111,7 @@ impl<'s> Collector<'s> {
                 self.register_formals(midx, &m.value.params);
                 self.walking_params = false;
                 if let Some(body) = m.value.body.as_deref() {
-                    self.stmt_list(&body.statements);
+                    self.stmt_list_kind(&body.statements, ListKind::FunctionBody);
                 }
                 self.walking_params = prev_params;
                 self.unit_stack.pop();
@@ -1160,7 +1233,7 @@ impl<'s> Collector<'s> {
                         span,
                     });
                 }
-                self.fn_unit(f, true, "<fn>");
+                self.fn_unit(f, true, "<fn>", false);
             }
             oxc_ast::ast::Declaration::ClassDeclaration(c) => {
                 if let Some(id) = &c.id
@@ -1242,7 +1315,7 @@ impl<'s> Collector<'s> {
                 // `export default function foo(){}` – function name binds
                 // inside itself for declaration forms, but for default export
                 // the name is not visible outside; treat as expression.
-                self.fn_unit(f, false, "<default fn>");
+                self.fn_unit(f, false, "<default fn>", false);
             }
             oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
                 let _ = c;
@@ -1523,7 +1596,7 @@ impl<'s> Collector<'s> {
                 self.plans.units[owner].uses_super = true;
             }
             Expression::FunctionExpression(f) => {
-                self.fn_unit(f, false, "<fnexpr>");
+                self.fn_unit(f, false, "<fnexpr>", false);
             }
             Expression::ArrowFunctionExpression(a) => {
                 self.arrow_unit(a);
@@ -2072,7 +2145,39 @@ fn ident_name_of_binding(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<String>
     }
 }
 
-/// Assigns concrete storage after the walk: captured symbols escape into
+fn resolve_block_functions(plans: &mut Plans, scoping: &Scoping) {
+    for unit in &mut plans.units {
+        let function_scope = unit.function_scope;
+        for plan in &mut unit.block_functions {
+            let name = scoping.symbol_name(plan.symbol);
+            let function_binding =
+                function_scope.and_then(|scope| scoping.get_binding(scope, name.into()));
+            let parameter_collision = (name == "arguments" && unit.implicit_arguments)
+                || function_scope
+                    .and_then(|scope| scoping.get_binding(scope, name.into()))
+                    .is_some_and(|symbol| unit.parameter_symbols.contains(&symbol));
+            let declaration_collision = scoping
+                .get_binding(plan.declaration_scope, name.into())
+                .is_some_and(|symbol| {
+                    symbol != plan.symbol && unit.lexical_symbols.contains(&symbol)
+                });
+            let hoisted_without_var =
+                function_binding.is_some_and(|symbol| unit.lexical_symbols.contains(&symbol));
+            if name == "arguments" && unit.implicit_arguments {
+                unit.needs_arguments = true;
+            }
+            plan.var_symbol = function_binding.or(Some(plan.symbol));
+            plan.skip = if parameter_collision {
+                BlockFunctionSkip::ParameterCollision
+            } else if declaration_collision || hoisted_without_var {
+                BlockFunctionSkip::LexicalCollision
+            } else {
+                BlockFunctionSkip::Eligible
+            };
+        }
+    }
+}
+
 /// their home unit's Environment, everything else gets sequential registers.
 ///
 /// Layout order per unit is deterministic: declaration order (params first)
@@ -2200,6 +2305,40 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
                     message: "too many functions/constants".into(),
                     span: Some((0, 0)),
                 })?;
+            }
+        }
+        let eval_reachable = plans.units[ui].eval_reachable;
+        let var_locations: Vec<Option<VarLoc>> = plans.units[ui]
+            .block_functions
+            .iter()
+            .map(|plan| {
+                plan.var_symbol
+                    .and_then(|sym| plans.units[ui].vars.get(&sym).copied())
+            })
+            .collect();
+        for (plan, var_location) in plans.units[ui]
+            .block_functions
+            .iter_mut()
+            .zip(var_locations)
+        {
+            let captured = plans.captured.contains(&plan.symbol);
+            plan.lexical_location = Some(if captured || eval_reachable {
+                let location = VarLoc::Env(slot);
+                slot = slot.checked_add(1).ok_or_else(|| CompileError {
+                    message: "too many functions/constants".into(),
+                    span: Some((0, 0)),
+                })?;
+                location
+            } else {
+                let location = VarLoc::Reg(reg);
+                reg = reg.checked_add(1).ok_or_else(|| CompileError {
+                    message: "too many functions/constants".into(),
+                    span: Some((0, 0)),
+                })?;
+                location
+            });
+            if plan.skip == BlockFunctionSkip::Eligible {
+                plan.var_location = var_location;
             }
         }
         let descriptors = {

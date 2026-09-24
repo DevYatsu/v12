@@ -531,7 +531,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         span: Span,
     ) -> Res<()> {
         if let Some(sym) = self.comp.symbol_of(rid) {
-            self.read_access(self.access(sym), dst, span);
+            self.read_access(self.access_in_scope(sym), dst, span);
             return Ok(());
         }
         // Spec-defined non-writable globals that need no runtime binding.
@@ -927,13 +927,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 let end = self.emit_with_probe(name, dst, None, span)?;
                 match self.comp.symbol_of(id.reference_id.get()) {
                     Some(sym)
-                        if matches!(self.access(sym), crate::model::VarAccess::Global { .. }) =>
+                        if matches!(
+                            self.access_in_scope(sym),
+                            crate::model::VarAccess::Global { .. }
+                        ) =>
                     {
                         let gid = self.global_name_id(name);
                         self.emit_get_global_lenient(dst, gid, span);
                     }
                     Some(sym) => {
-                        let access = self.access(sym);
+                        let access = self.access_in_scope(sym);
                         self.read_access(access, dst, span);
                     }
                     None => match name {
@@ -954,7 +957,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 return Ok(out);
             }
             if let Some(sym) = self.comp.symbol_of(id.reference_id.get()) {
-                if matches!(self.access(sym), crate::model::VarAccess::Global { .. }) {
+                if matches!(
+                    self.access_in_scope(sym),
+                    crate::model::VarAccess::Global { .. }
+                ) {
                     let name = self.comp.scoping.symbol_name(sym).to_string();
                     let gid = self.global_name_id(&name);
                     let dst = self.new_temp();
@@ -1145,7 +1151,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 {
                     return Err(self.err(id.span, "SyntaxError: Assignment to constant variable"));
                 }
-                let access = self.access(sym);
+                let access = self.access_in_scope(sym);
                 let old = self.new_temp();
                 self.read_access(access, old, span);
                 let one = self.new_temp();
@@ -1270,7 +1276,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 {
                     return Err(self.err(id.span, "SyntaxError: Assignment to constant variable"));
                 }
-                let access = self.access(sym);
+                let access = self.access_in_scope(sym);
                 let value = match binop {
                     None => rhs,
                     Some(opcode) => {
@@ -1452,7 +1458,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         }
                         continue;
                     };
-                    let access = self.access(sym);
+                    let access = self.access_in_scope(sym);
                     self.store_access(access, val, span);
                 }
                 oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
@@ -1513,7 +1519,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     }
                     return Ok(());
                 };
-                let access = self.access(sym);
+                let access = self.access_in_scope(sym);
                 self.store_access(access, val, span);
                 Ok(())
             }
@@ -1893,7 +1899,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 {
                     return Err(self.err(id.span, "SyntaxError: Assignment to constant variable"));
                 }
-                Target::Id(self.access(sym))
+                Target::Id(self.access_in_scope(sym))
             }
             _ => {
                 let Some(m) = simple.as_member_expression() else {

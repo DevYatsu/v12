@@ -207,6 +207,32 @@ pub(crate) struct EvalSitePlan {
 }
 
 /// Per-function-unit layout decided by the collect pass.
+/// Why a block-level function cannot update the function-scope Annex B name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockFunctionSkip {
+    Eligible,
+    ParameterCollision,
+    LexicalCollision,
+}
+
+/// One sloppy function-body Annex B block-function declaration.
+///
+/// The block binding and the optional function-scope target are deliberately
+/// independent. A block function has one Oxc symbol, but its runtime name can
+/// have two independent storage locations while the declaration is active.
+#[derive(Debug, Clone)]
+pub struct BlockFunctionPlan {
+    pub order: usize,
+    pub span: Span,
+    pub declaration_scope: ScopeId,
+    pub symbol: SymbolId,
+    pub child_unit: usize,
+    pub lexical_location: Option<VarLoc>,
+    pub var_location: Option<VarLoc>,
+    pub(crate) var_symbol: Option<SymbolId>,
+    pub skip: BlockFunctionSkip,
+}
+
 #[derive(Debug)]
 pub struct UnitPlan {
     /// Enclosing unit index (`None` for the main script body).
@@ -281,6 +307,10 @@ pub struct UnitPlan {
     pub parameter_symbols: HashSet<SymbolId>,
     pub var_symbols: HashSet<SymbolId>,
     pub lexical_symbols: HashSet<SymbolId>,
+    /// Function-body block-function candidates in source order.
+    pub block_functions: Vec<BlockFunctionPlan>,
+    /// Oxc function scope for this unit, when it has one.
+    pub function_scope: Option<ScopeId>,
 }
 
 impl UnitPlan {
@@ -320,6 +350,8 @@ impl UnitPlan {
             parameter_symbols: HashSet::new(),
             var_symbols: HashSet::new(),
             lexical_symbols: HashSet::new(),
+            block_functions: Vec::new(),
+            function_scope: None,
         }
     }
 }
@@ -537,6 +569,7 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     /// so far, when there is one. The main unit emits a `Return` of it so
     /// `eval` gets the spec-compliant script completion value.
     pub last_expr_reg: Option<u16>,
+    scope_stack: Vec<ScopeId>,
     overflow: Option<CompileError>,
 }
 
@@ -554,6 +587,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             finallies: Vec::new(),
             with_objs: Vec::new(),
             last_expr_reg: None,
+            scope_stack: Vec::new(),
             overflow: None,
         }
     }
@@ -639,7 +673,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     // -- variable access ----------------------------------------------------
 
-    /// Resolve a symbol to concrete storage relative to the current unit.
+    /// Resolve a symbol to ordinary function/global storage.
     pub fn access(&self, sym: SymbolId) -> VarAccess {
         let plans = &self.comp.plans;
         let Some(&home) = plans.home_of.get(&sym) else {
@@ -655,6 +689,79 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 slot,
             },
             VarLoc::Global => VarAccess::Global { sym },
+        }
+    }
+
+    /// Resolve a reference at the current lexical scope, preferring the
+    /// nearest block-function lexical location and falling back to the
+    /// ordinary function-scope route.
+    pub fn access_in_scope(&self, sym: SymbolId) -> VarAccess {
+        let plans = &self.comp.plans;
+        if plans.units[self.unit].block_functions.iter().any(|plan| {
+            plan.symbol == sym
+                && self.comp.scoping.symbol_name(plan.symbol) == "arguments"
+                && plan.skip == BlockFunctionSkip::ParameterCollision
+        }) {
+            return VarAccess::Global { sym };
+        }
+        if let Some(scope) = self.scope_stack.last().copied()
+            && let Some(location) = plans.units[self.unit]
+                .block_functions
+                .iter()
+                .rev()
+                .find(|plan| {
+                    plan.symbol == sym
+                        && plan.declaration_scope
+                            != plans.units[self.unit]
+                                .function_scope
+                                .unwrap_or(plan.declaration_scope)
+                        && self
+                            .comp
+                            .scoping
+                            .scope_is_descendant_of(scope, plan.declaration_scope)
+                })
+                .and_then(|plan| plan.lexical_location)
+        {
+            return self.access_location(location);
+        }
+        self.access(sym)
+    }
+
+    pub fn access_location(&self, loc: VarLoc) -> VarAccess {
+        match loc {
+            VarLoc::Reg(reg) => VarAccess::Reg(reg),
+            VarLoc::Env(slot) => VarAccess::Env { depth: 0, slot },
+            VarLoc::Global => VarAccess::Global {
+                sym: self
+                    .comp
+                    .plans
+                    .symbol_names
+                    .iter()
+                    .find_map(|(sym, _)| {
+                        self.comp.plans.units[self.unit]
+                            .vars
+                            .get(sym)
+                            .is_some_and(|candidate| *candidate == VarLoc::Global)
+                            .then_some(*sym)
+                    })
+                    .expect("global block-function location has a symbol"),
+            },
+        }
+    }
+
+    pub fn push_scope(&mut self, scope: Option<ScopeId>) {
+        if let Some(scope) = scope {
+            self.scope_stack.push(scope);
+        }
+    }
+
+    pub fn current_scope(&self) -> Option<ScopeId> {
+        self.scope_stack.last().copied()
+    }
+
+    pub fn pop_scope(&mut self, scope: Option<ScopeId>) {
+        if scope.is_some() {
+            self.scope_stack.pop();
         }
     }
 

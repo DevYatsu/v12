@@ -57,6 +57,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let mut hoisted: Vec<Span> = Vec::new();
         for s in stmts {
             if let Some(f) = fn_decl_of(s) {
+                if self.block_function_plan(f).is_some()
+                    || self.current_scope() != self.comp.plans.units[self.unit].function_scope
+                {
+                    continue;
+                }
                 self.hoist_fn_decl(f)?;
                 hoisted.push(f.span());
             }
@@ -72,6 +77,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(())
     }
 
+    fn block_function_plan(&self, f: &Function<'_>) -> Option<&crate::model::BlockFunctionPlan> {
+        self.comp.plans.units[self.unit]
+            .block_functions
+            .iter()
+            .find(|plan| {
+                debug_assert!(plan.order < self.comp.plans.units[self.unit].block_functions.len());
+                plan.span == f.span() && plan.child_unit < self.comp.functions.len()
+            })
+    }
+
     fn hoist_fn_decl(&mut self, f: &Function<'_>) -> Res<()> {
         let Some(id) = &f.id else { return Ok(()) };
         let Some(sym) = id.symbol_id.get() else {
@@ -79,7 +94,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         };
         let dst = self.new_temp();
         self.closure_fn(dst, f)?;
-        let access = self.access(sym);
+        let access = self.access_in_scope(sym);
         self.store_access(access, dst, f.span());
         Ok(())
     }
@@ -99,7 +114,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             | Statement::ExportAllDeclaration(_)
             | Statement::TSExportAssignment(_)
             | Statement::TSNamespaceExportDeclaration(_) => self.module_decl(s),
-            Statement::BlockStatement(b) => self.stmt_list(&b.body),
+            Statement::BlockStatement(b) => {
+                self.push_scope(b.scope_id.get());
+                let result = self.stmt_list(&b.body);
+                self.pop_scope(b.scope_id.get());
+                result
+            }
             Statement::ExpressionStatement(e) => {
                 let v = self.expr(&e.expression)?;
                 // Track the last expression statement's value so the main
@@ -168,16 +188,30 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         "SyntaxError: function declarations in blocks are not allowed in strict mode",
                     ));
                 }
-                // Annex B sloppy: emit initialization here. The binding already
-                // exists as a var in the function scope.
+                // Annex B sloppy: initialize the block binding first, then
+                // conditionally mirror the closure into the function-scope
+                // target. The two stores intentionally use independent plans.
                 let Some(id) = &f.id else { return Ok(()) };
                 let Some(sym) = id.symbol_id.get() else {
                     return Ok(());
                 };
                 let dst = self.new_temp();
                 self.closure_fn(dst, f)?;
-                let access = self.access(sym);
-                self.store_access(access, dst, f.span);
+                if let Some((lexical, var, skip)) = self
+                    .block_function_plan(f)
+                    .map(|plan| (plan.lexical_location, plan.var_location, plan.skip))
+                {
+                    if let Some(location) = lexical {
+                        self.store_access(self.access_location(location), dst, f.span);
+                    }
+                    if skip == crate::model::BlockFunctionSkip::Eligible
+                        && let Some(location) = var
+                    {
+                        self.store_access(self.access_location(location), dst, f.span);
+                    }
+                } else {
+                    self.store_access(self.access_in_scope(sym), dst, f.span);
+                }
                 Ok(())
             }
             Statement::VariableDeclaration(v) => self.var_decl(v),
@@ -291,7 +325,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         let sym = binding_symbol(&d.id).ok_or_else(|| {
                             self.err(d.span, "internal: declarator without symbol")
                         })?;
-                        let access = self.access(sym);
+                        let access = self.access_in_scope(sym);
                         self.store_access(access, val, d.span);
                     }
                     // No initializer: registers / env slots are already
@@ -467,7 +501,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 let Some(sym) = id.symbol_id.get() else {
                     return Err(self.err(pat.span(), "internal: pattern without symbol"));
                 };
-                let access = self.access(sym);
+                let access = self.access_in_scope(sym);
                 self.store_access(access, src, pat.span());
                 Ok(())
             }
@@ -699,7 +733,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
                 let src = value;
                 if let Some(sym) = self.comp.symbol_of(id.reference_id.get()) {
-                    let access = self.access(sym);
+                    let access = self.access_in_scope(sym);
                     self.store_access(access, src, span);
                 } else {
                     let gid = self.global_name_id(id.name.as_str());
@@ -880,7 +914,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                                 val = chosen;
                             }
                             if let Some(sym) = self.comp.symbol_of(id.binding.reference_id.get()) {
-                                let access = self.access(sym);
+                                let access = self.access_in_scope(sym);
                                 self.store_access(access, val, span);
                             } else {
                                 let gid = self.global_name_id(id.binding.name.as_str());
@@ -1181,7 +1215,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
 
         // Phase 2: bodies in source order (fallthrough = straight-line flow).
-        self.with_loop(end, None, name, None, |cx| {
+        self.push_scope(s.scope_id.get());
+        let result = self.with_loop(end, None, name, None, |cx| {
             let mut bound_default = false;
             for (case, entry) in s.cases.iter().zip(entries) {
                 match entry {
@@ -1200,7 +1235,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 "default clause must bind its label"
             );
             Ok(())
-        })?;
+        });
+        self.pop_scope(s.scope_id.get());
+        result?;
         self.bind(end);
         Ok(())
     }
@@ -1347,7 +1384,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     ) -> Res<()> {
         // Support plain identifier, array/object destructuring via generic lowering.
         if let Some(sym) = binding_symbol_pattern(param) {
-            let access = self.access(sym);
+            let access = self.access_in_scope(sym);
             self.store_access(access, exc, span);
             return Ok(());
         }
