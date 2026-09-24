@@ -24,6 +24,16 @@ fn direct_eval_mutates_caller_register_and_reads_lexical_binding() {
         ),
         "3"
     );
+    assert_eq!(
+        result(
+            "function f() { return eval(\"'use strict'; missing = 1\"); } try { f(); } catch (e) { e.name; }"
+        ),
+        "ReferenceError"
+    );
+    assert_eq!(
+        result("function f(){ var x='caller'; return eval(\"var x='eval'; eval('x')\"); } f()"),
+        "eval"
+    );
 }
 
 #[test]

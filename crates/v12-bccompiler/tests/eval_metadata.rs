@@ -1,4 +1,4 @@
-use v12_bccompiler::compile_source;
+use v12_bccompiler::{Interner, compile_eval_source_with_interner_facts, compile_source};
 
 #[test]
 fn direct_eval_call_site_is_marked_without_new_opcode() {
@@ -50,6 +50,19 @@ fn eval_reachable_bindings_are_promoted_to_environment() {
         .find(|(name, _)| name == "x")
         .unwrap();
     assert!(matches!(x.1, v12_bytecode::BindingLocation::Env(_)));
+}
+
+#[test]
+fn eval_source_directive_wins_over_false_caller_strictness() {
+    let mut interner = Interner::default();
+    let program = compile_eval_source_with_interner_facts(
+        "'use strict'; missing = 1",
+        &mut interner,
+        true,
+        false,
+    )
+    .unwrap();
+    assert!(program.functions[program.main as usize].is_strict);
 }
 
 #[test]

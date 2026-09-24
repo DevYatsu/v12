@@ -244,11 +244,15 @@ fn compile_script_with_interner(
         });
     }
     let scoping = semantic.semantic.into_scoping();
+    // A strict caller and a strict eval directive are both sources of strict
+    // mode.  Only the absence of both may compile sloppy eval code; an
+    // explicit `Some(false)` must not suppress a directive in the payload.
+    let effective_strict = has_use_strict(&parsed.program) || strict_override.unwrap_or(false);
     let program = compile_ast_inner(
         &parsed.program,
         &scoping,
         interner,
-        strict_override,
+        Some(effective_strict),
         eval_leniency,
     )?;
     // `collect` records imports/exports even for scripts; scripts must reject

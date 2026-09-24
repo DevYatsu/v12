@@ -90,6 +90,18 @@ impl Interp<'_> {
             .map(|ctx| ctx.bindings.clone())
             .unwrap_or_default();
         for (name, location) in own_bindings {
+            // In sloppy direct eval, a `var` declaration belongs to the
+            // inherited variable environment when that environment already
+            // has the name.  Do not let the eval unit's global descriptor
+            // replace the caller's binding in a nested eval.  Lexical
+            // Register/Env locations still shadow, and strict eval keeps the
+            // normal global binding behavior.
+            if !strict
+                && matches!(location, BindingLocation::Global)
+                && bindings.iter().any(|(old, _)| old == &name)
+            {
+                continue;
+            }
             let reference = match location {
                 BindingLocation::Register(reg) => EvalBindingRef::Register {
                     base: self.frames[frame_idx].base,
