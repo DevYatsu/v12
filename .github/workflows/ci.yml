@@ -39,9 +39,37 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: ./conformance/run.sh --filter language --jobs 4 --format tap --tap-out /tmp/t262.tap
+      - name: Run Test262
+        run: |
+          set +e
+          ./conformance/run.sh --filter language --jobs 4 --format tap --tap-out /tmp/t262.tap \
+            >/tmp/t262.stdout 2>/tmp/t262.stderr
+          status=$?
+          printf '%s\n' "$status" >/tmp/t262.status
+          exit 0
+      - name: Upload Test262 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-coverage
+          path: |
+            /tmp/t262.tap
+            /tmp/t262.stdout
+            /tmp/t262.stderr
+            /tmp/t262.status
+          if-no-files-found: ignore
       - name: Report pass rate
         if: always()
         run: |
           tail -n 40 /tmp/t262.tap || true
+      - name: Propagate Test262 status
+        if: always()
+        run: |
+          if [[ ! -s /tmp/t262.status ]]; then
+            echo "Test262 status was not recorded." >&2
+            exit 1
+          fi
+          exit "$(cat /tmp/t262.status)"

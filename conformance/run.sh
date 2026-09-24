@@ -17,38 +17,54 @@ TEST262_DIR="$REPO_ROOT/conformance/test262"
 
 # --- Ensure checkout -------------------------------------------------------
 
-if [[ ! -d "$TEST262_DIR/test" ]]; then
-  echo "conformance/test262 checkout not found at $TEST262_DIR" >&2
+GITLINK_ENTRY="$(git -C "$REPO_ROOT" ls-tree HEAD -- conformance/test262 2>/dev/null || true)"
+read -r GITLINK_MODE GITLINK_TYPE EXPECTED_TEST262 GITLINK_PATH <<< "$GITLINK_ENTRY"
+if [[ "$GITLINK_MODE" != 160000 || "$GITLINK_TYPE" != commit || -z "$EXPECTED_TEST262" ]]; then
+  echo "No Test262 gitlink found at HEAD: conformance/test262" >&2
+  exit 1
+fi
 
-  if [[ -f "$REPO_ROOT/.gitmodules" ]] && grep -q "test262" "$REPO_ROOT/.gitmodules" 2>/dev/null; then
-    echo "Attempting: git submodule update --init --depth 1 conformance/test262" >&2
-    if git -C "$REPO_ROOT" submodule update --init --depth 1 conformance/test262 2>&1; then
-      echo "Submodule checkout succeeded." >&2
-    else
-      echo "Submodule update failed. Falling back to shallow clone." >&2
-      rm -rf "$TEST262_DIR"
-      git clone --depth 1 https://github.com/tc39/test262 "$TEST262_DIR"
+TEST262_REPO_URL="https://github.com/tc39/test262.git"
+if ! git -C "$TEST262_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "Test262 checkout not found at $TEST262_DIR; initializing pinned checkout." >&2
+  mkdir -p "$TEST262_DIR"
+  git -C "$TEST262_DIR" init
+  if ! git -C "$TEST262_DIR" remote get-url upstream >/dev/null 2>&1; then
+    git -C "$TEST262_DIR" remote add upstream "$TEST262_REPO_URL"
+  fi
+  if ! git -C "$TEST262_DIR" fetch --depth 1 upstream "$EXPECTED_TEST262"; then
+    echo "Failed to fetch Test262 object $EXPECTED_TEST262 from $TEST262_REPO_URL." >&2
+    echo "The checkout is pinned to the repository gitlink; refusing to use latest upstream." >&2
+    exit 1
+  fi
+else
+  if ! git -C "$TEST262_DIR" cat-file -e "$EXPECTED_TEST262^{commit}" >/dev/null 2>&1; then
+    if ! git -C "$TEST262_DIR" remote get-url upstream >/dev/null 2>&1; then
+      git -C "$TEST262_DIR" remote add upstream "$TEST262_REPO_URL"
     fi
-  else
-    echo "Attempting: git clone --depth 1 https://github.com/tc39/test262 $TEST262_DIR" >&2
-    if ! git clone --depth 1 https://github.com/tc39/test262 "$TEST262_DIR" 2>&1; then
-      echo "" >&2
-      echo "Network clone failed. The runner can still execute with its minimal" >&2
-      echo "harness polyfill, but many tests will be skipped (see conformance/README.md)." >&2
-      echo "To retry manually:" >&2
-      echo "  git clone --depth 1 https://github.com/tc39/test262 \"$TEST262_DIR\"" >&2
-      echo "  or: git submodule add https://github.com/tc39/test262 conformance/test262" >&2
+    if ! git -C "$TEST262_DIR" fetch --depth 1 upstream "$EXPECTED_TEST262"; then
+      echo "Failed to fetch Test262 object $EXPECTED_TEST262 from $TEST262_REPO_URL." >&2
+      echo "The checkout is pinned to the repository gitlink; refusing to use latest upstream." >&2
+      exit 1
     fi
   fi
 fi
 
-if [[ -f "$TEST262_DIR/harness/assert.js" ]]; then
-  echo "Using Test262 checkout at $TEST262_DIR ($(find "$TEST262_DIR/test" -name '*.js' | wc -l | tr -d ' ') tests, harness present)." >&2
-elif [[ -d "$TEST262_DIR/test" ]]; then
-  echo "Using Test262 checkout at $TEST262_DIR (harness missing — runner will use minimal polyfill)." >&2
-else
-  echo "No Test262 checkout found; proceeding with minimal polyfill (expect many skips)." >&2
+ACTUAL_TEST262="$(git -C "$TEST262_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [[ "$ACTUAL_TEST262" != "$EXPECTED_TEST262" ]]; then
+  if ! git -C "$TEST262_DIR" checkout --detach "$EXPECTED_TEST262"; then
+    echo "Failed to check out pinned Test262 object $EXPECTED_TEST262." >&2
+    exit 1
+  fi
+  ACTUAL_TEST262="$(git -C "$TEST262_DIR" rev-parse HEAD)"
 fi
+
+if [[ "$ACTUAL_TEST262" != "$EXPECTED_TEST262" ]]; then
+  echo "Test262 checkout is at $ACTUAL_TEST262; expected $EXPECTED_TEST262." >&2
+  exit 1
+fi
+
+echo "Using Test262 checkout $TEST262_DIR at $ACTUAL_TEST262" >&2
 
 # --- Default args when none provided ---------------------------------------
 
