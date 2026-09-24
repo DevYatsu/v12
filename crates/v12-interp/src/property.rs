@@ -183,11 +183,16 @@ impl Interp<'_> {
                     "TypeError: 'caller' may not be accessed in strict mode",
                 )));
             }
-            return Ok(self
-                .heap
-                .get(obj)
-                .arguments_callee
-                .unwrap_or(JsValue::undefined()));
+            let shape = self.shape_of(obj);
+            let value = key
+                .and_then(|key| {
+                    self.heap
+                        .lookup_property(shape, key)
+                        .and_then(|descriptor| descriptor.slot())
+                })
+                .and_then(|slot| self.heap.get(obj).properties.get(slot as usize).copied())
+                .filter(|value| !value.is_hole());
+            return Ok(value.unwrap_or(JsValue::undefined()));
         }
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)

@@ -45,6 +45,14 @@ fn arguments_object_has_configurable_length_and_callee() {
 }
 
 #[test]
+fn arguments_callee_assignment_updates_own_value() {
+    assert!(completion(
+        "function f() { arguments.callee = 'something different'; return arguments.callee; } f() === 'something different';"
+    )
+    .is_true());
+}
+
+#[test]
 fn strict_arguments_callee_throws_but_sloppy_callee_is_readable() {
     assert!(completion(
         "function f() { 'use strict'; return arguments.callee; } try { f(); } catch (e) { e.name === 'TypeError'; }"
