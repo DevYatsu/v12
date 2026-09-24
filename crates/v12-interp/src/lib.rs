@@ -1262,6 +1262,7 @@ impl<'a> Interp<'a> {
                     while self.frames.len() > b {
                         if let Some(f) = self.frames.pop() {
                             self.drop_frame_arguments(&f);
+                            self.drop_frame_context(f.base);
                         }
                     }
                     self.stack.truncate(base);

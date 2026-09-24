@@ -679,7 +679,9 @@ impl Interp<'_> {
             Err(e) => {
                 // Pop the generator frame if still there, mark done.
                 if self.frames.len() >= frames_before {
-                    self.frames.pop();
+                    if let Some(frame) = self.frames.pop() {
+                        self.drop_frame_context(frame.base);
+                    }
                     self.stack.truncate(new_base);
                 }
                 if self.heap.get(r#gen).properties.len() >= 3 {

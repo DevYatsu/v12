@@ -56,6 +56,7 @@ impl Suspendable for Interp<'_> {
         // TODO: dedicated env slot, using prototype as env storage per Task 2 contract
         self.heap.get_mut(r#gen).prototype = env;
         let finished_base = self.frames.pop().expect("pop").base;
+        self.drop_frame_context(finished_base);
         self.stack.truncate(finished_base);
         // Encapsulate yielded value: caller no longer needs to set top_result separately
         // for SuspendYield. Await caller will overwrite with None after.

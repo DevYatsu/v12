@@ -39,6 +39,10 @@ impl EvalCallerContext {
 }
 
 impl Interp<'_> {
+    pub(crate) fn drop_frame_context(&mut self, base: usize) {
+        self.eval_frame_contexts.remove(&base);
+    }
+
     pub(crate) fn capture_eval_context(&mut self, call_pc: u32) -> EvalCallerContext {
         let frame_idx = self.frames.len().saturating_sub(1);
         let (this, env, new_target, strict, own_bindings, site_caller, site_phase, is_arrow) = {

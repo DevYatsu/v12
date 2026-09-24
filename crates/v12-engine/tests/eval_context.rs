@@ -91,6 +91,12 @@ fn nested_eval_contexts_keep_env_and_caller_bindings() {
         ),
         "7"
     );
+    assert_eq!(
+        result(
+            "function first() { return (() => eval(\"var stale = 1; stale\"))(); } function second() { return (() => eval(\"typeof stale\"))(); } first() + ':' + second()"
+        ),
+        "1:undefined"
+    );
 }
 
 #[test]

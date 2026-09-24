@@ -613,6 +613,7 @@ impl Interp<'_> {
         let finished = self.frames.pop().expect("complete_frame requires a frame");
         self.drop_frame_arguments(&finished);
         self.call_args.remove(&finished.base);
+        self.drop_frame_context(finished.base);
         self.notify_tier_ups();
         // A re-entrant accessor call stops the nested execute here: the
         // accessor's frame is done, and the caller's frames must remain
@@ -833,6 +834,7 @@ impl Interp<'_> {
             {
                 let popped = self.frames.pop().expect("boundary frame exists");
                 self.drop_frame_arguments(&popped);
+                self.drop_frame_context(popped.base);
                 self.stack.truncate(popped.base);
                 self.notify_tier_ups();
                 return Err(JSException(exc));
@@ -2097,6 +2099,7 @@ impl Interp<'_> {
                             while self.frames.len() > b {
                                 if let Some(f) = self.frames.pop() {
                                     self.drop_frame_arguments(&f);
+                                    self.drop_frame_context(f.base);
                                 }
                             }
                         }
