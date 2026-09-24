@@ -175,11 +175,21 @@ pub struct EvalCallerFacts {
     pub bindings: Vec<(String, EvalBindingKind)>,
 }
 
+/// Target environment for declarations introduced by a direct eval payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EvalVarTarget {
+    #[default]
+    Global,
+    CallerFunction,
+    EvalLocal,
+}
+
 /// Facts passed through the compile-only direct-eval seam.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvalCompileFacts {
     pub direct: bool,
     pub strict: bool,
+    pub var_target: EvalVarTarget,
     pub caller: EvalCallerFacts,
 }
 
@@ -247,6 +257,8 @@ pub struct FunctionBytecode {
     /// Arrow functions lack a `prototype` property (they are not
     /// constructible). Set from the compiler's unit plan.
     pub is_arrow: bool,
+    /// True for the script/eval main unit, not an ordinary function unit.
+    pub is_top_level: bool,
     pub eval_metadata: Option<EvalFunctionMetadata>,
 }
 
@@ -273,6 +285,7 @@ impl FunctionBytecode {
             is_generator: false,
             is_async: false,
             is_arrow: false,
+            is_top_level: false,
             eval_metadata: None,
         }
     }

@@ -26,6 +26,7 @@ fn compile_with_direct(
                 .map(|(name, kind)| ((*name).to_string(), *kind))
                 .collect(),
         },
+        ..EvalCompileFacts::default()
     };
     compile_eval_source_with_interner_facts(source, &mut interner, &facts)
         .map(|_| ())

@@ -65,7 +65,7 @@ fn eval_owned_vars_route_to_caller_or_eval_local_storage() {
     );
     assert_eq!(
         result(
-            "function f() { return eval(\"var arguments; return 1;\"); } f() + ':' + (typeof globalThis.arguments)"
+            "function f() { return eval(\"var arguments; 1\"); } f() + ':' + (typeof globalThis.arguments)"
         ),
         "1:undefined"
     );
@@ -114,6 +114,30 @@ fn top_level_and_indirect_eval_keep_global_var_scope() {
     assert_eq!(
         result("eval(\"var topLevelProbe = 7\"); topLevelProbe"),
         "7"
+    );
+    assert_eq!(
+        result("eval(\"var ownGlobal = 1\"); globalThis.ownGlobal"),
+        "1"
+    );
+    assert_eq!(
+        result(
+            "function existingFunction() { return 1; } eval(\"function existingFunction() { return 2; }\"); existingFunction()"
+        ),
+        "2"
+    );
+    assert_eq!(
+        result("var existingVar = 1; eval(\"var existingVar = 2\"); existingVar"),
+        "2"
+    );
+    assert_eq!(
+        result(
+            "((a = 1) => { eval('var arrowLocal = 1'); return arrowLocal + ':' + (typeof globalThis.arrowLocal); })()"
+        ),
+        "1:undefined"
+    );
+    assert_eq!(
+        result("try { eval('return 1'); } catch (e) { e.name; }"),
+        "SyntaxError"
     );
     assert_eq!(
         result("function f() { return (0, eval)(\"var indirectProbe = 2; indirectProbe\"); } f()"),

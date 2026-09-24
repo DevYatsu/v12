@@ -432,6 +432,7 @@ pub struct Compiler<'s, 'i> {
     /// Emit binding metadata for every unit in a compiled eval payload.
     pub emit_eval_metadata: bool,
     pub is_eval_payload: bool,
+    pub eval_var_target: v12_bytecode::EvalVarTarget,
 }
 
 impl<'s, 'i> Compiler<'s, 'i> {

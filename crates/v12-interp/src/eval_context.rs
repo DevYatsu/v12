@@ -1,6 +1,6 @@
 //! Direct-eval caller context and child-frame execution.
 
-use v12_bytecode::{BindingLocation, EvalBindingKind, EvalCallerFacts, EvalPhase};
+use v12_bytecode::{BindingLocation, EvalBindingKind, EvalCallerFacts, EvalPhase, EvalVarTarget};
 use v12_heap::{Handle, JsObject, JsValue};
 use v12_native::{CompiledEval, EvalCompileFacts};
 
@@ -18,7 +18,7 @@ pub(crate) enum EvalBindingRef {
 #[derive(Debug, Clone)]
 pub(crate) struct EvalCallerContext {
     pub local_env: Option<Handle<JsObject>>,
-    pub eval_local_owner: bool,
+    pub var_target: EvalVarTarget,
     pub this: JsValue,
     pub env: Option<Handle<JsObject>>,
     pub new_target: Option<JsValue>,
@@ -33,6 +33,7 @@ impl EvalCallerContext {
         EvalCompileFacts {
             direct: true,
             strict: self.strict,
+            var_target: self.var_target,
             caller: self.caller.clone(),
         }
     }
@@ -84,16 +85,24 @@ impl Interp<'_> {
             .and_then(|frame| {
                 self.functions_for_program(frame.program)
                     .get(frame.fn_idx as usize)
-                    .map(|function| !function.is_arrow && frame.fn_idx != 0)
+                    .map(|function| !function.is_arrow && !function.is_top_level)
             })
             .unwrap_or(false);
         let local_env = self.frames.get(owner).and_then(|frame| frame.env);
-        let eval_local_owner = is_arrow && !owner_is_ordinary;
         let inherited = self.frames.get(frame_idx).and_then(|frame| {
             frame
                 .env
                 .and_then(|env| self.eval_contexts.get(&(env.index() as usize)))
                 .or_else(|| self.eval_frame_contexts.get(&frame.base))
+        });
+        let var_target = inherited.map(|ctx| ctx.var_target).unwrap_or_else(|| {
+            if owner_is_ordinary {
+                EvalVarTarget::CallerFunction
+            } else if is_arrow {
+                EvalVarTarget::EvalLocal
+            } else {
+                EvalVarTarget::Global
+            }
         });
         let mut bindings = inherited
             .map(|ctx| ctx.bindings.clone())
@@ -187,7 +196,7 @@ impl Interp<'_> {
         }
         EvalCallerContext {
             local_env,
-            eval_local_owner,
+            var_target,
             this,
             env,
             new_target,
@@ -221,10 +230,27 @@ impl Interp<'_> {
             .map(|metadata| metadata.var_declared_names.clone())
             .unwrap_or_default();
         let caller_base = self.frames.last().map(|frame| frame.base);
-        let local_env = if context.eval_local_owner {
-            Some(home_env)
-        } else {
-            context.local_env
+        let local_env = match context.var_target {
+            EvalVarTarget::Global => None,
+            EvalVarTarget::EvalLocal => Some(home_env),
+            EvalVarTarget::CallerFunction => {
+                if context.local_env.is_some() {
+                    context.local_env
+                } else {
+                    // A direct eval call from an ordinary function is a
+                    // declaration-instantiation boundary. Ensure that even a
+                    // function without a pre-existing environment gets a
+                    // durable caller-local environment.
+                    let env = self.heap.alloc(JsObject::environment(0, None));
+                    self.heap.add_root(JsValue::object(env));
+                    let env_display = self.env_display_for(Some(env));
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.env = Some(env);
+                        frame.env_display = env_display;
+                    }
+                    Some(env)
+                }
+            }
         };
         if let Some(local_env) = local_env {
             for name in var_names {
@@ -272,7 +298,9 @@ impl Interp<'_> {
             self.eval_contexts
                 .insert(local_env.index() as usize, context.clone());
         }
-        if let Some(caller_base) = caller_base {
+        if context.var_target == EvalVarTarget::EvalLocal
+            && let Some(caller_base) = caller_base
+        {
             self.eval_frame_contexts
                 .insert(caller_base, context.clone());
         }

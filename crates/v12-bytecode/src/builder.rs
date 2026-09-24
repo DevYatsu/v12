@@ -46,6 +46,7 @@ pub struct FunctionBuilder {
     pub is_generator: bool,
     pub is_async: bool,
     pub is_arrow: bool,
+    pub is_top_level: bool,
 }
 
 impl FunctionBuilder {
@@ -174,6 +175,7 @@ impl FunctionBuilder {
             is_generator: self.is_generator,
             is_async: self.is_async,
             is_arrow: self.is_arrow,
+            is_top_level: self.is_top_level,
             eval_metadata: None,
         }
     }

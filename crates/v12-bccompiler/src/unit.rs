@@ -165,25 +165,28 @@ pub fn compile_unit(
     // `FnCtx` borrows `comp`) and the slots are declared `undefined` in the
     // main unit's prologue. Keeps reads of declared-but-unassigned globals
     // `undefined` now that missing global reads throw `ReferenceError`.
-    let global_var_init_ids: Vec<u32> =
-        if idx == 0 && !comp.plans.is_module && !comp.is_eval_payload {
-            let mut ids = Vec::new();
-            for sym in comp.plans.units[idx].decl_order.clone() {
-                if comp.plans.units[idx].vars.get(&sym) != Some(&VarLoc::Global) {
-                    continue;
-                }
-                let name = comp.scoping.symbol_name(sym).to_string();
-                if v12_bytecode::GLOBAL_INTRINSICS.contains(&name.as_str()) {
-                    continue;
-                }
-                ids.push(crate::model::str_id_of(comp.strings.get_or_intern(&name)));
+    let global_var_init_ids: Vec<u32> = if idx == 0
+        && !comp.plans.is_module
+        && (comp.eval_var_target == v12_bytecode::EvalVarTarget::Global || !comp.is_eval_payload)
+    {
+        let mut ids = Vec::new();
+        for sym in comp.plans.units[idx].decl_order.clone() {
+            if comp.plans.units[idx].vars.get(&sym) != Some(&VarLoc::Global) {
+                continue;
             }
-            ids
-        } else {
-            Vec::new()
-        };
+            let name = comp.scoping.symbol_name(sym).to_string();
+            if v12_bytecode::GLOBAL_INTRINSICS.contains(&name.as_str()) {
+                continue;
+            }
+            ids.push(crate::model::str_id_of(comp.strings.get_or_intern(&name)));
+        }
+        ids
+    } else {
+        Vec::new()
+    };
 
     let mut cx = FnCtx::new(comp, idx);
+    cx.b.is_top_level = idx == 0;
     // Flag generator/async on the underlying FunctionBuilder before emission.
     match &node {
         UnitNode::Fn(f) => {
