@@ -1569,6 +1569,8 @@ mod tests {
             dictionary: None,
             dict_seq: 0,
             arguments_mapped: None,
+            arguments_callee: None,
+            arguments_strict: false,
         }
     }
 
