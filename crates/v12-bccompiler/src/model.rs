@@ -257,6 +257,14 @@ pub struct UnitPlan {
     pub eval_reachable: bool,
     /// Runtime binding descriptors emitted with the function bytecode.
     pub binding_descriptors: Vec<(String, VarLoc)>,
+    /// Formal parameter names in this unit.
+    pub parameter_names: HashSet<String>,
+    /// Function-scoped `var` names in this unit.
+    pub var_names: HashSet<String>,
+    /// Lexical names in this unit.
+    pub lexical_names: HashSet<String>,
+    /// Whether this ordinary function has an implicit arguments binding.
+    pub implicit_arguments: bool,
 }
 
 impl UnitPlan {
@@ -287,6 +295,10 @@ impl UnitPlan {
             direct_eval_sites: Vec::new(),
             eval_reachable: false,
             binding_descriptors: Vec::new(),
+            parameter_names: HashSet::new(),
+            var_names: HashSet::new(),
+            lexical_names: HashSet::new(),
+            implicit_arguments: false,
         }
     }
 }

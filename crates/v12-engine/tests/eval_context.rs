@@ -37,6 +37,35 @@ fn direct_eval_mutates_caller_register_and_reads_lexical_binding() {
 }
 
 #[test]
+fn direct_eval_argument_early_errors_suppress_side_effects() {
+    for source in [
+        "function f(a) { eval(\"marker = 1; var arguments = 'param'\"); } f(1)",
+        "function f() { let arguments; eval(\"marker = 1; var arguments = 'lexical'\"); } f()",
+        "function f() { var arguments; eval(\"marker = 1; var arguments = 'var'\"); } f()",
+    ] {
+        let value = result(&format!(
+            "try {{ {source} }} catch (e) {{ e.name + ':' + typeof marker }}"
+        ));
+        assert_eq!(value, "SyntaxError:undefined");
+    }
+}
+
+#[test]
+fn direct_eval_keeps_legal_argument_and_eval_bindings() {
+    assert_eq!(result("((a = 1) => eval(\"var arguments; 1\"))()"), "1");
+    assert_eq!(
+        result("function f() { eval(\"var eval = 1\"); return eval; } f()"),
+        "1"
+    );
+    assert_eq!(
+        result(
+            "function f() { 'use strict'; try { eval(\"var eval = 1\"); } catch (e) { return e.name; } } f()"
+        ),
+        "SyntaxError"
+    );
+}
+
+#[test]
 fn direct_eval_closure_survives_caller_return() {
     assert_eq!(
         result(

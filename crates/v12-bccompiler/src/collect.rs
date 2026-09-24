@@ -27,6 +27,7 @@ use oxc_ast::ast::{
 };
 use oxc_semantic::{Scoping, SymbolId};
 use oxc_span::GetSpan;
+use v12_bytecode::EvalCallerFacts;
 
 use crate::model::{
     CompileError, ExportEntry, ImportEntry, MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan,
@@ -39,7 +40,16 @@ pub fn collect(
     scoping: &Scoping,
     is_strict: bool,
 ) -> Result<Plans, CompileError> {
-    collect_inner(program, scoping, is_strict, false)
+    collect_inner(program, scoping, is_strict, false, None)
+}
+
+pub fn collect_with_eval_facts(
+    program: &Program<'_>,
+    scoping: &Scoping,
+    is_strict: bool,
+    facts: &EvalCallerFacts,
+) -> Result<Plans, CompileError> {
+    collect_inner(program, scoping, is_strict, false, Some(facts))
 }
 
 /// Module-mode collection: top-level `var` stays module-scoped.
@@ -48,7 +58,7 @@ pub fn collect_module(
     scoping: &Scoping,
     is_strict: bool,
 ) -> Result<Plans, CompileError> {
-    collect_inner(program, scoping, is_strict, true)
+    collect_inner(program, scoping, is_strict, true, None)
 }
 
 fn collect_inner(
@@ -56,6 +66,7 @@ fn collect_inner(
     scoping: &Scoping,
     is_strict: bool,
     is_module: bool,
+    eval_caller_facts: Option<&EvalCallerFacts>,
 ) -> Result<Plans, CompileError> {
     let mut c = Collector {
         scoping,
@@ -107,6 +118,16 @@ fn collect_inner(
                 });
             }
         }
+    }
+    if !is_strict
+        && let Some(facts) = eval_caller_facts
+        && plans.units[0].var_names.contains("arguments")
+        && facts.bindings.iter().any(|(name, _)| name == "arguments")
+    {
+        return Err(CompileError {
+            message: "SyntaxError: 'arguments' is not a valid var binding in direct eval".into(),
+            span: None,
+        });
     }
     finalize(&mut plans)?;
     Ok(plans)
@@ -479,6 +500,7 @@ impl<'s> Collector<'s> {
         self.check_use_strict_with_non_simple_params(&f.params, own_strict, f.span());
         let mut plan = UnitPlan::new(Some(parent), false, name_hint);
         plan.is_strict = is_strict;
+        plan.implicit_arguments = true;
         plan.allows_super = allows_super;
         // A named function's `name` own property (installed at closure alloc):
         // without this the name is unobservable (`f.name === undefined`).
@@ -637,11 +659,22 @@ impl<'s> Collector<'s> {
             Statement::ForInStatement(f) => {
                 // `for (const k in obj)`: declare the left binding pattern
                 // (the loop variable), then walk the right and body.
+                let unit = self.cur_unit();
                 match &f.left {
                     oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
                         let is_const =
                             matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+                        let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
                         for d in &v.declarations {
+                            if is_var {
+                                self.plans.units[unit]
+                                    .var_names
+                                    .extend(binding_names(&d.id));
+                            } else {
+                                self.plans.units[unit]
+                                    .lexical_names
+                                    .extend(binding_names(&d.id));
+                            }
                             if is_const && let Some(sym) = binding_symbol(&d.id) {
                                 self.plans.const_bindings.insert(sym);
                             }
@@ -663,11 +696,22 @@ impl<'s> Collector<'s> {
                 // `for (const x of iterable)`: the left binding pattern is a
                 // fresh per-iteration binding — declare it in the current
                 // unit so `access()` resolves a real register, not r0.
+                let unit = self.cur_unit();
                 match &f.left {
                     oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
                         let is_const =
                             matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+                        let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
                         for d in &v.declarations {
+                            if is_var {
+                                self.plans.units[unit]
+                                    .var_names
+                                    .extend(binding_names(&d.id));
+                            } else {
+                                self.plans.units[unit]
+                                    .lexical_names
+                                    .extend(binding_names(&d.id));
+                            }
                             if is_const && let Some(sym) = binding_symbol(&d.id) {
                                 self.plans.const_bindings.insert(sym);
                             }
@@ -694,7 +738,11 @@ impl<'s> Collector<'s> {
             Statement::TryStatement(t) => {
                 self.stmt_list(&t.block.body);
                 if let Some(h) = &t.handler {
+                    let unit = self.cur_unit();
                     if let Some(param) = &h.param {
+                        self.plans.units[unit]
+                            .lexical_names
+                            .extend(binding_names(&param.pattern));
                         self.binding_pattern(&param.pattern);
                     }
                     self.stmt_list(&h.body.body);
@@ -1226,10 +1274,19 @@ impl<'s> Collector<'s> {
 
     fn var_decl(&mut self, v: &VariableDeclaration<'_>) {
         let is_const = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
-        let is_var_at_top = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var)
-            && self.cur_unit() == 0
-            && !self.plans.is_module;
+        let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+        let is_var_at_top = is_var && self.cur_unit() == 0 && !self.plans.is_module;
+        let unit = self.cur_unit();
         for d in &v.declarations {
+            if is_var {
+                self.plans.units[unit]
+                    .var_names
+                    .extend(binding_names(&d.id));
+            } else {
+                self.plans.units[unit]
+                    .lexical_names
+                    .extend(binding_names(&d.id));
+            }
             if is_const {
                 if let Some(sym) = binding_symbol(&d.id) {
                     self.plans.const_bindings.insert(sym);
@@ -1370,6 +1427,16 @@ impl<'s> Collector<'s> {
         self.plans.units[idx].rest_ident = rest_ident;
         self.plans.units[idx].has_rest = params.rest.is_some();
         self.plans.units[idx].expected_args = expected_args(&params.items);
+        for p in &params.items {
+            self.plans.units[idx]
+                .parameter_names
+                .extend(binding_names(&p.pattern));
+        }
+        if let Some(rest) = &params.rest {
+            self.plans.units[idx]
+                .parameter_names
+                .extend(binding_names(&rest.rest.argument));
+        }
         self.walking_params = prev_params;
     }
 
@@ -1793,6 +1860,36 @@ fn binding_symbol(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<SymbolId> {
     match p {
         oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
         _ => None,
+    }
+}
+
+fn binding_names(pattern: &BindingPattern<'_>) -> Vec<String> {
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => vec![id.name.to_string()],
+        BindingPattern::ObjectPattern(object) => object
+            .properties
+            .iter()
+            .flat_map(|property| binding_names(&property.value))
+            .chain(
+                object
+                    .rest
+                    .iter()
+                    .flat_map(|rest| binding_names(&rest.argument)),
+            )
+            .collect(),
+        BindingPattern::ArrayPattern(array) => array
+            .elements
+            .iter()
+            .flatten()
+            .flat_map(binding_names)
+            .chain(
+                array
+                    .rest
+                    .iter()
+                    .flat_map(|rest| binding_names(&rest.argument)),
+            )
+            .collect(),
+        BindingPattern::AssignmentPattern(assignment) => binding_names(&assignment.left),
     }
 }
 

@@ -2,19 +2,11 @@
 //! empty registry.
 
 use v12_bytecode::FunctionBytecode;
+pub use v12_bytecode::{EvalBindingKind, EvalCallerFacts, EvalCompileFacts};
 use v12_heap::{Heap, JsValue};
 
 use crate::id::NativeId;
 use crate::throw::Throw;
-
-/// Caller binding facts supplied to the compile-only direct-eval seam.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EvalCompileFacts {
-    pub direct: bool,
-    pub strict: bool,
-    pub non_simple_parameters: bool,
-    pub bindings: Vec<(String, v12_bytecode::BindingLocation)>,
-}
 
 /// A compiled eval program. The registry only compiles; the interpreter owns
 /// registration and frame execution.

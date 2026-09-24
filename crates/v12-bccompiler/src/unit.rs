@@ -399,8 +399,39 @@ pub fn compile_unit(
                     (name.clone(), location)
                 })
                 .collect();
+            let mut caller_facts = v12_bytecode::EvalCallerFacts {
+                strict: plan.is_strict,
+                arguments_object_needed: plan.needs_arguments,
+                bindings: Vec::new(),
+            };
+            for (name, _) in &plan.binding_descriptors {
+                let kind = if plan.lexical_names.contains(name) {
+                    v12_bytecode::EvalBindingKind::Lexical
+                } else if plan.parameter_names.contains(name) {
+                    v12_bytecode::EvalBindingKind::Parameter
+                } else if plan.var_names.contains(name) {
+                    v12_bytecode::EvalBindingKind::Var
+                } else {
+                    v12_bytecode::EvalBindingKind::Var
+                };
+                if !caller_facts.bindings.iter().any(|(old, _)| old == name) {
+                    caller_facts.bindings.push((name.clone(), kind));
+                }
+            }
+            if plan.implicit_arguments
+                && !caller_facts
+                    .bindings
+                    .iter()
+                    .any(|(name, _)| name == "arguments")
+            {
+                caller_facts.bindings.push((
+                    "arguments".to_string(),
+                    v12_bytecode::EvalBindingKind::ImplicitArguments,
+                ));
+            }
             Some(v12_bytecode::EvalFunctionMetadata {
                 bindings,
+                caller_facts,
                 direct_eval_sites: plan.direct_eval_sites.clone(),
                 eval_reachable: plan.eval_reachable,
             })

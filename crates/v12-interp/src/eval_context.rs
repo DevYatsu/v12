@@ -1,6 +1,6 @@
 //! Direct-eval caller context and child-frame execution.
 
-use v12_bytecode::BindingLocation;
+use v12_bytecode::{BindingLocation, EvalBindingKind, EvalCallerFacts};
 use v12_heap::{Handle, JsObject, JsValue};
 use v12_native::{CompiledEval, EvalCompileFacts};
 
@@ -21,29 +21,16 @@ pub(crate) struct EvalCallerContext {
     pub new_target: Option<JsValue>,
     pub arguments: Option<EvalBindingRef>,
     pub strict: bool,
+    pub caller: EvalCallerFacts,
     pub bindings: Vec<(String, EvalBindingRef)>,
 }
 
 impl EvalCallerContext {
     pub(crate) fn compile_facts(&self) -> EvalCompileFacts {
-        let bindings = self
-            .bindings
-            .iter()
-            .filter_map(|(name, location)| {
-                let location = match location {
-                    EvalBindingRef::Register { reg, .. } => BindingLocation::Register(*reg),
-                    EvalBindingRef::Env { slot, .. } => BindingLocation::Env(*slot),
-                    EvalBindingRef::Global => BindingLocation::Global,
-                    EvalBindingRef::Arguments { .. } => BindingLocation::Global,
-                };
-                Some((name.clone(), location))
-            })
-            .collect();
         EvalCompileFacts {
             direct: true,
             strict: self.strict,
-            non_simple_parameters: false,
-            bindings,
+            caller: self.caller.clone(),
         }
     }
 }
@@ -51,14 +38,11 @@ impl EvalCallerContext {
 impl Interp<'_> {
     pub(crate) fn capture_eval_context(&mut self) -> EvalCallerContext {
         let frame_idx = self.frames.len().saturating_sub(1);
-        let (this, env, new_target, strict, own_bindings) = {
+        let (this, env, new_target, strict, own_bindings, own_caller, is_arrow) = {
             let frame = &self.frames[frame_idx];
             let funcs = self.functions_for_program(frame.program);
             let function = funcs.get(frame.fn_idx as usize);
-            let bindings = function
-                .and_then(|f| f.eval_metadata.as_ref())
-                .map(|m| m.bindings.clone())
-                .unwrap_or_default();
+            let metadata = function.and_then(|f| f.eval_metadata.as_ref());
             (
                 self.stack
                     .get(frame.base)
@@ -67,7 +51,9 @@ impl Interp<'_> {
                 frame.env,
                 frame.new_target,
                 function.is_some_and(|f| f.is_strict),
-                bindings,
+                metadata.map(|m| m.bindings.clone()).unwrap_or_default(),
+                metadata.map(|m| m.caller_facts.clone()).unwrap_or_default(),
+                function.is_some_and(|f| f.is_arrow),
             )
         };
         let owner = self
@@ -82,20 +68,80 @@ impl Interp<'_> {
             })
             .map(|(idx, _)| idx)
             .unwrap_or(frame_idx);
-        let mut bindings = self
+        let inherited = self
             .frames
             .get(frame_idx)
             .and_then(|f| f.env)
-            .and_then(|env| self.eval_contexts.get(&(env.index() as usize)))
+            .and_then(|env| self.eval_contexts.get(&(env.index() as usize)));
+        let mut bindings = inherited
             .map(|ctx| ctx.bindings.clone())
             .unwrap_or_default();
+        let mut caller =
+            inherited
+                .map(|ctx| ctx.caller.clone())
+                .unwrap_or_else(|| EvalCallerFacts {
+                    strict,
+                    ..EvalCallerFacts::default()
+                });
+        if !is_arrow {
+            caller.arguments_object_needed |= own_caller.arguments_object_needed;
+            if own_caller.bindings.iter().any(|(name, kind)| {
+                name == "arguments" && *kind == EvalBindingKind::ImplicitArguments
+            }) {
+                caller.bindings.retain(|(name, _)| name != "arguments");
+                caller
+                    .bindings
+                    .push(("arguments".to_string(), EvalBindingKind::ImplicitArguments));
+            }
+        }
+
+        // Arrows inherit the nearest ordinary owner's facts, not their own
+        // parameter list's implicit arguments binding.  Keep lexical this/env
+        // storage from the current frame while resolving the owner's values.
+        if is_arrow {
+            let owner_frame = &self.frames[owner];
+            let owner_funcs = self.functions_for_program(owner_frame.program);
+            let owner_metadata = owner_funcs
+                .get(owner_frame.fn_idx as usize)
+                .and_then(|f| f.eval_metadata.as_ref());
+            if let Some(metadata) = owner_metadata {
+                for (name, kind) in &metadata.caller_facts.bindings {
+                    let reference = metadata
+                        .bindings
+                        .iter()
+                        .find(|(binding_name, _)| binding_name == name)
+                        .map(|(_, location)| match location {
+                            BindingLocation::Register(reg) => EvalBindingRef::Register {
+                                base: owner_frame.base,
+                                reg: *reg,
+                            },
+                            BindingLocation::Env(slot) => EvalBindingRef::Env {
+                                env: owner_frame.env.expect("owner env binding has environment"),
+                                slot: *slot,
+                            },
+                            BindingLocation::Global => EvalBindingRef::Global,
+                        })
+                        .unwrap_or_else(|| EvalBindingRef::Arguments { frame: owner });
+                    bindings.retain(|(old, _)| old != name);
+                    bindings.push((name.clone(), reference));
+                    caller.bindings.retain(|(old, _)| old != name);
+                    caller.bindings.push((name.clone(), *kind));
+                }
+                caller.strict = metadata.caller_facts.strict;
+                caller.arguments_object_needed |= metadata.caller_facts.arguments_object_needed;
+            }
+        }
+
         for (name, location) in own_bindings {
-            // In sloppy direct eval, a `var` declaration belongs to the
-            // inherited variable environment when that environment already
-            // has the name.  Do not let the eval unit's global descriptor
-            // replace the caller's binding in a nested eval.  Lexical
-            // Register/Env locations still shadow, and strict eval keeps the
-            // normal global binding behavior.
+            let kind = own_caller
+                .bindings
+                .iter()
+                .find(|(old, _)| old == &name)
+                .map(|(_, kind)| *kind)
+                .unwrap_or(EvalBindingKind::Var);
+            // In sloppy nested eval, `var` metadata is global in the eval
+            // unit, but an inherited caller binding remains the variable
+            // environment target.  Lexical locations still shadow it.
             if !strict
                 && matches!(location, BindingLocation::Global)
                 && bindings.iter().any(|(old, _)| old == &name)
@@ -114,18 +160,27 @@ impl Interp<'_> {
                 BindingLocation::Global => EvalBindingRef::Global,
             };
             bindings.retain(|(old, _)| old != &name);
-            bindings.push((name, reference));
+            bindings.push((name.clone(), reference));
+            caller.bindings.retain(|(old, _)| old != &name);
+            caller.bindings.push((name, kind));
         }
+
         let arguments = EvalBindingRef::Arguments { frame: owner };
-        if !bindings.iter().any(|(name, _)| name == "arguments") {
+        if !bindings.iter().any(|(name, _)| name == "arguments")
+            && caller.bindings.iter().any(|(name, kind)| {
+                name == "arguments" && *kind == EvalBindingKind::ImplicitArguments
+            })
+        {
             bindings.push(("arguments".to_string(), arguments.clone()));
         }
+        caller.strict = strict;
         EvalCallerContext {
             this,
             env,
             new_target,
             arguments: Some(arguments),
             strict,
+            caller,
             bindings,
         }
     }

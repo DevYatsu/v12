@@ -158,11 +158,37 @@ pub enum BindingLocation {
     Global,
 }
 
+/// The declaration kind of a binding visible to a direct-eval caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalBindingKind {
+    Parameter,
+    Var,
+    Lexical,
+    ImplicitArguments,
+}
+
+/// Actual binding facts captured from the nearest non-arrow eval caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvalCallerFacts {
+    pub strict: bool,
+    pub arguments_object_needed: bool,
+    pub bindings: Vec<(String, EvalBindingKind)>,
+}
+
+/// Facts passed through the compile-only direct-eval seam.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvalCompileFacts {
+    pub direct: bool,
+    pub strict: bool,
+    pub caller: EvalCallerFacts,
+}
+
 /// Metadata used by the interpreter to route syntactic direct-eval calls
 /// and the bindings visible to their child program.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EvalFunctionMetadata {
     pub bindings: Vec<(String, BindingLocation)>,
+    pub caller_facts: EvalCallerFacts,
     pub direct_eval_sites: Vec<u32>,
     pub eval_reachable: bool,
 }

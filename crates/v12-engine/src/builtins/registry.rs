@@ -252,13 +252,9 @@ impl v12_native::NativeRegistry for NativeRegistry {
         facts: &EvalCompileFacts,
     ) -> Result<CompiledEval, Throw> {
         let mut interner = v12_bccompiler::Interner::default();
-        let program = v12_bccompiler::compile_eval_source_with_interner_facts(
-            source,
-            &mut interner,
-            facts.direct,
-            facts.strict,
-        )
-        .map_err(|err| Throw::Value(syntax_error_value(heap, global, &err.message)))?;
+        let program =
+            v12_bccompiler::compile_eval_source_with_interner_facts(source, &mut interner, facts)
+                .map_err(|err| Throw::Value(syntax_error_value(heap, global, &err.message)))?;
         let strings: Vec<String> = v12_bccompiler::freeze_interner(interner)
             .iter()
             .map(|(_, s)| s.to_string())

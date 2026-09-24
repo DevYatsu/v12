@@ -1,4 +1,6 @@
-use v12_bccompiler::{Interner, compile_eval_source_with_interner_facts, compile_source};
+use v12_bccompiler::{
+    EvalCompileFacts, Interner, compile_eval_source_with_interner_facts, compile_source,
+};
 
 #[test]
 fn direct_eval_call_site_is_marked_without_new_opcode() {
@@ -58,8 +60,11 @@ fn eval_source_directive_wins_over_false_caller_strictness() {
     let program = compile_eval_source_with_interner_facts(
         "'use strict'; missing = 1",
         &mut interner,
-        true,
-        false,
+        &EvalCompileFacts {
+            direct: true,
+            strict: false,
+            ..EvalCompileFacts::default()
+        },
     )
     .unwrap();
     assert!(program.functions[program.main as usize].is_strict);

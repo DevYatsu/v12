@@ -27,7 +27,8 @@ pub use convert::DecodeError;
 pub use id::{NativeId, UnknownNativeId};
 pub use methods::lookup_method;
 pub use registry::{
-    CompiledEval, EmptyNativeRegistry, EvalCompileFacts, NativeRegistry, ProgramTable,
+    CompiledEval, EmptyNativeRegistry, EvalBindingKind, EvalCallerFacts, EvalCompileFacts,
+    NativeRegistry, ProgramTable,
 };
 pub use throw::{Throw, error_object, parse_error_text};
 

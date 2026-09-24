@@ -91,7 +91,7 @@ pub use model::{
 /// facade can run pre-compiled programs without depending on the front-end.
 /// The compiler still owns the act of producing a `Program` from source; the
 /// re-export keeps the public surface of `v12-bccompiler` stable.
-pub use v12_bytecode::Program;
+pub use v12_bytecode::{EvalBindingKind, EvalCallerFacts, EvalCompileFacts, Program};
 
 /// Compiled ES module: bytecode plus linkage metadata.
 ///
@@ -152,7 +152,7 @@ pub fn compile_source_with_interner(
     src: &str,
     interner: &mut Interner,
 ) -> Result<Program, CompileError> {
-    compile_script_with_interner(src, interner, false, None)
+    compile_script_with_interner(src, interner, false, None, None)
 }
 
 /// Compiles direct-eval payload (the [`v12_native::NativeRegistry::eval`]
@@ -168,7 +168,7 @@ pub fn compile_eval_source_with_interner(
     src: &str,
     interner: &mut Interner,
 ) -> Result<Program, CompileError> {
-    compile_script_with_interner(src, interner, true, None)
+    compile_script_with_interner(src, interner, true, None, None)
 }
 
 /// Compiles an eval payload with the caller's effective strictness. The
@@ -177,10 +177,15 @@ pub fn compile_eval_source_with_interner(
 pub fn compile_eval_source_with_interner_facts(
     src: &str,
     interner: &mut Interner,
-    direct: bool,
-    strict: bool,
+    facts: &EvalCompileFacts,
 ) -> Result<Program, CompileError> {
-    compile_script_with_interner(src, interner, direct, Some(strict))
+    compile_script_with_interner(
+        src,
+        interner,
+        facts.direct,
+        Some(facts.strict),
+        Some(&facts.caller),
+    )
 }
 
 fn compile_script_with_interner(
@@ -188,6 +193,7 @@ fn compile_script_with_interner(
     interner: &mut Interner,
     eval_leniency: bool,
     strict_override: Option<bool>,
+    eval_caller_facts: Option<&EvalCallerFacts>,
 ) -> Result<Program, CompileError> {
     // Cheap pre-check: module syntax is a strict superset of script syntax
     // for this subset, and `SourceType::script()` panics on `import` rather
@@ -254,6 +260,7 @@ fn compile_script_with_interner(
         interner,
         Some(effective_strict),
         eval_leniency,
+        eval_caller_facts,
     )?;
     // `collect` records imports/exports even for scripts; scripts must reject
     // them explicitly rather than silently ignoring (via
@@ -438,7 +445,14 @@ pub fn compile_ast(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> Result<Program, CompileError> {
-    compile_ast_inner(program, scoping, &mut Interner::default(), None, false)
+    compile_ast_inner(
+        program,
+        scoping,
+        &mut Interner::default(),
+        None,
+        false,
+        None,
+    )
 }
 
 fn compile_ast_inner(
@@ -447,9 +461,13 @@ fn compile_ast_inner(
     interner: &mut Interner,
     strict_override: Option<bool>,
     emit_eval_metadata: bool,
+    eval_caller_facts: Option<&EvalCallerFacts>,
 ) -> Result<Program, CompileError> {
     let strict = strict_override.unwrap_or_else(|| has_use_strict(program));
-    let plans = collect::collect(program, scoping, strict)?;
+    let plans = match eval_caller_facts {
+        Some(facts) => collect::collect_with_eval_facts(program, scoping, strict, facts)?,
+        None => collect::collect(program, scoping, strict)?,
+    };
     // Scripts must not carry module linkage.
     if !plans.imports.is_empty() {
         let span = plans.imports.first().and_then(|e| e.span);
