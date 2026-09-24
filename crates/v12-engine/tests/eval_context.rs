@@ -51,6 +51,13 @@ fn direct_eval_argument_early_errors_suppress_side_effects() {
 }
 
 #[test]
+fn nested_arrow_rejects_var_arguments_from_non_simple_owner() {
+    let value =
+        result("function outer(a = 1) { return (() => eval(\"var arguments; 1\"))(); } outer()");
+    assert!(value.starts_with("threw: SyntaxError"), "{value}");
+}
+
+#[test]
 fn direct_eval_keeps_legal_argument_and_eval_bindings() {
     assert_eq!(result("((a = 1) => eval(\"var arguments; 1\"))()"), "1");
     assert_eq!(

@@ -129,6 +129,53 @@ fn arrow_parameter_site_excludes_body_arguments_binding() {
 }
 
 #[test]
+fn nested_arrow_inherits_non_simple_owner_arguments_fact() {
+    let program =
+        compile_source("function outer(a = 1) { return (() => eval(\"var arguments; 1\"))(); }")
+            .unwrap();
+    let site = program
+        .functions
+        .iter()
+        .flat_map(|f| f.eval_metadata.iter().flat_map(|m| &m.direct_eval_sites))
+        .next()
+        .unwrap();
+    assert!(site.caller.arguments_object_needed);
+    assert!(
+        site.caller
+            .bindings
+            .iter()
+            .any(|(name, kind)| name == "arguments" && *kind == EvalBindingKind::ImplicitArguments)
+    );
+}
+
+#[test]
+fn explicit_arrow_arguments_binding_wins_over_owner_implicit_fact() {
+    let program = compile_source(
+        "function outer(a = 1) { return (arguments => eval(\"var arguments; 1\"))(1); }",
+    )
+    .unwrap();
+    let site = program
+        .functions
+        .iter()
+        .flat_map(|f| f.eval_metadata.iter().flat_map(|m| &m.direct_eval_sites))
+        .next()
+        .unwrap();
+    assert!(
+        site.caller
+            .bindings
+            .iter()
+            .any(|(name, kind)| name == "arguments" && *kind == EvalBindingKind::Parameter)
+    );
+    assert!(
+        !site
+            .caller
+            .bindings
+            .iter()
+            .any(|(name, kind)| name == "arguments" && *kind == EvalBindingKind::ImplicitArguments)
+    );
+}
+
+#[test]
 fn arrow_body_site_sees_body_arguments_binding() {
     let program =
         compile_source("const f = () => { let arguments; return eval(\"var arguments\"); };")

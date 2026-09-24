@@ -1899,19 +1899,19 @@ fn resolve_eval_sites(plans: &mut Plans, scoping: &Scoping, nodes: Option<&AstNo
         return;
     };
     for unit_index in 0..plans.units.len() {
-        let (strict, implicit_arguments, non_simple, needs_arguments) = {
-            let unit = &plans.units[unit_index];
-            (
-                unit.is_strict,
-                unit.implicit_arguments,
-                unit.has_non_simple_parameters,
-                unit.needs_arguments,
-            )
-        };
+        let strict = plans.units[unit_index].is_strict;
         let mut owner_index = unit_index;
         while plans.units[owner_index].is_arrow {
             owner_index = plans.units[owner_index].parent.expect("arrow has owner");
         }
+        let (owner_implicit_arguments, owner_non_simple, owner_needs_arguments) = {
+            let owner = &plans.units[owner_index];
+            (
+                owner.implicit_arguments,
+                owner.has_non_simple_parameters,
+                owner.needs_arguments,
+            )
+        };
         for site_index in 0..plans.units[unit_index].direct_eval_sites.len() {
             let span = plans.units[unit_index].direct_eval_sites[site_index].span;
             let Some(node) = nodes.iter().find(
@@ -1959,8 +1959,8 @@ fn resolve_eval_sites(plans: &mut Plans, scoping: &Scoping, nodes: Option<&AstNo
             }
             let owner_strict = plans.units[owner_index].is_strict;
             let implicit = owner_index != 0
-                && implicit_arguments
-                && (non_simple || needs_arguments)
+                && owner_implicit_arguments
+                && (owner_non_simple || owner_needs_arguments)
                 && !plans.units[unit_index].direct_eval_sites[site_index]
                     .caller
                     .bindings

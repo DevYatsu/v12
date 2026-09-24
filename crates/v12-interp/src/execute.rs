@@ -594,7 +594,11 @@ impl Interp<'_> {
                             .eval_metadata
                             .as_ref()
                             .is_some_and(|m| {
-                                m.direct_eval_sites.iter().any(|site| site.pc == pc as u32)
+                                m.direct_eval_sites.iter().any(|site| {
+                                    site.pc == pc as u32
+                                        || site.pc + 1 == pc as u32
+                                        || site.pc + 2 == pc as u32
+                                })
                             });
                     match attempt!(self.prepare_call(
                         base,

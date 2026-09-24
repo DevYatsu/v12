@@ -43,8 +43,11 @@ impl Interp<'_> {
             let funcs = self.functions_for_program(frame.program);
             let function = funcs.get(frame.fn_idx as usize);
             let metadata = function.and_then(|f| f.eval_metadata.as_ref());
-            let site =
-                metadata.and_then(|m| m.direct_eval_sites.iter().find(|site| site.pc == call_pc));
+            let site = metadata.and_then(|m| {
+                m.direct_eval_sites.iter().find(|site| {
+                    site.pc == call_pc || site.pc + 1 == call_pc || site.pc + 2 == call_pc
+                })
+            });
             (
                 self.stack
                     .get(frame.base)
