@@ -85,11 +85,12 @@ impl Interp<'_> {
             .unwrap_or(false);
         let local_env = self.frames.get(owner).and_then(|frame| frame.env);
         let eval_local_owner = is_arrow && !owner_is_ordinary;
-        let inherited = self
-            .frames
-            .get(frame_idx)
-            .and_then(|f| f.env)
-            .and_then(|env| self.eval_contexts.get(&(env.index() as usize)));
+        let inherited = self.frames.get(frame_idx).and_then(|frame| {
+            frame
+                .env
+                .and_then(|env| self.eval_contexts.get(&(env.index() as usize)))
+                .or_else(|| self.eval_frame_contexts.get(&frame.base))
+        });
         let mut bindings = inherited
             .map(|ctx| ctx.bindings.clone())
             .unwrap_or_default();
@@ -268,7 +269,8 @@ impl Interp<'_> {
                 .insert(local_env.index() as usize, context.clone());
         }
         if let Some(caller_base) = caller_base {
-            self.eval_contexts.insert(caller_base, context.clone());
+            self.eval_frame_contexts
+                .insert(caller_base, context.clone());
         }
         let saved_program = self.program_id;
         self.program_id = program_id;
@@ -286,7 +288,7 @@ impl Interp<'_> {
         let context = frame
             .env
             .and_then(|env| self.eval_contexts.get(&(env.index() as usize)))
-            .or_else(|| self.eval_contexts.get(&frame.base))?;
+            .or_else(|| self.eval_frame_contexts.get(&frame.base))?;
         context
             .bindings
             .iter()

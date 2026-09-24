@@ -298,6 +298,18 @@ impl Interp<'_> {
                             // slot count matters here, matching the narrow op.
                             self.gc_protect();
                             let parent = self.frames.last().expect("frame").env;
+                            let parent_context = self
+                                .frames
+                                .last()
+                                .and_then(|frame| {
+                                    frame
+                                        .env
+                                        .and_then(|env| {
+                                            self.eval_contexts.get(&(env.index() as usize))
+                                        })
+                                        .or_else(|| self.eval_frame_contexts.get(&frame.base))
+                                })
+                                .cloned();
                             let h = self
                                 .heap
                                 .alloc(JsObject::environment(usize::from(slots), parent));
@@ -306,10 +318,7 @@ impl Interp<'_> {
                             let frame = self.frames.last_mut().expect("frame");
                             env_display_push(&mut frame.env_display, h);
                             frame.env = Some(h);
-                            if let Some(parent) = parent
-                                && let Some(ctx) =
-                                    self.eval_contexts.get(&(parent.index() as usize)).cloned()
-                            {
+                            if let Some(ctx) = parent_context {
                                 self.eval_contexts.insert(h.index() as usize, ctx);
                             }
                         }
@@ -746,15 +755,22 @@ impl Interp<'_> {
                     // so aliased environments cannot collide with user global
                     // properties that occupy the same physical storage.
                     let parent = self.frames.last().expect("frame").env;
+                    let parent_context = self
+                        .frames
+                        .last()
+                        .and_then(|frame| {
+                            frame
+                                .env
+                                .and_then(|env| self.eval_contexts.get(&(env.index() as usize)))
+                                .or_else(|| self.eval_frame_contexts.get(&frame.base))
+                        })
+                        .cloned();
                     let h = self.heap.alloc(JsObject::environment(slots, parent));
                     // Display head-shift (O(1)), mirroring the wide op.
                     let frame = self.frames.last_mut().expect("frame");
                     env_display_push(&mut frame.env_display, h);
                     frame.env = Some(h);
-                    if let Some(parent) = parent
-                        && let Some(ctx) =
-                            self.eval_contexts.get(&(parent.index() as usize)).cloned()
-                    {
+                    if let Some(ctx) = parent_context {
                         self.eval_contexts.insert(h.index() as usize, ctx);
                     }
                     self.set_pc(pc + op_width);

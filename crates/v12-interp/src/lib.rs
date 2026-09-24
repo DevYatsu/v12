@@ -503,6 +503,7 @@ pub struct Interp<'a> {
     stack: Vec<JsValue>,
     frames: Vec<Frame>,
     eval_contexts: std::collections::HashMap<usize, eval_context::EvalCallerContext>,
+    eval_frame_contexts: std::collections::HashMap<usize, eval_context::EvalCallerContext>,
     call_args: std::collections::HashMap<usize, (usize, usize)>,
     /// When set, `execute` returns as soon as the frame count drops to this
     /// value (a re-entrant accessor call stops after its own frame, leaving
@@ -630,6 +631,7 @@ impl<'a> Interp<'a> {
             stack: Vec::with_capacity(INITIAL_STACK_CAPACITY),
             frames: Vec::new(),
             eval_contexts: std::collections::HashMap::new(),
+            eval_frame_contexts: std::collections::HashMap::new(),
             call_args: std::collections::HashMap::new(),
             stop_at_frames: None,
             resume_depth: 0,

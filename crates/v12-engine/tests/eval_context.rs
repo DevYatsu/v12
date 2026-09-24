@@ -84,6 +84,16 @@ fn eval_owned_vars_route_to_caller_or_eval_local_storage() {
 }
 
 #[test]
+fn nested_eval_contexts_keep_env_and_caller_bindings() {
+    assert_eq!(
+        result(
+            "function f() { let x = 1; var y = 2; return eval(\"var n = 3; eval('n = 4; n + x + y')\"); } f()"
+        ),
+        "7"
+    );
+}
+
+#[test]
 fn top_level_and_indirect_eval_keep_global_var_scope() {
     assert_eq!(
         result("eval(\"var topLevelProbe = 7\"); topLevelProbe"),
