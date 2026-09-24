@@ -26,7 +26,7 @@ use oxc_ast::ast::{
     ForStatementInit, FormalParameters, Function, ImportPhase, ModuleDeclaration, ModuleExportName,
     Program, PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
 };
-use oxc_semantic::{AstNodes, Scoping, SymbolId};
+use oxc_semantic::{AstNodes, ScopeId, Scoping, SymbolId};
 use oxc_span::GetSpan;
 use std::collections::HashSet;
 use v12_bytecode::{EvalBindingKind, EvalCallerFacts, EvalCompileFacts, EvalPhase};
@@ -2148,8 +2148,19 @@ fn ident_name_of_binding(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<String>
 fn resolve_block_functions(plans: &mut Plans, scoping: &Scoping) {
     for unit in &mut plans.units {
         let function_scope = unit.function_scope;
+        let block_pairs: Vec<(ScopeId, SymbolId)> = unit
+            .block_functions
+            .iter()
+            .map(|plan| (plan.declaration_scope, plan.symbol))
+            .collect();
         for plan in &mut unit.block_functions {
             let name = scoping.symbol_name(plan.symbol);
+            let nested_collision = block_pairs.iter().any(|(scope, symbol)| {
+                *symbol != plan.symbol
+                    && scoping.symbol_name(*symbol) == name
+                    && Some(*scope) != function_scope
+                    && scoping.scope_is_descendant_of(plan.declaration_scope, *scope)
+            });
             let function_binding =
                 function_scope.and_then(|scope| scoping.get_binding(scope, name.into()));
             let parameter_collision = (name == "arguments" && unit.implicit_arguments)
@@ -2169,7 +2180,7 @@ fn resolve_block_functions(plans: &mut Plans, scoping: &Scoping) {
             plan.var_symbol = function_binding.or(Some(plan.symbol));
             plan.skip = if parameter_collision {
                 BlockFunctionSkip::ParameterCollision
-            } else if declaration_collision || hoisted_without_var {
+            } else if declaration_collision || hoisted_without_var || nested_collision {
                 BlockFunctionSkip::LexicalCollision
             } else {
                 BlockFunctionSkip::Eligible

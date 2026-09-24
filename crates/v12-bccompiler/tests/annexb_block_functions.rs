@@ -125,6 +125,16 @@ fn annex_b_eval_reachable_block_binding_promotes_storage() {
     assert!(matches!(f.1, v12_bytecode::BindingLocation::Env(_)));
 }
 #[test]
+fn annex_b_nested_block_function_keeps_outer_binding() {
+    assert_eq!(
+        result(
+            "return function g() { { function f() { return 1; } { function f() { return 2; } } } return f(); }();"
+        ),
+        "1"
+    );
+}
+
+#[test]
 fn annex_b_parameter_collision_keeps_function_binding() {
     assert_eq!(
         value_to_string(&eval_src(
