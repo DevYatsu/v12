@@ -3,7 +3,7 @@
 //!
 //! ## Shape
 //!
-//! [`LoaderState`] is the module map: canonical path → namespace snapshot.
+//! [`LoaderState`] is the module map: canonical path → linked module record.
 //! It lives in an `Rc<RefCell<…>>` owned by the engine's
 //! [`NativeRegistry`](crate::builtins::NativeRegistry), so the `ModuleImport`
 //! native — dispatched from arbitrary interpreter contexts — and the
@@ -16,9 +16,9 @@
 //! post-order DFS, each dependency's main executes on the live interpreter
 //! via [`v12_interp::Interp::call_program_main`], which registers the module
 //! program in the cross-program table (exported functions stay callable from
-//! other programs). The compiled main returns its exports object (the
-//! compiler emits an epilogue building one), which becomes the namespace
-//! snapshot stored in the map. When the importing module's body later runs
+//! other programs). The compiled main runs with a loader-seeded environment;
+//! export values stay in GC-visible binding cells, and the namespace properties
+//! dereference those cells. When the importing module's body later runs
 //! its lowered `import(specifier)` native call, the loader resolves the
 //! specifier against the *current* referrer directory and answers from the
 //! map — synchronously, as static imports require.
@@ -30,18 +30,15 @@
 //! promise (prototype = `%Promise%.prototype` from the realm intrinsics) and
 //! enqueues a load job on the pending-job sink; the job evaluates the target
 //! module graph on the draining interpreter and settles the promise with the
-//! namespace snapshot (or the load/compile/evaluation error as the rejection
+//! linked namespace (or the load/compile/evaluation error as the rejection
 //! reason). Returning the promise synchronously matches ImportCall
 //! evaluation; resolution happens at the next checkpoint, so `.then`/`await`
 //! observe it through the normal microtask machinery.
 //!
 //! ## Known v1 gaps
 //!
-//! - Live bindings: namespace snapshots are taken after evaluation; a module
-//!   that mutates its exports later is not observed.
-//! - Cycles: a module re-entered while its graph is still loading yields an
-//!   empty placeholder namespace (no partially-initialized live bindings).
-//! - Re-exports (`export … from`) are skipped by the compiler epilogue.
+//! - Deferred reads do not trigger evaluation yet; the interpreter-owned
+//!   evaluator capability is Task 6B.
 //! - Specifier coercion uses basic ToString (no user `toString` hooks).
 
 use std::cell::RefCell;
@@ -49,7 +46,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use v12_heap::JsValue;
+use v12_bccompiler::{ModuleBindingPlan, ModuleBindingSource};
+use v12_heap::{Handle, JsObject, JsValue};
 use v12_interp::Interp;
 use v12_native::Throw;
 
@@ -57,6 +55,14 @@ use super::builtins::ctx::Ctx;
 use super::builtins::promise;
 use crate::engine::string_value;
 use crate::job_queue::{Job, JobCtx};
+
+#[derive(Clone)]
+pub(crate) struct LinkedModule {
+    pub namespace: JsValue,
+    pub env: Handle<JsObject>,
+    pub binding_plan: Rc<[ModuleBindingPlan]>,
+    pub evaluated: bool,
+}
 
 /// Shared module map + referrer tracking (see crate docs).
 #[derive(Default)]
@@ -68,8 +74,8 @@ pub(crate) struct LoaderState {
     /// native resolves static specifiers against this, so nested modules
     /// resolve their own imports relative to themselves.
     pub referrer: PathBuf,
-    /// Evaluated modules: canonical path → namespace snapshot.
-    pub modules: HashMap<PathBuf, JsValue>,
+    /// Linked/evaluated modules: canonical path → stable module record.
+    pub modules: HashMap<PathBuf, LinkedModule>,
     /// Deferred modules: canonical path → *linked-only* deferred namespace.
     ///
     /// `import defer * as ns from` links the dependency (compile + export
@@ -78,9 +84,10 @@ pub(crate) struct LoaderState {
     /// [`Self::modules`] stays reserved for evaluated modules so an eager
     /// import of the same path still evaluates rather than observing the
     /// placeholder.
-    pub deferred: HashMap<PathBuf, JsValue>,
+    pub deferred: HashMap<PathBuf, LinkedModule>,
     /// Canonical paths currently loading (cycle detection).
-    loading: HashSet<PathBuf>,
+    pub(crate) loading: HashSet<PathBuf>,
+    pub(crate) next_module_id: u32,
 }
 
 /// Lexically resolves `spec` against `base_dir`: join, then normalize `.`/`..`
@@ -141,12 +148,12 @@ pub(crate) fn handle_import(
     };
     let path = resolve_specifier(&dir, &spec_text);
     if !dynamic {
-        if let Some(ns) = state.borrow().modules.get(&path) {
-            return Ok(*ns);
+        if let Some(module) = state.borrow().modules.get(&path) {
+            return Ok(module.namespace);
         }
         // A `defer` dependency is linked into `deferred`, not `modules`.
-        if let Some(ns) = state.borrow().deferred.get(&path) {
-            return Ok(*ns);
+        if let Some(module) = state.borrow().deferred.get(&path) {
+            return Ok(module.namespace);
         }
         return Err(ctx.type_error(format!("Unlinked module import: '{spec_text}'")));
     }
@@ -229,8 +236,8 @@ fn gather_async_targets(
 }
 
 /// Links the module at `path` without evaluating it (the `import defer`
-/// contract): compiles it, allocates a namespace, seeds the statically-known
-/// export keys, and registers it in [`LoaderState::deferred`].
+/// contract): compiles it, allocates a namespace and binding cells, and
+/// registers it in [`LoaderState::deferred`].
 ///
 /// The deferred namespace deliberately lives in a separate map from
 /// [`LoaderState::modules`]: an eager import of the same path must still
@@ -245,20 +252,41 @@ pub(crate) fn load_deferred(
     state: &Loader,
     path: &Path,
 ) -> Result<JsValue, JsValue> {
-    if let Some(ns) = state.borrow().modules.get(path) {
-        return Ok(*ns);
+    if let Some(module) = state.borrow().modules.get(path) {
+        return Ok(module.namespace);
     }
-    if let Some(ns) = state.borrow().deferred.get(path) {
-        return Ok(*ns);
+    if let Some(module) = state.borrow().deferred.get(path) {
+        return Ok(module.namespace);
     }
     let (module, _strings) = read_and_compile(interp, path)?;
-    let namespace = super::module_namespace::alloc_namespace(interp.heap_mut());
-    let export_names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
-    super::module_namespace::seed_export_keys(interp.heap_mut(), namespace, &export_names);
+    let env_slots = module
+        .program
+        .functions
+        .get(module.program.main as usize)
+        .map_or(0, |f| f.env_slots);
+    let owner_module_id = {
+        let mut s = state.borrow_mut();
+        let id = s.next_module_id;
+        s.next_module_id += 1;
+        id
+    };
+    let (namespace, env) = super::module_namespace::alloc_linked_module(
+        interp.heap_mut(),
+        owner_module_id,
+        env_slots,
+        &module.binding_plan,
+    );
+    let namespace = JsValue::object(namespace);
+    let record = LinkedModule {
+        namespace,
+        env,
+        binding_plan: Rc::from(module.binding_plan.into_boxed_slice()),
+        evaluated: false,
+    };
     state
         .borrow_mut()
         .deferred
-        .insert(path.to_path_buf(), JsValue::object(namespace));
+        .insert(path.to_path_buf(), record);
     // Gather then evaluate the async transitive dependencies. Gathering must
     // complete before any of them evaluates: evaluating one may add its own
     // namespaces to `modules`, which would prune the walk.
@@ -270,10 +298,10 @@ pub(crate) fn load_deferred(
     }
     // An async deferred module was evaluated above; hand back its real
     // namespace so the importer observes populated exports immediately.
-    if let Some(ns) = state.borrow().modules.get(path) {
-        return Ok(*ns);
+    if let Some(module) = state.borrow().modules.get(path) {
+        return Ok(module.namespace);
     }
-    Ok(JsValue::object(namespace))
+    Ok(namespace)
 }
 
 /// Evaluates the module at `path` (loading its static dependency graph first,
@@ -288,18 +316,18 @@ pub(crate) fn load_and_evaluate(
     state: &Loader,
     path: &Path,
 ) -> Result<JsValue, JsValue> {
-    if let Some(ns) = state.borrow().modules.get(path) {
-        return Ok(*ns);
+    if let Some(module) = state.borrow().modules.get(path) {
+        if module.evaluated {
+            return Ok(module.namespace);
+        }
     }
     if state.borrow().loading.contains(path) {
-        // Cycle: the namespace was allocated and registered *before* this
-        // module's dependencies were evaluated (see below), so a cyclic or
-        // self importer resolves to that same object. A registered-but-empty
-        // namespace is the v1 snapshot contract: exports fill in once the
-        // module body completes. Defensive fallback for an unregistered
-        // re-entry (no live bindings either way).
-        if let Some(ns) = state.borrow().modules.get(path) {
-            return Ok(*ns);
+        // Cycle: the namespace and cell records were allocated and registered
+        // before this module's dependencies were evaluated, so a cyclic or
+        // self importer resolves to that same object. Defensive fallback for
+        // an unregistered re-entry.
+        if let Some(module) = state.borrow().modules.get(path) {
+            return Ok(module.namespace);
         }
         let placeholder = interp.heap_mut().alloc(v12_heap::JsObject::ordinary(
             Default::default(),
@@ -309,25 +337,37 @@ pub(crate) fn load_and_evaluate(
     }
     let (module, strings) = read_and_compile(interp, path)?;
     state.borrow_mut().loading.insert(path.to_path_buf());
-    // Allocate and register the namespace *before* evaluating static
-    // dependencies: a self-import (`import * as ns from './self.js'`) or a
-    // cyclic importer hits `handle_import`, which answers from
-    // `state.modules`; without early registration it throws
-    // `Unlinked module import`. Exports populate after the body runs.
-    let namespace = super::module_namespace::alloc_namespace(interp.heap_mut());
+    let env_slots = module
+        .program
+        .functions
+        .get(module.program.main as usize)
+        .map_or(0, |f| f.env_slots);
+    let owner_module_id = {
+        let mut s = state.borrow_mut();
+        let id = s.next_module_id;
+        s.next_module_id += 1;
+        id
+    };
+    let (namespace, env) = super::module_namespace::alloc_linked_module(
+        interp.heap_mut(),
+        owner_module_id,
+        env_slots,
+        &module.binding_plan,
+    );
+    let namespace = JsValue::object(namespace);
+    let record = LinkedModule {
+        namespace,
+        env,
+        binding_plan: Rc::from(module.binding_plan.clone().into_boxed_slice()),
+        evaluated: false,
+    };
     state
         .borrow_mut()
         .modules
-        .insert(path.to_path_buf(), JsValue::object(namespace));
+        .insert(path.to_path_buf(), record);
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    // Install the statically-known export keys (values snapshot later) so
-    // `in`/`hasOwnProperty`/enumeration observe the exports even for a
-    // cyclic/self importer that reads the namespace while this body (or a
-    // dependency's body) is still executing.
-    let export_names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
-    super::module_namespace::seed_export_keys(interp.heap_mut(), namespace, &export_names);
     // Evaluate static dependencies first (dedup, source order). A `defer`
-    // dependency is *linked* (namespace allocated, export keys seeded) but
+    // dependency is linked (namespace/cells allocated) but
     // not evaluated here: its body runs only when an export is read through
     // the deferred namespace, per the defer-import-eval proposal.
     let mut seen: HashSet<String> = HashSet::new();
@@ -348,6 +388,17 @@ pub(crate) fn load_and_evaluate(
             }
         }
     }
+    if let Err(reason) = link_binding_cells(interp, state, path, &dir) {
+        state.borrow_mut().loading.remove(path);
+        state.borrow_mut().modules.remove(path);
+        return Err(reason);
+    }
+    let env = state
+        .borrow()
+        .modules
+        .get(path)
+        .expect("linked module record")
+        .env;
     // Evaluate this module's body with the referrer pointing at its own
     // directory so its static import calls resolve correctly.
     let prev_referrer = state.borrow().referrer.clone();
@@ -359,11 +410,9 @@ pub(crate) fn load_and_evaluate(
         .get(main as usize)
         .is_some_and(|f| f.is_async);
     let functions: Rc<[v12_bytecode::FunctionBytecode]> = module.program.functions.into();
-    let result = interp.call_program_main(functions, strings, main);
+    let result = interp.call_program_main_with_env(functions, strings, main, Some(env));
     state.borrow_mut().referrer = prev_referrer;
-    // The compiler epilogue makes the module main's completion the exports
-    // object; that snapshot is the namespace.
-    let exports = result.map_err(|exc| {
+    let _completion = result.map_err(|exc| {
         state.borrow_mut().loading.remove(path);
         state.borrow_mut().modules.remove(path);
         exc.0
@@ -376,16 +425,92 @@ pub(crate) fn load_and_evaluate(
     // (promise reactions, dynamic-import loads) are engine-side and cannot
     // run here: an evaluation promise parked on one stays pending and the
     // loop exits quiescent, falling back to the promise object.
-    let exports = if main_is_async && exports.as_object().is_some() {
-        settle_evaluation_promise(interp, exports)?
-    } else {
-        exports
-    };
-    if let Some(exports) = exports.as_object() {
-        super::module_namespace::populate_namespace(interp.heap_mut(), namespace, exports);
+    if main_is_async && _completion.as_object().is_some() {
+        settle_evaluation_promise(interp, _completion)?;
+    }
+    if let Some(record) = state.borrow_mut().modules.get_mut(path) {
+        record.evaluated = true;
     }
     state.borrow_mut().loading.remove(path);
-    Ok(JsValue::object(namespace))
+    Ok(namespace)
+}
+
+/// Installs direct source-cell aliases for named imports and explicit
+/// re-exports. Namespace imports use a cell whose value is the stable namespace
+/// object.
+pub(crate) fn link_binding_cells(
+    interp: &mut Interp<'_>,
+    state: &Loader,
+    module_path: &Path,
+    base: &Path,
+) -> Result<(), JsValue> {
+    let record = state
+        .borrow()
+        .modules
+        .get(module_path)
+        .cloned()
+        .expect("linked module record");
+    for binding in record.binding_plan.iter() {
+        let (specifier, imported, reexport) = match &binding.source {
+            ModuleBindingSource::Local | ModuleBindingSource::DefaultExpression => continue,
+            ModuleBindingSource::Import { specifier, imported } => (specifier, imported, false),
+            ModuleBindingSource::ReExport { specifier, imported } => (specifier, imported, true),
+        };
+        let child_path = resolve_specifier(base, specifier);
+        let child = {
+            let s = state.borrow();
+            s.modules
+                .get(&child_path)
+                .or_else(|| s.deferred.get(&child_path))
+                .cloned()
+        };
+        let Some(child) = child else {
+            return Err(string_value(
+                interp.heap_mut(),
+                &format!("Unlinked module import: '{specifier}'"),
+            ));
+        };
+        let child_ns = child
+            .namespace
+            .as_object()
+            .expect("linked module namespace object");
+        if imported == "*" {
+            super::module_namespace::set_env_value(
+                interp.heap_mut(),
+                record.env,
+                binding.env_slot,
+                child.namespace,
+            );
+            continue;
+        }
+        let cell = super::module_namespace::export_cell(
+            interp.heap_mut(),
+            child_ns,
+            imported,
+        )
+        .ok_or_else(|| {
+            string_value(
+                interp.heap_mut(),
+                &format!("The requested module does not provide an export named '{imported}'"),
+            )
+        })?;
+        super::module_namespace::set_env_cell(
+            interp.heap_mut(),
+            record.env,
+            binding.env_slot,
+            cell,
+        );
+        if reexport {
+            let namespace = record.namespace.as_object().expect("module namespace object");
+            super::module_namespace::set_export_cell(
+                interp.heap_mut(),
+                namespace,
+                &binding.exports[0],
+                cell,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Drains interpreter awaits until async module `main_promise` settles.

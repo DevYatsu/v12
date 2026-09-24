@@ -289,7 +289,8 @@ impl Interp<'_> {
                         } => {
                             self.gc_protect();
                             let env = self.frames.last().expect("frame").env;
-                            let h = self.alloc_closure(function_index.into(), env);
+                            let owner_program = self.frames.last().expect("frame").program;
+                            let h = self.alloc_closure(function_index.into(), owner_program, env);
                             self.stack[base + usize::from(dst)] = JsValue::object(h);
                         }
                         WideOp::NewEnvironmentW { depth: _, slots } => {
@@ -741,7 +742,8 @@ impl Interp<'_> {
                 Opcode::Closure => {
                     self.gc_protect();
                     let env = self.frames.last().expect("frame").env;
-                    let h = self.alloc_closure(rb.into(), env);
+                    let owner_program = self.frames.last().expect("frame").program;
+                    let h = self.alloc_closure(rb.into(), owner_program, env);
                     self.stack[base + usize::from(ra)] = JsValue::object(h);
                     self.set_pc(pc + op_width);
                 }

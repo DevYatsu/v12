@@ -161,6 +161,7 @@ impl FunctionBuilder {
             name_hint: self.name_hint,
             function_name: None,
             max_regs: self.max_regs,
+            env_slots: 0,
             instrs: self.instrs,
             consts: self.consts,
             handlers: self.handlers,
@@ -176,6 +177,7 @@ impl FunctionBuilder {
             is_async: self.is_async,
             is_arrow: self.is_arrow,
             is_top_level: self.is_top_level,
+            uses_seeded_env: false,
             eval_metadata: None,
         }
     }

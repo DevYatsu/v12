@@ -465,6 +465,8 @@ pub mod generator;
 pub struct Interp<'a> {
     functions: Rc<[FunctionBytecode]>,
     main: u32,
+    /// Loader-seeded lexical environment for a module main.
+    main_env: Option<Handle<JsObject>>,
     /// Compiler string table: `Const::Str32` ids resolve through this.
     strings: Rc<[String]>,
     /// This interpreter's program id: 0 for the built program, higher for
@@ -620,6 +622,7 @@ impl<'a> Interp<'a> {
         let mut interp = Self {
             functions,
             main,
+            main_env: None,
             strings,
             program_id: 0,
             programs,
@@ -727,6 +730,11 @@ impl<'a> Interp<'a> {
         self.program_id = id;
     }
 
+    /// Supplies the seeded environment used by the bottom module main.
+    pub fn set_main_env(&mut self, env: Handle<JsObject>) {
+        self.main_env = Some(env);
+    }
+
     /// Replaces the shared cross-program table (a nested eval interpreter
     /// adopts the caller's registry so both resolve the same programs).
     pub fn set_programs(
@@ -777,14 +785,19 @@ impl<'a> Interp<'a> {
     /// (a fresh object whose `constructor` points back at the function) so
     /// `F.prototype` reads and `new F` work without lazy materialization.
     /// Arrow functions are not constructible and have no `prototype`.
-    fn alloc_closure(&mut self, fn_idx: u32, env: Option<Handle<JsObject>>) -> Handle<JsObject> {
-        let funcs = self.functions_for_program(self.program_id);
+    fn alloc_closure(
+        &mut self,
+        fn_idx: u32,
+        program_id: u32,
+        env: Option<Handle<JsObject>>,
+    ) -> Handle<JsObject> {
+        let funcs = self.functions_for_program(program_id);
         let (is_arrow, expected_args, function_name) = funcs
             .get(fn_idx as usize)
             .map(|f| (f.is_arrow, f.expected_args, f.function_name.clone()))
             .unwrap_or((false, 0, None));
         let mut obj = JsObject::function(v12_heap::FunctionTarget::Bytecode(fn_idx), env);
-        obj.program_id = self.program_id;
+        obj.program_id = program_id;
         let h = self.heap.alloc(obj);
         // Every closure carries its own `length` (ExpectedArgumentCount), so
         // `f.length` reads never depend on the property surfaces.
@@ -1177,7 +1190,7 @@ impl<'a> Interp<'a> {
                 0.0,
                 0,
                 window,
-                None,
+                self.main_env,
                 Some(JsValue::object(promise)),
             );
             g_obj.program_id = self.program_id;
@@ -1207,8 +1220,8 @@ impl<'a> Interp<'a> {
             pc: 0,
             base: 0,
             max_regs: main_regs,
-            env: None,
-            env_display: [None; ENV_DISPLAY_CAP],
+            env: self.main_env,
+            env_display: self.env_display_for(self.main_env),
             generator: None,
             yield_dst: None,
             new_target: None,
@@ -1277,10 +1290,22 @@ impl<'a> Interp<'a> {
         strings: impl Into<Rc<[String]>>,
         main: u32,
     ) -> Result<JsValue, JSException> {
+        self.call_program_main_with_env(functions, strings, main, None)
+    }
+
+    /// Module-main variant carrying the loader-seeded environment as the
+    /// synthetic main closure's captured environment.
+    pub fn call_program_main_with_env(
+        &mut self,
+        functions: impl Into<Rc<[FunctionBytecode]>>,
+        strings: impl Into<Rc<[String]>>,
+        main: u32,
+        env: Option<Handle<JsObject>>,
+    ) -> Result<JsValue, JSException> {
         let id = self.register_program(functions, strings);
         let callee = self.heap.alloc(JsObject::function(
             v12_heap::FunctionTarget::Bytecode(main),
-            None,
+            env,
         ));
         self.heap.get_mut(callee).program_id = id;
         self.call_object(callee, JsValue::undefined(), &[])
@@ -1492,29 +1517,71 @@ impl<'a> Interp<'a> {
 
     fn env_read(&mut self, depth: u16, slot: u16) -> Result<JsValue, JSException> {
         let env = self.env_at_expect(depth)?;
+        self.read_env_slot(env, slot)
+    }
+
+    fn read_env_slot(
+        &mut self,
+        env: Handle<JsObject>,
+        slot: u16,
+    ) -> Result<JsValue, JSException> {
         let idx = usize::from(slot);
-        let len = self.heap.get(env).properties.len();
-        if idx < len {
-            Ok(self.heap.get(env).properties[idx])
-        } else {
-            Err(JSException(self.error_value(
+        let value = self
+            .heap
+            .get(env)
+            .properties
+            .get(idx)
+            .copied()
+            .ok_or_else(|| JSException(self.error_value(
                 "InternalError: environment slot out of range",
-            )))
+            )))?;
+        if let Some(cell) = value.as_object()
+            && self.heap.get(cell).kind == v12_heap::Kind::BindingCell
+        {
+            let binding = self
+                .heap
+                .get(cell)
+                .binding_cell
+                .as_ref()
+                .expect("binding cell payload");
+            if !binding.initialized {
+                return Err(JSException(self.error_value("ReferenceError: Cannot access binding before initialization")));
+            }
+            return Ok(binding.value);
         }
+        Ok(value)
+    }
+
+    fn write_env_slot(
+        &mut self,
+        env: Handle<JsObject>,
+        slot: u16,
+        value: JsValue,
+    ) -> Result<(), JSException> {
+        let idx = usize::from(slot);
+        let stored = self.heap.get(env).properties.get(idx).copied().ok_or_else(|| {
+            JSException(self.error_value("InternalError: environment slot out of range"))
+        })?;
+        if let Some(cell) = stored.as_object()
+            && self.heap.get(cell).kind == v12_heap::Kind::BindingCell
+        {
+            let binding = self
+                .heap
+                .get_mut(cell)
+                .binding_cell
+                .as_mut()
+                .expect("binding cell payload");
+            binding.initialized = true;
+            binding.value = value;
+            return Ok(());
+        }
+        self.heap.get_mut(env).properties[idx] = value;
+        Ok(())
     }
 
     fn env_write(&mut self, depth: u16, slot: u16, v: JsValue) -> Result<(), JSException> {
         let env = self.env_at_expect(depth)?;
-        let idx = usize::from(slot);
-        let len = self.heap.get(env).properties.len();
-        if idx < len {
-            self.heap.get_mut(env).properties[idx] = v;
-            Ok(())
-        } else {
-            Err(JSException(self.error_value(
-                "InternalError: environment slot out of range",
-            )))
-        }
+        self.write_env_slot(env, slot, v)
     }
 
     /// Display for a fresh frame whose environment head is `env`: the

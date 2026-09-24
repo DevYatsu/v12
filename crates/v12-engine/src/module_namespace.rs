@@ -1,155 +1,147 @@
-//! ES 10.4.6 Module Namespace Exotic Object.
-//!
-//! v1 represents a module namespace as a non-extensible ordinary object with
-//! a `null` `[[Prototype]]` and export properties carrying the spec descriptor
-//! `{ [[Writable]]: true, [[Enumerable]]: true, [[Configurable]]: false }`.
-//!
-//! ## Representation and its honest limits
-//!
-//! The spec makes the namespace a *distinct exotic* object whose `[[Set]]`
-//! returns `false` for every key, `[[Get]]` answers only export keys, and
-//! `[[OwnPropertyKeys]]` is sorted. The engine's property dispatch has no
-//! per-object exotic hook reachable from `v12-engine` (the interpreter owns
-//! `get_property`/`set_property` and cannot be edited by this lane), so the
-//! representation uses ordinary machinery and therefore does **not** capture
-//! every exotic behaviour:
-//!
-//! - `[[Prototype]]` is `null` — represented directly, observable and correct.
-//! - `[[Extensible]]` is `false` — `FLAG_NOT_EXTENSIBLE`, set at allocation so
-//!   it holds even while exports are still being initialized, correct.
-//! - Export descriptors — installed with the spec attributes, correct.
-//! - `[[OwnPropertyKeys]]` order — keys are installed in sorted order so the
-//!   shape walk (which `Object.getOwnPropertyNames` reads) reports sorted
-//!   export string keys, correct.
-//! - `[[Delete]]` — `configurable: false` makes deletes of export keys fail
-//!   and deletes of absent keys succeed, matching the exotic.
-//! - `[[Set]]` — **gap**: exports are `[[Writable]]: true` per the descriptor
-//!   quirk, so an ordinary write to an export key succeeds instead of being
-//!   rejected. A correct `[[Set]]` needs an exotic dispatch seam.
-//! - `@@toStringTag` — **gap**: the engine has no reachable well-known
-//!   `Symbol.toStringTag` singleton to key a stored property against, so the
-//!   property is not installed.
-//! - Live bindings — **gap**: exports are a post-evaluation snapshot; a module
-//!   that reads its own namespace mid-body observes an empty object.
-//!
-//! The loader registers the namespace before evaluating dependencies, so a
-//! cyclic or self importer resolves to the same object; exports are populated
-//! after the module body completes.
+//! Module namespace exotic objects and live binding-cell installation.
 
-use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, PropKey};
+use v12_bccompiler::ModuleBindingPlan;
+use v12_heap::{
+    Attrs, Handle, Heap, JsObject, JsValue, Kind, ModuleNamespaceRecord, PropKey,
+};
 
 /// Allocates an empty namespace object: `[[Prototype]]` null and
-/// `[[Extensible]]` false from birth. Rooted so dependency evaluation cannot
-/// collect it.
+/// `[[Extensible]]` false from birth.
 pub(crate) fn alloc_namespace(heap: &mut Heap) -> Handle<JsObject> {
     let obj = heap.alloc(JsObject {
+        kind: Kind::ModuleNamespace,
         prototype: None,
         flags: JsObject::FLAG_NOT_EXTENSIBLE,
         ..JsObject::default()
     });
-    heap.add_root(JsValue::object(obj));
+    heap.add_module_root(obj);
     obj
 }
 
-/// Flattened text of a string `PropKey` (symbol keys return empty).
-fn key_text(heap: &mut Heap, key: PropKey) -> String {
-    let Some(h) = key.string() else {
-        return String::new();
-    };
-    heap.flatten(h);
-    match &heap.get(h).storage {
-        v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
-        _ => String::new(),
-    }
-}
+/// Allocates the namespace, seeded main environment, and one cell per
+/// compiler binding-plan entry. Import/re-export cells are uninitialized
+/// placeholders until the linker installs the source cell.
+pub(crate) fn alloc_linked_module(
+    heap: &mut Heap,
+    owner_module_id: u32,
+    env_slots: u16,
+    plan: &[ModuleBindingPlan],
+) -> (Handle<JsObject>, Handle<JsObject>) {
+    let namespace = alloc_namespace(heap);
+    let env = heap.alloc(JsObject::environment(usize::from(env_slots), None));
+    heap.add_module_root(env);
 
-/// Installs the module's export keys (sorted, deduped) with `undefined`
-/// values, before the body runs.
-///
-/// ES 10.4.6 defines `[[OwnPropertyKeys]]` as the module's export list, which
-/// the linker knows statically. Seeding the keys makes `hasOwnProperty`,
-/// `in`, and `getOwnPropertyNames` observe the exports while the body is
-/// still executing; values are filled later by [`populate_namespace`]. This
-/// does NOT close the live-binding gap: a read during the body sees
-/// `undefined`, not the current binding value.
-pub(crate) fn seed_export_keys(heap: &mut Heap, ns: Handle<JsObject>, names: &[String]) {
-    let mut sorted: Vec<&str> = names
-        .iter()
-        .map(String::as_str)
-        .filter(|n| !n.is_empty() && *n != "*")
-        .collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    let attrs = Attrs::new(true, true, false);
-    for name in sorted {
-        let key = PropKey::from_string(heap.intern_text(name));
-        let shape = heap.shape_of(ns);
-        if heap.get(shape).descriptors.find(key).is_some() {
-            continue;
+    let mut cells = Vec::with_capacity(plan.len());
+    let mut exports = Vec::new();
+    for binding in plan {
+        let cell = heap.alloc(JsObject::binding_cell(
+            JsValue::undefined(),
+            binding.initially_initialized,
+            owner_module_id,
+        ));
+        heap.add_module_root(cell);
+        cells.push((binding.env_slot, cell));
+        if usize::from(binding.env_slot) < heap.get(env).properties.len() {
+            heap.get_mut(env).properties[usize::from(binding.env_slot)] = JsValue::object(cell);
         }
-        let child = heap.add_property(shape, key, attrs);
-        heap.bind_shape(ns, child);
-        heap.get_mut(ns).properties.push(JsValue::undefined());
-        heap.get_mut(ns).property_keys.push(Some(key));
+        for export in &binding.exports {
+            exports.push((export.clone(), cell));
+        }
     }
-}
 
-/// Populates `ns` from the compiler epilogue's `exports` object.
-///
-/// Export keys are installed in ascending string order so the shape descriptor
-/// order — hence `[[OwnPropertyKeys]]` — is sorted per ES 10.4.6 step 1.
-/// Installation is a direct shape transition (not the ordinary define path)
-/// because the namespace is already non-extensible. An existing key's value is
-/// overwritten in place; the spec attributes are fixed.
-pub(crate) fn populate_namespace(heap: &mut Heap, ns: Handle<JsObject>, exports: Handle<JsObject>) {
-    let shape = heap.shape_of(exports);
-    // Copy the descriptor list out before any mutable borrow (key_text
-    // flattens strings); descriptors are `Copy`.
-    let descriptors: Vec<(PropKey, Option<u32>)> = heap
-        .get(shape)
-        .descriptors
-        .as_slice()
-        .iter()
-        .map(|d| (d.key(), d.slot()))
-        .collect();
-    let mut entries: Vec<(String, PropKey, JsValue)> = Vec::new();
-    for (key, slot) in descriptors {
-        if key.is_symbol() {
-            continue;
-        }
-        let Some(slot) = slot else {
-            continue;
-        };
-        let value = heap
-            .get(exports)
-            .properties
-            .get(slot as usize)
-            .copied()
-            .unwrap_or(JsValue::undefined());
-        let text = key_text(heap, key);
-        entries.push((text, key, value));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    // `{ [[Writable]]: true, [[Enumerable]]: true, [[Configurable]]: false }`
-    // is the spec's report for an export data property (ES 10.4.6 step 5).
+    exports.sort_by(|a, b| a.0.cmp(&b.0));
+    exports.dedup_by(|a, b| a.0 == b.0);
     let attrs = Attrs::new(true, true, false);
-    for (_, key, value) in entries {
-        let shape = heap.shape_of(ns);
+    let mut record_cells = Vec::with_capacity(exports.len());
+    for (name, cell) in exports {
+        let key = PropKey::from_string(heap.intern_text(&name));
+        let shape = heap.shape_of(namespace);
         if let Some(desc) = heap.get(shape).descriptors.find(key).copied() {
-            // Update in place; attributes stay fixed.
             if let Some(slot) = desc.slot() {
-                let o = heap.get_mut(ns);
-                if o.properties.len() <= slot as usize {
-                    o.properties.resize(slot as usize + 1, JsValue::hole());
-                }
-                o.properties[slot as usize] = value;
+                heap.get_mut(namespace).properties[slot as usize] = JsValue::object(cell);
+                record_cells.push(cell);
             }
             continue;
         }
         let child = heap.add_property(shape, key, attrs);
-        heap.bind_shape(ns, child);
-        heap.get_mut(ns).properties.push(value);
-        heap.get_mut(ns).property_keys.push(Some(key));
+        heap.bind_shape(namespace, child);
+        heap.get_mut(namespace).properties.push(JsValue::object(cell));
+        heap.get_mut(namespace).property_keys.push(Some(key));
+        record_cells.push(cell);
+    }
+    heap.get_mut(namespace).module_namespace = Some(ModuleNamespaceRecord {
+        owner_module_id,
+        cells: record_cells,
+    });
+    (namespace, env)
+}
+
+/// Installs a source cell into an explicit re-export or imported seed slot.
+pub(crate) fn set_export_cell(
+    heap: &mut Heap,
+    namespace: Handle<JsObject>,
+    name: &str,
+    cell: Handle<JsObject>,
+) {
+    let key = PropKey::from_string(heap.intern_text(name));
+    let shape = heap.shape_of(namespace);
+    let Some(desc) = heap.get(shape).descriptors.find(key).copied() else {
+        return;
+    };
+    if let Some(slot) = desc.slot() {
+        heap.get_mut(namespace).properties[slot as usize] = JsValue::object(cell);
+    }
+}
+
+/// Raw cell handle for an export name, used only by the loader's linker.
+pub(crate) fn export_cell(
+    heap: &mut Heap,
+    namespace: Handle<JsObject>,
+    name: &str,
+) -> Option<Handle<JsObject>> {
+    let key = PropKey::from_string(heap.intern_text(name));
+    let shape = heap.shape_of(namespace);
+    let slot = heap.lookup_property(shape, key)?.slot()?;
+    heap.get(namespace).properties.get(slot as usize)?.as_object()
+}
+
+/// Linker helper for a module-main import/re-export plan slot.
+pub(crate) fn set_env_cell(
+    heap: &mut Heap,
+    env: Handle<JsObject>,
+    slot: u16,
+    cell: Handle<JsObject>,
+) {
+    if let Some(value) = heap
+        .get_mut(env)
+        .properties
+        .get_mut(usize::from(slot))
+    {
+        *value = JsValue::object(cell);
+    }
+}
+
+/// Linker helper for `import * as ns`; the seeded cell holds the namespace
+/// identity as its value.
+pub(crate) fn set_env_value(
+    heap: &mut Heap,
+    env: Handle<JsObject>,
+    slot: u16,
+    value: JsValue,
+) {
+    let Some(stored) = heap
+        .get(env)
+        .properties
+        .get(usize::from(slot))
+        .copied()
+        .and_then(|v| v.as_object())
+    else {
+        return;
+    };
+    if heap.get(stored).kind == Kind::BindingCell
+        && let Some(binding) = heap.get_mut(stored).binding_cell.as_mut()
+    {
+        binding.value = value;
+        binding.initialized = true;
     }
 }

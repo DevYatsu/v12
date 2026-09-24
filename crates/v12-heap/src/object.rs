@@ -64,6 +64,12 @@ pub enum Kind {
     /// carries no shape descriptor, so it is invisible to property lookup and
     /// enumeration; `Date.prototype`-installed methods serve the JS surface.
     Date = 11,
+    /// Module namespace exotic object. Export property slots hold binding
+    /// cells internally; ordinary property paths must dereference them.
+    ModuleNamespace = 12,
+    /// One live module binding. The value is observable only through the
+    /// owning environment or namespace, never directly as a JavaScript value.
+    BindingCell = 13,
     /// Proxy object: every internal method traps (the engine's dispatch
     /// reports a `TypeError` for the v1 stub).
     Proxy = 99,
@@ -107,6 +113,22 @@ pub enum IntegrityLevel {
 /// A heap object: a kind/flags header plus dense property and element
 /// vectors and a prototype link. Shapes describe the layout; this carries
 /// the storage.
+/// Mutable module-binding state stored inside a [`Kind::BindingCell`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct BindingCellData {
+    pub value: crate::JsValue,
+    pub initialized: bool,
+    pub owner_module_id: u32,
+}
+
+/// GC-visible record attached to a [`Kind::ModuleNamespace`] object.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModuleNamespaceRecord {
+    pub owner_module_id: u32,
+    /// Handles parallel to the namespace's shape-backed export slots.
+    pub cells: Vec<Handle<JsObject>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsObject {
     /// Object kind; [`Kind::Ordinary`] by default.
@@ -169,6 +191,12 @@ pub struct JsObject {
     pub proxy_target: Option<Handle<JsObject>>,
     /// See [`JsObject::proxy_target`].
     pub proxy_handler: Option<Handle<JsObject>>,
+    /// Live module-binding payload. Present exactly for `Kind::BindingCell`.
+    pub binding_cell: Option<BindingCellData>,
+    /// Namespace record for `Kind::ModuleNamespace`; the same cells are also
+    /// stored in property slots, but this record gives the loader a traced,
+    /// ordered module-level view.
+    pub module_namespace: Option<ModuleNamespaceRecord>,
     /// The validity cell watching assumptions about this object (prototype
     /// identity, attribute stability), assigned lazily on first use. The
     /// registry holding serials lives on the heap. Not on the shape-lookup
@@ -219,6 +247,8 @@ impl Default for JsObject {
             prototype: None,
             proxy_target: None,
             proxy_handler: None,
+            binding_cell: None,
+            module_namespace: None,
             validity_cell: ValidityCellId::NONE,
             private_brand: None,
             private_fields: None,
@@ -296,6 +326,24 @@ impl JsObject {
             kind: Kind::Function,
             callable: target,
             captured_env: env,
+            ..Self::default()
+        }
+    }
+
+    /// Allocates the payload for one live module binding.
+    #[must_use]
+    pub fn binding_cell(
+        value: crate::JsValue,
+        initialized: bool,
+        owner_module_id: u32,
+    ) -> Self {
+        Self {
+            kind: Kind::BindingCell,
+            binding_cell: Some(BindingCellData {
+                value,
+                initialized,
+                owner_module_id,
+            }),
             ..Self::default()
         }
     }
@@ -846,7 +894,12 @@ impl SizeEstimate for JsObject {
         // the object, not in a heap vector, so charge them here alongside the
         // prototype link.
         let proxy_slots = 2 * core::mem::size_of::<Option<Handle<JsObject>>>();
-        16 + proxy_slots
+        let module_slots = core::mem::size_of::<Option<BindingCellData>>()
+            + self
+                .module_namespace
+                .as_ref()
+                .map_or(0, |record| record.cells.capacity() * core::mem::size_of::<Handle<JsObject>>());
+        16 + proxy_slots + module_slots
             + self.properties.capacity() * VALUE_BYTES
             + self.elements.capacity() * VALUE_BYTES
             + self.property_keys.capacity() * core::mem::size_of::<Option<crate::PropKey>>()
@@ -887,6 +940,14 @@ impl Trace for JsObject {
         self.proxy_target.trace(sink);
         self.proxy_handler.trace(sink);
         self.captured_env.trace(sink);
+        if let Some(cell) = &self.binding_cell {
+            cell.value.trace(sink);
+        }
+        if let Some(record) = &self.module_namespace {
+            for &cell in &record.cells {
+                sink.mark_object(cell);
+            }
+        }
         // The callable target can itself carry heap handles (`RealmEval`
         // global, `Bound` state object); trace it so those stay reachable.
         self.callable.trace(sink);

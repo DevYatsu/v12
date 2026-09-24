@@ -283,32 +283,46 @@ impl Engine {
             return Err(string_value(&mut self.heap, "RangeError: source too large"));
         }
         self.prime_loader(base.to_path_buf());
-        // Register the entry namespace under its own path so a self-import or
-        // cyclic importer resolves to it. `resolve_specifier(".", abs)` just
-        // normalizes the absolute path.
-        let entry_ns = entry_path.map(|ep| {
-            let ns = crate::module_namespace::alloc_namespace(&mut self.heap);
-            if let Some(loader) = self.registry.loader() {
-                let canonical =
-                    crate::module_loader::resolve_specifier(Path::new("."), &ep.to_string_lossy());
-                loader
-                    .borrow_mut()
-                    .modules
-                    .insert(canonical, JsValue::object(ns));
-            }
-            ns
-        });
         let global = self.realm.global();
         self.heap.add_root(JsValue::object(global));
         // Compile as module.
         let mut interner = v12_bccompiler::Interner::default();
         let module = v12_bccompiler::compile_source_as_module_with_interner(source, &mut interner)
             .map_err(|err| string_value(&mut self.heap, &err.message))?;
-        // Seed the entry's export keys before its dependencies evaluate: a
-        // self-import during the body must observe the export list.
-        if let Some(ns) = entry_ns {
-            let names: Vec<String> = module.exports.iter().map(|e| e.exported.clone()).collect();
-            crate::module_namespace::seed_export_keys(&mut self.heap, ns, &names);
+        let env_slots = module
+            .program
+            .functions
+            .get(module.program.main as usize)
+            .map_or(0, |f| f.env_slots);
+        let owner_module_id = self.registry.loader().map_or(0, |loader| {
+            let mut state = loader.borrow_mut();
+            let id = state.next_module_id;
+            state.next_module_id += 1;
+            id
+        });
+        let (entry_ns, entry_env) = crate::module_namespace::alloc_linked_module(
+            &mut self.heap,
+            owner_module_id,
+            env_slots,
+            &module.binding_plan,
+        );
+        let entry_ns = JsValue::object(entry_ns);
+        if let Some(loader) = self.registry.loader()
+            && let Some(entry_path) = entry_path
+        {
+            let canonical =
+                crate::module_loader::resolve_specifier(Path::new("."), &entry_path.to_string_lossy());
+            let mut state = loader.borrow_mut();
+            state.loading.insert(canonical.clone());
+            state.modules.insert(
+                canonical,
+                crate::module_loader::LinkedModule {
+                    namespace: entry_ns,
+                    env: entry_env,
+                    binding_plan: std::rc::Rc::from(module.binding_plan.clone().into_boxed_slice()),
+                    evaluated: false,
+                },
+            );
         }
         let strings: Vec<String> = v12_bccompiler::freeze_interner(interner)
             .iter()
@@ -336,9 +350,9 @@ impl Engine {
         let mut interp = Self::make_interp(
             heap,
             global,
-            functions,
+            Rc::clone(&functions),
             program.main,
-            strings,
+            Rc::clone(&strings),
             natives,
             deadline,
             Rc::clone(programs),
@@ -364,21 +378,48 @@ impl Engine {
                 }
             }
         }
+        if let Some(loader) = registry.loader()
+            && let Some(entry_path) = entry_path
+        {
+            let canonical =
+                crate::module_loader::resolve_specifier(Path::new("."), &entry_path.to_string_lossy());
+            if let Err(reason) =
+                crate::module_loader::link_binding_cells(&mut interp, &loader, &canonical, base)
+            {
+                if let Some(loader) = registry.loader() {
+                    let mut state = loader.borrow_mut();
+                    state.modules.remove(&canonical);
+                    state.loading.remove(&canonical);
+                }
+                drop(interp);
+                return Err(reason);
+            }
+        }
+        interp.set_main_env(entry_env);
         let outcome = interp.run();
         // Drain the single microtask checkpoint against the still-live
         // interpreter: host jobs and async resumes alternate until empty.
         let _ = Self::drain_checkpoint(registry, &mut interp, jobs, pending);
         *completion = interp.completion_value();
+        let entry_value = entry_ns;
         drop(interp); // releases the `&mut heap` borrow
-        // Fill the entry namespace from the module epilogue's exports object
-        // (the completion value) so self-importers read real exports.
-        if let Some(ns) = entry_ns
-            && let Some(exports) = (*completion).and_then(|v| v.as_object())
+        if let Some(loader) = registry.loader()
+            && let Some(entry_path) = entry_path
         {
-            crate::module_namespace::populate_namespace(heap, ns, exports);
+            let canonical =
+                crate::module_loader::resolve_specifier(Path::new("."), &entry_path.to_string_lossy());
+            let mut state = loader.borrow_mut();
+            if outcome.is_ok() {
+                if let Some(record) = state.modules.get_mut(&canonical) {
+                    record.evaluated = true;
+                }
+            } else {
+                state.modules.remove(&canonical);
+            }
+            state.loading.remove(&canonical);
         }
         match outcome {
-            Ok(()) => Ok(completion.unwrap_or_else(JsValue::undefined)),
+            Ok(()) => Ok(entry_value),
             Err(JSException(thrown)) => Err(thrown),
         }
     }

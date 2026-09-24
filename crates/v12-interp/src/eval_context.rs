@@ -174,10 +174,26 @@ impl Interp<'_> {
                     base: self.frames[frame_idx].base,
                     reg,
                 },
-                BindingLocation::Env(slot) => EvalBindingRef::Env {
-                    env: env.expect("eval-reachable env binding has environment"),
-                    slot,
-                },
+                BindingLocation::Env(slot) => {
+                    let mut binding_env = env.expect("eval-reachable env binding has environment");
+                    while self
+                        .heap
+                        .get(binding_env)
+                        .properties
+                        .get(usize::from(slot))
+                        .is_none()
+                    {
+                        binding_env = self
+                            .heap
+                            .get(binding_env)
+                            .prototype
+                            .expect("eval-reachable env binding has a parent environment");
+                    }
+                    EvalBindingRef::Env {
+                        env: binding_env,
+                        slot,
+                    }
+                }
                 BindingLocation::Global => EvalBindingRef::Global,
             };
             bindings.retain(|(old, _)| old != &name);
@@ -345,13 +361,7 @@ impl Interp<'_> {
                     .unwrap_or_else(JsValue::undefined),
             )),
             EvalBindingRef::Env { env, slot } => {
-                let value = self
-                    .heap
-                    .get(env)
-                    .properties
-                    .get(usize::from(slot))
-                    .copied();
-                Ok(Some(value.unwrap_or_else(JsValue::undefined)))
+                Ok(Some(self.read_env_slot(env, slot)?))
             }
             EvalBindingRef::EvalLocal { env, slot } => {
                 let value = self
@@ -394,13 +404,7 @@ impl Interp<'_> {
                 self.stack[base + usize::from(reg)] = value;
             }
             EvalBindingRef::Env { env, slot } => {
-                let idx = usize::from(slot);
-                if idx >= self.heap.get(env).properties.len() {
-                    return Err(JSException(
-                        self.error_value("ReferenceError: invalid eval binding"),
-                    ));
-                }
-                self.heap.get_mut(env).properties[idx] = value;
+                self.write_env_slot(env, slot, value)?;
             }
             EvalBindingRef::EvalLocal { env, slot } => {
                 let idx = usize::from(slot);

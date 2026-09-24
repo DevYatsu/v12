@@ -228,6 +228,9 @@ pub struct FunctionBytecode {
     /// known (methods, class constructors). `None` for anonymous/arrow fns.
     pub function_name: Option<String>,
     pub max_regs: u16,
+    /// Environment slots expected by this function. Module mains use this to
+    /// size the loader-seeded environment.
+    pub env_slots: u16,
     pub instrs: Vec<Instr>,
     pub consts: ConstantPool,
     pub handlers: Vec<HandlerRange>,
@@ -259,6 +262,8 @@ pub struct FunctionBytecode {
     pub is_arrow: bool,
     /// True for the script/eval main unit, not an ordinary function unit.
     pub is_top_level: bool,
+    /// Module main uses a loader-seeded environment instead of creating one.
+    pub uses_seeded_env: bool,
     pub eval_metadata: Option<EvalFunctionMetadata>,
 }
 
@@ -271,6 +276,7 @@ impl FunctionBytecode {
             name_hint: None,
             function_name: None,
             max_regs,
+            env_slots: 0,
             spans: vec![(0, 0); n],
             instrs,
             consts: ConstantPool::new(),
@@ -286,6 +292,7 @@ impl FunctionBytecode {
             is_async: false,
             is_arrow: false,
             is_top_level: false,
+            uses_seeded_env: false,
             eval_metadata: None,
         }
     }

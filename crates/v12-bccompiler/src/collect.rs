@@ -33,7 +33,8 @@ use v12_bytecode::{EvalBindingKind, EvalCallerFacts, EvalCompileFacts, EvalPhase
 
 use crate::model::{
     BlockFunctionPlan, BlockFunctionSkip, CompileError, EvalSitePlan, ExportEntry, ImportEntry,
-    MAX_ENV_SLOTS, MAX_REGS, Plans, REG_THIS, UnitPlan, VarLoc,
+    MAX_ENV_SLOTS, MAX_REGS, ModuleBindingPlan, ModuleBindingSource, Plans, REG_THIS, UnitPlan,
+    VarLoc,
 };
 
 /// Entry point: produce finalized layout plans for a whole program.
@@ -56,12 +57,13 @@ pub fn collect_with_eval_facts(
 }
 
 /// Module-mode collection: top-level `var` stays module-scoped.
-pub fn collect_module(
+pub fn collect_module_with_nodes(
     program: &Program<'_>,
     scoping: &Scoping,
     is_strict: bool,
+    nodes: Option<&AstNodes<'_>>,
 ) -> Result<Plans, CompileError> {
-    collect_inner(program, scoping, is_strict, true, None, None)
+    collect_inner(program, scoping, is_strict, true, None, nodes)
 }
 
 fn collect_inner(
@@ -127,6 +129,9 @@ fn collect_inner(
         }
     }
     resolve_eval_sites(&mut plans, scoping, nodes);
+    if is_module {
+        build_module_binding_plans(&mut plans, scoping);
+    }
     if !is_strict
         && let Some(facts) = eval_caller_facts
         && facts.direct
@@ -1213,6 +1218,7 @@ impl<'s> Collector<'s> {
                             .unwrap_or_else(|| self.scoping.symbol_name(sym).to_string());
                         self.plans.exports.push(ExportEntry {
                             specifier: None,
+                            imported: None,
                             local: Some(sym),
                             exported,
                             span,
@@ -1228,6 +1234,7 @@ impl<'s> Collector<'s> {
                     let exported = id.name.to_string();
                     self.plans.exports.push(ExportEntry {
                         specifier: None,
+                        imported: None,
                         local: Some(sym),
                         exported,
                         span,
@@ -1242,6 +1249,7 @@ impl<'s> Collector<'s> {
                     let exported = id.name.to_string();
                     self.plans.exports.push(ExportEntry {
                         specifier: None,
+                        imported: None,
                         local: Some(sym),
                         exported,
                         span,
@@ -1259,6 +1267,7 @@ impl<'s> Collector<'s> {
             let exported = module_export_name_to_string(&sp.exported);
             self.plans.exports.push(ExportEntry {
                 specifier: None,
+                imported: None,
                 local,
                 exported,
                 span,
@@ -1274,9 +1283,11 @@ impl<'s> Collector<'s> {
         let span = Some((d.span.start, d.span.end));
         for sp in &d.specifiers {
             let exported = module_export_name_to_string(&sp.exported);
+            let imported = module_export_name_to_string(&sp.local);
             let local = module_export_name_to_symbol(&sp.local, self.scoping);
             self.plans.exports.push(ExportEntry {
                 specifier: Some(specifier.clone()),
+                imported: Some(imported),
                 local,
                 exported,
                 span,
@@ -1305,6 +1316,7 @@ impl<'s> Collector<'s> {
         }
         self.plans.exports.push(ExportEntry {
             specifier: None,
+            imported: None,
             local: local_sym,
             exported: "default".to_string(),
             span,
@@ -1340,6 +1352,7 @@ impl<'s> Collector<'s> {
             .unwrap_or_else(|| "*".to_string());
         self.plans.exports.push(ExportEntry {
             specifier: Some(specifier),
+            imported: None,
             local: None,
             exported,
             span,
@@ -2189,6 +2202,81 @@ fn resolve_block_functions(plans: &mut Plans, scoping: &Scoping) {
     }
 }
 
+/// Builds the module-main seed environment plan after the AST walk has
+/// classified imports/exports and declared their symbols.
+fn build_module_binding_plans(plans: &mut Plans, scoping: &Scoping) {
+    for import in plans.imports.clone() {
+        let Some(symbol) = import.local else {
+            continue;
+        };
+        let name = scoping.symbol_name(symbol).to_string();
+        plans.module_bindings.push(ModuleBindingPlan {
+            symbol: Some(symbol),
+            name,
+            env_slot: 0,
+            source: ModuleBindingSource::Import {
+                specifier: import.specifier,
+                imported: import.imported,
+            },
+            exports: Vec::new(),
+            initially_initialized: true,
+        });
+    }
+
+    for export in plans.exports.clone() {
+        if let Some(specifier) = export.specifier.clone() {
+            if let Some(imported) = export.imported.clone() {
+                plans.module_bindings.push(ModuleBindingPlan {
+                    symbol: None,
+                    name: export.exported.clone(),
+                    env_slot: 0,
+                    source: ModuleBindingSource::ReExport { specifier, imported },
+                    exports: vec![export.exported],
+                    initially_initialized: true,
+                });
+            }
+            continue;
+        }
+        if let Some(symbol) = export.local {
+            let name = scoping.symbol_name(symbol).to_string();
+            let plan = plans.module_bindings.iter_mut().find(|plan| plan.symbol == Some(symbol));
+            if let Some(plan) = plan {
+                if !plan.exports.contains(&export.exported) {
+                    plan.exports.push(export.exported);
+                }
+            } else {
+                plans.module_bindings.push(ModuleBindingPlan {
+                    symbol: Some(symbol),
+                    name,
+                    env_slot: 0,
+                    source: ModuleBindingSource::Local,
+                    exports: vec![export.exported],
+                    initially_initialized: plans.units[0].var_symbols.contains(&symbol),
+                });
+            }
+        } else if export.exported == "default"
+            && !plans
+                .module_bindings
+                .iter()
+                .any(|plan| plan.source == ModuleBindingSource::DefaultExpression)
+        {
+            plans.module_bindings.push(ModuleBindingPlan {
+                symbol: None,
+                name: "default".to_string(),
+                env_slot: 0,
+                source: ModuleBindingSource::DefaultExpression,
+                exports: vec!["default".to_string()],
+                initially_initialized: false,
+            });
+        }
+    }
+
+    for (slot, plan) in plans.module_bindings.iter_mut().enumerate() {
+        plan.env_slot = u16::try_from(slot).expect("module binding slots fit u16");
+    }
+    plans.units[0].has_env = true;
+}
+
 /// their home unit's Environment, everything else gets sequential registers.
 ///
 /// Layout order per unit is deterministic: declaration order (params first)
@@ -2225,7 +2313,24 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
             unit.has_env = escapes_here || needs_this || eval_reachable;
         }
 
-        let mut slot: u16 = 0;
+        let mut slot: u16 = if ui == 0 && plans.is_module {
+            plans.units[ui].has_env = true;
+            for plan in &plans.module_bindings {
+                if let Some(sym) = plan.symbol {
+                    plans.units[ui].env_slots.insert(sym, plan.env_slot);
+                    plans.units[ui].vars.insert(sym, VarLoc::Env(plan.env_slot));
+                }
+            }
+            plans
+                .module_bindings
+                .iter()
+                .map(|plan| plan.env_slot.checked_add(1))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|slots| slots.into_iter().max())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let mut reg: u16 = REG_THIS.checked_add(1).ok_or_else(|| CompileError {
             message: "too many functions/constants".into(),
             span: Some((0, 0)),

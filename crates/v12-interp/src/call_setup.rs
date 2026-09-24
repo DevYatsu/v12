@@ -2151,7 +2151,7 @@ impl Interp<'_> {
         let arg = args.first().copied().unwrap_or(JsValue::undefined());
         // Primitive receivers keep the registry native's behavior.
         let obj = arg.as_object()?;
-        if self.heap.get(obj).kind != Kind::Proxy {
+        if !matches!(self.heap.get(obj).kind, Kind::Proxy | Kind::ModuleNamespace) {
             return None;
         }
         Some(self.run_proxy_static_inner(id, obj, args))

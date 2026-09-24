@@ -165,6 +165,9 @@ impl Interp<'_> {
         if self.heap.get(obj).kind == Kind::Proxy {
             return self.proxy_op_get(obj, obj_v, key_v);
         }
+        if self.heap.get(obj).kind == Kind::ModuleNamespace {
+            return self.module_namespace_get(obj, key, key_v);
+        }
         // Cheapest-integer-first: the canonical-index probe runs before any
         // surface. Kind-guarded to Array/Arguments, so other receivers flow
         // through unchanged; for index keys on arrays every later surface
@@ -907,6 +910,46 @@ impl Interp<'_> {
         Some(Ok(self.map_set_method(constant)))
     }
 
+    fn module_namespace_get(
+        &mut self,
+        namespace: Handle<JsObject>,
+        key: Option<PropKey>,
+        _key_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let Some(key) = key.filter(|key| key.is_string()) else {
+            return Ok(JsValue::undefined());
+        };
+        let shape = self.shape_of(namespace);
+        let Some(desc) = self.heap.lookup_property(shape, key).copied() else {
+            return Ok(JsValue::undefined());
+        };
+        let Some(slot) = desc.slot() else {
+            return Ok(JsValue::undefined());
+        };
+        let stored = self
+            .heap
+            .get(namespace)
+            .properties
+            .get(slot as usize)
+            .copied()
+            .unwrap_or_else(JsValue::undefined);
+        let Some(cell) = stored.as_object() else {
+            return Ok(stored);
+        };
+        let binding = self
+            .heap
+            .get(cell)
+            .binding_cell
+            .as_ref()
+            .expect("module namespace property stores a binding cell");
+        if !binding.initialized {
+            return Err(JSException(
+                self.error_value("ReferenceError: Cannot access binding before initialization"),
+            ));
+        }
+        Ok(binding.value)
+    }
+
     /// Shape-bound lookup with the polymorphic inline cache: probe the IC
     /// first (only data descriptors with a slot are cached; up to
     /// `IC_MAX_ENTRIES` shapes per site), then walk the own shape and the
@@ -1106,6 +1149,15 @@ impl Interp<'_> {
             if !ok && strict {
                 return Err(JSException(
                     self.error_value("TypeError: 'set' on proxy returned false"),
+                ));
+            }
+            return Ok(());
+        }
+
+        if self.heap.get(obj).kind == Kind::ModuleNamespace {
+            if strict {
+                return Err(JSException(
+                    self.error_value("TypeError: Cannot assign to module namespace property"),
                 ));
             }
             return Ok(());
@@ -1605,6 +1657,38 @@ impl Interp<'_> {
         key: PropKey,
     ) -> Option<OwnDesc> {
         let kind = self.heap.get(obj).kind;
+        if kind == Kind::ModuleNamespace {
+            let shape = self.shape_of(obj);
+            let Some(desc) = self.heap.lookup_property(shape, key).copied() else {
+                return None;
+            };
+            let Some(slot) = desc.slot() else {
+                return None;
+            };
+            let stored = self
+                .heap
+                .get(obj)
+                .properties
+                .get(slot as usize)
+                .copied()
+                .unwrap_or_else(JsValue::undefined);
+            let value = stored
+                .as_object()
+                .filter(|&cell| self.heap.get(cell).kind == Kind::BindingCell)
+                .and_then(|cell| self.heap.get(cell).binding_cell.as_ref())
+                .map_or(stored, |binding| binding.value);
+            return Some(OwnDesc {
+                has_value: true,
+                value,
+                has_writable: true,
+                writable: true,
+                has_enumerable: true,
+                enumerable: true,
+                has_configurable: true,
+                configurable: false,
+                ..Default::default()
+            });
+        }
         if kind == Kind::Arguments
             && self.heap.get(obj).arguments_strict
             && key == PropKey::from_string(self.heap.intern_text("callee"))
@@ -1819,6 +1903,10 @@ impl Interp<'_> {
         if self.heap.get(obj).kind == Kind::Proxy {
             return self.proxy_op_delete(obj, key_v);
         }
+        if self.heap.get(obj).kind == Kind::ModuleNamespace {
+            let key = self.property_key(key_v)?;
+            return Ok(self.ordinary_own_descriptor(obj, key).is_none());
+        }
         self.delete_property(JsValue::object(obj), key_v)
     }
 
@@ -1875,6 +1963,9 @@ impl Interp<'_> {
     ) -> Result<bool, JSException> {
         if self.heap.get(obj).kind == Kind::Proxy {
             return self.proxy_op_define_own_property(obj, key, desc);
+        }
+        if self.heap.get(obj).kind == Kind::ModuleNamespace {
+            return Ok(false);
         }
         self.ordinary_define_from_own_desc(obj, key, desc)
     }
@@ -3138,6 +3229,11 @@ impl Interp<'_> {
         // Proxy exotic: `[[Delete]]` is the `deleteProperty` trap (ES 10.5.10).
         if self.heap.get(obj).kind == Kind::Proxy {
             return self.proxy_op_delete(obj, key_v);
+        }
+
+        if self.heap.get(obj).kind == Kind::ModuleNamespace {
+            let key = self.property_key(key_v)?;
+            return Ok(self.ordinary_own_descriptor(obj, key).is_none());
         }
 
         // Flatten-once so the index scan and the intern below share it.

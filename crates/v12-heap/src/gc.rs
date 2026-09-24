@@ -292,6 +292,11 @@ pub struct Heap {
     /// [`Heap::deregister_realm_global`] when a realm is destroyed.
     realm_globals: Vec<Handle<JsObject>>,
 
+    /// Namespace/environment handles retained by the module map. Rust-side
+    /// linker records are not GC-visible, so these heap objects are permanent
+    /// roots for the engine lifetime and keep their cells transitively live.
+    module_roots: Vec<Handle<JsObject>>,
+
     /// `Symbol.for` registry: key string → the single shared symbol for
     /// that key on this heap (spec: one registry per agent; per-heap
     /// here). Handles are GC roots (marked at each collection start,
@@ -356,6 +361,7 @@ impl Heap {
             validity_cells: Vec::new(),
             interned_strings: rustc_hash::FxHashMap::default(),
             realm_globals: Vec::new(),
+            module_roots: Vec::new(),
             symbol_registry: rustc_hash::FxHashMap::default(),
             symbol_registry_reverse: rustc_hash::FxHashMap::default(),
             stub_cache: StubCache::new(),
@@ -420,6 +426,13 @@ impl Heap {
     /// [`Heap::realm_globals`] field docs).
     pub fn realm_globals(&self) -> &[Handle<JsObject>] {
         &self.realm_globals
+    }
+
+    /// Registers a module namespace/environment as a permanent GC root.
+    pub fn add_module_root(&mut self, object: Handle<JsObject>) {
+        if !self.module_roots.contains(&object) {
+            self.module_roots.push(object);
+        }
     }
 
     /// `Symbol.for` shared symbol for `key`: the registered handle on a
@@ -1341,6 +1354,9 @@ impl Heap {
         for &global in &self.realm_globals {
             collector.mark(Space::Objects, global.index());
         }
+        for &module_object in &self.module_roots {
+            collector.mark(Space::Objects, module_object.index());
+        }
         // Canonical string instances are permanent roots: the interning
         // table promises deduplication for the heap's whole lifetime, so a
         // canonical instance can never be reclaimed while the table stands.
@@ -1563,6 +1579,8 @@ mod tests {
             prototype: proto,
             proxy_target: None,
             proxy_handler: None,
+            binding_cell: None,
+            module_namespace: None,
             validity_cell: ValidityCellId::NONE,
             private_brand: None,
             private_fields: None,

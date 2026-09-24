@@ -59,17 +59,6 @@ pub const MAX_ENV_SLOTS: u16 = 65_535;
 pub const NATIVE_IMPORT_INDEX: u16 = 254;
 pub const NATIVE_IMPORT_INDEX_U32: u32 = NATIVE_IMPORT_INDEX as u32;
 
-/// Hidden global slot capturing `export default <expr>` values.
-///
-/// The expression form of `export default` has no local binding to read in
-/// the module epilogue that assembles the exports object, so lowering stores
-/// the value into this global slot and the epilogue reads it back. The NUL
-/// prefix makes a collision with source-level identifiers impossible, and
-/// sequential module evaluation (one module body runs to completion before
-/// the next starts) means concurrent modules cannot clobber each other's
-/// capture within a synchronous evaluation.
-pub const DEFAULT_EXPORT_GLOBAL: &str = "\u{0}default";
-
 /// Native index for `Object.enumerableOwnKeys` - returns array of own enumerable property keys.
 /// Must match `v12_native::NativeId::ObjectEnumerableOwnKeys` (1003).
 pub const NATIVE_OBJECT_ENUMERABLE_OWN_KEYS: u32 = 1003;
@@ -167,9 +156,38 @@ pub struct ImportEntry {
 #[derive(Debug, Clone)]
 pub struct ExportEntry {
     pub specifier: Option<String>,
+    /// Source export name for `export {x as y} from "./m.js"`.
+    pub imported: Option<String>,
     pub local: Option<SymbolId>,
     pub exported: String,
     pub span: Option<(u32, u32)>,
+}
+
+/// Linkage role for one seeded module-main binding slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleBindingSource {
+    /// A binding declared by this module.
+    Local,
+    /// `import ... from`; the slot aliases the source export cell.
+    Import { specifier: String, imported: String },
+    /// `export {x as y} from`; the slot aliases the source export cell.
+    ReExport { specifier: String, imported: String },
+    /// `export default <expression>` has no Oxc symbol and uses a synthetic slot.
+    DefaultExpression,
+}
+
+/// Runtime seeding/linkage plan for a module-main environment slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleBindingPlan {
+    pub symbol: Option<SymbolId>,
+    pub name: String,
+    pub env_slot: u16,
+    pub source: ModuleBindingSource,
+    /// Export names backed by this same cell. Empty for non-exported imports.
+    pub exports: Vec<String>,
+    /// Module `var` and function bindings are initialized during declaration
+    /// instantiation; lexical bindings begin uninitialized (TDZ).
+    pub initially_initialized: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +401,8 @@ pub struct Plans {
     pub imports: Vec<ImportEntry>,
     /// Module linkage: exports recorded during collection (module mode only).
     pub exports: Vec<ExportEntry>,
+    /// Seeded module-main environment slots and their cell-link sources.
+    pub module_bindings: Vec<ModuleBindingPlan>,
 }
 
 impl Plans {

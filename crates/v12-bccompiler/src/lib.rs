@@ -83,7 +83,8 @@ use oxc_semantic::Scoping;
 use oxc_span::{GetSpan, SourceType};
 
 pub use model::{
-    CompileError, ExportEntry, ImportEntry, Interner, NATIVE_IMPORT_INDEX, NATIVE_IMPORT_INDEX_U32,
+    CompileError, ExportEntry, ImportEntry, Interner, ModuleBindingPlan, ModuleBindingSource,
+    NATIVE_IMPORT_INDEX, NATIVE_IMPORT_INDEX_U32,
 };
 
 /// Re-exported from [`v12_bytecode::Program`]: the canonical home
@@ -123,6 +124,7 @@ pub struct Module {
     pub program: Program,
     pub imports: Vec<ImportEntry>,
     pub exports: Vec<ExportEntry>,
+    pub binding_plan: Vec<ModuleBindingPlan>,
 }
 
 /// Parses and compiles JavaScript source text (script grammar, strict mode
@@ -320,7 +322,9 @@ pub fn compile_source_as_module_with_interner(
             span: None,
         });
     }
-    let semantic = oxc_semantic::SemanticBuilder::new().build(&parsed.program);
+    let semantic = oxc_semantic::SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program);
     if let Some(d) = semantic.diagnostics.errors().next() {
         return Err(CompileError {
             message: format!("semantic error: {d}"),
@@ -330,8 +334,8 @@ pub fn compile_source_as_module_with_interner(
             }),
         });
     }
-    let scoping = semantic.semantic.into_scoping();
-    compile_ast_as_module_inner(&parsed.program, &scoping, interner)
+    let (scoping, nodes) = semantic.semantic.into_scoping_and_nodes();
+    compile_ast_as_module_inner(&parsed.program, &scoping, interner, Some(&nodes))
 }
 
 /// Compiles an already-parsed module `Program` (module source type) into a
@@ -340,7 +344,7 @@ pub fn compile_ast_as_module(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
 ) -> Result<Module, CompileError> {
-    compile_ast_as_module_inner(program, scoping, &mut Interner::default())
+    compile_ast_as_module_inner(program, scoping, &mut Interner::default(), None)
 }
 
 fn early_module_syntax_error(src: &str) -> Option<CompileError> {
@@ -516,12 +520,14 @@ fn compile_ast_as_module_inner(
     program: &oxc_ast::ast::Program<'_>,
     scoping: &Scoping,
     interner: &mut Interner,
+    nodes: Option<&oxc_semantic::AstNodes<'_>>,
 ) -> Result<Module, CompileError> {
     // Modules are always strict, even without a directive.
     let strict = true;
-    let plans = collect::collect_module(program, scoping, strict)?;
+    let plans = collect::collect_module_with_nodes(program, scoping, strict, nodes)?;
     let imports = plans.imports.clone();
     let exports = plans.exports.clone();
+    let binding_plan = plans.module_bindings.clone();
     let mut comp = model::Compiler {
         scoping,
         strings: interner,
@@ -545,6 +551,7 @@ fn compile_ast_as_module_inner(
         },
         imports,
         exports,
+        binding_plan,
     })
 }
 

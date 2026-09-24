@@ -185,6 +185,7 @@ pub fn compile_unit(
         Vec::new()
     };
 
+    let uses_seeded_env = idx == 0 && comp.plans.is_module;
     let mut cx = FnCtx::new(comp, idx);
     cx.b.is_top_level = idx == 0;
     // Flag generator/async on the underlying FunctionBuilder before emission.
@@ -382,6 +383,8 @@ pub fn compile_unit(
         }
     }
     let mut fb = cx.finish()?;
+    fb.uses_seeded_env = uses_seeded_env;
+    fb.env_slots = comp.plans.units[idx].env_slot_count;
     fb.name_hint = Some(comp.plans.units[idx].name_hint.clone());
     // Top-level await: nested functions compile to their own units, so any
     // `Await` in the main unit's own instruction stream is a module-body
@@ -408,7 +411,7 @@ pub fn compile_unit(
     fb.needs_arguments = plan.needs_arguments;
     let eval_metadata =
         if comp.emit_eval_metadata || plan.eval_reachable || !plan.direct_eval_sites.is_empty() {
-            let bindings = plan
+            let mut bindings: Vec<(String, v12_bytecode::BindingLocation)> = plan
                 .binding_descriptors
                 .iter()
                 .map(|(name, loc)| {
@@ -420,6 +423,39 @@ pub fn compile_unit(
                     (name.clone(), location)
                 })
                 .collect();
+            // Captured module bindings are not declarations of the function
+            // containing a direct-eval site. Add their home location so eval
+            // can reach the seeded cell through the function's environment
+            // chain instead of treating the name as an unbound global.
+            for site in &plan.direct_eval_sites {
+                for (name, _) in &site.caller.bindings {
+                    if bindings.iter().any(|(old, _)| old == name) {
+                        continue;
+                    }
+                    let Some((symbol, _)) = comp
+                        .plans
+                        .symbol_names
+                        .iter()
+                        .find(|(_, binding_name)| *binding_name == name)
+                    else {
+                        continue;
+                    };
+                    let Some(home) = comp.plans.home_of.get(symbol) else {
+                        continue;
+                    };
+                    let Some(location) = comp.plans.units[*home].vars.get(symbol) else {
+                        continue;
+                    };
+                    bindings.push((
+                        name.clone(),
+                        match location {
+                            VarLoc::Reg(reg) => v12_bytecode::BindingLocation::Register(*reg),
+                            VarLoc::Env(slot) => v12_bytecode::BindingLocation::Env(*slot),
+                            VarLoc::Global => v12_bytecode::BindingLocation::Global,
+                        },
+                    ));
+                }
+            }
             let direct_eval_sites = plan
                 .direct_eval_sites
                 .iter()
@@ -477,7 +513,7 @@ fn emit_prologue(
         )
     };
 
-    if has_env {
+    if has_env && !(cx.unit == 0 && cx.comp.plans.is_module) {
         let ancestor_envs = if cx.unit == 0 {
             0
         } else {
@@ -566,45 +602,13 @@ fn emit_prologue(
     Ok(())
 }
 
-/// Emits the module epilogue: materialize the exports object and return it.
-///
-/// Named exports read their local binding (register/env/global access —
-/// whatever `collect` assigned); `export default <expr>` reads the hidden
-/// capture slot written by the declaration lowering
-/// ([`crate::model::DEFAULT_EXPORT_GLOBAL`]); re-exports (`export ... from`)
-/// are skipped (their linkage is not modeled yet). The returned object is the
-/// module's completion value and doubles as its namespace snapshot in the
-/// engine's loader.
+/// Module export values live in loader-seeded environment cells. The main
+/// returns `undefined`; the engine returns the already-linked namespace rather
+/// than copying completion values into it.
 fn emit_exports_epilogue(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {
-    let exports = cx.comp.plans.exports.clone();
-    let span = oxc_span::Span::default();
-    let obj = cx.new_temp();
-    cx.emit_reg3(Opcode::NewObject, obj, 0, 0, span);
-    for e in &exports {
-        if e.specifier.is_some() {
-            continue;
-        }
-        let value = if let Some(sym) = e.local {
-            let access = cx.access(sym);
-            let dst = cx.new_temp();
-            cx.read_access(access, dst, span);
-            dst
-        } else if e.exported == "default" {
-            let name_id = crate::model::str_id_of(
-                cx.comp
-                    .strings
-                    .get_or_intern(crate::model::DEFAULT_EXPORT_GLOBAL),
-            );
-            let dst = cx.new_temp();
-            cx.emit_get_global(dst, name_id, span);
-            dst
-        } else {
-            continue;
-        };
-        let key = cx.load_str_key(&e.exported, span)?;
-        cx.emit_reg3(Opcode::SetProperty, obj, key, value, span);
-    }
-    cx.emit_reg1(Opcode::Return, obj, span);
+    let dst = cx.new_temp();
+    cx.load_undefined(dst, oxc_span::Span::default());
+    cx.emit_reg1(Opcode::Return, dst, oxc_span::Span::default());
     Ok(())
 }
 
@@ -648,26 +652,10 @@ fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError>
         cx.emit_call(callee, callee, 1, span);
         let ns_reg = callee;
 
-        // Wire named imports: `local = ns[imported]`. Side-effect imports
-        // (local == None) produce no wiring; the call's side effect is the
-        // whole effect.
-        for e in entries {
-            let Some(local) = e.local else { continue };
-            if e.imported == "*" {
-                // `import * as ns from` : whole namespace object.
-                let access = cx.access(local);
-                cx.store_access(access, ns_reg, span);
-            } else if e.imported.is_empty() {
-                continue;
-            } else {
-                let key = cx.new_temp();
-                cx.load_str(key, &e.imported, span)?;
-                let dst = cx.new_temp();
-                cx.emit_reg3(Opcode::GetProperty, dst, ns_reg, key, span);
-                let access = cx.access(local);
-                cx.store_access(access, dst, span);
-            }
-        }
+        // The loader links every imported environment slot directly to the
+        // source export cell before main runs. The native call still executes
+        // for side-effect-only imports and keeps the synchronous graph seam.
+        let _ = (entries, ns_reg);
     }
     Ok(())
 }
