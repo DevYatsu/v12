@@ -843,6 +843,7 @@ impl Interp<'_> {
                 return Err(JSException(exc));
             };
             self.drop_frame_arguments(&popped);
+            self.drop_frame_context(popped.base);
             self.stack.truncate(popped.base);
             self.notify_tier_ups();
             if self.frames.is_empty() {

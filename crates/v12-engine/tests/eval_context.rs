@@ -100,6 +100,16 @@ fn nested_eval_contexts_keep_env_and_caller_bindings() {
 }
 
 #[test]
+fn thrown_eval_frame_context_does_not_leak_to_later_frame() {
+    assert_eq!(
+        result(
+            "function first() { try { return (() => eval(\"throw new Error('x')\"))(); } catch (e) { return 'caught'; } } function second() { return (() => eval(\"typeof stale\"))(); } first() + ':' + second()"
+        ),
+        "caught:undefined"
+    );
+}
+
+#[test]
 fn top_level_and_indirect_eval_keep_global_var_scope() {
     assert_eq!(
         result("eval(\"var topLevelProbe = 7\"); topLevelProbe"),
