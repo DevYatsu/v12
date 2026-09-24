@@ -2084,21 +2084,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             let direct_eval =
                 matches!(&c.callee, Expression::Identifier(id) if id.name.as_str() == "eval");
-            let call_pc = self.b.pc();
             self.emit_call(block, block, argc, c.span);
             if direct_eval {
-                let logical_pc = if self.b.pc() > call_pc + 1 {
-                    call_pc + 1
-                } else {
-                    call_pc
-                };
+                // `emit_call` ends with the narrow Call instruction, whether
+                // or not a preceding RegExt prefix was required.
+                let call_pc = self.b.pc().saturating_sub(1);
                 if let Some(site) = self.comp.plans.units[self.unit]
                     .direct_eval_sites
                     .iter_mut()
                     .rev()
                     .find(|site| site.pc.is_none())
                 {
-                    site.pc = Some(logical_pc);
+                    site.pc = Some(call_pc);
                 }
             }
             return Ok(block);

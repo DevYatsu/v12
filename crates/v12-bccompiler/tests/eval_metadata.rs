@@ -30,6 +30,35 @@ fn direct_eval_call_site_is_marked_without_new_opcode() {
 }
 
 #[test]
+fn direct_eval_site_pc_points_at_call_instruction() {
+    let params = (0..260)
+        .map(|index| format!("p{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let program = compile_source(&format!("function f({params}) {{ return eval('1'); }}")).unwrap();
+    let f = program
+        .functions
+        .iter()
+        .find(|f| {
+            f.name_hint
+                .as_deref()
+                .is_some_and(|name| name.ends_with(":f"))
+        })
+        .unwrap();
+    let site = f
+        .eval_metadata
+        .as_ref()
+        .unwrap()
+        .direct_eval_sites
+        .first()
+        .unwrap();
+    assert_eq!(
+        f.instrs[site.pc as usize].op(),
+        Some(v12_bytecode::Opcode::Call)
+    );
+}
+
+#[test]
 fn eval_reachable_bindings_are_promoted_to_environment() {
     let program =
         compile_source("function f() { let x = 1; return eval('(function(){ return x; })'); }")
