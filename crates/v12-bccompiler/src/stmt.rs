@@ -520,6 +520,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // IteratorClose convention used by for-of.
         let close_guard = self.new_temp();
         self.load_bool(close_guard, false, span);
+        // Spec 7.4.17 step 6 asks whether the *last* IteratorStepValue saw
+        // `done` — the iterator record's [[Done]] flag. Tracking it in a
+        // register keeps the step-6 check from consuming an extra value from
+        // a live iterator (an extra `next()` here is observable: it advances
+        // generators and can throw where the pattern must complete normally).
+        let last_done = self.new_temp();
+        self.load_bool(last_done, true, span);
         let exc = self.new_temp();
         let try_start = self.pc();
 
@@ -530,6 +537,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.load_str(done_key, "done", span)?;
             let done = self.new_temp();
             self.emit_reg3(Opcode::GetProperty, done, result, done_key, span);
+            self.move_reg(last_done, done, span);
             let done_label = self.label();
             self.emit_jump(Opcode::JumpIfTrue, done, done_label);
 
@@ -557,6 +565,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.lower_binding_pattern(pat, value)?;
             }
             self.bind(next_label);
+        }
+
+        if a.rest.is_none() {
+            // A pattern without rest must distinguish exhaustion from an early
+            // normal completion (spec 7.4.17 step 6). Reuse the last step's
+            // `done` flag: `true` means the iterator is already exhausted and
+            // must not be closed; `false` means an early normal completion, so
+            // close with normal-completion validation of the `return()` result.
+            // The guard is armed before the close so a close error re-entering
+            // the handler cannot close a second time.
+            let exhausted = self.label();
+            self.emit_jump(Opcode::JumpIfTrue, last_done, exhausted);
+            self.load_bool(close_guard, true, span);
+            self.emit_reg3(Opcode::IteratorClose, iter, 1, 0, span);
+            self.bind(exhausted);
         }
 
         if let (Some(rest), Some(rest_array)) = (&a.rest, rest_array) {
