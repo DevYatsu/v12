@@ -290,7 +290,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         let probe_key = self.new_temp();
                         self.load_str(probe_key, "next", y.span)?;
                         let probe_next = self.new_temp();
-                        self.emit_reg3(Opcode::GetProperty, probe_next, iterable, probe_key, y.span);
+                        self.emit_reg3(
+                            Opcode::GetProperty,
+                            probe_next,
+                            iterable,
+                            probe_key,
+                            y.span,
+                        );
                         let array_fallback = self.label();
                         self.emit_jump(Opcode::JumpIfFalse, probe_next, array_fallback);
                         self.move_reg(iter, iterable, y.span);
@@ -340,65 +346,65 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     self.load_str(done_key, "done", y.span)?;
                     let value_key = self.new_temp();
                     self.load_str(value_key, "value", y.span)?;
-                     let loop_end = self.label();
-                     let result = self.new_temp();
-                     let next_fn = self.new_temp();
-                     self.emit_reg3(Opcode::GetProperty, next_fn, iter, next_key, y.span);
-                     let (block, argc) = if async_generator {
-                         let block = self.new_temps(CALL_HEADER_REGS + 1);
-                         self.load_undefined(block + 2, y.span);
-                         (block, 1)
-                     } else {
-                         (self.new_temps(CALL_HEADER_REGS), 0)
-                     };
-                     self.move_reg(block, next_fn, y.span);
-                     self.move_reg(block + 1, iter, y.span);
-                     self.emit_call(block, block, argc, y.span);
-                     self.move_reg(result, block, y.span);
-                     if async_generator {
-                         let awaited_result = self.new_temp();
-                         self.emit_reg3(Opcode::Await, awaited_result, result, 0, y.span);
-                         self.move_reg(result, awaited_result, y.span);
-                     }
-                     let process_result = self.label();
-                     self.bind(process_result);
-                     let done_val = self.new_temp();
-                     self.emit_reg3(Opcode::GetProperty, done_val, result, done_key, y.span);
-                     self.emit_jump(Opcode::JumpIfTrue, done_val, loop_end);
-                     let yielded = self.new_temp();
-                     self.emit_reg3(Opcode::GetProperty, yielded, result, value_key, y.span);
-                     if async_generator {
-                         let awaited_yield = self.new_temp();
-                          self.emit_reg3(Opcode::Await, awaited_yield, yielded, 1, y.span);
-                         self.move_reg(yielded, awaited_yield, y.span);
-                     }
-                     let ydst = self.new_temp();
-                     self.move_reg(ydst, yielded, y.span);
-                     // Resume value forwarding: after the first inner next(),
-                     // the value sent to the delegating yield flows to
-                     // `inner.next(v)`.
-                     self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, y.span);
-                     if async_generator {
-                         let awaited_resume = self.new_temp();
-                         self.emit_reg3(Opcode::Await, awaited_resume, ydst, 0, y.span);
-                         self.move_reg(ydst, awaited_resume, y.span);
-                     }
-                     // Return-completion dispatch runs first (it must not fall
-                     // through to the next(v) call below).
-                     self.emit_delegate_return_path(ydst, iter, async_generator, y.span)?;
-                     let fwd_block = self.new_temps(CALL_HEADER_REGS + 1);
-                     self.emit_reg3(Opcode::GetProperty, fwd_block, iter, next_key, y.span);
-                     self.move_reg(fwd_block + 1, iter, y.span);
-                     self.move_reg(fwd_block + 2, ydst, y.span);
-                     self.emit_call(fwd_block, fwd_block, 1, y.span);
-                     self.move_reg(result, fwd_block, y.span);
-                     if async_generator {
-                         let awaited_result = self.new_temp();
-                         self.emit_reg3(Opcode::Await, awaited_result, result, 0, y.span);
-                         self.move_reg(result, awaited_result, y.span);
-                     }
-                     self.emit_jump(Opcode::Jump, 0, process_result);
-                     self.bind(loop_end);
+                    let loop_end = self.label();
+                    let result = self.new_temp();
+                    let next_fn = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, next_fn, iter, next_key, y.span);
+                    let (block, argc) = if async_generator {
+                        let block = self.new_temps(CALL_HEADER_REGS + 1);
+                        self.load_undefined(block + 2, y.span);
+                        (block, 1)
+                    } else {
+                        (self.new_temps(CALL_HEADER_REGS), 0)
+                    };
+                    self.move_reg(block, next_fn, y.span);
+                    self.move_reg(block + 1, iter, y.span);
+                    self.emit_call(block, block, argc, y.span);
+                    self.move_reg(result, block, y.span);
+                    if async_generator {
+                        let awaited_result = self.new_temp();
+                        self.emit_reg3(Opcode::Await, awaited_result, result, 0, y.span);
+                        self.move_reg(result, awaited_result, y.span);
+                    }
+                    let process_result = self.label();
+                    self.bind(process_result);
+                    let done_val = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, done_val, result, done_key, y.span);
+                    self.emit_jump(Opcode::JumpIfTrue, done_val, loop_end);
+                    let yielded = self.new_temp();
+                    self.emit_reg3(Opcode::GetProperty, yielded, result, value_key, y.span);
+                    if async_generator {
+                        let awaited_yield = self.new_temp();
+                        self.emit_reg3(Opcode::Await, awaited_yield, yielded, 1, y.span);
+                        self.move_reg(yielded, awaited_yield, y.span);
+                    }
+                    let ydst = self.new_temp();
+                    self.move_reg(ydst, yielded, y.span);
+                    // Resume value forwarding: after the first inner next(),
+                    // the value sent to the delegating yield flows to
+                    // `inner.next(v)`.
+                    self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, y.span);
+                    if async_generator {
+                        let awaited_resume = self.new_temp();
+                        self.emit_reg3(Opcode::Await, awaited_resume, ydst, 0, y.span);
+                        self.move_reg(ydst, awaited_resume, y.span);
+                    }
+                    // Return-completion dispatch runs first (it must not fall
+                    // through to the next(v) call below).
+                    self.emit_delegate_return_path(ydst, iter, async_generator, y.span)?;
+                    let fwd_block = self.new_temps(CALL_HEADER_REGS + 1);
+                    self.emit_reg3(Opcode::GetProperty, fwd_block, iter, next_key, y.span);
+                    self.move_reg(fwd_block + 1, iter, y.span);
+                    self.move_reg(fwd_block + 2, ydst, y.span);
+                    self.emit_call(fwd_block, fwd_block, 1, y.span);
+                    self.move_reg(result, fwd_block, y.span);
+                    if async_generator {
+                        let awaited_result = self.new_temp();
+                        self.emit_reg3(Opcode::Await, awaited_result, result, 0, y.span);
+                        self.move_reg(result, awaited_result, y.span);
+                    }
+                    self.emit_jump(Opcode::Jump, 0, process_result);
+                    self.bind(loop_end);
                     self.emit_reg3(Opcode::GetProperty, ret, result, value_key, y.span);
                     self.bind(done_label);
                     return Ok(ret);
@@ -931,13 +937,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.move_reg(block, rfn, span);
         self.move_reg(block + 1, iter, span);
         self.move_reg(block + 2, ydst, span);
-         self.emit_call(block, block, 1, span);
-         if async_generator {
-             let awaited_return = self.new_temp();
-             self.emit_reg3(Opcode::Await, awaited_return, block, 0, span);
-             self.move_reg(block, awaited_return, span);
-         }
-         let value_key = self.new_temp();
+        self.emit_call(block, block, 1, span);
+        if async_generator {
+            let awaited_return = self.new_temp();
+            self.emit_reg3(Opcode::Await, awaited_return, block, 0, span);
+            self.move_reg(block, awaited_return, span);
+        }
+        let value_key = self.new_temp();
         self.load_str(value_key, "value", span)?;
         let rvalue = self.new_temp();
         self.emit_reg3(Opcode::GetProperty, rvalue, block, value_key, span);

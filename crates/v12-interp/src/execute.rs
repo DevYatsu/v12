@@ -835,7 +835,8 @@ impl Interp<'_> {
                         .copied()
                         .unwrap_or_else(JsValue::undefined);
                     self.stack[base + usize::from(dst)] = v;
-                    if ops::to_boolean(self.heap, v) && rb != 0
+                    if ops::to_boolean(self.heap, v)
+                        && rb != 0
                         && let Some(return_value) = self
                             .heap
                             .get(generator)

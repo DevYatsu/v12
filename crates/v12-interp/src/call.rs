@@ -69,9 +69,8 @@ pub(crate) fn fill_stack_call_window(
             right[..to_copy].copy_from_slice(&left[arg_src..arg_src + to_copy]);
         } else {
             let (left, right) = interp.stack.split_at_mut(dst_start);
-            left[dst_start..dst_start + to_copy].copy_from_slice(
-                &right[arg_src - dst_start..arg_src - dst_start + to_copy],
-            );
+            left[dst_start..dst_start + to_copy]
+                .copy_from_slice(&right[arg_src - dst_start..arg_src - dst_start + to_copy]);
         }
         let rest_len = argc.saturating_sub(fixed_usize);
         let slice = if rest_len > 0 {
@@ -95,9 +94,8 @@ pub(crate) fn fill_stack_call_window(
             right[..copied].copy_from_slice(&left[arg_src..arg_src + copied]);
         } else {
             let (left, right) = interp.stack.split_at_mut(dst_start);
-            left[dst_start..dst_start + copied].copy_from_slice(
-                &right[arg_src - dst_start..arg_src - dst_start + copied],
-            );
+            left[dst_start..dst_start + copied]
+                .copy_from_slice(&right[arg_src - dst_start..arg_src - dst_start + copied]);
         }
     }
 }

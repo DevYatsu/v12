@@ -18,7 +18,11 @@ fn last_generator(interp: &Interp<'_>) -> Handle<JsObject> {
         .filter(|&h| {
             let generator = interp.heap().get(h);
             generator.kind == Kind::Generator
-                && generator.properties.get(2).and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64())) != Some(1.0)
+                && generator
+                    .properties
+                    .get(2)
+                    .and_then(|v| v.as_smi().map(|n| n as f64).or(v.as_f64()))
+                    != Some(1.0)
         })
         .last()
         .expect("test setup creates a generator")
@@ -97,10 +101,7 @@ fn pending_promise(interp: &Interp<'_>) -> JsValue {
         .expect("test setup creates a pending promise")
 }
 
-fn take_iterator_result(
-    interp: &mut Interp<'_>,
-    request: JsValue,
-) -> IteratorResult {
+fn take_iterator_result(interp: &mut Interp<'_>, request: JsValue) -> IteratorResult {
     let mut settlements = interp.take_pending_settlements();
     assert_eq!(settlements.len(), 1, "one request settles exactly once");
     let (promise, payload, rejected) = settlements.pop().unwrap();
@@ -113,7 +114,9 @@ fn take_iterator_result(
             rejected: true,
         };
     }
-    let result = payload.as_object().expect("resolved request has an iterator result");
+    let result = payload
+        .as_object()
+        .expect("resolved request has an iterator result");
     let (value, done) = {
         let object = interp.heap().get(result);
         assert_eq!(object.properties.len(), 2);
@@ -210,7 +213,10 @@ fn async_yield_star_awaits_resume_value_before_forwarding_next() {
     settle_ready_promises(&mut interp);
     let promise = promise_value.as_object().unwrap();
     assert_eq!(interp.heap().get(promise).properties[0].as_smi(), Some(1));
-    assert_eq!(interp.to_display_string(interp.heap().get(promise).properties[1]), "42");
+    assert_eq!(
+        interp.to_display_string(interp.heap().get(promise).properties[1]),
+        "42"
+    );
     let generator = last_generator(&interp);
     let first = call_generator_method(
         &mut interp,
@@ -278,7 +284,10 @@ fn async_yield_star_delegates_return_after_awaiting_values() {
     settle_ready_promises(&mut interp);
     let promise = promise_value.as_object().unwrap();
     assert_eq!(interp.heap().get(promise).properties[0].as_smi(), Some(1));
-    assert_eq!(interp.to_display_string(interp.heap().get(promise).properties[1]), "7");
+    assert_eq!(
+        interp.to_display_string(interp.heap().get(promise).properties[1]),
+        "7"
+    );
     let generator = last_generator(&interp);
     let first = call_generator_method(
         &mut interp,

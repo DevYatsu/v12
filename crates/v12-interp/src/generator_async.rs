@@ -269,11 +269,7 @@ impl Interp<'_> {
             .is_some_and(|v| v.is_true())
     }
 
-    pub(crate) fn set_async_gen_from_sync(
-        &mut self,
-        r#gen: Handle<JsObject>,
-        from_sync: bool,
-    ) {
+    pub(crate) fn set_async_gen_from_sync(&mut self, r#gen: Handle<JsObject>, from_sync: bool) {
         self.ensure_async_gen_slots(r#gen);
         self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_FROM_SYNC_SLOT] =
             JsValue::from_bool(from_sync);
@@ -424,11 +420,7 @@ impl Interp<'_> {
             }
             o.properties[5] = ops::box_number(1.0);
         }
-        self.set_generator_header_value(
-            r#gen,
-            Self::GENERATOR_RETURN_VALUE_SLOT,
-            arg,
-        );
+        self.set_generator_header_value(r#gen, Self::GENERATOR_RETURN_VALUE_SLOT, arg);
         if self.is_async_generator_for(r#gen) {
             let request = self.alloc_async_gen_request();
             self.set_async_gen_request(r#gen, request);
