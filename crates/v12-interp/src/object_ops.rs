@@ -351,6 +351,20 @@ impl Interp<'_> {
         src_v: JsValue,
         is_async: bool,
     ) -> Result<JsValue, JSException> {
+        self.get_iterator_with_mode(src_v, is_async)
+            .map(|(iterator, _)| iterator)
+    }
+
+    /// Returns the iterator and whether it came from AsyncFromSyncIterator.
+    /// A direct `next` fallback is the engine's manual async-iterator
+    /// representation; a `Symbol.iterator` fallback must continue awaiting
+    /// each yielded value.
+    pub(crate) fn get_iterator_with_mode(
+        &mut self,
+        src_v: JsValue,
+        is_async: bool,
+    ) -> Result<(JsValue, bool), JSException> {
+        let mut from_sync = false;
         // 1. `method = GetV(iterable, @@iterator)` — resolve the well-known
         //    symbol first so the lookup uses the real symbol key.
         let method = if is_async {
@@ -376,8 +390,9 @@ impl Interp<'_> {
                         .as_object()
                         .is_some_and(|h| matches!(self.heap.get(h).kind, Kind::Function))
                 {
-                    return Ok(src_v);
+                    return Ok((src_v, false));
                 }
+                from_sync = true;
                 self.iterator_symbol_method(src_v)?
             } else {
                 async_method
@@ -409,7 +424,7 @@ impl Interp<'_> {
         let result = self.call_value(JsValue::object(method_obj), src_v, &[]);
         self.stack.pop();
         match result {
-            Ok(v) if v.as_object().is_some() => Ok(v),
+            Ok(v) if v.as_object().is_some() => Ok((v, from_sync)),
             Ok(_) => Err(JSException(self.error_value(
                 "TypeError: result of Symbol.iterator call is not an object",
             ))),

@@ -369,7 +369,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                      self.emit_reg3(Opcode::GetProperty, yielded, result, value_key, y.span);
                      if async_generator {
                          let awaited_yield = self.new_temp();
-                         self.emit_reg3(Opcode::Await, awaited_yield, yielded, 0, y.span);
+                          self.emit_reg3(Opcode::Await, awaited_yield, yielded, 1, y.span);
                          self.move_reg(yielded, awaited_yield, y.span);
                      }
                      let ydst = self.new_temp();
@@ -899,7 +899,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     fn emit_suspend_yield(&mut self, ydst: u16, _iter: Option<u16>, span: Span) -> Res<()> {
         self.emit_reg3(Opcode::SuspendYield, ydst, 0, 0, span);
         let mode = self.new_temp();
-        self.emit_reg2(Opcode::GenResumeMode, mode, 0, span);
+        self.emit_reg3(Opcode::GenResumeMode, mode, ydst, 0, span);
         let resume_ok = self.label();
         self.emit_jump(Opcode::JumpIfFalse, mode, resume_ok);
         self.emit_yield_return_finally_copies()?;

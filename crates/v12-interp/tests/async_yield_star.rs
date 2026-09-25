@@ -3,6 +3,7 @@ use v12_interp::{Interp, NativeId};
 
 struct IteratorResult {
     value: String,
+    raw_value: JsValue,
     done: bool,
     rejected: bool,
 }
@@ -107,6 +108,7 @@ fn take_iterator_result(
     if rejected {
         return IteratorResult {
             value: interp.to_display_string(payload),
+            raw_value: payload,
             done: true,
             rejected: true,
         };
@@ -119,6 +121,7 @@ fn take_iterator_result(
     };
     IteratorResult {
         value: interp.to_display_string(value),
+        raw_value: value,
         done,
         rejected: false,
     }
@@ -151,12 +154,15 @@ fn async_yield_star_uses_async_iterator_and_awaits_next_result() {
 }
 
 #[test]
-fn async_yield_star_awaits_each_delegated_value_promise() {
+fn async_yield_star_preserves_manual_async_iterator_value_promise() {
     let src = "var iterable = { \
-                 next() { return { value: valuePromise(), done: false }; } \
+                 next() { return resultPromise(); } \
                }; \
-               async function valuePromise() { return 'awaited'; } \
-               async function* ag() { yield* iterable; } \
+               async function resultPromise() { \
+                 return { value: valuePromise(), done: false }; \
+               } \
+               async function valuePromise() { return 'unwrapped value'; } \
+               async function* ag() { return yield* iterable; } \
                var it = ag();";
     let mut heap = Heap::new(GcPolicy::NoGC);
     let mut interp = Interp::from_source(&mut heap, src).expect("compile");
@@ -171,7 +177,13 @@ fn async_yield_star_awaits_each_delegated_value_promise() {
     drive_request(&mut interp, request);
 
     let result = take_iterator_result(&mut interp, request);
-    assert_eq!(result.value, "awaited");
+    assert_eq!(result.value, "[object Object]");
+    assert!(
+        result
+            .raw_value
+            .as_object()
+            .is_some_and(|h| interp.heap().get(h).kind == Kind::Promise)
+    );
     assert!(!result.done);
     assert!(!result.rejected);
 }
@@ -289,6 +301,54 @@ fn async_yield_star_delegates_return_after_awaiting_values() {
 
     let result = take_iterator_result(&mut interp, request);
     assert_eq!(result.value, "inner:7");
+    assert!(result.done);
+    assert!(!result.rejected);
+}
+
+#[test]
+fn async_yield_star_return_survives_finally_yield() {
+    let src = "async function* ag() { \
+                 try { yield 'first'; } \
+                 finally { yield 2; } \
+               } \
+               var it = ag();";
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = Interp::from_source(&mut heap, src).expect("compile");
+    run_setup(&mut interp);
+    let generator = last_generator(&interp);
+
+    let first = call_generator_method(
+        &mut interp,
+        NativeId::GeneratorNext,
+        generator,
+        JsValue::undefined(),
+    );
+    drive_request(&mut interp, first);
+    let first_result = take_iterator_result(&mut interp, first);
+    assert_eq!(first_result.value, "first");
+    assert!(!first_result.done);
+
+    let sent_value = JsValue::string(interp.heap_mut().intern_text("sent-value"));
+    let returned = call_generator_method(
+        &mut interp,
+        NativeId::GeneratorReturn,
+        generator,
+        sent_value,
+    );
+    drive_request(&mut interp, returned);
+    let yielded = take_iterator_result(&mut interp, returned);
+    assert_eq!(yielded.value, "2");
+    assert!(!yielded.done);
+
+    let completed = call_generator_method(
+        &mut interp,
+        NativeId::GeneratorNext,
+        generator,
+        JsValue::undefined(),
+    );
+    drive_request(&mut interp, completed);
+    let result = take_iterator_result(&mut interp, completed);
+    assert_eq!(result.value, "sent-value");
     assert!(result.done);
     assert!(!result.rejected);
 }

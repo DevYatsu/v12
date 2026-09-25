@@ -806,23 +806,45 @@ impl Interp<'_> {
                     // `@@asyncIterator`, fall back to `@@iterator`.
                     let src_v = self.stack[base + usize::from(rb)];
                     self.gc_protect();
-                    let iter = attempt!(self.get_iterator(src_v, true));
+                    let (iter, from_sync) = attempt!(self.get_iterator_with_mode(src_v, true));
+                    if let Some(generator) = self.frames.last().and_then(|frame| frame.generator)
+                        && self.is_async_generator_for(generator)
+                    {
+                        self.set_async_gen_from_sync(generator, from_sync);
+                    }
                     self.stack[base + usize::from(ra)] = iter;
                     self.set_pc(pc + op_width);
                 }
                 Opcode::GenResumeMode => {
                     // Loads the resumed generator's pending-mode slot: 0 =
-                    // normal `next()` resume, 1 = `return(v)` completion (the
-                    // resume value is the return value). Reads the generator
-                    // attached to the current frame.
+                    // normal `next()` resume, 1 = `return(v)` completion. For a
+                    // return completion, restore the original return value into
+                    // the caller-provided register so a finalizer yield does
+                    // not replace it with the following next() argument.
                     let dst = ra;
-                    let v = self
+                    let generator = self
                         .frames
                         .last()
                         .and_then(|f| f.generator)
-                        .and_then(|g| self.heap.get(g).properties.get(5).copied())
+                        .expect("GenResumeMode requires a generator frame");
+                    let v = self
+                        .heap
+                        .get(generator)
+                        .properties
+                        .get(5)
+                        .copied()
                         .unwrap_or_else(JsValue::undefined);
                     self.stack[base + usize::from(dst)] = v;
+                    if ops::to_boolean(self.heap, v) && rb != 0
+                        && let Some(return_value) = self
+                            .heap
+                            .get(generator)
+                            .properties
+                            .get(Self::GENERATOR_RETURN_VALUE_SLOT)
+                            .copied()
+                    {
+                        self.stack[base + usize::from(rb)] = return_value;
+                    }
                     self.set_pc(pc + op_width);
                 }
                 Opcode::IteratorNext => {
@@ -1108,6 +1130,19 @@ impl Interp<'_> {
                             .get(fn_idx_of_frame as usize)
                             .is_some_and(|f| f.is_async && !f.is_generator)
                     };
+                    // AsyncIterator.next() promises are awaited by the
+                    // delegation lowering, but its value is already the
+                    // iterator's raw value. Only AsyncFromSyncIterator needs
+                    // the extra value await.
+                    if rc == 1
+                        && !frame_is_async_fn
+                        && self.is_async_generator_for(r#gen)
+                        && !self.async_gen_from_sync(r#gen)
+                    {
+                        self.stack[base + usize::from(dst)] = arg;
+                        self.set_pc(pc + op_width);
+                        continue 'drive;
+                    }
                     let async_promise = if self.heap.get(r#gen).properties.len() > 4 {
                         self.heap.get(r#gen).properties[4]
                     } else {

@@ -18,6 +18,9 @@ impl Interp<'_> {
     /// async generators; the resume path reads it to decide whether the
     /// pending request promise settles now or stays parked on the await.
     pub(crate) const ASYNC_GEN_YIELD_SLOT: usize = 7;
+    /// `true` when `GetAsyncIterator` used the AsyncFromSyncIterator fallback.
+    pub(crate) const ASYNC_GEN_FROM_SYNC_SLOT: usize = 10;
+    pub(crate) const GENERATOR_RETURN_VALUE_SLOT: usize = 9;
     /// Retained materialized arguments value for every generator/async header.
     pub(crate) const GENERATOR_ARGUMENTS_SLOT: usize = 8;
 
@@ -157,11 +160,11 @@ impl Interp<'_> {
         (fn_idx, o.program_id)
     }
 
-    /// Pads an async generator's property slots through
-    /// `ASYNC_GEN_YIELD_SLOT` so the request-promise and yield-flag slots are
-    /// addressable (generators are created with only the 4 header slots).
+    /// Pads an async generator's property slots through the delegation marker
+    /// so request, yield, and AsyncFromSyncIterator state are addressable
+    /// (generators are created with only the 4 header slots).
     fn ensure_async_gen_slots(&mut self, r#gen: Handle<JsObject>) {
-        let need = Self::ASYNC_GEN_YIELD_SLOT + 1;
+        let need = Self::ASYNC_GEN_FROM_SYNC_SLOT + 1;
         let o = self.heap.get_mut(r#gen);
         if o.properties.len() < need {
             o.properties.resize(need, JsValue::undefined());
@@ -256,6 +259,24 @@ impl Interp<'_> {
             .properties
             .get(Self::ASYNC_GEN_YIELD_SLOT)
             .is_some_and(|v| v.is_true())
+    }
+
+    pub(crate) fn async_gen_from_sync(&self, r#gen: Handle<JsObject>) -> bool {
+        self.heap
+            .get(r#gen)
+            .properties
+            .get(Self::ASYNC_GEN_FROM_SYNC_SLOT)
+            .is_some_and(|v| v.is_true())
+    }
+
+    pub(crate) fn set_async_gen_from_sync(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        from_sync: bool,
+    ) {
+        self.ensure_async_gen_slots(r#gen);
+        self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_FROM_SYNC_SLOT] =
+            JsValue::from_bool(from_sync);
     }
 
     /// Marks whether the current async-generator suspension is a real `yield`
@@ -403,6 +424,11 @@ impl Interp<'_> {
             }
             o.properties[5] = ops::box_number(1.0);
         }
+        self.set_generator_header_value(
+            r#gen,
+            Self::GENERATOR_RETURN_VALUE_SLOT,
+            arg,
+        );
         if self.is_async_generator_for(r#gen) {
             let request = self.alloc_async_gen_request();
             self.set_async_gen_request(r#gen, request);
@@ -703,6 +729,9 @@ impl Interp<'_> {
                         let o = self.heap.get_mut(r#gen);
                         if o.properties.len() >= 6 {
                             o.properties[5] = ops::box_number(0.0);
+                        }
+                        if o.properties.len() > Self::GENERATOR_RETURN_VALUE_SLOT {
+                            o.properties[Self::GENERATOR_RETURN_VALUE_SLOT] = JsValue::undefined();
                         }
                     }
                     if done_val != 1.0 && self.heap.get(r#gen).properties.len() >= 3 {
