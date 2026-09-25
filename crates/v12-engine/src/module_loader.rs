@@ -499,7 +499,8 @@ pub(crate) fn link_export_stars(
             if name == "default" {
                 continue;
             }
-            let Some(cell) = super::module_namespace::export_cell(interp.heap_mut(), child_ns, &name)
+            let Some(cell) =
+                super::module_namespace::export_cell(interp.heap_mut(), child_ns, &name)
             else {
                 continue;
             };
@@ -559,9 +560,9 @@ pub(crate) fn validate_export_stars(
             if let Some(previous) = owners.get(&name)
                 && previous != &child_path
             {
-                return Err(interp.error_value(&format!(
-                    "SyntaxError: ambiguous export name '{name}'"
-                )));
+                return Err(
+                    interp.error_value(&format!("SyntaxError: ambiguous export name '{name}'"))
+                );
             }
             owners.insert(name, child_path.clone());
         }
@@ -587,8 +588,14 @@ pub(crate) fn link_binding_cells(
     for binding in record.binding_plan.iter() {
         let (specifier, imported, reexport) = match &binding.source {
             ModuleBindingSource::Local | ModuleBindingSource::DefaultExpression => continue,
-            ModuleBindingSource::Import { specifier, imported } => (specifier, imported, false),
-            ModuleBindingSource::ReExport { specifier, imported } => (specifier, imported, true),
+            ModuleBindingSource::Import {
+                specifier,
+                imported,
+            } => (specifier, imported, false),
+            ModuleBindingSource::ReExport {
+                specifier,
+                imported,
+            } => (specifier, imported, true),
         };
         let child_path = resolve_specifier(base, specifier);
         let child = {
@@ -617,17 +624,13 @@ pub(crate) fn link_binding_cells(
             );
             continue;
         }
-        let cell = super::module_namespace::export_cell(
-            interp.heap_mut(),
-            child_ns,
-            imported,
-        )
-        .ok_or_else(|| {
-            string_value(
-                interp.heap_mut(),
-                &format!("The requested module does not provide an export named '{imported}'"),
-            )
-        })?;
+        let cell = super::module_namespace::export_cell(interp.heap_mut(), child_ns, imported)
+            .ok_or_else(|| {
+                string_value(
+                    interp.heap_mut(),
+                    &format!("The requested module does not provide an export named '{imported}'"),
+                )
+            })?;
         super::module_namespace::set_env_cell(
             interp.heap_mut(),
             record.env,
@@ -635,7 +638,10 @@ pub(crate) fn link_binding_cells(
             cell,
         );
         if reexport {
-            let namespace = record.namespace.as_object().expect("module namespace object");
+            let namespace = record
+                .namespace
+                .as_object()
+                .expect("module namespace object");
             super::module_namespace::set_export_cell(
                 interp.heap_mut(),
                 namespace,

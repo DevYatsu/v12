@@ -482,14 +482,7 @@ impl<'s> Collector<'s> {
     fn enter_object_method(&mut self, p: &oxc_ast::ast::ObjectProperty<'_>) {
         if let Expression::FunctionExpression(f) = &p.value {
             let hint = static_key_or_default(&p.key);
-            self.fn_unit_ext(
-                f,
-                false,
-                &format!("<objmethod>:{hint}"),
-                true,
-                true,
-                false,
-            );
+            self.fn_unit_ext(f, false, &format!("<objmethod>:{hint}"), true, true, false);
         }
     }
 
@@ -2263,7 +2256,10 @@ fn build_module_binding_plans(plans: &mut Plans, scoping: &Scoping) {
                     symbol: None,
                     name: export.exported.clone(),
                     env_slot: 0,
-                    source: ModuleBindingSource::ReExport { specifier, imported },
+                    source: ModuleBindingSource::ReExport {
+                        specifier,
+                        imported,
+                    },
                     exports: vec![export.exported],
                     initially_initialized: true,
                 });
@@ -2272,7 +2268,10 @@ fn build_module_binding_plans(plans: &mut Plans, scoping: &Scoping) {
         }
         if let Some(symbol) = export.local {
             let name = scoping.symbol_name(symbol).to_string();
-            let plan = plans.module_bindings.iter_mut().find(|plan| plan.symbol == Some(symbol));
+            let plan = plans
+                .module_bindings
+                .iter_mut()
+                .find(|plan| plan.symbol == Some(symbol));
             if let Some(plan) = plan {
                 if !plan.exports.contains(&export.exported) {
                     plan.exports.push(export.exported);

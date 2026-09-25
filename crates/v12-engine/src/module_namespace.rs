@@ -1,9 +1,7 @@
 //! Module namespace exotic objects and live binding-cell installation.
 
 use v12_bccompiler::ModuleBindingPlan;
-use v12_heap::{
-    Attrs, Handle, Heap, JsObject, JsValue, Kind, ModuleNamespaceRecord, PropKey,
-};
+use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, Kind, ModuleNamespaceRecord, PropKey};
 
 /// Allocates an empty namespace object: `[[Prototype]]` null and
 /// `[[Extensible]]` false from birth.
@@ -65,7 +63,9 @@ pub(crate) fn alloc_linked_module(
         }
         let child = heap.add_property(shape, key, attrs);
         heap.bind_shape(namespace, child);
-        heap.get_mut(namespace).properties.push(JsValue::object(cell));
+        heap.get_mut(namespace)
+            .properties
+            .push(JsValue::object(cell));
         heap.get_mut(namespace).property_keys.push(Some(key));
         record_cells.push(cell);
     }
@@ -111,7 +111,9 @@ pub(crate) fn set_or_add_export_cell(
     }
     let child = heap.add_property(shape, key, Attrs::new(true, true, false));
     heap.bind_shape(namespace, child);
-    heap.get_mut(namespace).properties.push(JsValue::object(cell));
+    heap.get_mut(namespace)
+        .properties
+        .push(JsValue::object(cell));
     heap.get_mut(namespace).property_keys.push(Some(key));
 }
 
@@ -197,7 +199,9 @@ pub(crate) fn export_names(heap: &mut Heap, namespace: Handle<JsObject>) -> Vec<
             let handle = key.string()?;
             heap.flatten(handle);
             match &heap.get(handle).storage {
-                v12_heap::StrStorage::Latin1(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+                v12_heap::StrStorage::Latin1(bytes) => {
+                    Some(String::from_utf8_lossy(bytes).into_owned())
+                }
                 v12_heap::StrStorage::Utf16(units) => Some(String::from_utf16_lossy(units)),
                 _ => None,
             }
@@ -214,7 +218,10 @@ pub(crate) fn export_cell(
     let key = PropKey::from_string(heap.intern_text(name));
     let shape = heap.shape_of(namespace);
     let slot = heap.lookup_property(shape, key)?.slot()?;
-    heap.get(namespace).properties.get(slot as usize)?.as_object()
+    heap.get(namespace)
+        .properties
+        .get(slot as usize)?
+        .as_object()
 }
 
 /// Linker helper for a module-main import/re-export plan slot.
@@ -224,23 +231,14 @@ pub(crate) fn set_env_cell(
     slot: u16,
     cell: Handle<JsObject>,
 ) {
-    if let Some(value) = heap
-        .get_mut(env)
-        .properties
-        .get_mut(usize::from(slot))
-    {
+    if let Some(value) = heap.get_mut(env).properties.get_mut(usize::from(slot)) {
         *value = JsValue::object(cell);
     }
 }
 
 /// Linker helper for `import * as ns`; the seeded cell holds the namespace
 /// identity as its value.
-pub(crate) fn set_env_value(
-    heap: &mut Heap,
-    env: Handle<JsObject>,
-    slot: u16,
-    value: JsValue,
-) {
+pub(crate) fn set_env_value(heap: &mut Heap, env: Handle<JsObject>, slot: u16, value: JsValue) {
     let Some(stored) = heap
         .get(env)
         .properties

@@ -50,7 +50,10 @@ fn namespace_reads_follow_later_local_writes() {
         "import * as ns from './dep.js'; globalThis.ns = ns; ns.update();",
     );
 
-    assert_true(&mut engine, "globalThis.ns.value === 2 && globalThis.ns.alias === 2");
+    assert_true(
+        &mut engine,
+        "globalThis.ns.value === 2 && globalThis.ns.alias === 2",
+    );
 }
 
 #[test]
@@ -72,7 +75,10 @@ fn self_and_cycle_imports_preserve_namespace_identity() {
     assert_true(&mut engine, "globalThis.selfSame === true");
     assert_true(&mut engine, "globalThis.bCycle === globalThis.aSelf");
     assert_true(&mut engine, "globalThis.aCycle === globalThis.bSelf");
-    assert_true(&mut engine, "globalThis.aSelf.a === 1 && globalThis.aCycle.b === 2");
+    assert_true(
+        &mut engine,
+        "globalThis.aSelf.a === 1 && globalThis.aCycle.b === 2",
+    );
 }
 
 #[test]

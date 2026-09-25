@@ -1520,11 +1520,7 @@ impl<'a> Interp<'a> {
         self.read_env_slot(env, slot)
     }
 
-    fn read_env_slot(
-        &mut self,
-        env: Handle<JsObject>,
-        slot: u16,
-    ) -> Result<JsValue, JSException> {
+    fn read_env_slot(&mut self, env: Handle<JsObject>, slot: u16) -> Result<JsValue, JSException> {
         let idx = usize::from(slot);
         let value = self
             .heap
@@ -1532,9 +1528,9 @@ impl<'a> Interp<'a> {
             .properties
             .get(idx)
             .copied()
-            .ok_or_else(|| JSException(self.error_value(
-                "InternalError: environment slot out of range",
-            )))?;
+            .ok_or_else(|| {
+                JSException(self.error_value("InternalError: environment slot out of range"))
+            })?;
         if let Some(cell) = value.as_object()
             && self.heap.get(cell).kind == v12_heap::Kind::BindingCell
         {
@@ -1545,7 +1541,9 @@ impl<'a> Interp<'a> {
                 .as_ref()
                 .expect("binding cell payload");
             if !binding.initialized {
-                return Err(JSException(self.error_value("ReferenceError: Cannot access binding before initialization")));
+                return Err(JSException(self.error_value(
+                    "ReferenceError: Cannot access binding before initialization",
+                )));
             }
             return Ok(binding.value);
         }
@@ -1559,9 +1557,15 @@ impl<'a> Interp<'a> {
         value: JsValue,
     ) -> Result<(), JSException> {
         let idx = usize::from(slot);
-        let stored = self.heap.get(env).properties.get(idx).copied().ok_or_else(|| {
-            JSException(self.error_value("InternalError: environment slot out of range"))
-        })?;
+        let stored = self
+            .heap
+            .get(env)
+            .properties
+            .get(idx)
+            .copied()
+            .ok_or_else(|| {
+                JSException(self.error_value("InternalError: environment slot out of range"))
+            })?;
         if let Some(cell) = stored.as_object()
             && self.heap.get(cell).kind == v12_heap::Kind::BindingCell
         {

@@ -943,9 +943,9 @@ impl Interp<'_> {
             .as_ref()
             .expect("module namespace property stores a binding cell");
         if !binding.initialized {
-            return Err(JSException(
-                self.error_value("ReferenceError: Cannot access binding before initialization"),
-            ));
+            return Err(JSException(self.error_value(
+                "ReferenceError: Cannot access binding before initialization",
+            )));
         }
         Ok(binding.value)
     }
@@ -1162,9 +1162,9 @@ impl Interp<'_> {
 
         if self.heap.get(obj).kind == Kind::ModuleNamespace {
             if strict {
-                return Err(JSException(
-                    self.error_value("TypeError: Cannot assign to module namespace property"),
-                ));
+                return Err(JSException(self.error_value(
+                    "TypeError: Cannot assign to module namespace property",
+                )));
             }
             return Ok(());
         }

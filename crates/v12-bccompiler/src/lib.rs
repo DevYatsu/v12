@@ -533,7 +533,9 @@ fn compile_ast_as_module_inner(
     let export_stars = plans
         .exports
         .iter()
-        .filter(|entry| entry.specifier.is_some() && entry.imported.is_none() && entry.exported == "*")
+        .filter(|entry| {
+            entry.specifier.is_some() && entry.imported.is_none() && entry.exported == "*"
+        })
         .filter_map(|entry| entry.specifier.clone())
         .collect();
     let mut comp = model::Compiler {

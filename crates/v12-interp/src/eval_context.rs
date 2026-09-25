@@ -360,9 +360,7 @@ impl Interp<'_> {
                     .copied()
                     .unwrap_or_else(JsValue::undefined),
             )),
-            EvalBindingRef::Env { env, slot } => {
-                Ok(Some(self.read_env_slot(env, slot)?))
-            }
+            EvalBindingRef::Env { env, slot } => Ok(Some(self.read_env_slot(env, slot)?)),
             EvalBindingRef::EvalLocal { env, slot } => {
                 let value = self
                     .heap

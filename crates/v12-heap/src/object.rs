@@ -332,11 +332,7 @@ impl JsObject {
 
     /// Allocates the payload for one live module binding.
     #[must_use]
-    pub fn binding_cell(
-        value: crate::JsValue,
-        initialized: bool,
-        owner_module_id: u32,
-    ) -> Self {
+    pub fn binding_cell(value: crate::JsValue, initialized: bool, owner_module_id: u32) -> Self {
         Self {
             kind: Kind::BindingCell,
             binding_cell: Some(BindingCellData {
@@ -895,11 +891,11 @@ impl SizeEstimate for JsObject {
         // prototype link.
         let proxy_slots = 2 * core::mem::size_of::<Option<Handle<JsObject>>>();
         let module_slots = core::mem::size_of::<Option<BindingCellData>>()
-            + self
-                .module_namespace
-                .as_ref()
-                .map_or(0, |record| record.cells.capacity() * core::mem::size_of::<Handle<JsObject>>());
-        16 + proxy_slots + module_slots
+            + self.module_namespace.as_ref().map_or(0, |record| {
+                record.cells.capacity() * core::mem::size_of::<Handle<JsObject>>()
+            });
+        16 + proxy_slots
+            + module_slots
             + self.properties.capacity() * VALUE_BYTES
             + self.elements.capacity() * VALUE_BYTES
             + self.property_keys.capacity() * core::mem::size_of::<Option<crate::PropKey>>()

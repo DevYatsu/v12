@@ -310,8 +310,10 @@ impl Engine {
         if let Some(loader) = self.registry.loader()
             && let Some(entry_path) = entry_path
         {
-            let canonical =
-                crate::module_loader::resolve_specifier(Path::new("."), &entry_path.to_string_lossy());
+            let canonical = crate::module_loader::resolve_specifier(
+                Path::new("."),
+                &entry_path.to_string_lossy(),
+            );
             let mut state = loader.borrow_mut();
             state.loading.insert(canonical.clone());
             state.modules.insert(
@@ -382,8 +384,10 @@ impl Engine {
         if let Some(loader) = registry.loader()
             && let Some(entry_path) = entry_path
         {
-            let canonical =
-                crate::module_loader::resolve_specifier(Path::new("."), &entry_path.to_string_lossy());
+            let canonical = crate::module_loader::resolve_specifier(
+                Path::new("."),
+                &entry_path.to_string_lossy(),
+            );
             if let Err(reason) =
                 crate::module_loader::validate_export_stars(&mut interp, &loader, &canonical, base)
             {
@@ -429,8 +433,10 @@ impl Engine {
         if let Some(loader) = registry.loader()
             && let Some(entry_path) = entry_path
         {
-            let canonical =
-                crate::module_loader::resolve_specifier(Path::new("."), &entry_path.to_string_lossy());
+            let canonical = crate::module_loader::resolve_specifier(
+                Path::new("."),
+                &entry_path.to_string_lossy(),
+            );
             let mut state = loader.borrow_mut();
             if outcome.is_ok() {
                 if let Some(record) = state.modules.get_mut(&canonical) {
