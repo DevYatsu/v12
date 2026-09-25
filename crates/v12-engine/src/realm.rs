@@ -28,6 +28,8 @@ pub const INTRINSIC_COUNT: usize = v12_bytecode::GLOBAL_VAR_OFFSET;
 pub struct Realm {
     global: Handle<JsObject>,
     intrinsics: HashMap<String, JsValue>,
+    symbol_iterator: Handle<v12_heap::V12Symbol>,
+    symbol_to_string_tag: Handle<v12_heap::V12Symbol>,
 }
 
 impl Realm {
@@ -281,6 +283,10 @@ impl Realm {
         );
         let boolean_proto = alloc_root(heap);
         let symbol_proto = alloc_root(heap);
+        let (symbol_iterator, symbol_to_string_tag) = {
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            (ctx.fresh_symbol(), ctx.fresh_symbol())
+        };
         // `RegExp.prototype`: the spec's `%RegExp.prototype%` is an ordinary
         // object; the interpreter synthesizes the method surface from
         // `Kind::RegExp`, so no own props are stamped here. Linking it at
@@ -297,6 +303,10 @@ impl Realm {
         // property (same mechanism as the `Function` constructor), which the
         // compiler's unbound-identifier path resolves through `GetGlobal`.
         let date_proto = alloc_root(heap);
+        let map_proto = alloc_root(heap);
+        heap.get_mut(map_proto).prototype = Some(object_proto);
+        let set_proto = alloc_root(heap);
+        heap.get_mut(set_proto).prototype = Some(object_proto);
 
         // Link the intrinsic constructors to their prototypes through the
         // unified install family (`install_ctor`: `prototype` field +
@@ -312,6 +322,8 @@ impl Realm {
             ("Number", number_proto),
             ("Boolean", boolean_proto),
             ("Symbol", symbol_proto),
+            ("Map", map_proto),
+            ("Set", set_proto),
             ("RegExp", regexp_proto),
         ] {
             if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
@@ -340,12 +352,69 @@ impl Realm {
             boolean_proto,
             symbol: intrinsics.get("Symbol").and_then(|v| v.as_object()),
             symbol_proto,
+            map: intrinsics.get("Map").and_then(|v| v.as_object()),
+            map_proto,
+            set: intrinsics.get("Set").and_then(|v| v.as_object()),
+            set_proto,
             proxy: intrinsics.get("Proxy").and_then(|v| v.as_object()),
             date: None,
             date_proto,
             reflect: None,
         };
         crate::builtins::install_builtins(heap, &targets);
+
+        // Replace the macro's placeholder functions with the realm's canonical
+        // well-known symbols. Both properties are non-writable,
+        // non-enumerable, and non-configurable; the same handles install the
+        // collection iterator aliases below.
+        {
+            let symbol_ctor = intrinsics
+                .get("Symbol")
+                .and_then(|v| v.as_object())
+                .expect("Symbol intrinsic");
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            assert!(ctx.redefine_data_prop_with_attrs(
+                symbol_ctor,
+                "iterator",
+                JsValue::symbol(symbol_iterator),
+                v12_heap::Attrs::new(false, false, false),
+            ));
+            assert!(ctx.redefine_data_prop_with_attrs(
+                symbol_ctor,
+                "toStringTag",
+                JsValue::symbol(symbol_to_string_tag),
+                v12_heap::Attrs::new(false, false, false),
+            ));
+        }
+
+        for (proto, method, tag_name, size_id) in [
+            (map_proto, "entries", "Map", NativeId::MapSize),
+            (set_proto, "values", "Set", NativeId::SetSize),
+        ] {
+            let method_key = v12_heap::PropKey::from_string(heap.intern_text(method));
+            let method_shape = heap.shape_of(proto);
+            let method_slot = heap
+                .get(method_shape)
+                .find_descriptor(method_key)
+                .and_then(|d| d.slot())
+                .expect("collection iterator method installed");
+            let iterator = heap.get(proto).properties[method_slot as usize];
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            ctx.define_symbol_data_prop_with_attrs(
+                proto,
+                symbol_iterator,
+                iterator,
+                v12_heap::Attrs::BUILTIN,
+            );
+            ctx.define_size_getter(proto, "get size", size_id, 0);
+            let tag = ctx.heap.intern_text(tag_name);
+            ctx.define_symbol_data_prop_with_attrs(
+                proto,
+                symbol_to_string_tag,
+                JsValue::string(tag),
+                v12_heap::Attrs::new(false, false, true),
+            );
+        }
 
         // `Date`: created and installed as an ordinary global property (see
         // the `date_proto` note above). Statics install on the constructor,
@@ -464,22 +533,16 @@ impl Realm {
         let reflect = alloc_root(heap);
         heap.get_mut(reflect).prototype = Some(object_proto);
         // `Symbol.toStringTag` = "Reflect": non-writable, non-enumerable,
-        // configurable (ES 17). Symbol-keyed, so it cannot ride the
-        // string-keyed macro install.
+        // configurable (ES 17), reusing this realm's canonical symbol.
         {
-            let symbol_ctor = intrinsics.get("Symbol").and_then(|v| v.as_object());
-            if let Some(symbol_ctor) = symbol_ctor {
-                let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
-                let tag_sym = ctx.fresh_symbol();
-                ctx.overwrite_data_prop(symbol_ctor, "toStringTag", JsValue::symbol(tag_sym));
-                let reflect_name = ctx.heap.intern_text("Reflect");
-                ctx.define_symbol_data_prop_with_attrs(
-                    reflect,
-                    tag_sym,
-                    JsValue::string(reflect_name),
-                    v12_heap::Attrs::new(false, false, true),
-                );
-            }
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            let reflect_name = ctx.heap.intern_text("Reflect");
+            ctx.define_symbol_data_prop_with_attrs(
+                reflect,
+                symbol_to_string_tag,
+                JsValue::string(reflect_name),
+                v12_heap::Attrs::new(false, false, true),
+            );
         }
         let reflect_targets = crate::builtins::BuiltinTargets {
             global,
@@ -497,6 +560,10 @@ impl Realm {
             boolean_proto,
             symbol: None,
             symbol_proto,
+            map: None,
+            map_proto,
+            set: None,
+            set_proto,
             proxy: None,
             date: None,
             date_proto,
@@ -537,13 +604,30 @@ impl Realm {
             crate::builtins::install_native(heap, Some(global), name, NativeId::Function);
         }
 
-        Self { global, intrinsics }
+        Self {
+            global,
+            intrinsics,
+            symbol_iterator,
+            symbol_to_string_tag,
+        }
     }
 
     /// Handle to the realm's global object.
     #[must_use]
     pub fn global(&self) -> Handle<JsObject> {
         self.global
+    }
+
+    /// This realm's canonical `Symbol.iterator` handle.
+    #[must_use]
+    pub fn symbol_iterator(&self) -> Handle<v12_heap::V12Symbol> {
+        self.symbol_iterator
+    }
+
+    /// This realm's canonical `Symbol.toStringTag` handle.
+    #[must_use]
+    pub fn symbol_to_string_tag(&self) -> Handle<v12_heap::V12Symbol> {
+        self.symbol_to_string_tag
     }
 
     /// Intrinsic table for inspection and native registry wiring.

@@ -372,6 +372,9 @@ impl Interp<'_> {
             return None;
         }
         if self.key_is_wk(key, WK_ITERATOR) {
+            if key.is_some_and(|key| self.has_own_descriptor(obj, key)) {
+                return None;
+            }
             return Some(Ok(JsValue::symbol(self.symbol_iterator_key())));
         }
         if self.key_is_wk(key, WK_ASYNC_ITERATOR) {
@@ -535,7 +538,15 @@ impl Interp<'_> {
         if !self.key_is_symbol_iterator(key_v) {
             return None;
         }
-        let constant = match self.heap.get(obj).kind {
+        let kind = self.heap.get(obj).kind;
+        if matches!(kind, Kind::Map | Kind::Set)
+            && self
+                .global
+                .is_some_and(|global| self.heap.is_realm_global(global))
+        {
+            return None;
+        }
+        let constant = match kind {
             Kind::Array | Kind::Arguments => crate::NativeId::ArrayIterator,
             Kind::Map => crate::NativeId::MapIterator,
             Kind::Set => crate::NativeId::SetIterator,
@@ -855,6 +866,12 @@ impl Interp<'_> {
     ) -> Option<Result<JsValue, JSException>> {
         let kind = self.heap.get(obj).kind;
         if kind != Kind::Map && kind != Kind::Set {
+            return None;
+        }
+        if self
+            .global
+            .is_some_and(|global| self.heap.is_realm_global(global))
+        {
             return None;
         }
         // `size` is a getter: invoke the handler directly with the

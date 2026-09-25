@@ -439,6 +439,31 @@ impl Interp<'_> {
         if let Some(h) = self.symbol_iterator {
             return h;
         }
+        if let Some(global) = self.global
+            && self.heap.is_realm_global(global)
+            && let Some(ctor) = self
+                .heap
+                .get(global)
+                .properties
+                .get(super::intrinsic_slot("Symbol").expect("Symbol intrinsic"))
+                .copied()
+                .and_then(|v| v.as_object())
+        {
+            let key = PropKey::from_string(self.heap.intern_text("iterator"));
+            let shape = self.shape_of(ctor);
+            if let Some(slot) = self
+                .heap
+                .lookup_property(shape, key)
+                .and_then(|desc| desc.slot())
+                .and_then(|slot| self.heap.get(ctor).properties.get(slot as usize))
+                .and_then(|value| value.as_symbol())
+            {
+                self.symbol_iterator = Some(slot);
+                return slot;
+            }
+        }
+        // Standalone interpreters have no realm Symbol constructor, so retain
+        // the historical lazy symbol allocation as their structural fallback.
         // Symbol("Symbol.iterator") — the well-known symbol's [[Description]].
         // The heap's V12Symbol is currently a unit struct; the description is
         // recorded on the Symbol intrinsic's `description` property instead

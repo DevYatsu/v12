@@ -534,6 +534,71 @@ impl<'a> Ctx<'a> {
         Some(func)
     }
 
+    /// Replaces an existing own data property's value and attributes without
+    /// appending a duplicate shape descriptor.
+    pub fn redefine_data_prop_with_attrs(
+        &mut self,
+        obj: Handle<JsObject>,
+        name: &str,
+        value: JsValue,
+        attrs: v12_heap::Attrs,
+    ) -> bool {
+        let key = v12_heap::PropKey::from_string(self.heap.intern_text(name));
+        let shape = self.heap.shape_of(obj);
+        let Some(v12_heap::Descriptor::Data { slot, .. }) =
+            self.heap.lookup_property(shape, key).copied()
+        else {
+            return false;
+        };
+        if let Some(stored) = self.heap.get_mut(obj).properties.get_mut(slot as usize) {
+            *stored = value;
+        }
+        let child = self.heap.update_data_attrs(shape, key, attrs);
+        self.heap.bind_shape(obj, child);
+        true
+    }
+
+    /// Allocates a rooted native getter and installs it as a configurable,
+    /// non-enumerable accessor named `name` on `obj`.
+    pub fn define_size_getter(
+        &mut self,
+        obj: Handle<JsObject>,
+        name: &str,
+        id: v12_native::NativeId,
+        length: u32,
+    ) -> Handle<JsObject> {
+        let getter = self.alloc_obj(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+            ..Default::default()
+        });
+        self.define_data_prop_with_attrs(
+            getter,
+            "length",
+            JsValue::from_i32_smi(length as i32).expect("getter arity fits Smi"),
+            v12_heap::Attrs::new(false, false, true),
+        );
+        let getter_name = self.heap.intern_text(name);
+        self.define_data_prop_with_attrs(
+            getter,
+            "name",
+            JsValue::string(getter_name),
+            v12_heap::Attrs::new(false, false, true),
+        );
+        let key = v12_heap::PropKey::from_string(self.heap.intern_text("size"));
+        let shape = self.heap.shape_of_mut(obj);
+        debug_assert!(self.heap.lookup_property(shape, key).is_none());
+        let child = self.heap.define_accessor(
+            shape,
+            key,
+            Some(getter),
+            None,
+            v12_heap::Attrs::new(false, false, true),
+        );
+        self.heap.bind_shape(obj, child);
+        getter
+    }
+
     /// Debug-only check (plan §3.4): `obj` has an own data descriptor for
     /// `name` whose stored value is `expected`. Fresh builtin function objects
     /// are storage-lockstep (one push per descriptor), so the descriptor slot
@@ -675,8 +740,16 @@ impl<'a> Ctx<'a> {
         );
         let child = self.heap.add_property(shape, key, attrs);
         self.heap.bind_shape(obj, child);
-        self.heap.get_mut(obj).properties.push(value);
-        self.heap.get_mut(obj).property_keys.push(Some(key));
+        let slot = (self.heap.get(child).num_own - 1) as usize;
+        let settings = self.heap.get_mut(obj);
+        if settings.properties.len() <= slot {
+            settings.properties.resize(slot + 1, JsValue::hole());
+        }
+        if settings.property_keys.len() <= slot {
+            settings.property_keys.resize(slot + 1, None);
+        }
+        settings.properties[slot] = value;
+        settings.property_keys[slot] = Some(key);
     }
 
     /// Mints a fresh, rooted symbol (identity is the handle) for a well-known

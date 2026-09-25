@@ -47,11 +47,27 @@ fn same_value_zero(a: JsValue, b: JsValue) -> bool {
 }
 
 /// Allocates an empty collection of `kind`.
-fn construct(ctx: &mut Ctx, kind: Kind) -> Result<JsValue, Throw> {
+fn construct(ctx: &mut Ctx, kind: Kind, this: JsValue) -> Result<JsValue, Throw> {
     let obj = ctx.alloc_obj(JsObject {
         kind,
         ..JsObject::default()
     });
+    let ctor_name = match kind {
+        Kind::Map => "Map",
+        Kind::Set => "Set",
+        _ => unreachable!("collection construction accepts Map and Set only"),
+    };
+    if let Some(proto) = this
+        .as_object()
+        .and_then(|ctor| ctx.heap.get(ctor).prototype)
+        .or_else(|| {
+            ctx.intrinsic(ctor_name)
+                .and_then(|v| v.as_object())
+                .and_then(|ctor| ctx.heap.get(ctor).prototype)
+        })
+    {
+        ctx.heap.get_mut(obj).prototype = Some(proto);
+    }
     Ok(JsValue::object(obj))
 }
 
@@ -99,13 +115,13 @@ fn delete(
 
 /// `Map(iterable?)` — creates a Map. The iterable is ignored for v1
 /// (constructor from entries is a later conformance item).
-pub fn map_construct(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    construct(ctx, Kind::Map)
+pub fn map_construct(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    construct(ctx, Kind::Map, this)
 }
 
 /// `Set(iterable?)` — creates a Set.
-pub fn set_construct(ctx: &mut Ctx, _this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    construct(ctx, Kind::Set)
+pub fn set_construct(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    construct(ctx, Kind::Set, this)
 }
 
 /// `Map.prototype.get(key)` — the value for `key`, or `undefined`.

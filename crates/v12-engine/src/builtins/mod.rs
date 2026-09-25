@@ -54,6 +54,10 @@ pub struct BuiltinTargets {
     pub boolean_proto: v12_heap::Handle<v12_heap::JsObject>,
     pub symbol: Option<v12_heap::Handle<v12_heap::JsObject>>,
     pub symbol_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub map: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub map_proto: v12_heap::Handle<v12_heap::JsObject>,
+    pub set: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    pub set_proto: v12_heap::Handle<v12_heap::JsObject>,
     /// The `Proxy` constructor. Statics install on it (`Proxy.revocable`);
     /// `Proxy` intentionally has no `prototype` (test262
     /// `built-ins/Proxy/proxy-no-prototype.js`), so there is no
@@ -170,6 +174,25 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::MathTan => Some(1),
         NativeId::MathTanh => Some(1),
         NativeId::MathTrunc => Some(1),
+        NativeId::MapGet => Some(1),
+        NativeId::MapSet => Some(2),
+        NativeId::MapHas => Some(1),
+        NativeId::MapDelete => Some(1),
+        NativeId::MapSize => Some(0),
+        NativeId::MapClear => Some(0),
+        NativeId::MapForEach => Some(1),
+        NativeId::MapEntries => Some(0),
+        NativeId::MapKeys => Some(0),
+        NativeId::MapValues => Some(0),
+        NativeId::SetAdd => Some(1),
+        NativeId::SetHas => Some(1),
+        NativeId::SetDelete => Some(1),
+        NativeId::SetSize => Some(0),
+        NativeId::SetClear => Some(0),
+        NativeId::SetForEach => Some(1),
+        NativeId::SetEntries => Some(0),
+        NativeId::SetKeys => Some(0),
+        NativeId::SetValues => Some(0),
         NativeId::NumberIsFinite => Some(1),
         NativeId::NumberIsInteger => Some(1),
         NativeId::NumberIsNan => Some(1),
@@ -479,16 +502,16 @@ macro_rules! __builtin_emit_install {
         $crate::builtins::install_native($heap, None, $name, $id)
     };
     (Map, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, $targets.map, $name, $id)
     };
     (MapProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, Some($targets.map_proto), $name, $id)
     };
     (Set, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, $targets.set, $name, $id)
     };
     (SetProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, Some($targets.set_proto), $name, $id)
     };
     (Iterator, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, None, $name, $id)
@@ -621,6 +644,24 @@ macro_rules! __builtin_emit_install {
         $crate::builtins::install_native_with_length(
             $heap,
             Some($targets.symbol_proto),
+            $name,
+            $id,
+            Some($len),
+        )
+    };
+    (MapProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.map_proto),
+            $name,
+            $id,
+            Some($len),
+        )
+    };
+    (SetProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.set_proto),
             $name,
             $id,
             Some($len),
@@ -870,6 +911,27 @@ define_builtins! {
         "of" (0) => ArrayOf => |heap, this, args| call_ctx(array::array_of, heap, this, args),
         "from" (1) => ArrayFrom => |heap, this, args| call_ctx(array::array_from, heap, this, args),
     },
+    MapProto {
+        "get" (1) => MapGet => |heap, this, args| call_ctx(map::map_get, heap, this, args),
+        "set" (2) => MapSet => |heap, this, args| call_ctx(map::map_set, heap, this, args),
+        "has" (1) => MapHas => |heap, this, args| call_ctx(map::map_has, heap, this, args),
+        "delete" (1) => MapDelete => |heap, this, args| call_ctx(map::map_delete, heap, this, args),
+        "clear" (0) => MapClear => |heap, this, args| call_ctx(map::map_clear, heap, this, args),
+        "forEach" (1) => MapForEach => callback_stub,
+        "entries" (0) => MapEntries => |heap, this, args| call_ctx(map::map_entries, heap, this, args),
+        "keys" (0) => MapKeys => |heap, this, args| call_ctx(map::map_keys, heap, this, args),
+        "values" (0) => MapValues => |heap, this, args| call_ctx(map::map_values, heap, this, args),
+    },
+    SetProto {
+        "add" (1) => SetAdd => |heap, this, args| call_ctx(map::set_add, heap, this, args),
+        "has" (1) => SetHas => |heap, this, args| call_ctx(map::set_has, heap, this, args),
+        "delete" (1) => SetDelete => |heap, this, args| call_ctx(map::set_delete, heap, this, args),
+        "clear" (0) => SetClear => |heap, this, args| call_ctx(map::set_clear, heap, this, args),
+        "forEach" (1) => SetForEach => callback_stub,
+        "entries" (0) => SetEntries => |heap, this, args| call_ctx(map::set_entries, heap, this, args),
+        "keys" (0) => SetKeys => |heap, this, args| call_ctx(map::set_keys, heap, this, args),
+        "values" (0) => SetValues => |heap, this, args| call_ctx(map::set_values, heap, this, args),
+    },
     Object {
         "assign" (2) => ObjectAssign => |heap, this, args| call_ctx(object::object_assign, heap, this, args),
         "is" (2) => ObjectIs => |heap, this, args| call_ctx(object::object_is, heap, this, args),
@@ -1073,26 +1135,9 @@ define_builtins! {
     ObjectConstruct => |heap, this, args| call_ctx(object::object_construct, heap, this, args),
     ArrayConstruct => |heap, this, args| call_ctx(array::array_construct, heap, this, args),
     MapConstruct => |heap, this, args| call_ctx(map::map_construct, heap, this, args),
-    MapGet => |heap, this, args| call_ctx(map::map_get, heap, this, args),
-    MapSet => |heap, this, args| call_ctx(map::map_set, heap, this, args),
-    MapHas => |heap, this, args| call_ctx(map::map_has, heap, this, args),
-    MapDelete => |heap, this, args| call_ctx(map::map_delete, heap, this, args),
     MapSize => |heap, this, args| call_ctx(map::map_size, heap, this, args),
-    MapClear => |heap, this, args| call_ctx(map::map_clear, heap, this, args),
-    MapEntries => |heap, this, args| call_ctx(map::map_entries, heap, this, args),
-    MapKeys => |heap, this, args| call_ctx(map::map_keys, heap, this, args),
-    MapValues => |heap, this, args| call_ctx(map::map_values, heap, this, args),
-    MapForEach => callback_stub,
     SetConstruct => |heap, this, args| call_ctx(map::set_construct, heap, this, args),
-    SetAdd => |heap, this, args| call_ctx(map::set_add, heap, this, args),
-    SetHas => |heap, this, args| call_ctx(map::set_has, heap, this, args),
-    SetDelete => |heap, this, args| call_ctx(map::set_delete, heap, this, args),
     SetSize => |heap, this, args| call_ctx(map::set_size, heap, this, args),
-    SetClear => |heap, this, args| call_ctx(map::set_clear, heap, this, args),
-    SetEntries => |heap, this, args| call_ctx(map::set_entries, heap, this, args),
-    SetKeys => |heap, this, args| call_ctx(map::set_keys, heap, this, args),
-    SetValues => |heap, this, args| call_ctx(map::set_values, heap, this, args),
-    SetForEach => callback_stub,
     IteratorNext => |heap, this, args| call_ctx(iterator::iterator_next, heap, this, args),
     IteratorToArray => |heap, this, args| call_ctx(iterator::iterator_to_array, heap, this, args),
     IteratorTake => |heap, this, args| call_ctx(iterator::iterator_take, heap, this, args),
