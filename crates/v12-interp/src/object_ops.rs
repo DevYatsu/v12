@@ -356,6 +356,28 @@ impl Interp<'_> {
         let method = if is_async {
             let async_method = self.async_iterator_symbol_method(src_v)?;
             if async_method.is_null() || async_method.is_undefined() {
+                // Async-generator delegation historically accepted the
+                // existing direct-`next` contract used by standalone embedders
+                // that do not materialize a Symbol constructor. Keep that
+                // narrow compatibility fallback outside for-await lowering.
+                let direct_next = self
+                    .frames
+                    .last()
+                    .and_then(|frame| frame.generator)
+                    .filter(|&generator| self.is_async_generator_for(generator))
+                    .map(|_| {
+                        self.gc_protect();
+                        let key = self.heap.intern_text("next");
+                        self.get_property(0, 0, src_v, JsValue::string(key))
+                    })
+                    .transpose()?;
+                if let Some(next) = direct_next
+                    && next
+                        .as_object()
+                        .is_some_and(|h| matches!(self.heap.get(h).kind, Kind::Function))
+                {
+                    return Ok(src_v);
+                }
                 self.iterator_symbol_method(src_v)?
             } else {
                 async_method

@@ -671,15 +671,6 @@ impl Interp<'_> {
         };
         match exec_res {
             Ok(()) => {
-                // The pending return-completion mode is consumed by the
-                // compiled `GenResumeMode` check; reset it so later resumes
-                // are normal `next()` payloads.
-                {
-                    let o = self.heap.get_mut(r#gen);
-                    if o.properties.len() >= 6 {
-                        o.properties[5] = ops::box_number(0.0);
-                    }
-                }
                 // Discriminate suspend (done==2.0, frames popped) vs
                 // completion (done==1.0).
                 let done_val = self
@@ -704,6 +695,16 @@ impl Interp<'_> {
                     Ok(None)
                 } else {
                     let ret = self.top_result.take().unwrap_or(JsValue::undefined());
+                    // The pending return-completion mode is consumed only by
+                    // completion. An internal await may suspend between the
+                    // user yield and the delegated return trampoline, so keep
+                    // the mode while done == 2 (suspended).
+                    {
+                        let o = self.heap.get_mut(r#gen);
+                        if o.properties.len() >= 6 {
+                            o.properties[5] = ops::box_number(0.0);
+                        }
+                    }
                     if done_val != 1.0 && self.heap.get(r#gen).properties.len() >= 3 {
                         self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
                     }
