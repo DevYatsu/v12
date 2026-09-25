@@ -396,6 +396,17 @@ impl Engine {
                 return Err(reason);
             }
             if let Err(reason) =
+                crate::module_loader::link_export_stars(&mut interp, &loader, &canonical, base)
+            {
+                if let Some(loader) = registry.loader() {
+                    let mut state = loader.borrow_mut();
+                    state.modules.remove(&canonical);
+                    state.loading.remove(&canonical);
+                }
+                drop(interp);
+                return Err(reason);
+            }
+            if let Err(reason) =
                 crate::module_loader::link_binding_cells(&mut interp, &loader, &canonical, base)
             {
                 if let Some(loader) = registry.loader() {

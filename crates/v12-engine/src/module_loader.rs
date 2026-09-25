@@ -404,6 +404,11 @@ pub(crate) fn load_and_evaluate(
         state.borrow_mut().modules.remove(path);
         return Err(reason);
     }
+    if let Err(reason) = link_export_stars(interp, state, path, &dir) {
+        state.borrow_mut().loading.remove(path);
+        state.borrow_mut().modules.remove(path);
+        return Err(reason);
+    }
     if let Err(reason) = link_binding_cells(interp, state, path, &dir) {
         state.borrow_mut().loading.remove(path);
         state.borrow_mut().modules.remove(path);
@@ -451,6 +456,65 @@ pub(crate) fn load_and_evaluate(
     Ok(namespace)
 }
 
+/// Compatibility alias installation for `export *`. This intentionally does
+/// not attempt full star-export resolution; it copies already validated child
+/// cells so the previously passing arbitrary-name star probe remains usable.
+pub(crate) fn link_export_stars(
+    interp: &mut Interp<'_>,
+    state: &Loader,
+    module_path: &Path,
+    base: &Path,
+) -> Result<(), JsValue> {
+    let record = state
+        .borrow()
+        .modules
+        .get(module_path)
+        .cloned()
+        .expect("linked module record");
+    let namespace = record
+        .namespace
+        .as_object()
+        .expect("linked module namespace object");
+    for specifier in record.export_stars.iter() {
+        let child_path = resolve_specifier(base, specifier);
+        let child = {
+            let state = state.borrow();
+            state
+                .modules
+                .get(&child_path)
+                .or_else(|| state.deferred.get(&child_path))
+                .cloned()
+        };
+        let Some(child) = child else {
+            return Err(string_value(
+                interp.heap_mut(),
+                &format!("Unlinked module import: '{specifier}'"),
+            ));
+        };
+        let child_ns = child
+            .namespace
+            .as_object()
+            .expect("linked module namespace object");
+        for name in super::module_namespace::export_names(interp.heap_mut(), child_ns) {
+            if name == "default" {
+                continue;
+            }
+            let Some(cell) = super::module_namespace::export_cell(interp.heap_mut(), child_ns, &name)
+            else {
+                continue;
+            };
+            super::module_namespace::set_or_add_export_cell(
+                interp.heap_mut(),
+                namespace,
+                &name,
+                cell,
+            );
+        }
+    }
+    super::module_namespace::sort_exports(interp.heap_mut(), namespace);
+    Ok(())
+}
+
 /// Compatibility validation for indirect `export *` entries. Full star
 /// export materialization remains deferred, but duplicate names from distinct
 /// source modules must reject dynamic imports as `SyntaxError` rather than
@@ -495,10 +559,9 @@ pub(crate) fn validate_export_stars(
             if let Some(previous) = owners.get(&name)
                 && previous != &child_path
             {
-                return Err(string_value(
-                    interp.heap_mut(),
-                    &format!("SyntaxError: ambiguous export name '{name}'"),
-                ));
+                return Err(interp.error_value(&format!(
+                    "SyntaxError: ambiguous export name '{name}'"
+                )));
             }
             owners.insert(name, child_path.clone());
         }

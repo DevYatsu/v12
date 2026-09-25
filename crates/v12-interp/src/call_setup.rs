@@ -894,7 +894,8 @@ impl Interp<'_> {
             .map_err(|t| JSException::from_throw(self.heap, t))
     }
 
-    pub(crate) fn error_value(&mut self, text: &str) -> JsValue {
+    /// Creates a realm-linked error value for embedder/module-loader failures.
+    pub fn error_value(&mut self, text: &str) -> JsValue {
         let (kind, message) = match text.split_once(": ") {
             Some((n, m)) => (n, m),
             None => ("Error", text),

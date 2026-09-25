@@ -93,6 +93,93 @@ pub(crate) fn set_export_cell(
     }
 }
 
+/// Installs a cell for an export name, adding the compatibility star alias
+/// when the name was not part of the initial local export plan.
+pub(crate) fn set_or_add_export_cell(
+    heap: &mut Heap,
+    namespace: Handle<JsObject>,
+    name: &str,
+    cell: Handle<JsObject>,
+) {
+    let key = PropKey::from_string(heap.intern_text(name));
+    let shape = heap.shape_of(namespace);
+    if let Some(desc) = heap.get(shape).descriptors.find(key).copied()
+        && let Some(slot) = desc.slot()
+    {
+        heap.get_mut(namespace).properties[slot as usize] = JsValue::object(cell);
+        return;
+    }
+    let child = heap.add_property(shape, key, Attrs::new(true, true, false));
+    heap.bind_shape(namespace, child);
+    heap.get_mut(namespace).properties.push(JsValue::object(cell));
+    heap.get_mut(namespace).property_keys.push(Some(key));
+}
+
+/// Rebuilds export slots in string-key order after compatibility star aliases
+/// are installed. This keeps the namespace's sorted-key invariant without
+/// attempting full star-export resolution.
+pub(crate) fn sort_exports(heap: &mut Heap, namespace: Handle<JsObject>) {
+    let shape = heap.shape_of(namespace);
+    let mut entries: Vec<(String, PropKey, JsValue)> = Vec::new();
+    let descriptors: Vec<(PropKey, Option<u32>)> = heap
+        .get(shape)
+        .descriptors
+        .as_slice()
+        .iter()
+        .map(|descriptor| (descriptor.key(), descriptor.slot()))
+        .collect();
+    for (key, slot) in descriptors {
+        let Some(slot) = slot else {
+            continue;
+        };
+        let Some(handle) = key.string() else {
+            continue;
+        };
+        heap.flatten(handle);
+        let text = match &heap.get(handle).storage {
+            v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+            v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
+            _ => continue,
+        };
+        let value = heap
+            .get(namespace)
+            .properties
+            .get(slot as usize)
+            .copied()
+            .unwrap_or_else(JsValue::undefined);
+        entries.push((text, key, value));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries.dedup_by(|a, b| a.1 == b.1);
+
+    let owner_module_id = heap
+        .get(namespace)
+        .module_namespace
+        .as_ref()
+        .map_or(0, |record| record.owner_module_id);
+    heap.bind_shape(namespace, heap.root_shape());
+    let object = heap.get_mut(namespace);
+    object.properties.clear();
+    object.property_keys.clear();
+    object.module_namespace = None;
+
+    let mut cells = Vec::with_capacity(entries.len());
+    for (_, key, value) in entries {
+        let shape = heap.shape_of(namespace);
+        let child = heap.add_property(shape, key, Attrs::new(true, true, false));
+        heap.bind_shape(namespace, child);
+        heap.get_mut(namespace).properties.push(value);
+        heap.get_mut(namespace).property_keys.push(Some(key));
+        if let Some(cell) = value.as_object() {
+            cells.push(cell);
+        }
+    }
+    heap.get_mut(namespace).module_namespace = Some(ModuleNamespaceRecord {
+        owner_module_id,
+        cells,
+    });
+}
+
 /// Export names currently linked on a namespace, used only for compatibility
 /// validation of `export *` ambiguity.
 pub(crate) fn export_names(heap: &mut Heap, namespace: Handle<JsObject>) -> Vec<String> {
