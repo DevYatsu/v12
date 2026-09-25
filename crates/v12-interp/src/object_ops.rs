@@ -365,6 +365,24 @@ impl Interp<'_> {
         is_async: bool,
     ) -> Result<(JsValue, bool), JSException> {
         let mut from_sync = false;
+        // The realm's String prototype does not materialize a separate string
+        // iterator yet. Reuse the canonical array iterator with UTF-16 code
+        // units rather than adding a second iterator protocol.
+        if !is_async && let Some(text) = src_v.as_string() {
+            let units = ops::string_units(self.heap, text);
+            let values: Vec<JsValue> = units
+                .into_iter()
+                .map(|unit| {
+                    JsValue::string(self.heap.intern_string(v12_heap::V12Str::utf16(vec![unit])))
+                })
+                .collect();
+            self.gc_protect();
+            let array = self.heap.alloc(JsObject::array(values));
+            let shape = self.array_shape();
+            self.bind_shape(array, shape);
+            self.link_array_proto(array);
+            return self.get_iterator_with_mode(JsValue::object(array), false);
+        }
         // 1. `method = GetV(iterable, @@iterator)` — resolve the well-known
         //    symbol first so the lookup uses the real symbol key.
         let method = if is_async {

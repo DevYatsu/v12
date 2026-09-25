@@ -350,7 +350,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         .as_ref()
                         .ok_or_else(|| self.err(v.span, "destructuring requires an initializer"))?;
                     let val = self.expr(src)?;
-                    self.array_pattern_store(a, val)?;
+                    // Keep the direct, spread-free array-literal fast path. It
+                    // preserves the ordinary-array ABI for embedders and the
+                    // compiler mini harness; all other sources use the general
+                    // iterator lowering below.
+                    let direct_array = matches!(
+                        src,
+                        Expression::ArrayExpression(arr)
+                            if !arr.elements.iter().any(|el| matches!(
+                                el,
+                                oxc_ast::ast::ArrayExpressionElement::SpreadElement(_)
+                            ))
+                    );
+                    if direct_array {
+                        self.array_pattern_store_fixed(a, val)?;
+                    } else {
+                        self.array_pattern_store(a, val)?;
+                    }
                 }
                 BindingPattern::AssignmentPattern(ap) => {
                     return Err(
@@ -449,31 +465,26 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(())
     }
 
-    /// `let [a, b, ...rest] = arr` with nested, default, and rest via slice.
-    fn array_pattern_store(&mut self, a: &ArrayPattern<'_>, src: u16) -> Res<()> {
-        // An all-elision `[,]` with no rest emits zero reads: require
-        // coercibility so `null`/`undefined` still throw `TypeError`.
+    /// Direct spread-free array literals retain the historical fixed-index
+    /// lowering. This is an optimization for an already-known array source,
+    /// not a second iterable protocol.
+    fn array_pattern_store_fixed(&mut self, a: &ArrayPattern<'_>, src: u16) -> Res<()> {
         if a.rest.is_none() && a.elements.iter().all(|el| el.is_none()) {
             self.emit_require_object_coercible(src, a.span)?;
         }
-        let fixed_len = a.elements.len();
-        for (idx, el) in a.elements.iter().enumerate() {
-            let Some(pat) = el else { continue };
+        for (idx, pat) in a.elements.iter().enumerate() {
+            let Some(pat) = pat else { continue };
             let key = self.new_temp();
             self.load_str(key, &idx.to_string(), pat.span())?;
-            // Spec 14.3.3.3 step 2: ResolveBinding before the `GetV` (step 3).
-            // The index key is already a string, so no ToPropertyKey is due.
             self.probe_resolve_binding(pat, pat.span())?;
-            let tmp = self.new_temp();
-            self.emit_reg3(Opcode::GetProperty, tmp, src, key, pat.span());
-            self.lower_binding_pattern(pat, tmp)?;
+            let value = self.new_temp();
+            self.emit_reg3(Opcode::GetProperty, value, src, key, pat.span());
+            self.lower_binding_pattern(pat, value)?;
         }
         if let Some(rest) = &a.rest {
             let dst = self.new_temp();
-            let start = fixed_len as u16;
+            let start = a.elements.len() as u16;
             if start <= u16::from(u8::MAX) {
-                // Registers may exceed 255 while `start` fits its immediate
-                // slot: a RegExt prefix extends only the register slots.
                 self.emit_reg2_imm8(Opcode::CopyArrayRest, dst, src, start as u8, rest.span);
             } else {
                 let words = WideOp::CopyArrayRestW { dst, src, start }.encode();
@@ -481,6 +492,123 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             self.lower_binding_pattern(&rest.argument, dst)?;
         }
+        Ok(())
+    }
+
+    /// `let [a, b, ...rest] = iterable` with nested, default, and rest via
+    /// the iterator protocol. `CopyArrayRest` is intentionally not used here:
+    /// it is the array-only fast path for spread and assignment targets.
+    fn array_pattern_store(&mut self, a: &ArrayPattern<'_>, src: u16) -> Res<()> {
+        let span = a.span;
+        // ArrayBindingPattern starts with RequireObjectCoercible, including the
+        // all-elision form. GetIterator then supplies the same general-iterable
+        // protocol used by for-of and yield*.
+        self.emit_require_object_coercible(src, span)?;
+        if a.rest.is_none() && a.elements.iter().all(|el| el.is_none()) {
+            return Ok(());
+        }
+
+        let iter = self.new_temp();
+        self.emit_reg3(Opcode::GetIterator, iter, src, 0, span);
+        let rest_array = a.rest.as_ref().map(|_| self.new_temp());
+        if let Some(rest_array) = rest_array {
+            self.emit_new_array(rest_array, self.undef_reg(), 0, span);
+        }
+
+        // Iterator acquisition succeeded. From here through the last binding
+        // store, an abrupt completion follows the existing exception-range and
+        // IteratorClose convention used by for-of.
+        let close_guard = self.new_temp();
+        self.load_bool(close_guard, false, span);
+        let exc = self.new_temp();
+        let try_start = self.pc();
+
+        for el in &a.elements {
+            let result = self.new_temp();
+            self.emit_reg3(Opcode::IteratorNext, result, iter, 0, span);
+            let done_key = self.new_temp();
+            self.load_str(done_key, "done", span)?;
+            let done = self.new_temp();
+            self.emit_reg3(Opcode::GetProperty, done, result, done_key, span);
+            let done_label = self.label();
+            self.emit_jump(Opcode::JumpIfTrue, done, done_label);
+
+            let value = self.new_temp();
+            let value_key = self.new_temp();
+            self.load_str(value_key, "value", span)?;
+            self.emit_reg3(Opcode::GetProperty, value, result, value_key, span);
+            if let Some(pat) = el {
+                // ResolveBinding happens after IteratorValue and before the
+                // binding initialization, matching the existing nested lowering.
+                self.probe_resolve_binding(pat, pat.span())?;
+                self.lower_binding_pattern(pat, value)?;
+            }
+            let next_label = self.label();
+            self.emit_jump(Opcode::Jump, 0, next_label);
+
+            self.bind(done_label);
+            if let Some(pat) = el {
+                // A completed iterator supplies undefined for the remaining
+                // fixed elements, which also gives AssignmentPattern its
+                // default initializer a chance to run.
+                let value = self.new_temp();
+                self.load_undefined(value, span);
+                self.probe_resolve_binding(pat, pat.span())?;
+                self.lower_binding_pattern(pat, value)?;
+            }
+            self.bind(next_label);
+        }
+
+        if let (Some(rest), Some(rest_array)) = (&a.rest, rest_array) {
+            let top = self.label();
+            let cont = self.label();
+            let end = self.label();
+            self.bind(top);
+            let result = self.new_temp();
+            self.emit_reg3(Opcode::IteratorNext, result, iter, 0, span);
+            let done_key = self.new_temp();
+            self.load_str(done_key, "done", span)?;
+            let done = self.new_temp();
+            self.emit_reg3(Opcode::GetProperty, done, result, done_key, span);
+            self.emit_jump(Opcode::JumpIfTrue, done, end);
+            let value_key = self.new_temp();
+            self.load_str(value_key, "value", span)?;
+            let value = self.new_temp();
+            self.emit_reg3(Opcode::GetProperty, value, result, value_key, span);
+            self.append_array_binding_value(rest_array, value, span)?;
+            self.bind(cont);
+            self.emit_jump(Opcode::Jump, 0, top);
+            self.bind(end);
+            self.lower_binding_pattern(&rest.argument, rest_array)?;
+        }
+
+        let over_handler = self.label();
+        self.emit_jump(Opcode::Jump, 0, over_handler);
+        let try_end = self.pc();
+        let handler_start = self.pc();
+        let skip_close = self.label();
+        self.emit_jump(Opcode::JumpIfTrue, close_guard, skip_close);
+        self.emit_reg3(Opcode::IteratorClose, iter, 0, 0, span);
+        self.bind(skip_close);
+        self.emit_reg3(Opcode::Throw, exc, 0, 0, span);
+        self.bind(over_handler);
+        self.push_range(try_start, try_end, handler_start, exc);
+        Ok(())
+    }
+
+    /// Appends one iterator-produced value through the canonical array shape
+    /// path used by incremental array literals.
+    fn append_array_binding_value(
+        &mut self,
+        array: u16,
+        value: u16,
+        span: oxc_span::Span,
+    ) -> Res<()> {
+        let length_key = self.new_temp();
+        self.load_str(length_key, "length", span)?;
+        let length = self.new_temp();
+        self.emit_reg3(Opcode::GetProperty, length, array, length_key, span);
+        self.emit_reg3(Opcode::SetProperty, array, length, value, span);
         Ok(())
     }
 
