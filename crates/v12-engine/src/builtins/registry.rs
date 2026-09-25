@@ -141,6 +141,17 @@ impl NativeRegistry {
     }
 }
 
+impl NativeRegistry {
+    /// `Ctx` for the stateful Promise natives: the shared pending-job sink
+    /// plus the primary realm's global, so `Ctx::type_error` builds a real
+    /// class instance. v1 is single-realm, so the first registered realm
+    /// global is the right one.
+    fn promise_ctx<'h>(&self, heap: &'h mut Heap) -> Ctx<'h> {
+        let global = heap.realm_globals().first().copied();
+        Ctx::new(heap, global, Some(Rc::clone(&self.pending)))
+    }
+}
+
 impl v12_native::NativeRegistry for NativeRegistry {
     fn call_native(
         &mut self,
@@ -158,40 +169,45 @@ impl v12_native::NativeRegistry for NativeRegistry {
         //    RegExp natives need the per-registry compiled-pattern cache.
         //    They are intercepted here instead of registered as handlers.
         match id {
+            // The Promise natives get the primary realm's global (the same
+            // convention the ModuleImport arm below uses) so a `TypeError`
+            // they throw is a real class instance: `Ctx::type_error` links the
+            // error's [[Prototype]] and `constructor` only when a global is
+            // attached, and `assert.throws(TypeError, ...)` needs the link.
             NativeId::PromiseResolve => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_resolve(&mut ctx, this, args)
             }
             NativeId::PromiseReject => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_reject(&mut ctx, this, args)
             }
             NativeId::PromiseThen => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_then(&mut ctx, this, args)
             }
             NativeId::PromiseCatch => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_catch(&mut ctx, this, args)
             }
             NativeId::PromiseAll => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_all(&mut ctx, this, args)
             }
             NativeId::PromiseRace => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_race(&mut ctx, this, args)
             }
             NativeId::PromiseFinally => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_finally(&mut ctx, this, args)
             }
             NativeId::PromiseConstruct => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::promise_construct(&mut ctx, this, args)
             }
             NativeId::QueueMicrotask => {
-                let mut ctx = Ctx::new(heap, None, Some(Rc::clone(&self.pending)));
+                let mut ctx = self.promise_ctx(heap);
                 promise::queue_microtask(&mut ctx, this, args)
             }
             NativeId::RegExpExec => {

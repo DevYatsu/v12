@@ -30,6 +30,7 @@ pub struct Realm {
     intrinsics: HashMap<String, JsValue>,
     symbol_iterator: Handle<v12_heap::V12Symbol>,
     symbol_to_string_tag: Handle<v12_heap::V12Symbol>,
+    symbol_species: Handle<v12_heap::V12Symbol>,
 }
 
 impl Realm {
@@ -122,26 +123,10 @@ impl Realm {
         // The Promise constructor itself: `new Promise(executor)` routes to
         // the stateful native seam (the capability needs the job sink).
         wire_callable(heap, &intrinsics, "Promise", NativeId::PromiseConstruct);
-        // `Promise.all` / `Promise.race` statics and
-        // `Promise.prototype.finally`: shape-bound installs on the
-        // constructor / prototype (found by ordinary property lookup — no
-        // interpreter surface change needed). The handlers are stateful
-        // natives dispatched through the registry's pending-sink seam.
-        if let Some(promise_ctor) = intrinsics.get("Promise").and_then(|v| v.as_object()) {
-            crate::builtins::install_native(heap, Some(promise_ctor), "all", NativeId::PromiseAll);
-            crate::builtins::install_native(
-                heap,
-                Some(promise_ctor),
-                "race",
-                NativeId::PromiseRace,
-            );
-            crate::builtins::install_native(
-                heap,
-                Some(promise_proto),
-                "finally",
-                NativeId::PromiseFinally,
-            );
-        }
+        // The prototype method set (`then`/`catch`/`finally`) and the
+        // statics (`all`/`race`/`resolve`/`reject`) install further down,
+        // next to the canonical well-known symbols: `Symbol.species` is only
+        // canonical once this realm's symbols exist.
         // Error class prototypes: `Error.prototype` carries `name: "Error"`
         // (and the spec's own `message: ""`); each subclass prototype chains
         // to it and carries its class `name`. Every error instance (user
@@ -283,9 +268,13 @@ impl Realm {
         );
         let boolean_proto = alloc_root(heap);
         let symbol_proto = alloc_root(heap);
-        let (symbol_iterator, symbol_to_string_tag) = {
+        // `Symbol.species` is the third canonical well-known symbol this
+        // realm needs (the macro's Symbol group installed a *handler
+        // function* for it; the Promise surface below replaces that slot
+        // with the real symbol, exactly as `toPrimitive` does for Date).
+        let (symbol_iterator, symbol_to_string_tag, symbol_species) = {
             let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
-            (ctx.fresh_symbol(), ctx.fresh_symbol())
+            (ctx.fresh_symbol(), ctx.fresh_symbol(), ctx.fresh_symbol())
         };
         // `RegExp.prototype`: the spec's `%RegExp.prototype%` is an ordinary
         // object; the interpreter synthesizes the method surface from
@@ -386,6 +375,84 @@ impl Realm {
                 v12_heap::Attrs::new(false, false, false),
             ));
         }
+
+        // The Promise surface. Installed here rather than next to the
+        // `install_ctor` call above because `Symbol.species` is only canonical
+        // once this realm's well-known symbols exist. From here on
+        // `Promise.resolve`/`Promise.reject` and `Promise.prototype.then`/
+        // `catch` are ordinary properties: `Object.getOwnPropertyNames`,
+        // descriptors, overrides and deletions all observe them, and the
+        // interpreter's `promise_surface` synthesized read defers to them
+        // (it only synthesizes for receivers with no `Promise.prototype` link
+        // — bare-heap interpreters and interpreter-created async results).
+        //
+        // The handlers are the same stateful natives dispatched through the
+        // registry's pending-sink seam; no reaction scheduling changes.
+        if let Some(promise_ctor) = intrinsics.get("Promise").and_then(|v| v.as_object()) {
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            // `Promise.length` is 1 and `Promise.name` is `"Promise"`
+            // (`CreateBuiltinFunction`); the intrinsic placeholder carries
+            // neither, and `install_ctor` does not stamp them.
+            let promise_name = ctx.heap.intern_text("Promise");
+            ctx.define_data_prop_with_attrs(
+                promise_ctor,
+                "length",
+                JsValue::from_i32_smi(1).expect("1 fits Smi"),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            ctx.define_data_prop_with_attrs(
+                promise_ctor,
+                "name",
+                JsValue::string(promise_name),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            for (name, id, arity) in [
+                ("all", NativeId::PromiseAll, 1u32),
+                ("race", NativeId::PromiseRace, 1),
+                ("resolve", NativeId::PromiseResolve, 1),
+                ("reject", NativeId::PromiseReject, 1),
+            ] {
+                ctx.define_method(Some(promise_ctor), name, id, Some(arity));
+            }
+            for (name, id, arity) in [
+                ("then", NativeId::PromiseThen, 2u32),
+                ("catch", NativeId::PromiseCatch, 1),
+                ("finally", NativeId::PromiseFinally, 1),
+            ] {
+                ctx.define_method(Some(promise_proto), name, id, Some(arity));
+            }
+            // `Promise[Symbol.species] === Promise`: a non-writable,
+            // non-enumerable, configurable data property (ES 27.2.4). The
+            // accessor it replaces in the spec (`this`) is a later phase —
+            // cross-realm species selection is out of scope for v1's single
+            // realm.
+            ctx.define_symbol_data_prop_with_attrs(
+                promise_ctor,
+                symbol_species,
+                JsValue::object(promise_ctor),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            // `Promise.prototype[Symbol.toStringTag] === "Promise"`, same
+            // attributes, reusing this realm's canonical tag symbol.
+            let proto_tag = ctx.heap.intern_text("Promise");
+            ctx.define_symbol_data_prop_with_attrs(
+                promise_proto,
+                symbol_to_string_tag,
+                JsValue::string(proto_tag),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            // `Symbol.species`: the macro installed a handler *function* in
+            // that slot, so overwrite it with this realm's canonical symbol
+            // (the `toPrimitive` fix below does the same for its own well-known
+            // symbol).
+            if let Some(symbol_ctor) = intrinsics.get("Symbol").and_then(|v| v.as_object()) {
+                ctx.overwrite_data_prop(symbol_ctor, "species", JsValue::symbol(symbol_species));
+            }
+        }
+        // `%Promise.prototype%`'s [[Prototype]] is `%Object.prototype%`; the
+        // prototype was allocated before `object_proto` existed, so the link
+        // is closed here.
+        heap.get_mut(promise_proto).prototype = Some(object_proto);
 
         for (proto, method, tag_name, size_id) in [
             (map_proto, "entries", "Map", NativeId::MapSize),
@@ -609,6 +676,7 @@ impl Realm {
             intrinsics,
             symbol_iterator,
             symbol_to_string_tag,
+            symbol_species,
         }
     }
 
@@ -628,6 +696,12 @@ impl Realm {
     #[must_use]
     pub fn symbol_to_string_tag(&self) -> Handle<v12_heap::V12Symbol> {
         self.symbol_to_string_tag
+    }
+
+    /// This realm's canonical `Symbol.species` handle.
+    #[must_use]
+    pub fn symbol_species(&self) -> Handle<v12_heap::V12Symbol> {
+        self.symbol_species
     }
 
     /// Intrinsic table for inspection and native registry wiring.

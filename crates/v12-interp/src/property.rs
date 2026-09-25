@@ -391,6 +391,17 @@ impl Interp<'_> {
     /// - `then` on any object whose prototype is the Promise constructor's
     ///   `prototype` link — the realm installs that link, and the engine's
     ///   promise built-ins give every promise instance the same prototype.
+    ///
+    /// A realm installs the real surface (`realm.rs`), so every read this
+    /// helper synthesizes must be one the ordinary property path cannot
+    /// answer. Two guards enforce that:
+    /// - The statics defer entirely for a realm global (the same
+    ///   `is_realm_global` signal `map_set_surface` uses), so an override or a
+    ///   `delete Promise.resolve` is observable.
+    /// - `then`/`catch` defer for any receiver whose prototype chain reaches
+    ///   the constructor's `prototype` link. Interpreter-created async results
+    ///   carry no link (the interpreter has no realm handle at allocation
+    ///   time), so they keep the synthesized read.
     pub(crate) fn promise_surface(
         &mut self,
         obj: Handle<JsObject>,
@@ -408,11 +419,13 @@ impl Interp<'_> {
                 .and_then(|v| v.as_object())
         }?;
         if obj == promise_ctor {
-            if self.key_is_wk(key, WK_RESOLVE) {
-                return Some(Ok(self.cached_native(NativeId::PromiseResolve)));
-            }
-            if self.key_is_wk(key, WK_REJECT) {
-                return Some(Ok(self.cached_native(NativeId::PromiseReject)));
+            if !self.heap.is_realm_global(g) {
+                if self.key_is_wk(key, WK_RESOLVE) {
+                    return Some(Ok(self.cached_native(NativeId::PromiseResolve)));
+                }
+                if self.key_is_wk(key, WK_REJECT) {
+                    return Some(Ok(self.cached_native(NativeId::PromiseReject)));
+                }
             }
             return None;
         }
@@ -421,14 +434,37 @@ impl Interp<'_> {
         // link — the interp has no realm handle at allocation time), so
         // prototype matching would miss `.then`/`.catch` on them.
         if self.is_promise(JsValue::object(obj)) {
-            if self.key_is_wk(key, WK_THEN) {
+            let wants_then = self.key_is_wk(key, WK_THEN);
+            let wants_catch = self.key_is_wk(key, WK_CATCH);
+            if (wants_then || wants_catch) && self.proto_chain_reaches(obj, promise_ctor) {
+                return None;
+            }
+            if wants_then {
                 return Some(Ok(self.cached_native(NativeId::PromiseThen)));
             }
-            if self.key_is_wk(key, WK_CATCH) {
+            if wants_catch {
                 return Some(Ok(self.cached_native(NativeId::PromiseCatch)));
             }
         }
         None
+    }
+
+    /// True when `obj`'s `[[Prototype]]` chain reaches the Promise
+    /// constructor's `prototype` object — i.e. the ordinary property path owns
+    /// `then`/`catch` reads on this receiver, so the installed method, a user
+    /// override, or an explicit deletion is the observable answer.
+    fn proto_chain_reaches(&mut self, obj: Handle<JsObject>, ctor: Handle<JsObject>) -> bool {
+        let Some(target) = self.heap.get(ctor).prototype else {
+            return false;
+        };
+        let mut cursor = self.heap.get(obj).prototype;
+        while let Some(current) = cursor {
+            if current == target {
+                return true;
+            }
+            cursor = self.heap.get(current).prototype;
+        }
+        false
     }
 
     /// Static methods on the `Object` constructor: `create`/
