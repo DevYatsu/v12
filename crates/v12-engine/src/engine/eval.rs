@@ -320,6 +320,7 @@ impl Engine {
                     namespace: entry_ns,
                     env: entry_env,
                     binding_plan: std::rc::Rc::from(module.binding_plan.clone().into_boxed_slice()),
+                    export_stars: std::rc::Rc::from(module.export_stars.clone().into_boxed_slice()),
                     evaluated: false,
                 },
             );
@@ -383,6 +384,17 @@ impl Engine {
         {
             let canonical =
                 crate::module_loader::resolve_specifier(Path::new("."), &entry_path.to_string_lossy());
+            if let Err(reason) =
+                crate::module_loader::validate_export_stars(&mut interp, &loader, &canonical, base)
+            {
+                if let Some(loader) = registry.loader() {
+                    let mut state = loader.borrow_mut();
+                    state.modules.remove(&canonical);
+                    state.loading.remove(&canonical);
+                }
+                drop(interp);
+                return Err(reason);
+            }
             if let Err(reason) =
                 crate::module_loader::link_binding_cells(&mut interp, &loader, &canonical, base)
             {

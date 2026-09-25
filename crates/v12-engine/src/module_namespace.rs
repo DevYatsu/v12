@@ -93,6 +93,31 @@ pub(crate) fn set_export_cell(
     }
 }
 
+/// Export names currently linked on a namespace, used only for compatibility
+/// validation of `export *` ambiguity.
+pub(crate) fn export_names(heap: &mut Heap, namespace: Handle<JsObject>) -> Vec<String> {
+    let shape = heap.shape_of(namespace);
+    let descriptors: Vec<PropKey> = heap
+        .get(shape)
+        .descriptors
+        .as_slice()
+        .iter()
+        .map(|descriptor| descriptor.key())
+        .collect();
+    descriptors
+        .into_iter()
+        .filter_map(|key| {
+            let handle = key.string()?;
+            heap.flatten(handle);
+            match &heap.get(handle).storage {
+                v12_heap::StrStorage::Latin1(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+                v12_heap::StrStorage::Utf16(units) => Some(String::from_utf16_lossy(units)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// Raw cell handle for an export name, used only by the loader's linker.
 pub(crate) fn export_cell(
     heap: &mut Heap,

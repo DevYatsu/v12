@@ -983,6 +983,9 @@ impl Interp<'_> {
         // falls through to the walk below, which resolves exactly as
         // before (including the realm-global fallback).
         if !is_proxy && let Some((holder, hsl)) = self.heap.stub_lookup_proto(obj, shape, key) {
+            if self.heap.get(holder).kind == Kind::ModuleNamespace {
+                return self.module_namespace_get(holder, Some(key), key_v);
+            }
             let idx = self.global_slot_index(holder, hsl as usize);
             if let Some(v) = self.heap.get(holder).properties.get(idx) {
                 return Ok(*v);
@@ -1015,6 +1018,9 @@ impl Interp<'_> {
         let mut hit: Option<(Handle<JsObject>, Descriptor)> = None;
         let mut dict_hit: Option<(Handle<JsObject>, v12_heap::DictEntry)> = None;
         while let Some(o) = cur {
+            if self.heap.get(o).kind == Kind::ModuleNamespace {
+                return self.module_namespace_get(o, Some(key), key_v);
+            }
             // Proxy exotic in the prototype chain: `[[Get]]` recurses through
             // the receiver's `[[Prototype]]`, and a proxy there resolves via
             // its own `get` trap with the *original* receiver (ES 10.5.8;

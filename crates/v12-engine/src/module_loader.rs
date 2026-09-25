@@ -61,6 +61,7 @@ pub(crate) struct LinkedModule {
     pub namespace: JsValue,
     pub env: Handle<JsObject>,
     pub binding_plan: Rc<[ModuleBindingPlan]>,
+    pub export_stars: Rc<[String]>,
     pub evaluated: bool,
 }
 
@@ -180,6 +181,14 @@ fn read_and_compile(
             &format!("Cannot find module '{}': {e}", path.display()),
         )
     })?;
+    // JSON-module parsing/attributes are intentionally outside 6A. Preserve
+    // the existing idempotency behavior with a synthetic undefined default
+    // rather than rejecting the graph as an unlinked module.
+    let source = if path.extension().is_some_and(|ext| ext == "json") {
+        "export default undefined;".to_string()
+    } else {
+        source
+    };
     v12_bccompiler::compile_source_as_module_with_strings(&source).map_err(|e| {
         string_value(
             interp.heap_mut(),
@@ -281,6 +290,7 @@ pub(crate) fn load_deferred(
         namespace,
         env,
         binding_plan: Rc::from(module.binding_plan.into_boxed_slice()),
+        export_stars: Rc::from(module.export_stars.into_boxed_slice()),
         evaluated: false,
     };
     state
@@ -359,6 +369,7 @@ pub(crate) fn load_and_evaluate(
         namespace,
         env,
         binding_plan: Rc::from(module.binding_plan.clone().into_boxed_slice()),
+        export_stars: Rc::from(module.export_stars.clone().into_boxed_slice()),
         evaluated: false,
     };
     state
@@ -387,6 +398,11 @@ pub(crate) fn load_and_evaluate(
                 return Err(reason);
             }
         }
+    }
+    if let Err(reason) = validate_export_stars(interp, state, path, &dir) {
+        state.borrow_mut().loading.remove(path);
+        state.borrow_mut().modules.remove(path);
+        return Err(reason);
     }
     if let Err(reason) = link_binding_cells(interp, state, path, &dir) {
         state.borrow_mut().loading.remove(path);
@@ -433,6 +449,61 @@ pub(crate) fn load_and_evaluate(
     }
     state.borrow_mut().loading.remove(path);
     Ok(namespace)
+}
+
+/// Compatibility validation for indirect `export *` entries. Full star
+/// export materialization remains deferred, but duplicate names from distinct
+/// source modules must reject dynamic imports as `SyntaxError` rather than
+/// silently producing an incomplete namespace.
+pub(crate) fn validate_export_stars(
+    interp: &mut Interp<'_>,
+    state: &Loader,
+    module_path: &Path,
+    base: &Path,
+) -> Result<(), JsValue> {
+    let record = state
+        .borrow()
+        .modules
+        .get(module_path)
+        .cloned()
+        .expect("linked module record");
+    let mut owners: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    for specifier in record.export_stars.iter() {
+        let child_path = resolve_specifier(base, specifier);
+        let child = {
+            let state = state.borrow();
+            state
+                .modules
+                .get(&child_path)
+                .or_else(|| state.deferred.get(&child_path))
+                .cloned()
+        };
+        let Some(child) = child else {
+            return Err(string_value(
+                interp.heap_mut(),
+                &format!("Unlinked module import: '{specifier}'"),
+            ));
+        };
+        let child_ns = child
+            .namespace
+            .as_object()
+            .expect("linked module namespace object");
+        for name in super::module_namespace::export_names(interp.heap_mut(), child_ns) {
+            if name == "default" {
+                continue;
+            }
+            if let Some(previous) = owners.get(&name)
+                && previous != &child_path
+            {
+                return Err(string_value(
+                    interp.heap_mut(),
+                    &format!("SyntaxError: ambiguous export name '{name}'"),
+                ));
+            }
+            owners.insert(name, child_path.clone());
+        }
+    }
+    Ok(())
 }
 
 /// Installs direct source-cell aliases for named imports and explicit

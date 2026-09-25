@@ -125,6 +125,8 @@ pub struct Module {
     pub imports: Vec<ImportEntry>,
     pub exports: Vec<ExportEntry>,
     pub binding_plan: Vec<ModuleBindingPlan>,
+    /// `export * from` sources retained for compatibility validation.
+    pub export_stars: Vec<String>,
 }
 
 /// Parses and compiles JavaScript source text (script grammar, strict mode
@@ -528,6 +530,12 @@ fn compile_ast_as_module_inner(
     let imports = plans.imports.clone();
     let exports = plans.exports.clone();
     let binding_plan = plans.module_bindings.clone();
+    let export_stars = plans
+        .exports
+        .iter()
+        .filter(|entry| entry.specifier.is_some() && entry.imported.is_none() && entry.exported == "*")
+        .filter_map(|entry| entry.specifier.clone())
+        .collect();
     let mut comp = model::Compiler {
         scoping,
         strings: interner,
@@ -552,6 +560,7 @@ fn compile_ast_as_module_inner(
         imports,
         exports,
         binding_plan,
+        export_stars,
     })
 }
 

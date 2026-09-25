@@ -482,7 +482,14 @@ impl<'s> Collector<'s> {
     fn enter_object_method(&mut self, p: &oxc_ast::ast::ObjectProperty<'_>) {
         if let Expression::FunctionExpression(f) = &p.value {
             let hint = static_key_or_default(&p.key);
-            self.fn_unit_ext(f, false, &format!("<objmethod>:{hint}"), true, false);
+            self.fn_unit_ext(
+                f,
+                false,
+                &format!("<objmethod>:{hint}"),
+                true,
+                true,
+                false,
+            );
         }
     }
 
@@ -498,7 +505,14 @@ impl<'s> Collector<'s> {
         hint: &str,
         block_candidate: bool,
     ) -> usize {
-        self.fn_unit_ext(f, declare_name_in_enclosing, hint, false, block_candidate)
+        self.fn_unit_ext(
+            f,
+            declare_name_in_enclosing,
+            hint,
+            false,
+            false,
+            block_candidate,
+        )
     }
 
     /// [`Self::fn_unit`] with an explicit HomeObject flag: `allows_super` is
@@ -510,6 +524,7 @@ impl<'s> Collector<'s> {
         declare_name_in_enclosing: bool,
         hint: &str,
         allows_super: bool,
+        is_object_method: bool,
         block_candidate: bool,
     ) -> usize {
         let parent = self.cur_unit();
@@ -543,6 +558,7 @@ impl<'s> Collector<'s> {
         plan.implicit_arguments = true;
         plan.has_non_simple_parameters = !is_simple_parameter_list(&f.params);
         plan.allows_super = allows_super;
+        plan.is_object_method = is_object_method;
         // A named function's `name` own property (installed at closure alloc):
         // without this the name is unobservable (`f.name === undefined`).
         if let Some(id) = f.id.as_ref() {
@@ -1292,6 +1308,16 @@ impl<'s> Collector<'s> {
                 exported,
                 span,
             });
+            // Indirect exports are module dependencies too. Keep a
+            // side-effect-free import entry so the loader resolves and links
+            // the source module before this module's main runs.
+            self.plans.imports.push(ImportEntry {
+                specifier: specifier.clone(),
+                imported: String::new(),
+                local: None,
+                span,
+                deferred: false,
+            });
         }
     }
 
@@ -1351,11 +1377,18 @@ impl<'s> Collector<'s> {
             .map(|n| module_export_name_to_string(n))
             .unwrap_or_else(|| "*".to_string());
         self.plans.exports.push(ExportEntry {
-            specifier: Some(specifier),
+            specifier: Some(specifier.clone()),
             imported: None,
             local: None,
             exported,
             span,
+        });
+        self.plans.imports.push(ImportEntry {
+            specifier,
+            imported: String::new(),
+            local: None,
+            span,
+            deferred: false,
         });
     }
 

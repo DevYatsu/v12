@@ -2210,6 +2210,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Lowers `super` used as a member object: `superCtor.prototype` for
     /// instance methods, `superCtor` for static methods and constructors.
     fn super_expr(&mut self, span: Span) -> Res<u16> {
+        if self.comp.plans.units[self.unit].is_object_method {
+            return Ok(crate::model::REG_THIS);
+        }
         let ctor = self.super_ctor(span)?;
         let is_static = self.comp.plans.units[self.unit].static_method;
         if is_static {

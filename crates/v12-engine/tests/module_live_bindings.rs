@@ -172,6 +172,41 @@ fn direct_eval_reads_and_writes_module_cells() {
 }
 
 #[test]
+fn namespace_super_reads_return_exported_values_without_cell_handles() {
+    let dir = fixture("namespace-super");
+    write_module(&dir, "dep.js", "export const then = 1;");
+    let mut engine = Engine::new();
+    evaluate_entry(
+        &mut engine,
+        &dir,
+        "main.js",
+        "import * as ns from './dep.js'; let obj = { read() { return super.then; } }; Object.setPrototypeOf(obj, ns); globalThis.result = obj.read();",
+    );
+
+    assert_true(&mut engine, "globalThis.result === 1");
+}
+
+#[test]
+fn explicit_string_source_reexports_are_linked() {
+    let dir = fixture("string-reexport");
+    write_module(&dir, "dep.js", "export const Mercury = 9;");
+    write_module(
+        &dir,
+        "bridge.js",
+        "export { Mercury as '☿' } from './dep.js';",
+    );
+    let mut engine = Engine::new();
+    evaluate_entry(
+        &mut engine,
+        &dir,
+        "main.js",
+        "import * as ns from './bridge.js'; globalThis.ns = ns;",
+    );
+
+    assert_true(&mut engine, "globalThis.ns['☿'] === 9");
+}
+
+#[test]
 fn live_binding_cells_survive_gc_stress() {
     let dir = fixture("gc");
     write_module(

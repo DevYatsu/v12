@@ -300,6 +300,8 @@ pub struct UnitPlan {
     /// resolves against the parent constructor directly instead of its
     /// `prototype`.
     pub static_method: bool,
+    /// Object-literal method whose `super` fallback uses the call receiver.
+    pub is_object_method: bool,
     /// The unit is lexically a class member (constructor, method, or field
     /// initializer), so `super` property/call references are legal in it.
     /// Nested ordinary functions reset this; nested arrows inherit it.
@@ -355,6 +357,7 @@ impl UnitPlan {
             uses_super: false,
             static_method: false,
             allows_super: false,
+            is_object_method: false,
             locals_end: 1, // r0 = this
             direct_eval_sites: Vec::new(),
             eval_reachable: false,
