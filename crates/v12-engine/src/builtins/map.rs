@@ -113,13 +113,15 @@ fn delete(
     Ok(JsValue::false_())
 }
 
-/// `Map(iterable?)` — creates a Map. The iterable is ignored for v1
-/// (constructor from entries is a later conformance item).
+/// Native fallback for `Map` construction. Realm execution routes this id
+/// through the interpreter callback seam so iterable arguments can re-enter
+/// the machine; this handler remains the bare-heap fallback.
 pub fn map_construct(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     construct(ctx, Kind::Map, this)
 }
 
-/// `Set(iterable?)` — creates a Set.
+/// Native fallback for `Set` construction; realm execution uses the
+/// interpreter callback seam for iterable arguments.
 pub fn set_construct(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     construct(ctx, Kind::Set, this)
 }

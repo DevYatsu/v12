@@ -1677,6 +1677,9 @@ impl Interp<'_> {
             | NativeId::ArrayReduceRight
             | NativeId::ArrayFlatMap
             | NativeId::ArraySort => Some(self.run_array_callback(id, this_v, args)),
+            NativeId::MapConstruct | NativeId::SetConstruct => {
+                Some(self.construct_collection(id, this_v, args))
+            }
             NativeId::MapForEach | NativeId::SetForEach => {
                 Some(self.run_collection_for_each(id, this_v, args))
             }
@@ -2727,6 +2730,104 @@ impl Interp<'_> {
                 Ok(arr)
             }
             _ => Ok(JsValue::undefined()),
+        }
+    }
+
+    fn construct_collection(
+        &mut self,
+        id: NativeId,
+        constructor: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let (kind, ctor_name, adder_name) = match id {
+            NativeId::MapConstruct => (Kind::Map, "Map", "set"),
+            NativeId::SetConstruct => (Kind::Set, "Set", "add"),
+            _ => unreachable!("only Map and Set constructors use this seam"),
+        };
+        let ctor = constructor
+            .as_object()
+            .filter(|obj| self.heap.get(*obj).kind == Kind::Function)
+            .or_else(|| {
+                self.global
+                    .and_then(|global| self.global_intrinsic_value(global, ctor_name))
+                    .and_then(|value| value.as_object())
+            });
+        let collection = self.heap.alloc(JsObject {
+            kind,
+            ..JsObject::default()
+        });
+        let collection_v = JsValue::object(collection);
+        self.heap.add_root(collection_v);
+        if let Some(ctor) = ctor {
+            let proto_key = self.new_temp_key("prototype");
+            let proto = self.get_property(0, 0, JsValue::object(ctor), proto_key)?;
+            if let Some(proto) = proto.as_object() {
+                self.heap.get_mut(collection).prototype = Some(proto);
+            }
+        }
+
+        // The ordinary adder is resolved before GetIterator, matching the
+        // constructor algorithms and preserving prototype overrides.
+        let adder_key = self.new_temp_key(adder_name);
+        let adder = self.get_property(0, 0, collection_v, adder_key)?;
+        let Some(adder) = adder
+            .as_object()
+            .filter(|obj| matches!(self.heap.get(*obj).kind, Kind::Function | Kind::Proxy))
+        else {
+            return Err(JSException(
+                self.error_value("TypeError: collection adder is not callable"),
+            ));
+        };
+
+        let iterable = match args.first() {
+            None => return Ok(collection_v),
+            Some(&value) if value.is_undefined() => return Ok(collection_v),
+            Some(&value) => value,
+        };
+        let iterator = self.get_iterator(iterable, false)?;
+        let result = self.consume_collection_iterable(iterator, collection_v, adder, kind);
+        match result {
+            Ok(()) => Ok(collection_v),
+            Err(error) => {
+                // The original abrupt completion wins over an error raised by
+                // return(), as required by IteratorClose's throw path.
+                self.op_iterator_close(iterator, true)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn consume_collection_iterable(
+        &mut self,
+        iterator: JsValue,
+        collection: JsValue,
+        adder: Handle<JsObject>,
+        kind: Kind,
+    ) -> Result<(), JSException> {
+        loop {
+            let result = self.op_iterator_next(iterator)?;
+            let done_key = self.new_temp_key("done");
+            let done = self.get_property(0, 0, result, done_key)?;
+            if ops::to_boolean(self.heap, done) {
+                return Ok(());
+            }
+            let value_key = self.new_temp_key("value");
+            let value = self.get_property(0, 0, result, value_key)?;
+            let call_args = if kind == Kind::Map {
+                let Some(entry) = value.as_object() else {
+                    return Err(JSException(
+                        self.error_value("TypeError: Map iterator entry is not an object"),
+                    ));
+                };
+                let key_key = self.new_temp_key("0");
+                let value_key = self.new_temp_key("1");
+                let key = self.get_property(0, 0, JsValue::object(entry), key_key)?;
+                let entry_value = self.get_property(0, 0, JsValue::object(entry), value_key)?;
+                vec![key, entry_value]
+            } else {
+                vec![value]
+            };
+            self.call_value(JsValue::object(adder), collection, &call_args)?;
         }
     }
 

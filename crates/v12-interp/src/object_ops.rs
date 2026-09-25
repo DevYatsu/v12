@@ -376,7 +376,7 @@ impl Interp<'_> {
         //    `call_inline` and read a placeholder callable.
         let method_obj = method
             .as_object()
-            .filter(|h| self.heap.get(*h).kind == Kind::Function)
+            .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
             .ok_or_else(|| {
                 JSException(self.error_value(
                     "TypeError: value is not iterable (its Symbol.iterator property is not a function)",
@@ -491,7 +491,7 @@ impl Interp<'_> {
         let next_v = self.get_property(0, 0, iter_v, next_key)?;
         let Some(next_obj) = next_v
             .as_object()
-            .filter(|h| self.heap.get(*h).kind == Kind::Function)
+            .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
         else {
             return Err(JSException(
                 self.error_value("TypeError: iterator.next is not a function"),
@@ -565,7 +565,7 @@ impl Interp<'_> {
         }
         let Some(return_obj) = return_v
             .as_object()
-            .filter(|h| self.heap.get(*h).kind == Kind::Function)
+            .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
         else {
             return Err(JSException(
                 self.error_value("TypeError: iterator.return is not a function"),

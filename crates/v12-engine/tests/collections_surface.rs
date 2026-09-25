@@ -182,6 +182,61 @@ fn collection_methods_reject_prototype_objects_without_internal_slots() {
 }
 
 #[test]
+fn map_and_set_constructors_consume_iterables() {
+    assert_eq!(
+        display(
+            "let m = new Map([['a', 1], ['b', 2]]); let s = new Set([1, 2, 2]); \
+             let n = 0; let custom = { [Symbol.iterator]: function () { return { next: function () { n++; return n === 1 ? { value: ['x', 3], done: false } : { done: true }; } }; } }; \
+             let cm = new Map(custom); throw [m.size, s.size, cm.get('x')].join(',');"
+        ),
+        "2,2,3"
+    );
+}
+
+#[test]
+fn constructors_use_overridden_adders_and_reject_non_callable_adders() {
+    assert_eq!(
+        display(
+            "let calls = 0; let original = Set.prototype.add; \
+             Set.prototype.add = function (v) { calls++; return original.call(this, v); }; \
+             let s = new Set([4, 5]); Set.prototype.add = 1; let out = ''; \
+             try { new Set([6]); } catch (e) { out = e instanceof TypeError ? 't' : 'x'; } \
+             Set.prototype.add = original; throw [s.size, calls, out].join(',');"
+        ),
+        "2,2,t"
+    );
+}
+
+#[test]
+fn map_constructor_rejects_non_entry_values_and_closes_on_failures() {
+    assert_eq!(
+        display(
+            "let out = ''; try { new Map([1]); } catch (e) { out += e instanceof TypeError ? 'e' : 'x'; } \
+             let closed = 0; let iterable = { [Symbol.iterator]: function () { return { next: function () { return { value: ['k', 1], done: false }; }, return: function () { closed++; return {}; } }; } }; \
+             let old = Map.prototype.set; Map.prototype.set = function () { throw new Error('adder'); }; \
+             try { new Map(iterable); } catch (e) { out += e.message; } Map.prototype.set = old; \
+             let nextClosed = 0; let bad = { [Symbol.iterator]: function () { return { next: function () { throw new Error('next'); }, return: function () { nextClosed++; return {}; } }; } }; \
+             try { new Map(bad); } catch (e) { out += e.message; } throw [out, closed, nextClosed].join(',');"
+        ),
+        "eaddernext,1,1"
+    );
+}
+
+#[test]
+fn constructor_iterator_closes_generators_and_accepts_callable_proxies() {
+    assert_eq!(
+        display(
+            "let closed = false; function* values() { try { yield 1; yield 2; } finally { closed = true; } } \
+             let old = Set.prototype.add; Set.prototype.add = function () { throw new Error('stop'); }; \
+             try { new Set(values()); } catch (e) {} Set.prototype.add = old; \
+             let proxy = new Proxy(function (v) { return Reflect.apply(old, this, arguments); }, { apply: function (target, receiver, args) { return Reflect.apply(target, receiver, args); } }); \
+             Set.prototype.add = proxy; let s = new Set([9]); throw [closed, s.has(9)].join(',');"
+        ),
+        "true,true"
+    );
+}
+
+#[test]
 fn collection_size_is_an_accessor_on_the_prototype() {
     assert_eq!(
         display(
