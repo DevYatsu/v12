@@ -339,6 +339,9 @@ impl Engine {
         let entries: Vec<JsValue> = self.heap.get(obj).elements_snapshot();
         let mut parts = Vec::with_capacity(entries.len() / 2);
         for pair in entries.chunks_exact(2) {
+            if pair[0].is_hole() {
+                continue;
+            }
             let k = self.display_value(pair[0], depth + 1);
             let v = self.display_value(pair[1], depth + 1);
             parts.push(format!("{k} => {v}"));
@@ -351,6 +354,9 @@ impl Engine {
         let values: Vec<JsValue> = self.heap.get(obj).elements_snapshot();
         let mut parts = Vec::with_capacity(values.len());
         for v in values {
+            if v.is_hole() {
+                continue;
+            }
             parts.push(self.display_value(v, depth + 1));
         }
         format!("Set({}) {{{}}}", parts.len(), parts.join(", "))
@@ -417,7 +423,8 @@ impl Engine {
     fn iterator_text(&mut self, obj: v12_heap::Handle<v12_heap::JsObject>) -> String {
         use crate::builtins::iterator::{
             ITER_KIND_ARRAY_ENTRIES, ITER_KIND_ARRAY_KEYS, ITER_KIND_ARRAY_VALUES,
-            ITER_KIND_MAP_ENTRIES, ITER_KIND_MAP_KEYS, ITER_KIND_MAP_VALUES, ITER_KIND_SET_VALUES,
+            ITER_KIND_MAP_ENTRIES, ITER_KIND_MAP_KEYS, ITER_KIND_MAP_VALUES, ITER_KIND_SET_ENTRIES,
+            ITER_KIND_SET_VALUES,
         };
         let label = match self.heap.get(obj).elements.first().and_then(|v| v.as_smi()) {
             Some(k)
@@ -434,7 +441,7 @@ impl Engine {
             {
                 "Map Iterator"
             }
-            Some(k) if k == ITER_KIND_SET_VALUES => "Set Iterator",
+            Some(k) if k == ITER_KIND_SET_VALUES || k == ITER_KIND_SET_ENTRIES => "Set Iterator",
             _ => "Iterator",
         };
         format!("[{label}]")

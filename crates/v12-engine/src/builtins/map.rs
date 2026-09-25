@@ -41,7 +41,7 @@ fn entries(heap: &Heap, obj: Handle<JsObject>, kind: Kind) -> Option<&[JsValue]>
 /// SameValueZero on engine values: bit-identical, with `-0.0` equal to `+0.0`.
 fn same_value_zero(a: JsValue, b: JsValue) -> bool {
     match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x == y || (x == 0.0 && y == 0.0), // +0 == -0
+        (Some(x), Some(y)) => (x.is_nan() && y.is_nan()) || x == y || (x == 0.0 && y == 0.0),
         _ => a == b,
     }
 }
@@ -66,7 +66,10 @@ fn has(
     let obj = ctx.this_object(this, method, Some(kind))?;
     let step = stride(kind);
     let store = entries(ctx.heap, obj, kind).unwrap_or_default();
-    let found = (0..store.len() / step).any(|i| same_value_zero(store[i * step], key));
+    let found = (0..store.len() / step).any(|i| {
+        let key_slot = store[i * step];
+        !key_slot.is_hole() && same_value_zero(key_slot, key)
+    });
     Ok(JsValue::from_bool(found))
 }
 
@@ -82,10 +85,13 @@ fn delete(
     let step = stride(kind);
     let store = &mut ctx.heap.get_mut(obj).elements;
     if let Some(pos) = (0..store.len() / step)
-        .find(|&i| same_value_zero(store[i * step], key))
+        .find(|&i| {
+            let key_slot = store[i * step];
+            !key_slot.is_hole() && same_value_zero(key_slot, key)
+        })
         .map(|i| i * step)
     {
-        store.drain(pos..pos + step);
+        store[pos..pos + step].fill(JsValue::hole());
         return Ok(JsValue::true_());
     }
     Ok(JsValue::false_())
@@ -110,7 +116,7 @@ pub fn map_get(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue
         .unwrap_or_default()
         .chunks_exact(2)
     {
-        if same_value_zero(pair[0], key) {
+        if !pair[0].is_hole() && same_value_zero(pair[0], key) {
             return Ok(pair[1]);
         }
     }
@@ -124,7 +130,7 @@ pub fn map_set(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue
     let value = args.get(1).copied().unwrap_or_else(JsValue::undefined);
     let entries = &mut ctx.heap.get_mut(obj).elements;
     for pair in entries.chunks_exact_mut(2) {
-        if same_value_zero(pair[0], key) {
+        if !pair[0].is_hole() && same_value_zero(pair[0], key) {
             pair[1] = value;
             return Ok(this);
         }
@@ -149,7 +155,11 @@ pub fn map_delete(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVa
 /// `Map.prototype.size` getter — number of entries. Wired as a native.
 pub fn map_size(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Map.prototype.size", Some(Kind::Map))?;
-    let n = (entries(ctx.heap, obj, Kind::Map).unwrap_or_default().len() / 2) as i64;
+    let n = entries(ctx.heap, obj, Kind::Map)
+        .unwrap_or_default()
+        .chunks_exact(2)
+        .filter(|pair| !pair[0].is_hole())
+        .count() as i64;
     Ok(helpers::smi_or_f64(n))
 }
 
@@ -158,7 +168,10 @@ pub fn set_add(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue
     let obj = ctx.this_object(this, "Set.prototype.add", Some(Kind::Set))?;
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
     let entries = &mut ctx.heap.get_mut(obj).elements;
-    if !entries.iter().any(|&v| same_value_zero(v, value)) {
+    if !entries
+        .iter()
+        .any(|&v| !v.is_hole() && same_value_zero(v, value))
+    {
         entries.push(value);
     }
     Ok(this)
@@ -179,21 +192,33 @@ pub fn set_delete(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVa
 /// `Set.prototype.size` getter — number of values.
 pub fn set_size(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Set.prototype.size", Some(Kind::Set))?;
-    let n = entries(ctx.heap, obj, Kind::Set).unwrap_or_default().len() as i64;
+    let n = entries(ctx.heap, obj, Kind::Set)
+        .unwrap_or_default()
+        .iter()
+        .filter(|&&v| !v.is_hole())
+        .count() as i64;
     Ok(helpers::smi_or_f64(n))
 }
 
 /// `Map.prototype.clear()` — removes all entries.
 pub fn map_clear(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Map.prototype.clear", Some(Kind::Map))?;
-    ctx.heap.get_mut(obj).elements.clear();
+    ctx.heap
+        .get_mut(obj)
+        .elements
+        .chunks_exact_mut(2)
+        .for_each(|pair| pair.fill(JsValue::hole()));
     Ok(JsValue::undefined())
 }
 
 /// `Set.prototype.clear()` — removes all values.
 pub fn set_clear(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Set.prototype.clear", Some(Kind::Set))?;
-    ctx.heap.get_mut(obj).elements.clear();
+    ctx.heap
+        .get_mut(obj)
+        .elements
+        .iter_mut()
+        .for_each(|slot| *slot = JsValue::hole());
     Ok(JsValue::undefined())
 }
 
@@ -212,10 +237,9 @@ pub fn map_values(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsV
     super::iterator::iterator_for(ctx, this, super::iterator::ITER_KIND_MAP_VALUES)
 }
 
-/// `Set.prototype.entries()` — `[value, value]` pairs per spec; v1 reuses
-/// values iteration (entries surface present, pair shape deferred).
+/// `Set.prototype.entries()` — `[value, value]` pairs per spec.
 pub fn set_entries(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
-    super::iterator::iterator_for(ctx, this, super::iterator::ITER_KIND_SET_VALUES)
+    super::iterator::iterator_for(ctx, this, super::iterator::ITER_KIND_SET_ENTRIES)
 }
 
 /// `Set.prototype.keys()` — alias of values per spec.

@@ -2731,7 +2731,8 @@ impl Interp<'_> {
     }
 
     /// `Map.prototype.forEach` / `Set.prototype.forEach` — re-entrant
-    /// callback over a snapshot of the entries.
+    /// callback over live entries. Tombstones are skipped; an append is
+    /// observed once the current index reaches it.
     fn run_collection_for_each(
         &mut self,
         id: NativeId,
@@ -2761,19 +2762,27 @@ impl Interp<'_> {
         };
         self.heap.add_root(JsValue::object(cb));
         let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
-        let snapshot: Vec<JsValue> = self.heap.get(obj).elements.clone();
-        if want_map {
-            for pair in snapshot.chunks_exact(2) {
-                let call_args = [pair[1], pair[0], this_v];
-                let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
-                self.heap.add_root(r);
-            }
-        } else {
-            for v in &snapshot {
-                let call_args = [*v, *v, this_v];
-                let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
-                self.heap.add_root(r);
-            }
+        let step = if want_map { 2 } else { 1 };
+        let mut index = 0usize;
+        loop {
+            let call_args = {
+                let elements = &self.heap.get(obj).elements;
+                if index * step >= elements.len() {
+                    break;
+                }
+                if elements[index * step].is_hole() {
+                    index += 1;
+                    continue;
+                }
+                if want_map {
+                    [elements[index * step + 1], elements[index * step], this_v]
+                } else {
+                    [elements[index], elements[index], this_v]
+                }
+            };
+            let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
+            self.heap.add_root(r);
+            index += 1;
         }
         Ok(JsValue::undefined())
     }

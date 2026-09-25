@@ -39,6 +39,8 @@ pub const ITER_KIND_MAP_KEYS: i32 = 4;
 pub const ITER_KIND_MAP_VALUES: i32 = 5;
 /// Iterator kind: Set values (`for (const v of set)`).
 pub const ITER_KIND_SET_VALUES: i32 = 6;
+/// Iterator kind: Set entries (`[value, value]` pairs).
+pub const ITER_KIND_SET_ENTRIES: i32 = 7;
 
 /// Index of the state slots inside an iterator's `elements` vector.
 const SLOT_KIND: usize = 0;
@@ -144,41 +146,60 @@ pub fn iterator_next(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<
     let kind = ctx.heap.get(iter).elements[SLOT_KIND]
         .as_smi()
         .unwrap_or(ITER_KIND_ARRAY_VALUES);
-    let len = source_len(ctx.heap, source);
-    if index >= len {
-        // Done: mark the iterator exhausted and return {undefined, true}.
-        ctx.heap.get_mut(iter).elements[SLOT_INDEX] =
-            helpers::smi_or_f64(i64::from(v12_heap::JsValue::SMI_MAX));
-        return Ok(iterator_result(ctx, JsValue::undefined(), true));
-    }
-    // Advance the index before producing the value: iterator state updates
-    // happen on each `next`, even when the value is a pair.
-    ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(index as i64 + 1);
-    let heap = &mut *ctx.heap;
-    let value = match kind {
-        ITER_KIND_ARRAY_VALUES => source_elem(heap, source, index),
-        ITER_KIND_ARRAY_KEYS => helpers::smi_or_f64(index as i64),
-        ITER_KIND_ARRAY_ENTRIES | ITER_KIND_MAP_ENTRIES => {
-            let key = if kind == ITER_KIND_ARRAY_ENTRIES {
-                helpers::smi_or_f64(index as i64)
-            } else {
-                source_elem(heap, source, 2 * index)
-            };
-            let val = if kind == ITER_KIND_ARRAY_ENTRIES {
-                source_elem(heap, source, index)
-            } else {
-                source_elem(heap, source, 2 * index + 1)
-            };
-            // `[key, value]` pair.
-            let pair = helpers::alloc_obj(heap, JsObject::array(vec![key, val]));
-            JsValue::object(pair)
+    let mut index = index;
+    loop {
+        let len = source_len(ctx.heap, source);
+        if index >= len {
+            // Done: mark the iterator exhausted and return {undefined, true}.
+            ctx.heap.get_mut(iter).elements[SLOT_INDEX] =
+                helpers::smi_or_f64(i64::from(v12_heap::JsValue::SMI_MAX));
+            return Ok(iterator_result(ctx, JsValue::undefined(), true));
         }
-        ITER_KIND_MAP_KEYS => source_elem(heap, source, 2 * index),
-        ITER_KIND_MAP_VALUES => source_elem(heap, source, 2 * index + 1),
-        ITER_KIND_SET_VALUES => source_elem(heap, source, index),
-        _ => JsValue::undefined(),
-    };
-    Ok(iterator_result(ctx, value, false))
+        let tombstoned = match kind {
+            ITER_KIND_MAP_ENTRIES | ITER_KIND_MAP_KEYS | ITER_KIND_MAP_VALUES => {
+                source_elem(ctx.heap, source, 2 * index).is_hole()
+            }
+            ITER_KIND_SET_VALUES | ITER_KIND_SET_ENTRIES => {
+                source_elem(ctx.heap, source, index).is_hole()
+            }
+            _ => false,
+        };
+        if tombstoned {
+            index += 1;
+            ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(index as i64);
+            continue;
+        }
+        // Advance the index before producing the value: iterator state updates
+        // happen on each `next`, even when the value is a pair.
+        ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(index as i64 + 1);
+        let value = match kind {
+            ITER_KIND_ARRAY_VALUES => source_elem(ctx.heap, source, index),
+            ITER_KIND_ARRAY_KEYS => helpers::smi_or_f64(index as i64),
+            ITER_KIND_ARRAY_ENTRIES | ITER_KIND_MAP_ENTRIES => {
+                let (key, val) = if kind == ITER_KIND_ARRAY_ENTRIES {
+                    (
+                        helpers::smi_or_f64(index as i64),
+                        source_elem(ctx.heap, source, index),
+                    )
+                } else {
+                    (
+                        source_elem(ctx.heap, source, 2 * index),
+                        source_elem(ctx.heap, source, 2 * index + 1),
+                    )
+                };
+                JsValue::object(ctx.alloc_array(vec![key, val]))
+            }
+            ITER_KIND_MAP_KEYS => source_elem(ctx.heap, source, 2 * index),
+            ITER_KIND_MAP_VALUES => source_elem(ctx.heap, source, 2 * index + 1),
+            ITER_KIND_SET_VALUES => source_elem(ctx.heap, source, index),
+            ITER_KIND_SET_ENTRIES => {
+                let value = source_elem(ctx.heap, source, index);
+                JsValue::object(ctx.alloc_array(vec![value, value]))
+            }
+            _ => JsValue::undefined(),
+        };
+        return Ok(iterator_result(ctx, value, false));
+    }
 }
 
 /// `%IteratorPrototype%` shared `[Symbol.iterator]()`: returns `this`.
