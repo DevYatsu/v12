@@ -208,6 +208,21 @@ fn constructors_use_overridden_adders_and_reject_non_callable_adders() {
 }
 
 #[test]
+fn empty_map_and_set_construction_does_not_read_adders() {
+    assert_eq!(
+        display(
+            "let oldSet = Map.prototype.set; let oldAdd = Set.prototype.add; \
+             Map.prototype.set = 1; Set.prototype.add = 1; \
+             let m0 = new Map(); let mu = new Map(undefined); let mn = new Map(null); \
+             let s0 = new Set(); let su = new Set(undefined); let sn = new Set(null); \
+             Map.prototype.set = oldSet; Set.prototype.add = oldAdd; \
+             throw [m0.size, mu.size, mn.size, s0.size, su.size, sn.size].join(',');"
+        ),
+        "0,0,0,0,0,0"
+    );
+}
+
+#[test]
 fn map_constructor_rejects_non_entry_values_and_closes_on_failures() {
     assert_eq!(
         display(

@@ -2766,8 +2766,15 @@ impl Interp<'_> {
             }
         }
 
-        // The ordinary adder is resolved before GetIterator, matching the
-        // constructor algorithms and preserving prototype overrides.
+        let iterable = match args.first() {
+            None => return Ok(collection_v),
+            Some(&value) if value.is_null() || value.is_undefined() => return Ok(collection_v),
+            Some(&value) => value,
+        };
+        // For a present iterable, resolve the ordinary adder before
+        // GetIterator, matching the constructor algorithms and preserving
+        // prototype overrides. The empty-construction path above must not
+        // read the adder at all.
         let adder_key = self.new_temp_key(adder_name);
         let adder = self.get_property(0, 0, collection_v, adder_key)?;
         let Some(adder) = adder
@@ -2777,12 +2784,6 @@ impl Interp<'_> {
             return Err(JSException(
                 self.error_value("TypeError: collection adder is not callable"),
             ));
-        };
-
-        let iterable = match args.first() {
-            None => return Ok(collection_v),
-            Some(&value) if value.is_undefined() => return Ok(collection_v),
-            Some(&value) => value,
         };
         let iterator = self.get_iterator(iterable, false)?;
         let result = self.consume_collection_iterable(iterator, collection_v, adder, kind);
