@@ -169,7 +169,11 @@ pub enum ModuleBindingSource {
     /// A binding declared by this module.
     Local,
     /// `import ... from`; the slot aliases the source export cell.
-    Import { specifier: String, imported: String },
+    Import {
+        specifier: String,
+        imported: String,
+        deferred: bool,
+    },
     /// `export {x as y} from`; the slot aliases the source export cell.
     ReExport { specifier: String, imported: String },
     /// `export default <expression>` has no Oxc symbol and uses a synthetic slot.

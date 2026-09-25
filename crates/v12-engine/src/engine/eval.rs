@@ -294,38 +294,62 @@ impl Engine {
             .functions
             .get(module.program.main as usize)
             .map_or(0, |f| f.env_slots);
-        let owner_module_id = self.registry.loader().map_or(0, |loader| {
-            let mut state = loader.borrow_mut();
-            let id = state.next_module_id;
-            state.next_module_id += 1;
-            id
+        let canonical = entry_path.map(|path| {
+            crate::module_loader::resolve_specifier(Path::new("."), &path.to_string_lossy())
         });
-        let (entry_ns, entry_env) = crate::module_namespace::alloc_linked_module(
-            &mut self.heap,
-            owner_module_id,
-            env_slots,
-            &module.binding_plan,
+        let existing = canonical.as_ref().and_then(|path| {
+            self.registry
+                .loader()
+                .and_then(|loader| loader.borrow().modules.get(path).cloned())
+        });
+        let (entry_env, owner_module_id) = existing.as_ref().map_or_else(
+            || {
+                let owner_module_id = self.registry.loader().map_or(0, |loader| {
+                    let mut state = loader.borrow_mut();
+                    let id = state.next_module_id;
+                    state.next_module_id += 1;
+                    id
+                });
+                let env = crate::module_namespace::alloc_execution(
+                    &mut self.heap,
+                    owner_module_id,
+                    env_slots,
+                    &module.binding_plan,
+                );
+                (env, owner_module_id)
+            },
+            |record| (record.env, record.owner_module_id),
         );
-        let entry_ns = JsValue::object(entry_ns);
+        let entry_ns = existing
+            .as_ref()
+            .and_then(|record| record.eager_namespace)
+            .unwrap_or_else(|| {
+                JsValue::object(crate::module_namespace::attach_namespace(
+                    &mut self.heap,
+                    owner_module_id,
+                    entry_env,
+                    &module.binding_plan,
+                    v12_heap::ModuleNamespaceVariant::Eager,
+                ))
+            });
         if let Some(loader) = self.registry.loader()
-            && let Some(entry_path) = entry_path
+            && let Some(canonical) = canonical.as_ref()
         {
-            let canonical = crate::module_loader::resolve_specifier(
-                Path::new("."),
-                &entry_path.to_string_lossy(),
-            );
             let mut state = loader.borrow_mut();
             state.loading.insert(canonical.clone());
-            state.modules.insert(
-                canonical,
+            let record = state.modules.entry(canonical.clone()).or_insert_with(|| {
                 crate::module_loader::LinkedModule {
-                    namespace: entry_ns,
+                    eager_namespace: Some(entry_ns),
+                    deferred_namespace: None,
                     env: entry_env,
+                    owner_module_id,
                     binding_plan: std::rc::Rc::from(module.binding_plan.clone().into_boxed_slice()),
                     export_stars: std::rc::Rc::from(module.export_stars.clone().into_boxed_slice()),
                     evaluated: false,
-                },
-            );
+                    cached_error: None,
+                }
+            });
+            record.eager_namespace = Some(entry_ns);
         }
         let strings: Vec<String> = v12_bccompiler::freeze_interner(interner)
             .iter()
@@ -365,9 +389,10 @@ impl Engine {
         // `defer` request is linked but not evaluated here: its body runs
         // only when an export is read through the deferred namespace.
         if let Some(loader) = registry.loader() {
-            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen: std::collections::HashSet<(String, bool)> =
+                std::collections::HashSet::new();
             for entry in &module.imports {
-                if seen.insert(entry.specifier.clone()) {
+                if seen.insert((entry.specifier.clone(), entry.deferred)) {
                     let child = crate::module_loader::resolve_specifier(base, &entry.specifier);
                     let result = if entry.deferred {
                         crate::module_loader::load_deferred(&mut interp, &loader, &child)

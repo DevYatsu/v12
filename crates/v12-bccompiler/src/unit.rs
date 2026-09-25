@@ -621,19 +621,19 @@ fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError>
     // Group imported bindings by specifier, dedup specifiers for the actual
     // `import(specifier)` native call, then wire each binding via a
     // `GetProperty` from the returned namespace object.
-    let mut by_spec: HashMap<String, Vec<crate::model::ImportEntry>> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    let mut seen_spec: HashSet<String> = HashSet::new();
+    let mut by_spec: HashMap<(String, bool), Vec<crate::model::ImportEntry>> = HashMap::new();
+    let mut order: Vec<(String, bool)> = Vec::new();
+    let mut seen_spec: HashSet<(String, bool)> = HashSet::new();
     for e in &cx.comp.plans.imports {
-        let s = e.specifier.clone();
-        if seen_spec.insert(s.clone()) {
-            order.push(s.clone());
+        let key = (e.specifier.clone(), e.deferred);
+        if seen_spec.insert(key.clone()) {
+            order.push(key.clone());
         }
-        by_spec.entry(s).or_default().push(e.clone());
+        by_spec.entry(key).or_default().push(e.clone());
     }
 
-    for spec in order {
-        let entries = &by_spec[&spec];
+    for (spec, deferred) in order {
+        let entries = &by_spec[&(spec.clone(), deferred)];
         // Representative span for the call site; use first entry's span or
         // default when side-effect only.
         let span = entries
@@ -642,14 +642,19 @@ fn emit_import_calls(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError>
             .map(|(s, e)| oxc_span::Span::new(s, e))
             .unwrap_or_default();
 
-        // Call native import helper: Closure + Call with one string arg.
-        // Layout: [callee][this][arg] -> Call rC, rC, argc=1
-        let block = cx.new_temps(crate::model::CALL_HEADER_REGS + 1);
+        // Call native import helper. Static eager calls pass one argument;
+        // static deferred calls add a numeric phase marker. Dynamic imports
+        // use a third argument and are lowered in `expr.rs`.
+        let arg_count = if deferred { 2 } else { 1 };
+        let block = cx.new_temps(crate::model::CALL_HEADER_REGS + arg_count);
         let callee = block;
         cx.emit_closure(callee, NATIVE_IMPORT_INDEX, span);
         cx.load_undefined(callee + 1, span);
         cx.load_str(callee + 2, &spec, span)?;
-        cx.emit_call(callee, callee, 1, span);
+        if deferred {
+            cx.load_number(callee + 3, 1.0, span)?;
+        }
+        cx.emit_call(callee, callee, arg_count, span);
         let ns_reg = callee;
 
         // The loader links every imported environment slot directly to the

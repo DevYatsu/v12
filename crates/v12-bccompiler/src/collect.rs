@@ -2243,6 +2243,7 @@ fn build_module_binding_plans(plans: &mut Plans, scoping: &Scoping) {
             source: ModuleBindingSource::Import {
                 specifier: import.specifier,
                 imported: import.imported,
+                deferred: import.deferred,
             },
             exports: Vec::new(),
             initially_initialized: true,

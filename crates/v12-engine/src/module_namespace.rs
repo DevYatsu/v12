@@ -1,7 +1,10 @@
 //! Module namespace exotic objects and live binding-cell installation.
 
 use v12_bccompiler::ModuleBindingPlan;
-use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, Kind, ModuleNamespaceRecord, PropKey};
+use v12_heap::{
+    Attrs, Handle, Heap, JsObject, JsValue, Kind, ModuleNamespaceRecord, ModuleNamespaceVariant,
+    PropKey,
+};
 
 /// Allocates an empty namespace object: `[[Prototype]]` null and
 /// `[[Extensible]]` false from birth.
@@ -16,21 +19,19 @@ pub(crate) fn alloc_namespace(heap: &mut Heap) -> Handle<JsObject> {
     obj
 }
 
-/// Allocates the namespace, seeded main environment, and one cell per
-/// compiler binding-plan entry. Import/re-export cells are uninitialized
-/// placeholders until the linker installs the source cell.
-pub(crate) fn alloc_linked_module(
+/// Allocates the shared module execution environment and one cell per compiler
+/// binding-plan entry. Namespace attachment is intentionally separate so an
+/// eager and a deferred request can expose different namespace objects over
+/// these same cells.
+pub(crate) fn alloc_execution(
     heap: &mut Heap,
     owner_module_id: u32,
     env_slots: u16,
     plan: &[ModuleBindingPlan],
-) -> (Handle<JsObject>, Handle<JsObject>) {
-    let namespace = alloc_namespace(heap);
+) -> Handle<JsObject> {
     let env = heap.alloc(JsObject::environment(usize::from(env_slots), None));
     heap.add_module_root(env);
 
-    let mut cells = Vec::with_capacity(plan.len());
-    let mut exports = Vec::new();
     for binding in plan {
         let cell = heap.alloc(JsObject::binding_cell(
             JsValue::undefined(),
@@ -38,10 +39,33 @@ pub(crate) fn alloc_linked_module(
             owner_module_id,
         ));
         heap.add_module_root(cell);
-        cells.push((binding.env_slot, cell));
         if usize::from(binding.env_slot) < heap.get(env).properties.len() {
             heap.get_mut(env).properties[usize::from(binding.env_slot)] = JsValue::object(cell);
         }
+    }
+    env
+}
+
+/// Allocates and attaches one namespace variant to an already allocated shared
+/// execution environment.
+pub(crate) fn attach_namespace(
+    heap: &mut Heap,
+    owner_module_id: u32,
+    env: Handle<JsObject>,
+    plan: &[ModuleBindingPlan],
+    variant: ModuleNamespaceVariant,
+) -> Handle<JsObject> {
+    let namespace = alloc_namespace(heap);
+    let mut exports = Vec::new();
+    for binding in plan {
+        let Some(cell) = heap
+            .get(env)
+            .properties
+            .get(usize::from(binding.env_slot))
+            .and_then(|value| value.as_object())
+        else {
+            continue;
+        };
         for export in &binding.exports {
             exports.push((export.clone(), cell));
         }
@@ -71,9 +95,10 @@ pub(crate) fn alloc_linked_module(
     }
     heap.get_mut(namespace).module_namespace = Some(ModuleNamespaceRecord {
         owner_module_id,
+        variant,
         cells: record_cells,
     });
-    (namespace, env)
+    namespace
 }
 
 /// Installs a source cell into an explicit re-export or imported seed slot.
@@ -154,11 +179,13 @@ pub(crate) fn sort_exports(heap: &mut Heap, namespace: Handle<JsObject>) {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries.dedup_by(|a, b| a.1 == b.1);
 
-    let owner_module_id = heap
+    let (owner_module_id, variant) = heap
         .get(namespace)
         .module_namespace
         .as_ref()
-        .map_or(0, |record| record.owner_module_id);
+        .map_or((0, ModuleNamespaceVariant::Eager), |record| {
+            (record.owner_module_id, record.variant)
+        });
     heap.bind_shape(namespace, heap.root_shape());
     let object = heap.get_mut(namespace);
     object.properties.clear();
@@ -178,6 +205,7 @@ pub(crate) fn sort_exports(heap: &mut Heap, namespace: Handle<JsObject>) {
     }
     heap.get_mut(namespace).module_namespace = Some(ModuleNamespaceRecord {
         owner_module_id,
+        variant,
         cells,
     });
 }

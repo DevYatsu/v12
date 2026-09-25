@@ -121,10 +121,18 @@ pub struct BindingCellData {
     pub owner_module_id: u32,
 }
 
+/// Identifies which request phase exposed a module namespace object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleNamespaceVariant {
+    Eager,
+    Deferred,
+}
+
 /// GC-visible record attached to a [`Kind::ModuleNamespace`] object.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModuleNamespaceRecord {
     pub owner_module_id: u32,
+    pub variant: ModuleNamespaceVariant,
     /// Handles parallel to the namespace's shape-backed export slots.
     pub cells: Vec<Handle<JsObject>>,
 }
