@@ -274,6 +274,11 @@ impl Engine {
         let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
+        if let Some(loader) = registry.loader() {
+            interp.set_module_evaluator(Rc::new(
+                crate::module_loader::ModuleEvaluatorAdapter::new(loader),
+            ));
+        }
         // Same shared-table adoption as `run_jobs`: the invoked callee may
         // close over programs registered during earlier evals.
         interp.adopt_shared_programs(Rc::clone(programs));

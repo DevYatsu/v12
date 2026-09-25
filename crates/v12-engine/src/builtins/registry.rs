@@ -299,6 +299,11 @@ impl v12_native::NativeRegistry for NativeRegistry {
         interp.set_program_id(program_id);
         interp.set_programs(programs);
         interp.set_natives(Box::new(self.clone()));
+        if let Some(loader) = self.loader.clone() {
+            interp.set_module_evaluator(std::rc::Rc::new(
+                crate::module_loader::ModuleEvaluatorAdapter::new(loader),
+            ));
+        }
         match interp.run() {
             Ok(()) => Ok(interp.completion_value().unwrap_or_else(JsValue::undefined)),
             Err(v12_interp::JSException(thrown)) => Err(Throw::Value(thrown)),

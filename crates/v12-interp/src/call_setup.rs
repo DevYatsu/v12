@@ -1698,6 +1698,7 @@ impl Interp<'_> {
             | NativeId::ObjectEntries
             | NativeId::ObjectGetOwnPropertyDescriptor
             | NativeId::ObjectGetOwnPropertyDescriptors
+            | NativeId::ObjectHasOwn
             | NativeId::ObjectDefineProperty
             | NativeId::ObjectDefineProperties
             | NativeId::ObjectGetPrototypeOf
@@ -2178,6 +2179,13 @@ impl Interp<'_> {
                     Some(desc) => self.own_desc_to_object(desc),
                     None => JsValue::undefined(),
                 })
+            }
+            NativeId::ObjectHasOwn => {
+                let key = self
+                    .property_key(args.get(1).copied().unwrap_or(JsValue::undefined()))?;
+                Ok(JsValue::from_bool(
+                    self.object_get_own_property(proxy, key)?.is_some(),
+                ))
             }
             NativeId::ObjectGetOwnPropertyDescriptors => {
                 let keys = self.object_own_keys(proxy)?;

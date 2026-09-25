@@ -67,6 +67,9 @@ mod globals;
 mod object_ops;
 mod ops;
 mod property;
+mod module_eval;
+
+pub use module_eval::ModuleEvaluator;
 
 #[cfg(test)]
 mod tests;
@@ -523,6 +526,7 @@ pub struct Interp<'a> {
     resume_depth: usize,
 
     natives: Box<dyn NativeRegistry>,
+    module_evaluator: Option<Rc<dyn crate::ModuleEvaluator>>,
     hooks: Box<dyn TierHooks>,
     /// Per-function execution feedback, allocated on first observation.
     feedback: std::collections::HashMap<u32, FeedbackVector>,
@@ -640,6 +644,7 @@ impl<'a> Interp<'a> {
             stop_at_frames: None,
             resume_depth: 0,
             natives: Box::new(EmptyNativeRegistry),
+            module_evaluator: None,
             hooks: Box::new(()),
             feedback: std::collections::HashMap::new(),
             tier_up_pending: Vec::new(),

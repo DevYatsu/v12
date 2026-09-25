@@ -48,7 +48,7 @@ use std::rc::Rc;
 
 use v12_bccompiler::{ModuleBindingPlan, ModuleBindingSource};
 use v12_heap::{Handle, JsObject, JsValue};
-use v12_interp::Interp;
+use v12_interp::{Interp, JSException, ModuleEvaluator};
 use v12_native::Throw;
 
 use super::builtins::ctx::Ctx;
@@ -63,12 +63,14 @@ pub(crate) struct LinkedModule {
     pub eager_namespace: Option<JsValue>,
     pub deferred_namespace: Option<JsValue>,
     pub env: Handle<JsObject>,
+    pub path: PathBuf,
     pub owner_module_id: u32,
     pub binding_plan: Rc<[ModuleBindingPlan]>,
     pub export_stars: Rc<[String]>,
     pub evaluated: bool,
-    /// Reserved for the deferred read-trigger evaluator in the next task.
-    #[allow(dead_code)]
+    /// Async main that has not settled at the current checkpoint.
+    pub tla_pending: bool,
+    /// Runtime evaluation failure shared by both namespace variants.
     pub cached_error: Option<JsValue>,
 }
 
@@ -79,6 +81,39 @@ impl LinkedModule {
         } else {
             self.eager_namespace
         }
+    }
+}
+
+/// Engine adapter installed on interpreters sharing the engine heap.
+pub(crate) struct ModuleEvaluatorAdapter {
+    state: Loader,
+}
+
+impl ModuleEvaluatorAdapter {
+    pub(crate) fn new(state: Loader) -> Self {
+        Self { state }
+    }
+}
+
+impl ModuleEvaluator for ModuleEvaluatorAdapter {
+    fn ensure_evaluated(
+        &self,
+        interp: &mut Interp<'_>,
+        namespace: JsValue,
+    ) -> Result<(), JSException> {
+        let path = {
+            let state = self.state.borrow();
+            state
+                .modules
+                .iter()
+                .find_map(|(_, record)| {
+                    (record.deferred_namespace == Some(namespace)
+                        || record.eager_namespace == Some(namespace))
+                        .then(|| record.path.clone())
+                })
+        };
+        let Some(path) = path else { return Ok(()) };
+        ensure_deferred(interp, &self.state, &path).map_err(JSException)
     }
 }
 
@@ -335,10 +370,12 @@ pub(crate) fn load_deferred(
             eager_namespace: None,
             deferred_namespace: Some(namespace),
             env,
+            path: path.to_path_buf(),
             owner_module_id,
             binding_plan: Rc::from(module.binding_plan.into_boxed_slice()),
             export_stars: Rc::from(module.export_stars.into_boxed_slice()),
             evaluated: false,
+            tla_pending: false,
             cached_error: None,
         },
     );
@@ -379,6 +416,40 @@ pub(crate) fn load_deferred(
         .expect("deferred namespace"))
 }
 
+fn ensure_deferred(
+    interp: &mut Interp<'_>,
+    state: &Loader,
+    path: &Path,
+) -> Result<(), JsValue> {
+    let (evaluated, loading, pending_tla, cached_error) = {
+        let state_ref = state.borrow();
+        let Some(record) = state_ref.modules.get(path) else {
+            return Ok(());
+        };
+        (
+            record.evaluated,
+            state_ref.loading.contains(path),
+            record.tla_pending,
+            record.cached_error,
+        )
+    };
+    if let Some(error) = cached_error {
+        return Err(error);
+    }
+    if evaluated {
+        return Ok(());
+    }
+    if loading || pending_tla {
+        return Err(interp.error_value(
+            "TypeError: Cannot evaluate a module while it is already evaluating",
+        ));
+    }
+    match load_and_evaluate(interp, state, path) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Links export-star aliases and named binding cells for either namespace
 /// variant of a canonical module record.
 fn link_record(interp: &mut Interp<'_>, state: &Loader, path: &Path) -> Result<(), JsValue> {
@@ -388,6 +459,28 @@ fn link_record(interp: &mut Interp<'_>, state: &Loader, path: &Path) -> Result<(
     link_binding_cells(interp, state, path, &dir)
 }
 
+fn cache_evaluation_error(
+    interp: &mut Interp<'_>,
+    state: &Loader,
+    path: &Path,
+    error: JsValue,
+) -> JsValue {
+    interp.heap_mut().add_root(error);
+    let mut state = state.borrow_mut();
+    state.loading.remove(path);
+    if let Some(record) = state.modules.get_mut(path) {
+        record.cached_error = Some(error);
+        record.tla_pending = false;
+    }
+    error
+}
+
+enum EvaluationSettlement {
+    Fulfilled,
+    Rejected(JsValue),
+    Pending,
+}
+
 /// Evaluates the module at `path` (loading its static dependency graph first,
 /// post-order) and returns its eager namespace snapshot.
 pub(crate) fn load_and_evaluate(
@@ -395,24 +488,32 @@ pub(crate) fn load_and_evaluate(
     state: &Loader,
     path: &Path,
 ) -> Result<JsValue, JsValue> {
-    if let Some(module) = state.borrow().modules.get(path) {
-        if module.evaluated {
-            if let Some(namespace) = module.eager_namespace {
+    {
+        let state_ref = state.borrow();
+        if let Some(record) = state_ref.modules.get(path) {
+            if let Some(error) = record.cached_error {
+                return Err(error);
+            }
+            if (record.evaluated || record.tla_pending)
+                && let Some(namespace) = record.eager_namespace
+            {
                 return Ok(namespace);
             }
         }
-    }
-    if state.borrow().loading.contains(path) {
-        if let Some(module) = state.borrow().modules.get(path)
-            && let Some(namespace) = module.namespace(false).or_else(|| module.namespace(true))
-        {
-            return Ok(namespace);
+        if state_ref.loading.contains(path) {
+            if let Some(namespace) = state_ref
+                .modules
+                .get(path)
+                .and_then(|record| record.namespace(false).or_else(|| record.namespace(true)))
+            {
+                return Ok(namespace);
+            }
+            let placeholder = interp.heap_mut().alloc(v12_heap::JsObject::ordinary(
+                Default::default(),
+                Default::default(),
+            ));
+            return Ok(JsValue::object(placeholder));
         }
-        let placeholder = interp.heap_mut().alloc(v12_heap::JsObject::ordinary(
-            Default::default(),
-            Default::default(),
-        ));
-        return Ok(JsValue::object(placeholder));
     }
 
     let (module, strings) = read_and_compile(interp, path)?;
@@ -466,10 +567,12 @@ pub(crate) fn load_and_evaluate(
                 eager_namespace: None,
                 deferred_namespace: None,
                 env,
+                path: path.to_path_buf(),
                 owner_module_id,
                 binding_plan: Rc::from(module.binding_plan.clone().into_boxed_slice()),
                 export_stars: Rc::from(module.export_stars.clone().into_boxed_slice()),
                 evaluated: false,
+                tla_pending: false,
                 cached_error: None,
             });
         record.eager_namespace = Some(eager_namespace);
@@ -514,13 +617,27 @@ pub(crate) fn load_and_evaluate(
     let functions: Rc<[v12_bytecode::FunctionBytecode]> = module.program.functions.into();
     let result = interp.call_program_main_with_env(functions, strings, main, Some(env));
     state.borrow_mut().referrer = prev_referrer;
-    let completion = result.map_err(|exc| {
-        state.borrow_mut().loading.remove(path);
-        state.borrow_mut().modules.remove(path);
-        exc.0
-    })?;
+    let completion = match result {
+        Ok(completion) => completion,
+        Err(JSException(error)) => {
+            return Err(cache_evaluation_error(interp, state, path, error));
+        }
+    };
     if main_is_async && completion.as_object().is_some() {
-        settle_evaluation_promise(interp, completion)?;
+        match settle_evaluation_promise(interp, completion) {
+            EvaluationSettlement::Fulfilled => {}
+            EvaluationSettlement::Rejected(error) => {
+                return Err(cache_evaluation_error(interp, state, path, error));
+            }
+            EvaluationSettlement::Pending => {
+                let mut state_mut = state.borrow_mut();
+                if let Some(record) = state_mut.modules.get_mut(path) {
+                    record.tla_pending = true;
+                }
+                state_mut.loading.remove(path);
+                return Ok(eager_namespace);
+            }
+        }
     }
     if let Some(record) = state.borrow_mut().modules.get_mut(path) {
         record.evaluated = true;
@@ -730,24 +847,23 @@ pub(crate) fn link_binding_cells(
 }
 
 /// Drains interpreter awaits until async module `main_promise` settles.
-///
-/// Returns the fulfillment value, or the rejection reason as `Err`. Exits
-/// quiescent (returning the still-pending promise) when no pass resumes or
-/// settles anything: the remaining awaits are parked on promises only host
-/// jobs can settle, which run at the engine's checkpoint drain.
 fn settle_evaluation_promise(
     interp: &mut Interp<'_>,
     main_promise: JsValue,
-) -> Result<JsValue, JsValue> {
+) -> EvaluationSettlement {
     let target = main_promise.as_object();
     for _ in 0..10_000 {
         let resumed = interp.run_jobs();
         let settlements = interp.take_pending_settlements();
-        let mut outcome: Option<Result<JsValue, JsValue>> = None;
+        let mut outcome = None;
         for (promise, value, rejecting) in settlements {
             if Some(promise) == target {
                 if outcome.is_none() {
-                    outcome = Some(if rejecting { Err(value) } else { Ok(value) });
+                    outcome = Some(if rejecting {
+                        EvaluationSettlement::Rejected(value)
+                    } else {
+                        EvaluationSettlement::Fulfilled
+                    });
                 }
             } else {
                 interp.push_pending_settlement(promise, value, rejecting);
@@ -763,7 +879,7 @@ fn settle_evaluation_promise(
             break;
         }
     }
-    Ok(main_promise)
+    EvaluationSettlement::Pending
 }
 
 /// Dynamic-import load job: evaluate the graph, then settle `promise`.

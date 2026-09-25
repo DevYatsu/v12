@@ -110,11 +110,17 @@ impl Engine {
         natives: Box<dyn v12_interp::NativeRegistry>,
         deadline: Option<std::time::Instant>,
         programs: Rc<RefCell<Vec<v12_native::ProgramTable>>>,
+        loader: Option<crate::module_loader::Loader>,
     ) -> Interp<'a> {
         #[cfg(feature = "jit")]
         let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(natives);
+        if let Some(loader) = loader {
+            interp.set_module_evaluator(Rc::new(
+                crate::module_loader::ModuleEvaluatorAdapter::new(loader),
+            ));
+        }
         interp.adopt_shared_programs(programs);
         #[cfg(feature = "jit")]
         jit_tier::JitTierHooks::install_if_enabled(&mut interp, &jit_program);
@@ -165,6 +171,7 @@ impl Engine {
             natives,
             deadline,
             Rc::clone(programs),
+            registry.loader(),
         );
         let outcome = interp.run();
         // Drain the single microtask checkpoint against the still-live
@@ -342,10 +349,12 @@ impl Engine {
                     eager_namespace: Some(entry_ns),
                     deferred_namespace: None,
                     env: entry_env,
+                    path: canonical.clone(),
                     owner_module_id,
                     binding_plan: std::rc::Rc::from(module.binding_plan.clone().into_boxed_slice()),
                     export_stars: std::rc::Rc::from(module.export_stars.clone().into_boxed_slice()),
                     evaluated: false,
+                    tla_pending: false,
                     cached_error: None,
                 }
             });
@@ -383,6 +392,7 @@ impl Engine {
             natives,
             deadline,
             Rc::clone(programs),
+            registry.loader(),
         );
         // Pre-evaluate the static import graph on this interpreter (the
         // dynamic-import path is runtime-driven and does not need it). A
@@ -615,6 +625,11 @@ impl Engine {
         let jit_program = Rc::clone(&functions);
         let mut interp = Interp::new_with_heap(heap, Some(global), functions, main, strings);
         interp.set_natives(Box::new(registry.clone()));
+        if let Some(loader) = registry.loader() {
+            interp.set_module_evaluator(Rc::new(
+                crate::module_loader::ModuleEvaluatorAdapter::new(loader),
+            ));
+        }
         // Adopt the engine's shared cross-program table and register the
         // retained program under a fresh id: async resumes and reaction jobs
         // may close over programs registered during earlier evals (imports,

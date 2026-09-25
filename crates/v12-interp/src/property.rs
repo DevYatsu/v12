@@ -166,7 +166,12 @@ impl Interp<'_> {
             return self.proxy_op_get(obj, obj_v, key_v);
         }
         if self.heap.get(obj).kind == Kind::ModuleNamespace {
-            return self.module_namespace_get(obj, key, key_v);
+            let trigger_key = match key {
+                Some(key) => Some(key),
+                None if key_v.is_symbol() => None,
+                None => Some(self.property_key(key_v)?),
+            };
+            return self.module_namespace_get(obj, trigger_key, key_v);
         }
         // Cheapest-integer-first: the canonical-index probe runs before any
         // surface. Kind-guarded to Array/Arguments, so other receivers flow
@@ -916,6 +921,7 @@ impl Interp<'_> {
         key: Option<PropKey>,
         _key_v: JsValue,
     ) -> Result<JsValue, JSException> {
+        self.trigger_module_namespace(namespace, key, false)?;
         let Some(key) = key.filter(|key| key.is_string()) else {
             return Ok(JsValue::undefined());
         };
@@ -1522,6 +1528,10 @@ impl Interp<'_> {
         // Flatten-once so the index scan never materializes.
         self.flatten_key(key_v);
         let kind = self.heap.get(obj).kind;
+        if kind == Kind::ModuleNamespace {
+            let key = self.property_key(key_v)?;
+            self.trigger_module_namespace(obj, Some(key), false)?;
+        }
         if (kind == Kind::Array || kind == Kind::Arguments)
             && let Some(idx) = self.array_index_of(key_v)
             && self.heap.get(obj).get_element(idx).is_some()
@@ -1531,6 +1541,9 @@ impl Interp<'_> {
         let key = self.property_key(key_v)?;
         let mut cur = Some(obj);
         while let Some(o) = cur {
+            if self.heap.get(o).kind == Kind::ModuleNamespace {
+                self.trigger_module_namespace(o, Some(key), false)?;
+            }
             // Proxy exotic in the prototype chain: `HasProperty` recurses
             // through the receiver's `[[Prototype]]`, and a proxy there
             // answers via its own `has` trap (ES 10.5.6, `HasProperty` step
@@ -1648,6 +1661,9 @@ impl Interp<'_> {
         &mut self,
         obj: Handle<JsObject>,
     ) -> Result<Vec<PropKey>, JSException> {
+        if self.heap.get(obj).kind == Kind::ModuleNamespace {
+            self.trigger_module_namespace(obj, None, true)?;
+        }
         if self.heap.get(obj).kind == Kind::Proxy {
             return self.proxy_op_own_keys(obj);
         }
@@ -1894,6 +1910,9 @@ impl Interp<'_> {
         obj: Handle<JsObject>,
         key: PropKey,
     ) -> Result<Option<OwnDesc>, JSException> {
+        if self.heap.get(obj).kind == Kind::ModuleNamespace {
+            self.trigger_module_namespace(obj, Some(key), false)?;
+        }
         if self.heap.get(obj).kind == Kind::Proxy {
             return self.proxy_op_get_own_property(obj, key);
         }
