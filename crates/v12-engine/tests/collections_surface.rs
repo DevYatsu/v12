@@ -168,6 +168,20 @@ fn ordinary_overrides_and_deletions_do_not_resurrect_collection_methods() {
 }
 
 #[test]
+fn collection_methods_reject_prototype_objects_without_internal_slots() {
+    assert_eq!(
+        display(
+            "let out = ''; try { Map.prototype.clear.call(Map.prototype); } catch (e) { out += e instanceof TypeError ? 'c' : 'x'; } \
+             try { Map.prototype.delete.call(Map.prototype); } catch (e) { out += e instanceof TypeError ? 'd' : 'x'; } \
+             try { Set.prototype.entries.call(Set.prototype); } catch (e) { out += e instanceof TypeError ? 'e' : 'x'; } \
+             try { Set.prototype.values.call(Set.prototype); } catch (e) { out += e instanceof TypeError ? 'v' : 'x'; } \
+             throw out;"
+        ),
+        "cdev"
+    );
+}
+
+#[test]
 fn collection_size_is_an_accessor_on_the_prototype() {
     assert_eq!(
         display(

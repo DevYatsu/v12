@@ -133,6 +133,23 @@ pub fn iterator_for(ctx: &mut Ctx, this: JsValue, kind: i32) -> Result<JsValue, 
     let obj = this
         .as_object()
         .ok_or_else(|| ctx.type_error("TypeError: value is not iterable"))?;
+    let receiver_kind = ctx.heap.get(obj).kind;
+    let valid = match kind {
+        ITER_KIND_MAP_ENTRIES | ITER_KIND_MAP_KEYS | ITER_KIND_MAP_VALUES => {
+            receiver_kind == v12_heap::Kind::Map
+        }
+        ITER_KIND_SET_VALUES | ITER_KIND_SET_ENTRIES => receiver_kind == v12_heap::Kind::Set,
+        ITER_KIND_ARRAY_VALUES | ITER_KIND_ARRAY_ENTRIES | ITER_KIND_ARRAY_KEYS => {
+            matches!(
+                receiver_kind,
+                v12_heap::Kind::Array | v12_heap::Kind::Arguments
+            )
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(ctx.type_error("TypeError: iterator called on incompatible receiver"));
+    }
     Ok(JsValue::object(create_iterator(ctx, obj, kind)))
 }
 
