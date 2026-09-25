@@ -153,7 +153,10 @@ fn deferred_symbol_and_then_reads_do_not_trigger() {
     );
 
     assert_true(&mut engine, "globalThis.symbolRead === undefined");
-    assert_true(&mut engine, "globalThis.thenError instanceof ReferenceError");
+    assert_true(
+        &mut engine,
+        "globalThis.thenError instanceof ReferenceError",
+    );
     assert_true(&mut engine, "globalThis.before === undefined");
     assert_true(&mut engine, "globalThis.ns.value === 4");
     assert_true(&mut engine, "globalThis.depRuns === 1");
@@ -176,8 +179,14 @@ fn deferred_enumeration_and_own_queries_trigger_once() {
 
     assert_true(&mut engine, "globalThis.keys.indexOf('value') !== -1");
     assert_true(&mut engine, "globalThis.names.indexOf('value') !== -1");
-    assert_true(&mut engine, "globalThis.reflectKeys.indexOf('value') !== -1");
-    assert_true(&mut engine, "globalThis.has === false && globalThis.reflectHas === false");
+    assert_true(
+        &mut engine,
+        "globalThis.reflectKeys.indexOf('value') !== -1",
+    );
+    assert_true(
+        &mut engine,
+        "globalThis.has === false && globalThis.reflectHas === false",
+    );
     assert_true(&mut engine, "globalThis.desc === undefined");
     assert_true(&mut engine, "globalThis.depRuns === 1");
 }
@@ -197,7 +206,10 @@ fn deferred_prototype_super_read_triggers() {
         "import defer * as ns from './dep.js'; let obj = { read() { return super.value; } }; Object.setPrototypeOf(obj, ns); globalThis.result = obj.read();",
     );
 
-    assert_true(&mut engine, "globalThis.result === 6 && globalThis.depRuns === 1");
+    assert_true(
+        &mut engine,
+        "globalThis.result === 6 && globalThis.depRuns === 1",
+    );
 }
 
 #[test]
@@ -217,7 +229,10 @@ fn deferred_star_reexport_read_triggers() {
     );
 
     assert_true(&mut engine, "globalThis.depRuns === undefined");
-    assert_true(&mut engine, "globalThis.bridge.value === 8 && globalThis.depRuns === 1");
+    assert_true(
+        &mut engine,
+        "globalThis.bridge.value === 8 && globalThis.depRuns === 1",
+    );
 }
 
 #[test]
@@ -244,7 +259,11 @@ fn deferred_nested_import_uses_the_module_referrer() {
 #[test]
 fn deferred_evaluation_error_is_cached_by_identity() {
     let dir = fixture("cached-error");
-    write_module(&dir, "dep.js", "globalThis.depRuns = (globalThis.depRuns || 0) + 1; throw new Error('boom');");
+    write_module(
+        &dir,
+        "dep.js",
+        "globalThis.depRuns = (globalThis.depRuns || 0) + 1; throw new Error('boom');",
+    );
     let mut engine = Engine::new();
     evaluate_entry(
         &mut engine,
@@ -252,7 +271,10 @@ fn deferred_evaluation_error_is_cached_by_identity() {
         "import defer * as ns from './dep.js'; globalThis.ns = ns; try { ns.value; } catch (e) { globalThis.firstError = e; } try { ns.missing; } catch (e) { globalThis.secondError = e; }",
     );
 
-    assert_true(&mut engine, "globalThis.firstError === globalThis.secondError");
+    assert_true(
+        &mut engine,
+        "globalThis.firstError === globalThis.secondError",
+    );
     assert_true(&mut engine, "globalThis.firstError instanceof Error");
     assert_true(&mut engine, "globalThis.depRuns === 1");
 }

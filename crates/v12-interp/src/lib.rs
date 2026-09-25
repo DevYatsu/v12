@@ -64,10 +64,10 @@ mod execute;
 pub mod feedback;
 mod generator_async;
 mod globals;
+mod module_eval;
 mod object_ops;
 mod ops;
 mod property;
-mod module_eval;
 
 pub use module_eval::ModuleEvaluator;
 

@@ -2181,8 +2181,8 @@ impl Interp<'_> {
                 })
             }
             NativeId::ObjectHasOwn => {
-                let key = self
-                    .property_key(args.get(1).copied().unwrap_or(JsValue::undefined()))?;
+                let key =
+                    self.property_key(args.get(1).copied().unwrap_or(JsValue::undefined()))?;
                 Ok(JsValue::from_bool(
                     self.object_get_own_property(proxy, key)?.is_some(),
                 ))

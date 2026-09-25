@@ -103,14 +103,11 @@ impl ModuleEvaluator for ModuleEvaluatorAdapter {
     ) -> Result<(), JSException> {
         let path = {
             let state = self.state.borrow();
-            state
-                .modules
-                .iter()
-                .find_map(|(_, record)| {
-                    (record.deferred_namespace == Some(namespace)
-                        || record.eager_namespace == Some(namespace))
-                        .then(|| record.path.clone())
-                })
+            state.modules.iter().find_map(|(_, record)| {
+                (record.deferred_namespace == Some(namespace)
+                    || record.eager_namespace == Some(namespace))
+                .then(|| record.path.clone())
+            })
         };
         let Some(path) = path else { return Ok(()) };
         ensure_deferred(interp, &self.state, &path).map_err(JSException)
@@ -416,11 +413,7 @@ pub(crate) fn load_deferred(
         .expect("deferred namespace"))
 }
 
-fn ensure_deferred(
-    interp: &mut Interp<'_>,
-    state: &Loader,
-    path: &Path,
-) -> Result<(), JsValue> {
+fn ensure_deferred(interp: &mut Interp<'_>, state: &Loader, path: &Path) -> Result<(), JsValue> {
     let (evaluated, loading, pending_tla, cached_error) = {
         let state_ref = state.borrow();
         let Some(record) = state_ref.modules.get(path) else {
@@ -440,9 +433,8 @@ fn ensure_deferred(
         return Ok(());
     }
     if loading || pending_tla {
-        return Err(interp.error_value(
-            "TypeError: Cannot evaluate a module while it is already evaluating",
-        ));
+        return Err(interp
+            .error_value("TypeError: Cannot evaluate a module while it is already evaluating"));
     }
     match load_and_evaluate(interp, state, path) {
         Ok(_) => Ok(()),
