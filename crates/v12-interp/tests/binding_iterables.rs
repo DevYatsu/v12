@@ -112,6 +112,52 @@ fn ordinary_array_and_sync_generator_binding_control() {
 }
 
 #[test]
+fn nested_pattern_over_a_literal_element_keeps_the_fast_path() {
+    // The known-array fact has to survive the nested `lower_binding_pattern`,
+    // otherwise the fixed path silently degrades to `GetIterator` (which the
+    // standalone interpreter cannot even run for an array).
+    let ops = compiled_ops("let [a, [b, c], ...rest] = [1, [2, 3], 4, 5];");
+    assert!(
+        !has_iter_ops(&ops),
+        "nested known-array pattern must stay on the fixed path: {ops:?}"
+    );
+}
+
+#[test]
+fn nested_pattern_over_a_rest_array_keeps_the_fast_path() {
+    let ops = compiled_ops("let [a, ...[b, c]] = [1, 2, 3];");
+    assert!(
+        !has_iter_ops(&ops),
+        "a rest array this lowering built is a known array: {ops:?}"
+    );
+}
+
+#[test]
+fn nested_pattern_over_an_unknown_element_uses_the_iterator_protocol() {
+    // Element 1 is not an array literal: the fact does not hold.
+    for src in [
+        "let [a, [b, c]] = [1, x];",
+        "let [a, [b, c]] = [1, [2, 3].values()];",
+        "let [[a, b] = [5, 6]] = [undefined];", // only the default is a literal
+        "let [a, [b]] = [1, makeIterable()];",
+    ] {
+        let ops = compiled_ops(src);
+        assert!(has_iter_ops(&ops), "{src} must use the iterator protocol");
+    }
+}
+
+#[test]
+fn default_with_two_known_array_candidates_keeps_the_fast_path() {
+    // Raw value *and* default are spread-free array literals, so whichever
+    // runs, the source is a known array.
+    let ops = compiled_ops("let [[a, b] = [5, 6]] = [[7, 8]];");
+    assert!(
+        !has_iter_ops(&ops),
+        "both candidates known: the fact survives the default: {ops:?}"
+    );
+}
+
+#[test]
 fn next_failure_closes_iterator_once_on_throw_path() {
     let src = "let closed = 0; let source = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { closed++; return {}; } }; } }; let [a, b] = source; throw [a, b, closed].join(',');";
     assert!(close_flags(src).contains(&0));

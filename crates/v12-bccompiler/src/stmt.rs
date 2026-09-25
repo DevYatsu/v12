@@ -10,9 +10,9 @@
 //! ranges may share one.
 
 use oxc_ast::ast::{
-    ArrayPattern, BindingPattern, Declaration, Expression, ForInStatement, ForOfStatement,
-    ForStatementInit, Function, LabeledStatement, ModuleDeclaration, ObjectPattern, Statement,
-    TryStatement, VariableDeclarationKind, WithStatement,
+    ArrayExpressionElement, ArrayPattern, BindingPattern, Declaration, Expression, ForInStatement,
+    ForOfStatement, ForStatementInit, Function, LabeledStatement, ModuleDeclaration, ObjectPattern,
+    Statement, TryStatement, VariableDeclarationKind, WithStatement,
 };
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{HandlerRange, Instr, Label, Opcode, WideOp};
@@ -354,18 +354,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     // preserves the ordinary-array ABI for embedders and the
                     // compiler mini harness; all other sources use the general
                     // iterator lowering below.
-                    let direct_array = matches!(
-                        src,
-                        Expression::ArrayExpression(arr)
-                            if !arr.elements.iter().any(|el| matches!(
-                                el,
-                                oxc_ast::ast::ArrayExpressionElement::SpreadElement(_)
-                            ))
-                    );
-                    if direct_array {
-                        self.array_pattern_store_fixed(a, val)?;
-                    } else {
-                        self.array_pattern_store(a, val)?;
+                    match direct_array_elements(src) {
+                        Some(elements) => {
+                            self.array_pattern_store_fixed_known(a, val, Some(elements))?
+                        }
+                        None => self.array_pattern_store(a, val)?,
                     }
                 }
                 BindingPattern::AssignmentPattern(ap) => {
@@ -469,6 +462,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// lowering. This is an optimization for an already-known array source,
     /// not a second iterable protocol.
     fn array_pattern_store_fixed(&mut self, a: &ArrayPattern<'_>, src: u16) -> Res<()> {
+        self.array_pattern_store_fixed_known(a, src, None)
+    }
+
+    /// Fixed-index lowering with the source's literal elements threaded
+    /// through. `literal_elements` is the direct array literal `src` was
+    /// evaluated from, so element `i` of `src` is known to be a plain array
+    /// exactly when the literal's element `i` is a spread-free array literal;
+    /// a nested pattern over such an element keeps the fixed-index path
+    /// instead of dropping to `GetIterator`. `None` (a nested fixed path over
+    /// a rest array, whose elements are runtime values) still lets the *rest*
+    /// argument keep the fixed path, because that array is built right here.
+    fn array_pattern_store_fixed_known(
+        &mut self,
+        a: &ArrayPattern<'_>,
+        src: u16,
+        literal_elements: Option<&[ArrayExpressionElement<'_>]>,
+    ) -> Res<()> {
         if a.rest.is_none() && a.elements.iter().all(|el| el.is_none()) {
             self.emit_require_object_coercible(src, a.span)?;
         }
@@ -479,7 +489,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.probe_resolve_binding(pat, pat.span())?;
             let value = self.new_temp();
             self.emit_reg3(Opcode::GetProperty, value, src, key, pat.span());
-            self.lower_binding_pattern(pat, value)?;
+            let known_array = literal_elements
+                .and_then(|elements| elements.get(idx))
+                .is_some_and(is_array_literal_element);
+            self.lower_binding_pattern_known(pat, value, known_array)?;
         }
         if let Some(rest) = &a.rest {
             let dst = self.new_temp();
@@ -490,7 +503,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 let words = WideOp::CopyArrayRestW { dst, src, start }.encode();
                 self.emit_words(words, rest.span);
             }
-            self.lower_binding_pattern(&rest.argument, dst)?;
+            // `CopyArrayRest` just built a dense array, so a nested array
+            // pattern over it is a known-array source too.
+            self.lower_binding_pattern_known(&rest.argument, dst, true)?;
         }
         Ok(())
     }
@@ -652,6 +667,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// Recursively lowers any binding pattern against `src`.
     pub(crate) fn lower_binding_pattern(&mut self, pat: &BindingPattern<'_>, src: u16) -> Res<()> {
+        self.lower_binding_pattern_known(pat, src, false)
+    }
+
+    /// [`Self::lower_binding_pattern`] with the source's array-ness as a
+    /// caller-proven fact. `known_array` is only ever set where this lowering
+    /// itself established the value is a plain array: an element of a direct
+    /// array literal, or a rest array just built by `CopyArrayRest`. Object
+    /// patterns and identifier stores ignore it; a nested `ArrayPattern` takes
+    /// the fixed-index path only while the fact holds, and every arbitrary
+    /// source (property values, iterator values, default results) falls back
+    /// to the general iterator lowering.
+    fn lower_binding_pattern_known(
+        &mut self,
+        pat: &BindingPattern<'_>,
+        src: u16,
+        known_array: bool,
+    ) -> Res<()> {
         match pat {
             BindingPattern::BindingIdentifier(id) => {
                 let Some(sym) = id.symbol_id.get() else {
@@ -662,6 +694,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(())
             }
             BindingPattern::ObjectPattern(o) => self.object_pattern_store(o, src),
+            BindingPattern::ArrayPattern(a) if known_array => {
+                self.array_pattern_store_fixed(a, src)
+            }
             BindingPattern::ArrayPattern(a) => self.array_pattern_store(a, src),
             BindingPattern::AssignmentPattern(ap) => {
                 // `src === undefined ? default : src`
@@ -685,7 +720,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.bind(use_src);
                 self.move_reg(chosen, src, ap.span);
                 self.bind(end);
-                self.lower_binding_pattern(&ap.left, chosen)
+                // `chosen` holds `src` *or* the default's value, and which one
+                // ran is a runtime fact: the array-ness only survives when both
+                // candidates are known arrays.
+                let chosen_known = known_array && direct_array_elements(&ap.right).is_some();
+                self.lower_binding_pattern_known(&ap.left, chosen, chosen_known)
             }
         }
     }
@@ -1577,6 +1616,38 @@ fn is_direct_super_call(s: &Statement<'_>) -> bool {
             Expression::CallExpression(c) => c.callee.is_super(),
             _ => false,
         },
+        _ => false,
+    }
+}
+
+/// A direct, spread-free array literal: the one source whose value is a
+/// statically known plain array, so both it and the elements that are
+/// themselves spread-free array literals can take the fixed-index lowering.
+/// A spread element makes the literal's contents runtime values, so the
+/// general iterator protocol is used instead.
+fn direct_array_elements<'a>(expr: &'a Expression<'a>) -> Option<&'a [ArrayExpressionElement<'a>]> {
+    match expr {
+        Expression::ArrayExpression(arr)
+            if !arr
+                .elements
+                .iter()
+                .any(|el| matches!(el, ArrayExpressionElement::SpreadElement(_))) =>
+        {
+            Some(&arr.elements)
+        }
+        _ => None,
+    }
+}
+
+/// One element of a direct array literal: `true` when it is itself a
+/// spread-free array literal, i.e. a statically known plain array. Holes and
+/// spread elements are not.
+fn is_array_literal_element(el: &ArrayExpressionElement<'_>) -> bool {
+    match el {
+        ArrayExpressionElement::ArrayExpression(arr) => !arr
+            .elements
+            .iter()
+            .any(|inner| matches!(inner, ArrayExpressionElement::SpreadElement(_))),
         _ => false,
     }
 }
