@@ -1125,3 +1125,22 @@ fn construct_non_constructor_throws_type_error() {
         "unexpected message: {msg}"
     );
 }
+
+#[test]
+fn error_value_leaves_no_scratch_root_behind() {
+    // The scratch root `error_value` pushes is popped on the way out: a thrown
+    // error must not stay reachable from the interpreter afterwards, or every
+    // engine-generated error would leak. Pairs with
+    // `tests/error_value_gc.rs`, which covers the collection hazard itself.
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    heap.gc_stress(Some(1));
+    let mut interp = Interp::from_source(&mut heap, "1;").unwrap();
+    for _ in 0..10 {
+        let v = interp.error_value("TypeError: boom");
+        assert!(v.as_object().is_some());
+        assert!(
+            interp.scratch_roots.is_empty(),
+            "error_value left a scratch root behind"
+        );
+    }
+}

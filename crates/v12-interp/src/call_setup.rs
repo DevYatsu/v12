@@ -905,7 +905,14 @@ impl Interp<'_> {
             kind: Kind::Error,
             ..Default::default()
         });
-        self.heap.add_root(JsValue::object(obj));
+        let obj_v = JsValue::object(obj);
+        // `add_root` cannot cover the span below: every `gc_protect` (this
+        // function's own, and the one `define_own_data_attrs` takes before it
+        // touches the receiver) clears the transient root set, so the next
+        // collection would free the slot this function keeps writing to. Rooted
+        // through `scratch_roots`, which `gc_protect` republishes; popped
+        // before the return, so a thrown error is not retained.
+        self.scratch_roots.push(obj_v);
         // Shape-bound installs in display order: `properties[0]`/`[1]` stay
         // the name/message strings the display paths read positionally, with
         // descriptors that make the props observable (`e.name`, `e.message`).
@@ -915,7 +922,6 @@ impl Interp<'_> {
         let msg_v = JsValue::string(self.heap.intern_text(message));
         let name_key = JsValue::string(self.heap.intern_text("name"));
         let msg_key = JsValue::string(self.heap.intern_text("message"));
-        let obj_v = JsValue::object(obj);
         let _ = self.define_own_data_attrs(obj_v, name_key, name_v, Attrs::BUILTIN);
         let _ = self.define_own_data_attrs(obj_v, msg_key, msg_v, Attrs::BUILTIN);
         // `constructor` link + [[Prototype]] → class prototype object, when
@@ -947,6 +953,7 @@ impl Interp<'_> {
                 }
             }
         }
+        self.scratch_roots.pop();
         JsValue::object(obj)
     }
 

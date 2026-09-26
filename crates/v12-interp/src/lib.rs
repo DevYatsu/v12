@@ -567,6 +567,15 @@ pub struct Interp<'a> {
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
     top_result: Option<JsValue>,
+    /// Scratch roots for objects an engine helper is still building.
+    ///
+    /// `add_root` alone cannot cover this: [`Self::gc_protect`] clears the
+    /// whole transient root set before it collects, so a helper that allocates
+    /// an object and then reaches a safepoint (`define_own_data_attrs` takes
+    /// one) would have its own slot freed mid-build. Pushing here republishes
+    /// the value at every safepoint until the helper pops it on the way out.
+    /// A `Vec` rather than one slot so nested helpers compose.
+    scratch_roots: Vec<JsValue>,
     /// Pending async resumes as FIFO microtask queue: (generator, value, is_reject).
     pending_awaits: std::collections::VecDeque<(Handle<JsObject>, JsValue, bool)>,
     /// Async-function completions awaiting promise settlement:
@@ -673,6 +682,7 @@ impl<'a> Interp<'a> {
             symbol_iterator: None,
             symbol_async_iterator: None,
             top_result: None,
+            scratch_roots: Vec::new(),
             pending_awaits: std::collections::VecDeque::new(),
             pending_settlements: Vec::new(),
             pending_adoptions: Vec::new(),
@@ -2324,12 +2334,16 @@ impl<'a> Interp<'a> {
         // Finding #5 / stale-handle root cause: a previous version listed only 5 of
         // the 11 cached natives here, so a collection between allocations could free
         // an unregistered one (e.g. `Promise.then`) and leave a stale handle.
-        let persistent: [Option<JsValue>; 11] = [
+        // `promise_catch_fn` was the twelfth cached native and was missing here:
+        // `cached_native` parks it in that field and nowhere else, so the next
+        // `gc_protect` freed it and the cached `JsValue` dangled.
+        let persistent: [Option<JsValue>; 12] = [
             self.global.map(JsValue::object),
             self.console_log,
             self.promise_resolve_fn,
             self.promise_reject_fn,
             self.promise_then_fn,
+            self.promise_catch_fn,
             self.array_push_fn,
             self.array_join_fn,
             self.enumerable_own_keys_fn,
@@ -2367,6 +2381,10 @@ impl<'a> Interp<'a> {
         if let Some(v) = self.top_result {
             roots.push(v);
         }
+        // In-flight engine helpers (see `scratch_roots`): an object being
+        // built across a safepoint must outlive the collection that safepoint
+        // runs, exactly like the stack slots above.
+        roots.extend_from_slice(&self.scratch_roots);
         if let Some(sym) = self.symbol_iterator {
             roots.push(JsValue::symbol(sym));
         }
