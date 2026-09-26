@@ -1190,8 +1190,8 @@ pub mod combinator {
     use v12_native::NativeId;
     use v12_native::Throw;
     use v12_native::promise_combinator::{
-        KIND_ALL, KIND_RACE, SLOT_AGGREGATE, SLOT_KIND, SLOT_REJECT, SLOT_REMAINING, SLOT_RESULTS,
-        STATE_SLOTS,
+        KIND_ALL, KIND_ALL_SETTLED, KIND_RACE, SLOT_AGGREGATE, SLOT_KIND, SLOT_REJECT,
+        SLOT_REMAINING, SLOT_RESULTS, STATE_SLOTS,
     };
 
     use super::{shape_resolving_function, smi};
@@ -1247,7 +1247,7 @@ pub mod combinator {
         promise: JsValue,
         reject_v: JsValue,
     ) -> Result<JsValue, Throw> {
-        if kind != KIND_ALL && kind != KIND_RACE {
+        if kind != KIND_ALL && kind != KIND_RACE && kind != KIND_ALL_SETTLED {
             return Err(Throw::Message(
                 "TypeError: unknown Promise combinator".into(),
             ));
@@ -1299,16 +1299,23 @@ pub mod combinator {
     /// shifted (`built-ins/Promise/race/resolved-sequence*`). It also settled
     /// elements whose own `then` is a no-op, which the spec leaves pending.
     ///
-    /// The pair is the capability's own, never a fresh one:
+    /// The pair is the capability's own, never a fresh one — except for
+    /// `KIND_ALL_SETTLED`, which the spec gives a pair of its own because
+    /// neither half may reach the capability directly:
     ///
-    /// - `KIND_RACE` builds none (27.2.4.2 step 8-f):
+    /// - `KIND_RACE` builds none (27.5.4.5.1 step 8-e):
     ///   `[promiseCapability.[[Resolve]], promiseCapability.[[Reject]]]`
     ///   verbatim, so a race element is settled by exactly the functions the
     ///   receiver's constructor handed to its executor.
-    /// - `KIND_ALL` builds only the fulfilled half (27.2.4.1 step 11-b):
+    /// - `KIND_ALL` builds only the fulfilled half (27.5.4.1.1 step 4):
     ///   `[onFulfilledElement, promiseCapability.[[Reject]]]`. The reject half
     ///   needed no per-element wrapper either, so an element rejection
     ///   rejects the aggregate directly.
+    /// - `KIND_ALL_SETTLED` builds **both** halves (27.5.4.2.1 steps 4 and
+    ///   5), each writing a `{ status, value }` / `{ status, reason }` object
+    ///   at the element's own index, and sharing one `alreadyCalled` record.
+    ///   `promiseCapability.[[Reject]]` is never in the pair: an element
+    ///   rejection is a *result*, not the aggregate's.
     ///
     /// First-wins per element is now the capability's own business — the
     /// aggregate's resolving functions ignore a second settlement — so a `then`
@@ -1327,15 +1334,25 @@ pub mod combinator {
         let callable = then_v
             .as_object()
             .is_some_and(|f| matches!(ctx.heap.get(f).kind, Kind::Function | Kind::Proxy));
-        if kind == KIND_ALL {
+        if kind == KIND_ALL || kind == KIND_ALL_SETTLED {
             let remaining = slot(ctx.heap, state, SLOT_REMAINING)
                 .as_smi()
                 .unwrap_or(0)
                 .saturating_add(1);
             ctx.heap.get_mut(state).properties[SLOT_REMAINING as usize] = smi(remaining);
         }
+        if kind == KIND_ALL_SETTLED {
+            // 27.5.4.2.1 has no `IsCallable(nextPromise.then)` branch: it goes
+            // straight from `Call(promiseResolve, …)` to `Invoke(nextPromise,
+            // "then", « onFulfilled, onRejected »)`, so a non-callable `then`
+            // is the `Invoke`'s `TypeError` and rejects the aggregate. Building
+            // the pair unconditionally is what keeps that the case — the
+            // `settle_now` carrier below would settle such an element in place
+            // instead, which is `KIND_ALL`'s rule and not this one's.
+            return Ok(all_settled_pair(ctx, state, index, resolve_v));
+        }
         if !callable {
-            // `IsCallable(then) is false` (27.2.4.1 step 11-c / 27.2.4.2
+            // `IsCallable(then) is false` (27.5.4.1 step 11-c / 27.5.4.5.1
             // step 8-e): the spec hands the element's own handlers to
             // `promiseResolve` rather than invoking anything, and the
             // bookkeeping is the interpreter's — through `element_settled`,
@@ -1389,32 +1406,99 @@ pub mod combinator {
             smallvec::smallvec![JsValue::from_bool(false)],
             smallvec::smallvec![None],
         ));
+        let func = element_handler(ctx, state, index, resolve_v, already, true);
+        JsValue::object(func)
+    }
+
+    /// `PerformPromiseAllSettled`'s pair (spec 27.5.4.2.1 steps 4 and 5):
+    /// `[onFulfilled, onRejected]`, **both** per-element, sharing one
+    /// `alreadyCalled` record.
+    ///
+    /// The shared record is the load-bearing part (step 4-c / 5-c set
+    /// `onRejected.[[AlreadyCalled]]` to the record step 4-b made for
+    /// `onFulfilled`): a `then` free to call both halves records the first
+    /// outcome only, so the unsettled count cannot reach zero twice and the
+    /// aggregate cannot be fulfilled with a half-written entry. Each function's
+    /// own `[[Index]]` is the same `index`; `element::FULFILLED` is what tells
+    /// the two halves apart, since the records are otherwise identical.
+    ///
+    /// The handlers are interpreter-intercepted natives
+    /// ([`NativeId::PromiseCombinatorElement`]) rather than host closures
+    /// because each one's last step is
+    /// `Return ? Call(resultCapability.[[Resolve]], undefined, « valuesArray »)`
+    /// and for a subclassed receiver that is user code. The status object each
+    /// builds is a plain `OrdinaryObjectCreate` plus two
+    /// `CreateDataPropertyOrThrow`s, which the interpreter's property path
+    /// owns (it is the `Call` of `[[Resolve]]` that needs the machine, not the
+    /// object).
+    fn all_settled_pair(
+        ctx: &mut Ctx,
+        state: Handle<JsObject>,
+        index: u32,
+        resolve_v: JsValue,
+    ) -> JsValue {
+        // Step 4-b: `Let alreadyCalled be the Record { [[Value]]: false }`.
+        let already = ctx.heap.alloc(JsObject::ordinary(
+            smallvec::smallvec![JsValue::from_bool(false)],
+            smallvec::smallvec![None],
+        ));
+        let on_fulfilled = element_handler(ctx, state, index, resolve_v, already, true);
+        let on_rejected = element_handler(ctx, state, index, resolve_v, already, false);
+        let pair = ctx.heap.alloc(JsObject::array(vec![
+            JsValue::object(on_fulfilled),
+            JsValue::object(on_rejected),
+        ]));
+        ctx.heap.add_pinned_root(pair);
+        JsValue::object(pair)
+    }
+
+    /// One `CreateBuiltinFunction` of a per-element handler: the intercepted
+    /// native carrying its [`v12_native::promise_combinator::element`] record,
+    /// shaped like any other resolving function (`length: 1`, `name: ""`,
+    /// `%Function.prototype%`).
+    ///
+    /// Rooted like every other combinator object: the only reference the
+    /// reaction record holds is the handler, and the element record — the state
+    /// object and the `alreadyCalled` flag included — rides this one. The flag
+    /// is not pinned separately because `elements` is traced from a pinned
+    /// function.
+    fn element_handler(
+        ctx: &mut Ctx,
+        state: Handle<JsObject>,
+        index: u32,
+        resolve_v: JsValue,
+        already: Handle<JsObject>,
+        fulfilled: bool,
+    ) -> Handle<JsObject> {
         let func = ctx.heap.alloc(JsObject::function(
             v12_heap::FunctionTarget::Bytecode(NativeId::PromiseCombinatorElement.into()),
             None,
         ));
-        // Rooted like every other combinator object: the only reference the
-        // reaction record holds is the handler, and the element record — the
-        // state object and the flag included — rides this one.
         ctx.heap.add_pinned_root(func);
         ctx.heap.get_mut(func).elements = vec![
             JsValue::object(state),
             smi(index as i32),
             resolve_v,
             JsValue::object(already),
+            JsValue::from_bool(fulfilled),
         ];
         shape_resolving_function(ctx, func);
-        JsValue::object(func)
+        func
     }
 
-    /// `combinator_element_settled`: `KIND_ALL`'s element bookkeeping — the
-    /// outcome at `index`, the unsettled count, and (for the last outstanding
-    /// element) the values array the aggregate's `[[Resolve]]` has to be called
-    /// with.
+    /// `combinator_element_settled`: the element bookkeeping — the outcome at
+    /// `index`, the unsettled count, and (for the last outstanding element) the
+    /// values array the aggregate's `[[Resolve]]` has to be called with.
     ///
     /// `KIND_RACE` installs no per-element handler, so the only way here is the
     /// non-callable-`then` path, where the value itself is what the aggregate
     /// settles with.
+    ///
+    /// `fulfilled` is the pair half that fired. `KIND_ALL` only ever installs
+    /// the fulfilled one, so for it the flag is always `true`; `KIND_ALL_SETTLED`
+    /// installs both and the value is already the element's status object by
+    /// the time it arrives (the interpreter's handler built it, steps 4-b-iii-iv
+    /// / 5-b-iii-iv).
     pub fn element_settled(
         ctx: &mut Ctx,
         state_v: JsValue,
@@ -1423,7 +1507,7 @@ pub mod combinator {
         value: JsValue,
     ) -> Result<Option<JsValue>, Throw> {
         let (state, _aggregate, kind) = parts(ctx.heap, state_v)?;
-        if kind != KIND_ALL {
+        if kind == KIND_RACE {
             return Ok(Some(value));
         }
         if let Some(results) = slot(ctx.heap, state, SLOT_RESULTS).as_object() {
@@ -1444,7 +1528,7 @@ pub mod combinator {
         exhausted: bool,
     ) -> Result<Option<JsValue>, Throw> {
         let (state, _aggregate, kind) = parts(ctx.heap, state_v)?;
-        if exhausted && kind == KIND_ALL {
+        if exhausted && kind != KIND_RACE {
             return Ok(drop_unsettled(ctx.heap, state));
         }
         // `KIND_RACE` on exhaustion: the spec returns the capability promise

@@ -17,9 +17,18 @@ use v12_heap::JsValue;
 pub const KIND_ALL: i32 = 0;
 /// See [`KIND_ALL`].
 pub const KIND_RACE: i32 = 1;
+/// `Promise.allSettled` (spec 27.5.4.2.1): the same loop and the same
+/// `results`/`remaining` bookkeeping as [`KIND_ALL`], but every element
+/// settles into a per-element status object and no element rejection reaches
+/// the aggregate's `[[Reject]]`.
+///
+/// Appended, never renumbered: a kind Smi is written once by
+/// `combinator_begin` and compared by identity of meaning from then on, so
+/// `KIND_ALL` and `KIND_RACE` keep the values they have always had.
+pub const KIND_ALL_SETTLED: i32 = 2;
 
-/// Reads `KIND_ALL`/`KIND_RACE` back out of a kind slot; `None` for a slot
-/// that is not one of them (a corrupt state object).
+/// Reads a kind Smi back out of a kind slot; `None` for a slot that is not one
+/// of them (a corrupt state object).
 #[must_use]
 pub fn combinator_kind(slot: JsValue) -> Option<i32> {
     let raw = slot.as_smi()?;
@@ -28,6 +37,9 @@ pub fn combinator_kind(slot: JsValue) -> Option<i32> {
     }
     if raw == KIND_RACE {
         return Some(KIND_RACE);
+    }
+    if raw == KIND_ALL_SETTLED {
+        return Some(KIND_ALL_SETTLED);
     }
     None
 }
@@ -45,18 +57,29 @@ pub const SLOT_AGGREGATE: i32 = 1;
 /// `IfAbruptRejectPromise` (the `[[Resolve]]` call that threw rejects through
 /// it).
 pub const SLOT_REJECT: i32 = 2;
-/// The results array (`KIND_ALL` only): one slot per element pulled so far.
-/// The aggregate fulfills with the results array when the count reaches zero.
+/// The results array (`KIND_ALL` and `KIND_ALL_SETTLED` only): one slot per
+/// element pulled so far. The aggregate fulfills with the results array when
+/// the count reaches zero. For `KIND_ALL_SETTLED` each slot holds the element's
+/// `{ status, value }` / `{ status, reason }` object rather than the raw value.
+/// `KIND_ANY` shares this slot for its `errors` array — only one kind runs per
+/// state object, so the layout stays uniform and no slot is position-dependent.
 pub const SLOT_RESULTS: i32 = 3;
-/// `KIND_ALL` only: how many elements are still unsettled, counting one extra
-/// for "the iterator has not been exhausted yet" (see `combinator::begin`).
-/// The aggregate fulfills with the results array when the count reaches zero.
-/// `KIND_RACE` leaves it at the exhaustion token forever — the race settles
-/// on its first element and its spec loop returns the capability promise
-/// unchanged.
+/// How many elements are still unsettled, counting one extra for "the iterator
+/// has not been exhausted yet" (see `combinator::begin`) — for `KIND_ALL` and
+/// `KIND_ALL_SETTLED`. The aggregate fulfills with the results array when the
+/// count reaches zero. `KIND_RACE` leaves it at the exhaustion token forever —
+/// the race settles on its first element and its spec loop returns the
+/// capability promise unchanged.
 pub const SLOT_REMAINING: i32 = 4;
+/// `Promise.any`'s `errors` array (spec 27.5.4.3.1 step 2), the per-element
+/// snapshot the `AggregateError` is built from when the last element rejects.
+///
+/// Reserved by the layout widening that `KIND_ALL_SETTLED` needed, so the
+/// `Promise.any` lane needs no re-layout: appended, never inserted, and
+/// `undefined` for every kind that does not use it.
+pub const SLOT_ERRORS: i32 = 5;
 /// The number of populated slots.
-pub const STATE_SLOTS: usize = 5;
+pub const STATE_SLOTS: usize = 6;
 
 /// What `combinator_step` hands back to the interpreter, told apart by the
 /// length of the carrier array it returns (both are heap arrays, so the shape
@@ -76,7 +99,7 @@ pub mod carrier {
 /// The record an `onFulfilledElement` function object carries in its
 /// `elements` (the same slot a bound function uses for its bound arguments),
 /// so the interpreter can reach the element it belongs to when a reaction job
-/// calls the handler. One per element; the function object is rooted, and
+/// calls the handler. One per handler; the function object is rooted, and
 /// `elements` is traced, so the whole record is.
 ///
 /// Index 3 is a one-slot mutable object rather than a bare value because the
@@ -91,8 +114,20 @@ pub mod element {
     /// `promiseCapability.[[Resolve]]`, the function the last element's
     /// bookkeeping calls with the values array.
     pub const RESOLVE: usize = 2;
-    /// The one-slot `alreadyResolved` flag object.
+    /// The spec's `alreadyCalled` record — the one-slot flag object. A
+    /// `KIND_ALL_SETTLED` element's two handlers point at the *same* record,
+    /// which is what 27.5.4.2.1 specifies: a `then` that calls both halves
+    /// records only the first outcome.
     pub const ALREADY: usize = 3;
+    /// Which half of the element's pair this function is, as a boolean
+    /// (`true` = the fulfilled handler). Appended, so a record written before
+    /// it existed still satisfies the `STATE`/`INDEX`/`RESOLVE`/`ALREADY`
+    /// reads that mean the same thing.
+    ///
+    /// `KIND_ALL` installs only the fulfilled half, so it always records
+    /// `true`; `KIND_RACE` installs no per-element handler at all, so nothing
+    /// ever reads it there.
+    pub const FULFILLED: usize = 4;
     /// The number of slots in the record.
-    pub const SLOTS: usize = 4;
+    pub const SLOTS: usize = 5;
 }

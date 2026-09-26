@@ -19,7 +19,7 @@ fn promise_constructor_and_prototype_own_property_names() {
             "throw [Object.getOwnPropertyNames(Promise).sort().join(','), \
              Object.getOwnPropertyNames(Promise.prototype).sort().join(',')].join(' | ');"
         ),
-        "all,length,name,prototype,race,reject,resolve \
+        "all,allSettled,length,name,prototype,race,reject,resolve,try,withResolvers \
          | catch,constructor,finally,then"
     );
 }

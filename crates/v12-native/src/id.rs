@@ -253,6 +253,18 @@ pub enum NativeId {
     /// subclassed receiver is user code, so the interpreter intercepts it
     /// (see `v12_native::promise_combinator` for the record it carries).
     PromiseCombinatorElement = 1718,
+    /// `Promise.allSettled(iterable)` (spec 27.5.4.2). Streams the iterable, so
+    /// it runs on the interpreter side of the seam like `PromiseAll` /
+    /// `PromiseRace`; the difference is only the combinator kind it asks for
+    /// (`v12_native::promise_combinator::KIND_ALL_SETTLED`).
+    PromiseAllSettled = 1719,
+    /// `Promise.withResolvers()` (spec 27.5.4.9). `NewPromiseCapability(C)`
+    /// runs the receiver's constructor, so it is interpreter work; the three
+    /// `CreateDataPropertyOrThrow` calls that follow are heap-only.
+    PromiseWithResolvers = 1720,
+    /// `Promise.try(callback, ...args)` (spec 27.5.4.8). Calls a user callback
+    /// and then `PromiseResolve(C, result)`, so both halves are machine work.
+    PromiseTry = 1721,
     QueueMicrotask = 1700,
     // Map / Set
     MapConstruct = 2000,

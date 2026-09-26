@@ -9,7 +9,7 @@ use crate::execute::decode_parked_call;
 use crate::ops;
 use crate::property::OwnDesc;
 use v12_native::NativeId;
-use v12_native::promise_combinator::SLOT_REJECT;
+use v12_native::promise_combinator::{KIND_ALL_SETTLED, SLOT_KIND, SLOT_REJECT};
 
 /// A `PromiseCapability Record` as the combinators hold it (spec 27.5.4.1 step
 /// 2): the promise to return, and the pair every settlement goes through. The
@@ -1744,13 +1744,20 @@ impl Interp<'_> {
             NativeId::MapForEach | NativeId::SetForEach => {
                 Some(self.run_collection_for_each(id, this_v, args))
             }
-            // `Promise.all`/`Promise.race` read `@@iterator` and drive
-            // `next`/`return` on it, so their iterator half re-enters the
-            // machine; the engine handler stays the settled-promise
-            // aggregation and receives the drained values.
-            NativeId::PromiseAll | NativeId::PromiseRace => {
+            // `Promise.all`/`Promise.race`/`Promise.allSettled` read
+            // `@@iterator` and drive `next`/`return` on it, so their iterator
+            // half re-enters the machine; the engine handler stays the
+            // settled-promise aggregation and receives the drained values.
+            NativeId::PromiseAll | NativeId::PromiseRace | NativeId::PromiseAllSettled => {
                 Some(self.run_promise_combinator(id, this_v, args))
             }
+            // `Promise.withResolvers()` runs the receiver's constructor
+            // (`NewPromiseCapability(C)` step 6 is a `Construct`), and
+            // `Promise.try` calls a user callback and then resolves through the
+            // receiver's own resolving pair — both machine work, so neither can
+            // run as a pure registry native.
+            NativeId::PromiseWithResolvers => Some(self.run_promise_with_resolvers(this_v, args)),
+            NativeId::PromiseTry => Some(self.run_promise_try(this_v, args)),
             // `Promise.resolve(x)` adopts a thenable through a job the
             // interpreter cannot build, so the `then` read happens here and
             // the adoption is queued for the engine's drain. Non-thenables
@@ -2940,8 +2947,9 @@ impl Interp<'_> {
         }
     }
 
-    /// `Promise.all(iterable)` / `Promise.race(iterable)`, streamed (spec
-    /// 27.5.4.1 / 27.5.4.2).
+    /// `Promise.all(iterable)` / `Promise.race(iterable)` /
+    /// `Promise.allSettled(iterable)`, streamed (spec 27.5.4.1 / 27.5.4.2 /
+    /// 27.5.4.5).
     ///
     /// The spec algorithm alternates between two halves, and so does this. The
     /// interpreter owns everything that is a machine operation or a call into
@@ -2987,11 +2995,10 @@ impl Interp<'_> {
         this_v: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        use v12_native::promise_combinator::{KIND_ALL, KIND_RACE};
-        let kind = if id == NativeId::PromiseAll {
-            KIND_ALL
-        } else {
-            KIND_RACE
+        let kind = match id {
+            NativeId::PromiseAll => v12_native::promise_combinator::KIND_ALL,
+            NativeId::PromiseAllSettled => v12_native::promise_combinator::KIND_ALL_SETTLED,
+            _ => v12_native::promise_combinator::KIND_RACE,
         };
         let base = self.stack.len();
         // Step 2 (27.5.4.1) / step 3 (27.5.4.2):
@@ -3341,18 +3348,18 @@ impl Interp<'_> {
         Ok(capability.promise)
     }
 
-    /// `PerformPromiseAll`'s `onFulfilledElement` (spec 27.5.4.1.1 step 4) — the
-    /// one per-element handler left after the capability rewiring, and the one
-    /// remaining path from an element to the aggregate.
+    /// `PerformPromiseAll`'s `onFulfilledElement` (spec 27.5.4.1.1 step 4) —
+    /// and, for `KIND_ALL_SETTLED`, both halves of the pair 27.5.4.2.1 steps
+    /// 4 and 5 build. The one remaining path from an element to the aggregate.
     ///
     /// It is an interpreter-intercepted native rather than an engine host
     /// closure because its last step is
     /// `Perform ? Call(resultCapability.[[Resolve]], undefined, « valuesArray
     /// »)` (step 4-b-iii-2), and for a subclassed receiver `[[Resolve]]` is
     /// user code that a `&mut Heap` closure cannot reach. The element's own
-    /// record — state, index, `[[Resolve]]`, and the spec's `alreadyResolved`
-    /// flag — rides the function object, so this is reached from
-    /// [`Self::call_value`] with the callee in hand.
+    /// record — state, index, `[[Resolve]]`, the spec's `alreadyCalled` flag and
+    /// which half of the pair this is — rides the function object, so this is
+    /// reached from [`Self::call_value`] with the callee in hand.
     ///
     /// Rooting across the `Call` below needs nothing: the function object is
     /// pinned by the engine, `elements` is traced, and the reaction record pins
@@ -3380,20 +3387,81 @@ impl Interp<'_> {
                 "TypeError: combinator element has no alreadyResolved",
             )));
         };
-        // Steps 4-a-1/2: the per-element first-wins guard, so a `then` free to
-        // call its resolve function twice records the first outcome only.
+        let fulfilled = ops::to_boolean(self.heap, element_record[record::FULFILLED]);
+        // Steps 4-a-1/2 (and 5-a-1/2): the per-element first-wins guard, so a
+        // `then` free to call its resolve function twice records the first
+        // outcome only. `KIND_ALL_SETTLED`'s two halves share one record, so
+        // the second half to fire is the one that returns here.
         if ops::to_boolean(self.heap, self.heap.get(already).properties[0]) {
             return Ok(JsValue::undefined());
         }
         self.heap.get_mut(already).properties[0] = JsValue::from_bool(true);
         let value = args.first().copied().unwrap_or_else(JsValue::undefined);
+        // `KIND_ALL` stores the value itself; `KIND_ALL_SETTLED` stores the
+        // status object the half builds first (27.5.4.2.1 step 4-b-iii-iv /
+        // 5-b-iii-iv), so the engine's `element_settled` writes the same
+        // `values[thisIndex]` in both cases.
+        let outcome = if self.combinator_kind(state) == Some(KIND_ALL_SETTLED) {
+            self.all_settled_status(fulfilled, value)?
+        } else {
+            value
+        };
         // Steps 4-a-iii to 4-b: the bookkeeping, and — for the last outstanding
         // element — the values array `[[Resolve]]` is called with.
-        let settled = self.combinator_element_settled(state, index, true, value)?;
+        let settled = self.combinator_element_settled(state, index, fulfilled, outcome)?;
         self.heap.add_pinned_root(callee);
         let reject_v = self.combinator_state_slot(state, SLOT_REJECT);
         self.resolve_through(resolve_v, reject_v, settled)?;
         Ok(JsValue::undefined())
+    }
+
+    /// The combinator's own kind, read back off the state object
+    /// ([`Self::combinator_state_slot`]) through
+    /// [`v12_native::promise_combinator::combinator_kind`]. `None` for a state
+    /// object whose kind slot is not a known kind, which the element handler
+    /// treats as "not `allSettled`" — the same reading the engine's own
+    /// `parts` would reject loudly, and unreachable for a state object the
+    /// engine itself allocated.
+    fn combinator_kind(&mut self, state: JsValue) -> Option<i32> {
+        let slot = self.combinator_state_slot(state, SLOT_KIND);
+        v12_native::promise_combinator::combinator_kind(slot)
+    }
+
+    /// The element's status object: `OrdinaryObjectCreate(%Object.prototype%)`
+    /// plus `CreateDataPropertyOrThrow(status, "status", …)` and
+    /// `CreateDataPropertyOrThrow(status, "value"|"reason", …)`, all with
+    /// `DEFAULT` attributes (27.5.4.2.1 step 4-b-ii-iii / 5-b-ii-iii).
+    ///
+    /// The property order is the spec's: `status` first, which is what
+    /// `Object.keys(status)` reports. `CreateDataPropertyOrThrow` cannot throw
+    /// here — the object is fresh, ordinary and extensible by construction — so
+    /// the `?` is discharged by the allocation itself.
+    fn all_settled_status(
+        &mut self,
+        fulfilled: bool,
+        payload: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let base = self.stack.len();
+        // Park the payload: the two `define_own_data_attrs` calls are pure heap
+        // work, but `gc_protect` republishes the stack as the root set and the
+        // status object itself is not on it yet.
+        self.stack.push(payload);
+        self.gc_protect();
+        let h = self.heap.alloc(JsObject::default());
+        self.link_object_proto(h);
+        let status = JsValue::object(h);
+        let (label, key) = if fulfilled {
+            ("fulfilled", "value")
+        } else {
+            ("rejected", "reason")
+        };
+        let label_v = JsValue::string(self.heap.intern_text(label));
+        let status_key = self.new_temp_key("status");
+        let payload_key = self.new_temp_key(key);
+        self.define_own_data_attrs(status, status_key, label_v, v12_heap::Attrs::DEFAULT)?;
+        self.define_own_data_attrs(status, payload_key, payload, v12_heap::Attrs::DEFAULT)?;
+        self.stack.truncate(base);
+        Ok(status)
     }
 
     /// [`Self::resolve_through`] for the element handler, which reads the pair
@@ -3494,30 +3562,18 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Option<Result<JsValue, JSException>> {
         let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-        if self.is_engine_promise(value) {
-            // Spec 27.5.4.7.1 `PromiseResolve(C, x)` step 3: the identity is
-            // conditional — `Let xConstructor be ? Get(x, "constructor")` and
-            // `If SameValue(xConstructor, C) is true, return x`. `IsPromise`
-            // alone is not enough, which is what
-            // `built-ins/Promise/resolve/arg-uniq-ctor.js` pins: a promise whose
-            // own `constructor` is `null` is resolved by *building* a new one.
-            //
-            // The read is a machine call, so it belongs here rather than in
-            // `is_engine_promise`; `ReturnIfAbrupt` propagates out of
-            // `Promise.resolve` as a `TypeError` from a throwing getter.
-            self.stack.push(value);
-            let ctor_key = self.new_temp_key("constructor");
-            let x_constructor = self.get_property(0, 0, value, ctor_key);
-            self.stack.pop();
-            let x_constructor = match x_constructor {
-                Ok(x_constructor) => x_constructor,
-                Err(JSException(thrown)) => return Some(Err(JSException(thrown))),
-            };
-            if x_constructor.bits() == this_v.bits() {
-                return Some(Ok(value));
+        // A throwing `constructor` getter is a `TypeError` out of
+        // `Promise.resolve` itself, so the identity check's `Result` has to
+        // become the `Option`'s `Some(Err(..))` rather than short-circuiting
+        // the arm: `None` is reserved for "not a thenable, let the registry
+        // native fulfill".
+        match self.promise_resolve_identity(this_v, value) {
+            Ok(Some(identity)) => return Some(Ok(identity)),
+            Ok(None) => {
+                // A different constructor: steps 2-4 still run, so `value` goes
+                // through the ordinary resolving-function path below.
             }
-            // A different constructor: steps 2-4 still run, so `x` goes through
-            // the ordinary resolving-function path below.
+            Err(error) => return Some(Err(error)),
         }
         // Park the argument on the value stack: the `then` read may run a
         // getter, and `gc_protect` republishes the stack as the root set.
@@ -3534,6 +3590,158 @@ impl Interp<'_> {
         let result = self.adopt_thenable(this_v, value, then_v, abrupt);
         self.stack.pop();
         Some(result)
+    }
+
+    /// `PromiseResolve(C, x)` step 1-b (spec 27.5.4.7.1): the identity
+    /// short-circuit, `If IsPromise(x) is true, then … If SameValue(xConstructor,
+    /// C) is true, return x`.
+    ///
+    /// `Some(x)` is that return; `None` means the short-circuit does not apply
+    /// and the caller must build a capability. Shared by the `Promise.resolve`
+    /// static (which then reads `then` and adopts) and by `Promise.try` (which
+    /// then calls `NewPromiseCapability` + `[[Resolve]]`) because the two
+    /// abstract operations are the same function of `C` and the resolution.
+    ///
+    /// The identity is conditional — `IsPromise` alone is not enough, which is
+    /// what `built-ins/Promise/resolve/arg-uniq-ctor.js` pins: a promise whose
+    /// own `constructor` is `null` is resolved by *building* a new one. The
+    /// read is a machine call, so it belongs here rather than in
+    /// `is_engine_promise`; `ReturnIfAbrupt` propagates out of
+    /// `Promise.resolve` as a `TypeError` from a throwing getter.
+    fn promise_resolve_identity(
+        &mut self,
+        this_v: JsValue,
+        value: JsValue,
+    ) -> Result<Option<JsValue>, JSException> {
+        if !self.is_engine_promise(value) {
+            return Ok(None);
+        }
+        self.stack.push(value);
+        let ctor_key = self.new_temp_key("constructor");
+        let x_constructor = self.get_property(0, 0, value, ctor_key);
+        self.stack.pop();
+        let x_constructor = x_constructor?;
+        if x_constructor.bits() == this_v.bits() {
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+
+    /// `PromiseResolve(C, x)` (spec 27.5.4.7.1 steps 1-4) as a value:
+    /// `Promise.try`'s step 5 calls it and returns what it produces.
+    ///
+    /// The identity short-circuit is [`Self::promise_resolve_identity`]'s;
+    /// steps 2-4 are `NewPromiseCapability(C)`, `Call([[Resolve]], undefined,
+    /// « resolution »)` and `return [[Promise]]`. The `Call` is the
+    /// interpreter's — for a subclassed receiver `[[Resolve]]` is user code — and
+    /// the `?` on it propagates, as step 3's `Perform ?` does.
+    fn promise_resolve(
+        &mut self,
+        ctor: JsValue,
+        resolution: JsValue,
+    ) -> Result<JsValue, JSException> {
+        if let Some(identity) = self.promise_resolve_identity(ctor, resolution)? {
+            return Ok(identity);
+        }
+        let (promise, resolve, _reject) = self.new_promise_capability(ctor)?;
+        // Park the resolution across the call: `gc_protect` republishes the
+        // value stack as the root set, and a subclass's `[[Resolve]]` can
+        // collect.
+        let base = self.stack.len();
+        self.stack.push(resolution);
+        self.gc_protect();
+        let result = self.call_value(resolve, JsValue::undefined(), &[resolution]);
+        self.stack.truncate(base);
+        result?;
+        Ok(promise)
+    }
+
+    /// `Promise.withResolvers()` (spec 27.5.4.9).
+    ///
+    /// Two `NewPromiseCapability(ctor)`-shaped steps and three
+    /// `CreateDataPropertyOrThrow` calls, so the capability is the only
+    /// machine work: the object is `OrdinaryObjectCreate(%Object.prototype%)`
+    /// and each property is installed with `Attrs::DEFAULT` —
+    /// `{ writable: true, enumerable: true, configurable: true }`, which is
+    /// what `built-ins/Promise/withResolvers/result.js` verifies (a
+    /// `BUILTIN`-shaped install would read `enumerable: false` and fail it).
+    ///
+    /// The property order is the spec's, and `Object.getOwnPropertyNames`
+    /// reports it: `promise`, `resolve`, `reject`.
+    fn run_promise_with_resolvers(
+        &mut self,
+        this_v: JsValue,
+        _args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        // Step 2: `NewPromiseCapability(C)`, whose own step 1 is the
+        // `IsConstructor` gate — so a non-constructor receiver throws here, and
+        // a non-object one with it.
+        let (promise, resolve, reject) = self.new_promise_capability(this_v)?;
+        let base = self.stack.len();
+        self.stack.push(promise);
+        self.stack.push(resolve);
+        self.stack.push(reject);
+        self.gc_protect();
+        let h = self.heap.alloc(JsObject::default());
+        self.link_object_proto(h);
+        let obj = JsValue::object(h);
+        for (name, value) in [
+            ("promise", promise),
+            ("resolve", resolve),
+            ("reject", reject),
+        ] {
+            let key = self.new_temp_key(name);
+            self.define_own_data_attrs(obj, key, value, Attrs::DEFAULT)?;
+        }
+        self.stack.truncate(base);
+        Ok(obj)
+    }
+
+    /// `Promise.try(callback, ...args)` (spec 27.5.4.8).
+    ///
+    /// The order is the spec's and it is load-bearing twice over: step 1's
+    /// `If ctor is not an Object, throw a TypeError exception` runs *before*
+    /// the callback, so a non-object receiver never runs user code; and the
+    /// capability is built *inside* the abrupt branch (step 4-a), so a
+    /// non-throwing call never constructs through the receiver at all — which is
+    /// why `Promise.try.call(SubPromise, () => {})` reports `callCount === 1`
+    /// (the single construction is the one step 5's `PromiseResolve` makes).
+    ///
+    /// Step 5 is [`Self::promise_resolve`], so a promise the callback returns is
+    /// adopted by identity rather than wrapped.
+    fn run_promise_try(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        // Step 1: `If ctor is not an Object, throw a TypeError exception`.
+        if this_v.as_object().is_none() {
+            return Err(JSException(
+                self.error_value("TypeError: Promise.try requires an object receiver"),
+            ));
+        }
+        let callback = args.first().copied().unwrap_or_else(JsValue::undefined);
+        let forwarded = args.get(1..).unwrap_or(&[]);
+        // Step 2: `Let status be Completion(Call(callback, undefined, args))`.
+        // A missing or uncallable callback throws out of `Call` like any other,
+        // and lands in the same abrupt branch — so the *promise* rejects rather
+        // than the call throwing.
+        let status = self.call_value(callback, JsValue::undefined(), forwarded);
+        match status {
+            Err(JSException(thrown)) => {
+                // Step 4: the capability is built here, not before the call.
+                let (promise, _resolve, reject) = self.new_promise_capability(this_v)?;
+                let base = self.stack.len();
+                self.stack.push(thrown);
+                self.gc_protect();
+                let result = self.call_value(reject, JsValue::undefined(), &[thrown]);
+                self.stack.truncate(base);
+                result?;
+                Ok(promise)
+            }
+            // Step 5: `Return ? PromiseResolve(ctor, status)`.
+            Ok(value) => self.promise_resolve(this_v, value),
+        }
     }
 
     /// `new Promise(executor)` (spec 27.5.1.1 steps 2-7).

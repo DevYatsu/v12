@@ -410,6 +410,9 @@ impl Realm {
             for (name, id, arity) in [
                 ("all", NativeId::PromiseAll, 1u32),
                 ("race", NativeId::PromiseRace, 1),
+                ("allSettled", NativeId::PromiseAllSettled, 1),
+                ("withResolvers", NativeId::PromiseWithResolvers, 0),
+                ("try", NativeId::PromiseTry, 1),
                 ("resolve", NativeId::PromiseResolve, 1),
                 ("reject", NativeId::PromiseReject, 1),
             ] {
