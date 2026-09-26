@@ -2845,69 +2845,234 @@ impl Interp<'_> {
         }
     }
 
-    /// `Promise.all(iterable)` / `Promise.race(iterable)`: drains the input
-    /// iterable here, then hands the values to the engine handler.
+    /// `Promise.all(iterable)` / `Promise.race(iterable)`, streamed (spec
+    /// 27.2.4.1 / 27.2.4.2).
     ///
-    /// The split is the spec algorithm's own boundary. The iterator half
-    /// (GetIterator, IteratorStep/Value, IteratorClose) reads properties off
-    /// user objects and calls bytecode functions, so it needs the machine;
-    /// the aggregation half only reads promise state and appends host-closure
-    /// reaction records to the engine heap, which no interpreter-only path can
-    /// do (jobs live in `v12-engine`). So this resolves the iterator once,
-    /// consumes every value in order, closes the iterator on any abrupt
-    /// completion (original error winning, per IteratorClose's throw path),
-    /// and forwards a canonical dense array to the handler — which keeps
-    /// array-input behaviour, reaction watchers, and species-less result
-    /// shapes exactly as they were.
+    /// The spec algorithm alternates between two halves, and so does this: the
+    /// interpreter pulls `next`/`done`/`value` and invokes `C.resolve` and
+    /// `then` — each reads a property off a user object or calls user code — and
+    /// the engine owns the aggregate promise, the results array and the
+    /// reaction watchers (jobs live in `v12-engine`). The two meet at a
+    /// combinator state object on the heap
+    /// ([`v12_native::promise_combinator`]).
+    ///
+    /// One element at a time is the point: an element whose `resolve`/`then`
+    /// throws closes the iterator and settles the aggregate, so an unbounded
+    /// iterator cannot stall the loop. Per spec an abrupt `next`/`done`/`value`
+    /// does *not* close — it rejects the capability where it happened
+    /// (`PerformPromiseAll`'s `IfAbruptRejectPromise`), and so does a failed
+    /// `GetIterator`.
+    ///
+    /// Everything the loop holds across a safepoint — the state, the iterator,
+    /// the element, the capability pair — rides the value stack, because
+    /// `gc_protect` republishes the stack as the root set and any of those
+    /// calls can collect.
     fn run_promise_combinator(
         &mut self,
         id: NativeId,
         this_v: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
-        let iterator = self.get_iterator(iterable, false)?;
-        // Yielded values ride on the value stack while collection runs:
-        // `gc_protect` republishes the stack as the root set, so a `next()`
-        // call that allocates cannot free a value held only by this Vec.
+        use v12_native::promise_combinator::{KIND_ALL, KIND_RACE};
+        let kind = if id == NativeId::PromiseAll {
+            KIND_ALL
+        } else {
+            KIND_RACE
+        };
         let base = self.stack.len();
-        match self.collect_iterable_values(iterator) {
-            Ok(values) => {
-                let inputs = crate::call::alloc_array(self, values);
-                self.heap.add_root(inputs);
-                self.stack.truncate(base);
-                self.gc_protect();
-                self.natives
-                    .call_native(self.heap, this_v, &[inputs], id)
-                    .map_err(|t| JSException::from_throw(self.heap, t))
-            }
+        let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
+        let state = match self.combinator_begin(this_v, kind) {
+            Ok(state) => state,
             Err(error) => {
                 self.stack.truncate(base);
-                // The original abrupt completion wins over an error raised by
-                // return(), as required by IteratorClose's throw path.
-                self.op_iterator_close(iterator, true)?;
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        self.stack.push(state);
+        let result = self.stream_combinator(this_v, iterable, state);
+        self.stack.truncate(base);
+        result
     }
 
-    /// ES 7.4.5 IteratorStepValue, drained to exhaustion: `next()`, then the
-    /// `done`/`value` reads. Each yielded value is parked on the value stack
-    /// (see [`Self::run_promise_combinator`]) before the next `next()` call.
-    fn collect_iterable_values(&mut self, iterator: JsValue) -> Result<Vec<JsValue>, JSException> {
-        let mut values = Vec::new();
-        loop {
-            let result = self.op_iterator_next(iterator)?;
+    /// The element loop, from `GetIterator` to the terminal settlement.
+    fn stream_combinator(
+        &mut self,
+        this_v: JsValue,
+        iterable: JsValue,
+        state: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let iterator = match self.get_iterator(iterable, false) {
+            Ok(iterator) => iterator,
+            Err(JSException(thrown)) => {
+                // No iterator record, so nothing to close: the capability
+                // rejects where the abrupt happened.
+                return self.settle_combinator(state, true, thrown);
+            }
+        };
+        // Park the iterator for the whole loop: `gc_protect` republishes the
+        // stack as the root set, and every `next()` call can collect.
+        let base = self.stack.len();
+        self.stack.push(iterator);
+        let mut index: u32 = 0;
+        let outcome = loop {
+            // IteratorStepValue: an abrupt here rejects without closing.
+            let result = match self.op_iterator_next(iterator) {
+                Ok(result) => result,
+                Err(JSException(thrown)) => break (true, thrown),
+            };
             let done_key = self.new_temp_key("done");
-            let done = self.get_property(0, 0, result, done_key)?;
+            let done = match self.get_property(0, 0, result, done_key) {
+                Ok(done) => done,
+                Err(JSException(thrown)) => break (true, thrown),
+            };
             if ops::to_boolean(self.heap, done) {
-                return Ok(values);
+                break (false, JsValue::undefined());
             }
             let value_key = self.new_temp_key("value");
-            let value = self.get_property(0, 0, result, value_key)?;
-            self.stack.push(value);
-            values.push(value);
+            let element = match self.get_property(0, 0, result, value_key) {
+                Ok(value) => value,
+                Err(JSException(thrown)) => break (true, thrown),
+            };
+            match self.combinator_element(this_v, state, index, element) {
+                Ok(()) => {}
+                // `C.resolve`, the `then` read, the engine step and the `then`
+                // invocation are element-processing aborts: the iterator closes
+                // first, and the original error wins over anything `return()`
+                // throws.
+                Err(JSException(thrown)) => {
+                    self.op_iterator_close(iterator, true)?;
+                    break (true, thrown);
+                }
+            }
+            index += 1;
+        };
+        self.stack.truncate(base);
+        self.settle_combinator(state, outcome.0, outcome.1)
+    }
+
+    /// One element of a combinator: `C.resolve(element)`, read `then`, engine
+    /// step, then invoke `then` with the capability pair it returned.
+    ///
+    /// The element and the pair are parked on the value stack for the calls
+    /// that can collect; the truncate is unconditional so a throwing
+    /// `C.resolve`/`then` leaves the same stack it found.
+    fn combinator_element(
+        &mut self,
+        this_v: JsValue,
+        state: JsValue,
+        index: u32,
+        element: JsValue,
+    ) -> Result<(), JSException> {
+        let base = self.stack.len();
+        self.stack.push(element);
+        let result = self.combinator_element_calls(this_v, state, index, element);
+        self.stack.truncate(base);
+        result
+    }
+
+    /// The body of [`Self::combinator_element`], with the element already
+    /// parked on the stack.
+    fn combinator_element_calls(
+        &mut self,
+        this_v: JsValue,
+        state: JsValue,
+        index: u32,
+        element: JsValue,
+    ) -> Result<(), JSException> {
+        // `promiseResolve = Get(C, "resolve")` (spec 27.2.4.1 step 3). The
+        // receiver is `this` rather than `%Promise%`, so a subclassed receiver
+        // keeps its own `resolve`.
+        let resolve_key = self.new_temp_key("resolve");
+        let resolve_v = self.get_property(0, 0, this_v, resolve_key)?;
+        let resolve =
+            self.callable_or_err(resolve_v, "Promise combinator resolve is not callable")?;
+        self.call_value(resolve, JsValue::undefined(), &[element])?;
+        // `Get(V, P)` boxes its receiver (spec 7.3.9), so a primitive element
+        // has no `then` — a hole in a sparse array reads as `undefined`, and
+        // `Promise.all([1, , 3])` must fulfill rather than reject.
+        let then_v = if element.is_null() || element.is_undefined() {
+            JsValue::undefined()
+        } else {
+            let then_key = self.new_temp_key("then");
+            self.get_property(0, 0, element, then_key)?
+        };
+        let pair = self.combinator_step(state, index, element, then_v)?;
+        // `undefined` means the engine already settled this element (no
+        // callable `then`), so there is nothing left to invoke.
+        if pair.is_undefined() {
+            return Ok(());
         }
+        let zero = self.new_temp_key("0");
+        let one = self.new_temp_key("1");
+        let resolve_element = self.get_property(0, 0, pair, zero)?;
+        let reject_element = self.get_property(0, 0, pair, one)?;
+        self.stack.push(pair);
+        let then = self.callable_or_err(then_v, "then is not callable")?;
+        self.call_value(then, element, &[resolve_element, reject_element])?;
+        Ok(())
+    }
+
+    /// The terminal settlement: fulfills at exhaustion, rejects on the abrupt
+    /// paths, and hands back the aggregate promise.
+    fn settle_combinator(
+        &mut self,
+        state: JsValue,
+        rejecting: bool,
+        reason: JsValue,
+    ) -> Result<JsValue, JSException> {
+        self.stack.push(reason);
+        self.gc_protect();
+        let settled = self.combinator_settle(state, rejecting, reason);
+        self.stack.truncate(self.stack.len() - 1);
+        settled
+    }
+
+    /// `combinator_begin` over the registry seam. The registry builds its own
+    /// `Ctx` from the shared pending sink, so the interpreter hands over only
+    /// the heap.
+    fn combinator_begin(&mut self, this_v: JsValue, kind: i32) -> Result<JsValue, JSException> {
+        let result = self.natives.combinator_begin(self.heap, this_v, kind);
+        result.map_err(|t| JSException::from_throw(self.heap, t))
+    }
+
+    /// `combinator_step` over the registry seam.
+    fn combinator_step(
+        &mut self,
+        state: JsValue,
+        index: u32,
+        value: JsValue,
+        then_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let result = self
+            .natives
+            .combinator_step(self.heap, state, index, value, then_v);
+        result.map_err(|t| JSException::from_throw(self.heap, t))
+    }
+
+    /// `combinator_settle` over the registry seam.
+    fn combinator_settle(
+        &mut self,
+        state: JsValue,
+        rejecting: bool,
+        reason: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let result = self
+            .natives
+            .combinator_settle(self.heap, state, rejecting, reason);
+        result.map_err(|t| JSException::from_throw(self.heap, t))
+    }
+
+    /// The `IsCallable` gate for a value the spec `Call`s.
+    fn callable_or_err(&mut self, v: JsValue, message: &str) -> Result<JsValue, JSException> {
+        let callable = v
+            .as_object()
+            .is_some_and(|o| matches!(self.heap.get(o).kind, Kind::Function | Kind::Proxy));
+        if !callable {
+            return Err(JSException(
+                self.error_value(&format!("TypeError: {message}")),
+            ));
+        }
+        Ok(v)
     }
 
     /// `Promise.resolve(x)` when `x` is a thenable (spec 27.2.1.3.1).
@@ -2947,6 +3112,12 @@ impl Interp<'_> {
     /// Allocates the pending promise an adoption settles and queues the
     /// adoption. `prototype` comes from the receiver's `prototype` field, so
     /// the result is an ordinary `%Promise.prototype%` instance.
+    ///
+    /// A receiver that is not an object is the unbound case: the combinators
+    /// `Call(promiseResolve, undefined, « nextPromise »)` (spec 27.2.4.1
+    /// step 6-g), so there is no `prototype` to read and the result is a
+    /// prototype-less promise — the same degradation the engine handler
+    /// documents for a destructured `Promise.resolve`.
     fn adopt_thenable(
         &mut self,
         this_v: JsValue,
@@ -2954,8 +3125,12 @@ impl Interp<'_> {
         then_v: JsValue,
         abrupt: bool,
     ) -> Result<JsValue, JSException> {
-        let proto_key = self.new_temp_key("prototype");
-        let prototype = self.get_property(0, 0, this_v, proto_key)?.as_object();
+        let prototype = if this_v.as_object().is_some() {
+            let proto_key = self.new_temp_key("prototype");
+            self.get_property(0, 0, this_v, proto_key)?.as_object()
+        } else {
+            None
+        };
         self.gc_protect();
         let promise = self.alloc_pending_promise(prototype);
         self.push_pending_adoption(promise, thenable, then_v, abrupt);

@@ -373,6 +373,30 @@ impl Interp<'_> {
             JsValue::from_bool(on_yield);
     }
 
+    /// Runs `body` with `r#gen` and its fresh `request` promise parked on the
+    /// value stack, so both survive every safepoint inside it.
+    ///
+    /// `gc_protect` republishes the value stack as the GC root set, which
+    /// discards the `add_root` an [`Self::alloc_async_gen_request`] promise
+    /// carries; between that call and the request's enqueue the only thing
+    /// keeping it alive is this pair, and a suspended generator sits on no
+    /// frame. The register window `resume_generator` pushes starts at the
+    /// current stack length, so the two parked slots below it stay put and
+    /// the unconditional truncate leaves the stack as it was found.
+    fn with_async_gen_request_rooted<T>(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        request: Handle<JsObject>,
+        body: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let base = self.stack.len();
+        self.stack.push(JsValue::object(request));
+        self.stack.push(JsValue::object(r#gen));
+        let out = body(self);
+        self.stack.truncate(base);
+        out
+    }
+
     pub(crate) fn generator_next(
         &mut self,
         this_v: JsValue,
@@ -415,8 +439,10 @@ impl Interp<'_> {
             // body yields synchronously here or suspends on an `await` and
             // resumes later. Async generators never throw synchronously from
             // `next()`: an abrupt body completion rejects the request promise.
-            self.enqueue_async_gen_request(r#gen, promise);
-            let _ = self.resume_generator(r#gen, arg, false);
+            self.with_async_gen_request_rooted(r#gen, promise, |interp| {
+                interp.enqueue_async_gen_request(r#gen, promise);
+                let _ = interp.resume_generator(r#gen, arg, false);
+            });
             return Ok(JsValue::object(promise));
         }
         match self.resume_generator(r#gen, arg, false)? {
@@ -508,11 +534,13 @@ impl Interp<'_> {
         self.set_generator_header_value(r#gen, Self::GENERATOR_RETURN_VALUE_SLOT, arg);
         if self.is_async_generator_for(r#gen) {
             let request = self.alloc_async_gen_request();
-            self.enqueue_async_gen_request(r#gen, request);
-            // `return()` is a real suspension point for an async generator's
-            // request queue: the resume path settles the oldest request when
-            // the body finally yields again or completes.
-            let _ = self.resume_generator(r#gen, arg, false);
+            self.with_async_gen_request_rooted(r#gen, request, |interp| {
+                interp.enqueue_async_gen_request(r#gen, request);
+                // `return()` is a real suspension point for an async generator's
+                // request queue: the resume path settles the oldest request when
+                // the body finally yields again or completes.
+                let _ = interp.resume_generator(r#gen, arg, false);
+            });
             return Ok(JsValue::object(request));
         }
         match self.resume_generator(r#gen, arg, false)? {
@@ -561,8 +589,10 @@ impl Interp<'_> {
         // intercept it and `finally` runs on the unwind path.
         if self.is_async_generator_for(r#gen) {
             let request = self.alloc_async_gen_request();
-            self.enqueue_async_gen_request(r#gen, request);
-            let _ = self.resume_generator(r#gen, arg, true);
+            self.with_async_gen_request_rooted(r#gen, request, |interp| {
+                interp.enqueue_async_gen_request(r#gen, request);
+                let _ = interp.resume_generator(r#gen, arg, true);
+            });
             return Ok(JsValue::object(request));
         }
         match self.resume_generator(r#gen, arg, true) {
@@ -647,7 +677,7 @@ impl Interp<'_> {
         shell.properties.push(JsValue::undefined());
         shell.properties.push(JsValue::object(reactions));
         shell.property_keys.resize(3, None);
-        let handle = self.heap.alloc(shell);
+        let handle = self.heap.alloc_promise(shell);
         self.heap.add_root(JsValue::object(handle));
         handle
     }
@@ -737,7 +767,9 @@ impl Interp<'_> {
                 // fulfilled promise lets the existing resume path carry it.
                 let reactions = self.heap.alloc(JsObject::array(Vec::new()));
                 self.heap.add_root(JsValue::object(reactions));
-                let promise = self.heap.alloc(JsObject::fulfilled_promise(v, reactions));
+                let promise = self
+                    .heap
+                    .alloc_promise(JsObject::fulfilled_promise(v, reactions));
                 self.heap.add_root(JsValue::object(promise));
                 (JsValue::object(promise), false, v)
             }

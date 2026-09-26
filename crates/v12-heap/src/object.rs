@@ -805,6 +805,12 @@ impl GeneratorExt for crate::Handle<JsObject> {
     }
 }
 
+/// Number of leading `properties` entries a `Kind::Promise` object reserves
+/// for its internal slots: `[[State]]`, `[[Result]]`, `[[Reactions]]`.
+/// User-defined own properties must be numbered past them, which is what
+/// the reserved promise shape's `num_own` buys (see [`crate::Heap::alloc_promise`]).
+pub const PROMISE_INTERNAL_SLOTS: u32 = 3;
+
 /// Heap allocation helpers that hide `add_root` + `property_keys` invariants.
 pub trait HeapExt {
     fn alloc_array(&mut self, elements: Vec<crate::JsValue>) -> crate::Handle<JsObject>;
@@ -844,7 +850,7 @@ impl HeapExt for crate::Heap {
     fn alloc_pending_promise(&mut self) -> crate::Handle<JsObject> {
         let reactions = self.alloc(JsObject::array(Vec::new()));
         self.add_root(crate::JsValue::object(reactions));
-        let h = self.alloc(JsObject::pending_promise(reactions));
+        let h = self.alloc_promise(JsObject::pending_promise(reactions));
         self.add_root(crate::JsValue::object(h));
         h
     }

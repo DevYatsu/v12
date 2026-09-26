@@ -23,6 +23,8 @@ mod methods;
 mod registry;
 mod throw;
 
+pub mod promise_combinator;
+
 pub use convert::DecodeError;
 pub use id::{NativeId, UnknownNativeId};
 pub use methods::lookup_method;

@@ -21,7 +21,9 @@
 //! implicit global pool.
 
 use crate::handle::{Handle, HeapSpace, Space};
-use crate::object::{IntegrityLevel, JsObject, SizeEstimate, V12BigInt, V12Symbol};
+use crate::object::{
+    IntegrityLevel, JsObject, PROMISE_INTERNAL_SLOTS, SizeEstimate, V12BigInt, V12Symbol,
+};
 use crate::prop_key::PropKey;
 use crate::shape::{Attrs, Descriptor, Serial, Shape, ShapeHandle, Transitions, ValidityCellId};
 use crate::string::{self, CONCAT_EAGER_FLATTEN_MAX_UNITS, Seed, StrStorage, V12Str};
@@ -262,12 +264,17 @@ pub struct Heap {
     roots: RootSet,
 
     /// Shapes pinned for their whole lifetime: shape-slot 0's empty-object
-    /// root plus any anchors registered via [`Heap::add_shape_root`]. Marked
-    /// at every collection start; transition-tree branches hanging off them
-    /// survive only while live objects reach them through parent links.
+    /// root, shape-slot 1's internal-slot-reserving promise root, plus any
+    /// anchors registered via [`Heap::add_shape_root`]. Marked at every
+    /// collection start; transition-tree branches hanging off them survive
+    /// only while live objects reach them through parent links.
     shape_roots: Vec<ShapeHandle>,
     /// Handles of the pinned empty-object shape (always `shape_roots[0]`).
     root_shape: ShapeHandle,
+    /// The pinned promise shape (always `shape_roots[1]`): parentless, no
+    /// descriptors, `num_own == PROMISE_INTERNAL_SLOTS`. See
+    /// [`Heap::alloc_promise`].
+    promise_shape: ShapeHandle,
 
     /// Serials of validity cells, indexed by `ValidityCellId.0 - 1`; id 0 is
     /// the shared null cell and never appears here. A cell's serial changes
@@ -347,17 +354,33 @@ impl Heap {
             // Shape-slot 0 is pinned: the canonical empty-object shape every
             // fresh object starts from. Registered as a permanent shape root
             // below, it can never be collected or handed out again.
-            shapes: vec![Shape::root()],
+            // Shape-slot 1 is the promise root, which reserves the three
+            // leading `properties` entries for `[[State]]`/`[[Result]]`/
+            // `[[Reactions]]` (see `Heap::alloc_promise`).
+            shapes: vec![Shape::root(), Shape::reserved(PROMISE_INTERNAL_SLOTS)],
             free: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            // Shape-slot 0 is born live (pinned root); every other space
-            // starts with no slots and therefore no flags.
-            alive: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), vec![true]],
-            released: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), vec![false]],
+            // Shape-slot 0 and 1 are born live (pinned roots); every other
+            // space starts with no slots and therefore no flags.
+            alive: [
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![true, true],
+            ],
+            released: [
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![false, false],
+            ],
             sweep_cursor: [0; 5],
             pending_dead: [0; 5],
             roots: RootSet(Vec::new()),
-            shape_roots: vec![Handle::new(0)],
+            shape_roots: vec![Handle::new(0), Handle::new(1)],
             root_shape: Handle::new(0),
+            promise_shape: Handle::new(1),
             validity_cells: Vec::new(),
             interned_strings: rustc_hash::FxHashMap::default(),
             realm_globals: Vec::new(),
@@ -381,6 +404,30 @@ impl Heap {
     /// all transition trees descend from it (or from other anchored roots).
     pub fn root_shape(&self) -> ShapeHandle {
         self.root_shape
+    }
+
+    /// The pinned promise shape at shape-slot 1: parentless, no descriptors,
+    /// `num_own == PROMISE_INTERNAL_SLOTS`. Permanently rooted.
+    pub fn promise_shape(&self) -> ShapeHandle {
+        self.promise_shape
+    }
+
+    /// Allocates a promise object and binds it to the reserved promise shape.
+    ///
+    /// A promise keeps `[[State]]`/`[[Result]]`/`[[Reactions]]` in
+    /// `properties[0..3]`, and shape slot numbering starts from the parent
+    /// shape's `num_own`. Starting a promise on the ordinary empty-object
+    /// root (`num_own == 0`) would hand the first user-defined own property
+    /// slot 0, so reading it back answered the promise's `[[State]]` Smi and
+    /// writing it clobbered the internal slot. Binding the reserved root moves
+    /// every user property past the three internal ones while keeping them
+    /// invisible to key lookup and enumeration (the descriptors list is
+    /// empty).
+    ///
+    /// Does not root the handle — callers root as they do for [`Heap::alloc`].
+    pub fn alloc_promise(&mut self, mut promise: JsObject) -> Handle<JsObject> {
+        promise.shape = self.promise_shape;
+        self.alloc(promise)
     }
 
     /// Header bit marking a realm global directly on the object.

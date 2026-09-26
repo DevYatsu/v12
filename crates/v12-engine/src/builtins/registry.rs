@@ -260,6 +260,43 @@ impl v12_native::NativeRegistry for NativeRegistry {
         }
     }
 
+    /// The streaming `Promise.all` / `Promise.race` seam. The interpreter
+    /// drives it one element at a time (it owns the iterator and the calls
+    /// into user code); the engine owns the aggregate promise, the results
+    /// array and the reaction watchers.
+    fn combinator_begin(
+        &mut self,
+        heap: &mut Heap,
+        this: JsValue,
+        kind: i32,
+    ) -> Result<JsValue, Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::combinator::begin(&mut ctx, this, kind)
+    }
+
+    fn combinator_step(
+        &mut self,
+        heap: &mut Heap,
+        state: JsValue,
+        index: u32,
+        value: JsValue,
+        then_v: JsValue,
+    ) -> Result<JsValue, Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::combinator::step(&mut ctx, state, index, value, then_v)
+    }
+
+    fn combinator_settle(
+        &mut self,
+        heap: &mut Heap,
+        state: JsValue,
+        rejecting: bool,
+        reason: JsValue,
+    ) -> Result<JsValue, Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::combinator::settle(&mut ctx, state, rejecting, reason)
+    }
+
     fn compile_eval(
         &mut self,
         heap: &mut Heap,

@@ -584,6 +584,23 @@ impl Shape {
         Shape::default()
     }
 
+    /// A parentless shape that *reserves* `reserved` leading `properties`
+    /// entries for a kind's internal slots, without naming them.
+    ///
+    /// Slot assignment is `parent.num_own`-based ([`crate::Heap::add_property`]),
+    /// so an object whose kind keeps internal slots in `properties[0..n]` must
+    /// start from a shape with `num_own == n` — otherwise the first
+    /// user-defined property is handed slot 0 and silently overwrites (or is
+    /// read back as) the internal slot. The descriptors list stays empty, so
+    /// the reserved prefix remains invisible to `find_descriptor` and to
+    /// own-key enumeration; only the slot numbering accounts for it.
+    pub fn reserved(reserved: u32) -> Shape {
+        Shape {
+            num_own: reserved,
+            ..Shape::default()
+        }
+    }
+
     /// Property lookup over this shape's descriptors alone.
     ///
     /// Every way a shape comes into existence ([`crate::Heap::add_property`],
@@ -644,6 +661,7 @@ impl crate::object::SizeEstimate for Shape {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::object::PROMISE_INTERNAL_SLOTS;
     use crate::{GcPolicy, Heap, V12Str};
 
     /// Allocates a string and roots it immediately (allocation contract),
@@ -652,6 +670,33 @@ mod tests {
         let h = heap.alloc(V12Str::latin1(name.to_vec()));
         heap.add_root(crate::JsValue::string(h));
         PropKey::from_string(h)
+    }
+
+    #[test]
+    fn reserved_root_offsets_user_slots_past_the_internal_prefix() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let reserved = heap.promise_shape();
+        // Parentless and descriptor-less, so the reserved prefix is invisible
+        // to lookup and enumeration ...
+        assert!(heap.get(reserved).parent.is_none());
+        assert!(heap.get(reserved).descriptors.is_empty());
+        // ... but `num_own` still counts it, so the first user property is
+        // numbered past the three promise internal slots.
+        assert_eq!(heap.get(reserved).num_own, PROMISE_INTERNAL_SLOTS);
+
+        let k = keyed(&mut heap, b"then");
+        let child = heap.add_property(reserved, k, Attrs::DEFAULT);
+        assert_eq!(
+            heap.get(child).descriptors.find(k).copied(),
+            Some(Descriptor::Data {
+                key: k,
+                slot: PROMISE_INTERNAL_SLOTS,
+                attrs: Attrs::DEFAULT
+            })
+        );
+        // And the reserved root is a distinct node from the empty-object
+        // root, so the two slot spaces never alias in the shape/IC caches.
+        assert_ne!(reserved, heap.root_shape());
     }
 
     #[test]
@@ -928,10 +973,13 @@ mod tests {
         heap.force_collect();
 
         // Only the anchored chain survives; the dead branch was reclaimed…
+        // 4 = the pinned empty-object root, the pinned promise root (also a
+        // permanent shape root, see `Heap::promise_shape`), and the two
+        // live-branch shapes.
         assert_eq!(
             heap.live_count::<Shape>(),
-            3,
-            "expected root + two live-branch shapes"
+            4,
+            "expected both pinned roots + two live-branch shapes"
         );
         // …and its stale transition entry was pruned from the live base.
         assert_eq!(heap.get(base).transitions.get(kz, Attrs::DEFAULT), None);
