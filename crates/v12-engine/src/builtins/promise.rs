@@ -736,7 +736,44 @@ pub(crate) fn make_capability(
         capability_settle(heap, &sink2, p, rv, jv, reason, true)
     });
     heap.get_mut(reject_obj).callable = v12_heap::FunctionTarget::Host(reject_closure);
+
+    // Spec shape of both halves (27.5.1.3): they are `CreateBuiltinFunction`
+    // results, so they must carry `length`/`name` and inherit
+    // `%Function.prototype%` like any other builtin function.
+    let mut ctx = Ctx::new(heap, None, None);
+    shape_resolving_function(&mut ctx, resolve_obj);
+    shape_resolving_function(&mut ctx, reject_obj);
     (resolve_v, reject_v)
+}
+
+/// Stamps the spec shape of a 27.5.1.3 resolving function onto `func`:
+/// `length: 1`, then `name: ""`, and `[[Prototype]] = %Function.prototype%`.
+///
+/// The order of the two installs is observable — test262
+/// `built-ins/Promise/prototype/then/reject-function-property-order.js` pins
+/// `length` before `name` — so `length` goes first. No own `prototype` property
+/// is created: that absence is what makes the function non-constructible
+/// (27.5.1.3 step 1-a), and the engine already leaves fresh host functions
+/// without one.
+///
+/// Shape only: no settlement, ordering, or combinator behaviour changes here.
+pub(crate) fn shape_resolving_function(ctx: &mut Ctx, func: v12_heap::Handle<JsObject>) {
+    if let Some(proto) = ctx.function_proto() {
+        ctx.heap.get_mut(func).prototype = Some(proto);
+    }
+    ctx.define_data_prop_with_attrs(
+        func,
+        "length",
+        JsValue::from_i32_smi(1).expect("resolving-function arity 1 fits Smi"),
+        v12_heap::Attrs::new(false, false, true),
+    );
+    let empty = ctx.heap.intern_text("");
+    ctx.define_data_prop_with_attrs(
+        func,
+        "name",
+        JsValue::string(empty),
+        v12_heap::Attrs::new(false, false, true),
+    );
 }
 
 /// Settles an async function's completion promise and runs its reactions as
@@ -877,7 +914,7 @@ pub mod combinator {
 
     use super::{
         STATE_FULFILLED, STATE_PENDING, STATE_REJECTED, alloc_host, capability_settle,
-        create_promise, make_capability, settle_sync, smi,
+        create_promise, make_capability, settle_sync, shape_resolving_function, smi,
     };
     use crate::builtins::ctx::Ctx;
     use crate::job_queue::Job;
@@ -1023,9 +1060,22 @@ pub mod combinator {
             KIND_ALL => all_element(ctx, state, index, &settled, &sink),
             _ => race_element(ctx, state, &settled, &sink),
         };
+        // 27.5.4.1/27.5.4.5 build the per-element pair with
+        // `CreateResolvingFunction` too, and hand it to a user-visible `then`,
+        // so it carries the same spec shape as an executor's capability.
+        shape_pair(ctx, resolve_v, reject_v);
         let pair = ctx.heap.alloc(JsObject::array(vec![resolve_v, reject_v]));
         ctx.heap.add_root(JsValue::object(pair));
         Ok(JsValue::object(pair))
+    }
+
+    /// Stamps the 27.5.1.3 resolving-function shape on a combinator
+    /// `[resolveElement, rejectElement]` pair.
+    fn shape_pair(ctx: &mut Ctx, resolve: JsValue, reject: JsValue) {
+        for half in [resolve, reject] {
+            let obj = half.as_object().expect("alloc_host returns a function");
+            shape_resolving_function(ctx, obj);
+        }
     }
 
     /// `combinator_settle`: `KIND_ALL` exhaustion fulfills the aggregate with

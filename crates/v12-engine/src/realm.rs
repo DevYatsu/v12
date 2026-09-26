@@ -31,6 +31,7 @@ pub struct Realm {
     symbol_iterator: Handle<v12_heap::V12Symbol>,
     symbol_to_string_tag: Handle<v12_heap::V12Symbol>,
     symbol_species: Handle<v12_heap::V12Symbol>,
+    function_proto: Handle<JsObject>,
 }
 
 impl Realm {
@@ -677,6 +678,7 @@ impl Realm {
             symbol_iterator,
             symbol_to_string_tag,
             symbol_species,
+            function_proto,
         }
     }
 
@@ -702,6 +704,14 @@ impl Realm {
     #[must_use]
     pub fn symbol_species(&self) -> Handle<v12_heap::V12Symbol> {
         self.symbol_species
+    }
+
+    /// This realm's `%Function.prototype%` handle — the `[[Prototype]]` every
+    /// spec function object created by the engine inherits
+    /// (27.5.1.3's resolving functions, `CreateBuiltinFunction` results).
+    #[must_use]
+    pub fn function_proto(&self) -> Handle<JsObject> {
+        self.function_proto
     }
 
     /// Intrinsic table for inspection and native registry wiring.

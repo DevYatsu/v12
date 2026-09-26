@@ -702,6 +702,18 @@ impl<'a> Ctx<'a> {
         self.intrinsic("Array")
     }
 
+    /// This realm's `%Function.prototype%` handle, `None` outside a realm.
+    ///
+    /// `Ctx` carries no `Realm` handle, so this resolves the same object
+    /// [`crate::realm::Realm::function_proto`] stores: the `Function` global
+    /// property's `prototype` field, installed by `install_ctor` at realm
+    /// build. Same source (and the same `realm_globals()` fallback) as
+    /// [`Self::intrinsic`], so no new plumbing and no extra GC root — the
+    /// realm already roots both ends.
+    pub fn function_proto(&mut self) -> Option<Handle<JsObject>> {
+        realm_function_proto(self.heap)
+    }
+
     /// Overwrites the value of an already-installed own data property
     /// `name` on `obj` (no shape transition — the descriptor slot is
     /// reused). Used by the realm to replace a placeholder installed by
@@ -761,6 +773,40 @@ impl<'a> Ctx<'a> {
         self.heap.add_root(JsValue::symbol(h));
         h
     }
+}
+
+/// Reads an own data property `name` from `obj` (shape lookup, no prototype
+/// walk), `None` when absent or accessor-defined.
+fn own_data_prop(heap: &mut Heap, obj: Handle<JsObject>, name: &str) -> Option<JsValue> {
+    use v12_heap::{PropKey, V12Str};
+    let key = PropKey::from_string(heap.intern_string(V12Str::latin1_slice(name.as_bytes())));
+    let slot = heap
+        .lookup_property(heap.shape_of(obj), key)
+        .and_then(|d| d.slot())? as usize;
+    // A realm global carries the descriptor-less intrinsic prefix, so its
+    // shape slots are biased by `GLOBAL_VAR_OFFSET` — the same mapping
+    // `Interp::global_slot_index` applies. Every other object indexes
+    // `properties` directly.
+    let idx = if heap.is_realm_global(obj) {
+        v12_bytecode::GLOBAL_VAR_OFFSET + slot
+    } else {
+        slot
+    };
+    heap.get(obj).properties.get(idx).copied()
+}
+
+/// The realm's `%Function.prototype%` handle, read off the `Function` global
+/// property's `prototype` field — the same object
+/// [`crate::realm::Realm::function_proto`] stores, reached without threading a
+/// `Realm` through the `Ctx`-free paths (`promise::make_capability` and
+/// `settle_async_completion` hold a bare `&mut Heap`).
+///
+/// `None` outside a realm (bare-heap engine tests) and when the realm has not
+/// installed the `Function` constructor yet.
+pub fn realm_function_proto(heap: &mut Heap) -> Option<Handle<JsObject>> {
+    let global = heap.realm_globals().first().copied()?;
+    let ctor = own_data_prop(heap, global, "Function")?.as_object()?;
+    heap.get(ctor).prototype
 }
 
 /// Parses a trimmed `0x`/`0b`/`0o` integer literal per
