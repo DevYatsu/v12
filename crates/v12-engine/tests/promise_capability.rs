@@ -463,10 +463,17 @@ use v12_native::NativeRegistry as _;
 
 /// 27.5.1.5 step 2: a fresh `PromiseCapability Record` — a two-slot object
 /// whose `[[Resolve]]`/`[[Reject]]` both start out `undefined`.
+/// The `PromiseCapability Record` spec 27.5.1.5 step 2 asks for: `[[Resolve]]`,
+/// `[[Reject]]` and `[[AlreadyResolved]]`, in that order (slot names in
+/// `v12_native::promise_capability`).
 fn capability_record(heap: &mut Heap) -> Handle<JsObject> {
     heap.alloc(JsObject::ordinary(
-        smallvec::smallvec![JsValue::undefined(), JsValue::undefined()],
-        smallvec::smallvec![None; 2],
+        smallvec::smallvec![
+            JsValue::undefined(),
+            JsValue::undefined(),
+            JsValue::from_i32_smi(v12_native::promise_capability::CAPABILITY_FRESH).expect("Smi"),
+        ],
+        smallvec::smallvec![None; 3],
     ))
 }
 

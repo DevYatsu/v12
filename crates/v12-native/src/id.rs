@@ -247,6 +247,12 @@ pub enum NativeId {
     PromiseAll = 1715,
     PromiseRace = 1716,
     PromiseFinally = 1717,
+    /// `PerformPromiseAll`'s `onFulfilledElement`: the one per-element
+    /// handler that survives the capability rewiring. Not a registry native —
+    /// its last step is a `Call` of the capability's `[[Resolve]]`, which for a
+    /// subclassed receiver is user code, so the interpreter intercepts it
+    /// (see `v12_native::promise_combinator` for the record it carries).
+    PromiseCombinatorElement = 1718,
     QueueMicrotask = 1700,
     // Map / Set
     MapConstruct = 2000,

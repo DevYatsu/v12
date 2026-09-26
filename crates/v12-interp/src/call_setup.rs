@@ -9,6 +9,25 @@ use crate::execute::decode_parked_call;
 use crate::ops;
 use crate::property::OwnDesc;
 use v12_native::NativeId;
+use v12_native::promise_combinator::SLOT_REJECT;
+
+/// A `PromiseCapability Record` as the combinators hold it (spec 27.5.4.1 step
+/// 2): the promise to return, and the pair every settlement goes through. The
+/// pair is `C`'s own — 27.5.1.5 records whatever the constructor passed its
+/// executor — so all three are `Call`s the interpreter makes, not writes it
+/// performs.
+///
+/// Parked on the value stack for the duration of a combinator call, because
+/// `gc_protect` republishes that stack as the root set and each of the three is
+/// held in a Rust local meanwhile.
+struct Capability {
+    /// `[[Promise]]` — what `Promise.all`/`Promise.race` hand back.
+    promise: JsValue,
+    /// `[[Resolve]]`.
+    resolve: JsValue,
+    /// `[[Reject]]`.
+    reject: JsValue,
+}
 
 /// Resolves `[callee][this][args…]` at `callee_reg` in the current frame
 /// and either pushes a bytecode frame or completes a native inline.
@@ -162,7 +181,7 @@ impl Interp<'_> {
                 let args_end = args_start + usize::from(argc);
                 let args_slice = self.stack[args_start..args_end].to_vec();
                 return self
-                    .dispatch_native(native_fn, this_v, &args_slice)
+                    .dispatch_call_native(callee_obj, native_fn, this_v, &args_slice)
                     .map(CallOutcome::Value);
             }
             let args_start = callee_slot + 2;
@@ -198,7 +217,7 @@ impl Interp<'_> {
             // the stack borrow would otherwise conflict.)
             let args_vec = self.stack[args_start..args_end].to_vec();
             return self
-                .dispatch_native(id, this_v, &args_vec)
+                .dispatch_call_native(callee_obj, id, this_v, &args_vec)
                 .map(CallOutcome::Value);
         }
 
@@ -532,7 +551,7 @@ impl Interp<'_> {
                     // One router: explicit arms run before the callback
                     // seam + registry fallback (adds callback-taking
                     // builtins + eval/Function routing to this path).
-                    return self.dispatch_native(native_fn, this, args);
+                    return self.dispatch_call_native(func, native_fn, this, args);
                 }
                 let funcs = self.functions_for_program(func_program);
                 if (fn_idx as usize) >= funcs.len() {
@@ -1067,7 +1086,7 @@ impl Interp<'_> {
             // One router: explicit arms (eval/Function/generators/call/apply)
             // run before the callback seam + registry fallback.
             return self
-                .dispatch_native(id, this_v, &args_vec)
+                .dispatch_call_native(callee_obj, id, this_v, &args_vec)
                 .map(CallOutcome::Value);
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
@@ -1202,6 +1221,16 @@ impl Interp<'_> {
         let target_idx = match target {
             v12_heap::FunctionTarget::Bytecode(idx) => {
                 if (idx as usize) >= self.functions_for_program(callee_program).len() {
+                    // `onFulfilledElement` is a `CreateBuiltinFunction` and has
+                    // no `[[Construct]]` (spec 27.5.4.1.1 step 4), so `new` on
+                    // it is a `TypeError` — and the *spec's* `TypeError`, not
+                    // the registry's "not registered", which is neither a
+                    // `TypeError` object nor the right message.
+                    if idx == u32::from(NativeId::PromiseCombinatorElement) {
+                        return Err(JSException(
+                            self.error_value("TypeError: not a constructor"),
+                        ));
+                    }
                     let args_start = callee_slot + 2;
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
@@ -1411,6 +1440,31 @@ impl Interp<'_> {
 // ---------------------------------------------------------------------------
 
 impl Interp<'_> {
+    /// [`Self::dispatch_native`] for a *call*, with the callee object in hand.
+    ///
+    /// Identical but for one interception: `onFulfilledElement` reads its
+    /// element record off the callee, which `dispatch_native` is not handed. It
+    /// cannot live in `run_callback_builtin` either, because a reaction reaches
+    /// the handler through whichever call site ran the user's `then` — a
+    /// `call` opcode in `prepare_call`, an engine arm in `call_inline`, or
+    /// `Interp::call_object` in `call_value` — so every call site funnels
+    /// through here first.
+    ///
+    /// The construct paths deliberately do not: nothing constructs a reaction
+    /// handler, it is only ever called.
+    fn dispatch_call_native(
+        &mut self,
+        callee: Handle<JsObject>,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        if id == NativeId::PromiseCombinatorElement {
+            return self.run_combinator_element(callee, args);
+        }
+        self.dispatch_native(id, this_v, args)
+    }
+
     /// Single normalization point for every `NativeId` call. Explicit router
     /// arms (generator control, `ArrayJoin`/`ArrayPush` fallbacks,
     /// `ConsoleLog`, `Function.prototype.call/apply/bind`, direct `eval`,
@@ -2108,6 +2162,13 @@ impl Interp<'_> {
         if (idx as usize) >= self.functions_for_program(program).len() {
             // Out-of-range bytecode index: an engine-installed native
             // constructor (Boolean/Error/…). Route through the registry.
+            // `onFulfilledElement` is the one native here with no
+            // `[[Construct]]` at all (see `prepare_construct`).
+            if idx == u32::from(NativeId::PromiseCombinatorElement) {
+                return Err(JSException(
+                    self.error_value("TypeError: not a constructor"),
+                ));
+            }
             let id = self.native_id_for(idx)?;
             return self.dispatch_native(id, target_v, args);
         }
@@ -2880,25 +2941,40 @@ impl Interp<'_> {
     }
 
     /// `Promise.all(iterable)` / `Promise.race(iterable)`, streamed (spec
-    /// 27.2.4.1 / 27.2.4.2).
+    /// 27.5.4.1 / 27.5.4.2).
     ///
-    /// The spec algorithm alternates between two halves, and so does this: the
-    /// interpreter pulls `next`/`done`/`value` and invokes `C.resolve` and
-    /// `then` — each reads a property off a user object or calls user code — and
-    /// the engine owns the aggregate promise, the results array and the
-    /// reaction watchers (jobs live in `v12-engine`). The two meet at a
-    /// combinator state object on the heap
-    /// ([`v12_native::promise_combinator`]).
+    /// The spec algorithm alternates between two halves, and so does this. The
+    /// interpreter owns everything that is a machine operation or a call into
+    /// user code: `NewPromiseCapability(C)` — which *runs* `C` — `Get(C,
+    /// "resolve")`, `GetIterator`, the element loop, and every `Call` of the
+    /// capability's own `[[Resolve]]`/`[[Reject]]` (user code whenever the
+    /// receiver supplied its own pair). The engine owns the bookkeeping those
+    /// calls feed: the results array, the unsettled count and the reaction
+    /// records (jobs live in `v12-engine`). The two meet at a combinator state
+    /// object on the heap ([`v12_native::promise_combinator`]).
     ///
-    /// One element at a time is the point: an element whose `resolve`/`then`
-    /// throws closes the iterator and settles the aggregate, so an unbounded
-    /// iterator cannot stall the loop. Per spec an abrupt `next`/`done`/`value`
-    /// does *not* close — it rejects the capability where it happened
-    /// (`PerformPromiseAll`'s `IfAbruptRejectPromise`), and so does a failed
-    /// `GetIterator`.
+    /// The order below is the spec's, and it is load-bearing. Steps 2-4 run
+    /// before `GetIterator` at step 5, so `Promise.all.call(eval, …)` throws its
+    /// `TypeError` before a single iterator step, and a poisoned `C.resolve`
+    /// rejects without the iterator's `@@iterator` getter ever running.
     ///
-    /// Everything the loop holds across a safepoint — the state, the iterator,
-    /// the element, the capability pair — rides the value stack, because
+    /// Steps 2 and 3-4 differ in how their abrupt completion surfaces, and that
+    /// split is the spec's: step 2's `NewPromiseCapability(C)` has no
+    /// `IfAbruptRejectPromise` after it, so a receiver that is not a constructor
+    /// or that ignored its executor *throws*; step 4 applies
+    /// `IfAbruptRejectPromise` to `GetPromiseResolve(C)`, so a throwing
+    /// `resolve` getter or a non-callable `resolve` *rejects* the capability and
+    /// the call still returns it.
+    ///
+    /// One element at a time is the point: an element whose `promiseResolve` or
+    /// `then` throws closes the iterator and settles the aggregate, so an
+    /// unbounded iterator cannot stall the loop. Per spec an abrupt
+    /// `next`/`done`/`value` does *not* close — it rejects the capability where
+    /// it happened (`PerformPromiseAll`'s `IfAbruptRejectPromise`), and so does a
+    /// failed `GetIterator`.
+    ///
+    /// Everything the loop holds across a safepoint — the capability, the
+    /// state, the iterator, the element — rides the value stack, because
     /// `gc_protect` republishes the stack as the root set and any of those
     /// calls can collect.
     fn run_promise_combinator(
@@ -2914,22 +2990,58 @@ impl Interp<'_> {
             KIND_RACE
         };
         let base = self.stack.len();
-        // Spec 27.2.4.1 step 6 / 27.2.4.2 step 3:
-        // `promiseCapability = NewPromiseCapability(C)`, whose first act is
-        // `If IsConstructor(C) is false, throw a TypeError` — so
-        // `Promise.all.call(eval, …)` throws before a single iterator step.
-        // The check lives here rather than inside `combinator_begin` because
-        // `IsConstructor` is an interpreter-owned oracle (a bytecode function
-        // that is not an arrow, a bound function of one, or a constructible
-        // engine native); the engine half only allocates the capability.
-        if !self.is_capability_constructor(this_v) {
-            self.stack.truncate(base);
-            return Err(JSException(self.error_value(
-                "TypeError: Promise combinator called on a non-constructor",
-            )));
-        }
-        let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
-        let state = match self.combinator_begin(this_v, kind) {
+        // Step 2 (27.5.4.1) / step 3 (27.5.4.2):
+        // `promiseCapability = NewPromiseCapability(C)`. Its own step 1 is
+        // `If IsConstructor(C) is false, throw a TypeError` and its steps 7-8
+        // are the two `IsCallable` checks on the pair the constructor recorded,
+        // so this is where a non-constructor receiver, one that ignored its
+        // executor and one that handed the executor an uncallable all throw —
+        // before `Get(C, "resolve")` and before a single iterator step.
+        let capability = match self.new_promise_capability(this_v) {
+            Ok((promise, resolve, reject)) => Capability {
+                promise,
+                resolve,
+                reject,
+            },
+            Err(error) => {
+                self.stack.truncate(base);
+                return Err(error);
+            }
+        };
+        // Park the capability for the whole call: the three values live in Rust
+        // locals from here to the return, and `gc_protect` cannot see them — it
+        // republishes the value stack as the root set. The state object needs
+        // no parking for the collector's sake (the engine pins it), but it does
+        // for `gc_protect`'s.
+        self.stack.push(capability.promise);
+        self.stack.push(capability.resolve);
+        self.stack.push(capability.reject);
+        // Step 3: `promiseResolve = ? Get(C, "resolve")` (the `GetPromiseResolve`
+        // abstract operation), read on the receiver `this` rather than
+        // `%Promise%` so a subclassed receiver keeps its own `resolve`, and read
+        // once for the whole call rather than once per element.
+        let resolve_key = self.new_temp_key("resolve");
+        let promise_resolve = self
+            .get_property(0, 0, this_v, resolve_key)
+            .and_then(|v| self.callable_or_err(v, "Promise combinator resolve is not callable"));
+        let promise_resolve = match promise_resolve {
+            Ok(promise_resolve) => promise_resolve,
+            Err(JSException(thrown)) => {
+                // Step 4: `IfAbruptRejectPromise(promiseResolve, promiseCapability)`
+                // — the capability rejects with the thrown value (or with the
+                // `TypeError` the `IsCallable` gate raised) and the call returns
+                // the capability promise rather than propagating. The `Call` is
+                // `?`, so a receiver whose own reject throws does propagate.
+                self.stack.push(thrown);
+                self.gc_protect();
+                let rejected = self.call_value(capability.reject, JsValue::undefined(), &[thrown]);
+                self.stack.truncate(base);
+                rejected?;
+                return Ok(capability.promise);
+            }
+        };
+        self.stack.push(promise_resolve);
+        let state = match self.combinator_begin(kind, capability.promise, capability.reject) {
             Ok(state) => state,
             Err(error) => {
                 self.stack.truncate(base);
@@ -2937,7 +3049,12 @@ impl Interp<'_> {
             }
         };
         self.stack.push(state);
-        let result = self.stream_combinator(this_v, iterable, state);
+        let result = self.stream_combinator(
+            &capability,
+            args.first().copied().unwrap_or_else(JsValue::undefined),
+            promise_resolve,
+            state,
+        );
         self.stack.truncate(base);
         result
     }
@@ -2945,8 +3062,9 @@ impl Interp<'_> {
     /// The element loop, from `GetIterator` to the terminal settlement.
     fn stream_combinator(
         &mut self,
-        this_v: JsValue,
+        capability: &Capability,
         iterable: JsValue,
+        promise_resolve: JsValue,
         state: JsValue,
     ) -> Result<JsValue, JSException> {
         let iterator = match self.get_iterator(iterable, false) {
@@ -2954,7 +3072,7 @@ impl Interp<'_> {
             Err(JSException(thrown)) => {
                 // No iterator record, so nothing to close: the capability
                 // rejects where the abrupt happened.
-                return self.settle_combinator(state, true, thrown);
+                return self.settle_combinator(capability, state, false, thrown);
             }
         };
         // Park the iterator for the whole loop: `gc_protect` republishes the
@@ -2962,58 +3080,63 @@ impl Interp<'_> {
         let base = self.stack.len();
         self.stack.push(iterator);
         let mut index: u32 = 0;
+        // `(exhausted, value)`: whether the iterator ran out rather than
+        // throwing, and the rejection reason when it did not.
         let outcome = loop {
             // IteratorStepValue: an abrupt here rejects without closing.
             let result = match self.op_iterator_next(iterator) {
                 Ok(result) => result,
-                Err(JSException(thrown)) => break (true, thrown),
+                Err(JSException(thrown)) => break (false, thrown),
             };
             let done_key = self.new_temp_key("done");
             let done = match self.get_property(0, 0, result, done_key) {
                 Ok(done) => done,
-                Err(JSException(thrown)) => break (true, thrown),
+                Err(JSException(thrown)) => break (false, thrown),
             };
             if ops::to_boolean(self.heap, done) {
-                break (false, JsValue::undefined());
+                break (true, JsValue::undefined());
             }
             let value_key = self.new_temp_key("value");
             let element = match self.get_property(0, 0, result, value_key) {
                 Ok(value) => value,
-                Err(JSException(thrown)) => break (true, thrown),
+                Err(JSException(thrown)) => break (false, thrown),
             };
-            match self.combinator_element(this_v, state, index, element) {
+            match self.combinator_element(capability, promise_resolve, state, index, element) {
                 Ok(()) => {}
-                // `C.resolve`, the `then` read, the engine step and the `then`
-                // invocation are element-processing aborts: the iterator closes
-                // first, and the original error wins over anything `return()`
-                // throws.
+                // `promiseResolve`, the `then` read, the engine step and the
+                // `then` invocation are element-processing aborts: the iterator
+                // closes first, and the original error wins over anything
+                // `return()` throws.
                 Err(JSException(thrown)) => {
                     self.op_iterator_close(iterator, true)?;
-                    break (true, thrown);
+                    break (false, thrown);
                 }
             }
             index += 1;
         };
         self.stack.truncate(base);
-        self.settle_combinator(state, outcome.0, outcome.1)
+        self.settle_combinator(capability, state, outcome.0, outcome.1)
     }
 
-    /// One element of a combinator: `C.resolve(element)`, read `then`, engine
-    /// step, then invoke `then` with the capability pair it returned.
+    /// One element of a combinator: `Call(promiseResolve, …)`, read `then`,
+    /// engine step, then either invoke `then` with the pair it built or settle
+    /// the element in place.
     ///
-    /// The element and the pair are parked on the value stack for the calls
-    /// that can collect; the truncate is unconditional so a throwing
-    /// `C.resolve`/`then` leaves the same stack it found.
+    /// The element is parked on the value stack for the calls that can collect;
+    /// the truncate is unconditional so a throwing `promiseResolve`/`then`
+    /// leaves the same stack it found.
     fn combinator_element(
         &mut self,
-        this_v: JsValue,
+        capability: &Capability,
+        promise_resolve: JsValue,
         state: JsValue,
         index: u32,
         element: JsValue,
     ) -> Result<(), JSException> {
         let base = self.stack.len();
         self.stack.push(element);
-        let result = self.combinator_element_calls(this_v, state, index, element);
+        let result =
+            self.combinator_element_calls(capability, promise_resolve, state, index, element);
         self.stack.truncate(base);
         result
     }
@@ -3022,19 +3145,15 @@ impl Interp<'_> {
     /// parked on the stack.
     fn combinator_element_calls(
         &mut self,
-        this_v: JsValue,
+        capability: &Capability,
+        promise_resolve: JsValue,
         state: JsValue,
         index: u32,
         element: JsValue,
     ) -> Result<(), JSException> {
-        // `promiseResolve = Get(C, "resolve")` (spec 27.2.4.1 step 3). The
-        // receiver is `this` rather than `%Promise%`, so a subclassed receiver
-        // keeps its own `resolve`.
-        let resolve_key = self.new_temp_key("resolve");
-        let resolve_v = self.get_property(0, 0, this_v, resolve_key)?;
-        let resolve =
-            self.callable_or_err(resolve_v, "Promise combinator resolve is not callable")?;
-        self.call_value(resolve, JsValue::undefined(), &[element])?;
+        // `nextPromise = Call(promiseResolve, undefined, « nextValue »)`. The
+        // `resolve` it names was read once, before `GetIterator`.
+        self.call_value(promise_resolve, JsValue::undefined(), &[element])?;
         // `Get(V, P)` boxes its receiver (spec 7.3.9), so a primitive element
         // has no `then` — a hole in a sparse array reads as `undefined`, and
         // `Promise.all([1, , 3])` must fulfill rather than reject.
@@ -3044,42 +3163,187 @@ impl Interp<'_> {
             let then_key = self.new_temp_key("then");
             self.get_property(0, 0, element, then_key)?
         };
-        let pair = self.combinator_step(state, index, element, then_v)?;
-        // `undefined` means the engine already settled this element (no
-        // callable `then`), so there is nothing left to invoke.
-        if pair.is_undefined() {
-            return Ok(());
+        let carrier = self.combinator_step(state, index, element, then_v, capability.resolve)?;
+        // The carrier's length is the whole protocol: one element means there
+        // was no callable `then` to invoke, two means the pair to hand it.
+        if self.carrier_len(carrier) == v12_native::promise_combinator::carrier::SETTLE_NOW {
+            let zero = self.new_temp_key("0");
+            let value = self.get_property(0, 0, carrier, zero)?;
+            return self.settle_element_now(capability, state, index, value);
         }
         let zero = self.new_temp_key("0");
         let one = self.new_temp_key("1");
-        let resolve_element = self.get_property(0, 0, pair, zero)?;
-        let reject_element = self.get_property(0, 0, pair, one)?;
-        self.stack.push(pair);
+        let on_fulfilled = self.get_property(0, 0, carrier, zero)?;
+        let on_rejected = self.get_property(0, 0, carrier, one)?;
+        self.stack.push(carrier);
         let then = self.callable_or_err(then_v, "then is not callable")?;
-        self.call_value(then, element, &[resolve_element, reject_element])?;
+        self.call_value(then, element, &[on_fulfilled, on_rejected])?;
         Ok(())
     }
 
-    /// The terminal settlement: fulfills at exhaustion, rejects on the abrupt
-    /// paths, and hands back the aggregate promise.
+    /// The non-callable-`then` paths (27.5.4.1 step 11-c / 27.5.4.2 step 8-e):
+    /// the element settles without a `Call`, through the engine's bookkeeping
+    /// and then — if it was the element that settles the aggregate — the
+    /// capability's own `[[Resolve]]`.
+    fn settle_element_now(
+        &mut self,
+        capability: &Capability,
+        state: JsValue,
+        index: u32,
+        value: JsValue,
+    ) -> Result<(), JSException> {
+        let settled = self.combinator_element_settled(state, index, true, value)?;
+        self.resolve_through(capability.resolve, capability.reject, settled)
+    }
+
+    /// `Call(promiseCapability.[[Resolve]], undefined, « value »)` for the
+    /// value the engine says the aggregate settles with, with
+    /// `IfAbruptRejectPromise` on a throw. That handler is the point of routing
+    /// settlement through the capability at all: `[[Resolve]]` is the
+    /// receiver's own code, so its throw becomes the rejection reason instead
+    /// of disappearing.
+    ///
+    /// A `None` means the element did not settle the aggregate, so there is no
+    /// call to make.
+    fn resolve_through(
+        &mut self,
+        resolve_v: JsValue,
+        reject_v: JsValue,
+        value: Option<JsValue>,
+    ) -> Result<(), JSException> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        match self.call_value(resolve_v, JsValue::undefined(), &[value]) {
+            Ok(_) => Ok(()),
+            // 27.5.1.1.1: reject with the thrown value instead. This `Call` is
+            // itself `?`, so a throw from the receiver's reject propagates.
+            Err(JSException(thrown)) => {
+                self.call_value(reject_v, JsValue::undefined(), &[thrown])?;
+                Ok(())
+            }
+        }
+    }
+
+    /// The terminal settlement: `KIND_ALL` exhaustion fulfills through the
+    /// capability when nothing is still outstanding, every abrupt path rejects
+    /// through it, and either way `Promise.all`/`Promise.race` return
+    /// `promiseCapability.[[Promise]]` (27.5.4.1 step 13).
     fn settle_combinator(
         &mut self,
+        capability: &Capability,
         state: JsValue,
-        rejecting: bool,
+        exhausted: bool,
         reason: JsValue,
     ) -> Result<JsValue, JSException> {
         self.stack.push(reason);
         self.gc_protect();
-        let settled = self.combinator_settle(state, rejecting, reason);
+        let outcome = if exhausted {
+            match self.combinator_settle(state) {
+                Ok(settled) => self.resolve_through(capability.resolve, capability.reject, settled),
+                Err(error) => Err(error),
+            }
+        } else {
+            // Step 7's `IfAbruptRejectPromise`: the capability rejects with the
+            // thrown value and the call still returns the capability promise,
+            // so a bad iterator rejects rather than throwing at the call site.
+            self.call_value(capability.reject, JsValue::undefined(), &[reason])
+                .map(|_| ())
+        };
         self.stack.truncate(self.stack.len() - 1);
-        settled
+        outcome?;
+        Ok(capability.promise)
+    }
+
+    /// `PerformPromiseAll`'s `onFulfilledElement` (spec 27.5.4.1.1 step 4) — the
+    /// one per-element handler left after the capability rewiring, and the one
+    /// remaining path from an element to the aggregate.
+    ///
+    /// It is an interpreter-intercepted native rather than an engine host
+    /// closure because its last step is
+    /// `Perform ? Call(resultCapability.[[Resolve]], undefined, « valuesArray
+    /// »)` (step 4-b-iii-2), and for a subclassed receiver `[[Resolve]]` is
+    /// user code that a `&mut Heap` closure cannot reach. The element's own
+    /// record — state, index, `[[Resolve]]`, and the spec's `alreadyResolved`
+    /// flag — rides the function object, so this is reached from
+    /// [`Self::call_value`] with the callee in hand.
+    ///
+    /// Rooting across the `Call` below needs nothing: the function object is
+    /// pinned by the engine, `elements` is traced, and the reaction record pins
+    /// the handler itself, so the state object, the results array it holds and
+    /// the flag all stay reachable for the whole call.
+    fn run_combinator_element(
+        &mut self,
+        callee: Handle<JsObject>,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        use v12_native::promise_combinator::element as record;
+        let element_record = self.heap.get(callee).elements.clone();
+        if element_record.len() < record::SLOTS {
+            return Err(JSException(
+                self.error_value("TypeError: combinator element has no record"),
+            ));
+        }
+        let state = element_record[record::STATE];
+        let index = element_record[record::INDEX].as_smi().ok_or_else(|| {
+            JSException(self.error_value("TypeError: combinator index is not Smi"))
+        })? as u32;
+        let resolve_v = element_record[record::RESOLVE];
+        let Some(already) = element_record[record::ALREADY].as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: combinator element has no alreadyResolved",
+            )));
+        };
+        // Steps 4-a-1/2: the per-element first-wins guard, so a `then` free to
+        // call its resolve function twice records the first outcome only.
+        if ops::to_boolean(self.heap, self.heap.get(already).properties[0]) {
+            return Ok(JsValue::undefined());
+        }
+        self.heap.get_mut(already).properties[0] = JsValue::from_bool(true);
+        let value = args.first().copied().unwrap_or_else(JsValue::undefined);
+        // Steps 4-a-iii to 4-b: the bookkeeping, and — for the last outstanding
+        // element — the values array `[[Resolve]]` is called with.
+        let settled = self.combinator_element_settled(state, index, true, value)?;
+        self.heap.add_pinned_root(callee);
+        let reject_v = self.combinator_state_slot(state, SLOT_REJECT);
+        self.resolve_through(resolve_v, reject_v, settled)?;
+        Ok(JsValue::undefined())
+    }
+
+    /// [`Self::resolve_through`] for the element handler, which reads the pair
+    /// off its own record rather than off a live [`Capability`].
+    ///
+    /// Reads one named slot of a combinator state object (slot names in
+    /// `v12_native::promise_combinator`).
+    fn combinator_state_slot(&mut self, state: JsValue, slot: i32) -> JsValue {
+        self.heap
+            .get(state.as_object().expect("a state object"))
+            .properties
+            .get(slot as usize)
+            .copied()
+            .unwrap_or_else(JsValue::undefined)
+    }
+
+    /// The element count of a `combinator_step` carrier, which is what tells
+    /// the "settle this now" carrier from the `[onFulfilled, onRejected]` pair.
+    fn carrier_len(&self, carrier: JsValue) -> usize {
+        carrier
+            .as_object()
+            .map_or(0, |obj| self.heap.get(obj).element_len())
     }
 
     /// `combinator_begin` over the registry seam. The registry builds its own
     /// `Ctx` from the shared pending sink, so the interpreter hands over only
     /// the heap.
-    fn combinator_begin(&mut self, this_v: JsValue, kind: i32) -> Result<JsValue, JSException> {
-        let result = self.natives.combinator_begin(self.heap, this_v, kind);
+    fn combinator_begin(
+        &mut self,
+        kind: i32,
+        promise: JsValue,
+        reject: JsValue,
+    ) -> Result<JsValue, JSException> {
+        let result = self
+            .natives
+            .combinator_begin(self.heap, kind, promise, reject);
         result.map_err(|t| JSException::from_throw(self.heap, t))
     }
 
@@ -3090,23 +3354,31 @@ impl Interp<'_> {
         index: u32,
         value: JsValue,
         then_v: JsValue,
+        resolve: JsValue,
     ) -> Result<JsValue, JSException> {
         let result = self
             .natives
-            .combinator_step(self.heap, state, index, value, then_v);
+            .combinator_step(self.heap, state, index, value, then_v, resolve);
+        result.map_err(|t| JSException::from_throw(self.heap, t))
+    }
+
+    /// `combinator_element_settled` over the registry seam.
+    fn combinator_element_settled(
+        &mut self,
+        state: JsValue,
+        index: u32,
+        fulfilled: bool,
+        value: JsValue,
+    ) -> Result<Option<JsValue>, JSException> {
+        let result = self
+            .natives
+            .combinator_element_settled(self.heap, state, index, fulfilled, value);
         result.map_err(|t| JSException::from_throw(self.heap, t))
     }
 
     /// `combinator_settle` over the registry seam.
-    fn combinator_settle(
-        &mut self,
-        state: JsValue,
-        rejecting: bool,
-        reason: JsValue,
-    ) -> Result<JsValue, JSException> {
-        let result = self
-            .natives
-            .combinator_settle(self.heap, state, rejecting, reason);
+    fn combinator_settle(&mut self, state: JsValue) -> Result<Option<JsValue>, JSException> {
+        let result = self.natives.combinator_settle(self.heap, state, true);
         result.map_err(|t| JSException::from_throw(self.heap, t))
     }
 
@@ -3285,18 +3557,20 @@ impl Interp<'_> {
     ///
     /// The spec's own constructor path, and the one that differs from 27.5.1.1
     /// in kind rather than in detail: the resolving pair is *not* built here.
-    /// Step 3 makes a `PromiseCapability Record`, step 5 hands `C` a
+    /// Step 3 makes a `PromiseCapability Record`, step 4 hands `C` a
     /// `GetCapabilitiesExecutor` builtin, step 6 is a `Construct` that runs `C`
     /// — so the pair ends up being whatever `C`'s own code passed in — and steps
     /// 7-8 read it back and check it.
     ///
     /// Step 6 is why this is an interpreter method and not a registry native:
     /// `Construct` on an arbitrary `C` is a machine operation, and it is
-    /// synchronous user code (the spec has no job queue between steps 5 and 7).
+    /// synchronous user code (the spec has no job queue between steps 4 and 7).
     ///
     /// Steps 1, 6 and 7-8 are the whole reason this is not
     /// `Interp::promise_capability`: that one takes a ready-made pair and
-    /// returns a freshly allocated promise, which is 27.5.1.1's shape.
+    /// returns a freshly allocated promise, which is 27.5.1.1's shape. The
+    /// combinators are the production callers — 27.5.4.1 step 6 and
+    /// 27.5.4.2 step 3 are exactly this call.
     pub fn new_promise_capability(
         &mut self,
         ctor: JsValue,
@@ -3309,13 +3583,16 @@ impl Interp<'_> {
                 "TypeError: promise constructor is not a constructor",
             )));
         }
-        // Step 2: the `PromiseCapability Record` — a plain two-slot object,
-        // `[[Resolve]]` and `[[Reject]]` both `undefined`. The engine's
-        // `capability_executor` records into it and `capability_pair` reads it
-        // back, so it is a real heap object rather than interpreter state.
+        // Step 2: the `PromiseCapability Record` — a plain three-slot object
+        // (`[[Resolve]]`, `[[Reject]]`, `[[AlreadyResolved]]`; slot names in
+        // `v12_native::promise_capability`). The engine's `capability_executor`
+        // records the pair into it and `capability_pair` reads it back, so it
+        // is a real heap object rather than interpreter state.
+        let fresh = JsValue::from_i32_smi(v12_native::promise_capability::CAPABILITY_FRESH)
+            .expect("the fresh marker fits Smi");
         let state = self.heap.alloc(JsObject {
-            properties: smallvec::smallvec![JsValue::undefined(), JsValue::undefined()],
-            property_keys: smallvec::smallvec![None; 2],
+            properties: smallvec::smallvec![JsValue::undefined(), JsValue::undefined(), fresh],
+            property_keys: smallvec::smallvec![None; 3],
             ..JsObject::default()
         });
         self.heap.add_pinned_root(state);

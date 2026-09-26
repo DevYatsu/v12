@@ -301,17 +301,19 @@ impl v12_native::NativeRegistry for NativeRegistry {
     }
 
     /// The streaming `Promise.all` / `Promise.race` seam. The interpreter
-    /// drives it one element at a time (it owns the iterator and the calls
-    /// into user code); the engine owns the aggregate promise, the results
-    /// array and the reaction watchers.
+    /// drives it one element at a time (it owns the iterator, the
+    /// `NewPromiseCapability(C)` constructor call, and every `Call` into user
+    /// code); the engine owns the results array, the unsettled count and the
+    /// reaction records.
     fn combinator_begin(
         &mut self,
         heap: &mut Heap,
-        this: JsValue,
         kind: i32,
+        promise: JsValue,
+        reject: JsValue,
     ) -> Result<JsValue, Throw> {
         let mut ctx = self.promise_ctx(heap);
-        promise::combinator::begin(&mut ctx, this, kind)
+        promise::combinator::begin(&mut ctx, kind, promise, reject)
     }
 
     fn combinator_step(
@@ -321,20 +323,32 @@ impl v12_native::NativeRegistry for NativeRegistry {
         index: u32,
         value: JsValue,
         then_v: JsValue,
+        resolve: JsValue,
     ) -> Result<JsValue, Throw> {
         let mut ctx = self.promise_ctx(heap);
-        promise::combinator::step(&mut ctx, state, index, value, then_v)
+        promise::combinator::step(&mut ctx, state, index, value, then_v, resolve)
+    }
+
+    fn combinator_element_settled(
+        &mut self,
+        heap: &mut Heap,
+        state: JsValue,
+        index: u32,
+        fulfilled: bool,
+        value: JsValue,
+    ) -> Result<Option<JsValue>, Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::combinator::element_settled(&mut ctx, state, index, fulfilled, value)
     }
 
     fn combinator_settle(
         &mut self,
         heap: &mut Heap,
         state: JsValue,
-        rejecting: bool,
-        reason: JsValue,
-    ) -> Result<JsValue, Throw> {
+        exhausted: bool,
+    ) -> Result<Option<JsValue>, Throw> {
         let mut ctx = self.promise_ctx(heap);
-        promise::combinator::settle(&mut ctx, state, rejecting, reason)
+        promise::combinator::settle(&mut ctx, state, exhausted)
     }
 
     fn compile_eval(

@@ -17,10 +17,14 @@
 //! two trait methods, because `v12-interp` cannot depend on `v12-engine` (that
 //! dependency runs the other way).
 //!
-//! There is no production caller yet: `Promise.all`/`race` still reach a
-//! hand-allocated aggregate through `combinator::begin` until the combinator
-//! rewiring that is its own change lands. That is why the seam is driven from
-//! here rather than through a `built-ins/Promise` filter.
+//! `Promise.all`/`race` are the production callers: 27.5.4.1 step 6 and
+//! 27.5.4.2 step 3 are exactly this call, which is why
+//! `Interp::run_promise_combinator` now runs it before `Get(C, "resolve")` and
+//! before `GetIterator`. The interpreter half is therefore driven from here
+//! against a stand-in registry, because `v12-interp` cannot depend on
+//! `v12-engine` (that dependency runs the other way) and the engine half is
+//! pinned from the other side in `v12-engine`'s `promise_capability.rs` and
+//! `promise_combinators.rs`.
 
 use v12_heap::{FunctionTarget, GcPolicy, Handle, Heap, JsObject, JsValue};
 use v12_interp::{Interp, JSException};
@@ -54,15 +58,17 @@ impl NativeRegistryTrait for Seam {
         };
         let func = heap.alloc(JsObject::function(
             FunctionTarget::Host(v12_heap::HostClosure::new(move |heap, _this, args| {
-                // 27.5.1.5 step 3: the guard first, then the two stores, then
-                // `undefined` — so a second call throws *without* overwriting.
-                let unset = heap.get(record).properties[0].is_undefined()
-                    && heap.get(record).properties[1].is_undefined();
-                if !unset {
+                // 27.5.1.5.1 step 2: the `[[AlreadyResolved]]` guard first, then
+                // the two stores, then `undefined` — so a second call throws
+                // *without* overwriting. The flag is a slot, not "are both
+                // halves still undefined", so `executor()` with no arguments
+                // still arms it.
+                if heap.get(record).properties[2].as_smi() == Some(1) {
                     let name = heap.intern_text("TypeError");
                     let message = heap.intern_text("capability executor called twice");
                     return Err(JsValue::object(heap.alloc(JsObject::error(name, message))));
                 }
+                heap.get_mut(record).properties[2] = JsValue::from_i32_smi(1).expect("Smi");
                 heap.get_mut(record).properties[0] =
                     args.first().copied().unwrap_or_else(JsValue::undefined);
                 heap.get_mut(record).properties[1] =
@@ -161,6 +167,16 @@ const CALLS_TWICE: &str = "(function Ctor(executor) { \
     return 'unreachable'; \
   })";
 
+/// `CALLS_TWICE` with its *first* call made with no arguments, so both halves of
+/// the record stay `undefined` and only `[[AlreadyResolved]]` can catch the
+/// second. This is what separates the current 27.5.1.5.1 step 2 from the older
+/// "are both halves still undefined" reading of it.
+const CALLS_TWICE_WITH_NO_ARGUMENTS: &str = "(function Ctor(executor) { \
+    executor(); \
+    executor(function () {}, function () {}); \
+    return 'unreachable'; \
+  })";
+
 /// `CALLS_ONCE` plus enough allocation after the executor call to make the
 /// collector reuse a freed slot.
 ///
@@ -247,21 +263,23 @@ fn a_constructor_that_never_calls_the_executor_throws_a_type_error() {
 
 #[test]
 fn a_constructor_that_calls_the_executor_twice_throws() {
-    // 27.5.1.5 step 3's guard, reached through the `Construct`: the second
+    // 27.5.1.5.1 step 2's guard, reached through the `Construct`: the second
     // call is the executor's own `TypeError`, and it propagates out of
     // `NewPromiseCapability` rather than being swallowed.
-    let mut heap = Heap::new(GcPolicy::NoGC);
-    let thrown = {
-        let mut interp = Interp::from_source(&mut heap, CALLS_TWICE).expect("compile");
-        interp.set_natives(Box::new(Seam));
-        interp.run().expect("run");
-        let ctor = interp.completion_value().expect("a completion value");
-        match interp.new_promise_capability(ctor) {
-            Ok(_) => panic!("the second executor call must throw"),
-            Err(JSException(thrown)) => thrown,
-        }
-    };
-    assert_eq!(error_name(&mut heap, thrown), "TypeError");
+    for source in [CALLS_TWICE, CALLS_TWICE_WITH_NO_ARGUMENTS] {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let thrown = {
+            let mut interp = Interp::from_source(&mut heap, source).expect("compile");
+            interp.set_natives(Box::new(Seam));
+            interp.run().expect("run");
+            let ctor = interp.completion_value().expect("a completion value");
+            match interp.new_promise_capability(ctor) {
+                Ok(_) => panic!("the second executor call must throw"),
+                Err(JSException(thrown)) => thrown,
+            }
+        };
+        assert_eq!(error_name(&mut heap, thrown), "TypeError");
+    }
 }
 
 #[test]

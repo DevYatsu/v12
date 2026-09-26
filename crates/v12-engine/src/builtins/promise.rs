@@ -64,6 +64,10 @@ use std::rc::Rc;
 
 use v12_heap::{Heap, JsObject, JsValue, Kind};
 use v12_native::Throw;
+use v12_native::promise_capability::{
+    CAPABILITY_USED, SLOT_ALREADY_RESOLVED, SLOT_REJECT as CAP_SLOT_REJECT,
+    SLOT_RESOLVE as CAP_SLOT_RESOLVE,
+};
 
 use super::ctx::Ctx;
 use crate::job_queue::{Job, JobCtx};
@@ -855,21 +859,29 @@ pub fn promise_capability(ctx: &mut Ctx, this: JsValue) -> Result<JsValue, Throw
     Ok(JsValue::object(carrier))
 }
 
-/// `NewPromiseCapability`'s `GetCapabilitiesExecutor` builtin (spec 27.5.1.5
-/// steps 3-4), for the seam where the record is filled in *by* the
+/// `NewPromiseCapability`'s `GetCapabilitiesExecutor` builtin (spec
+/// 27.5.1.5.1 steps 1-7), for the seam where the record is filled in *by* the
 /// constructor rather than handed to it ready-made.
 ///
 /// `state` is the `PromiseCapability Record` the interpreter allocated in step
-/// 2: a two-slot object whose `[[Resolve]]`/`[[Reject]]` start `undefined`. The
-/// returned function is `CreateBuiltinFunction(executorClosure, 2, "", «»)`:
+/// 2: a three-slot object whose `[[Resolve]]`/`[[Reject]]` start `undefined`
+/// and whose third slot is `[[AlreadyResolved]]`. The returned function is
+/// `CreateBuiltinFunction(executorClosure, 2, "", «»)`:
 /// `length: 2`, `name: ""`, `%Function.prototype%`, and no own `prototype`
 /// (which is what keeps it non-constructible).
 ///
-/// Called, it throws a `TypeError` if either slot is already set and otherwise
-/// records the two arguments and returns `undefined` — so the pair
+/// Called, it throws a `TypeError` if the record is already resolved and
+/// otherwise records the two arguments and returns `undefined` — so the pair
 /// `NewPromiseCapability` ends up with is exactly the pair the constructor's own
 /// code received. `Construct` itself is the interpreter's; a host closure runs
 /// synchronously inside it and needs no job.
+///
+/// The guard reads `[[AlreadyResolved]]` rather than "are both halves still
+/// `undefined`", which is the older text of the same step. The two differ for
+/// `executor()` — a first call with no arguments leaves both halves
+/// `undefined`, and under the older rule a second call would be accepted,
+/// recording over the first. `[[AlreadyResolved]]` is the current rule, and
+/// `built-ins/Promise/{all,race}/capability-executor-called-twice.js` pins it.
 pub(crate) fn capability_executor(ctx: &mut Ctx, state: JsValue) -> Result<JsValue, Throw> {
     let Some(record) = state.as_object() else {
         return Err(Throw::Message(
@@ -881,19 +893,18 @@ pub(crate) fn capability_executor(ctx: &mut Ctx, state: JsValue) -> Result<JsVal
     // the record is pinned for the rest of the run.
     ctx.heap.add_pinned_root(record);
     let executor = alloc_host(ctx.heap, move |heap, _this, args| {
-        let unset = heap.get(record).properties[0].is_undefined()
-            && heap.get(record).properties[1].is_undefined();
-        if !unset {
+        let used = heap.get(record).properties[SLOT_ALREADY_RESOLVED].as_smi();
+        if used == Some(CAPABILITY_USED) {
             return Err(v12_native::error_object(
                 heap,
                 "TypeError",
                 "capability resolve/reject functions already set",
             ));
         }
-        heap.get_mut(record).properties[0] =
-            args.first().copied().unwrap_or_else(JsValue::undefined);
-        heap.get_mut(record).properties[1] =
-            args.get(1).copied().unwrap_or_else(JsValue::undefined);
+        let obj = heap.get_mut(record);
+        obj.properties[SLOT_ALREADY_RESOLVED] = smi(CAPABILITY_USED);
+        obj.properties[CAP_SLOT_RESOLVE] = args.first().copied().unwrap_or_else(JsValue::undefined);
+        obj.properties[CAP_SLOT_REJECT] = args.get(1).copied().unwrap_or_else(JsValue::undefined);
         Ok(JsValue::undefined())
     });
     let func = executor.as_object().expect("alloc_host returns an object");
@@ -912,7 +923,10 @@ pub(crate) fn capability_pair(ctx: &mut Ctx, state: JsValue) -> Result<(JsValue,
         ));
     };
     let obj = ctx.heap.get(record);
-    Ok((obj.properties[0], obj.properties[1]))
+    Ok((
+        obj.properties[CAP_SLOT_RESOLVE],
+        obj.properties[CAP_SLOT_REJECT],
+    ))
 }
 
 /// [`capability_settle`] across the registry seam: the interpreter holds the
@@ -1159,27 +1173,29 @@ fn push_record(
 ///
 /// The combinator runs from both sides at once, so its state lives on the heap
 /// (slot names in [`v12_native::promise_combinator`]): the interpreter pulls
-/// iterator steps and invokes `C.resolve` and `then` — each needs the machine —
-/// while the aggregate promise, the results array and the reaction watchers
-/// live here. One element at a time, which is what lets an abrupt element
-/// settle the combinator instead of stalling on an unbounded iterator.
+/// iterator steps and invokes `promiseResolve` and `then` — each needs the
+/// machine — while the results array, the unsettled count and the reaction
+/// records live here. One element at a time, which is what lets an abrupt
+/// element settle the combinator instead of stalling on an unbounded iterator.
+///
+/// The aggregate promise is *not* one of the engine's: it is
+/// `promiseCapability.[[Promise]]`, the object `NewPromiseCapability(C)` had
+/// `C` construct, so a subclassed receiver gets its own promise back. Every
+/// settlement of it therefore goes through a `Call` of the capability's own
+/// `[[Resolve]]`/`[[Reject]]` — user code whenever `C` supplied its own — and
+/// that call is the interpreter's. What is left here is bookkeeping and the
+/// answer to "does this element settle the aggregate, and with what".
 pub mod combinator {
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
     use v12_heap::{Handle, Heap, JsObject, JsValue, Kind};
+    use v12_native::NativeId;
     use v12_native::Throw;
     use v12_native::promise_combinator::{
         KIND_ALL, KIND_RACE, SLOT_AGGREGATE, SLOT_KIND, SLOT_REJECT, SLOT_REMAINING, SLOT_RESULTS,
         STATE_SLOTS,
     };
 
-    use super::{
-        STATE_FULFILLED, STATE_PENDING, STATE_REJECTED, alloc_host, capability_settle,
-        create_promise, make_capability, settle_sync, shape_resolving_function, smi,
-    };
+    use super::{shape_resolving_function, smi};
     use crate::builtins::ctx::Ctx;
-    use crate::job_queue::Job;
 
     /// Reads slot `index` of a combinator state object.
     fn slot(heap: &Heap, state: Handle<JsObject>, index: i32) -> JsValue {
@@ -1213,28 +1229,35 @@ pub mod combinator {
         Ok((state, aggregate, kind))
     }
 
-    /// `combinator_begin`: the aggregate promise, its results array and the
-    /// capability reject function, in one state object the interpreter drives
+    /// `combinator_begin`: the results array, the unsettled count and the
+    /// capability's `[[Reject]]`, in one state object the interpreter drives
     /// element by element.
     ///
-    /// This is the allocating half of `NewPromiseCapability(C)` (spec
-    /// 27.2.4.1 step 6). Its `IsConstructor(C)` gate is applied by the caller
-    /// — `Interp::is_capability_constructor` — which owns the interpreter's
-    /// constructor oracle and runs it before `GetIterator`, so a
-    /// non-constructor receiver never reaches this function.
-    pub fn begin(ctx: &mut Ctx, this: JsValue, kind: i32) -> Result<JsValue, Throw> {
+    /// The aggregate promise is not allocated here. 27.5.4.1 step 6 is
+    /// `NewPromiseCapability(C)` — the spec's own constructor path, run by
+    /// `Interp::new_promise_capability` before it gets here — so `promise` is
+    /// the object `C` constructed and what script receives at step 13. That is
+    /// also why the two gates 27.5.1.5 enforces are the caller's: step 1
+    /// (`IsConstructor`) and steps 8-9 (`IsCallable` on both halves of the
+    /// record) run inside `new_promise_capability`, ahead of `GetIterator`, so
+    /// a non-constructor receiver never reaches this function.
+    pub fn begin(
+        ctx: &mut Ctx,
+        kind: i32,
+        promise: JsValue,
+        reject_v: JsValue,
+    ) -> Result<JsValue, Throw> {
         if kind != KIND_ALL && kind != KIND_RACE {
             return Err(Throw::Message(
                 "TypeError: unknown Promise combinator".into(),
             ));
         }
         let heap = &mut *ctx.heap;
-        let sink = ctx.pending.clone().unwrap_or_default();
-        // `this` is the receiver C: its `prototype` field hosts the aggregate's
-        // `[[Prototype]]`, exactly as the array handlers did.
-        let prototype = this.as_object().and_then(|ctor| heap.get(ctor).prototype);
-        let aggregate = create_promise(heap, prototype, STATE_PENDING, JsValue::undefined());
-        let (_, reject_v) = make_capability(heap, &sink, aggregate);
+        let Some(aggregate) = promise.as_object() else {
+            return Err(Throw::Message(
+                "TypeError: Promise combinator capability has no promise".into(),
+            ));
+        };
         // `KIND_RACE` never reads the results array, but keeping the layout
         // uniform means no slot is position-dependent.
         let results = heap.alloc(JsObject::array(Vec::new()));
@@ -1264,10 +1287,8 @@ pub mod combinator {
         Ok(JsValue::object(handle))
     }
 
-    /// One element of a combinator: records `value` at `index`, counts it
-    /// unsettled, and builds the `[resolveElement, rejectElement]` pair for it.
-    /// Returns that pair for the interpreter to hand to `then`, or `undefined`
-    /// when `then` is not callable and there is nothing to invoke.
+    /// One element of a combinator: counts it unsettled and builds the pair
+    /// `then` is invoked with — or reports that there is nothing to invoke.
     ///
     /// `then` is the element's *only* reaction path, exactly as the spec has
     /// it (27.2.4.1 step 11-b / 27.2.4.2 step 8-f). An earlier revision also
@@ -1278,29 +1299,35 @@ pub mod combinator {
     /// shifted (`built-ins/Promise/race/resolved-sequence*`). It also settled
     /// elements whose own `then` is a no-op, which the spec leaves pending.
     ///
-    /// The pair stays first-wins per element (`settled`) because that is what
-    /// `NewPromiseCapability`'s resolve/reject are: a `then` free to call both
-    /// halves must not decrement `SLOT_REMAINING` twice and fulfill the
-    /// aggregate with a hole in it.
+    /// The pair is the capability's own, never a fresh one:
+    ///
+    /// - `KIND_RACE` builds none (27.2.4.2 step 8-f):
+    ///   `[promiseCapability.[[Resolve]], promiseCapability.[[Reject]]]`
+    ///   verbatim, so a race element is settled by exactly the functions the
+    ///   receiver's constructor handed to its executor.
+    /// - `KIND_ALL` builds only the fulfilled half (27.2.4.1 step 11-b):
+    ///   `[onFulfilledElement, promiseCapability.[[Reject]]]`. The reject half
+    ///   needed no per-element wrapper either, so an element rejection
+    ///   rejects the aggregate directly.
+    ///
+    /// First-wins per element is now the capability's own business — the
+    /// aggregate's resolving functions ignore a second settlement — so a `then`
+    /// free to call both halves can no longer decrement `SLOT_REMAINING` twice
+    /// and fulfill the aggregate with a hole in it: it is already rejected by
+    /// then, and its `[[Resolve]]` is a no-op.
     pub fn step(
         ctx: &mut Ctx,
         state_v: JsValue,
         index: u32,
         value: JsValue,
         then_v: JsValue,
+        resolve_v: JsValue,
     ) -> Result<JsValue, Throw> {
-        let (state, aggregate, kind) = parts(ctx.heap, state_v)?;
-        let sink = ctx.pending.clone().unwrap_or_default();
+        let (state, _aggregate, kind) = parts(ctx.heap, state_v)?;
         let callable = then_v
             .as_object()
             .is_some_and(|f| matches!(ctx.heap.get(f).kind, Kind::Function | Kind::Proxy));
         if kind == KIND_ALL {
-            // The slot starts out holding the value itself, which is what it
-            // resolves to when `then` is not callable (spec: "Set result[index]
-            // to nextPromise").
-            if let Some(results) = slot(ctx.heap, state, SLOT_RESULTS).as_object() {
-                set_result(ctx.heap, results, index, value);
-            }
             let remaining = slot(ctx.heap, state, SLOT_REMAINING)
                 .as_smi()
                 .unwrap_or(0)
@@ -1308,69 +1335,117 @@ pub mod combinator {
             ctx.heap.get_mut(state).properties[SLOT_REMAINING as usize] = smi(remaining);
         }
         if !callable {
-            if kind == KIND_ALL {
-                drop_unsettled(ctx.heap, &sink, state);
-            } else {
-                // `KIND_RACE` with a non-callable `then`: the value itself
-                // settles the combinator, first one wins.
-                settle_sync(ctx.heap, &sink, aggregate, STATE_FULFILLED, value);
-            }
-            return Ok(JsValue::undefined());
+            // `IsCallable(then) is false` (27.2.4.1 step 11-c / 27.2.4.2
+            // step 8-e): the spec hands the element's own handlers to
+            // `promiseResolve` rather than invoking anything, and the
+            // bookkeeping is the interpreter's — through `element_settled`,
+            // which is where the results write and the count live now.
+            return Ok(settle_now(ctx, value));
         }
-        let settled = Rc::new(Cell::new(false));
-        let (resolve_v, reject_v) = match kind {
-            KIND_ALL => all_element(ctx, state, index, &settled, &sink),
-            _ => race_element(ctx, state, &settled, &sink),
+        let reject_v = slot(ctx.heap, state, SLOT_REJECT);
+        let on_fulfilled = match kind {
+            KIND_ALL => all_on_fulfilled(ctx, state, index, resolve_v),
+            _ => resolve_v,
         };
-        // 27.5.4.1/27.5.4.5 build the per-element pair with
-        // `CreateResolvingFunction` too, and hand it to a user-visible `then`,
-        // so it carries the same spec shape as an executor's capability.
-        shape_pair(ctx, resolve_v, reject_v);
-        let pair = ctx.heap.alloc(JsObject::array(vec![resolve_v, reject_v]));
+        let pair = ctx
+            .heap
+            .alloc(JsObject::array(vec![on_fulfilled, reject_v]));
         ctx.heap.add_pinned_root(pair);
         Ok(JsValue::object(pair))
     }
 
-    /// Stamps the 27.5.1.3 resolving-function shape on a combinator
-    /// `[resolveElement, rejectElement]` pair.
-    fn shape_pair(ctx: &mut Ctx, resolve: JsValue, reject: JsValue) {
-        for half in [resolve, reject] {
-            let obj = half.as_object().expect("alloc_host returns a function");
-            shape_resolving_function(ctx, obj);
-        }
+    /// The one-element carrier: "there is no `then` to invoke — settle this
+    /// element yourself, through `element_settled`, with this value".
+    fn settle_now(ctx: &mut Ctx, value: JsValue) -> JsValue {
+        let carrier = ctx.heap.alloc(JsObject::array(vec![value]));
+        ctx.heap.add_pinned_root(carrier);
+        JsValue::object(carrier)
     }
 
-    /// `combinator_settle`: `KIND_ALL` exhaustion fulfills the aggregate with
-    /// the results array once every element has settled; the abrupt path
-    /// rejects it with `reason`. Returns the aggregate promise — what the
-    /// caller hands back to script.
+    /// `PerformPromiseAll`'s `onFulfilledElement` (spec 27.5.4.1.1 step 4), the
+    /// one per-element handler the capability rewiring leaves in place.
+    ///
+    /// It is not a host closure, because its last step is
+    /// `Perform ? Call(resultCapability.[[Resolve]], undefined, « valuesArray
+    /// »)` and for a subclassed receiver that is user code — which a `&mut
+    /// Heap` closure cannot reach. So the function object is an
+    /// interpreter-intercepted native ([`NativeId::PromiseCombinatorElement`])
+    /// carrying its element record in `elements`
+    /// ([`v12_native::promise_combinator::element`]), and the `Call` is the
+    /// interpreter's.
+    ///
+    /// Spec shape: a `CreateBuiltinFunction` of arity 1, so it carries
+    /// `length: 1`, `name: ""` and `%Function.prototype%` like any other
+    /// resolving function.
+    fn all_on_fulfilled(
+        ctx: &mut Ctx,
+        state: Handle<JsObject>,
+        index: u32,
+        resolve_v: JsValue,
+    ) -> JsValue {
+        // The spec's `alreadyResolved[index]`, as a one-slot object: the flag
+        // has to outlive the call that set it, and a `Vec` element cannot.
+        let already = ctx.heap.alloc(JsObject::ordinary(
+            smallvec::smallvec![JsValue::from_bool(false)],
+            smallvec::smallvec![None],
+        ));
+        let func = ctx.heap.alloc(JsObject::function(
+            v12_heap::FunctionTarget::Bytecode(NativeId::PromiseCombinatorElement.into()),
+            None,
+        ));
+        // Rooted like every other combinator object: the only reference the
+        // reaction record holds is the handler, and the element record — the
+        // state object and the flag included — rides this one.
+        ctx.heap.add_pinned_root(func);
+        ctx.heap.get_mut(func).elements = vec![
+            JsValue::object(state),
+            smi(index as i32),
+            resolve_v,
+            JsValue::object(already),
+        ];
+        shape_resolving_function(ctx, func);
+        JsValue::object(func)
+    }
+
+    /// `combinator_element_settled`: `KIND_ALL`'s element bookkeeping — the
+    /// outcome at `index`, the unsettled count, and (for the last outstanding
+    /// element) the values array the aggregate's `[[Resolve]]` has to be called
+    /// with.
+    ///
+    /// `KIND_RACE` installs no per-element handler, so the only way here is the
+    /// non-callable-`then` path, where the value itself is what the aggregate
+    /// settles with.
+    pub fn element_settled(
+        ctx: &mut Ctx,
+        state_v: JsValue,
+        index: u32,
+        _fulfilled: bool,
+        value: JsValue,
+    ) -> Result<Option<JsValue>, Throw> {
+        let (state, _aggregate, kind) = parts(ctx.heap, state_v)?;
+        if kind != KIND_ALL {
+            return Ok(Some(value));
+        }
+        if let Some(results) = slot(ctx.heap, state, SLOT_RESULTS).as_object() {
+            set_result(ctx.heap, results, index, value);
+        }
+        Ok(drop_unsettled(ctx.heap, state))
+    }
+
+    /// `combinator_settle`: exhaustion hands back the values array when nothing
+    /// is still outstanding. Everything else is the interpreter's `Call` of the
+    /// capability's own functions — the abrupt path rejects through
+    /// `promiseCapability.[[Reject]]`, which may be user code — and `KIND_RACE`
+    /// at exhaustion is a no-op on the aggregate (27.2.4.2 step 8-f returns the
+    /// capability promise unchanged).
     pub fn settle(
         ctx: &mut Ctx,
         state_v: JsValue,
-        rejecting: bool,
-        reason: JsValue,
-    ) -> Result<JsValue, Throw> {
-        let (state, aggregate, kind) = parts(ctx.heap, state_v)?;
-        let sink = ctx.pending.clone().unwrap_or_default();
-        if rejecting {
-            // Through the state's own capability reject, so the reaction jobs it
-            // schedules come from the same path an executor's reject takes. The
-            // resolve half is never read on this path (a rejection adopts
-            // nothing), so `undefined` stands in for it.
-            let reject_v = slot(ctx.heap, state, SLOT_REJECT);
-            let _ = capability_settle(
-                ctx.heap,
-                &sink,
-                aggregate,
-                JsValue::undefined(),
-                reject_v,
-                reason,
-                true,
-            );
-        } else if kind == KIND_ALL {
-            // Exhaustion: fulfill if nothing is still unsettled. Elements that
-            // settle later fulfill it from their own closure.
-            drop_unsettled(ctx.heap, &sink, state);
+        exhausted: bool,
+    ) -> Result<Option<JsValue>, Throw> {
+        let (state, _aggregate, kind) = parts(ctx.heap, state_v)?;
+        if exhausted && kind == KIND_ALL {
+            return Ok(drop_unsettled(ctx.heap, state));
         }
         // `KIND_RACE` on exhaustion: the spec returns the capability promise
         // as it stands (27.2.4.2 step 8-f) — a still-pending race stays
@@ -1380,7 +1455,7 @@ pub mod combinator {
         // array, which is how `Promise.race([settledPromise])` used to resolve
         // to `[]` before its first element's reaction job ran and lose every
         // ordering race that followed.
-        Ok(JsValue::object(aggregate))
+        Ok(None)
     }
 
     /// Stores one result at `index`, keeping the array's `length` current.
@@ -1398,101 +1473,21 @@ pub mod combinator {
         }
     }
 
-    /// `KIND_ALL`'s per-element pair: store the value at `index`, then drop the
-    /// element off the unsettled count. The last one fulfills the aggregate
-    /// with the results array.
-    fn all_element(
-        ctx: &mut Ctx,
-        state: Handle<JsObject>,
-        index: u32,
-        settled: &Rc<Cell<bool>>,
-        sink: &Rc<RefCell<Vec<Job>>>,
-    ) -> (JsValue, JsValue) {
-        let resolve_sink = Rc::clone(sink);
-        let resolve_flag = Rc::clone(settled);
-        let resolve = alloc_host(ctx.heap, move |heap, _this, args| {
-            if resolve_flag.get() {
-                return Ok(JsValue::undefined());
-            }
-            resolve_flag.set(true);
-            let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-            if let Some(results) = slot(heap, state, SLOT_RESULTS).as_object() {
-                set_result(heap, results, index, value);
-            }
-            drop_unsettled(heap, &resolve_sink, state);
-            Ok(JsValue::undefined())
-        });
-        let reject_sink = Rc::clone(sink);
-        let reject_flag = Rc::clone(settled);
-        let reject = alloc_host(ctx.heap, move |heap, _this, args| {
-            if reject_flag.get() {
-                return Ok(JsValue::undefined());
-            }
-            reject_flag.set(true);
-            // An element rejection rejects the aggregate; `settle_sync` is
-            // first-wins, so a later element cannot revive it. The unsettled
-            // count is left alone — the aggregate will never fulfill now.
-            let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
-            if let Some(aggregate) = slot(heap, state, SLOT_AGGREGATE).as_object() {
-                settle_sync(heap, &reject_sink, aggregate, STATE_REJECTED, reason);
-            }
-            Ok(JsValue::undefined())
-        });
-        (resolve, reject)
-    }
-
-    /// `KIND_RACE`'s per-element pair: the first callback wins.
-    fn race_element(
-        ctx: &mut Ctx,
-        state: Handle<JsObject>,
-        settled: &Rc<Cell<bool>>,
-        sink: &Rc<RefCell<Vec<Job>>>,
-    ) -> (JsValue, JsValue) {
-        let resolve_sink = Rc::clone(sink);
-        let resolve_flag = Rc::clone(settled);
-        let resolve = alloc_host(ctx.heap, move |heap, _this, args| {
-            if resolve_flag.get() {
-                return Ok(JsValue::undefined());
-            }
-            resolve_flag.set(true);
-            let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-            if let Some(aggregate) = slot(heap, state, SLOT_AGGREGATE).as_object() {
-                settle_sync(heap, &resolve_sink, aggregate, STATE_FULFILLED, value);
-            }
-            Ok(JsValue::undefined())
-        });
-        let reject_sink = Rc::clone(sink);
-        let reject_flag = Rc::clone(settled);
-        let reject = alloc_host(ctx.heap, move |heap, _this, args| {
-            if reject_flag.get() {
-                return Ok(JsValue::undefined());
-            }
-            reject_flag.set(true);
-            let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
-            if let Some(aggregate) = slot(heap, state, SLOT_AGGREGATE).as_object() {
-                settle_sync(heap, &reject_sink, aggregate, STATE_REJECTED, reason);
-            }
-            Ok(JsValue::undefined())
-        });
-        (resolve, reject)
-    }
-
-    /// Drops one element off `SLOT_REMAINING` and fulfills the aggregate with
-    /// the results array when the count reaches zero. No-op afterwards: once
-    /// the aggregate has settled, `settle_sync` refuses.
-    fn drop_unsettled(heap: &mut Heap, sink: &Rc<RefCell<Vec<Job>>>, state: Handle<JsObject>) {
+    /// Drops one element off `SLOT_REMAINING` and hands back the results array
+    /// when the count reaches zero, which is the one thing left for the
+    /// interpreter to do: `Call(capability.[[Resolve]], undefined, « results
+    /// »)`. A later element cannot fulfill twice — the aggregate's resolving
+    /// functions are first-wins.
+    fn drop_unsettled(heap: &mut Heap, state: Handle<JsObject>) -> Option<JsValue> {
         let remaining = slot(heap, state, SLOT_REMAINING)
             .as_smi()
             .unwrap_or(1)
             .saturating_sub(1);
         heap.get_mut(state).properties[SLOT_REMAINING as usize] = smi(remaining);
         if remaining > 0 {
-            return;
+            return None;
         }
-        if let Some(aggregate) = slot(heap, state, SLOT_AGGREGATE).as_object() {
-            let results = slot(heap, state, SLOT_RESULTS);
-            settle_sync(heap, sink, aggregate, STATE_FULFILLED, results);
-        }
+        Some(slot(heap, state, SLOT_RESULTS))
     }
 }
 

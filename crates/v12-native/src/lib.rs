@@ -23,6 +23,7 @@ mod methods;
 mod registry;
 mod throw;
 
+pub mod promise_capability;
 pub mod promise_combinator;
 
 pub use convert::DecodeError;

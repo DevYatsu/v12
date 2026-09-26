@@ -164,7 +164,7 @@ pub trait NativeRegistry {
     /// 27.2.4.1 / 27.2.4.2, `PerformPromiseAll` / `PerformPromiseRace`).
     ///
     /// The combinator runs from both sides at once: the interpreter pulls
-    /// iterator steps and invokes `C.resolve` and `then` (each needs the
+    /// iterator steps and invokes `promiseResolve` and `then` (each needs the
     /// machine), while the engine owns the aggregate promise, the results
     /// array and the reaction watchers (jobs live there). So the three calls
     /// below carry a state object between them — see
@@ -172,30 +172,41 @@ pub trait NativeRegistry {
     /// them one element at a time, which is what lets an abrupt element settle
     /// the combinator instead of stalling on an unbounded iterator.
     ///
+    /// The aggregate promise is *not* allocated here: it is
+    /// `promiseCapability.[[Promise]]`, the object `NewPromiseCapability(C)`
+    /// had `C` construct, which is why `promise` and `reject` are parameters.
+    ///
     /// The default implementation refuses: a registry that does not
     /// implement it has no promise combinators.
     fn combinator_begin(
         &mut self,
         _heap: &mut Heap,
-        _this: JsValue,
         _kind: i32,
+        _promise: JsValue,
+        _reject: JsValue,
     ) -> Result<JsValue, Throw> {
         Err(Throw::Message(
             "TypeError: Promise combinators are not supported".into(),
         ))
     }
 
-    /// One element of a combinator: records `value` at `index` in the results
-    /// array (`KIND_ALL`) or notes it (`KIND_RACE`), builds the
-    /// `[resolveElement, rejectElement]` capability pair for it, and installs
-    /// the reaction watcher for a pending promise input. Returns that pair for
-    /// the interpreter to hand to a callable `then`, or `undefined` when
-    /// `then_v` is not callable and there is nothing to invoke.
+    /// One element of a combinator: counts it unsettled, then hands back either
+    /// the `[onFulfilled, onRejected]` pair for a callable `then` or, when
+    /// `then_v` is not callable, a one-element carrier naming the value the
+    /// element settles with ([`crate::promise_combinator::carrier`]).
     ///
     /// `then_v` is the value the interpreter already read off the element (the
     /// read needs the machine: a getter or a proxy `get` trap can run user
     /// code), so the engine decides callability and no side effect is observed
     /// twice.
+    ///
+    /// `resolve_v` is `promiseCapability.[[Resolve]]`. For `KIND_RACE` the
+    /// spec builds no per-element pair at all (27.5.4.5.1 step 8-e hands the
+    /// capability's own functions to `then` verbatim), so the pair this
+    /// returns is that pair. For `KIND_ALL` the pair is
+    /// `[onFulfilledElement, promiseCapability.[[Reject]]]` (27.5.4.1 step
+    /// 6-m-i), where `onFulfilledElement` is an interpreter-intercepted native
+    /// carrying this state object.
     fn combinator_step(
         &mut self,
         _heap: &mut Heap,
@@ -203,21 +214,55 @@ pub trait NativeRegistry {
         _index: u32,
         _value: JsValue,
         _then_v: JsValue,
+        _resolve_v: JsValue,
     ) -> Result<JsValue, Throw> {
         Err(Throw::Message(
             "TypeError: Promise combinators are not supported".into(),
         ))
     }
 
-    /// Exhaustion, or the abrupt path: fulfills the aggregate with the results
-    /// array, or rejects it with `reason`.
+    /// `PerformPromiseAll` / `PerformPromiseAllSettled` element bookkeeping:
+    /// records the element's outcome and takes it off the unsettled count,
+    /// atomically.
+    ///
+    /// Returns the value the aggregate's `[[Resolve]]` must be *called* with
+    /// when this element settled it — the results array for the last
+    /// outstanding `KIND_ALL` element, and the element's own value for
+    /// `KIND_RACE` — or `None` when the aggregate stays pending. The call
+    /// itself is the interpreter's, because `[[Resolve]]` is user code for a
+    /// subclassed receiver.
+    ///
+    /// `fulfilled` selects which result entry the outcome belongs to. For
+    /// `KIND_ALL` the pair's reject half is `promiseCapability.[[Reject]]`
+    /// verbatim, so only the fulfilled half reaches this seam; the flag is
+    /// carried for `allSettled`, whose pair records both outcomes here.
+    fn combinator_element_settled(
+        &mut self,
+        _heap: &mut Heap,
+        _state: JsValue,
+        _index: u32,
+        _fulfilled: bool,
+        _value: JsValue,
+    ) -> Result<Option<JsValue>, Throw> {
+        Err(Throw::Message(
+            "TypeError: Promise combinators are not supported".into(),
+        ))
+    }
+
+    /// Exhaustion (`exhausted` is true) or an abrupt element/iterator
+    /// completion: returns the value the aggregate's `[[Resolve]]` must be
+    /// called with, if any.
+    ///
+    /// The abrupt path is *not* settled here — it is the interpreter's
+    /// `Call(promiseCapability.[[Reject]], undefined, « reason »)`, which may
+    /// be user code — and neither is `KIND_RACE` at exhaustion, whose spec
+    /// loop returns the capability promise as it stands.
     fn combinator_settle(
         &mut self,
         _heap: &mut Heap,
         _state: JsValue,
-        _rejecting: bool,
-        _reason: JsValue,
-    ) -> Result<JsValue, Throw> {
+        _exhausted: bool,
+    ) -> Result<Option<JsValue>, Throw> {
         Err(Throw::Message(
             "TypeError: Promise combinators are not supported".into(),
         ))
