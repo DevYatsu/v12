@@ -1989,6 +1989,43 @@ impl Interp<'_> {
         }
     }
 
+    /// `IsConstructor(C)` for `NewPromiseCapability` (spec 27.2.4.1 step 6 /
+    /// 27.2.4.2 step 3), which is what makes `Promise.all.call(eval, …)`
+    /// throw a `TypeError` before the iterator is touched.
+    ///
+    /// [`Self::is_constructor_object`] answers for program functions and the
+    /// constructible engine natives, but the `Promise` constructor itself is
+    /// wired as an out-of-range bytecode index
+    /// ([`NativeId::PromiseConstruct`]) that the `new` path routes through the
+    /// registry — so it *is* a constructor even though that predicate does not
+    /// list it. Naming it here keeps the combinator check honest without
+    /// widening the shared oracle, which `Reflect.construct` also reads and
+    /// which still rejects it. A proxy in front of the constructor inherits the
+    /// answer, per `IsConstructor` on a proxy exotic object.
+    fn is_capability_constructor(&mut self, v: JsValue) -> bool {
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        if self.heap.get(obj).kind == Kind::Proxy {
+            // A proxy with no target is not constructible; a revocable one
+            // answers false, which `is_constructor_object` also does.
+            return match self.heap.get(obj).proxy_target {
+                Some(target) => self.is_capability_constructor(JsValue::object(target)),
+                None => false,
+            };
+        }
+        if self.heap.get(obj).kind == Kind::Function
+            && matches!(
+                self.heap.get(obj).callable,
+                v12_heap::FunctionTarget::Bytecode(idx)
+                    if idx == u32::from(NativeId::PromiseConstruct)
+            )
+        {
+            return true;
+        }
+        self.is_constructor_object(obj)
+    }
+
     /// True when a bytecode-table index names one of the engine's
     /// constructor-shaped natives (`new Object/Array/Boolean/Error/…`).
     fn native_constructor_id(&self, idx: u32) -> bool {
@@ -2880,6 +2917,20 @@ impl Interp<'_> {
             KIND_RACE
         };
         let base = self.stack.len();
+        // Spec 27.2.4.1 step 6 / 27.2.4.2 step 3:
+        // `promiseCapability = NewPromiseCapability(C)`, whose first act is
+        // `If IsConstructor(C) is false, throw a TypeError` — so
+        // `Promise.all.call(eval, …)` throws before a single iterator step.
+        // The check lives here rather than inside `combinator_begin` because
+        // `IsConstructor` is an interpreter-owned oracle (a bytecode function
+        // that is not an arrow, a bound function of one, or a constructible
+        // engine native); the engine half only allocates the capability.
+        if !self.is_capability_constructor(this_v) {
+            self.stack.truncate(base);
+            return Err(JSException(self.error_value(
+                "TypeError: Promise combinator called on a non-constructor",
+            )));
+        }
         let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
         let state = match self.combinator_begin(this_v, kind) {
             Ok(state) => state,

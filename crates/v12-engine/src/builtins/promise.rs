@@ -877,7 +877,7 @@ pub mod combinator {
 
     use super::{
         STATE_FULFILLED, STATE_PENDING, STATE_REJECTED, alloc_host, capability_settle,
-        create_promise, is_promise, make_capability, push_record, settle_sync, smi,
+        create_promise, make_capability, settle_sync, smi,
     };
     use crate::builtins::ctx::Ctx;
     use crate::job_queue::Job;
@@ -917,6 +917,12 @@ pub mod combinator {
     /// `combinator_begin`: the aggregate promise, its results array and the
     /// capability reject function, in one state object the interpreter drives
     /// element by element.
+    ///
+    /// This is the allocating half of `NewPromiseCapability(C)` (spec
+    /// 27.2.4.1 step 6). Its `IsConstructor(C)` gate is applied by the caller
+    /// — `Interp::is_capability_constructor` — which owns the interpreter's
+    /// constructor oracle and runs it before `GetIterator`, so a
+    /// non-constructor receiver never reaches this function.
     pub fn begin(ctx: &mut Ctx, this: JsValue, kind: i32) -> Result<JsValue, Throw> {
         if kind != KIND_ALL && kind != KIND_RACE {
             return Err(Throw::Message(
@@ -949,6 +955,10 @@ pub mod combinator {
         // pulled element has settled *and* exhaustion has been recorded — the
         // element count is not known up front, so the token is what keeps a
         // first element from fulfilling the aggregate mid-iteration.
+        //
+        // `KIND_RACE` never moves the count: its spec loop settles the
+        // aggregate on the first element and returns the capability promise
+        // unchanged at exhaustion (27.2.4.2 step 8-f), so nothing reads it.
         state.properties[SLOT_REMAINING as usize] = smi(1);
         let handle = heap.alloc(state);
         heap.add_root(JsValue::object(handle));
@@ -956,15 +966,23 @@ pub mod combinator {
     }
 
     /// One element of a combinator: records `value` at `index`, counts it
-    /// unsettled, builds the `[resolveElement, rejectElement]` pair for it and
-    /// installs the reaction watcher for a pending promise input. Returns that
-    /// pair for the interpreter to hand to `then`, or `undefined` when `then`
-    /// is not callable and there is nothing to invoke.
+    /// unsettled, and builds the `[resolveElement, rejectElement]` pair for it.
+    /// Returns that pair for the interpreter to hand to `then`, or `undefined`
+    /// when `then` is not callable and there is nothing to invoke.
     ///
-    /// The pair is first-wins per element (`settled`), because one input can be
-    /// watched twice over: the pushed reaction record *and* the `then` the
-    /// interpreter invokes. Without the flag a second call would decrement
-    /// `SLOT_REMAINING` twice and fulfill the aggregate with a hole in it.
+    /// `then` is the element's *only* reaction path, exactly as the spec has
+    /// it (27.2.4.1 step 11-b / 27.2.4.2 step 8-f). An earlier revision also
+    /// appended an engine watcher record here, which double-registered every
+    /// promise element: the pair then fired from a record the spec never
+    /// installs, so an already-settled input settled the aggregate a job
+    /// earlier than `then` alone and the whole tail of the microtask sequence
+    /// shifted (`built-ins/Promise/race/resolved-sequence*`). It also settled
+    /// elements whose own `then` is a no-op, which the spec leaves pending.
+    ///
+    /// The pair stays first-wins per element (`settled`) because that is what
+    /// `NewPromiseCapability`'s resolve/reject are: a `then` free to call both
+    /// halves must not decrement `SLOT_REMAINING` twice and fulfill the
+    /// aggregate with a hole in it.
     pub fn step(
         ctx: &mut Ctx,
         state_v: JsValue,
@@ -1005,30 +1023,22 @@ pub mod combinator {
             KIND_ALL => all_element(ctx, state, index, &settled, &sink),
             _ => race_element(ctx, state, &settled, &sink),
         };
-        // Pending engine promise input: watch it with the same host-closure
-        // reaction record the array handlers used, so its settlement routes
-        // into this element even if the `then` below never fires.
-        if is_promise(ctx.heap, value)
-            && let Some(input) = value.as_object()
-        {
-            push_record(ctx.heap, input, resolve_v, reject_v);
-        }
         let pair = ctx.heap.alloc(JsObject::array(vec![resolve_v, reject_v]));
         ctx.heap.add_root(JsValue::object(pair));
         Ok(JsValue::object(pair))
     }
 
-    /// `combinator_settle`: exhaustion fulfills the aggregate with the results
-    /// array (once every element has settled); the abrupt path rejects it with
-    /// `reason`. Returns the aggregate promise — what the caller hands back to
-    /// script.
+    /// `combinator_settle`: `KIND_ALL` exhaustion fulfills the aggregate with
+    /// the results array once every element has settled; the abrupt path
+    /// rejects it with `reason`. Returns the aggregate promise — what the
+    /// caller hands back to script.
     pub fn settle(
         ctx: &mut Ctx,
         state_v: JsValue,
         rejecting: bool,
         reason: JsValue,
     ) -> Result<JsValue, Throw> {
-        let (state, aggregate, _) = parts(ctx.heap, state_v)?;
+        let (state, aggregate, kind) = parts(ctx.heap, state_v)?;
         let sink = ctx.pending.clone().unwrap_or_default();
         if rejecting {
             // Through the state's own capability reject, so the reaction jobs it
@@ -1045,11 +1055,19 @@ pub mod combinator {
                 reason,
                 true,
             );
-        } else {
+        } else if kind == KIND_ALL {
             // Exhaustion: fulfill if nothing is still unsettled. Elements that
             // settle later fulfill it from their own closure.
             drop_unsettled(ctx.heap, &sink, state);
         }
+        // `KIND_RACE` on exhaustion: the spec returns the capability promise
+        // as it stands (27.2.4.2 step 8-f) — a still-pending race stays
+        // pending until an element settles, and an already-settled one keeps
+        // the winner `then` gave it. Dropping the unsettled count here would
+        // instead fulfill the aggregate with the (never written) results
+        // array, which is how `Promise.race([settledPromise])` used to resolve
+        // to `[]` before its first element's reaction job ran and lose every
+        // ordering race that followed.
         Ok(JsValue::object(aggregate))
     }
 

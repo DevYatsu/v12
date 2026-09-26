@@ -44,6 +44,9 @@ pub const SLOT_RESULTS: i32 = 3;
 /// `KIND_ALL` only: how many elements are still unsettled, counting one extra
 /// for "the iterator has not been exhausted yet" (see `combinator::begin`).
 /// The aggregate fulfills with the results array when the count reaches zero.
+/// `KIND_RACE` leaves it at the exhaustion token forever — the race settles
+/// on its first element and its spec loop returns the capability promise
+/// unchanged.
 pub const SLOT_REMAINING: i32 = 4;
 /// The number of populated slots.
 pub const STATE_SLOTS: usize = 5;

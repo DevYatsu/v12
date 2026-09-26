@@ -192,6 +192,92 @@ fn combinators_reject_non_iterable_and_bad_iterators() {
 }
 
 #[test]
+fn combinators_reject_a_non_constructor_receiver_before_touching_the_iterator() {
+    // Spec 27.2.4.1 step 6 / 27.2.4.2 step 3: `NewPromiseCapability(C)` opens
+    // with `If IsConstructor(C) is false, throw a TypeError`, so the throw
+    // happens *before* `GetIterator` — the `next`/`return` counters below stay
+    // at zero. Pinned by `Promise/{all,race}/ctx-non-ctor.js`.
+    assert_eq!(
+        display(
+            "let pulled = 0; let closed = 0; \
+             let iterable = { [Symbol.iterator]: function () { return { \
+               next: function () { pulled++; return { done: false, value: 1 }; }, \
+               return: function () { closed++; return {}; } }; } }; \
+             let thrown = []; \
+             for (let C of [eval, {}, 42, 'str', null]) { \
+               try { Promise.all.call(C, iterable); } catch (e) { thrown.push(e instanceof TypeError); } \
+               try { Promise.race.call(C, iterable); } catch (e) { thrown.push(e instanceof TypeError); } \
+             } \
+             if (!thrown.every(function (t) { return t; })) { throw new Error('non-TypeError: ' + thrown); } \
+             if (pulled !== 0 || closed !== 0) { throw new Error('iterator touched: ' + pulled + '/' + closed); } \
+             throw new TypeError('done');",
+        ),
+        "TypeError: done"
+    );
+}
+
+#[test]
+fn combinators_accept_constructor_receivers() {
+    // The other half of the same gate: a real constructor must keep working —
+    // the `Promise` constructor itself, a subclass, a plain function, a class,
+    // and a proxy over one. Each carries the `resolve` that
+    // `PerformPromiseAll` step 6 calls, and each fulfills with the results
+    // array (or the race winner), so this also pins that the gate did not
+    // start rejecting ordinary receivers.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             class Sub extends Promise {} \
+             function Fn() {} \
+             Fn.resolve = function (v) { return Promise.resolve(v); }; \
+             class Cls {} \
+             Cls.resolve = Fn.resolve; \
+             function one() { return { [Symbol.iterator]: function () { let n = 0; return { \
+               next: function () { n++; return n > 1 ? { done: true } : { done: false, value: 'v' }; }, \
+               return: function () { return {}; } }; } }; } \
+             let seen = []; \
+             let collect = function (p, tag) { p.then( \
+               function (v) { seen.push(tag + '=' + (Array.isArray(v) ? v.join('-') : String(v))); }, \
+               function (e) { seen.push(tag + '!rej:' + e); }); }; \
+             collect(Promise.all.call(Promise, one()), 'Promise'); \
+             collect(Promise.all.call(Sub, one()), 'Sub'); \
+             collect(Promise.all.call(Fn, one()), 'Fn'); \
+             collect(Promise.all.call(Cls, one()), 'Cls'); \
+             collect(Promise.all.call(new Proxy(Promise, {}), one()), 'Proxy'); \
+             collect(Promise.race.call(Sub, one()), 'race'); \
+             Promise.resolve().then(function () { globalThis.__out = seen.join('|'); });",
+            "globalThis.__out"
+        ),
+        "Promise=v|Sub=v|Fn=v|Cls=v|Proxy=v|race=v"
+    );
+}
+
+#[test]
+fn race_settles_with_the_first_element_in_reaction_order() {
+    // `Promise.race([settled])` used to fulfill with the (never written)
+    // results array the moment the iterator ran out, so the winner lost every
+    // microtask race that the spec orders after the `then` invocation
+    // (27.2.4.2 step 8-f returns the capability promise unchanged). The order
+    // below is the spec's: the `then` reaction on the already-fulfilled input
+    // runs first, and only then the handler the race result's own `then`
+    // registered.
+    let source = concat!(
+        "globalThis.__out = 'unset'; let sequence = [];",
+        "let a = Promise.resolve('a');",
+        "let race = Promise.race([a]);",
+        "race.then(function (winner) { sequence.push('handler:' + winner); });",
+        "a.then(function () { sequence.push('input'); });",
+        "Promise.resolve().then(function () { sequence.push('tick'); });",
+        "Promise.resolve().then(function () { sequence.push('tick2'); })",
+        ".then(function () { globalThis.__out = sequence.join(','); });",
+    );
+    assert_eq!(
+        settled(source, "globalThis.__out"),
+        "input,tick,tick2,handler:a"
+    );
+}
+
+#[test]
 fn a_throwing_done_or_value_getter_rejects_without_closing() {
     // Both reads are part of IteratorStepValue, so they reject in place and
     // `return` is never reached.
