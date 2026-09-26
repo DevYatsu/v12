@@ -343,6 +343,7 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::PromiseAll => Some(1),
         NativeId::PromiseRace => Some(1),
         NativeId::PromiseAllSettled => Some(1),
+        NativeId::PromiseAny => Some(1),
         NativeId::PromiseWithResolvers => Some(0),
         NativeId::PromiseTry => Some(1),
         NativeId::PromiseResolve => Some(1),

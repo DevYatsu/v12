@@ -29,6 +29,19 @@ struct Capability {
     reject: JsValue,
 }
 
+/// Which half of a combinator's terminal step the value the engine seam handed
+/// back belongs to. Every kind is [`Payoff::Fulfils`] except `KIND_ANY`, whose
+/// payoff is the `errors` array an `AggregateError` is built from — so the
+/// polarity is carried alongside the value rather than re-derived from the
+/// value at each of the two call sites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Payoff {
+    /// `Call(capability.[[Resolve]], undefined, « value »)`.
+    Fulfils,
+    /// `Call(capability.[[Reject]], undefined, « AggregateError(value) »)`.
+    Rejects,
+}
+
 /// Resolves `[callee][this][args…]` at `callee_reg` in the current frame
 /// and either pushes a bytecode frame or completes a native inline.
 impl Interp<'_> {
@@ -1744,13 +1757,14 @@ impl Interp<'_> {
             NativeId::MapForEach | NativeId::SetForEach => {
                 Some(self.run_collection_for_each(id, this_v, args))
             }
-            // `Promise.all`/`Promise.race`/`Promise.allSettled` read
-            // `@@iterator` and drive `next`/`return` on it, so their iterator
-            // half re-enters the machine; the engine handler stays the
+            // `Promise.all`/`Promise.race`/`Promise.allSettled`/`Promise.any`
+            // read `@@iterator` and drive `next`/`return` on it, so their
+            // iterator half re-enters the machine; the engine handler stays the
             // settled-promise aggregation and receives the drained values.
-            NativeId::PromiseAll | NativeId::PromiseRace | NativeId::PromiseAllSettled => {
-                Some(self.run_promise_combinator(id, this_v, args))
-            }
+            NativeId::PromiseAll
+            | NativeId::PromiseRace
+            | NativeId::PromiseAllSettled
+            | NativeId::PromiseAny => Some(self.run_promise_combinator(id, this_v, args)),
             // `Promise.withResolvers()` runs the receiver's constructor
             // (`NewPromiseCapability(C)` step 6 is a `Construct`), and
             // `Promise.try` calls a user callback and then resolves through the
@@ -3004,6 +3018,7 @@ impl Interp<'_> {
         let kind = match id {
             NativeId::PromiseAll => v12_native::promise_combinator::KIND_ALL,
             NativeId::PromiseAllSettled => v12_native::promise_combinator::KIND_ALL_SETTLED,
+            NativeId::PromiseAny => v12_native::promise_combinator::KIND_ANY,
             _ => v12_native::promise_combinator::KIND_RACE,
         };
         let base = self.stack.len();
@@ -3338,8 +3353,24 @@ impl Interp<'_> {
         self.stack.push(reason);
         self.gc_protect();
         let outcome = if exhausted {
+            // Exhaustion is not a half of any element's pair, so the payoff is
+            // the kind's own: `KIND_ANY` spends the exhaustion token on its
+            // errors list (27.5.4.3.1 step 6-c-d, and the all-rejected case
+            // that arrives here with the count already down to the token).
+            let payoff =
+                if self.combinator_kind(state) == Some(v12_native::promise_combinator::KIND_ANY) {
+                    Payoff::Rejects
+                } else {
+                    Payoff::Fulfils
+                };
             match self.combinator_settle(state) {
-                Ok(settled) => self.resolve_through(capability.resolve, capability.reject, settled),
+                Ok(settled) => self.settle_through(
+                    state,
+                    capability.resolve,
+                    capability.reject,
+                    payoff,
+                    settled,
+                ),
                 Err(error) => Err(error),
             }
         } else {
@@ -3352,6 +3383,87 @@ impl Interp<'_> {
         self.stack.truncate(self.stack.len() - 1);
         outcome?;
         Ok(capability.promise)
+    }
+
+    /// The single point where a settled element (or an exhausted loop) hands the
+    /// value the engine says the aggregate settles with over to the capability.
+    /// Two kinds of payoff come out of that seam and they are the two halves of
+    /// the operation, not two code paths: a **values** array the interpreter
+    /// resolves the aggregate with, and — for `KIND_ANY` — an **errors** array
+    /// it wraps in an `AggregateError` and rejects with.
+    ///
+    /// `KIND_ALL`, `KIND_ALL_SETTLED` and `KIND_RACE` all take the fulfilment
+    /// payoff, so `KIND_ANY` is the only kind that reaches the rejection one —
+    /// a kind test here rather than a second reaction path, so both callers
+    /// ([`Self::settle_combinator`] and [`Self::run_combinator_element`]) keep
+    /// one line each however the combinator families grow.
+    fn settle_through(
+        &mut self,
+        state: JsValue,
+        resolve_v: JsValue,
+        reject_v: JsValue,
+        payoff: Payoff,
+        value: Option<JsValue>,
+    ) -> Result<(), JSException> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        if payoff == Payoff::Rejects
+            && self.combinator_kind(state) == Some(v12_native::promise_combinator::KIND_ANY)
+        {
+            return self.reject_with_aggregate_error(reject_v, value);
+        }
+        self.resolve_through(resolve_v, reject_v, Some(value))
+    }
+
+    /// `KIND_ANY`'s terminal step, at both places the spec has it:
+    /// `let error be AggregateError(errors)` then
+    /// `Perform ! Call(promiseCapability.[[Reject]], undefined, « error »)`
+    /// (27.5.4.3.1 step 6-c-d for the empty iterable, and
+    /// 27.5.4.3.2 step 4-i-i-ii for the last element to reject).
+    ///
+    /// The construction lives here rather than in the engine seam for the two
+    /// reasons the whole combinator is split across the seam: `Construct` is an
+    /// interpreter operation, and `promiseCapability.[[Reject]]` is user code
+    /// whenever the receiver is a subclass that supplied its own executor pair.
+    ///
+    /// `errors` is the array the engine snapshotted at the elements' own
+    /// indices, so a later rejection cannot extend it. Both `AggregateError` and
+    /// the call's argument are parked on the value stack across the `Construct`
+    /// and the `Call`, since `gc_protect` republishes the stack as the root set
+    /// and either step can collect.
+    fn reject_with_aggregate_error(
+        &mut self,
+        reject_v: JsValue,
+        errors: JsValue,
+    ) -> Result<(), JSException> {
+        let base = self.stack.len();
+        let ctor = self
+            .global
+            .and_then(|global| self.global_intrinsic_value(global, "AggregateError"))
+            .and_then(|value| value.as_object());
+        let Some(ctor) = ctor else {
+            self.stack.truncate(base);
+            return Err(JSException(
+                self.error_value("TypeError: AggregateError is not available"),
+            ));
+        };
+        self.stack.push(JsValue::object(ctor));
+        self.stack.push(errors);
+        self.gc_protect();
+        let ctor_v = self.stack[base];
+        let errors_v = self.stack[base + 1];
+        let error = self.construct_object(ctor, &[errors_v], ctor_v)?;
+        if let Some(error) = error.as_object() {
+            self.heap.add_pinned_root(error);
+        }
+        self.stack.push(error);
+        self.gc_protect();
+        // Both steps are asserted (`!`) in the spec, so a receiver whose own
+        // `reject` throws propagates out of the reaction job.
+        let outcome = self.call_value(reject_v, JsValue::undefined(), &[error]);
+        self.stack.truncate(base);
+        outcome.map(|_| ())
     }
 
     /// `PerformPromiseAll`'s `onFulfilledElement` (spec 27.5.4.1.1 step 4) —
@@ -3413,11 +3525,18 @@ impl Interp<'_> {
             value
         };
         // Steps 4-a-iii to 4-b: the bookkeeping, and — for the last outstanding
-        // element — the values array `[[Resolve]]` is called with.
+        // element — the values array `[[Resolve]]` is called with, or, for
+        // `KIND_ANY`, the errors array an `AggregateError` is built from and
+        // `[[Reject]]` is called with.
         let settled = self.combinator_element_settled(state, index, fulfilled, outcome)?;
         self.heap.add_pinned_root(callee);
         let reject_v = self.combinator_state_slot(state, SLOT_REJECT);
-        self.resolve_through(resolve_v, reject_v, settled)?;
+        let payoff = if fulfilled {
+            Payoff::Fulfils
+        } else {
+            Payoff::Rejects
+        };
+        self.settle_through(state, resolve_v, reject_v, payoff, settled)?;
         Ok(JsValue::undefined())
     }
 

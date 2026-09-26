@@ -258,6 +258,211 @@ fn all_settled_produces_instances_of_the_receiver() {
 }
 
 // ---------------------------------------------------------------------------
+// any
+// ---------------------------------------------------------------------------
+
+/// The fulfilled half of 27.5.4.3.1 is `promiseCapability.[[Resolve]]`
+/// *verbatim*, so the first element to fulfil settles the aggregate — and a
+/// rejection arriving later is the rejected half's own business.
+#[test]
+fn any_resolves_with_the_first_fulfilled_element() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             Promise.any([Promise.reject('a'), Promise.resolve('b'), \
+                          Promise.reject('c')]).then( \
+               function (v) { globalThis.__out = 'fulfilled:' + v; }, \
+               function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "fulfilled:b"
+    );
+}
+
+/// A rejection that lands *after* the aggregate is already settled changes
+/// nothing: `[[Resolve]]` and `[[Reject]]` are first-wins, so the second
+/// element's `rejectElement` can only write to a reason list nobody reads.
+#[test]
+fn any_ignores_a_rejection_arriving_after_a_fulfilment() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let seen = []; \
+             Promise.any([Promise.resolve('win'), \
+                           new Promise(function (res, rej) { rej('late'); })]) \
+               .then( \
+                 function (v) { globalThis.__out = 'fulfilled:' + v; }, \
+                 function (e) { globalThis.__out = 'rejected'; }); \
+             Promise.resolve().then(function () {}).then(function () {}).then( \
+               function () { globalThis.__out += '/still:' + seen.length; });",
+            "globalThis.__out"
+        ),
+        "fulfilled:win/still:0"
+    );
+}
+
+/// Every rejected element's reason is recorded at the element's own index, so
+/// the `AggregateError`'s `errors` array comes back in input order
+/// (`Promise.any/reject-all-mixed.js` asserts the same `join`).
+#[test]
+fn any_rejects_with_an_aggregate_error_holding_every_reason_in_input_order() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             Promise.any([Promise.reject('a'), Promise.reject('b'), \
+                          Promise.reject('c')]).then( \
+               function (v) { globalThis.__out = 'fulfilled:' + v; }, \
+               function (e) { globalThis.__out = [e instanceof AggregateError, \
+                 e instanceof Error, e.errors.length, e.errors.join('')] \
+                 .join('/'); });",
+            "globalThis.__out"
+        ),
+        "true/true/3/abc"
+    );
+}
+
+/// 27.5.4.3.1 step 6: an empty iterable rejects with `AggregateError(« »)` —
+/// the errors list is built empty, *not* from a first rejection.
+#[test]
+fn any_of_an_empty_iterable_rejects_with_an_aggregate_error_with_no_errors() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             Promise.any([]).then( \
+               function (v) { globalThis.__out = 'fulfilled:' + v; }, \
+               function (e) { globalThis.__out = [e instanceof AggregateError, \
+                 Array.isArray(e.errors), e.errors.length, e.message] \
+                 .join('/'); });",
+            "globalThis.__out"
+        ),
+        "true/true/0/"
+    );
+}
+
+/// A non-iterable argument is an abrupt `GetIterator`, so the capability
+/// rejects with the `TypeError` rather than the call throwing — the same
+/// `IfAbruptRejectPromise` the other combinators route through.
+#[test]
+fn any_rejects_rather_than_throws_for_a_non_iterable_argument() {
+    for source in [
+        "Promise.any(42)",
+        "Promise.any(undefined)",
+        "Promise.any(null)",
+        "Promise.any(true)",
+        "Promise.any(Symbol())",
+        "Promise.any()",
+    ] {
+        let out = settled(
+            &format!(
+                "globalThis.__out = 'unset'; {source}.then( \
+                   function () {{ globalThis.__out = 'fulfilled'; }}, \
+                   function (e) {{ globalThis.__out = 'rejected:' + e; }});"
+            ),
+            "globalThis.__out",
+        );
+        assert!(
+            out.starts_with("rejected:TypeError"),
+            "{source} must reject with a TypeError, got {out}"
+        );
+    }
+}
+
+/// The `errors` array is snapshotted at the moment the count reaches zero: a
+/// `then` free to call its reject function a second time after the aggregate
+/// has already rejected cannot extend it (its `alreadyCalled` record is set,
+/// and the count is already spent).
+#[test]
+fn any_does_not_extend_the_errors_array_with_a_late_rejection() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let element = { then: function (res, rej) { \
+               rej('first'); \
+               Promise.resolve().then(function () { rej('second'); }); } }; \
+             Promise.any([element]).then( \
+               function () { globalThis.__out = 'fulfilled'; }, \
+               function (e) { Promise.resolve().then(function () { \
+                 globalThis.__out = e.errors.join(',') + '/' + e.errors.length; }); });",
+            "globalThis.__out"
+        ),
+        "first/1"
+    );
+}
+
+/// A reason is stored as-is, never adopted: a rejected promise used as a
+/// rejection reason stays that promise in the `errors` array rather than being
+/// unwrapped to its own fulfilment value.
+#[test]
+fn any_stores_a_promise_rejection_reason_without_adopting_it() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let reason = Promise.resolve('inner'); \
+             Promise.any([Promise.reject(reason)]).then( \
+               function () { globalThis.__out = 'fulfilled'; }, \
+               function (e) { globalThis.__out = (e.errors[0] === reason) + '/' \
+                 + (e.errors[0] instanceof Promise) + '/' \
+                 + typeof e.errors[0].then; });",
+            "globalThis.__out"
+        ),
+        "true/true/function"
+    );
+}
+
+/// `CreateBuiltinFunction`: `length: 1`, `name: "any"`, and the
+/// `@@toStringTag` every `%Promise%`-family static inherits.
+#[test]
+fn any_static_shape_is_length_one_named_any_and_to_string_tagged() {
+    assert_eq!(
+        evaluate(
+            "[Promise.any.length, Promise.any.name, \
+              Promise[Symbol.toStringTag], \
+              typeof Promise.any].join(',')"
+        ),
+        "1,any,Promise,function"
+    );
+}
+
+/// Nothing is special-cased to arrays: `GetIterator` accepts any iterable, so a
+/// generator, a `Set` and a hand-rolled `@@iterator` all work — and each reaches
+/// one of the two terminal steps.
+///
+/// The leading `anyR0` is 27.5.4.3.1 step 5-6 and not an ordering accident: a
+/// first `IteratorStepValue` that is already done short-circuits the whole
+/// algorithm, so that aggregate's `[[Reject]]` runs *synchronously* and its
+/// reaction is queued before any of the three below settle.
+#[test]
+fn any_accepts_a_generator_a_set_and_a_generic_iterable() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = ''; \
+             let empty = { [Symbol.iterator]: function () { \
+               return { next: function () { return { value: 'never', done: true }; } }; } }; \
+             Promise.any(empty).then( \
+               function (v) { globalThis.__out += '/any:' + v; }, \
+               function (e) { globalThis.__out += '/anyR0:' + e.errors.length; }); \
+             function* gen() { yield Promise.reject('g1'); yield 'g2'; } \
+             Promise.any(gen()).then( \
+               function (v) { globalThis.__out += '/gen:' + v; }, \
+               function (e) { globalThis.__out += '/genR:' + e.errors.join(''); }); \
+             Promise.any(new Set([Promise.reject('s')])).then( \
+               function (v) { globalThis.__out += '/set:' + v; }, \
+               function (e) { globalThis.__out += '/setR:' + e.errors.join(''); }); \
+             let generic = { [Symbol.iterator]: function () { \
+               let n = 0; \
+               return { next: function () { \
+                 return n++ === 0 ? { value: Promise.reject('x'), done: false } \
+                                  : { value: undefined, done: true }; } }; } }; \
+             Promise.any(generic).then( \
+               function (v) { globalThis.__out += '/generic:' + v; }, \
+               function (e) { globalThis.__out += '/genericR:' + e.errors.join(''); });",
+            "globalThis.__out"
+        ),
+        "/anyR0:0/gen:g2/setR:s/genericR:x"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // withResolvers
 // ---------------------------------------------------------------------------
 

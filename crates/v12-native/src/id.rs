@@ -269,6 +269,13 @@ pub enum NativeId {
     /// `Promise.try(callback, ...args)` (spec 27.5.4.8). Calls a user callback
     /// and then `PromiseResolve(C, result)`, so both halves are machine work.
     PromiseTry = 1721,
+    /// `Promise.any(iterable)` (spec 27.5.4.3). Streams the iterable on the
+    /// interpreter side of the seam like `PromiseAll` / `PromiseRace` /
+    /// `PromiseAllSettled`; the difference is only the combinator kind it asks
+    /// for (`v12_native::promise_combinator::KIND_ANY`). The `AggregateError`
+    /// the all-rejected case rejects with is built by the interpreter, because
+    /// `Construct` and a possibly-user `[[Reject]]` are machine operations.
+    PromiseAny = 1722,
     QueueMicrotask = 1700,
     // Map / Set
     MapConstruct = 2000,

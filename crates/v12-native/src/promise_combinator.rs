@@ -26,6 +26,13 @@ pub const KIND_RACE: i32 = 1;
 /// `combinator_begin` and compared by identity of meaning from then on, so
 /// `KIND_ALL` and `KIND_RACE` keep the values they have always had.
 pub const KIND_ALL_SETTLED: i32 = 2;
+/// `Promise.any` (spec 27.5.4.3.1): the [`KIND_ALL`] loop and its
+/// `remainingElementsCount`, but the *opposite* settlement polarity — the
+/// fulfilled half of the pair is `promiseCapability.[[Resolve]]` verbatim
+/// (so any fulfilment wins immediately) and only the rejected half is
+/// per-element, recording its reason at the element's own index in
+/// [`SLOT_ERRORS`] until the count reaches zero.
+pub const KIND_ANY: i32 = 3;
 
 /// Reads a kind Smi back out of a kind slot; `None` for a slot that is not one
 /// of them (a corrupt state object).
@@ -40,6 +47,9 @@ pub fn combinator_kind(slot: JsValue) -> Option<i32> {
     }
     if raw == KIND_ALL_SETTLED {
         return Some(KIND_ALL_SETTLED);
+    }
+    if raw == KIND_ANY {
+        return Some(KIND_ANY);
     }
     None
 }
@@ -61,15 +71,16 @@ pub const SLOT_REJECT: i32 = 2;
 /// element pulled so far. The aggregate fulfills with the results array when
 /// the count reaches zero. For `KIND_ALL_SETTLED` each slot holds the element's
 /// `{ status, value }` / `{ status, reason }` object rather than the raw value.
-/// `KIND_ANY` shares this slot for its `errors` array — only one kind runs per
-/// state object, so the layout stays uniform and no slot is position-dependent.
+/// `KIND_RACE` and `KIND_ANY` never read it; only one kind runs per state
+/// object, so the layout stays uniform and no slot is position-dependent.
 pub const SLOT_RESULTS: i32 = 3;
 /// How many elements are still unsettled, counting one extra for "the iterator
-/// has not been exhausted yet" (see `combinator::begin`) — for `KIND_ALL` and
-/// `KIND_ALL_SETTLED`. The aggregate fulfills with the results array when the
-/// count reaches zero. `KIND_RACE` leaves it at the exhaustion token forever —
-/// the race settles on its first element and its spec loop returns the
-/// capability promise unchanged.
+/// has not been exhausted yet" (see `combinator::begin`) — for every kind but
+/// `KIND_RACE`. The aggregate fulfills with the results array when the count
+/// reaches zero (`KIND_ALL`/`KIND_ALL_SETTLED`), or rejects with an
+/// `AggregateError` built from [`SLOT_ERRORS`] (`KIND_ANY`). `KIND_RACE` leaves
+/// it at the exhaustion token forever — the race settles on its first element
+/// and its spec loop returns the capability promise unchanged.
 pub const SLOT_REMAINING: i32 = 4;
 /// `Promise.any`'s `errors` array (spec 27.5.4.3.1 step 2), the per-element
 /// snapshot the `AggregateError` is built from when the last element rejects.
