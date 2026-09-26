@@ -15,6 +15,12 @@ const ASYNC_GEN_REQUEST_NEXT: i32 = 0;
 const ASYNC_GEN_REQUEST_RETURN: i32 = 1;
 const ASYNC_GEN_REQUEST_THROW: i32 = 2;
 
+/// The `[[State]]`/`[[Result]]`/`[[Reactions]]` slots every engine promise
+/// starts with, and the floor `is_engine_promise` checks: a user property is
+/// numbered past them, so a promise can have *more* than this many properties
+/// and still be one.
+const PROMISE_SLOTS: usize = 3;
+
 /// The outcome of the ordinary-path `then` read that decides thenable
 /// adoption (spec 27.2.1.3.1 `PromiseResolveFunctions` step 3).
 pub(crate) enum ThenRead {
@@ -822,19 +828,32 @@ impl Interp<'_> {
                 .is_some_and(|s| (0..=2).contains(&s))
     }
 
-    /// The engine's `is_promise` predicate, mirrored: a promise carries
-    /// *exactly* the three `[[State]]`/`[[Result]]`/`[[Reactions]]` slots, so
-    /// a user-added own property takes it out. The `Promise.resolve` seam needs
-    /// the same answer the engine's handler would give — it decides "identity
-    /// or adopt" once, and the handler is the fallback for the branch the seam
-    /// does not take.
+    /// `IsPromise` (spec 6.6.1) for the `Promise.resolve` seam: a promise
+    /// carries a `[[PromiseState]]` *internal slot*, and an own property does
+    /// not take that away — `alloc_promise` binds the reserved promise shape,
+    /// so a user-defined property is numbered past the three
+    /// `[[State]]`/`[[Result]]`/`[[Reactions]]` slots rather than aliasing
+    /// them. The check is therefore `>= PROMISE_SLOTS`, not `==`.
+    ///
+    /// It was `== 3`, which made `Object.defineProperty(p, 'then', …)` demote a
+    /// promise to a plain thenable. That is invisible while a combinator reads
+    /// `then` off the *element* — the element's own `then` is invoked either
+    /// way — but 27.5.4.1 step 12 reads `then` off `nextPromise`, and a
+    /// `nextPromise` that is a *new* promise has `%Promise.prototype.then%`:
+    /// nothing throws, the loop never closes, and
+    /// `built-ins/Promise/all/invoke-then-get-error-close.js` (an unbounded
+    /// iterator of such promises) spins.
+    ///
+    /// The engine's `is_promise` in `builtins/promise.rs` still says `==`; it
+    /// answers a different question (whether a resolution is a promise to chain
+    /// onto) and is left alone here.
     pub(crate) fn is_engine_promise(&self, v: JsValue) -> bool {
         let Some(obj) = v.as_object() else {
             return false;
         };
         let o = self.heap.get(obj);
         o.kind == Kind::Promise
-            && o.properties.len() == 3
+            && o.properties.len() >= PROMISE_SLOTS
             && o.properties[0]
                 .as_smi()
                 .is_some_and(|s| (0..=2).contains(&s))

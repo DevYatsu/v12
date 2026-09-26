@@ -239,6 +239,14 @@ fn combinators_accept_constructor_receivers() {
     // B { constructor(f) { super(f); } }` and no promise in sight), so this test
     // steps around it rather than papering over it — a `let` in any of these
     // scopes would fail the whole case, not just the `Sub` line.
+    //
+    // The final read needs a microtask *ladder*, not a single
+    // `Promise.resolve().then(…)`. Every element here is the string `'v'`, and
+    // 27.5.4.1 step 11-b routes it through `promiseResolve` — so `nextPromise`
+    // is a promise and the element settles from the `Invoke`d `then`'s reaction
+    // job, one tick later than the old element-read shortcut (which saw no
+    // `then` on a primitive and settled the element in place). Six combinators
+    // back to back therefore need more than one checkpoint.
     assert_eq!(
         settled(
             "globalThis.__out = 'unset'; \
@@ -250,6 +258,10 @@ fn combinators_accept_constructor_receivers() {
              function one() { return { [Symbol.iterator]: function () { var n = 0; return { \
                next: function () { n++; return n > 1 ? { done: true } : { done: false, value: 'v' }; }, \
                return: function () { return {}; } }; } }; } \
+             function flush(n, f) { \
+               if (n === 0) { f(); return; } \
+               Promise.resolve(0).then(function () { return 0; }) \
+                 .then(function () { flush(n - 1, f); }); } \
              var seen = []; \
              var collect = function (p, tag) { p.then( \
                function (v) { seen.push(tag + '=' + (Array.isArray(v) ? v.join('-') : String(v))); }, \
@@ -260,7 +272,7 @@ fn combinators_accept_constructor_receivers() {
              collect(Promise.all.call(Cls, one()), 'Cls'); \
              collect(Promise.all.call(new Proxy(Promise, {}), one()), 'Proxy'); \
              collect(Promise.race.call(Sub, one()), 'race'); \
-             Promise.resolve().then(function () { globalThis.__out = seen.join('|'); });",
+             flush(6, function () { globalThis.__out = seen.join('|'); });",
             "globalThis.__out"
         ),
         "Promise=v|Sub=v|Fn=v|Cls=v|Proxy=v|race=v"
@@ -356,21 +368,34 @@ fn an_element_abort_closes_the_iterator_and_keeps_the_original_error() {
 }
 
 #[test]
-fn a_two_element_infinite_iterator_closes_when_the_second_then_throws() {
+fn a_two_element_infinite_iterator_closes_when_the_second_element_invoke_throws() {
     // The regression this streaming correction exists for: the loop pulls one
-    // element at a time, so the second element's throwing `then` closes the
-    // iterator and rejects — the iterator's end is never reached.
+    // element at a time, so the second element's `then` — read off
+    // `nextPromise` and invoked there by 27.5.4.1 step 16 — throws, closes the
+    // iterator and rejects, without the iterator's end ever being reached.
+    //
+    // The elements are *promises* carrying an own `then`, which is what makes
+    // the throw observable to the loop at all. A plain thenable element's `then`
+    // is called from the `PromiseResolveThenableJob` that
+    // `Call(promiseResolve, …)` queued, so its throw is a job's, not the loop's
+    // — see `a_thenable_whose_then_throws_still_settles_the_aggregate` for that
+    // half, and note the honest limit it leaves: an unbounded iterator of
+    // thenables is no longer broken out of by a throwing element `then`, which
+    // is what the spec does anyway.
     let source = concat!(
         "globalThis.__out = 'unset'; globalThis.__closed = 0; globalThis.__pulled = 0;",
-        "let iterable = { [Symbol.iterator]: function () { let n = 0; return {",
-        "next: function () { n++; globalThis.__pulled = n;",
-        "return { done: false, value: { then: function () {",
-        "if (globalThis.__pulled > 1) { throw new Error('boom'); } } } }; },",
+        "let err = new Error('boom');",
+        "let plain = new Promise(function () {});",
+        "let poisoned = new Promise(function () {});",
+        "Object.defineProperty(poisoned, 'then', { value: function () { throw err; } });",
+        "let iterable = { [Symbol.iterator]: function () { return {",
+        "next: function () { globalThis.__pulled++;",
+        "return { done: false, value: globalThis.__pulled === 1 ? plain : poisoned }; },",
         "return: function () { globalThis.__closed++; return {}; } }; } };",
         "Promise.all(iterable).then(",
         "function () { globalThis.__out = 'fulfilled'; },",
-        "function (e) { globalThis.__out = e.message + '/closed=' + globalThis.__closed",
-        "+ '/pulled=' + globalThis.__pulled; });",
+        "function (e) { globalThis.__out = (e === err ? 'boom' : 'other:' + e)",
+        "+ '/closed=' + globalThis.__closed + '/pulled=' + globalThis.__pulled; });",
     );
     assert_eq!(
         settled(source, "globalThis.__out"),
@@ -382,12 +407,12 @@ fn a_two_element_infinite_iterator_closes_when_the_second_then_throws() {
 fn all_closes_when_a_promise_element_then_throws() {
     // Test262 `built-ins/Promise/all/invoke-then-error-close.js`: the element is
     // a *promise* carrying an own `then` that throws, over an iterator that
-    // never ends. Two things must hold at once: the own `then` must be read
-    // off the promise (an internal-slot object — its three
-    // `[[State]]`/`[[Result]]`/`[[Reactions]]` entries used to be numbered
-    // from 0, so the first user property aliased them and the read answered
-    // the `[[State]]` Smi), and the pull loop must break out instead of
-    // treating a non-callable `then` as "settled" and spinning forever.
+    // never ends. Two things must hold at once: `nextPromise` must be the
+    // element — `IsPromise` is an internal-slot test, so an own property does
+    // not demote it to a thenable, and the `GetV` at 27.5.4.1 step 12 answers
+    // the own `then` rather than `%Promise.prototype.then%` — and the pull loop
+    // must break out instead of treating a non-callable `then` as "settled" and
+    // spinning forever.
     let source = concat!(
         "globalThis.__out = 'unset'; globalThis.__closed = 0; globalThis.__pulled = 0;",
         "let err = new Error('boom');",
@@ -409,30 +434,46 @@ fn all_closes_when_a_promise_element_then_throws() {
 }
 
 #[test]
-fn race_closes_when_an_element_then_throws() {
+fn race_closes_when_the_invoked_then_throws() {
+    // The race half of the same `Invoke` abrupt, over a *bounded* iterator so a
+    // regression fails an assertion instead of hanging. `KIND_RACE` builds no
+    // per-element handler, so the pair handed to `then` is the capability's own
+    // and nothing about the throw is special to the race.
     let source = concat!(
         "globalThis.__out = 'unset'; globalThis.__closed = 0; globalThis.__pulled = 0;",
-        "let iterable = { [Symbol.iterator]: function () { let n = 0; return {",
-        "next: function () { n++; globalThis.__pulled = n;",
-        "return { done: false, value: { then: function () {",
-        "if (globalThis.__pulled > 1) { throw new Error('boom'); } } } }; },",
+        "let err = new Error('boom');",
+        "let promise = new Promise(function () {});",
+        "Object.defineProperty(promise, 'then', { value: function () { throw err; } });",
+        "let iterable = { [Symbol.iterator]: function () { return {",
+        "next: function () { globalThis.__pulled++;",
+        "return globalThis.__pulled > 3 ? { done: true } : { done: false, value: promise }; },",
         "return: function () { globalThis.__closed++; return {}; } }; } };",
         "Promise.race(iterable).then(",
         "function () { globalThis.__out = 'fulfilled'; },",
-        "function (e) { globalThis.__out = e.message + '/' + globalThis.__closed; });",
+        "function (e) { globalThis.__out = (e === err ? 'boom' : 'other:' + e)",
+        "+ '/closed=' + globalThis.__closed + '/pulled=' + globalThis.__pulled; });",
     );
-    assert_eq!(settled(source, "globalThis.__out"), "boom/1");
+    assert_eq!(
+        settled(source, "globalThis.__out"),
+        "boom/closed=1/pulled=1"
+    );
 }
 
 #[test]
-fn a_get_then_abrupt_closes_the_iterator() {
-    // The other element-processing abrupt: reading `then` throws.
+fn a_poisoned_element_then_rejects_the_aggregate_without_closing() {
+    // The element's own `then` getter is no longer read by the combinator, so
+    // it cannot be the thing that closes the iterator. The `Get` belongs to
+    // `Call(promiseResolve, C, « nextValue »)` — that is, to `PromiseResolve`,
+    // where 27.5.1.3.1 step 3's `? Get` is caught and the adoption job rejects
+    // `nextPromise` — and 27.5.4.1 step 11-a's `IfAbruptRejectPromise` is not a
+    // close. The aggregate still rejects with the thrown value, reached
+    // through `nextPromise`'s own rejection and the pair's reject half.
     assert_eq!(
         settled(
             "globalThis.__out = 'unset'; globalThis.__closed = 0; \
-             let iterable = { [Symbol.iterator]: function () { return { \
-               next: function () { return { done: false, value: { \
-                 get then() { throw new Error('get-then'); } } }; }, \
+             let poison = { get then() { throw new Error('get-then'); } }; \
+             let iterable = { [Symbol.iterator]: function () { let n = 0; return { \
+               next: function () { n++; return n > 1 ? { done: true } : { done: false, value: poison }; }, \
                return: function () { globalThis.__closed++; return {}; } \
              }; } }; \
              Promise.all(iterable).then( \
@@ -440,7 +481,7 @@ fn a_get_then_abrupt_closes_the_iterator() {
                function (e) { globalThis.__out = e.message + '/' + globalThis.__closed; });",
             "globalThis.__out"
         ),
-        "get-then/1"
+        "get-then/0"
     );
 }
 
@@ -852,6 +893,216 @@ fn the_receiver_resolve_is_read_once_for_a_multi_element_iterable() {
             "globalThis.__out"
         ),
         "1-2-3 get=1 call=3"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `then` is read and invoked on `nextPromise`, never on the element
+// (spec 27.5.4.1 steps 12 and 16 / 27.5.4.2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_plain_thenable_element_has_its_then_called_exactly_once() {
+    // 27.5.4.1 step 11-b hands the element to `promiseResolve`, so a *thenable*
+    // element is adopted by `PromiseResolve(C, x)` and its `then` is called
+    // from the adoption job `PromiseResolveThenableJob` — and only there.
+    // Step 16 then does `Invoke(nextPromise, "then", …)`, i.e. on the promise
+    // `PromiseResolve` returned, whose own `then` is `%Promise.prototype.then%`.
+    //
+    // Reading the element's `then` and calling *that* is what ran the script's
+    // function twice: once from the combinator loop and once from the adoption
+    // job. It is invisible when the element *is* a promise, because the
+    // identity resolve makes `nextPromise` the element — which is why
+    // `built-ins/Promise/race/resolve-ignores-late-rejection-deferred.js` was
+    // the only member of its family to fail.
+    //
+    // The counter is read through [`settled`] rather than inside a `.then`, so
+    // it is observed *after* the adoption job has run: a read taken from the
+    // first reaction sees only the combinator's own call.
+    assert_eq!(
+        settled(
+            "globalThis.__race = 0; globalThis.__all = 0; \
+             let t1 = { then: function (r) { globalThis.__race++; r(1); } }; \
+             let t2 = { then: function (r) { globalThis.__all++; r(2); } }; \
+             Promise.race([t1]).then(function () {}, function () {}); \
+             Promise.all([t2]).then(function () {}, function () {});",
+            "globalThis.__race + '/' + globalThis.__all"
+        ),
+        "1/1"
+    );
+}
+
+#[test]
+fn a_thenable_elements_then_is_never_reached_through_the_element() {
+    // The stronger form of the rule above: the *element's* own `then` is not
+    // read at all by the combinator, so an accessor on it runs once (inside
+    // `promiseResolve`) rather than twice, and a poisoned one cannot reach the
+    // element-processing close. `then` is read exactly twice more, off
+    // `nextPromise` — once for 27.5.4.1 step 12's `GetV` and once for step 16's
+    // `Invoke` — and those reads land on the promise `Promise.resolve` built,
+    // never on the element.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             globalThis.__reads = 0; globalThis.__calls = 0; \
+             let t = { get then() { globalThis.__reads++; \
+               return function (r) { globalThis.__calls++; r(1); }; } }; \
+             Promise.all([t]).then( \
+               function (v) { globalThis.__out = 'reads=' + globalThis.__reads \
+                 + ' calls=' + globalThis.__calls + ' v=' + v[0]; }, \
+               function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "reads=1 calls=1 v=1"
+    );
+}
+
+#[test]
+fn a_thenable_whose_then_throws_still_settles_the_aggregate() {
+    // The element's `then` throwing no longer closes the iterator — that
+    // throw belongs to the adoption job now, and a job's abrupt rejects
+    // `nextPromise`, which the combinator's `Invoke`d `then` reports through
+    // `resultCapability.[[Reject]]`. What must survive the move is the
+    // settlement itself, with the thrown value verbatim.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; globalThis.__closed = 0; \
+             let err = { tag: 'boom' }; \
+             let iterable = { [Symbol.iterator]: function () { let n = 0; return { \
+               next: function () { n++; return n > 1 \
+                 ? { done: true } \
+                 : { done: false, value: { then: function () { throw err; } } }; }, \
+               return: function () { globalThis.__closed++; return {}; } \
+             }; } }; \
+             Promise.all(iterable).then( \
+               function () { globalThis.__out = 'fulfilled'; }, \
+               function (e) { globalThis.__out = (e === err ? 'boom' : 'other') \
+                 + '/closed=' + globalThis.__closed; });",
+            "globalThis.__out"
+        ),
+        "boom/closed=0"
+    );
+}
+
+#[test]
+fn a_primitive_next_promise_settles_the_element_in_place() {
+    // A `promiseResolve` that returns a primitive is not a `TypeError`:
+    // spec 7.3.13 `Invoke` has no "V must be an Object" step, and 7.3.9 `GetV`
+    // only throws for `undefined`/`null`. The boxed read finds no callable
+    // `then`, so 27.5.4.1 step 15 settles the element in place — with
+    // `nextValue`, the *element*, not the primitive the receiver's `resolve`
+    // returned.
+    //
+    // The boxing itself is the engine's general `ToObject` gap rather than
+    // this path's: `get_property` sends a primitive to its string-primitive
+    // surface, so `Number.prototype.then` is not reachable from here. Unobservable
+    // in practice, because `Promise.resolve(x)` returns a promise for every `x`.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             function C(executor) { return new Promise(function (res, rej) { executor(res, rej); }); } \
+             C.resolve = function () { return 42; }; \
+             Promise.all.call(C, ['a', 'b']).then( \
+               function (v) { globalThis.__out = v.join('-'); }, \
+               function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "a-b"
+    );
+}
+
+#[test]
+fn a_next_promise_that_is_nullish_fails_the_getv_that_precedes_the_invoke() {
+    // 27.5.4.1 step 12 is `? GetV(nextPromise, "then")`, and `GetV` opens with
+    // `If V is undefined or null, throw a TypeError` — so a `promiseResolve`
+    // returning `undefined` fails *before* any bookkeeping, and the aggregate
+    // rejects without a results write. It is still an element-processing
+    // abrupt, so the iterator closes first.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; globalThis.__closed = 0; \
+             function C(executor) { return new Promise(function (res, rej) { executor(res, rej); }); } \
+             C.resolve = function () { return undefined; }; \
+             let iterable = { [Symbol.iterator]: function () { let n = 0; return { \
+               next: function () { n++; return n > 3 ? { done: true } : { done: false, value: 1 }; }, \
+               return: function () { globalThis.__closed++; return {}; } \
+             }; } }; \
+             Promise.all.call(C, iterable).then( \
+               function () { globalThis.__out = 'fulfilled'; }, \
+               function (e) { globalThis.__out = (e instanceof TypeError ? 'TypeError' : 'other') \
+                 + '/closed=' + globalThis.__closed; });",
+            "globalThis.__out"
+        ),
+        "TypeError/closed=1"
+    );
+}
+
+#[test]
+fn a_non_callable_then_on_the_next_promise_settles_the_element_in_place() {
+    // 27.5.4.1 step 15: a `nextPromise` whose `then` is not callable is not an
+    // adoption, so the element is settled by
+    // `Call(resultCapability.[[Resolve]], undefined, « nextValue »)` — with the
+    // *element*, not with `nextPromise`. `C.resolve` below hands back a
+    // non-thenable wrapper for every value, which is the only way to reach this
+    // branch: `Promise.resolve` always returns a promise, whose `then` is
+    // callable.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             function C(executor) { return new Promise(function (res, rej) { executor(res, rej); }); } \
+             C.resolve = function (v) { return { tag: 'wrapper' }; }; \
+             Promise.all.call(C, [1, 2, 3]).then( \
+               function (v) { globalThis.__out = v.join('-'); }, \
+               function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "1-2-3"
+    );
+}
+
+#[test]
+fn a_primitive_element_still_fulfills_the_aggregate_unchanged() {
+    // `GetV` boxes a primitive receiver (spec 7.3.9), so `Promise.all([1, 2])`
+    // reads `then` off a `Number` wrapper and finds nothing callable — the
+    // boxing must not turn a primitive into a `TypeError`, and the results
+    // array must hold the primitives themselves. `null` and `undefined` are in
+    // the same array to pin the two spellings of "absent".
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             Promise.all([1, 2]).then( \
+               function (v) { globalThis.__out = v.length + ':' + v.join('-') \
+                 + ':' + typeof v[0] + ',' + typeof v[1]; }, \
+               function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "2:1-2:number,number"
+    );
+}
+
+#[test]
+fn the_receiver_resolve_is_read_once_even_with_a_thenable_element() {
+    // The Task 2a pin, restated next to the `nextPromise` read so a later
+    // revision cannot reintroduce the per-element `Get(C, "resolve")` while
+    // fixing the `then` side: one `Get`, one `Call` per element, and the
+    // thenable's `then` still exactly once.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             globalThis.__gets = 0; globalThis.__calls = 0; globalThis.__then = 0; \
+             function C(executor) { return new Promise(function (res, rej) { executor(res, rej); }); } \
+             Object.defineProperty(C, 'resolve', { \
+               configurable: true, \
+               get: function () { globalThis.__gets++; \
+                 return function (v) { globalThis.__calls++; return Promise.resolve(v); }; } }); \
+             let t = { then: function (r) { globalThis.__then++; r('x'); } }; \
+             Promise.all.call(C, [t, t]).then( \
+               function (v) { globalThis.__out = v.join('-') + ' gets=' + globalThis.__gets \
+                 + ' calls=' + globalThis.__calls + ' then=' + globalThis.__then; }, \
+               function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "x-x gets=1 calls=2 then=2"
     );
 }
 

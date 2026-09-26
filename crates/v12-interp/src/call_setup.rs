@@ -2966,12 +2966,16 @@ impl Interp<'_> {
     /// `resolve` getter or a non-callable `resolve` *rejects* the capability and
     /// the call still returns it.
     ///
-    /// One element at a time is the point: an element whose `promiseResolve` or
-    /// `then` throws closes the iterator and settles the aggregate, so an
-    /// unbounded iterator cannot stall the loop. Per spec an abrupt
-    /// `next`/`done`/`value` does *not* close — it rejects the capability where
-    /// it happened (`PerformPromiseAll`'s `IfAbruptRejectPromise`), and so does a
-    /// failed `GetIterator`.
+    /// One element at a time is the point: an element whose `promiseResolve`,
+    /// whose `GetV(nextPromise, "then")` or whose `Invoke` throws closes the
+    /// iterator and settles the aggregate, so an unbounded iterator of those is
+    /// not stalled by the loop. The element's *own* `then` is not on that list
+    /// any more — 27.5.4.1 step 11-b hands the element to `promiseResolve`, so a
+    /// thenable element's `then` is called by the adoption job, and an
+    /// unbounded iterator of thenables runs the loop out the way the spec says
+    /// it should. Per spec an abrupt `next`/`done`/`value` does *not* close —
+    /// it rejects the capability where it happened (`PerformPromiseAll`'s
+    /// `IfAbruptRejectPromise`), and so does a failed `GetIterator`.
     ///
     /// Everything the loop holds across a safepoint — the capability, the
     /// state, the iterator, the element — rides the value stack, because
@@ -3051,6 +3055,7 @@ impl Interp<'_> {
         self.stack.push(state);
         let result = self.stream_combinator(
             &capability,
+            this_v,
             args.first().copied().unwrap_or_else(JsValue::undefined),
             promise_resolve,
             state,
@@ -3063,6 +3068,7 @@ impl Interp<'_> {
     fn stream_combinator(
         &mut self,
         capability: &Capability,
+        ctor: JsValue,
         iterable: JsValue,
         promise_resolve: JsValue,
         state: JsValue,
@@ -3101,7 +3107,8 @@ impl Interp<'_> {
                 Ok(value) => value,
                 Err(JSException(thrown)) => break (false, thrown),
             };
-            match self.combinator_element(capability, promise_resolve, state, index, element) {
+            match self.combinator_element(capability, ctor, promise_resolve, state, index, element)
+            {
                 Ok(()) => {}
                 // `promiseResolve`, the `then` read, the engine step and the
                 // `then` invocation are element-processing aborts: the iterator
@@ -3118,16 +3125,17 @@ impl Interp<'_> {
         self.settle_combinator(capability, state, outcome.0, outcome.1)
     }
 
-    /// One element of a combinator: `Call(promiseResolve, …)`, read `then`,
-    /// engine step, then either invoke `then` with the pair it built or settle
-    /// the element in place.
+    /// One element of a combinator: `Call(promiseResolve, C, …)`, read `then`
+    /// off the result, engine step, then either invoke that `then` on it with
+    /// the pair the engine built or settle the element in place.
     ///
     /// The element is parked on the value stack for the calls that can collect;
-    /// the truncate is unconditional so a throwing `promiseResolve`/`then`
-    /// leaves the same stack it found.
+    /// the truncate is unconditional so a throwing `promiseResolve`, `GetV` or
+    /// `Invoke` leaves the same stack it found.
     fn combinator_element(
         &mut self,
         capability: &Capability,
+        ctor: JsValue,
         promise_resolve: JsValue,
         state: JsValue,
         index: u32,
@@ -3136,33 +3144,64 @@ impl Interp<'_> {
         let base = self.stack.len();
         self.stack.push(element);
         let result =
-            self.combinator_element_calls(capability, promise_resolve, state, index, element);
+            self.combinator_element_calls(capability, ctor, promise_resolve, state, index, element);
         self.stack.truncate(base);
         result
     }
 
     /// The body of [`Self::combinator_element`], with the element already
     /// parked on the stack.
+    ///
+    /// 27.5.4.1 steps 11 to 16 (27.5.4.2 has the same shape). The load-bearing
+    /// line is that `then` is read and invoked on **`nextPromise`**, the value
+    /// `promiseResolve` returned — never on the element. The element is only
+    /// what step 11-b hands to `promiseResolve` and what step 15-c resolves the
+    /// aggregate with.
+    ///
+    /// Reading the element's own `then` is what made a plain thenable's `then`
+    /// run twice: once from this loop and once from the
+    /// `PromiseResolveThenableJob` that `Promise.resolve(x)` queues for the
+    /// same thenable. It is invisible when the element *is* a promise, because
+    /// 27.5.4.7.1's identity check makes `nextPromise` the element — which is
+    /// why `built-ins/Promise/race/resolve-ignores-late-rejection-deferred.js`
+    /// was the only member of its family to fail. The element's reaction path
+    /// is now reached only through `then`, with no engine watcher record.
+    ///
+    /// `nextPromise` and `then` ride the value stack from the `Call` to the
+    /// `Invoke`: both can be a user getter's output, and `gc_protect`
+    /// republishes the stack as the root set. [`Self::combinator_element`]
+    /// truncates.
     fn combinator_element_calls(
         &mut self,
         capability: &Capability,
+        ctor: JsValue,
         promise_resolve: JsValue,
         state: JsValue,
         index: u32,
         element: JsValue,
     ) -> Result<(), JSException> {
-        // `nextPromise = Call(promiseResolve, undefined, « nextValue »)`. The
-        // `resolve` it names was read once, before `GetIterator`.
-        self.call_value(promise_resolve, JsValue::undefined(), &[element])?;
-        // `Get(V, P)` boxes its receiver (spec 7.3.9), so a primitive element
-        // has no `then` — a hole in a sparse array reads as `undefined`, and
-        // `Promise.all([1, , 3])` must fulfill rather than reject.
-        let then_v = if element.is_null() || element.is_undefined() {
-            JsValue::undefined()
-        } else {
-            let then_key = self.new_temp_key("then");
-            self.get_property(0, 0, element, then_key)?
-        };
+        // Step 11-b: `nextPromise = ? Call(promiseResolve, C, « nextValue »)`.
+        // The `resolve` it names was read once, before `GetIterator`, so this
+        // is a `Call` per element and no `Get`.
+        //
+        // The receiver is `C`, the constructor `Get(C, "resolve")` was read
+        // from — the ES2015 text said `undefined` here, and the ratified one
+        // says `C`. It is load-bearing, not cosmetic: 27.5.4.7.1 step 3 only
+        // takes the identity resolve when
+        // `SameValue(Get(x, "constructor"), C)`, so a promise element is the
+        // identity only if `promiseResolve` is called *on* `C`.
+        // `built-ins/Promise/{all,race}/invoke-resolve.js` asserts the receiver
+        // directly.
+        let next_promise = self.call_value(promise_resolve, ctor, &[element])?;
+        self.stack.push(next_promise);
+        // Step 12: `then = ? GetV(nextPromise, "then")`. The receiver is
+        // `nextPromise`, and the nullish `TypeError` `GetV` specifies comes
+        // from `get_property` — see [`Self::get_v`].
+        let then_v = self.get_v(next_promise, "then")?;
+        self.stack.push(then_v);
+        // Steps 12-13: the engine counts the element unsettled and either
+        // reports that there is no `then` to invoke (a one-element carrier) or
+        // builds the `[onFulfilled, onRejected]` pair to hand it.
         let carrier = self.combinator_step(state, index, element, then_v, capability.resolve)?;
         // The carrier's length is the whole protocol: one element means there
         // was no callable `then` to invoke, two means the pair to hand it.
@@ -3176,9 +3215,56 @@ impl Interp<'_> {
         let on_fulfilled = self.get_property(0, 0, carrier, zero)?;
         let on_rejected = self.get_property(0, 0, carrier, one)?;
         self.stack.push(carrier);
-        let then = self.callable_or_err(then_v, "then is not callable")?;
-        self.call_value(then, element, &[on_fulfilled, on_rejected])?;
+        self.stack.push(on_fulfilled);
+        self.stack.push(on_rejected);
+        // Step 16: `Perform ? Invoke(nextPromise, "then", « pair »)`. The abrupt
+        // is an element-processing one, so `stream_combinator` closes the
+        // iterator and rejects the capability with it — which is what
+        // `built-ins/Promise/all/invoke-then-get-error-close.js` and
+        // `-reject.js` assert. `Invoke` itself only rejects when `GetV` throws
+        // (a `nullish` `nextPromise`, a step earlier) or when the second read of
+        // `then` is not callable.
+        self.invoke_on(next_promise, "then", &[on_fulfilled, on_rejected])?;
         Ok(())
+    }
+
+    /// `GetV(V, P)` (spec 7.3.9). `get_property` already opens with the
+    /// nullish `TypeError` that `GetV` specifies, so that half needs nothing
+    /// here; the name records which abstract operation the combinator's two
+    /// `then` reads are, because that is what fixes the receiver.
+    ///
+    /// The other half — `ToObject(V)` for a primitive receiver — is the
+    /// engine's general gap, not this path's: `get_property` routes a
+    /// primitive to its string-primitive surface and yields `undefined`
+    /// otherwise, so a number wrapper's `then` is not reachable. It is
+    /// unobservable here in practice, because `Promise.resolve(x)` returns a
+    /// promise for every `x` — a primitive `nextPromise` needs a receiver whose
+    /// own `resolve` returns one, and its wrapper has no `then` either way.
+    fn get_v(&mut self, v: JsValue, name: &str) -> Result<JsValue, JSException> {
+        let key = self.new_temp_key(name);
+        self.get_property(0, 0, v, key)
+    }
+
+    /// `Invoke(V, P, arguments)` (spec 7.3.13): `GetV(V, P)`, an `IsCallable`
+    /// gate, then `Call(f, V, arguments)`.
+    ///
+    /// `Invoke` has no "V must be an Object" step — its only guards are
+    /// `GetV`'s nullish check and `IsCallable` — so a primitive receiver is
+    /// legal and reaches `Call` with the primitive as `this`.
+    ///
+    /// The `GetV` is a *second* read of `P`: the abstract operation does not
+    /// take the value 27.5.4.1 step 12 already read, so a `nextPromise` whose
+    /// `then` becomes non-callable between the two steps throws instead of
+    /// being called.
+    fn invoke_on(
+        &mut self,
+        v: JsValue,
+        name: &str,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let f = self.get_v(v, name)?;
+        let f = self.callable_or_err(f, &format!("{name} is not a function"))?;
+        self.call_value(f, v, args)
     }
 
     /// The non-callable-`then` paths (27.5.4.1 step 11-c / 27.5.4.2 step 8-e):
@@ -3409,8 +3495,29 @@ impl Interp<'_> {
     ) -> Option<Result<JsValue, JSException>> {
         let value = args.first().copied().unwrap_or_else(JsValue::undefined);
         if self.is_engine_promise(value) {
-            // Spec 27.2.1.4 step 1: resolving with a promise is the identity.
-            return Some(Ok(value));
+            // Spec 27.5.4.7.1 `PromiseResolve(C, x)` step 3: the identity is
+            // conditional — `Let xConstructor be ? Get(x, "constructor")` and
+            // `If SameValue(xConstructor, C) is true, return x`. `IsPromise`
+            // alone is not enough, which is what
+            // `built-ins/Promise/resolve/arg-uniq-ctor.js` pins: a promise whose
+            // own `constructor` is `null` is resolved by *building* a new one.
+            //
+            // The read is a machine call, so it belongs here rather than in
+            // `is_engine_promise`; `ReturnIfAbrupt` propagates out of
+            // `Promise.resolve` as a `TypeError` from a throwing getter.
+            self.stack.push(value);
+            let ctor_key = self.new_temp_key("constructor");
+            let x_constructor = self.get_property(0, 0, value, ctor_key);
+            self.stack.pop();
+            let x_constructor = match x_constructor {
+                Ok(x_constructor) => x_constructor,
+                Err(JSException(thrown)) => return Some(Err(JSException(thrown))),
+            };
+            if x_constructor.bits() == this_v.bits() {
+                return Some(Ok(value));
+            }
+            // A different constructor: steps 2-4 still run, so `x` goes through
+            // the ordinary resolving-function path below.
         }
         // Park the argument on the value stack: the `then` read may run a
         // getter, and `gc_protect` republishes the stack as the root set.
