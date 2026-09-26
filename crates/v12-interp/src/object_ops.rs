@@ -530,6 +530,56 @@ impl Interp<'_> {
         h
     }
 
+    /// The realm's `Symbol.species` well-known symbol, as a `PropKey` ready
+    /// for `get_property`.
+    ///
+    /// Read off the realm's `Symbol` constructor exactly like
+    /// [`Self::symbol_iterator_key`], because `Get(C, @@species)` has to use
+    /// *this realm's* symbol identity: the realm installs it as the accessor
+    /// key of `Promise[@@species]`, so a freshly allocated stand-in would
+    /// miss the property and every read would answer `undefined`.
+    ///
+    /// A standalone interpreter with no realm `Symbol` constructor falls back
+    /// to a lazy allocation of its own, which answers nothing — the same
+    /// structural fallback the two iterator keys document.
+    pub(crate) fn species_wk_key(&mut self) -> PropKey {
+        if let Some(h) = self.symbol_species {
+            return PropKey::from_symbol(h);
+        }
+        if let Some(global) = self.global
+            && self.heap.is_realm_global(global)
+            && let Some(ctor) = self
+                .heap
+                .get(global)
+                .properties
+                .get(super::intrinsic_slot("Symbol").expect("Symbol intrinsic"))
+                .copied()
+                .and_then(|v| v.as_object())
+        {
+            // An *own data* slot read, not `get_property`: the `Symbol`
+            // constructor's own `species` property holds the symbol value,
+            // while `Promise[@@species]` (the same key) is an accessor whose
+            // getter returns its receiver. `get_property` here would run that
+            // getter and hand back the constructor.
+            let key = PropKey::from_string(self.heap.intern_text("species"));
+            let shape = self.shape_of(ctor);
+            if let Some(handle) = self
+                .heap
+                .lookup_property(shape, key)
+                .and_then(|desc| desc.slot())
+                .and_then(|slot| self.heap.get(ctor).properties.get(slot as usize))
+                .and_then(|value| value.as_symbol())
+            {
+                self.symbol_species = Some(handle);
+                return PropKey::from_symbol(handle);
+            }
+        }
+        let h = self.heap.alloc(v12_heap::V12Symbol);
+        self.heap.add_root(JsValue::symbol(h));
+        self.symbol_species = Some(h);
+        PropKey::from_symbol(h)
+    }
+
     /// ES IteratorNext (7.4.2): `result = iterator.next()`.
     /// GetMethod gate + result validation: a present non-callable `next`
     /// is a TypeError (same `Kind::Function` gate as `op_iterator_close`),

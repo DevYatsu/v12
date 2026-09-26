@@ -202,6 +202,13 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx = self.promise_ctx(heap);
                 promise::promise_finally(&mut ctx, this, args)
             }
+            // `get Promise [ @@species ]`: installed by the realm as the get
+            // accessor of a symbol-keyed property, so the function object
+            // carries no `prototype` and reaches here by id.
+            NativeId::PromiseSymbolSpeciesGet => {
+                let mut ctx = self.promise_ctx(heap);
+                promise::promise_species_get(&mut ctx, this, args)
+            }
             NativeId::PromiseConstruct => Err(Throw::type_error(
                 heap,
                 "Promise must be constructed with new".to_string(),
@@ -298,6 +305,31 @@ impl v12_native::NativeRegistry for NativeRegistry {
     ) -> Result<(JsValue, JsValue), Throw> {
         let mut ctx = self.promise_ctx(heap);
         promise::capability_pair(&mut ctx, state)
+    }
+
+    /// `PerformPromiseThen` behind a species-selected derived promise.
+    fn promise_perform_then(
+        &mut self,
+        heap: &mut Heap,
+        promise: JsValue,
+        derived: JsValue,
+        on_fulfilled: JsValue,
+        on_rejected: JsValue,
+    ) -> Result<(), Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::promise_perform_then(&mut ctx, promise, derived, on_fulfilled, on_rejected)
+    }
+
+    /// The `finally` watcher behind a species-selected derived promise.
+    fn promise_watch_finally(
+        &mut self,
+        heap: &mut Heap,
+        promise: JsValue,
+        derived: JsValue,
+        on_finally: JsValue,
+    ) -> Result<(), Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::promise_watch_finally(&mut ctx, promise, derived, on_finally)
     }
 
     /// The streaming `Promise.all` / `Promise.race` seam. The interpreter

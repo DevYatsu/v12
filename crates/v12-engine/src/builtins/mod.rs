@@ -351,6 +351,7 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::PromiseThen => Some(2),
         NativeId::PromiseCatch => Some(1),
         NativeId::PromiseFinally => Some(1),
+        NativeId::PromiseSymbolSpeciesGet => Some(0),
         NativeId::ErrorIsError => Some(1),
         NativeId::ErrorProtoToString => Some(0),
         NativeId::ReflectApply => Some(3),

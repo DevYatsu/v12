@@ -566,6 +566,12 @@ pub struct Interp<'a> {
     /// The realm's `Symbol.asyncIterator` well-known symbol (distinct from
     /// `Symbol.iterator`), allocated lazily on first `for await` use.
     symbol_async_iterator: Option<Handle<v12_heap::V12Symbol>>,
+    /// The realm's `Symbol.species` well-known symbol, read off the `Symbol`
+    /// constructor on first `SpeciesConstructor` use (spec 27.5.5.4 step 3).
+    /// Distinct from the two iterator symbols: the realm installs it as the
+    /// *accessor* key of `Promise[@@species]`, so it has to be that exact
+    /// handle, never a freshly allocated stand-in.
+    symbol_species: Option<Handle<v12_heap::V12Symbol>>,
     /// Completion value of the bottom frame when the dispatch loop ends.
     ///
     /// `run` ignores it; `call_object` reads it to return the callee's result.
@@ -684,6 +690,7 @@ impl<'a> Interp<'a> {
             generator_throw_fn: None,
             symbol_iterator: None,
             symbol_async_iterator: None,
+            symbol_species: None,
             top_result: None,
             scratch_roots: Vec::new(),
             pending_awaits: std::collections::VecDeque::new(),

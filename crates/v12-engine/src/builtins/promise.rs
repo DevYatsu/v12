@@ -54,10 +54,15 @@
 //! JobCtx)>`) therefore died there, and the next `settle` wrote through a
 //! stale handle. The pinned set is marked separately and is never cleared.
 //!
-//! Still out of scope: `Symbol.species` constructor selection (every promise
-//! here uses `%Promise%` or the receiver's own `prototype`), and adoption
-//! when a *reaction handler's* return value is a thenable (`settle` writes
-//! the handler's value straight into the derived promise).
+//! Still out of scope: adoption when a *reaction handler's* return value is a
+//! thenable (`settle` writes the handler's value straight into the derived
+//! promise — routing it through the capability's `[[Resolve]]` is the next
+//! task). The species *selection* half is not out of scope any more: the
+//! accessor exists (see [`promise_species_get`]) and
+//! `Interp::species_constructor` reads it, but the derived promise a
+//! species-selected constructor hands back is settled by writing straight into
+//! it, so a subclass that gives itself a custom `[[Resolve]]` is not honoured
+//! yet.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -286,10 +291,53 @@ pub fn promise_then(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     let promise = this.as_object().expect("checked above");
     let handler = args.first().copied().unwrap_or_else(JsValue::undefined);
     let on_rejected = args.get(1).copied().unwrap_or_else(JsValue::undefined);
-    let sink = ctx.pending.clone().unwrap_or_default();
     let prototype = ctx.heap.get(promise).prototype;
     let derived = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
+    let derived_v = JsValue::object(derived);
+    install_then_record(ctx, this, handler, on_rejected, derived_v)?;
+    Ok(derived_v)
+}
 
+/// `get Promise [ @@species ]` (spec 27.5.4.10). The whole body is
+/// `1. Return the this value.`
+///
+/// A bare dispatch id: the realm installs the function object itself (as the
+/// get accessor of a symbol-keyed property with *no* set accessor, so
+/// `Promise[Symbol.species] = x` cannot replace it), because the value has to
+/// be keyed by the realm's canonical `@@species`.
+pub fn promise_species_get(
+    _ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    Ok(this)
+}
+
+/// `PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability)`
+/// with the derived promise already chosen — spec 27.5.5.4 step 7 — reached
+/// through [`promise_perform_then`] once the interpreter has selected the
+/// species constructor and built the capability.
+///
+/// The pending/settled split and the reaction job are the engine's (jobs live
+/// here); only the derived-promise allocation moved out, because 27.5.5.4 step
+/// 5 makes it `resultCapability.[[Promise]]` — the object the selected
+/// constructor constructed, which is user code for a subclass.
+fn install_then_record(
+    ctx: &mut Ctx,
+    this: JsValue,
+    handler: JsValue,
+    on_rejected: JsValue,
+    derived: JsValue,
+) -> Result<(), Throw> {
+    let promise = this.as_object().expect("checked by the caller");
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let derived = derived
+        .as_object()
+        .expect("the derived promise is an object");
+    // The derived promise is reachable from a Rust local for the duration of
+    // this function, and `alloc`/`add_property` below can collect, so it is
+    // pinned rather than rooted (the same reasoning as `push_record`'s dummy).
+    ctx.heap.add_pinned_root(derived);
     let (state, payload) = {
         let p = ctx.heap.get(promise);
         (
@@ -329,7 +377,84 @@ pub fn promise_then(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
             true,
         ),
     }
-    Ok(JsValue::object(derived))
+    Ok(())
+}
+
+/// The [`promise_then`] half behind a derived promise the caller already has
+/// (the interpreter's species-selected capability).
+pub(crate) fn promise_perform_then(
+    ctx: &mut Ctx,
+    promise: JsValue,
+    derived: JsValue,
+    on_fulfilled: JsValue,
+    on_rejected: JsValue,
+) -> Result<(), Throw> {
+    if !is_promise(ctx.heap, promise) {
+        return Err(ctx.type_error("Promise.prototype.then requires a promise"));
+    }
+    install_then_record(ctx, promise, on_fulfilled, on_rejected, derived)
+}
+
+/// The [`promise_finally`] half behind a derived promise the caller already
+/// has.
+pub(crate) fn promise_watch_finally(
+    ctx: &mut Ctx,
+    promise: JsValue,
+    derived: JsValue,
+    on_finally: JsValue,
+) -> Result<(), Throw> {
+    if !is_promise(ctx.heap, promise) {
+        return Err(ctx.type_error("Promise.prototype.finally requires a promise"));
+    }
+    let Some(derived) = derived.as_object() else {
+        return Err(ctx.type_error("finally requires an object receiver"));
+    };
+    let promise_h = promise.as_object().expect("checked above");
+    // Watched for the same reason as `install_then_record`'s derived: pinned,
+    // because the settlement job below captures it in a closure the collector
+    // cannot see.
+    ctx.heap.add_pinned_root(derived);
+    pin(ctx.heap, on_finally);
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let (state, payload) = {
+        let o = ctx.heap.get(promise_h);
+        (
+            o.properties[0].as_smi().unwrap_or(STATE_PENDING),
+            o.properties[1],
+        )
+    };
+    if state == STATE_PENDING {
+        let sink_f = Rc::clone(&sink);
+        let fulfill = alloc_host(ctx.heap, move |_heap, _this, args| {
+            let value = args.first().copied().unwrap_or_else(JsValue::undefined);
+            sink_f.borrow_mut().push(finally_settle_job(
+                derived,
+                on_finally,
+                STATE_FULFILLED,
+                value,
+            ));
+            Ok(JsValue::undefined())
+        });
+        let sink_r = Rc::clone(&sink);
+        let reject = alloc_host(ctx.heap, move |_heap, _this, args| {
+            let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
+            sink_r.borrow_mut().push(finally_settle_job(
+                derived,
+                on_finally,
+                STATE_REJECTED,
+                reason,
+            ));
+            Ok(JsValue::undefined())
+        });
+        push_record(ctx.heap, promise_h, fulfill, reject);
+    } else {
+        // `this` is settled, so nothing else holds its payload once the
+        // watcher record is not installed: pin it for the job below.
+        pin(ctx.heap, payload);
+        sink.borrow_mut()
+            .push(finally_settle_job(derived, on_finally, state, payload));
+    }
+    Ok(())
 }
 
 /// `queueMicrotask(cb)`: enqueues a job that calls `cb` with no arguments.
@@ -1834,55 +1959,30 @@ pub fn promise_race(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
 /// promise — with the original outcome, or with the callback's thrown
 /// value when the callback throws. An already-settled `this` enqueues that
 /// job directly. No polling, so a never-settling `this` costs nothing.
+///
+/// The bare-heap fallback: it allocates its own derived promise carrying the
+/// source's `[[Prototype]]`, because there is no interpreter here to select a
+/// species constructor. The interpreter seam
+/// (`Interp::run_promise_finally`) does it the spec way instead — 27.5.5.8
+/// step 3-4 is the same `SpeciesConstructor(promise, %Promise%)` followed by
+/// `NewPromiseCapability(C)`, and the derived promise is
+/// `resultCapability.[[Promise]]` — and reaches
+/// [`promise_watch_finally`] for the watching half.
 pub fn promise_finally(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     if !is_promise(ctx.heap, this) {
         return Err(ctx.type_error("Promise.prototype.finally requires a promise"));
     }
     let promise = this.as_object().expect("checked above");
     let on_finally = args.first().copied().unwrap_or_else(JsValue::undefined);
-    pin(ctx.heap, on_finally);
     let prototype = ctx.heap.get(promise).prototype;
-    let derived = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
-    let sink = ctx.pending.clone().unwrap_or_default();
-    let (state, payload) = {
-        let o = ctx.heap.get(promise);
-        (
-            o.properties[0].as_smi().unwrap_or(STATE_PENDING),
-            o.properties[1],
-        )
-    };
-    if state == STATE_PENDING {
-        let sink_f = Rc::clone(&sink);
-        let fulfill = alloc_host(ctx.heap, move |_heap, _this, args| {
-            let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-            sink_f.borrow_mut().push(finally_settle_job(
-                derived,
-                on_finally,
-                STATE_FULFILLED,
-                value,
-            ));
-            Ok(JsValue::undefined())
-        });
-        let sink_r = Rc::clone(&sink);
-        let reject = alloc_host(ctx.heap, move |_heap, _this, args| {
-            let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
-            sink_r.borrow_mut().push(finally_settle_job(
-                derived,
-                on_finally,
-                STATE_REJECTED,
-                reason,
-            ));
-            Ok(JsValue::undefined())
-        });
-        push_record(ctx.heap, promise, fulfill, reject);
-    } else {
-        // `this` is settled, so nothing else holds its payload once the
-        // watcher record is not installed: pin it for the job below.
-        pin(ctx.heap, payload);
-        sink.borrow_mut()
-            .push(finally_settle_job(derived, on_finally, state, payload));
-    }
-    Ok(JsValue::object(derived))
+    let derived = JsValue::object(create_promise(
+        ctx.heap,
+        prototype,
+        STATE_PENDING,
+        JsValue::undefined(),
+    ));
+    promise_watch_finally(ctx, this, derived, on_finally)?;
+    Ok(derived)
 }
 
 /// One settlement job for [`promise_finally`]: calls the callback (when

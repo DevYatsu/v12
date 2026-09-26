@@ -83,21 +83,30 @@ fn promise_prototype_has_object_prototype_and_constructor_identity() {
 
 #[test]
 fn species_and_to_string_tag_are_canonical_per_realm() {
+    // `Promise[Symbol.species] === Promise` now holds through the getter, which
+    // returns its receiver — so the descriptor is an *accessor*: there is no
+    // `value` to read. (`Promise.prototype[@@toStringTag]` is still the data
+    // property it has always been.)
     assert_eq!(
         display(
             "let tag = Symbol.toStringTag; \
              throw [Promise[Symbol.species] === Promise, \
              Promise.prototype[tag] === 'Promise', \
              Promise.prototype[Symbol.toStringTag] === 'Promise', \
-             Object.getOwnPropertyDescriptor(Promise, Symbol.species).value === Promise, \
+             typeof Object.getOwnPropertyDescriptor(Promise, Symbol.species).get, \
+             Object.getOwnPropertyDescriptor(Promise, Symbol.species).set === undefined, \
+             Object.getOwnPropertyDescriptor(Promise, Symbol.species).value === undefined, \
              Object.getOwnPropertyDescriptor(Promise.prototype, tag).value === 'Promise'].join(',');"
         ),
-        "true,true,true,true,true"
+        "true,true,true,function,true,true,true"
     );
 }
 
 #[test]
 fn promise_surface_descriptors_match_the_ordinary_builtin_shape() {
+    // The `@@species` slot is the one accessor here: `get` is a function,
+    // `set` is `undefined`, and — because an accessor descriptor has no
+    // `writable` field at all — the third field prints empty.
     assert_eq!(
         display(
             "let data = function (d) { return [typeof d.get, typeof d.set, \
@@ -111,10 +120,10 @@ fn promise_surface_descriptors_match_the_ordinary_builtin_shape() {
              data(Object.getOwnPropertyDescriptor(Promise, 'reject')), \
              data(Object.getOwnPropertyDescriptor(Promise, 'all')), \
              data(Object.getOwnPropertyDescriptor(Promise, 'race')), \
-             data(Object.getOwnPropertyDescriptor(Promise, Symbol.species)), \
-             data(Object.getOwnPropertyDescriptor(Promise.prototype, Symbol.toStringTag)), \
-             Object.keys(Promise.prototype).length, \
-             Object.keys(Promise).length].join(' ');"
+              data(Object.getOwnPropertyDescriptor(Promise, Symbol.species)), \
+              data(Object.getOwnPropertyDescriptor(Promise.prototype, Symbol.toStringTag)), \
+              Object.keys(Promise.prototype).length, \
+              Object.keys(Promise).length].join(' ');"
         ),
         "undefined/undefined/false/false/false \
          undefined/undefined/true/false/true \
@@ -125,7 +134,7 @@ fn promise_surface_descriptors_match_the_ordinary_builtin_shape() {
          undefined/undefined/true/false/true \
          undefined/undefined/true/false/true \
          undefined/undefined/true/false/true \
-         undefined/undefined/false/false/true \
+         function/undefined//false/true \
          undefined/undefined/false/false/true \
          0 0"
     );

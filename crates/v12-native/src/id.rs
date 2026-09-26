@@ -276,6 +276,12 @@ pub enum NativeId {
     /// the all-rejected case rejects with is built by the interpreter, because
     /// `Construct` and a possibly-user `[[Reject]]` are machine operations.
     PromiseAny = 1722,
+    /// The `get Promise [ @@species ]` accessor of 27.5.4.10 — a bare
+    /// dispatch-only id: the realm installs the function object itself (under
+    /// this realm's canonical `@@species` key, as an accessor with no set
+    /// accessor), because the macro installs string-keyed data properties.
+    /// The body is `1. Return the this value.`
+    PromiseSymbolSpeciesGet = 1723,
     QueueMicrotask = 1700,
     // Map / Set
     MapConstruct = 2000,

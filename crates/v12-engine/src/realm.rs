@@ -468,16 +468,18 @@ impl Realm {
             ] {
                 ctx.define_method(Some(promise_proto), name, id, Some(arity));
             }
-            // `Promise[Symbol.species] === Promise`: a non-writable,
-            // non-enumerable, configurable data property (ES 27.2.4). The
-            // accessor it replaces in the spec (`this`) is a later phase —
-            // cross-realm species selection is out of scope for v1's single
-            // realm.
-            ctx.define_symbol_data_prop_with_attrs(
+            // `get Promise [ @@species ]` (ES 27.5.4.10): an accessor with
+            // no set accessor, non-enumerable and configurable, whose whole
+            // body is `1. Return the this value.`. The data property that
+            // stood here was a single-realm stand-in; the getter is what makes
+            // the species *read* per-constructor, which is the mechanism
+            // cross-realm selection needs (and v1 has exactly one realm).
+            ctx.define_symbol_getter(
                 promise_ctor,
                 symbol_species,
-                JsValue::object(promise_ctor),
-                v12_heap::Attrs::new(false, false, true),
+                NativeId::PromiseSymbolSpeciesGet,
+                "get [Symbol.species]",
+                0,
             );
             // `Promise.prototype[Symbol.toStringTag] === "Promise"`, same
             // attributes, reusing this realm's canonical tag symbol.

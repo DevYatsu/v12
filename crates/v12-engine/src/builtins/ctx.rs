@@ -600,6 +600,93 @@ impl<'a> Ctx<'a> {
         getter
     }
 
+    /// Allocates a rooted native getter and installs it as a configurable,
+    /// non-enumerable accessor named `name` on `obj`, with no set accessor.
+    ///
+    /// The symbol-keyed sibling of [`Self::define_size_getter`]: that one is
+    /// hard-wired to the `size` key of `Map`/`Set`, this one takes the key from
+    /// the caller so the realm can install `Promise[@@species]` (spec
+    /// 27.5.4.10) under its own canonical well-known symbol. `getter_name` is
+    /// the function's `name` own prop, which for an accessor is the
+    /// `get `/`set `-prefixed form (`"get [Symbol.species]"`).
+    pub fn define_symbol_getter(
+        &mut self,
+        obj: Handle<JsObject>,
+        sym: Handle<v12_heap::V12Symbol>,
+        id: v12_native::NativeId,
+        getter_name: &str,
+        length: u32,
+    ) -> Handle<JsObject> {
+        let getter = self.alloc_obj(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+            ..Default::default()
+        });
+        self.define_data_prop_with_attrs(
+            getter,
+            "length",
+            JsValue::from_i32_smi(length as i32).expect("getter arity fits Smi"),
+            v12_heap::Attrs::new(false, false, true),
+        );
+        debug_assert_eq!(
+            super::builtin_length(id),
+            Some(length),
+            "installed getter length must match the declared arity"
+        );
+        self.assert_own_data_value(
+            getter,
+            "length",
+            JsValue::from_i32_smi(length as i32).expect("getter arity fits Smi"),
+        );
+        let name_h = self.heap.intern_text(getter_name);
+        self.define_data_prop_with_attrs(
+            getter,
+            "name",
+            JsValue::string(name_h),
+            v12_heap::Attrs::new(false, false, true),
+        );
+        self.assert_own_data_value(getter, "name", JsValue::string(name_h));
+        let key = v12_heap::PropKey::from_symbol(sym);
+        let shape = self.heap.shape_of_mut(obj);
+        debug_assert!(
+            self.heap.lookup_property(shape, key).is_none(),
+            "duplicate symbol accessor install"
+        );
+        let child = self.heap.define_accessor(
+            shape,
+            key,
+            Some(getter),
+            None,
+            v12_heap::Attrs::new(false, false, true),
+        );
+        self.heap.bind_shape(obj, child);
+        // Enforcement (plan §3.4): the bound descriptor is an accessor with a
+        // getter and no set accessor, carrying the declared attrs.
+        let bound = self.heap.shape_of(obj);
+        let desc = self
+            .heap
+            .lookup_property(bound, key)
+            .copied()
+            .expect("freshly installed symbol key must resolve");
+        match desc {
+            v12_heap::Descriptor::Accessor {
+                getter: g,
+                setter: s,
+                ..
+            } => {
+                debug_assert_eq!(g, Some(getter));
+                debug_assert_eq!(s, None, "species accessor has no set accessor");
+            }
+            other => panic!("species slot must be an accessor, found {other:?}"),
+        }
+        debug_assert_eq!(
+            desc.attrs(),
+            v12_heap::Attrs::new(false, false, true),
+            "species accessor attrs must be non-enumerable and configurable"
+        );
+        getter
+    }
+
     /// Debug-only check (plan §3.4): `obj` has an own data descriptor for
     /// `name` whose stored value is `expected`. Fresh builtin function objects
     /// are storage-lockstep (one push per descriptor), so the descriptor slot

@@ -249,6 +249,56 @@ pub trait NativeRegistry {
         ))
     }
 
+    /// `PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability)`
+    /// (spec 27.5.5.4 step 7) with the derived promise already chosen.
+    ///
+    /// The interpreter owns everything up to and including the capability:
+    /// 27.5.5.4 step 3 reads `Get(promise, "constructor")` and
+    /// `Get(C, @@species)` (both can run user code) and step 5 constructs the
+    /// derived promise. What is left is the reaction record on `promise` and,
+    /// for an already-settled source, the job that settles `derived` — and
+    /// jobs live in the engine.
+    ///
+    /// `derived` is `resultCapability.[[Promise]]`: the object the
+    /// species-selected constructor constructed, which for `%Promise%` is an
+    /// ordinary promise and for a subclass is that subclass's own. The
+    /// *settlement* of it still writes the handler's return value straight in
+    /// (adoption through the capability's `[[Resolve]]` is later work), so a
+    /// subclass that supplies a custom resolving function is not honoured yet.
+    ///
+    /// The default implementation refuses: a registry with no promise
+    /// machinery has no reactions to install.
+    fn promise_perform_then(
+        &mut self,
+        _heap: &mut Heap,
+        _promise: JsValue,
+        _derived: JsValue,
+        _on_fulfilled: JsValue,
+        _on_rejected: JsValue,
+    ) -> Result<(), Throw> {
+        Err(Throw::Message(
+            "TypeError: promise reactions are not supported".into(),
+        ))
+    }
+
+    /// The watching half of `Promise.prototype.finally` (spec 27.5.5.8 steps
+    /// 5-13) behind a `derived` promise the caller already has: enqueue the
+    /// callback job when `promise` settles, and settle `derived` with the
+    /// watched outcome.
+    ///
+    /// Default implementation refuses, like [`Self::promise_perform_then`].
+    fn promise_watch_finally(
+        &mut self,
+        _heap: &mut Heap,
+        _promise: JsValue,
+        _derived: JsValue,
+        _on_finally: JsValue,
+    ) -> Result<(), Throw> {
+        Err(Throw::Message(
+            "TypeError: promise reactions are not supported".into(),
+        ))
+    }
+
     /// Exhaustion (`exhausted` is true) or an abrupt element/iterator
     /// completion: returns the value the aggregate's `[[Resolve]]` must be
     /// called with, if any.

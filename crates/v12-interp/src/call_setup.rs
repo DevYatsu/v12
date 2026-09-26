@@ -4,7 +4,7 @@
 
 use v12_heap::{Attrs, Descriptor, Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 
-use super::{CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH};
+use super::{CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH, intrinsic_slot};
 use crate::execute::decode_parked_call;
 use crate::ops;
 use crate::property::OwnDesc;
@@ -1784,6 +1784,16 @@ impl Interp<'_> {
             // routes out-of-range native indices through `dispatch_native`,
             // so intercepting here is what a plain `new` reaches.
             NativeId::PromiseConstruct => Some(self.run_promise_construct(this_v, args)),
+            // `then`/`catch`/`finally` select the derived promise's constructor
+            // (27.5.5.4 step 3, 27.5.5.8 step 3) and then build a capability
+            // from it, so all three are machine work — two `Get`s that can run
+            // user code, then a `Construct`. The engine keeps its own
+            // `promise_then`/`promise_catch`/`promise_finally` as the bare-heap
+            // fallback (no interpreter, no realm, no species to select), which
+            // is also what a non-interpreter embedder reaches.
+            NativeId::PromiseThen => Some(self.run_promise_then(this_v, args)),
+            NativeId::PromiseCatch => Some(self.run_promise_catch(this_v, args)),
+            NativeId::PromiseFinally => Some(self.run_promise_finally(this_v, args)),
             // `new AggregateError(errors, message)` drains `errors` with
             // `IteratorToList` and `ToString`s the message — both run user
             // code, so neither can be a pure `&mut Heap` registry native. The
@@ -3990,6 +4000,190 @@ impl Interp<'_> {
                 Kind::Function | Kind::Proxy | Kind::Promise
             )
         })
+    }
+
+    /// The `SpeciesConstructor(O, defaultConstructor)` sequence of spec
+    /// 27.5.5.4 step 3, inlined.
+    ///
+    /// (It is spelled as its own abstract operation in the ES2015+ *text*, but
+    /// the ratified standard writes the steps out at each use site — there is no
+    /// `SpeciesConstructor` in the operation index — so this is a helper, not a
+    /// named AO, and it is deliberately not exported under that name.)
+    ///
+    /// 1. `C = Get(O, "constructor")`
+    /// 2. `undefined` `C` → `defaultConstructor`
+    /// 3. a non-object `C` → `TypeError`
+    /// 4. `S = Get(C, @@species)`
+    /// 5. `null`/`undefined` `S` → `defaultConstructor`
+    /// 6. a non-constructor `S` → `TypeError`
+    ///
+    /// Both `Get`s run user code (a getter, or a proxy `get` trap), and step 6's
+    /// `IsConstructor` has to follow a proxy exotic to its target, so this is
+    /// interpreter work with [`Self::is_capability_constructor`] as the oracle —
+    /// the same one `NewPromiseCapability` step 1 uses, which is why a proxy in
+    /// front of a constructor passes here and a revoked one does not.
+    pub(crate) fn species_constructor(
+        &mut self,
+        obj: JsValue,
+        default_ctor: JsValue,
+    ) -> Result<JsValue, JSException> {
+        // Step 1. The read can collect, so park the receiver for it.
+        let ctor_key = self.new_temp_key("constructor");
+        self.stack.push(obj);
+        let read = self.get_property(0, 0, obj, ctor_key);
+        self.stack.pop();
+        let c = read?;
+        // Step 2: only `undefined` falls back — a `null` constructor is the
+        // step-3 `TypeError`, which is what makes `p.constructor = null`
+        // throw rather than silently degrade.
+        let c = if c.is_undefined() { default_ctor } else { c };
+        // Step 3.
+        if c.as_object().is_none() {
+            return Err(JSException(
+                self.error_value("TypeError: species constructor is not an object"),
+            ));
+        }
+        // Step 4.
+        let species_key = self
+            .species_wk_key()
+            .symbol()
+            .map(JsValue::symbol)
+            .unwrap_or_else(JsValue::undefined);
+        self.stack.push(c);
+        let read = self.get_property(0, 0, c, species_key);
+        self.stack.pop();
+        let s = read?;
+        // Step 5: both the null and the undefined species fall back.
+        let s = if s.is_null() || s.is_undefined() {
+            default_ctor
+        } else {
+            s
+        };
+        // Step 6.
+        if !self.is_capability_constructor(s) {
+            return Err(JSException(
+                self.error_value("TypeError: species is not a constructor"),
+            ));
+        }
+        Ok(s)
+    }
+
+    /// This realm's `%Promise%`, the `defaultConstructor` 27.5.5.4 step 3 and
+    /// 27.5.5.8 step 3 pass.
+    ///
+    /// Read through the `Promise` intrinsic slot rather than cached in a field,
+    /// so an embedder with no realm answers `undefined` (and the `IsConstructor`
+    /// gate downstream reports the missing constructor) rather than caching a
+    /// stale handle across an install.
+    fn promise_ctor_value(&mut self) -> JsValue {
+        let Some(global) = self.global else {
+            return JsValue::undefined();
+        };
+        let idx = intrinsic_slot("Promise").expect("Promise intrinsic");
+        self.heap
+            .get(global)
+            .properties
+            .get(idx)
+            .copied()
+            .unwrap_or_else(JsValue::undefined)
+    }
+
+    /// `Promise.prototype.then(onFulfilled, onRejected)` (spec 27.5.5.4),
+    /// the interpreter seam.
+    ///
+    /// Steps 1-2 are the receiver check the engine handler also makes; steps
+    /// 3-5 are the species selection and the capability (both need the
+    /// machine — a getter, then a `Construct`); step 6 is the engine's
+    /// reaction record. The derived promise is therefore
+    /// `resultCapability.[[Promise]]`, the object the *selected* constructor
+    /// built, which is the whole observable point of the species read.
+    ///
+    /// The handler's return value still lands in the derived promise by direct
+    /// write (`reaction_job`), not through the capability's `[[Resolve]]` — so a
+    /// species constructor that supplies a custom resolving function is not
+    /// honoured yet. The derived-promise creation is shaped for that change
+    /// (the capability is built here, and its `[[Resolve]]` is one call away).
+    fn run_promise_then(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        if !self.is_promise(this_v) {
+            return Err(JSException(self.error_value(
+                "TypeError: Promise.prototype.then requires a promise",
+            )));
+        }
+        let on_fulfilled = args.first().copied().unwrap_or_else(JsValue::undefined);
+        let on_rejected = args.get(1).copied().unwrap_or_else(JsValue::undefined);
+        let default_ctor = self.promise_ctor_value();
+        let ctor = self.species_constructor(this_v, default_ctor)?;
+        let (derived, _resolve, _reject) = self.new_promise_capability(ctor)?;
+        // Park the derived promise across the engine seam: the record install
+        // allocates, and `gc_protect` (run by the allocation) republishes the
+        // value stack as the root set, so a Rust local would not survive it.
+        let base = self.stack.len();
+        self.stack.push(derived);
+        self.stack.push(on_fulfilled);
+        self.stack.push(on_rejected);
+        self.gc_protect();
+        let installed = self.natives.promise_perform_then(
+            self.heap,
+            this_v,
+            derived,
+            on_fulfilled,
+            on_rejected,
+        );
+        self.stack.truncate(base);
+        installed.map_err(|t| JSException::from_throw(self.heap, t))?;
+        Ok(derived)
+    }
+
+    /// `Promise.prototype.catch(onRejected)` (spec 27.5.5.6): `then` with an
+    /// absent fulfill handler, so it shares the species selection verbatim.
+    fn run_promise_catch(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let on_rejected = args.first().copied().unwrap_or_else(JsValue::undefined);
+        self.run_promise_then(this_v, &[JsValue::undefined(), on_rejected])
+    }
+
+    /// `Promise.prototype.finally(onFinally)` (spec 27.5.5.8), the
+    /// interpreter seam.
+    ///
+    /// Steps 1-4 mirror [`Self::run_promise_then`]: the species selection and
+    /// `NewPromiseCapability` happen here so the derived promise is the one the
+    /// selected constructor built. Steps 5-13 are the engine's watcher.
+    ///
+    /// The callback's *result* is not adopted through the capability's
+    /// `[[Resolve]]`/`[[Reject]]` (27.5.5.8 steps 8-9) — the engine's
+    /// settlement job passes the watched outcome through and only the
+    /// callback's thrown value replaces it. That is the same deferred adoption
+    /// `then` has.
+    fn run_promise_finally(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        if !self.is_promise(this_v) {
+            return Err(JSException(self.error_value(
+                "TypeError: Promise.prototype.finally requires a promise",
+            )));
+        }
+        let on_finally = args.first().copied().unwrap_or_else(JsValue::undefined);
+        let default_ctor = self.promise_ctor_value();
+        let ctor = self.species_constructor(this_v, default_ctor)?;
+        let (derived, _resolve, _reject) = self.new_promise_capability(ctor)?;
+        let base = self.stack.len();
+        self.stack.push(derived);
+        self.gc_protect();
+        let installed = self
+            .natives
+            .promise_watch_finally(self.heap, this_v, derived, on_finally);
+        self.stack.truncate(base);
+        installed.map_err(|t| JSException::from_throw(self.heap, t))?;
+        Ok(derived)
     }
 
     /// `NewPromiseCapability(C)` (spec 27.5.1.5), as
