@@ -18,7 +18,9 @@
 use v12_engine::Engine;
 
 /// Captures the executor's `(resolve, reject)` pair on `globalThis.__cap`.
-/// The executor runs as a microtask job, so the read happens after the drain.
+/// The executor runs synchronously (spec 27.5.1.1 step 5), so `__cap` is
+/// already set when the `new Promise` expression itself returns; the drain
+/// below is only there for tests that settle afterwards.
 const CAPTURE: &str = "globalThis.__cap = null; \
                       new Promise(function (resolve, reject) { \
                         globalThis.__cap = [resolve, reject]; \
@@ -149,9 +151,9 @@ fn capability_function_own_property_order_is_length_then_name() {
 //   visible to the next. `globalThis` is the same object across calls, which is
 //   what the `__cap` capture above already relies on.
 // - Where a value has to be produced in one program and *used* in a later one,
-//   the steps are passed as a slice. The boundary matters: a `new Promise`
-//   executor is enqueued as a job rather than run synchronously, so nothing
-//   the executor defines exists yet during the program that constructs it.
+//   the steps are passed as a slice. The boundary is forced by the host API,
+//   not by promise semantics: `Engine::eval` compiles a fresh program each
+//   time, and a top-level `let` in one program is not visible to the next.
 
 /// Runs each program in `steps` under collection-on-every-safepoint, draining
 /// the job queue between them, then evaluates `read` and returns its display
@@ -224,8 +226,9 @@ fn nested_async_generator_requests_survive_collection() {
 /// is the only thing keeping the pair alive, so a capability reclaimed in the
 /// meantime reads as `callee is not a function` when script later calls it.
 ///
-/// The call has to be a *later* program: the executor is a job, so within the
-/// program that runs `new Promise` the capture slot is still `null`.
+/// The call has to be a *later* program here: each `engine.eval` compiles a
+/// fresh program, so a `let` from one is not in scope in the next — which is
+/// why the two steps below are separate programs sharing `globalThis`.
 #[test]
 fn captured_capability_survives_collection_and_stays_callable() {
     let captured = under_gc_pressure_once(
@@ -255,25 +258,180 @@ fn captured_capability_survives_collection_and_stays_callable() {
     );
 }
 
-/// The `resolve`-captured-out-of-the-executor idiom, which 73 of the failing
-/// `built-ins/Promise` tests use, is **not** unblocked by pinning, and this
-/// test records why. `promise_construct` enqueues the executor as a job rather
-/// than calling it synchronously (the divergence note at the top of the
-/// `promise` module), so the spec order — executor first, then the next
-/// statement — is inverted, and a `resolve` captured in the executor is still
-/// unset when the following statement calls it. That call throws
-/// `callee is not a function` with liveness never at stake; the fix belongs to
-/// the synchronous-executor task, not the root-set task.
+// ---------------------------------------------------------------------------
+// The executor runs synchronously (spec 27.5.1.1 step 5)
+// ---------------------------------------------------------------------------
+//
+// `Call(executor, undefined, « [[Resolve]], [[Reject]] »)` happens before the
+// constructor returns, so script that captures a resolving function can call it
+// in the *same* turn — the idiom 66 of the failing `built-ins/Promise` tests
+// use. Each test below is one program: a `let` would not survive into the
+// follow-up `eval`, so the results travel on `globalThis`.
+
+/// Evaluates `source` — which must do all its own asserting through
+/// `globalThis` — drains the job queue, then reads `read`.
+fn settled(source: &str, read: &str) -> String {
+    let mut engine = Engine::new();
+    engine.eval(source).expect("eval");
+    engine.run_jobs();
+    let value = engine.eval(read).expect("read");
+    engine.to_display_string(value)
+}
+
 #[test]
-fn executor_is_deferred_so_a_same_program_resolve_call_cannot_work() {
-    let source = "globalThis.order = []; \
-                  globalThis.p = new Promise(function (r) { \
-                    globalThis.order.push('exec'); \
-                  }); \
-                  globalThis.order.push('after');";
-    // Spec would be "exec,after"; the deferral makes it "after,exec".
+fn a_captured_resolve_is_callable_in_the_same_turn() {
+    // The resolving function is live the instant `new Promise` returns, so the
+    // very next statement can call it. Before the synchronous executor this
+    // read `undefined` and the call threw `callee is not a function`.
     assert_eq!(
-        under_gc_pressure_once(source, "globalThis.order.join(',');"),
-        "after,exec"
+        settled(
+            "globalThis.__out = 'unset'; \
+             let resolve; \
+             let p = new Promise(function (r) { resolve = r; }); \
+             p.then(function (v) { globalThis.__out = 'fulfilled:' + v; }, \
+                    function (e) { globalThis.__out = 'rejected:' + e; }); \
+             resolve(42);",
+            "globalThis.__out"
+        ),
+        "fulfilled:42"
+    );
+}
+
+#[test]
+fn a_captured_reject_is_callable_in_the_same_turn() {
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let reject; \
+             let p = new Promise(function (r, j) { reject = j; }); \
+             p.then(function (v) { globalThis.__out = 'fulfilled:' + v; }, \
+                    function (e) { globalThis.__out = 'rejected:' + e; }); \
+             reject('boom');",
+            "globalThis.__out"
+        ),
+        "rejected:boom"
+    );
+}
+
+#[test]
+fn the_executor_runs_before_the_statement_after_the_constructor() {
+    // 27.5.1.1 step 5 orders the executor *before* step 7's return, so the log
+    // reads executor-then-after rather than the reverse.
+    assert_eq!(
+        settled(
+            "globalThis.__log = []; \
+             globalThis.p = new Promise(function () { \
+               globalThis.__log.push('executor'); \
+             }); \
+             globalThis.__log.push('after');",
+            "globalThis.__log.join(',')"
+        ),
+        "executor,after"
+    );
+}
+
+#[test]
+fn a_throwing_executor_rejects_the_promise_with_the_thrown_value() {
+    // 27.5.1.1 step 6 `IfAbruptRejectPromise`: the throw becomes the rejection
+    // reason and the constructor still returns the promise.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             globalThis.p = new Promise(function () { throw 'nope'; }); \
+             globalThis.p.then(function (v) { globalThis.__out = 'fulfilled:' + v; }, \
+                               function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "rejected:nope"
+    );
+}
+
+#[test]
+fn the_executor_call_context_is_undefined() {
+    // 27.5.1.1 step 5 passes `undefined` as `this`. Only a *strict* executor
+    // observes it: sloppy `Call(f, undefined, …)` rebinds `this` to the global
+    // object (7.3.14 OrdinaryCallBindThis), which is why test262 pins this in
+    // `executor-call-context-strict.js` with `flags: [onlyStrict]`. Before the
+    // synchronous executor the body never ran at all, so a non-strict reading
+    // would have passed either way — a false pass.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             new Promise(function () { 'use strict'; globalThis.__out = String(this); });",
+            "globalThis.__out"
+        ),
+        "undefined"
+    );
+}
+
+#[test]
+fn a_sloppy_executor_sees_the_global_object_as_its_this() {
+    // The other half of the same rule, and the one that makes the strict pin
+    // above non-vacuous: `this` is coerced, not left as `undefined`.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             new Promise(function () { globalThis.__out = (this === globalThis) ? 'global' : 'other'; });",
+            "globalThis.__out"
+        ),
+        "global"
+    );
+}
+
+#[test]
+fn a_resolution_with_a_non_callable_then_fulfills_and_terminates() {
+    // `resolve({then: null})` is not an adoption (27.2.1.3.1 step 3-b-i): the
+    // promise fulfills with the thenable itself. Routing that through the
+    // ordinary settle re-read the same non-callable `then` and queued the same
+    // job again — the drain spun to its 20 000-job cap and the handler below
+    // never ran, which is what pinned
+    // `Promise/resolve-non-thenable-immed.js` to a full-deadline stall.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let thenable = { then: null }; \
+             let p = new Promise(function (resolve) { resolve(thenable); }); \
+             p.then(function (v) { globalThis.__out = (v === thenable) ? 'same' : 'other'; }, \
+                    function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "same"
+    );
+}
+
+#[test]
+fn a_resolution_with_a_callable_then_is_adopted_synchronously() {
+    // The adoption's `then` call is still a job (spec 27.2.1.3.1 step 3-b-ii
+    // runs at the checkpoint), but the *read* that decides it happened during
+    // the executor, so a getter on `then` is already accounted for by the time
+    // the constructor returns.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let p = new Promise(function (resolve) { \
+               resolve({ then: function (r) { r('via-then'); } }); \
+             }); \
+             p.then(function (v) { globalThis.__out = v; }, \
+                    function (e) { globalThis.__out = 'rejected:' + e; });",
+            "globalThis.__out"
+        ),
+        "via-then"
+    );
+}
+
+#[test]
+fn a_settling_executor_does_not_hide_later_reaction_work() {
+    // The synchronous executor does not collapse the queue: the reaction jobs
+    // its settlement schedules still run at the checkpoint, in FIFO order.
+    assert_eq!(
+        settled(
+            "globalThis.__log = []; \
+             new Promise(function (resolve) { resolve(1); }) \
+               .then(function (v) { globalThis.__log.push('a' + v); }); \
+             Promise.resolve(2).then(function (v) { globalThis.__log.push('b' + v); }); \
+             globalThis.__log.push('sync');",
+            "globalThis.__log.join(',')"
+        ),
+        "sync,a1,b2"
     );
 }

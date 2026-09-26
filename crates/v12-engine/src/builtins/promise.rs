@@ -15,6 +15,13 @@
 //! `properties[0..3] == [fulfill handler, reject handler, derived promise]`;
 //! a handler may be `undefined` (pass-through to the derived promise).
 //!
+//! `new Promise(executor)` splits across the two crates: the capability
+//! ([`promise_capability`] — the promise plus the resolving pair) is engine
+//! work, and the executor call itself is `Interp::run_promise_construct`,
+//! because calling user code needs the machine. Spec 27.5.1.1 step 5 wants
+//! that call *synchronous*, which is why it does not go through a job the way
+//! the thenable adoption below does.
+//!
 //! Thenables (any object with a `then` property) are adopted by
 //! [`capability_settle`]: the resolution decision point moves into a
 //! [`Job`] that the engine's single scheduler already runs, so
@@ -410,6 +417,50 @@ fn capability_settle(
     value: JsValue,
     rejecting: bool,
 ) -> Result<JsValue, JsValue> {
+    settle_with_adoption(
+        heap, sink, promise, resolve_v, reject_v, value, rejecting, true,
+    )
+}
+
+/// [`capability_settle`] with the thenable-adoption step switched off: `value`
+/// is taken as the resolution itself, so a value that is *already* known not to
+/// be adoptable cannot loop back into the adoption that produced it.
+///
+/// The one caller is `thenable_job`'s "present but non-callable `then`" branch
+/// (spec 27.2.1.3.1 step 3-b-i: `FulfillPromise(promise, resolution)`). Going
+/// through `capability_settle` there re-entered `start_thenable_adoption`,
+/// which re-read the same non-callable `then` and queued another job, forever:
+/// `new Promise(r => r({then: null}))` burned the whole run deadline without
+/// ever settling. Pinned by `Promise/resolve-non-thenable-immed.js`.
+#[allow(clippy::too_many_arguments)]
+fn settle_now(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+    resolve_v: JsValue,
+    reject_v: JsValue,
+    value: JsValue,
+    rejecting: bool,
+) -> Result<JsValue, JsValue> {
+    settle_with_adoption(
+        heap, sink, promise, resolve_v, reject_v, value, rejecting, false,
+    )
+}
+
+/// The shared body of [`capability_settle`] and [`settle_now`]. `may_adopt`
+/// selects whether a thenable `value` is handed to a [`thenable_job`] instead
+/// of settling `promise` outright.
+#[allow(clippy::too_many_arguments)]
+fn settle_with_adoption(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+    resolve_v: JsValue,
+    reject_v: JsValue,
+    value: JsValue,
+    rejecting: bool,
+    may_adopt: bool,
+) -> Result<JsValue, JsValue> {
     let still_pending = heap.get(promise).properties[0].as_smi() == Some(STATE_PENDING);
     if !still_pending {
         return Ok(JsValue::undefined());
@@ -451,7 +502,7 @@ fn capability_settle(
         }
         return Ok(JsValue::undefined());
     }
-    if !rejecting && start_thenable_adoption(heap, sink, promise, value) {
+    if may_adopt && !rejecting && start_thenable_adoption(heap, sink, promise, value) {
         // The thenable job owns the settlement from here: `promise` stays
         // pending until the job calls the capability back (or never).
         return Ok(JsValue::undefined());
@@ -651,7 +702,11 @@ fn thenable_job(
             // A present but non-callable `then` is not an adoption: the
             // promise fulfills with the thenable itself (spec 27.2.1.3.1
             // step 3-b-i; pinned by `Promise/resolve/arg-non-thenable.js`).
-            let _ = capability_settle(
+            //
+            // `settle_now`, not `capability_settle`: this branch already *is*
+            // the adoption, so the full path would read the same non-callable
+            // `then` again and queue this very job once more, forever.
+            let _ = settle_now(
                 ctx.heap_mut(),
                 &sink,
                 promise,
@@ -679,68 +734,73 @@ fn thenable_job(
     })
 }
 
-/// `new Promise(executor)`.
+/// `NewPromiseCapability(C)` for `new Promise(executor)`: the pending promise
+/// plus the `[[Resolve]]`/`[[Reject]]` pair the executor receives (spec
+/// 27.5.1.1 step 3, `NewPromiseCapability` 27.2.3.1).
 ///
-/// The executor runs as a microtask job rather than synchronously (natives
-/// cannot re-enter the interpreter): side effects land one checkpoint later.
-/// Spec-conforming scripts that only observe ordering *within* the
-/// asynchronous surface are unaffected. Calling `Promise` without `new`
-/// throws per spec (prepare_construct passes the constructor as `this`; a
-/// plain call's receiver never carries the construct target).
-pub fn promise_construct(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let executor = args.first().copied().unwrap_or_else(JsValue::undefined);
-    if !executor
+/// The three values travel back as one heap array — the same carrier
+/// `combinator::step` uses for its pair — because a registry seam hands over
+/// a single value. The executor itself is *not* run here: calling user code
+/// needs the machine, so 27.5.1.1 step 5 belongs to
+/// `Interp::run_promise_construct`, which owns the synchronous call.
+///
+/// The spec gates are the caller's: `Interp::run_promise_construct` applies
+/// `IsConstructor(C)` through `Interp::is_capability_constructor` (the same
+/// oracle the combinators use, so a proxy in front of `Promise` is honored)
+/// and `IsCallable(executor)` before it gets here, exactly as
+/// `combinator::begin`'s `IsConstructor` gate is applied by
+/// `Interp::run_promise_combinator`.
+pub fn promise_capability(ctx: &mut Ctx, this: JsValue) -> Result<JsValue, Throw> {
+    let prototype = this
         .as_object()
-        .is_some_and(|o| ctx.heap.get(o).kind == Kind::Function)
-    {
-        return Err(ctx.type_error("Promise executor must be a function"));
-    }
-    let is_ctor = |heap: &Heap, v: JsValue| {
-        v.as_object().is_some_and(|o| {
-            matches!(
-                &heap.get(o).callable,
-                v12_heap::FunctionTarget::Bytecode(idx)
-                    if *idx == u32::from(v12_native::NativeId::PromiseConstruct)
-            )
-        })
-    };
-    if !is_ctor(ctx.heap, this) {
-        return Err(ctx.type_error("Promise constructor requires 'new'"));
-    }
-    let ctor = this.as_object().expect("checked above");
-    let prototype = ctx.heap.get(ctor).prototype;
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
     let promise = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
-    let promise_v = JsValue::object(promise);
-
     let pending: Rc<RefCell<Vec<Job>>> = ctx.pending.clone().unwrap_or_default();
-
     // Capability: the resolve/reject function objects handed to the executor.
     // They are ordinary function objects whose targets are host closures
     // capturing the shared pending-jobs sink — host closures cannot touch the
     // interpreter, so reaction settling they trigger joins the same sink
     // `Promise#then` on a settled promise uses.
     let (resolve_v, reject_v) = make_capability(ctx.heap, &pending, promise);
+    let carrier = ctx.heap.alloc(JsObject::array(vec![
+        JsValue::object(promise),
+        resolve_v,
+        reject_v,
+    ]));
+    // Pinned per the module contract: the interpreter holds the three values
+    // in Rust locals across the executor call, and the collector can run
+    // inside it.
+    ctx.heap.add_pinned_root(carrier);
+    Ok(JsValue::object(carrier))
+}
 
-    // The executor joins the pending sink: it runs at the next checkpoint
-    // (see the divergence note above). A throw from the executor rejects the
-    // promise.
-    pin(ctx.heap, executor);
-    let executor_obj = executor.as_object().expect("checked above");
-    let sink = Rc::clone(&pending);
-    let p = promise;
-    let rv = resolve_v;
-    let jv = reject_v;
-    pending
-        .borrow_mut()
-        .push(Box::new(move |ctx: &mut JobCtx<'_, '_>| {
-            match ctx.call_object(executor_obj, JsValue::undefined(), &[resolve_v, reject_v]) {
-                Ok(_) => {}
-                Err(JSException(e)) => {
-                    let _ = capability_settle(ctx.heap_mut(), &sink, p, rv, jv, e, true);
-                }
-            }
-        }));
-    Ok(promise_v)
+/// [`capability_settle`] across the registry seam: the interpreter holds the
+/// capability as values (the promise plus the two resolving functions) while
+/// the heap-level half works in handles.
+///
+/// 27.5.1.1 step 6 `IfAbruptRejectPromise` — an executor that threw rejects its
+/// own promise with the thrown value, and the constructor still returns it.
+pub(crate) fn capability_settle_values(
+    ctx: &mut Ctx,
+    promise: JsValue,
+    resolve_v: JsValue,
+    reject_v: JsValue,
+    value: JsValue,
+    rejecting: bool,
+) -> Result<JsValue, Throw> {
+    // Only the promise needs a handle: the pair is passed straight through to
+    // `capability_settle`, which needs no handles of its own for it.
+    let Some(promise) = promise.as_object() else {
+        // A capability is always a promise object (`promise_capability` builds
+        // it), so a non-object here means the interpreter handed back
+        // something this seam never produced. Nothing to settle.
+        return Ok(JsValue::undefined());
+    };
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let _ = capability_settle(
+        ctx.heap, &sink, promise, resolve_v, reject_v, value, rejecting,
+    );
+    Ok(JsValue::undefined())
 }
 
 /// Builds the `[[Resolve]]`/`[[Reject]]` capability pair for `promise`:

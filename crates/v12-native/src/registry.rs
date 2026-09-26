@@ -85,6 +85,46 @@ pub trait NativeRegistry {
             "TypeError: Function constructor is not supported".into(),
         ))
     }
+    /// `NewPromiseCapability(C)` for `new Promise(executor)`: the pending
+    /// promise plus the `[[Resolve]]`/`[[Reject]]` pair the executor receives
+    /// (spec 27.5.1.1 step 3, `NewPromiseCapability` 27.2.3.1).
+    ///
+    /// Returned as a three-element array `[promise, resolve, reject]` — the
+    /// same carrier `combinator_step` uses for its pair — because a registry
+    /// seam hands over one value. The executor itself is *not* called here:
+    /// that needs the machine, so 27.5.1.1 step 5 runs in the interpreter
+    /// (`Interp::run_promise_construct`), which is what makes it synchronous.
+    ///
+    /// The default implementation refuses: a registry that does not implement
+    /// it has no promise constructor.
+    fn promise_capability(&mut self, _heap: &mut Heap, _ctor: JsValue) -> Result<JsValue, Throw> {
+        Err(Throw::Message(
+            "TypeError: the Promise constructor is not supported".into(),
+        ))
+    }
+
+    /// Settles a capability pair built by [`Self::promise_capability`] —
+    /// 27.5.1.1 step 6 `IfAbruptRejectPromise`, the executor having thrown.
+    /// First settlement wins, so calling this on a promise the executor
+    /// already settled is a no-op.
+    ///
+    /// The default implementation refuses: a registry that does not implement
+    /// it has no promise constructor.
+    #[allow(clippy::too_many_arguments)]
+    fn capability_settle(
+        &mut self,
+        _heap: &mut Heap,
+        _promise: JsValue,
+        _resolve: JsValue,
+        _reject: JsValue,
+        _value: JsValue,
+        _rejecting: bool,
+    ) -> Result<JsValue, Throw> {
+        Err(Throw::Message(
+            "TypeError: the Promise constructor is not supported".into(),
+        ))
+    }
+
     /// `Promise.all` / `Promise.race` — the streaming seam (spec
     /// 27.2.4.1 / 27.2.4.2, `PerformPromiseAll` / `PerformPromiseRace`).
     ///

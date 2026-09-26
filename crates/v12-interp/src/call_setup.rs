@@ -1703,6 +1703,12 @@ impl Interp<'_> {
             // (and `then`-present-but-not-callable) fall through to the
             // registry native, which fulfills with the value as-is.
             NativeId::PromiseResolve => self.run_promise_resolve(this_v, args),
+            // `new Promise(executor)` *calls* the executor, so it cannot run
+            // as a pure registry native — and 27.5.1.1 step 5 wants that call
+            // synchronous, before the constructor returns. `prepare_construct`
+            // routes out-of-range native indices through `dispatch_native`,
+            // so intercepting here is what a plain `new` reaches.
+            NativeId::PromiseConstruct => Some(self.run_promise_construct(this_v, args)),
             NativeId::IteratorMap
             | NativeId::IteratorFilter
             | NativeId::IteratorFlatMap
@@ -3165,6 +3171,103 @@ impl Interp<'_> {
         let result = self.adopt_thenable(this_v, value, then_v, abrupt);
         self.stack.pop();
         Some(result)
+    }
+
+    /// `new Promise(executor)` (spec 27.5.1.1 steps 2-7).
+    ///
+    /// Step 5 is the reason this is not a registry native:
+    /// `Call(executor, undefined, « [[Resolve]], [[Reject]] »)` runs *before* the
+    /// constructor returns, so script that captures a resolving function can
+    /// call it in the same turn. Deferring the call to a checkpoint — which is
+    /// how the thenable adoption below works, because a `then` the script
+    /// supplies is only callable from a job — inverts that order and breaks
+    /// every program that reaches for `resolve` after the `new`.
+    ///
+    /// The three capability values arrive from the engine as one array
+    /// (`NativeRegistry::promise_capability`) and the executor is called here,
+    /// so the machine re-entry this needs stays on this side of the seam.
+    fn run_promise_construct(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        // Step 2: `If IsCallable(executor) is false, throw a TypeError`. Ahead
+        // of the `IsConstructor` check, as the spec orders them.
+        let executor = args.first().copied().unwrap_or_else(JsValue::undefined);
+        self.callable_or_err(executor, "Promise executor is not a function")?;
+        // Step 3: `NewPromiseCapability(C)`, whose first act is
+        // `If IsConstructor(C) is false, throw a TypeError`. `Promise` without
+        // `new` lands here with a receiver that is not the constructor, so this
+        // is also step 1's `NewTarget is undefined` in practice: a plain call's
+        // receiver never carries the construct target. A proxy in front of
+        // `Promise` is honored, as `IsConstructor` on a proxy exotic object
+        // requires.
+        if !self.is_capability_constructor(this_v) {
+            return Err(JSException(
+                self.error_value("TypeError: Promise constructor requires 'new'"),
+            ));
+        }
+        let (promise, resolve, reject) = self.promise_capability(this_v)?;
+        let Some(executor_obj) = executor.as_object() else {
+            unreachable!("callable_or_err rejects a non-object executor")
+        };
+        // The capability pair and the executor live in Rust locals across the
+        // call below, which `gc_protect` cannot see: it republishes the value
+        // stack as the root set, so park all three for its duration (the
+        // `stream_combinator` pattern). `promise` needs no parking — the
+        // engine pins it, as it pins the pair's own closures.
+        let base = self.stack.len();
+        self.stack.push(executor);
+        self.stack.push(resolve);
+        self.stack.push(reject);
+        self.gc_protect();
+        let outcome = self.call_object(executor_obj, JsValue::undefined(), &[resolve, reject]);
+        self.stack.truncate(base);
+        match outcome {
+            Ok(_) => Ok(promise),
+            // Step 6: `IfAbruptRejectPromise` — the throw becomes the rejection
+            // reason, and the constructor still returns the promise.
+            Err(JSException(thrown)) => {
+                self.capability_settle(promise, resolve, reject, thrown, true)?;
+                Ok(promise)
+            }
+        }
+    }
+
+    /// `NewPromiseCapability(C)` over the registry seam: the engine builds the
+    /// promise and the two host-closure resolving functions, and hands all three
+    /// back as one array. Read through the ordinary property path, like
+    /// `combinator_element_calls` reads its pair.
+    fn promise_capability(
+        &mut self,
+        ctor: JsValue,
+    ) -> Result<(JsValue, JsValue, JsValue), JSException> {
+        let capability = self
+            .natives
+            .promise_capability(self.heap, ctor)
+            .map_err(|t| JSException::from_throw(self.heap, t))?;
+        let read = |interp: &mut Self, i: u32| -> Result<JsValue, JSException> {
+            let key = interp.new_temp_key(&i.to_string());
+            interp.get_property(0, 0, capability, key)
+        };
+        let promise = read(self, 0)?;
+        let resolve = read(self, 1)?;
+        let reject = read(self, 2)?;
+        Ok((promise, resolve, reject))
+    }
+
+    /// `capability_settle` over the registry seam, for the step-6 abrupt path.
+    fn capability_settle(
+        &mut self,
+        promise: JsValue,
+        resolve: JsValue,
+        reject: JsValue,
+        value: JsValue,
+        rejecting: bool,
+    ) -> Result<JsValue, JSException> {
+        self.natives
+            .capability_settle(self.heap, promise, resolve, reject, value, rejecting)
+            .map_err(|t| JSException::from_throw(self.heap, t))
     }
 
     /// Allocates the pending promise an adoption settles and queues the

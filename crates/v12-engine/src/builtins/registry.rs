@@ -202,10 +202,10 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx = self.promise_ctx(heap);
                 promise::promise_finally(&mut ctx, this, args)
             }
-            NativeId::PromiseConstruct => {
-                let mut ctx = self.promise_ctx(heap);
-                promise::promise_construct(&mut ctx, this, args)
-            }
+            NativeId::PromiseConstruct => Err(Throw::type_error(
+                heap,
+                "Promise must be constructed with new".to_string(),
+            )),
             NativeId::QueueMicrotask => {
                 let mut ctx = self.promise_ctx(heap);
                 promise::queue_microtask(&mut ctx, this, args)
@@ -258,6 +258,28 @@ impl v12_native::NativeRegistry for NativeRegistry {
             // 3. Runtime map (host functions) or "not registered".
             _ => self.dispatch(heap, this, args, id),
         }
+    }
+
+    /// `NewPromiseCapability(C)` for `new Promise(executor)` — the promise and
+    /// its `[[Resolve]]`/`[[Reject]]` pair as one three-element array.
+    /// The executor call that follows is the interpreter's.
+    fn promise_capability(&mut self, heap: &mut Heap, ctor: JsValue) -> Result<JsValue, Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::promise_capability(&mut ctx, ctor)
+    }
+
+    /// Settles that capability when the executor threw (27.5.1.1 step 6).
+    fn capability_settle(
+        &mut self,
+        heap: &mut Heap,
+        promise: JsValue,
+        resolve: JsValue,
+        reject: JsValue,
+        value: JsValue,
+        rejecting: bool,
+    ) -> Result<JsValue, Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::capability_settle_values(&mut ctx, promise, resolve, reject, value, rejecting)
     }
 
     /// The streaming `Promise.all` / `Promise.race` seam. The interpreter
