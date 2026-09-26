@@ -603,14 +603,19 @@ fn push_record(
 /// `Promise.all(iterable)`: fulfills with an array of results once every
 /// input fulfills, or rejects with the first rejection.
 ///
-/// Only array inputs are supported (the overwhelmingly common shape — every
-/// `Promise.all` Test262 case passes an array): anything else throws a
-/// `TypeError`. Non-promise inputs count as already-fulfilled. Pending
-/// promise inputs are watched by host-closure reaction records appended to
-/// the input's own reactions (the adoption-record shape `capability_settle`
-/// uses): no polling jobs, so never-settling inputs cost nothing and cannot
-/// spin the drain. Arbitrary thenable unwrapping is out of scope (see the
-/// module docs).
+/// Input contract: a `Kind::Array` of already-collected values. In the
+/// engine the interpreter's `run_promise_combinator` seam resolves the real
+/// `@@iterator`, drives `next`/`return` on it (the half that re-enters the
+/// machine), and hands the drained values over as a canonical array — so the
+/// aggregation below never sees a general iterable. Anything else is a
+/// `TypeError`, which keeps the handler usable as a standalone fallback for
+/// a bare-heap embedder with no interpreter. Non-promise inputs count as
+/// already-fulfilled. Pending promise inputs are watched by host-closure
+/// reaction records appended to the input's own reactions (the
+/// adoption-record shape `capability_settle` uses): no polling jobs, so
+/// never-settling inputs cost nothing and cannot spin the drain. Arbitrary
+/// thenable unwrapping is out of scope (see the module docs), as is
+/// `Symbol.species` selection of the constructor.
 pub fn promise_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
     let Some(iter_obj) = iterable.as_object() else {
@@ -684,10 +689,12 @@ pub fn promise_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
 
 /// `Promise.race(iterable)`: settles with the first input's outcome.
 ///
-/// Same array-only input contract as [`promise_all`]. Already-settled
-/// inputs (and non-promise inputs, which count as fulfilled) settle the
-/// aggregate synchronously in iteration order; pending inputs are watched
-/// by host-closure reaction records, first settlement winning.
+/// Same array-of-collected-values input contract as [`promise_all`]: the
+/// interpreter seam resolves the general iterable before the handler sees
+/// it. Already-settled inputs (and non-promise inputs, which count as
+/// fulfilled) settle the aggregate synchronously in iteration order; pending
+/// inputs are watched by host-closure reaction records, first settlement
+/// winning.
 pub fn promise_race(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
     let Some(iter_obj) = iterable.as_object() else {

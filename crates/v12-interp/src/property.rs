@@ -583,6 +583,15 @@ impl Interp<'_> {
             return None;
         }
         let constant = match kind {
+            // The array iterator is synthesized (no realm
+            // `Array.prototype[Symbol.iterator]` property exists), so an
+            // installed override further up the chain would be shadowed by
+            // this surface. Defer to the ordinary lookup when the chain
+            // carries an own `@@iterator` — `for ([...a])`, `Promise.all(a)`
+            // and friends must observe the user function.
+            Kind::Array | Kind::Arguments if self.proto_chain_has_symbol_iterator(obj) => {
+                return None;
+            }
             Kind::Array | Kind::Arguments => crate::NativeId::ArrayIterator,
             Kind::Map => crate::NativeId::MapIterator,
             Kind::Set => crate::NativeId::SetIterator,
@@ -590,6 +599,23 @@ impl Interp<'_> {
             _ => return None,
         };
         Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// True when `obj` or any object on its prototype chain carries an own
+    /// `@@iterator` property. Used to keep the synthesized iterator surfaces
+    /// from shadowing a real override; the walk starts at `obj` because an
+    /// own property shadows the surface too. Bounded by chain length (an
+    /// array's is `Array.prototype` → `Object.prototype` → `null`).
+    fn proto_chain_has_symbol_iterator(&mut self, obj: Handle<JsObject>) -> bool {
+        let key = PropKey::from_symbol(self.symbol_iterator_key());
+        let mut cur = Some(obj);
+        while let Some(p) = cur {
+            if self.ordinary_own_descriptor(p, key).is_some() {
+                return true;
+            }
+            cur = self.heap.get(p).prototype;
+        }
+        false
     }
 
     /// `%IteratorPrototype%`-family instances resolve `next` from the const

@@ -1683,6 +1683,13 @@ impl Interp<'_> {
             NativeId::MapForEach | NativeId::SetForEach => {
                 Some(self.run_collection_for_each(id, this_v, args))
             }
+            // `Promise.all`/`Promise.race` read `@@iterator` and drive
+            // `next`/`return` on user objects, so their iterator half
+            // re-enters the machine; the engine handler stays the
+            // settled-promise aggregation and receives the drained values.
+            NativeId::PromiseAll | NativeId::PromiseRace => {
+                Some(self.run_promise_combinator(id, this_v, args))
+            }
             NativeId::IteratorMap
             | NativeId::IteratorFilter
             | NativeId::IteratorFlatMap
@@ -2829,6 +2836,71 @@ impl Interp<'_> {
                 vec![value]
             };
             self.call_value(JsValue::object(adder), collection, &call_args)?;
+        }
+    }
+
+    /// `Promise.all(iterable)` / `Promise.race(iterable)`: drains the input
+    /// iterable here, then hands the values to the engine handler.
+    ///
+    /// The split is the spec algorithm's own boundary. The iterator half
+    /// (GetIterator, IteratorStep/Value, IteratorClose) reads properties off
+    /// user objects and calls bytecode functions, so it needs the machine;
+    /// the aggregation half only reads promise state and appends host-closure
+    /// reaction records to the engine heap, which no interpreter-only path can
+    /// do (jobs live in `v12-engine`). So this resolves the iterator once,
+    /// consumes every value in order, closes the iterator on any abrupt
+    /// completion (original error winning, per IteratorClose's throw path),
+    /// and forwards a canonical dense array to the handler — which keeps
+    /// array-input behaviour, reaction watchers, and species-less result
+    /// shapes exactly as they were.
+    fn run_promise_combinator(
+        &mut self,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let iterable = args.first().copied().unwrap_or_else(JsValue::undefined);
+        let iterator = self.get_iterator(iterable, false)?;
+        // Yielded values ride on the value stack while collection runs:
+        // `gc_protect` republishes the stack as the root set, so a `next()`
+        // call that allocates cannot free a value held only by this Vec.
+        let base = self.stack.len();
+        match self.collect_iterable_values(iterator) {
+            Ok(values) => {
+                let inputs = crate::call::alloc_array(self, values);
+                self.heap.add_root(inputs);
+                self.stack.truncate(base);
+                self.gc_protect();
+                self.natives
+                    .call_native(self.heap, this_v, &[inputs], id)
+                    .map_err(|t| JSException::from_throw(self.heap, t))
+            }
+            Err(error) => {
+                self.stack.truncate(base);
+                // The original abrupt completion wins over an error raised by
+                // return(), as required by IteratorClose's throw path.
+                self.op_iterator_close(iterator, true)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// ES 7.4.5 IteratorStepValue, drained to exhaustion: `next()`, then the
+    /// `done`/`value` reads. Each yielded value is parked on the value stack
+    /// (see [`Self::run_promise_combinator`]) before the next `next()` call.
+    fn collect_iterable_values(&mut self, iterator: JsValue) -> Result<Vec<JsValue>, JSException> {
+        let mut values = Vec::new();
+        loop {
+            let result = self.op_iterator_next(iterator)?;
+            let done_key = self.new_temp_key("done");
+            let done = self.get_property(0, 0, result, done_key)?;
+            if ops::to_boolean(self.heap, done) {
+                return Ok(values);
+            }
+            let value_key = self.new_temp_key("value");
+            let value = self.get_property(0, 0, result, value_key)?;
+            self.stack.push(value);
+            values.push(value);
         }
     }
 
