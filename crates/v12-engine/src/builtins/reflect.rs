@@ -643,6 +643,7 @@ fn is_constructor(heap: &Heap, obj: Handle<JsObject>) -> bool {
                     | v12_native::NativeId::SyntaxErrorCreate
                     | v12_native::NativeId::EvalErrorCreate
                     | v12_native::NativeId::UriErrorCreate
+                    | v12_native::NativeId::AggregateErrorCreate
             ),
             Err(_) => true,
         },

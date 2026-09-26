@@ -417,6 +417,9 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
     // contract as `Proxy` above.
     "EvalError",
     "URIError",
+    // Appended (never mid-inserted): index 23. Same append-only contract as
+    // `EvalError`/`URIError` above.
+    "AggregateError",
 ];
 
 /// Offset of user-declared global slots in the global object's `properties`.
@@ -458,6 +461,7 @@ pub const GLOBAL_ACCESS_INTRINSICS: &[&str] = &[
     "Proxy",
     "EvalError",
     "URIError",
+    "AggregateError",
 ];
 
 /// Human-readable opcode name; exhaustive so a new variant fails to compile

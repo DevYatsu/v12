@@ -215,6 +215,10 @@ pub enum NativeId {
     UriErrorCreate = 1608,
     ErrorIsError = 1609,
     ErrorProtoToString = 1610,
+    /// `new AggregateError(errors, message)`. The interpreter seam drains
+    /// `errors` with `IteratorToList` and `ToString`s the message first (both
+    /// run user code); this id receives the drained array.
+    AggregateErrorCreate = 1611,
     ObjectConstruct = 1605,
     ArrayConstruct = 1606,
     // JSON

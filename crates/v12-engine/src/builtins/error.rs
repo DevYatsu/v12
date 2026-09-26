@@ -64,6 +64,57 @@ pub fn uri_error_create(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resu
     error_create_named(ctx, "URIError", args)
 }
 
+/// `AggregateError(errors, message)` – 27.5.5.1. **Not** an
+/// `error_create_named` variant: `errors` is a list the interpreter seam
+/// drains with `IteratorToList` (any iterable, not an array), and `message`
+/// has already been `ToString`ed there because both run user code.
+///
+/// What is left is pure `&mut Heap` work, so it lives here: a
+/// `%AggregateError.prototype%`-linked `[[ErrorData]]` object carrying a
+/// non-enumerable `errors` and — only when one was supplied — `message`.
+///
+/// Install order is `name`, `message`?, `errors`, `constructor`. `name` first
+/// keeps `properties[0]`/`[1]` the name/message pair the `Kind::Error`
+/// display paths read positionally (`engine/display.rs`,
+/// `Interp::to_display_string`); with no `message` the `errors` array lands at
+/// slot 1, where `as_string()` fails and the renderer falls back to the bare
+/// name, which is the right text anyway.
+pub fn aggregate_error_create(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let errors = args.first().copied().unwrap_or(JsValue::undefined());
+    let message = args.get(1).copied().unwrap_or(JsValue::undefined());
+    let obj = ctx.alloc_obj(v12_heap::JsObject {
+        kind: v12_heap::Kind::Error,
+        ..Default::default()
+    });
+    let name_h = ctx.heap.intern_text("AggregateError");
+    ctx.define_data_prop(obj, "name", JsValue::string(name_h));
+    // Step 5: `message` only when it was not `undefined` — an absent
+    // `message` argument installs no own property at all.
+    if !message.is_undefined() {
+        ctx.define_data_prop(obj, "message", message);
+    }
+    // Step 6: `errors`, non-enumerable (`Attrs::BUILTIN` = w + c, not e).
+    ctx.define_data_prop(obj, "errors", errors);
+    // 27.5.5.1 step 2: `OrdinaryCreateFromConstructor(NewTarget,
+    // "%AggregateError.prototype%")` — the realm linked the class prototype
+    // to the constructor's `prototype` field, so mirror `error_object`'s
+    // lookup (by intrinsic name, since the dispatch `Ctx` carries no global).
+    if let Some(ctor) = ctx.intrinsic("AggregateError")
+        && ctor.as_object().is_some()
+    {
+        ctx.define_data_prop(obj, "constructor", ctor);
+        let ctor_obj = ctor.as_object().expect("checked above");
+        if let Some(proto) = ctx.heap.get(ctor_obj).prototype {
+            ctx.heap.get_mut(obj).prototype = Some(proto);
+        }
+    }
+    Ok(JsValue::object(obj))
+}
+
 /// `Error.isError(value)` – whether `value` is an error object (any class).
 pub fn error_is_error(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let is_error = args

@@ -1139,6 +1139,9 @@ define_builtins! {
     UriErrorCreate => |heap, this, args| call_ctx(error::uri_error_create, heap, this, args),
     ErrorIsError => |heap, this, args| call_ctx(error::error_is_error, heap, this, args),
     ErrorProtoToString => |heap, this, args| call_ctx(error::error_proto_to_string, heap, this, args),
+    AggregateErrorCreate => {
+        |heap, this, args| call_ctx(error::aggregate_error_create, heap, this, args)
+    },
     ObjectConstruct => |heap, this, args| call_ctx(object::object_construct, heap, this, args),
     ArrayConstruct => |heap, this, args| call_ctx(array::array_construct, heap, this, args),
     MapConstruct => |heap, this, args| call_ctx(map::map_construct, heap, this, args),

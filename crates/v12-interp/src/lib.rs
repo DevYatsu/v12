@@ -177,6 +177,9 @@ fn intrinsic_slot(text: &str) -> Option<usize> {
         "Proxy" => Some(intrinsic_idx("Proxy").expect("intrinsic 'Proxy' present")),
         "EvalError" => Some(intrinsic_idx("EvalError").expect("intrinsic 'EvalError' present")),
         "URIError" => Some(intrinsic_idx("URIError").expect("intrinsic 'URIError' present")),
+        "AggregateError" => {
+            Some(intrinsic_idx("AggregateError").expect("intrinsic 'AggregateError' present"))
+        }
         _ => None,
     }
 }

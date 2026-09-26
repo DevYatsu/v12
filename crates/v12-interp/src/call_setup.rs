@@ -1770,6 +1770,11 @@ impl Interp<'_> {
             // routes out-of-range native indices through `dispatch_native`,
             // so intercepting here is what a plain `new` reaches.
             NativeId::PromiseConstruct => Some(self.run_promise_construct(this_v, args)),
+            // `new AggregateError(errors, message)` drains `errors` with
+            // `IteratorToList` and `ToString`s the message — both run user
+            // code, so neither can be a pure `&mut Heap` registry native. The
+            // engine handler gets the drained array and builds the instance.
+            NativeId::AggregateErrorCreate => Some(self.run_aggregate_error(this_v, args)),
             NativeId::IteratorMap
             | NativeId::IteratorFilter
             | NativeId::IteratorFlatMap
@@ -2098,7 +2103,8 @@ impl Interp<'_> {
                 | NativeId::ReferenceErrorCreate
                 | NativeId::SyntaxErrorCreate
                 | NativeId::EvalErrorCreate
-                | NativeId::UriErrorCreate)
+                | NativeId::UriErrorCreate
+                | NativeId::AggregateErrorCreate)
         )
     }
 
@@ -4257,6 +4263,101 @@ impl Interp<'_> {
         elems.extend(undefineds);
         self.heap.get_mut(obj).replace_elements(elems);
         Ok(JsValue::object(obj))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `AggregateError` (27.5.5.1)
+// ---------------------------------------------------------------------------
+
+impl Interp<'_> {
+    /// `AggregateError ( errors [ , message ] [ , options ] )`.
+    ///
+    /// Split across the two seams, exactly like the `Promise` combinators:
+    /// `ToString(message)` and `IteratorToList(errors)` both run user code, so
+    /// they happen here; the instance itself is a pure `&mut Heap`
+    /// allocation and stays in the registry native
+    /// ([`NativeId::AggregateErrorCreate`]), which receives the drained array.
+    ///
+    /// The engine's `drain_iterator` was not an option: it drives
+    /// `Kind::Iterator` objects (the array/map/set natives) through their
+    /// `elements` state, so it cannot see a generator's iterator, a string, or
+    /// a plain object with a `@@iterator` method — which is most of what
+    /// `IteratorToList` has to accept.
+    fn run_aggregate_error(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let base = self.stack.len();
+        // Step 4: `message = ? ToString(message)` when it is not `undefined`,
+        // and *before* the iterator is touched —
+        // `built-ins/AggregateError/order-of-args-evaluation.js` pins that
+        // superclass-then-subclass order.
+        let message = match args.get(1).copied() {
+            Some(v) if !v.is_undefined() => {
+                let s = self.to_string_value(v)?;
+                self.stack.push(s);
+                s
+            }
+            _ => JsValue::undefined(),
+        };
+        // Step 3: `errors = ? IteratorToList(errors)`.
+        let iterable = args.first().copied().unwrap_or(JsValue::undefined());
+        self.stack.push(iterable);
+        let list = self.iterator_to_list(iterable)?;
+        // Step 4 proper: `CreateArrayFromList`.
+        self.gc_protect();
+        let errors = crate::call::alloc_array(self, list);
+        self.heap.add_root(errors);
+        let result = self
+            .natives
+            .call_native(
+                self.heap,
+                this_v,
+                &[errors, message],
+                NativeId::AggregateErrorCreate,
+            )
+            .map_err(|t| JSException::from_throw(self.heap, t));
+        self.stack.truncate(base);
+        result
+    }
+
+    /// `IteratorToList(iterable)` (spec 7.4.23) — the drain half of
+    /// 27.5.5.1 step 3, over [`Self::get_iterator`] and
+    /// [`Self::op_iterator_next`] so every `GetMethod`/`IsCallable` gate and
+    /// every user `next` runs the ordinary machine path.
+    ///
+    /// No `IteratorClose` on an abrupt: `IteratorToList` has no close step
+    /// (unlike the `Promise` combinators' element loop).
+    fn iterator_to_list(&mut self, iterable: JsValue) -> Result<Vec<JsValue>, JSException> {
+        let iterator = self.get_iterator(iterable, false)?;
+        let base = self.stack.len();
+        // Parked for the whole loop: `gc_protect` republishes the stack as the
+        // root set, and every `next()` call can collect.
+        self.stack.push(iterator);
+        let mut out = Vec::new();
+        let outcome = loop {
+            let result = match self.op_iterator_next(iterator) {
+                Ok(result) => result,
+                Err(JSException(thrown)) => break Err(thrown),
+            };
+            let done_key = self.new_temp_key("done");
+            let done = match self.get_property(0, 0, result, done_key) {
+                Ok(done) => done,
+                Err(JSException(thrown)) => break Err(thrown),
+            };
+            if ops::to_boolean(self.heap, done) {
+                break Ok(out);
+            }
+            let value_key = self.new_temp_key("value");
+            match self.get_property(0, 0, result, value_key) {
+                Ok(value) => out.push(value),
+                Err(JSException(thrown)) => break Err(thrown),
+            }
+        };
+        self.stack.truncate(base);
+        outcome.map_err(JSException)
     }
 }
 

@@ -561,6 +561,7 @@ fn intrinsic_slot(name: &str) -> Option<usize> {
         "Proxy" => 20,
         "EvalError" => 21,
         "URIError" => 22,
+        "AggregateError" => 23,
         _ => return None,
     };
     debug_assert!(v12_bytecode::GLOBAL_INTRINSICS.get(idx) == Some(&name));

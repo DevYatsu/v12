@@ -183,6 +183,48 @@ impl Realm {
             crate::builtins::install_ctor(heap, ctor, proto);
             wire_callable(heap, &intrinsics, name, native);
         }
+        // `AggregateError` (27.5.5) joins the family but is wired apart: the
+        // constructor is not an `error_create_named` variant — the `errors`
+        // list is drained by the interpreter seam
+        // (`Interp::run_aggregate_error`), because `IteratorToList` and
+        // `ToString(message)` both run user code and cannot be a pure
+        // `&mut Heap` registry native.
+        if let Some(ctor) = intrinsics.get("AggregateError").and_then(|v| v.as_object()) {
+            let proto = alloc_root(heap);
+            heap.get_mut(proto).prototype = Some(error_proto);
+            let name_h = heap.intern_text("AggregateError");
+            crate::builtins::builtin_install_prop(heap, proto, "name", JsValue::string(name_h));
+            // 27.5.5.2's prototype list is `name` + `constructor` only, but
+            // test262 `prototype/message.js` asserts `message` as an *own*
+            // `{w: true, e: false, c: true}` property, so stamp the inherited
+            // empty string the same way `Error.prototype` does.
+            let empty_h = heap.intern_text("");
+            crate::builtins::builtin_install_prop(heap, proto, "message", JsValue::string(empty_h));
+            crate::builtins::install_ctor(heap, ctor, proto);
+            // `length`/`name` on the constructor, exactly as `Proxy` above:
+            // the intrinsic placeholders carry neither, and there is no other
+            // name surface for them.
+            let agg_name = heap.intern_text("AggregateError");
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            ctx.define_data_prop_with_attrs(
+                ctor,
+                "length",
+                JsValue::from_i32_smi(2).expect("2 fits Smi"),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            ctx.define_data_prop_with_attrs(
+                ctor,
+                "name",
+                JsValue::string(agg_name),
+                v12_heap::Attrs::new(false, false, true),
+            );
+            wire_callable(
+                heap,
+                &intrinsics,
+                "AggregateError",
+                NativeId::AggregateErrorCreate,
+            );
+        }
         // Point the placeholder constructors that are already callable at
         // their native seam (out-of-range bytecode → native registry).
         wire_callable(heap, &intrinsics, "Object", NativeId::ObjectConstruct);
