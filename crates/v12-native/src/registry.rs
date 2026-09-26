@@ -125,6 +125,41 @@ pub trait NativeRegistry {
         ))
     }
 
+    /// The `GetCapabilitiesExecutor` builtin of `NewPromiseCapability` (spec
+    /// 27.5.1.5 steps 3-4): a `CreateBuiltinFunction(executorClosure, 2, "",
+    /// «»)` that records `(resolve, reject)` into `state`'s two slots, throws a
+    /// `TypeError` if either slot is already set, and otherwise returns
+    /// `undefined`.
+    ///
+    /// `state` is the `PromiseCapability Record` the interpreter allocated in
+    /// step 2; it is a plain two-slot object, and the collector cannot see the
+    /// handle the host closure captures, so an implementation must root it (see
+    /// `Heap::add_pinned_root`).
+    ///
+    /// The default implementation refuses: a registry with no promise
+    /// machinery cannot build a capability executor.
+    fn capability_executor(&mut self, _heap: &mut Heap, _state: JsValue) -> Result<JsValue, Throw> {
+        Err(Throw::Message(
+            "TypeError: promise capabilities are not supported".into(),
+        ))
+    }
+
+    /// The recorded `(resolve, reject)` pair of a `PromiseCapability Record`
+    /// (spec 27.5.1.5 step 7, the two `IsCallable` checks left to the caller).
+    /// Both halves are `undefined` until the executor from
+    /// [`Self::capability_executor`] has been called.
+    ///
+    /// The default implementation refuses, like [`Self::capability_executor`].
+    fn capability_pair(
+        &mut self,
+        _heap: &mut Heap,
+        _state: JsValue,
+    ) -> Result<(JsValue, JsValue), Throw> {
+        Err(Throw::Message(
+            "TypeError: promise capabilities are not supported".into(),
+        ))
+    }
+
     /// `Promise.all` / `Promise.race` — the streaming seam (spec
     /// 27.2.4.1 / 27.2.4.2, `PerformPromiseAll` / `PerformPromiseRace`).
     ///

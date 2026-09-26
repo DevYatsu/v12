@@ -152,6 +152,59 @@ fn create_promise(
     promise
 }
 
+/// The instance a `Promise` construction initializes, when the receiver is
+/// already the object to initialize (spec 27.5.1.1, arm B of
+/// [`promise_capability`]).
+///
+/// `None` means arm A: allocate a fresh promise. That covers the constructor
+/// itself, every other callable receiver, and a proxy in front of one — a
+/// proxy is callable, so it belongs on the arm-A side even though it is neither
+/// a `Kind::Function` nor a promise, and turning one into a `Kind::Promise`
+/// would be meaningless.
+fn in_place_instance(heap: &Heap, this: JsValue) -> Option<v12_heap::Handle<JsObject>> {
+    let instance = this.as_object()?;
+    if !matches!(heap.get(instance).kind, Kind::Promise)
+        && !matches!(heap.get(instance).kind, Kind::Function | Kind::Proxy)
+        && !is_promise(heap, this)
+    {
+        Some(instance)
+    } else {
+        None
+    }
+}
+
+/// Arm B of [`promise_capability`]: turns `instance` into a pending promise
+/// where it stands.
+///
+/// `create_promise` is exactly these three fields plus an allocation, and the
+/// allocation is the part arm B does not do — spec 9.7.1's `[[Construct]]`
+/// chain already made the object (`OrdinaryCreateFromConstructor`) before the
+/// base constructor ran, so the base fills it in. The receiver is therefore
+/// fresh: no own property exists to lose, which is why `property_keys` is left
+/// alone rather than resized to match.
+fn init_promise_in_place(
+    heap: &mut Heap,
+    instance: v12_heap::Handle<JsObject>,
+) -> v12_heap::Handle<JsObject> {
+    let reactions = heap.alloc(JsObject::array(Vec::new()));
+    heap.add_pinned_root(reactions);
+    // The reserved promise shape, as `alloc_promise` binds it, so a
+    // user-defined own property added after `super(...)` is numbered past the
+    // three internal slots instead of aliasing them.
+    let promise_shape = heap.promise_shape();
+    let obj = heap.get_mut(instance);
+    obj.shape = promise_shape;
+    obj.kind = Kind::Promise;
+    obj.properties = smallvec::smallvec![
+        smi(STATE_PENDING),
+        JsValue::undefined(),
+        JsValue::object(reactions)
+    ];
+    // `[[Prototype]]` stays as the construct chain set it (`new_target.prototype`).
+    heap.add_pinned_root(instance);
+    instance
+}
+
 /// `Promise.resolve(x)`: identity for promises; otherwise a fulfilled promise
 /// carrying `x` (`undefined` when the argument is missing).
 ///
@@ -750,11 +803,39 @@ fn thenable_job(
 /// and `IsCallable(executor)` before it gets here, exactly as
 /// `combinator::begin`'s `IsConstructor` gate is applied by
 /// `Interp::run_promise_combinator`.
+///
+/// The receiver picks the arm, per [`in_place_instance`]:
+///
+/// - **Arm A** — the receiver is the constructor (or a callable wrapper on it),
+///   so a *fresh* promise is allocated with `[[Prototype]]` read off the
+///   receiver's `prototype` field, which is where `%Promise.prototype%` lives.
+/// - **Arm B** — the receiver is already the instance a derived constructor's
+///   `super(executor)` made, so it is initialized in place and keeps the
+///   `[[Prototype]]` the construct chain gave it (`newTarget.prototype`).
+///   Without this arm a subclass's promise was a different object from the one
+///   its constructor body had been given, and `super(executor)` threw
+///   `TypeError: Promise constructor requires 'new'` on the way.
+///
+///   Arm B is also what `Promise.call(obj, executor)` and
+///   `Reflect.apply(Promise, obj, « executor »)` reach, because a derived
+///   `super(…)` is lowered to a `Call` and is therefore indistinguishable from
+///   them at this seam: all three initialize `obj` as a promise, where a real
+///   engine throws for the first two (`%Promise%` has no `[[Call]]`). That is
+///   the one documented v1 divergence of this path;
+///   `promise_call_on_a_plain_object_initializes_it_in_place` pins it as a test
+///   rather than leaving it an accident. Making the three distinguishable needs
+///   the compiler to lower `super(…)` to a real `Construct` with a
+///   `newTarget` — a separate change, not a promise one.
 pub fn promise_capability(ctx: &mut Ctx, this: JsValue) -> Result<JsValue, Throw> {
-    let prototype = this
-        .as_object()
-        .and_then(|ctor| ctx.heap.get(ctor).prototype);
-    let promise = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
+    let promise = match in_place_instance(ctx.heap, this) {
+        Some(instance) => init_promise_in_place(ctx.heap, instance),
+        None => {
+            let prototype = this
+                .as_object()
+                .and_then(|ctor| ctx.heap.get(ctor).prototype);
+            create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined())
+        }
+    };
     let pending: Rc<RefCell<Vec<Job>>> = ctx.pending.clone().unwrap_or_default();
     // Capability: the resolve/reject function objects handed to the executor.
     // They are ordinary function objects whose targets are host closures
@@ -772,6 +853,66 @@ pub fn promise_capability(ctx: &mut Ctx, this: JsValue) -> Result<JsValue, Throw
     // inside it.
     ctx.heap.add_pinned_root(carrier);
     Ok(JsValue::object(carrier))
+}
+
+/// `NewPromiseCapability`'s `GetCapabilitiesExecutor` builtin (spec 27.5.1.5
+/// steps 3-4), for the seam where the record is filled in *by* the
+/// constructor rather than handed to it ready-made.
+///
+/// `state` is the `PromiseCapability Record` the interpreter allocated in step
+/// 2: a two-slot object whose `[[Resolve]]`/`[[Reject]]` start `undefined`. The
+/// returned function is `CreateBuiltinFunction(executorClosure, 2, "", «»)`:
+/// `length: 2`, `name: ""`, `%Function.prototype%`, and no own `prototype`
+/// (which is what keeps it non-constructible).
+///
+/// Called, it throws a `TypeError` if either slot is already set and otherwise
+/// records the two arguments and returns `undefined` — so the pair
+/// `NewPromiseCapability` ends up with is exactly the pair the constructor's own
+/// code received. `Construct` itself is the interpreter's; a host closure runs
+/// synchronously inside it and needs no job.
+pub(crate) fn capability_executor(ctx: &mut Ctx, state: JsValue) -> Result<JsValue, Throw> {
+    let Some(record) = state.as_object() else {
+        return Err(Throw::Message(
+            "TypeError: the capability record is not an object".into(),
+        ));
+    };
+    // The collector cannot see the handle this closure captures, and the
+    // interpreter drops its own reference the moment `Construct` returns, so
+    // the record is pinned for the rest of the run.
+    ctx.heap.add_pinned_root(record);
+    let executor = alloc_host(ctx.heap, move |heap, _this, args| {
+        let unset = heap.get(record).properties[0].is_undefined()
+            && heap.get(record).properties[1].is_undefined();
+        if !unset {
+            return Err(v12_native::error_object(
+                heap,
+                "TypeError",
+                "capability resolve/reject functions already set",
+            ));
+        }
+        heap.get_mut(record).properties[0] =
+            args.first().copied().unwrap_or_else(JsValue::undefined);
+        heap.get_mut(record).properties[1] =
+            args.get(1).copied().unwrap_or_else(JsValue::undefined);
+        Ok(JsValue::undefined())
+    });
+    let func = executor.as_object().expect("alloc_host returns an object");
+    shape_builtin_function(ctx, func, 2);
+    Ok(executor)
+}
+
+/// The recorded `(resolve, reject)` pair of a `PromiseCapability Record` (spec
+/// 27.5.1.5 step 7). Both halves are `undefined` until the executor has run;
+/// the caller applies the two `IsCallable` checks, so a constructor that
+/// ignored its executor surfaces as a `TypeError` from the interpreter.
+pub(crate) fn capability_pair(ctx: &mut Ctx, state: JsValue) -> Result<(JsValue, JsValue), Throw> {
+    let Some(record) = state.as_object() else {
+        return Err(Throw::Message(
+            "TypeError: the capability record is not an object".into(),
+        ));
+    };
+    let obj = ctx.heap.get(record);
+    Ok((obj.properties[0], obj.properties[1]))
 }
 
 /// [`capability_settle`] across the registry seam: the interpreter holds the
@@ -858,6 +999,18 @@ pub(crate) fn make_capability(
 /// Stamps the spec shape of a 27.5.1.3 resolving function onto `func`:
 /// `length: 1`, then `name: ""`, and `[[Prototype]] = %Function.prototype%`.
 ///
+/// Thin wrapper over [`shape_builtin_function`] with the resolving functions'
+/// arity — the pair is the only `CreateBuiltinFunction` in this module with
+/// `length: 1`, so the arity is spelled at the call site rather than threaded
+/// through every caller.
+pub(crate) fn shape_resolving_function(ctx: &mut Ctx, func: v12_heap::Handle<JsObject>) {
+    shape_builtin_function(ctx, func, 1);
+}
+
+/// Stamps the spec shape of a promise `CreateBuiltinFunction` result onto
+/// `func`: `length: <arity>`, then `name: ""`, and
+/// `[[Prototype]] = %Function.prototype%`.
+///
 /// The order of the two installs is observable — test262
 /// `built-ins/Promise/prototype/then/reject-function-property-order.js` pins
 /// `length` before `name` — so `length` goes first. No own `prototype` property
@@ -866,14 +1019,14 @@ pub(crate) fn make_capability(
 /// without one.
 ///
 /// Shape only: no settlement, ordering, or combinator behaviour changes here.
-pub(crate) fn shape_resolving_function(ctx: &mut Ctx, func: v12_heap::Handle<JsObject>) {
+fn shape_builtin_function(ctx: &mut Ctx, func: v12_heap::Handle<JsObject>, arity: i32) {
     if let Some(proto) = ctx.function_proto() {
         ctx.heap.get_mut(func).prototype = Some(proto);
     }
     ctx.define_data_prop_with_attrs(
         func,
         "length",
-        JsValue::from_i32_smi(1).expect("resolving-function arity 1 fits Smi"),
+        JsValue::from_i32_smi(arity).expect("builtin arity fits Smi"),
         v12_heap::Attrs::new(false, false, true),
     );
     let empty = ctx.heap.intern_text("");

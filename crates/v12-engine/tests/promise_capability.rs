@@ -435,3 +435,321 @@ fn a_settling_executor_does_not_hide_later_reaction_work() {
         "sync,a1,b2"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 27.5.1.5 NewPromiseCapability — the capability executor
+// ---------------------------------------------------------------------------
+//
+// `NewPromiseCapability(C)` is the spec's own constructor path: it makes a
+// `PromiseCapability Record`, hands `C` a `GetCapabilitiesExecutor` builtin,
+// and reads the recorded pair back out *after* the `Construct` returned. The
+// pair the record ends up holding is therefore exactly the pair the
+// constructor's own code received — the difference from 27.5.1.1, where the
+// resolving functions are created up front and the executor is only handed
+// them.
+//
+// The two halves sit on either side of the registry seam: the interpreter owns
+// the `IsConstructor` gate, the `Construct` call and the post-hoc callable
+// checks; the engine owns the executor object and the record. The engine half
+// is asserted here directly against the two `NativeRegistry` methods (a bare
+// heap, no interpreter needed); the interpreter half is asserted in
+// `v12-interp`'s `promise_capability_seam.rs`, which is the only level at
+// which `Construct` is reachable without a combinator rewiring that belongs to
+// a later task.
+
+use v12_engine::builtins::registry::NativeRegistry as EngineNatives;
+use v12_heap::{FunctionTarget, GcPolicy, Handle, Heap, JsObject, JsValue, Kind, PropKey};
+use v12_native::NativeRegistry as _;
+
+/// 27.5.1.5 step 2: a fresh `PromiseCapability Record` — a two-slot object
+/// whose `[[Resolve]]`/`[[Reject]]` both start out `undefined`.
+fn capability_record(heap: &mut Heap) -> Handle<JsObject> {
+    heap.alloc(JsObject::ordinary(
+        smallvec::smallvec![JsValue::undefined(), JsValue::undefined()],
+        smallvec::smallvec![None; 2],
+    ))
+}
+
+/// Reads one own data property out of the shape, as `(value, attrs)`.
+fn own_prop(heap: &mut Heap, obj: Handle<JsObject>, name: &str) -> (JsValue, v12_heap::Attrs) {
+    let key = PropKey::from_string(heap.intern_text(name));
+    let shape = heap.shape_of(obj);
+    let desc = heap
+        .lookup_property(shape, key)
+        .copied()
+        .unwrap_or_else(|| panic!("`{name}` must be an own property"));
+    let slot = desc.slot().expect("`{name}` must be a data property") as usize;
+    (heap.get(obj).properties[slot], desc.attrs())
+}
+
+/// Invokes a host-closure function object directly — the capability executor
+/// is one, and a bare heap has no interpreter to `Call` it through.
+fn call_host(heap: &mut Heap, func: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    let h = func.as_object().expect("callee is an object");
+    match heap.get(h).callable {
+        FunctionTarget::Host(closure) => closure.call(heap, JsValue::undefined(), args),
+        _ => panic!("the capability executor must be a host function"),
+    }
+}
+
+/// The error name of a thrown value, read off the `[name, message]` layout
+/// `JsObject::error` uses.
+fn error_name(heap: &mut Heap, thrown: JsValue) -> String {
+    let h = thrown.as_object().expect("a TypeError is an object");
+    assert_eq!(heap.get(h).kind, Kind::Error, "the throw must be an error");
+    let name = heap.get(h).properties[0];
+    let h = name.as_string().expect("the error name is a string");
+    heap.flatten(h);
+    match &heap.get(h).storage {
+        v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
+        _ => String::new(),
+    }
+}
+
+/// A pair of distinct function objects to hand the executor as
+/// `[[Resolve]]`/`[[Reject]]`.
+fn fake_pair(heap: &mut Heap) -> (JsValue, JsValue) {
+    let mk = |heap: &mut Heap| {
+        let f = heap.alloc(JsObject::function(FunctionTarget::Bytecode(u32::MAX), None));
+        heap.add_pinned_root(f);
+        JsValue::object(f)
+    };
+    (mk(heap), mk(heap))
+}
+
+#[test]
+fn the_capability_executor_has_length_two_and_an_empty_name() {
+    // 27.5.1.5 step 4: `CreateBuiltinFunction(executorClosure, 2, "", «»)`.
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut natives = EngineNatives::new();
+    let state = capability_record(&mut heap);
+    let executor = natives
+        .capability_executor(&mut heap, JsValue::object(state))
+        .expect("capability executor");
+    let h = executor.as_object().expect("executor is an object");
+
+    assert_eq!(own_prop(&mut heap, h, "length").0.as_smi(), Some(2));
+    let empty = JsValue::string(heap.intern_text(""));
+    assert_eq!(own_prop(&mut heap, h, "name").0, empty);
+    // Same `BUILTIN` attrs the resolving functions carry: both properties are
+    // non-writable, non-enumerable, configurable.
+    let builtin = v12_heap::Attrs::new(false, false, true);
+    assert_eq!(own_prop(&mut heap, h, "length").1, builtin);
+    assert_eq!(own_prop(&mut heap, h, "name").1, builtin);
+    // `length` before `name`, as `Promise/prototype/then/reject-function-property-order.js`
+    // pins for the resolving pair.
+    let length_key = PropKey::from_string(heap.intern_text("length"));
+    let keys = heap.get(h).property_keys.clone();
+    assert_eq!(keys[0].expect("`length` has a key"), length_key);
+    // `«»`: the builtin carries no own `prototype`, which is what keeps it
+    // non-constructible.
+    let prototype_key = PropKey::from_string(heap.intern_text("prototype"));
+    assert!(
+        heap.lookup_property(heap.shape_of(h), prototype_key)
+            .is_none(),
+        "the capability executor must have no own `prototype` property"
+    );
+}
+
+#[test]
+fn the_capability_executor_records_the_pair_and_returns_undefined() {
+    // 27.5.1.5 step 3: with both slots `undefined`, store the two functions
+    // and return `undefined` — the constructor's own `Construct` result is the
+    // object, not the executor's return value.
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut natives = EngineNatives::new();
+    let state = capability_record(&mut heap);
+    let executor = natives
+        .capability_executor(&mut heap, JsValue::object(state))
+        .expect("capability executor");
+    let (resolve, reject) = fake_pair(&mut heap);
+
+    assert_eq!(
+        call_host(&mut heap, executor, &[resolve, reject]).expect("first call"),
+        JsValue::undefined()
+    );
+    let (got_resolve, got_reject) = natives
+        .capability_pair(&mut heap, JsValue::object(state))
+        .expect("capability pair");
+    assert_eq!(got_resolve, resolve);
+    assert_eq!(got_reject, reject);
+}
+
+#[test]
+fn calling_the_capability_executor_twice_throws_a_type_error() {
+    // 27.5.1.5 step 3, the guard: `If resolvingFunctions.[[Resolve]] is not
+    // undefined or rejectingFunctions.[[Reject]] is not undefined, throw a
+    // TypeError`. A `NewPromiseCapability` consumer that keeps the executor and
+    // calls it again is the only way to reach it, and the throw must not
+    // disturb the pair already recorded.
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut natives = EngineNatives::new();
+    let state = capability_record(&mut heap);
+    let executor = natives
+        .capability_executor(&mut heap, JsValue::object(state))
+        .expect("capability executor");
+    let (resolve, reject) = fake_pair(&mut heap);
+    call_host(&mut heap, executor, &[resolve, reject]).expect("first call");
+
+    let (other_resolve, other_reject) = fake_pair(&mut heap);
+    let thrown = call_host(&mut heap, executor, &[other_resolve, other_reject])
+        .expect_err("the second call must throw");
+    assert_eq!(error_name(&mut heap, thrown), "TypeError");
+
+    // The record still holds the *first* pair: the guard throws before either
+    // store, so it is not a silent overwrite.
+    let (got_resolve, got_reject) = natives
+        .capability_pair(&mut heap, JsValue::object(state))
+        .expect("capability pair");
+    assert_eq!((got_resolve, got_reject), (resolve, reject));
+}
+
+#[test]
+fn a_constructor_that_never_calls_the_executor_leaves_the_record_unset() {
+    // The half of 27.5.1.5 steps 7-8 this seam can see: both slots stay
+    // `undefined`, which is what makes the interpreter's `IsCallable` gate
+    // throw for a constructor that ignores its executor.
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut natives = EngineNatives::new();
+    let state = capability_record(&mut heap);
+    let _executor = natives
+        .capability_executor(&mut heap, JsValue::object(state))
+        .expect("capability executor");
+
+    let (resolve, reject) = natives
+        .capability_pair(&mut heap, JsValue::object(state))
+        .expect("capability pair");
+    assert_eq!(resolve, JsValue::undefined());
+    assert_eq!(reject, JsValue::undefined());
+}
+
+// ---------------------------------------------------------------------------
+// 27.5.1.1 with a derived constructor, and `Construct` reached from Reflect
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_derived_constructor_initializes_its_own_instance_as_the_promise() {
+    // `super(executor)` in a derived class is spec 9.7.1's `[[Construct]]`
+    // chain: the base constructor initializes the receiver the derived
+    // `OrdinaryCreateFromConstructor` already made, it does not allocate a
+    // second object. Before the in-place arm the base allocated a *fresh*
+    // promise and threw `TypeError: Promise constructor requires 'new'` on the
+    // way, so the whole idiom was unavailable.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             class X extends Promise { \
+               constructor(executor) { super(executor); } \
+             } \
+             globalThis.p = new X(function (resolve) { resolve(7); }); \
+             globalThis.__shape = [p instanceof X, p instanceof Promise, \
+                                   p.constructor === X].join(','); \
+             globalThis.p.then(function (v) { globalThis.__out = 'v:' + v; }, \
+                              function (e) { globalThis.__out = 'e:' + e; });",
+            "globalThis.__out + '|' + globalThis.__shape"
+        ),
+        "v:7|true,true,true"
+    );
+}
+
+#[test]
+fn a_derived_constructor_own_properties_land_on_the_initialized_promise() {
+    // The `this.tag = 1` half of the same idiom, split out because of a
+    // pre-existing rule that is not this task's to change: `is_promise` counts
+    // the three internal slots *exactly*, so an own property added to a promise
+    // stops it answering as one, and `Promise.prototype.then` then throws
+    // `requires a promise`. That is true of a plain `new Promise(...)` too, and
+    // `is_promise`'s own comment names the `ctor-null` / `uniq-ctor` tests that
+    // pin the exact count. So this asserts what *is* observable — the property
+    // is on the promise the base constructor made — and the test above covers
+    // settlement.
+    assert_eq!(
+        settled(
+            "class X extends Promise { \
+               constructor(executor) { super(executor); this.tag = 1; } \
+             } \
+             let p = new X(function (resolve) { resolve(7); }); \
+             globalThis.__out = [p instanceof X, p instanceof Promise, p.tag, \
+                                 p.constructor === X].join(',');",
+            "globalThis.__out"
+        ),
+        "true,true,1,true"
+    );
+}
+
+#[test]
+fn reflect_construct_on_promise_runs_the_executor() {
+    // `Reflect.construct(Promise, « executor »)` is the same 27.5.1.1 body as
+    // `new Promise(executor)`; only the Call seam differs. This pins that the
+    // constructor is in the interpreter's constructor oracle — the `%Promise%`
+    // callable is an out-of-range bytecode index, so the oracle has to name it
+    // explicitly for `Reflect.construct` to route it at all.
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let p = Reflect.construct(Promise, [function (resolve) { resolve(3); }]); \
+             p.then(function (v) { globalThis.__out = 'v:' + v; }, \
+                    function (e) { globalThis.__out = 'e:' + e; });",
+            "globalThis.__out"
+        ),
+        "v:3"
+    );
+}
+
+#[test]
+fn reflect_construct_on_a_subclass_yields_the_subclass_instance() {
+    // `newTarget` is the subclass, so the capability promise's
+    // `[[Prototype]]` is `X.prototype` and the result is an `X` — which is only
+    // true because arm B keeps the prototype the construct chain installed
+    // instead of overwriting it with the receiver's own `prototype` field.
+    assert_eq!(
+        settled(
+            "class X extends Promise {} \
+             let p = Reflect.construct(X, [function (resolve) { resolve(1); }]); \
+             p.then(function () {}); \
+             globalThis.__out = [p instanceof X, p instanceof Promise].join(',');",
+            "globalThis.__out"
+        ),
+        "true,true"
+    );
+}
+
+#[test]
+fn promise_call_on_a_plain_object_initializes_it_in_place() {
+    // The one documented v1 divergence, pinned as a test so it stays a
+    // decision: because a derived `super(executor)` reaches `%Promise%` through
+    // the *Call* seam, `Promise.call(obj, executor)` and
+    // `Reflect.apply(Promise, obj, « executor »)` are indistinguishable from it
+    // here, so all three initialize `obj` as a promise. Real engines throw for
+    // the first two (`%Promise%` has no `[[Call]]`); making them
+    // distinguishable needs the compiler to lower `super(…)` to a real
+    // `Construct` with a `newTarget`, which is a separate change.
+    //
+    // `r === o` and `r.then(…)` working are the substance. `o instanceof
+    // Promise` is *false* and correctly so: arm B initializes in place and
+    // leaves `[[Prototype]]` alone, so the receiver keeps whatever prototype
+    // it was born with (`%Object.prototype%` for a plain `{}`).
+    assert_eq!(
+        settled(
+            "globalThis.__out = 'unset'; \
+             let o = {}; \
+             let r = Promise.call(o, function (resolve) { resolve(5); }); \
+             globalThis.__same = (r === o); \
+             r.then(function (v) { globalThis.__out = 'v:' + v; }, \
+                    function (e) { globalThis.__out = 'e:' + e; });",
+            "globalThis.__out + '|' + globalThis.__same"
+        ),
+        "v:5|true"
+    );
+    assert_eq!(
+        settled(
+            "let o = {}; \
+             let r = Promise.call(o, function () {}); \
+             globalThis.__out = [r === o, o instanceof Promise, \
+                                 Object.getPrototypeOf(o) === Object.prototype].join(',');",
+            "globalThis.__out"
+        ),
+        "true,false,true"
+    );
+}

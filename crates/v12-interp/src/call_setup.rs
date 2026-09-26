@@ -2002,51 +2002,35 @@ impl Interp<'_> {
         }
     }
 
-    /// `IsConstructor(C)` for `NewPromiseCapability` (spec 27.2.4.1 step 6 /
-    /// 27.2.4.2 step 3), which is what makes `Promise.all.call(eval, …)`
-    /// throw a `TypeError` before the iterator is touched.
+    /// `IsConstructor(C)` for `NewPromiseCapability` (spec 27.5.1.5 step 1,
+    /// 27.2.4.1 step 6 / 27.2.4.2 step 3), which is what makes
+    /// `Promise.all.call(eval, …)` throw a `TypeError` before the iterator is
+    /// touched, and what keeps a derived `super(executor)`'s pre-made instance
+    /// out of the gate in `run_promise_construct`.
     ///
-    /// [`Self::is_constructor_object`] answers for program functions and the
-    /// constructible engine natives, but the `Promise` constructor itself is
-    /// wired as an out-of-range bytecode index
-    /// ([`NativeId::PromiseConstruct`]) that the `new` path routes through the
-    /// registry — so it *is* a constructor even though that predicate does not
-    /// list it. Naming it here keeps the combinator check honest without
-    /// widening the shared oracle, which `Reflect.construct` also reads and
-    /// which still rejects it. A proxy in front of the constructor inherits the
-    /// answer, per `IsConstructor` on a proxy exotic object.
+    /// Now just [`Self::is_constructor_object`]: `%Promise%` is wired as an
+    /// out-of-range bytecode index ([`NativeId::PromiseConstruct`]) and
+    /// [`Self::native_constructor_id`] names it, so the shared oracle answers
+    /// for it and `Reflect.construct(Promise, …)` reaches the construct path as
+    /// well. A proxy in front of the constructor inherits the answer, per
+    /// `IsConstructor` on a proxy exotic object (and a proxy with no target
+    /// answers false there too, revoked or not).
     fn is_capability_constructor(&mut self, v: JsValue) -> bool {
         let Some(obj) = v.as_object() else {
             return false;
         };
-        if self.heap.get(obj).kind == Kind::Proxy {
-            // A proxy with no target is not constructible; a revocable one
-            // answers false, which `is_constructor_object` also does.
-            return match self.heap.get(obj).proxy_target {
-                Some(target) => self.is_capability_constructor(JsValue::object(target)),
-                None => false,
-            };
-        }
-        if self.heap.get(obj).kind == Kind::Function
-            && matches!(
-                self.heap.get(obj).callable,
-                v12_heap::FunctionTarget::Bytecode(idx)
-                    if idx == u32::from(NativeId::PromiseConstruct)
-            )
-        {
-            return true;
-        }
         self.is_constructor_object(obj)
     }
 
     /// True when a bytecode-table index names one of the engine's
-    /// constructor-shaped natives (`new Object/Array/Boolean/Error/…`).
+    /// constructor-shaped natives (`new Object/Array/Boolean/Error/Promise/…`).
     fn native_constructor_id(&self, idx: u32) -> bool {
         matches!(
             NativeId::try_from(idx),
             Ok(NativeId::ObjectConstruct
                 | NativeId::ArrayConstruct
                 | NativeId::BooleanConstruct
+                | NativeId::PromiseConstruct
                 | NativeId::ErrorCreate
                 | NativeId::TypeErrorCreate
                 | NativeId::RangeErrorCreate
@@ -3202,7 +3186,13 @@ impl Interp<'_> {
         // receiver never carries the construct target. A proxy in front of
         // `Promise` is honored, as `IsConstructor` on a proxy exotic object
         // requires.
-        if !self.is_capability_constructor(this_v) {
+        //
+        // The gate is skipped when the receiver is already the instance — a
+        // derived constructor's `super(executor)`, which is a `Call` with the
+        // pre-made `this`, not a `Construct`. The engine's
+        // `promise_capability` initializes that object in place rather than
+        // allocating a second one, so this arm returns the receiver itself.
+        if !self.promise_instance_receiver(this_v) && !self.is_capability_constructor(this_v) {
             return Err(JSException(
                 self.error_value("TypeError: Promise constructor requires 'new'"),
             ));
@@ -3268,6 +3258,105 @@ impl Interp<'_> {
         self.natives
             .capability_settle(self.heap, promise, resolve, reject, value, rejecting)
             .map_err(|t| JSException::from_throw(self.heap, t))
+    }
+
+    /// True when `this_v` is the object a derived constructor's
+    /// `super(executor)` passes — a `Call`, not a `Construct`, so the receiver
+    /// is the pre-made instance rather than the constructor.
+    ///
+    /// A deliberately shallow mirror of the engine's `in_place_instance`
+    /// (which is the authority on whether the receiver really is initialized in
+    /// place): both are structural header reads, and the two agreeing is what
+    /// keeps the `IsConstructor` gate from rejecting a legitimate subclass
+    /// while still rejecting `Promise.call({})`-shaped nonsense from arm A's
+    /// perspective. A disagreement would surface as a `TypeError`, never as a
+    /// mis-shaped object.
+    fn promise_instance_receiver(&self, this_v: JsValue) -> bool {
+        this_v.as_object().is_some_and(|obj| {
+            !matches!(
+                self.heap.get(obj).kind,
+                Kind::Function | Kind::Proxy | Kind::Promise
+            )
+        })
+    }
+
+    /// `NewPromiseCapability(C)` (spec 27.5.1.5), as
+    /// `(promise, resolve, reject)`.
+    ///
+    /// The spec's own constructor path, and the one that differs from 27.5.1.1
+    /// in kind rather than in detail: the resolving pair is *not* built here.
+    /// Step 3 makes a `PromiseCapability Record`, step 5 hands `C` a
+    /// `GetCapabilitiesExecutor` builtin, step 6 is a `Construct` that runs `C`
+    /// — so the pair ends up being whatever `C`'s own code passed in — and steps
+    /// 7-8 read it back and check it.
+    ///
+    /// Step 6 is why this is an interpreter method and not a registry native:
+    /// `Construct` on an arbitrary `C` is a machine operation, and it is
+    /// synchronous user code (the spec has no job queue between steps 5 and 7).
+    ///
+    /// Steps 1, 6 and 7-8 are the whole reason this is not
+    /// `Interp::promise_capability`: that one takes a ready-made pair and
+    /// returns a freshly allocated promise, which is 27.5.1.1's shape.
+    pub fn new_promise_capability(
+        &mut self,
+        ctor: JsValue,
+    ) -> Result<(JsValue, JsValue, JsValue), JSException> {
+        // Step 1: `If IsConstructor(C) is false, throw a TypeError exception`.
+        // Ahead of everything else, so a non-constructor never reaches the
+        // `Construct` below.
+        if !self.is_capability_constructor(ctor) {
+            return Err(JSException(self.error_value(
+                "TypeError: promise constructor is not a constructor",
+            )));
+        }
+        // Step 2: the `PromiseCapability Record` — a plain two-slot object,
+        // `[[Resolve]]` and `[[Reject]]` both `undefined`. The engine's
+        // `capability_executor` records into it and `capability_pair` reads it
+        // back, so it is a real heap object rather than interpreter state.
+        let state = self.heap.alloc(JsObject {
+            properties: smallvec::smallvec![JsValue::undefined(), JsValue::undefined()],
+            property_keys: smallvec::smallvec![None; 2],
+            ..JsObject::default()
+        });
+        self.heap.add_pinned_root(state);
+        // Step 4-5: the `GetCapabilitiesExecutor` builtin. It is a host closure,
+        // so calling it needs no machine and needs no job.
+        let executor = self
+            .natives
+            .capability_executor(self.heap, JsValue::object(state))
+            .map_err(|t| JSException::from_throw(self.heap, t))?;
+        // Step 6: `Construct(C, « executor »)` — the constructor's own code runs
+        // here, synchronously.
+        //
+        // The record and the executor live in Rust locals across that call,
+        // which `gc_protect` cannot see: it republishes the value stack as the
+        // root set, so park both for its duration (the `run_promise_construct`
+        // pattern). This is belt to the registry's braces rather than the load-
+        // bearing root — `capability_executor`'s contract has it pinning the
+        // record for the *rest of the run*, which is the window this park does
+        // not cover — but the interpreter should not have to trust an
+        // implementation to have read that contract for the window it can see
+        // itself. `new_target` is `C` itself, per the spec's single argument.
+        let base = self.stack.len();
+        self.stack.push(JsValue::object(state));
+        self.stack.push(executor);
+        self.gc_protect();
+        let ctor_obj = ctor.as_object().expect("IsConstructor implies an object");
+        let constructed = self.construct_object(ctor_obj, &[executor], ctor);
+        self.stack.truncate(base);
+        let promise = constructed?;
+        // Step 7: read the recorded pair back.
+        let (resolve, reject) = self
+            .natives
+            .capability_pair(self.heap, JsValue::object(state))
+            .map_err(|t| JSException::from_throw(self.heap, t))?;
+        // Step 8: `If IsCallable(resolve) is false, throw a TypeError` (and the
+        // same for `reject`). A constructor that ignored its executor, or passed
+        // something uncallable, lands here — 27.5.1.1 has no equivalent check,
+        // which is what makes `new Promise(function () {})` legal there.
+        self.callable_or_err(resolve, "Promise resolve function is not callable")?;
+        self.callable_or_err(reject, "Promise reject function is not callable")?;
+        Ok((promise, resolve, reject))
     }
 
     /// Allocates the pending promise an adoption settles and queues the

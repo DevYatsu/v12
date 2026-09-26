@@ -282,6 +282,24 @@ impl v12_native::NativeRegistry for NativeRegistry {
         promise::capability_settle_values(&mut ctx, promise, resolve, reject, value, rejecting)
     }
 
+    /// `NewPromiseCapability(C)`'s `GetCapabilitiesExecutor` builtin (spec
+    /// 27.5.1.5 steps 3-4). `Construct` is the interpreter's, so this is only
+    /// the object: a host closure over the record's two slots.
+    fn capability_executor(&mut self, heap: &mut Heap, state: JsValue) -> Result<JsValue, Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::capability_executor(&mut ctx, state)
+    }
+
+    /// The recorded `(resolve, reject)` pair (spec 27.5.1.5 step 7).
+    fn capability_pair(
+        &mut self,
+        heap: &mut Heap,
+        state: JsValue,
+    ) -> Result<(JsValue, JsValue), Throw> {
+        let mut ctx = self.promise_ctx(heap);
+        promise::capability_pair(&mut ctx, state)
+    }
+
     /// The streaming `Promise.all` / `Promise.race` seam. The interpreter
     /// drives it one element at a time (it owns the iterator and the calls
     /// into user code); the engine owns the aggregate promise, the results
