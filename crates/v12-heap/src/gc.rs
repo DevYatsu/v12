@@ -304,6 +304,18 @@ pub struct Heap {
     /// roots for the engine lifetime and keep their cells transitively live.
     module_roots: Vec<Handle<JsObject>>,
 
+    /// Handles pinned for the heap's lifetime by embedder code that owns an
+    /// object the *Rust* side keeps a bare handle to — the engine's promise
+    /// module is the only user (see [`Heap::add_pinned_root`]).
+    ///
+    /// Unlike the ordinary root set, this one is never cleared: the
+    /// interpreter's `gc_protect` republishes its own state by
+    /// `roots.clear()`-ing first, which silently drops every `add_root` an
+    /// embedder made. Pinning is a deliberate over-approximation — it trades
+    /// reclamation for soundness, because an object only captured by a
+    /// collector-invisible Rust closure has no other way to stay live.
+    pinned_roots: Vec<Handle<JsObject>>,
+
     /// `Symbol.for` registry: key string → the single shared symbol for
     /// that key on this heap (spec: one registry per agent; per-heap
     /// here). Handles are GC roots (marked at each collection start,
@@ -385,6 +397,7 @@ impl Heap {
             interned_strings: rustc_hash::FxHashMap::default(),
             realm_globals: Vec::new(),
             module_roots: Vec::new(),
+            pinned_roots: Vec::new(),
             symbol_registry: rustc_hash::FxHashMap::default(),
             symbol_registry_reverse: rustc_hash::FxHashMap::default(),
             stub_cache: StubCache::new(),
@@ -479,6 +492,27 @@ impl Heap {
     pub fn add_module_root(&mut self, object: Handle<JsObject>) {
         if !self.module_roots.contains(&object) {
             self.module_roots.push(object);
+        }
+    }
+
+    /// Pins `object` as a GC root for the heap's whole lifetime.
+    ///
+    /// Use this — not [`Heap::add_root`] — when the *only* remaining reference
+    /// to an object is a bare `Handle` held by Rust (a job closure, a
+    /// capability record, a pending-jobs sink entry). The ordinary root set is
+    /// transient by design: `Interp::gc_protect` republishes it from scratch
+    /// (`roots.clear()` first) at every safepoint, so an `add_root` from
+    /// outside the interpreter is discarded by the next collection that
+    /// follows it, and the handle it guarded goes stale.
+    ///
+    /// Pinning is permanent and has no unpin counterpart: an object that must
+    /// outlive an arbitrary number of interpreter safepoints has no sound
+    /// reclamation point this design can express. The cost is bounded by the
+    /// embedder's object count, so callers should pin only what a collector
+    /// cannot otherwise trace.
+    pub fn add_pinned_root(&mut self, object: Handle<JsObject>) {
+        if !self.pinned_roots.contains(&object) {
+            self.pinned_roots.push(object);
         }
     }
 
@@ -1403,6 +1437,12 @@ impl Heap {
         }
         for &module_object in &self.module_roots {
             collector.mark(Space::Objects, module_object.index());
+        }
+        // Pinned roots are permanent for the same reason: the Rust side holds a
+        // bare handle with no other path to the object, so a reclaimed slot
+        // would be a use-after-free rather than a missed cache.
+        for &pinned in &self.pinned_roots {
+            collector.mark(Space::Objects, pinned.index());
         }
         // Canonical string instances are permanent roots: the interning
         // table promises deduplication for the heap's whole lifetime, so a

@@ -30,9 +30,22 @@
 //! with the value itself.
 //!
 //! Promises, reaction records, reaction arrays, and queued callbacks are
-//! rooted at creation: jobs run after the program's operand stack is gone, so
-//! everything a job reaches must survive collection. This trades reclamation
-//! for soundness (the objects are small and few in harness workloads).
+//! pinned at creation with [`Heap::add_pinned_root`]: jobs run after the
+//! program's operand stack is gone, so everything a job reaches must survive
+//! collection. This trades reclamation for soundness (the objects are small
+//! and few in harness workloads) — the pinning is permanent, with no unpin
+//! path, precisely because there is no point at which the engine can know a
+//! job will never run again.
+//!
+//! Why pinned and not [`Heap::add_root`]: the ordinary root set is transient.
+//! `Interp::gc_protect` republishes it wholesale at every safepoint — it
+//! `roots.clear()`s first and then re-adds only the operand stack, the frames,
+//! the interpreter's pending-await/settlement/adoption queues, the last result
+//! and its cached natives — so any root an embedder added is gone by the time
+//! the `heap.safepoint()` inside that same call collects. A promise reachable
+//! only from a job closure (the collector cannot see `Box<dyn FnOnce(&mut
+//! JobCtx)>`) therefore died there, and the next `settle` wrote through a
+//! stale handle. The pinned set is marked separately and is never cleared.
 //!
 //! Still out of scope: `Symbol.species` constructor selection (every promise
 //! here uses `%Promise%` or the receiver's own `prototype`), and adoption
@@ -63,6 +76,34 @@ fn smi(v: i32) -> JsValue {
     JsValue::from_i32_smi(v).expect("state fits Smi")
 }
 
+/// Pins an object the module hands to a job, reaction record, or capability
+/// closure. Non-object values (a non-callable `finally` callback, say) have no
+/// handle to pin and cannot be called from a job either, so they are skipped.
+fn pin(heap: &mut Heap, value: JsValue) {
+    if let Some(obj) = value.as_object() {
+        heap.add_pinned_root(obj);
+    }
+}
+
+/// Pins the three values a [`reaction_job`] closure captures.
+///
+/// A `Box<dyn FnOnce(&mut JobCtx)>` is opaque to the collector, so a job's
+/// captures are roots by virtue of being pinned here and nowhere else. The
+/// handler and the payload are the two that are *not* reachable from a pinned
+/// promise: the record that holds a handler is drained (its elements taken)
+/// before the job runs, and the settled promise carrying the payload may be
+/// unreachable from script the moment `then` returns.
+fn pin_job_captures(
+    heap: &mut Heap,
+    handler: JsValue,
+    payload: JsValue,
+    derived: v12_heap::Handle<JsObject>,
+) {
+    pin(heap, handler);
+    pin(heap, payload);
+    heap.add_pinned_root(derived);
+}
+
 /// Structural promise check: a `Kind::Promise` object carrying the three
 /// internal slots with a plausible `[[State]]`. Promise objects are
 /// engine-created only, so no user object collides in practice. The slot count
@@ -90,7 +131,7 @@ fn create_promise(
     payload: JsValue,
 ) -> v12_heap::Handle<JsObject> {
     let reactions = heap.alloc(JsObject::array(Vec::new()));
-    heap.add_root(JsValue::object(reactions));
+    heap.add_pinned_root(reactions);
     // `alloc_promise` binds the reserved promise shape, so a user-defined own
     // property on this object is numbered past `[[State]]`/`[[Result]]`/
     // `[[Reactions]]` instead of aliasing them.
@@ -100,7 +141,7 @@ fn create_promise(
         prototype,
         ..JsObject::default()
     });
-    heap.add_root(JsValue::object(promise));
+    heap.add_pinned_root(promise);
     promise
 }
 
@@ -201,13 +242,14 @@ pub fn promise_then(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
                 smallvec::smallvec![handler, on_rejected, JsValue::object(derived)],
                 smallvec::smallvec![None; 3],
             ));
-            ctx.heap.add_root(JsValue::object(record));
+            ctx.heap.add_pinned_root(record);
             ctx.heap
                 .get_mut(reactions)
                 .elements
                 .push(JsValue::object(record));
         }
         STATE_FULFILLED => enqueue_reaction(
+            ctx.heap,
             &mut |job| sink.borrow_mut().push(job),
             handler,
             payload,
@@ -215,6 +257,7 @@ pub fn promise_then(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
             false,
         ),
         _ => enqueue_reaction(
+            ctx.heap,
             &mut |job| sink.borrow_mut().push(job),
             on_rejected,
             payload,
@@ -233,8 +276,8 @@ pub fn queue_microtask(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resul
     if cb.as_object().is_none() {
         return Err(ctx.type_error("queueMicrotask requires a function"));
     }
-    // Root the callback: the job outlives the program stack that referenced it.
-    ctx.heap.add_root(cb);
+    // Pin the callback: the job outlives the program stack that referenced it.
+    pin(ctx.heap, cb);
     let cb_obj = cb.as_object().expect("checked above");
     let sink = ctx.pending.clone().unwrap_or_default();
     sink.borrow_mut().push(Box::new(move |ctx| {
@@ -280,12 +323,17 @@ fn reaction_job(
 /// through when the handler is absent), then settles the derived promise —
 /// which in turn schedules that promise's own queued reactions.
 fn enqueue_reaction(
+    heap: &mut Heap,
     push: &mut dyn FnMut(Job),
     handler: JsValue,
     payload: JsValue,
     derived: v12_heap::Handle<JsObject>,
     rejecting: bool,
 ) {
+    // A job closure is invisible to the collector, and `this`'s own promise
+    // (and any record on it) can be reclaimed the moment the drain moves on,
+    // so every value the job captures is pinned here — not just the record.
+    pin_job_captures(heap, handler, payload, derived);
     push(reaction_job(handler, payload, derived, rejecting));
 }
 
@@ -319,6 +367,7 @@ fn drain_reaction_jobs(
         } else {
             (reject, true)
         };
+        pin_job_captures(heap, handler, value, derived);
         jobs.push(reaction_job(handler, value, derived, rejecting));
     }
     jobs
@@ -394,7 +443,7 @@ fn capability_settle(
             smallvec::smallvec![resolve_v, reject_v, JsValue::object(derived)],
             smallvec::smallvec![None; 3],
         ));
-        heap.add_root(JsValue::object(record));
+        heap.add_pinned_root(record);
         if let Some(reactions) = heap.get(value_obj).properties[2].as_object() {
             heap.get_mut(reactions)
                 .elements
@@ -497,8 +546,8 @@ fn start_thenable_adoption(
         // A getter cannot run without an interpreter, so the read stays
         // deferred: the job calls the stored getter and uses its result.
         ThenRead::Getter(getter) => {
-            heap.add_root(value);
-            heap.add_root(JsValue::object(promise));
+            pin(heap, value);
+            heap.add_pinned_root(promise);
             let (resolve_v, reject_v) = make_capability(heap, sink, promise);
             sink.borrow_mut().push(thenable_job(
                 value,
@@ -527,10 +576,10 @@ pub(crate) fn enqueue_thenable_adoption(
     then_v: JsValue,
     abrupt: bool,
 ) {
-    // Rooted per the module contract: the job outlives the program stack that
+    // Pinned per the module contract: the job outlives the program stack that
     // built the thenable, and the sink is invisible to the collector.
-    heap.add_root(thenable);
-    heap.add_root(JsValue::object(promise));
+    pin(heap, thenable);
+    heap.add_pinned_root(promise);
     let (resolve_v, reject_v) = make_capability(heap, sink, promise);
     sink.borrow_mut().push(thenable_job(
         thenable,
@@ -675,7 +724,7 @@ pub fn promise_construct(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resu
     // The executor joins the pending sink: it runs at the next checkpoint
     // (see the divergence note above). A throw from the executor rejects the
     // promise.
-    ctx.heap.add_root(executor);
+    pin(ctx.heap, executor);
     let executor_obj = executor.as_object().expect("checked above");
     let sink = Rc::clone(&pending);
     let p = promise;
@@ -709,7 +758,7 @@ pub(crate) fn make_capability(
             v12_heap::FunctionTarget::Bytecode(u32::MAX),
             None,
         ));
-        heap.add_root(JsValue::object(func));
+        heap.add_pinned_root(func);
         func
     };
     let resolve_obj = alloc_capability(heap);
@@ -856,7 +905,7 @@ fn alloc_host(
         v12_heap::FunctionTarget::Host(v12_heap::HostClosure::new(f)),
         None,
     ));
-    heap.add_root(JsValue::object(func));
+    heap.add_pinned_root(func);
     JsValue::object(func)
 }
 
@@ -875,7 +924,7 @@ fn push_record(
         smallvec::smallvec![fulfill, reject, JsValue::object(dummy)],
         smallvec::smallvec![None; 3],
     ));
-    heap.add_root(JsValue::object(record));
+    heap.add_pinned_root(record);
     if let Some(reactions) = heap.get(input).properties[2].as_object() {
         heap.get_mut(reactions)
             .elements
@@ -976,7 +1025,7 @@ pub mod combinator {
         // `KIND_RACE` never reads the results array, but keeping the layout
         // uniform means no slot is position-dependent.
         let results = heap.alloc(JsObject::array(Vec::new()));
-        heap.add_root(JsValue::object(results));
+        heap.add_pinned_root(results);
         let mut state = JsObject::default();
         for _ in 0..STATE_SLOTS {
             state.properties.push(JsValue::undefined());
@@ -998,7 +1047,7 @@ pub mod combinator {
         // unchanged at exhaustion (27.2.4.2 step 8-f), so nothing reads it.
         state.properties[SLOT_REMAINING as usize] = smi(1);
         let handle = heap.alloc(state);
-        heap.add_root(JsValue::object(handle));
+        heap.add_pinned_root(handle);
         Ok(JsValue::object(handle))
     }
 
@@ -1065,7 +1114,7 @@ pub mod combinator {
         // so it carries the same spec shape as an executor's capability.
         shape_pair(ctx, resolve_v, reject_v);
         let pair = ctx.heap.alloc(JsObject::array(vec![resolve_v, reject_v]));
-        ctx.heap.add_root(JsValue::object(pair));
+        ctx.heap.add_pinned_root(pair);
         Ok(JsValue::object(pair))
     }
 
@@ -1262,7 +1311,7 @@ pub fn promise_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
     let results = ctx
         .heap
         .alloc(JsObject::array(vec![JsValue::undefined(); inputs.len()]));
-    ctx.heap.add_root(JsValue::object(results));
+    ctx.heap.add_pinned_root(results);
     let results_v = JsValue::object(results);
     let sink = ctx.pending.clone().unwrap_or_default();
 
@@ -1391,7 +1440,7 @@ pub fn promise_finally(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result
     }
     let promise = this.as_object().expect("checked above");
     let on_finally = args.first().copied().unwrap_or_else(JsValue::undefined);
-    ctx.heap.add_root(on_finally);
+    pin(ctx.heap, on_finally);
     let prototype = ctx.heap.get(promise).prototype;
     let derived = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
     let sink = ctx.pending.clone().unwrap_or_default();
@@ -1427,6 +1476,9 @@ pub fn promise_finally(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result
         });
         push_record(ctx.heap, promise, fulfill, reject);
     } else {
+        // `this` is settled, so nothing else holds its payload once the
+        // watcher record is not installed: pin it for the job below.
+        pin(ctx.heap, payload);
         sink.borrow_mut()
             .push(finally_settle_job(derived, on_finally, state, payload));
     }
