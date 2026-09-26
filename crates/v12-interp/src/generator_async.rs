@@ -7,6 +7,14 @@ use v12_heap::{Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 use super::{Frame, Interp, JSException, MAX_RESUME_DEPTH};
 use crate::ops;
 
+/// `[[Completion]].[[Type]]` of a queued async-generator request, Smi-encoded
+/// in its queue entry. The queue resumes the *head* request, so a `return` or
+/// `throw` that arrived behind a suspended body runs before the `next` that
+/// woke it (spec 27.6.3.5).
+const ASYNC_GEN_REQUEST_NEXT: i32 = 0;
+const ASYNC_GEN_REQUEST_RETURN: i32 = 1;
+const ASYNC_GEN_REQUEST_THROW: i32 = 2;
+
 /// The outcome of the ordinary-path `then` read that decides thenable
 /// adoption (spec 27.2.1.3.1 `PromiseResolveFunctions` step 3).
 pub(crate) enum ThenRead {
@@ -22,13 +30,21 @@ pub(crate) enum ThenRead {
 
 impl Interp<'_> {
     /// Slot index of the async-generator request queue on an async generator
-    /// object: a rooted array of the request promises returned by
-    /// `.next()`/`.return()`/`.throw()` that have not settled yet, oldest first.
-    /// Async *function* generators reuse slots 0..4 (`properties[4]` is the
-    /// completion promise); async generators append here so the resume path can
-    /// settle requests FIFO (spec 27.6.3: requests queue while the generator is
-    /// executing or awaiting, and settle in arrival order).
+    /// object: a rooted array of the request entries returned by
+    /// `.next()`/`.return()`/`.throw()` that have not settled yet, oldest
+    /// first. Async *function* generators reuse slots 0..4 (`properties[4]` is
+    /// the completion promise); async generators append here so the resume
+    /// path can settle requests FIFO (spec 27.6.3: requests queue while the
+    /// generator is executing or awaiting, and settle in arrival order).
     pub(crate) const ASYNC_GEN_QUEUE_SLOT: usize = 11;
+    /// Slot marking that the body is mid-execution — running, or parked on an
+    /// internal `await` — which is spec state `executing`. Set while a resume
+    /// drives the body and kept across an `await` park; only a real `yield`
+    /// (or a completion) clears it. `AsyncGeneratorEnqueue` (spec 27.6.3.4
+    /// step 8) appends the request and returns *without* resuming a generator
+    /// in this state: a resume issued from inside the body would nest a second
+    /// body over the same register snapshot and settle the wrong request.
+    pub(crate) const ASYNC_GEN_EXECUTING_SLOT: usize = 12;
     /// Slot marking that the generator suspended on a real `yield` (not an
     /// internal `await`) during the current resume. `SuspendYield` sets it for
     /// async generators; the resume path reads it to decide whether the
@@ -177,10 +193,13 @@ impl Interp<'_> {
     }
 
     /// Pads an async generator's property slots through the request queue so
-    /// request, yield, and AsyncFromSyncIterator state are addressable
-    /// (generators are created with only the 4 header slots).
+    /// request, yield, executing-state and AsyncFromSyncIterator state are
+    /// addressable (generators are created with only the 4 header slots).
     fn ensure_async_gen_slots(&mut self, r#gen: Handle<JsObject>) {
-        let need = Self::ASYNC_GEN_QUEUE_SLOT.max(Self::ASYNC_GEN_FROM_SYNC_SLOT) + 1;
+        let need = Self::ASYNC_GEN_QUEUE_SLOT
+            .max(Self::ASYNC_GEN_FROM_SYNC_SLOT)
+            .max(Self::ASYNC_GEN_EXECUTING_SLOT)
+            + 1;
         let o = self.heap.get_mut(r#gen);
         if o.properties.len() < need {
             o.properties.resize(need, JsValue::undefined());
@@ -223,17 +242,89 @@ impl Interp<'_> {
             .and_then(|v| v.as_object())
     }
 
-    /// Appends `promise` to `r#gen`'s request queue (spec 27.6.3.4
-    /// AsyncGeneratorEnqueue), creating the queue on first use. Every request
-    /// gets its own slot: a request that arrives while the generator is
-    /// suspended on an `await` waits behind the in-flight one instead of
-    /// overwriting it.
+    /// Builds a request-queue entry: a bare object holding
+    /// `[promise, kind, value]`.
+    ///
+    /// The queue is internal engine state, so an entry is never exposed to
+    /// JavaScript; it keeps the promise *and* the completion the request
+    /// carries, because a request queued behind an executing body is not
+    /// resumed until it reaches the head of the queue (spec 27.6.3.5) and must
+    /// then run its own completion, not the one that woke the body. `properties`
+    /// is traced by the collector, so both survive as long as the queue does.
+    fn alloc_async_gen_request_entry(
+        &mut self,
+        promise: Handle<JsObject>,
+        kind: i32,
+        value: JsValue,
+    ) -> Handle<JsObject> {
+        self.gc_protect();
+        let mut entry = JsObject::default();
+        entry.properties.push(JsValue::object(promise));
+        entry
+            .properties
+            .push(JsValue::from_i32_smi(kind).expect("request kind is a small integer"));
+        entry.properties.push(value);
+        entry.property_keys.resize(3, None);
+        let entry = self.heap.alloc(entry);
+        self.heap.add_root(JsValue::object(entry));
+        entry
+    }
+
+    /// The promise a request-queue entry was built around.
+    fn async_gen_entry_promise(&self, entry: Handle<JsObject>) -> Handle<JsObject> {
+        self.heap
+            .get(entry)
+            .properties
+            .first()
+            .and_then(|v| v.as_object())
+            .expect("a request entry holds its promise")
+    }
+
+    /// The completion (`[[Completion]].[[Type]]`, value) a request-queue entry
+    /// resumes the body with.
+    fn async_gen_entry_completion(&self, entry: Handle<JsObject>) -> (i32, JsValue) {
+        let o = self.heap.get(entry);
+        let kind = o
+            .properties
+            .get(1)
+            .and_then(|v| v.as_smi())
+            .unwrap_or(ASYNC_GEN_REQUEST_NEXT);
+        (
+            kind,
+            o.properties.get(2).copied().unwrap_or(JsValue::undefined()),
+        )
+    }
+
+    /// The completion of the request at the head of `r#gen`'s queue — the one a
+    /// resume must run (spec 27.6.3.5).
+    fn async_gen_head_completion(&self, r#gen: Handle<JsObject>) -> Option<(i32, JsValue)> {
+        let queue = self.async_gen_request_queue(r#gen)?;
+        let head = self
+            .heap
+            .get(queue)
+            .elements_array
+            .get(0)
+            .and_then(|v| v.as_object())?;
+        Some(self.async_gen_entry_completion(head))
+    }
+
+    /// Appends a request to `r#gen`'s request queue (spec 27.6.3.4
+    /// AsyncGeneratorEnqueue step 6), creating the queue on first use. Every
+    /// request gets its own entry: a request that arrives while the generator
+    /// is executing waits behind the in-flight one instead of overwriting it.
     pub(crate) fn enqueue_async_gen_request(
         &mut self,
         r#gen: Handle<JsObject>,
         promise: Handle<JsObject>,
+        kind: i32,
+        value: JsValue,
     ) {
         self.ensure_async_gen_slots(r#gen);
+        // The queue array comes first: creating it runs a safepoint, and an
+        // entry allocated before that would be unreachable for the collection
+        // it triggers (`gc_protect` republishes the roots, dropping the
+        // `add_root` the entry carries) — the queue's own slot is the only root
+        // an entry has, so it has to exist before the entry does.
         let queue = match self.async_gen_request_queue(r#gen) {
             Some(queue) => queue,
             None => {
@@ -245,13 +336,14 @@ impl Interp<'_> {
                 queue
             }
         };
+        let entry = self.alloc_async_gen_request_entry(promise, kind, value);
         self.heap
             .get_mut(queue)
             .elements_array
-            .push(JsValue::object(promise));
+            .push(JsValue::object(entry));
     }
 
-    /// Removes and returns the oldest unsettled request promise of `r#gen`.
+    /// Removes and returns the oldest unsettled request entry of `r#gen`.
     ///
     /// The queue array is a canonical dense array, so the head is dropped by
     /// shifting the tail down and popping the duplicated last slot.
@@ -282,16 +374,116 @@ impl Interp<'_> {
         head
     }
 
+    /// How many requests `r#gen` has queued (its `[[AsyncGeneratorQueue]]`).
+    fn async_gen_queue_len(&self, r#gen: Handle<JsObject>) -> usize {
+        self.async_gen_request_queue(r#gen)
+            .map(|queue| self.heap.get(queue).elements_array.len())
+            .unwrap_or(0)
+    }
+
+    /// True while `r#gen`'s body is mid-execution: running, or parked on an
+    /// internal `await`. Spec state `executing` / `awaiting-return` — a request
+    /// that finds it there is queued, never resumed.
+    fn async_gen_executing(&self, r#gen: Handle<JsObject>) -> bool {
+        self.heap
+            .get(r#gen)
+            .properties
+            .get(Self::ASYNC_GEN_EXECUTING_SLOT)
+            .is_some_and(|v| v.is_true())
+    }
+
+    /// Applies one async-generator request: queue it, then resume the body only
+    /// when the spec allows it.
+    ///
+    /// Spec 27.6.3.4 `AsyncGeneratorEnqueue` appends the request and returns
+    /// without resuming a generator whose state is `executing` — which covers a
+    /// request issued re-entrantly from inside the body, and one that arrives
+    /// while the body is parked on an `await`. Resuming there would nest a
+    /// second body over the same saved register window and settle a request
+    /// that is not the one being processed.
+    ///
+    /// Otherwise the resume is driven by the *head* of the queue, not by the
+    /// request that just arrived (spec 27.6.3.5): a `return`/`throw` queued
+    /// behind a suspended body runs before the `next` that woke it.
+    fn apply_async_gen_request(
+        &mut self,
+        r#gen: Handle<JsObject>,
+        promise: Handle<JsObject>,
+        kind: i32,
+        value: JsValue,
+    ) {
+        // An async generator never throws synchronously from `next()`/
+        // `return()`/`throw()`: an abrupt body completion rejects the request
+        // promise, and a request that only queues still returns its promise.
+        self.with_async_gen_request_rooted(r#gen, promise, |interp| {
+            interp.enqueue_async_gen_request(r#gen, promise, kind, value);
+            if interp.async_gen_executing(r#gen) {
+                return; // state `executing`: queue only.
+            }
+            interp.resume_async_gen_head_request(r#gen);
+        });
+    }
+
+    /// Resumes `r#gen`'s body with the completion of the request at the head of
+    /// its queue (spec 27.6.3.5). A `return` request also arms the generator's
+    /// pending-return mode, so the compiled per-yield return trampoline runs
+    /// and the body completes with the returned value.
+    fn resume_async_gen_head_request(&mut self, r#gen: Handle<JsObject>) {
+        let Some((kind, value)) = self.async_gen_head_completion(r#gen) else {
+            return;
+        };
+        if kind == ASYNC_GEN_REQUEST_RETURN {
+            {
+                let o = self.heap.get_mut(r#gen);
+                if o.properties.len() < 6 {
+                    o.properties.resize(6, JsValue::undefined());
+                    o.property_keys.resize(6, None);
+                }
+                o.properties[5] = ops::box_number(1.0);
+            }
+            self.set_generator_header_value(r#gen, Self::GENERATOR_RETURN_VALUE_SLOT, value);
+        }
+        let _ = self.resume_generator(r#gen, value, kind == ASYNC_GEN_REQUEST_THROW);
+    }
+
+    /// Spec 27.6.3.3 `AsyncGeneratorYield` step 12-13: resolving a yielded
+    /// value settles the head request, and a queue that is still non-empty
+    /// means the body yields again right away — the next request resumes it
+    /// with its own completion. This is what lets a request queued re-entrantly
+    /// from the body settle after the in-flight one, with no new request
+    /// arriving to drive it.
+    ///
+    /// Terminates by construction: every pass either settles the head (which
+    /// shortens the queue) or leaves the body parked on an `await` (where the
+    /// `yield` flag is clear and the loop stops, to be continued by the
+    /// microtask drain), and the pass count is additionally bounded by the
+    /// queue length.
+    fn drain_async_gen_request_queue(&mut self, r#gen: Handle<JsObject>) {
+        // One extra pass: the last request resumes into the body completing.
+        let mut budget = self.async_gen_queue_len(r#gen) + 1;
+        while budget > 0 {
+            budget -= 1;
+            if !self.async_gen_yielded(r#gen) || self.async_gen_queue_len(r#gen) == 0 {
+                return;
+            }
+            self.resume_async_gen_head_request(r#gen);
+        }
+    }
+
     /// Settles and clears the oldest pending request promise
     /// (`next`/`return`/`throw`) queued on `r#gen`, if any.
     ///
-    /// `suspended` reports whether the resume stopped at a yield; `suspended`
-    /// with a value is `{value, done: false}`, a completion is
-    /// `{value, done: true}`, and `reject` rejects with `value`. A suspension
-    /// on an internal `await` (not a real `yield`) leaves the request queued
-    /// for the eventual yield/completion resume. Completing or rejecting the
-    /// body also drains the requests still queued behind it: a request on a
-    /// completed async generator resolves `{value: undefined, done: true}`.
+    /// The queue head is the request being processed: the body only runs while a
+    /// request is in flight and the resume carried that request's completion,
+    /// so a yield or a completion answers the head and nothing else (spec
+    /// 27.6.3.3 `AsyncGeneratorResolve` step 4). `suspended` reports whether the
+    /// resume stopped at a yield; `suspended` with a value is
+    /// `{value, done: false}`, a completion is `{value, done: true}`, and
+    /// `reject` rejects with `value`. A suspension on an internal `await` (not a
+    /// real `yield`) leaves the request queued for the eventual yield/completion
+    /// resume. Completing or rejecting the body also drains the requests still
+    /// queued behind it: a request on a completed async generator resolves
+    /// `{value: undefined, done: true}`.
     pub(crate) fn settle_async_gen_request_slot(
         &mut self,
         r#gen: Handle<JsObject>,
@@ -305,9 +497,11 @@ impl Interp<'_> {
         if suspended && !reject && !self.async_gen_yielded(r#gen) {
             return;
         }
-        let Some(promise) = self.pop_oldest_async_gen_request(r#gen) else {
+        let Some(entry) = self.pop_oldest_async_gen_request(r#gen) else {
             return;
         };
+        let promise = self.async_gen_entry_promise(entry);
+
         if reject {
             self.pending_settlements.push((promise, value, true));
             self.drain_completed_async_gen_requests(r#gen);
@@ -330,7 +524,8 @@ impl Interp<'_> {
     /// resume that completed generator, so they settle the same way instead of
     /// staying pending forever.
     fn drain_completed_async_gen_requests(&mut self, r#gen: Handle<JsObject>) {
-        while let Some(promise) = self.pop_oldest_async_gen_request(r#gen) {
+        while let Some(entry) = self.pop_oldest_async_gen_request(r#gen) {
+            let promise = self.async_gen_entry_promise(entry);
             let result = self.make_iterator_result(JsValue::undefined(), true);
             self.pending_settlements.push((promise, result, false));
         }
@@ -360,9 +555,26 @@ impl Interp<'_> {
             JsValue::from_bool(from_sync);
     }
 
+    /// Marks whether the async-generator body is mid-execution — running, or
+    /// parked on an internal `await` — i.e. spec state `executing`. A request
+    /// that finds the generator there is queued and nothing else happens.
+    pub(crate) fn set_async_gen_executing(&mut self, r#gen: Handle<JsObject>, executing: bool) {
+        self.ensure_async_gen_slots(r#gen);
+        self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_EXECUTING_SLOT] =
+            JsValue::from_bool(executing);
+    }
+
     /// Marks whether the current async-generator suspension is a real `yield`
     /// (`true`, settles the request promise) or an internal `await` (`false`,
     /// request promise stays parked).
+    ///
+    /// The two are the same state seen from both ends, so this also moves the
+    /// executing flag: a real `yield` ends the body execution (the generator is
+    /// `suspendedYield` and the next request resumes it), while an internal
+    /// `await` leaves it mid-flight. The await is the one suspension
+    /// `resume_generator` never sees the end of — the frame is parked in
+    /// `pending_awaits`, not on the stack — so this is where the flag follows
+    /// the body across it.
     pub(crate) fn set_async_gen_suspended_on_yield(
         &mut self,
         r#gen: Handle<JsObject>,
@@ -371,6 +583,7 @@ impl Interp<'_> {
         self.ensure_async_gen_slots(r#gen);
         self.heap.get_mut(r#gen).properties[Self::ASYNC_GEN_YIELD_SLOT] =
             JsValue::from_bool(on_yield);
+        self.set_async_gen_executing(r#gen, !on_yield);
     }
 
     /// Runs `body` with `r#gen` and its fresh `request` promise parked on the
@@ -434,17 +647,14 @@ impl Interp<'_> {
             return Ok(self.make_iterator_result(JsValue::undefined(), true));
         }
         if let Some(promise) = request {
-            // The request promise queues on the generator; the resume path
-            // (`resume_generator_nested`) settles the oldest one, whether the
-            // body yields synchronously here or suspends on an `await` and
-            // resumes later. Async generators never throw synchronously from
-            // `next()`: an abrupt body completion rejects the request promise.
-            self.with_async_gen_request_rooted(r#gen, promise, |interp| {
-                interp.enqueue_async_gen_request(r#gen, promise);
-                let _ = interp.resume_generator(r#gen, arg, false);
-            });
+            // The request queues on the generator and the resume path settles
+            // the oldest one, whether the body yields synchronously here, is
+            // still executing (re-entrant request), or suspends on an `await`
+            // and resumes later.
+            self.apply_async_gen_request(r#gen, promise, ASYNC_GEN_REQUEST_NEXT, arg);
             return Ok(JsValue::object(promise));
         }
+
         match self.resume_generator(r#gen, arg, false)? {
             Some(value) => Ok(self.make_iterator_result(value, true)),
             None => {
@@ -515,6 +725,16 @@ impl Interp<'_> {
             }
             return Ok(self.make_iterator_result(arg, true));
         }
+        if self.is_async_generator_for(r#gen) {
+            // An async generator's `return` is a queue entry like any other
+            // request: the pending-return mode is armed by
+            // `resume_async_gen_head_request` when this request reaches the
+            // head, not here — a `return` queued behind a running body must not
+            // bend that body towards its return completion.
+            let request = self.alloc_async_gen_request();
+            self.apply_async_gen_request(r#gen, request, ASYNC_GEN_REQUEST_RETURN, arg);
+            return Ok(JsValue::object(request));
+        }
         // Spec 27.5.3.4: resume the suspended body with a *return*
         // completion — active `finally` blocks must run (compiled per-yield
         // return paths keyed off the generator's mode slot), while `catch`
@@ -532,17 +752,6 @@ impl Interp<'_> {
             o.properties[5] = ops::box_number(1.0);
         }
         self.set_generator_header_value(r#gen, Self::GENERATOR_RETURN_VALUE_SLOT, arg);
-        if self.is_async_generator_for(r#gen) {
-            let request = self.alloc_async_gen_request();
-            self.with_async_gen_request_rooted(r#gen, request, |interp| {
-                interp.enqueue_async_gen_request(r#gen, request);
-                // `return()` is a real suspension point for an async generator's
-                // request queue: the resume path settles the oldest request when
-                // the body finally yields again or completes.
-                let _ = interp.resume_generator(r#gen, arg, false);
-            });
-            return Ok(JsValue::object(request));
-        }
         match self.resume_generator(r#gen, arg, false)? {
             // The return trampoline completed the body.
             Some(ret) => Ok(self.make_iterator_result(ret, true)),
@@ -584,17 +793,14 @@ impl Interp<'_> {
             }
             return Err(JSException(arg));
         }
+        if self.is_async_generator_for(r#gen) {
+            let request = self.alloc_async_gen_request();
+            self.apply_async_gen_request(r#gen, request, ASYNC_GEN_REQUEST_THROW, arg);
+            return Ok(JsValue::object(request));
+        }
         // Spec 27.5.3.5: resume the suspended body with a throw completion —
         // the exception surfaces at the suspended yield, so `catch` can
         // intercept it and `finally` runs on the unwind path.
-        if self.is_async_generator_for(r#gen) {
-            let request = self.alloc_async_gen_request();
-            self.with_async_gen_request_rooted(r#gen, request, |interp| {
-                interp.enqueue_async_gen_request(r#gen, request);
-                let _ = interp.resume_generator(r#gen, arg, true);
-            });
-            return Ok(JsValue::object(request));
-        }
         match self.resume_generator(r#gen, arg, true) {
             Ok(Some(ret)) => Ok(self.make_iterator_result(ret, true)),
             Ok(None) => {
@@ -820,6 +1026,17 @@ impl Interp<'_> {
     /// `Some(returned)` is returned and the generator is marked done. Used by
     /// `generator_next` (which wraps the result in `{value, done}`) and by
     /// the async resume paths (which settle the async promise instead).
+    ///
+    /// An async generator's body is marked executing for the whole run and
+    /// clears that itself on a real `yield`, a completion or an error — an
+    /// internal `await` keeps it executing (see
+    /// [`Self::set_async_gen_suspended_on_yield`]). So the flag is *not*
+    /// cleared here: a resume that ends on an `await` park leaves the body
+    /// mid-execution, and a request arriving in that window only queues.
+    ///
+    /// A resume that ends on a `yield` with requests still queued continues
+    /// into the next one (spec 27.6.3.3 step 12-13) — that is what settles a
+    /// request the body issued re-entrantly, with no new request to drive it.
     pub(crate) fn resume_generator(
         &mut self,
         r#gen: Handle<JsObject>,
@@ -832,7 +1049,13 @@ impl Interp<'_> {
             ));
         }
         self.resume_depth += 1;
+        if self.is_async_generator_for(r#gen) {
+            self.set_async_gen_executing(r#gen, true);
+        }
         let result = self.resume_generator_nested(r#gen, value, is_throw);
+        if result.is_ok() && self.is_async_generator_for(r#gen) {
+            self.drain_async_gen_request_queue(r#gen);
+        }
         self.resume_depth -= 1;
         result
     }
@@ -931,9 +1154,11 @@ impl Interp<'_> {
                 // promise rides the completion: it rejects with the error and
                 // the requests queued behind it drain (spec 27.6.3.7), rather
                 // than staying pending for a body that no longer exists.
-                if self.is_async_generator_for(r#gen) && self.heap.get(r#gen).properties.len() >= 3
-                {
-                    self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+                if self.is_async_generator_for(r#gen) {
+                    if self.heap.get(r#gen).properties.len() >= 3 {
+                        self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+                    }
+                    self.set_async_gen_executing(r#gen, false);
                 }
                 self.settle_async_gen_request_slot(r#gen, false, e.0, true);
                 return Err(e);
@@ -973,6 +1198,11 @@ impl Interp<'_> {
                     Ok(None)
                 } else {
                     let ret = self.top_result.take().unwrap_or(JsValue::undefined());
+                    // The body is no longer executing: a request that arrives
+                    // now finds a completed generator, not an executing one.
+                    if self.is_async_generator_for(r#gen) {
+                        self.set_async_gen_executing(r#gen, false);
+                    }
                     // The pending return-completion mode is consumed only by
                     // completion. An internal await may suspend between the
                     // user yield and the delegated return trampoline, so keep
@@ -1020,6 +1250,9 @@ impl Interp<'_> {
                 }
                 if self.heap.get(r#gen).properties.len() >= 3 {
                     self.heap.get_mut(r#gen).properties[2] = ops::box_number(1.0);
+                }
+                if self.is_async_generator_for(r#gen) {
+                    self.set_async_gen_executing(r#gen, false);
                 }
                 // An async generator's request promise rejects with the body's
                 // abrupt completion rather than surfacing the throw.
