@@ -121,7 +121,32 @@ impl JobQueue {
     /// semantics). Returns the number of jobs executed.
     pub fn drain(&mut self, interp: &mut Interp<'_>, pending: Rc<RefCell<Vec<Job>>>) -> usize {
         let mut count = 0usize;
+        // Thenable adoptions the interpreter requested: it read `then` through
+        // the ordinary property path (a getter needs the machine) but cannot
+        // build the job that calls it, so the requests ride its own rooted
+        // queue — the same seam as the async-completion settlements. Walked by
+        // index because a running job can append a nested adoption, and the
+        // entries stay queued until this drain returns: `gc_protect` roots
+        // them for as long as their job can still reach the promise, the
+        // thenable and `then`, none of which the job sink would keep alive.
+        let mut adoption_cursor = 0usize;
         loop {
+            while adoption_cursor < interp.pending_adoptions_len() {
+                let Some((promise, thenable, then_v, abrupt)) =
+                    interp.pending_adoption_at(adoption_cursor)
+                else {
+                    break;
+                };
+                crate::builtins::promise::enqueue_thenable_adoption(
+                    interp.heap_mut(),
+                    &pending,
+                    promise,
+                    thenable,
+                    then_v,
+                    abrupt,
+                );
+                adoption_cursor += 1;
+            }
             // Adopt follow-ups discovered by the previous job/natives before
             // picking the next one, keeping FIFO order.
             if !pending.borrow().is_empty() {
@@ -155,6 +180,11 @@ impl JobQueue {
                 break;
             }
         }
+        // Every request above has had its job run (or the drain bailed out on
+        // the deadline / queue cap, in which case its promise is unreachable
+        // anyway). Dropping them here releases the roots; a request queued
+        // after this point is picked up by the next drain.
+        interp.clear_pending_adoptions();
         count
     }
 

@@ -577,6 +577,16 @@ pub struct Interp<'a> {
     /// engine's checkpoint drain settles the promise through the full
     /// capability/reaction path (`promise::settle_async_completion`).
     pending_settlements: Vec<(Handle<JsObject>, JsValue, bool)>,
+    /// Thenable adoptions the engine still has to turn into jobs:
+    /// `(promise, thenable, then, then-read-was-abrupt)`.
+    ///
+    /// Same seam and same reason as `pending_settlements`: the interpreter
+    /// reads `then` through the ordinary property path (a getter or a proxy
+    /// trap needs the machine) but cannot build the `Job` that calls it (the
+    /// job machinery lives in the engine). Queuing the request here — rooted
+    /// by `gc_protect`, unlike the engine's job sink — keeps the thenable
+    /// alive until the drain converts it.
+    pending_adoptions: Vec<(Handle<JsObject>, JsValue, JsValue, bool)>,
     /// Cooperative execution deadline for Test262 conformance runs. When set,
     /// the dispatch loop aborts with a catchable timeout error as soon as the
     /// budget elapses, so a runaway test can never block the harness. `None`
@@ -665,6 +675,7 @@ impl<'a> Interp<'a> {
             top_result: None,
             pending_awaits: std::collections::VecDeque::new(),
             pending_settlements: Vec::new(),
+            pending_adoptions: Vec::new(),
             deadline: None,
             deadline_ticks: 0,
             deadline_exceeded: false,
@@ -2345,6 +2356,13 @@ impl<'a> Interp<'a> {
         for (ph, v, _) in &self.pending_settlements {
             roots.push(JsValue::object(*ph));
             roots.push(*v);
+        }
+        // Queued thenable adoptions: the promise, the thenable and its `then`
+        // must all survive until the engine's drain turns them into a job.
+        for (ph, thenable, then_v, _) in &self.pending_adoptions {
+            roots.push(JsValue::object(*ph));
+            roots.push(*thenable);
+            roots.push(*then_v);
         }
         if let Some(v) = self.top_result {
             roots.push(v);

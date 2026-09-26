@@ -1684,12 +1684,18 @@ impl Interp<'_> {
                 Some(self.run_collection_for_each(id, this_v, args))
             }
             // `Promise.all`/`Promise.race` read `@@iterator` and drive
-            // `next`/`return` on user objects, so their iterator half
-            // re-enters the machine; the engine handler stays the
-            // settled-promise aggregation and receives the drained values.
+            // `next`/`return` on it, so their iterator half re-enters the
+            // machine; the engine handler stays the settled-promise
+            // aggregation and receives the drained values.
             NativeId::PromiseAll | NativeId::PromiseRace => {
                 Some(self.run_promise_combinator(id, this_v, args))
             }
+            // `Promise.resolve(x)` adopts a thenable through a job the
+            // interpreter cannot build, so the `then` read happens here and
+            // the adoption is queued for the engine's drain. Non-thenables
+            // (and `then`-present-but-not-callable) fall through to the
+            // registry native, which fulfills with the value as-is.
+            NativeId::PromiseResolve => self.run_promise_resolve(this_v, args),
             NativeId::IteratorMap
             | NativeId::IteratorFilter
             | NativeId::IteratorFlatMap
@@ -2902,6 +2908,58 @@ impl Interp<'_> {
             self.stack.push(value);
             values.push(value);
         }
+    }
+
+    /// `Promise.resolve(x)` when `x` is a thenable (spec 27.2.1.3.1).
+    ///
+    /// The `then` read runs here — the ordinary property path, so a getter or
+    /// a proxy `get` trap is honored at the right moment — and the adoption
+    /// itself is queued for the engine, which owns the job that calls `then`
+    /// with the capability pair. Returns `None` when `x` is not a thenable,
+    /// leaving the registry native to fulfill with the value unchanged.
+    fn run_promise_resolve(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Option<Result<JsValue, JSException>> {
+        let value = args.first().copied().unwrap_or_else(JsValue::undefined);
+        if self.is_engine_promise(value) {
+            // Spec 27.2.1.4 step 1: resolving with a promise is the identity.
+            return Some(Ok(value));
+        }
+        // Park the argument on the value stack: the `then` read may run a
+        // getter, and `gc_protect` republishes the stack as the root set.
+        self.stack.push(value);
+        let read = self.read_then(value);
+        let (then_v, abrupt) = match read {
+            crate::generator_async::ThenRead::NotThenable => {
+                self.stack.pop();
+                return None;
+            }
+            crate::generator_async::ThenRead::Abrupt(thrown) => (thrown, true),
+            crate::generator_async::ThenRead::Then(then_v) => (then_v, false),
+        };
+        let result = self.adopt_thenable(this_v, value, then_v, abrupt);
+        self.stack.pop();
+        Some(result)
+    }
+
+    /// Allocates the pending promise an adoption settles and queues the
+    /// adoption. `prototype` comes from the receiver's `prototype` field, so
+    /// the result is an ordinary `%Promise.prototype%` instance.
+    fn adopt_thenable(
+        &mut self,
+        this_v: JsValue,
+        thenable: JsValue,
+        then_v: JsValue,
+        abrupt: bool,
+    ) -> Result<JsValue, JSException> {
+        let proto_key = self.new_temp_key("prototype");
+        let prototype = self.get_property(0, 0, this_v, proto_key)?.as_object();
+        self.gc_protect();
+        let promise = self.alloc_pending_promise(prototype);
+        self.push_pending_adoption(promise, thenable, then_v, abrupt);
+        Ok(JsValue::object(promise))
     }
 
     /// `Map.prototype.forEach` / `Set.prototype.forEach` — re-entrant

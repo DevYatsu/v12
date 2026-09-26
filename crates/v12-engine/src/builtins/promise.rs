@@ -14,14 +14,30 @@
 //! A reaction record is an ordinary object with
 //! `properties[0..3] == [fulfill handler, reject handler, derived promise]`;
 //! a handler may be `undefined` (pass-through to the derived promise).
-//! Arbitrary thenable unwrapping is out of scope: handlers are called as
-//! plain functions, and a handler's return value fulfills the derived promise
-//! directly.
+//!
+//! Thenables (any object with a `then` property) are adopted by
+//! [`capability_settle`]: the resolution decision point moves into a
+//! [`Job`] that the engine's single scheduler already runs, so
+//! `then(resolve, reject)` is never called synchronously and a thenable
+//! that never calls back leaves the checkpoint quiescent. The `then` read
+//! that decides the branch happens inside that job, through the heap
+//! ([`read_then`]) — the engine has no interpreter to read through, and
+//! `Ctx` cannot activate a user getter. Accessor `then` is honoured by
+//! running the stored getter from the job. Two receiver kinds are out of
+//! scope: a proxy thenable (its `get` trap needs the interpreter) and a
+//! realm global (its descriptor-less intrinsic prefix makes a shape slot
+//! not a `properties` index) both read as "no `then`", so they resolve
+//! with the value itself.
 //!
 //! Promises, reaction records, reaction arrays, and queued callbacks are
 //! rooted at creation: jobs run after the program's operand stack is gone, so
 //! everything a job reaches must survive collection. This trades reclamation
 //! for soundness (the objects are small and few in harness workloads).
+//!
+//! Still out of scope: `Symbol.species` constructor selection (every promise
+//! here uses `%Promise%` or the receiver's own `prototype`), and adoption
+//! when a *reaction handler's* return value is a thenable (`settle` writes
+//! the handler's value straight into the derived promise).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -49,7 +65,11 @@ fn smi(v: i32) -> JsValue {
 
 /// Structural promise check: a `Kind::Promise` object carrying the three
 /// internal slots with a plausible `[[State]]`. Promise objects are
-/// engine-created only, so no user object collides in practice.
+/// engine-created only, so no user object collides in practice. The slot count
+/// is exact on purpose: a user-added own property makes the object stop
+/// answering as a promise here, which several `ctor-null` / `uniq-ctor` tests
+/// pin. The interpreter's `Promise.resolve` seam mirrors this predicate, so the
+/// two agree on which values are promises.
 fn is_promise(heap: &Heap, v: JsValue) -> bool {
     let Some(obj) = v.as_object() else {
         return false;
@@ -83,6 +103,12 @@ fn create_promise(
 
 /// `Promise.resolve(x)`: identity for promises; otherwise a fulfilled promise
 /// carrying `x` (`undefined` when the argument is missing).
+///
+/// Thenable adoption is *not* here: it needs the `then` read, which runs in
+/// the interpreter (`Interp::run_promise_resolve`) because a getter or a proxy
+/// `get` trap re-enters the machine. The interpreter queues the adoption and
+/// this handler stays the non-thenable half — which is also what a standalone
+/// embedder with no interpreter gets.
 pub fn promise_resolve(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or_else(JsValue::undefined);
     if is_promise(ctx.heap, value) {
@@ -319,6 +345,7 @@ pub(crate) fn settle(
 /// the promise has settled (first resolution wins). A promise value is
 /// adopted: an adoption record `[resolve, reject, derived]` joins its
 /// reactions, so settling the adopted promise routes the outcome back here.
+/// A thenable value is adopted by a [`thenable_job`] queued on the same sink.
 /// Everything else fulfills/rejects `promise` directly, and its queued
 /// reaction jobs join the shared pending sink for the next checkpoint.
 #[allow(clippy::too_many_arguments)]
@@ -372,6 +399,11 @@ fn capability_settle(
         }
         return Ok(JsValue::undefined());
     }
+    if !rejecting && start_thenable_adoption(heap, sink, promise, value) {
+        // The thenable job owns the settlement from here: `promise` stays
+        // pending until the job calls the capability back (or never).
+        return Ok(JsValue::undefined());
+    }
     let state = if rejecting {
         STATE_REJECTED
     } else {
@@ -382,6 +414,217 @@ fn capability_settle(
     let jobs = drain_reaction_jobs(heap, promise, state, value);
     sink.borrow_mut().extend(jobs);
     Ok(JsValue::undefined())
+}
+
+/// What `Get(value, "then")` names, read straight off the heap.
+///
+/// The engine has no interpreter to read through and `Ctx` cannot activate a
+/// user getter, so the resolution decision is deferred to the job
+/// [`start_thenable_adoption`] enqueues; this only reports *that* a `then`
+/// property exists and how to obtain its value.
+enum ThenRead {
+    /// A data property: its stored value (`undefined` for a missing slot,
+    /// which is not callable either way).
+    Data(JsValue),
+    /// An accessor property: the stored getter, which the job calls to learn
+    /// the real `then` (spec 27.2.1.3.1 step 3-a).
+    Getter(v12_heap::Handle<JsObject>),
+}
+
+/// `Get(value, "then")` for adoption purposes: the first `then` descriptor on
+/// `obj` or its prototype chain. `None` means "no `then` property", so the
+/// value is not a thenable and the promise fulfills with it unchanged.
+///
+/// The walk is the ordinary one (own descriptor, then `[[Prototype]]`, …) so
+/// an inherited `then` counts. See the module docs for the two receiver
+/// kinds this skips.
+fn read_then(heap: &mut Heap, obj: v12_heap::Handle<JsObject>) -> Option<ThenRead> {
+    if heap.is_realm_global(obj)
+        || matches!(heap.get(obj).kind, Kind::Proxy | Kind::ModuleNamespace)
+    {
+        return None;
+    }
+    let key = v12_heap::PropKey::from_string(heap.intern_text("then"));
+    let mut cur = Some(obj);
+    while let Some(h) = cur {
+        let shape = heap.shape_of(h);
+        match heap.lookup_property(shape, key).copied() {
+            Some(v12_heap::Descriptor::Data { slot, .. }) => {
+                let value = heap
+                    .get(h)
+                    .properties
+                    .get(slot as usize)
+                    .copied()
+                    .unwrap_or_else(JsValue::undefined);
+                return Some(ThenRead::Data(value));
+            }
+            Some(v12_heap::Descriptor::Accessor { getter, .. }) => {
+                return getter.map(ThenRead::Getter);
+            }
+            None => {}
+        }
+        cur = heap.get(h).prototype;
+    }
+    None
+}
+
+/// Queues the thenable job for `value` when it is a thenable, leaving
+/// `promise` pending for that job to settle. Returns `false` when `value` has
+/// no `then` property, so the caller settles the promise itself.
+fn start_thenable_adoption(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+    value: JsValue,
+) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if is_promise(heap, value) {
+        return false;
+    }
+    let Some(read) = read_then(heap, obj) else {
+        return false;
+    };
+    match read {
+        ThenRead::Data(then_v) => {
+            enqueue_thenable_adoption(heap, sink, promise, value, then_v, false);
+            true
+        }
+        // A getter cannot run without an interpreter, so the read stays
+        // deferred: the job calls the stored getter and uses its result.
+        ThenRead::Getter(getter) => {
+            heap.add_root(value);
+            heap.add_root(JsValue::object(promise));
+            let (resolve_v, reject_v) = make_capability(heap, sink, promise);
+            sink.borrow_mut().push(thenable_job(
+                value,
+                ThenRead::Getter(getter),
+                false,
+                resolve_v,
+                reject_v,
+                promise,
+                Rc::clone(sink),
+            ));
+            true
+        }
+    }
+}
+
+/// Builds and queues the thenable job for an adoption the interpreter
+/// requested. The `then` read already happened there through the ordinary
+/// property path, so `abrupt`/`then_v` carry that read's outcome: an abrupt
+/// read rejects the promise with `then_v`, otherwise `then_v` is `then`
+/// itself (spec 27.2.1.3.1 step 3-a).
+pub(crate) fn enqueue_thenable_adoption(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    promise: v12_heap::Handle<JsObject>,
+    thenable: JsValue,
+    then_v: JsValue,
+    abrupt: bool,
+) {
+    // Rooted per the module contract: the job outlives the program stack that
+    // built the thenable, and the sink is invisible to the collector.
+    heap.add_root(thenable);
+    heap.add_root(JsValue::object(promise));
+    let (resolve_v, reject_v) = make_capability(heap, sink, promise);
+    sink.borrow_mut().push(thenable_job(
+        thenable,
+        ThenRead::Data(then_v),
+        abrupt,
+        resolve_v,
+        reject_v,
+        promise,
+        Rc::clone(sink),
+    ));
+}
+
+/// Spec 27.2.1.3.1 `PromiseResolveFunctions` steps 3-a to 3-d, deferred to a
+/// job: reject on an abrupt `Get`, fulfill with the thenable when `then` is
+/// not callable, otherwise call it with the capability pair and let the
+/// callbacks settle the promise.
+fn thenable_job(
+    thenable: JsValue,
+    read: ThenRead,
+    abrupt: bool,
+    resolve_v: JsValue,
+    reject_v: JsValue,
+    promise: v12_heap::Handle<JsObject>,
+    sink: Rc<RefCell<Vec<Job>>>,
+) -> Job {
+    Box::new(move |ctx: &mut JobCtx<'_, '_>| {
+        if abrupt {
+            // The ordinary-path `Get` threw: the abrupt rides the promise
+            // (spec 27.2.1.3.1 step 3-a; pinned by
+            // `Promise/resolve/arg-poisoned-then.js`). The thrown value
+            // travels as the would-be `then`.
+            let ThenRead::Data(err) = read else {
+                unreachable!("an abrupt read carries a value, not a getter")
+            };
+            let _ = capability_settle(
+                ctx.heap_mut(),
+                &sink,
+                promise,
+                resolve_v,
+                reject_v,
+                err,
+                true,
+            );
+            return;
+        }
+        let then_v = match read {
+            ThenRead::Data(value) => Ok(value),
+            ThenRead::Getter(getter) => ctx.call_object(getter, thenable, &[]),
+        };
+        let then_v = match then_v {
+            Ok(value) => value,
+            Err(JSException(thrown)) => {
+                let _ = capability_settle(
+                    ctx.heap_mut(),
+                    &sink,
+                    promise,
+                    resolve_v,
+                    reject_v,
+                    thrown,
+                    true,
+                );
+                return;
+            }
+        };
+        let callable = then_v
+            .as_object()
+            .is_some_and(|f| matches!(ctx.heap_mut().get(f).kind, Kind::Function));
+        if !callable {
+            // A present but non-callable `then` is not an adoption: the
+            // promise fulfills with the thenable itself (spec 27.2.1.3.1
+            // step 3-b-i; pinned by `Promise/resolve/arg-non-thenable.js`).
+            let _ = capability_settle(
+                ctx.heap_mut(),
+                &sink,
+                promise,
+                resolve_v,
+                reject_v,
+                thenable,
+                false,
+            );
+            return;
+        }
+        let then = then_v.as_object().expect("callability checked above");
+        if let Err(JSException(thrown)) = ctx.call_object(then, thenable, &[resolve_v, reject_v]) {
+            // A throw out of `then` rejects the promise (spec
+            // PromiseResolveThenableJob step 5).
+            let _ = capability_settle(
+                ctx.heap_mut(),
+                &sink,
+                promise,
+                resolve_v,
+                reject_v,
+                thrown,
+                true,
+            );
+        }
+    })
 }
 
 /// `new Promise(executor)`.

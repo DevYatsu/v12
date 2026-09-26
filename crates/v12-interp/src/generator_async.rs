@@ -7,6 +7,19 @@ use v12_heap::{Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 use super::{Frame, Interp, JSException, MAX_RESUME_DEPTH};
 use crate::ops;
 
+/// The outcome of the ordinary-path `then` read that decides thenable
+/// adoption (spec 27.2.1.3.1 `PromiseResolveFunctions` step 3).
+pub(crate) enum ThenRead {
+    /// No `then` property, or a present one that is not callable: not a
+    /// thenable, so the promise fulfills with the value itself (step 3-b-i).
+    NotThenable,
+    /// `then` is callable: adopt through a thenable job.
+    Then(JsValue),
+    /// The `Get` was abrupt (a throwing getter, a proxy `get` trap): the
+    /// thrown value rides the promise (step 3-a).
+    Abrupt(JsValue),
+}
+
 impl Interp<'_> {
     /// Slot index of the async-generator request queue on an async generator
     /// object: a rooted array of the request promises returned by
@@ -573,6 +586,120 @@ impl Interp<'_> {
                 .is_some_and(|s| (0..=2).contains(&s))
     }
 
+    /// The engine's `is_promise` predicate, mirrored: a promise carries
+    /// *exactly* the three `[[State]]`/`[[Result]]`/`[[Reactions]]` slots, so
+    /// a user-added own property takes it out. The `Promise.resolve` seam needs
+    /// the same answer the engine's handler would give — it decides "identity
+    /// or adopt" once, and the handler is the fallback for the branch the seam
+    /// does not take.
+    pub(crate) fn is_engine_promise(&self, v: JsValue) -> bool {
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        let o = self.heap.get(obj);
+        o.kind == Kind::Promise
+            && o.properties.len() == 3
+            && o.properties[0]
+                .as_smi()
+                .is_some_and(|s| (0..=2).contains(&s))
+    }
+
+    /// `Get(value, "then")` through the ordinary property path — prototype
+    /// chain, accessor getter, proxy `get` trap — with the callability gate a
+    /// thenable needs. Non-objects are never thenables.
+    pub(crate) fn read_then(&mut self, v: JsValue) -> ThenRead {
+        if v.as_object().is_none() {
+            return ThenRead::NotThenable;
+        }
+        let then_key = self.new_temp_key("then");
+        match self.get_property(0, 0, v, then_key) {
+            Err(JSException(thrown)) => ThenRead::Abrupt(thrown),
+            Ok(then_v) => {
+                let callable = then_v
+                    .as_object()
+                    .is_some_and(|f| matches!(self.heap.get(f).kind, Kind::Function | Kind::Proxy));
+                if callable {
+                    ThenRead::Then(then_v)
+                } else {
+                    ThenRead::NotThenable
+                }
+            }
+        }
+    }
+
+    /// A pending promise with an empty reactions array, rooted. The shape is
+    /// the engine's `[[State]]`/`[[Result]]`/`[[Reactions]]` triple, so both
+    /// sides' `is_promise` checks accept it.
+    pub(crate) fn alloc_pending_promise(
+        &mut self,
+        prototype: Option<Handle<JsObject>>,
+    ) -> Handle<JsObject> {
+        let reactions = self.heap.alloc(JsObject::array(Vec::new()));
+        self.heap.add_root(JsValue::object(reactions));
+        let mut shell = JsObject {
+            kind: Kind::Promise,
+            prototype,
+            ..JsObject::default()
+        };
+        shell
+            .properties
+            .push(JsValue::from_i32_smi(0).expect("0 fits Smi"));
+        shell.properties.push(JsValue::undefined());
+        shell.properties.push(JsValue::object(reactions));
+        shell.property_keys.resize(3, None);
+        let handle = self.heap.alloc(shell);
+        self.heap.add_root(JsValue::object(handle));
+        handle
+    }
+
+    /// Queues a thenable adoption for the engine to turn into a job. The
+    /// interpreter cannot build a `Job` (they live in `v12-engine`), and the
+    /// job sink is invisible to the collector, so the request rides this queue
+    /// — rooted by `gc_protect` like `pending_settlements` — and the engine's
+    /// drain walks it. The entry outlives its own job on purpose: the promise,
+    /// the thenable and `then` must stay rooted until the job has run.
+    pub(crate) fn push_pending_adoption(
+        &mut self,
+        promise: Handle<JsObject>,
+        thenable: JsValue,
+        then_v: JsValue,
+        abrupt: bool,
+    ) {
+        self.pending_adoptions
+            .push((promise, thenable, then_v, abrupt));
+    }
+
+    /// Number of queued adoption requests; the engine's drain walks it by
+    /// index (a running job can append a nested adoption).
+    pub fn pending_adoptions_len(&self) -> usize {
+        self.pending_adoptions.len()
+    }
+
+    /// The adoption request at `index`, cloned out so the engine can enqueue
+    /// its job without borrowing the queue.
+    pub fn pending_adoption_at(
+        &self,
+        index: usize,
+    ) -> Option<(Handle<JsObject>, JsValue, JsValue, bool)> {
+        self.pending_adoptions.get(index).copied()
+    }
+
+    /// Drops the drained adoption requests. Called once the engine's drain has
+    /// run the job for each of them.
+    pub fn clear_pending_adoptions(&mut self) {
+        self.pending_adoptions.clear();
+    }
+
+    /// The value an `await` parks on, plus how to resume: `(promise,
+    /// is_reject, payload)` (spec 27.7.5.1 `AsyncFunctionAwait`).
+    ///
+    /// An object argument goes through the engine's capability path rather
+    /// than a locally fulfilled promise: a thenable's `then` must be called
+    /// from a job, and only the engine can queue one. So the `then` read
+    /// happens here (the ordinary property path) and the frame parks on a
+    /// pending promise the engine settles — from the thenable job, or right
+    /// away for a plain object. Neither branch spins: a thenable that never
+    /// calls back leaves the promise pending.
     pub(crate) fn promise_resolve_for_await(&mut self, v: JsValue) -> (JsValue, bool, JsValue) {
         if self.is_promise(v) {
             let obj = v.as_object().unwrap();
@@ -589,13 +716,32 @@ impl Interp<'_> {
                 return (v, false, v);
             }
         }
-        // Create fulfilled promise for non-promise arg
         self.gc_protect();
-        let reactions = self.heap.alloc(JsObject::array(Vec::new()));
-        self.heap.add_root(JsValue::object(reactions));
-        let promise = self.heap.alloc(JsObject::fulfilled_promise(v, reactions));
-        self.heap.add_root(JsValue::object(promise));
-        (JsValue::object(promise), false, v)
+        let read = self.read_then(v);
+        match read {
+            ThenRead::Abrupt(thrown) => {
+                // `? PromiseResolve(...)` inside the async body: the abrupt
+                // rejects the async function (spec 27.7.5.1), which is what
+                // resuming with `is_reject` does. No promise slot to root.
+                self.heap.add_root(thrown);
+                (JsValue::undefined(), true, thrown)
+            }
+            ThenRead::Then(then_v) => {
+                let promise = self.alloc_pending_promise(None);
+                self.push_pending_adoption(promise, v, then_v, false);
+                let promise_v = JsValue::object(promise);
+                (promise_v, false, promise_v)
+            }
+            ThenRead::NotThenable => {
+                // A plain object (or a primitive) resolves to itself; the
+                // fulfilled promise lets the existing resume path carry it.
+                let reactions = self.heap.alloc(JsObject::array(Vec::new()));
+                self.heap.add_root(JsValue::object(reactions));
+                let promise = self.heap.alloc(JsObject::fulfilled_promise(v, reactions));
+                self.heap.add_root(JsValue::object(promise));
+                (JsValue::object(promise), false, v)
+            }
+        }
     }
 
     #[allow(dead_code)]
