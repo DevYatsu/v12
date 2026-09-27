@@ -938,4 +938,25 @@ Copy the block below for each fix. Keep it under 20 lines.
   valueless instance fields (`a;` — no own property on instance, the
    `after-same-line-*` failures) — installation gap, not name inference.
 
+### 2026-09-27 — Conformance burn-down wave 1, Task 1: gate deferred built-ins [plan: docs/superpowers/plans/2026-09-27-test262-builtins-coverage.md]
+
+- **Filter:** `built-ins` (full corpus, 24 061 tests, `--jobs 0`)
+- **Before:** 8 314 pass / 15 176 fail / 571 skip = 35.4 %
+- **After:** 8 314 pass / 6 873 fail / 8 874 skip = 34.6 % raw; **core 8 314 / 15 187 = 54.7 %**
+- **Pass count provably unchanged** (8 314 → 8 314). The raw percentage *drops* by design: the denominator stops counting unimplemented features as engine failures. Core % is now the honest number and is the one the plan tracks.
+- **Harness change:** `skip_reason_for` in `conformance/harness/src/runner.rs` now takes the test's path below `test/` and gates 17 `built-ins/<Topic>` directories — Temporal, TypedArray, TypedArrayConstructors, DataView, ArrayBuffer, Uint8Array, Atomics, SharedArrayBuffer, WeakMap, WeakSet, WeakRef, FinalizationRegistry, DisposableStack, AsyncDisposableStack, SuppressedError, BigInt, ShadowRealm — moving their tests from `fail` to `skip`. The pre-existing `tail-call-optimization` and `resizable-arraybuffer` arms are untouched.
+- **Design — why topic-keyed and not `features:`-tag-keyed** (this reverses the plan as written; the plan's tag table was wrong): the tag is far coarser than the scope decision.
+  - `BigInt` is declared by 1 257 files, only 75 of which live in `built-ins/BigInt`. A tag gate would have skipped ~1 165 *in-scope* failures that tasks 2-12 exist to attack.
+  - 7 tests in `built-ins/Date/prototype/toTemporalInstant/` declare `features: [Temporal]` and **pass precisely because `Temporal` is absent**. A tag gate would have demoted 7 real passes to skips.
+  - 8 of the plan's 11 tags matched zero files (the real spellings are CamelCase: `Temporal`, `TypedArray`, `WeakRef`, `Atomics`, `ShadowRealm`, `FinalizationRegistry`, `SharedArrayBuffer`; `weak-collections` and `shared-memory` do not exist). The plan's own verification command only matched the inline `features: [a, b]` spelling, which is why it would not have caught this.
+- **Exception:** `built-ins/BigInt/prototype/toString` is excluded from the `BigInt` gate — v12 implements the radix argument and its 2 radix tests pass. Cost: 11 genuine radix failures stay visible in an otherwise-skipped topic (the sole reason `fail` is 6 873 and not 6 863). They are real bugs, worth fixing on their own merits.
+- **Files:** `conformance/harness/src/runner.rs` (+242/-6); new `conformance/faildiff.sh` (regression gate, below)
+- **Tests:** 8 new unit tests in `runner.rs`, including a corpus-drift guard asserting the deferred topics hold exactly 8 794 discoverable files (3 `ShadowRealm/*_FIXTURE.js` are excluded by `discover_tests`) and that every table entry is a real directory.
+- **Runner:** `cargo nextest run --workspace` → **1 035 passed / 0 skipped** (was 1 027). `cargo clippy --workspace --all-targets` → 0 errors. `cargo fmt -p test262-runner` only.
+- **New tool — `conformance/faildiff.sh`:** compares two runner JSON reports and classifies FIXED / BROKE / REGRESSED / NEW_FAIL / FIXED_BY_SKIP, exiting 1 if any pass regressed. A net pass-rate rise can hide new failures, so every lane in this plan gates on the fail-set diff rather than the percentage. Negative-tested by injecting 3 pass→fail into a baseline report: it reported `net pass delta: +0` while correctly flagging all 3 and exiting 1 — the exact blind spot it exists to catch.
+- **Notes / known gaps:**
+  - `DEFERRED_TOPIC_EXCEPTIONS` is matched before the `annexB/` prefix is stripped, so an `annexB/built-ins/BigInt/...` copy would not be excepted. No such directory exists in the pinned corpus today, so this is latent, not an active bug.
+  - 8 794 is the *total* test count of the 17 deferred topics; 8 313 of them fail. The plan mislabelled 8 794 as "failing" and predicted `skip 9 365 / fail 6 383`; the real figures are `skip 8 874 / fail 6 873` (479 were already skips, 2 pass).
+  - `skip_reason_for` gained a third parameter. It is private to a `bin` crate, so there is no external breakage.
+
 <!-- Future entries go above this line -->

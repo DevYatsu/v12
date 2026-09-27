@@ -184,7 +184,7 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     let frontmatter = parse_frontmatter(&source);
 
     // Flag-driven skips (before harness loading).
-    if let Some(reason) = skip_reason_for(&frontmatter, &source) {
+    if let Some(reason) = skip_reason_for(&frontmatter, &source, &relative) {
         return TestOutcome {
             path: file_path.to_path_buf(),
             relative,
@@ -734,8 +734,66 @@ fn handle_async_ok(
     }
 }
 
+const DEFERRED_TEMPORAL: &str =
+    "requires temporal (Temporal not implemented; deferred by scope decision 2026-09-27)";
+const DEFERRED_TYPED_ARRAY: &str = "requires typedarray (TypedArray/ArrayBuffer/DataView not \
+     implemented; deferred by scope decision 2026-09-27)";
+const DEFERRED_WEAK: &str = "requires weak-collections (WeakMap/WeakSet/WeakRef/\
+     FinalizationRegistry not implemented; deferred by scope decision 2026-09-27)";
+const DEFERRED_DISPOSABLE: &str = "requires explicit-resource-management (DisposableStack not \
+     implemented; deferred by scope decision 2026-09-27)";
+const DEFERRED_ATOMICS: &str =
+    "requires atomics (Atomics/SharedArrayBuffer need a shared mutator; out of v1 scope)";
+const DEFERRED_SHADOW_REALM: &str = "requires shadow-realm (v1 is a single realm)";
+const DEFERRED_BIG_INT: &str =
+    "requires BigInt (BigInt arithmetic not implemented; deferred by scope decision 2026-09-27)";
+
+/// The `test/built-ins/<Topic>` directories whose feature v12 has deliberately
+/// not implemented, mapped to the reason their tests are skipped instead of
+/// failed. These 17 topics hold 8 794 of the 24 061 `built-ins` tests (37 %);
+/// 8 313 of them fail today and would otherwise dominate the failure report
+/// with a `X is not defined` that no amount of engine work can fix. Gating a
+/// topic here moves its tests from `fail` to `skip`; it never changes what
+/// passes.
+///
+/// Keyed on the topic directory rather than on the test262 `features:` tag
+/// because the tag is far coarser than the scope decision: `BigInt` is declared
+/// by 1 257 files, only 75 of which live in `built-ins/BigInt`, and the
+/// `Temporal` tag is declared by 7 `built-ins/Date/prototype/toTemporalInstant`
+/// tests that pass precisely because `Temporal` is absent. A tag gate would
+/// demote real passes and hide real work; a topic gate is exactly the scope
+/// decision.
+const DEFERRED_TOPICS: &[(&str, &str)] = &[
+    ("Temporal", DEFERRED_TEMPORAL),
+    ("TypedArray", DEFERRED_TYPED_ARRAY),
+    ("TypedArrayConstructors", DEFERRED_TYPED_ARRAY),
+    ("DataView", DEFERRED_TYPED_ARRAY),
+    ("ArrayBuffer", DEFERRED_TYPED_ARRAY),
+    ("Uint8Array", DEFERRED_TYPED_ARRAY),
+    ("Atomics", DEFERRED_ATOMICS),
+    ("SharedArrayBuffer", DEFERRED_ATOMICS),
+    ("WeakMap", DEFERRED_WEAK),
+    ("WeakSet", DEFERRED_WEAK),
+    ("WeakRef", DEFERRED_WEAK),
+    ("FinalizationRegistry", DEFERRED_WEAK),
+    ("DisposableStack", DEFERRED_DISPOSABLE),
+    ("AsyncDisposableStack", DEFERRED_DISPOSABLE),
+    ("SuppressedError", DEFERRED_DISPOSABLE),
+    ("BigInt", DEFERRED_BIG_INT),
+    ("ShadowRealm", DEFERRED_SHADOW_REALM),
+];
+
+/// Subtrees of a deferred topic that v12 already implements, so gating the
+/// whole topic would demote passing tests to skips. `BigInt.prototype.toString`
+/// handles a radix argument and both its radix tests pass; the rest of the
+/// `built-ins/BigInt` topic (`asIntN`/`asUintN` arithmetic) does not.
+const DEFERRED_TOPIC_EXCEPTIONS: &[&str] = &["built-ins/BigInt/prototype/toString"];
+
 /// Returns `Some(reason)` if the test should be skipped before execution.
-fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
+///
+/// `relative` is the test's path below `test/` (e.g.
+/// `built-ins/Temporal/PlainDate/prototype/monthCode/basic.js`).
+fn skip_reason_for(fm: &Frontmatter, source: &str, relative: &str) -> Option<String> {
     // Module tests are now wired for `language` (and generally via eval_module);
     // keep the skip only for non-language suites if needed. For the language
     // gate we want them executable, so do not skip here — `run_single_test`
@@ -773,7 +831,24 @@ fn skip_reason_for(fm: &Frontmatter, source: &str) -> Option<String> {
             "requires resizable-arraybuffer (TypedArray/ArrayBuffer not implemented)".to_string(),
         );
     }
-    None
+    // Whole topics for features that do not exist in v12 at all. Matched on
+    // the path segment after `built-ins/`, so the `annexB/built-ins/<Topic>/…`
+    // copies are gated too.
+    if DEFERRED_TOPIC_EXCEPTIONS
+        .iter()
+        .any(|ex| relative.starts_with(ex))
+    {
+        return None;
+    }
+    let in_builtins = relative
+        .strip_prefix("annexB/")
+        .unwrap_or(relative)
+        .strip_prefix("built-ins/");
+    let topic = in_builtins.and_then(|rest| rest.split('/').next())?;
+    DEFERRED_TOPICS
+        .iter()
+        .find(|(name, _)| *name == topic)
+        .map(|(_, reason)| (*reason).to_string())
 }
 
 /// Handles the case where `engine.eval` returned `Ok`.
@@ -1104,7 +1179,7 @@ mod tests {
             flags: vec!["module".to_string()],
             ..Default::default()
         };
-        let reason = skip_reason_for(&fm, "var x = 1;");
+        let reason = skip_reason_for(&fm, "var x = 1;", "language/pass.js");
         assert!(
             reason.is_none(),
             "module should no longer be skipped (now wired), got {reason:?}"
@@ -1118,7 +1193,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            skip_reason_for(&fm, "").is_none(),
+            skip_reason_for(&fm, "", "language/pass.js").is_none(),
             "async should no longer be skipped (generators+async wired)"
         );
     }
@@ -1129,7 +1204,168 @@ mod tests {
             flags: vec!["noStrict".to_string()],
             ..Default::default()
         };
-        assert!(skip_reason_for(&fm, "var x = 1;").is_none());
+        assert!(skip_reason_for(&fm, "var x = 1;", "language/pass.js").is_none());
+    }
+
+    #[test]
+    fn deferred_topic_produces_skip_reason() {
+        let fm = Frontmatter {
+            features: vec!["Temporal".to_string()],
+            ..Frontmatter::default()
+        };
+        let reason = skip_reason_for(
+            &fm,
+            "",
+            "built-ins/Temporal/PlainDate/prototype/monthCode/basic.js",
+        );
+        assert_eq!(reason, Some(DEFERRED_TEMPORAL.to_string()));
+    }
+
+    #[test]
+    fn temporal_test_file_is_skipped_before_execution() {
+        // The real file, so the topic table and the corpus cannot drift apart.
+        let relative = "built-ins/Temporal/PlainDate/prototype/monthCode/basic.js";
+        let src = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../test262/test")
+                .join(relative),
+        )
+        .expect("pinned test262 checkout must be present");
+        let fm = parse_frontmatter(&src);
+        assert!(
+            fm.has_feature("Temporal"),
+            "corpus drift: the real file no longer declares the Temporal feature"
+        );
+        assert_eq!(
+            skip_reason_for(&fm, &src, relative),
+            Some(DEFERRED_TEMPORAL.to_string()),
+            "Temporal tests must be skipped, not failed"
+        );
+    }
+
+    #[test]
+    fn core_builtin_is_not_skipped() {
+        let fm = Frontmatter {
+            features: vec![],
+            ..Frontmatter::default()
+        };
+        assert!(
+            skip_reason_for(
+                &fm,
+                "var x = [1,2,3].map(function(v){return v;});",
+                "built-ins/Array/prototype/map/callbackfn-is-not-callable.js"
+            )
+            .is_none()
+        );
+    }
+
+    /// A deferred *feature tag* is not by itself grounds for a skip: v12
+    /// implements parts of several of them. `BigInt/prototype/toString` carries
+    /// the `BigInt` tag and lives in the deferred `built-ins/BigInt` topic, yet
+    /// both of its radix tests pass today — so it must stay runnable. This is
+    /// the regression that a pure feature-tag gate would introduce.
+    #[test]
+    fn deferred_tag_in_a_passing_subtree_is_not_skipped() {
+        let fm = Frontmatter {
+            features: vec!["BigInt".to_string()],
+            ..Frontmatter::default()
+        };
+        for relative in [
+            "built-ins/BigInt/prototype/toString/a-z.js",
+            "built-ins/BigInt/prototype/toString/radix-tointegerorinfinity-throws-symbol.js",
+        ] {
+            assert_eq!(
+                skip_reason_for(&fm, "0n.toString(16)", relative),
+                None,
+                "{relative} passes today and must not be demoted to a skip"
+            );
+        }
+    }
+
+    /// Conversely the `Temporal` tag on a `Date` test must not skip it: those
+    /// seven tests assert that `Date.prototype.toTemporalInstant` is *absent*,
+    /// which is exactly what v12 does, so they pass.
+    #[test]
+    fn deferred_tag_outside_the_deferred_topic_is_not_skipped() {
+        let fm = Frontmatter {
+            features: vec!["Temporal".to_string()],
+            ..Frontmatter::default()
+        };
+        assert_eq!(
+            skip_reason_for(
+                &fm,
+                "",
+                "built-ins/Date/prototype/toTemporalInstant/name.js"
+            ),
+            None
+        );
+    }
+
+    /// `annexB` mirrors a handful of `built-ins` trees, so the gate has to look
+    /// past the extra prefix segment or those tests stay failures.
+    #[test]
+    fn annexb_copies_of_a_deferred_topic_are_skipped() {
+        let fm = Frontmatter::default();
+        assert_eq!(
+            skip_reason_for(
+                &fm,
+                "",
+                "annexB/built-ins/TypedArrayConstructors/from/iterator-method-emulates-undefined.js"
+            ),
+            Some(DEFERRED_TYPED_ARRAY.to_string())
+        );
+    }
+
+    /// Every topic in the table must exist in the pinned corpus, and every
+    /// deferred topic on disk must be in the table. A typo in either direction
+    /// is silent: it leaves thousands of tests failing as if they were real.
+    #[test]
+    fn deferred_topics_match_the_pinned_corpus() {
+        /// Counts the tests the runner would discover under `dir`, applying the
+        /// same `*_FIXTURE.js` exclusion as `discover_tests`.
+        fn count_js(dir: &Path) -> usize {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            rd.filter_map(|e| e.ok())
+                .map(|e| {
+                    let p = e.path();
+                    if p.is_dir() {
+                        return count_js(&p);
+                    }
+                    if p.extension().and_then(|x| x.to_str()) != Some("js")
+                        || p.file_stem()
+                            .and_then(|x| x.to_str())
+                            .is_some_and(|x| x.ends_with("_FIXTURE"))
+                    {
+                        return 0;
+                    }
+                    1
+                })
+                .sum()
+        }
+
+        let builtins = Path::new(env!("CARGO_MANIFEST_DIR")).join("../test262/test/built-ins");
+        let on_disk: Vec<String> = std::fs::read_dir(&builtins)
+            .expect("pinned test262 checkout must be present")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        for (topic, _) in DEFERRED_TOPICS {
+            assert!(
+                on_disk.iter().any(|t| t == topic),
+                "DEFERRED_TOPICS lists {topic}, which is not a directory in {builtins:?}"
+            );
+        }
+        // 8 794 files across the 17 deferred topics is the figure the scoreboard
+        // was corrected against. A silent corpus change must fail here rather
+        // than quietly move the denominator.
+        let files: usize = DEFERRED_TOPICS
+            .iter()
+            .map(|(topic, _)| count_js(&builtins.join(topic)))
+            .sum();
+        assert_eq!(files, 8_794, "deferred-topic file count drifted");
     }
 
     #[test]
