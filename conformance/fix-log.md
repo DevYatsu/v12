@@ -1127,4 +1127,46 @@ Task 5: 112 of 535 estimated. Task 2: 57 of 317 estimated. **The plan's per-task
 
 To revert its two temporary measurement patches the lane ran `git checkout -- crates/v12-engine/src/internal_methods.rs crates/v12-interp/src/property.rs`, which the constraints forbid. It touched only the two files it had itself edited, discarded only its own uncommitted measurement code, and the tree was otherwise clean, so no other lane's work was at risk — and it disclosed the action unprompted. The `git checkout`/`stash`/`reset` ban exists because of the 2026-09-02 incident, where a lane's `git stash` + `reset` wiped another lane's uncommitted diff. The rule stands; the disclosure is the behaviour I want, and future lanes should be told to prefer re-editing and to disclose if they must deviate.
 
+### 2026-09-27 — Iterator callback helpers: lazy iterators, not arrays [plan follow-up to Task 5]
+
+- **Filter:** `built-ins` (24 061) — fail-set gate against `/tmp/bi-iter.json`
+- **Result:** **FIXED 76, BROKE 0, MARGINAL 5**, `net pass delta: +81`, all 76 in `built-ins/Iterator`. `built-ins/Iterator` 126 → **202** pass. Workspace `cargo nextest run --workspace` → **1 089 passed / 2 skipped**. `cargo clippy --workspace --all-targets` → 0 errors. `ArrayIteratorPrototype` / `MapIteratorPrototype` / `SetIteratorPrototype` / `StringIteratorPrototype` all unchanged.
+- **What changed:** `map`/`filter`/`flatMap` are now lazy and return **iterators** (they previously answered with an `Array`, which is why `it.map(f).toArray()` died on `Array.prototype.toArray` being undefined). `reduce`/`forEach`/`some`/`every`/`find` consume and return a value. All eight accept any object with a callable `next` (generators, plain `{next(){}}`), call the callback with **two** arguments and `undefined` `this`, resolve `next` **once**, and close the underlying iterator on an abrupt.
+- **Files:** `crates/v12-engine/src/builtins/iterator.rs` (wrapper kinds `HELPER_MAP/FILTER/FLATMAP`, uniform **7**-slot wrapper layout, `wrapper_step`/`WrapperStep` shared by engine and interpreter so they cannot drift), `crates/v12-interp/src/call_setup.rs` (new `IteratorNext`/`Take`/`Drop`/`ToArray` arms, rewritten `run_iterator_callback`, `park`/`unpark`, `drain_helper`, `drain_to_array`), `crates/v12-engine/src/builtins/mod.rs`, new `crates/v12-engine/tests/iterator_helpers.rs` (28 tests).
+
+#### ⚠ Engine-wide hazard found: `add_root` is discarded at the next safepoint
+
+**`gc_protect` does `roots.clear()` and re-publishes the value stack, so every `add_root` is discarded at the next safepoint.** Any value that must survive a call has to live in a **stack slot** (`park`/`unpark`) — the discipline `op_iterator_next` already used. This was the single biggest time sink in the task. Recording it because the name reads like it does the job and it does not.
+
+#### The next 127 tests are a one-place fix, deliberately not taken here
+
+Of the 135 remaining failures in the eight callback directories, **127 are surface-blocked, not semantics-blocked**: only 8 reach the helper via `Iterator.prototype.x.call`. A generator has no `.map` property at all, because `iterator_method_surface` (`crates/v12-interp/src/property.rs:623`) gates on:
+
+```rust
+if self.heap.get(obj).kind != Kind::Iterator { return None; }
+```
+
+Generators are `Kind::Generator` and `class X extends Iterator` instances are `Kind::Ordinary`, so both fall through to `None` and expose no helper properties. **Both are spec-correct to expose** — a generator's `[[Prototype]]` chain reaches `%IteratorPrototype%`, as does a subclass instance's. 36 of the 135 files use the `extends` shape. `property.rs` was outside this lane's write scope, so the change was not made.
+
+Remaining in `built-ins/Iterator` and why each is not closeable cheaply: 8 `proto.js` files need `Object.getPrototypeOf(Iterator.prototype.map) === Function.prototype`, which is the **engine-wide single-`prototype`-field limitation** affecting every built-in function (a constructor's one `prototype` field is both the instance prototype and the chain link), so it needs a `v12-heap` change; ~9 `return`-forwarding tests need a `return` method plus `Symbol.dispose`; 3 `result-is-iterator.js` need `%IteratorHelperPrototype%` in the result's chain.
+
+#### Five Task 5 assumptions this overturned
+
+- *"Helpers can be driven by a pure-heap `pull`."* No — `pull` only steps v12's own element-store iterators. A generator or a plain object needs the machine, so the wrapper now carries the source's `next` method.
+- *"A wrapper is identified by its kind alone."* No — a `map` wrapper over an array iterator still needs the machine (to run the callback) while a `take` wrapper over the same array does not. The discriminator is whether a real `next` exists in the wrapper's slot, not the kind.
+- *"`require_iterator` is the shared brand check."* It cannot be. Spec 27.1.4 step 3 is `GetMethod(O, "next")`, which **runs user code**, so the brand check moved to the interpreter; the engine side now enforces object-ness only.
+- *"`add_root` keeps a value alive across a call."* **False** — see the hazard above.
+- *"Callbacks take a `thisArgument`."* They do not. The old body passed `args[1]` as `this` and 3 arguments; spec 27.1.4.5 step 5.b.iv is `Call(mapper, undefined, « value, 𝔽(counter) »)`.
+
+Laziness did change the wrapper shape: the layout grew 4 slots → 7, slot 3 changed meaning from "the limit" to "the source's `next`", and two slots are `flatMap`-only (a lazy `flatMap` must yield the flattened array one element per `next`, needing a pending array and a cursor). The concept is unchanged.
+
+#### Two probe errors the lane caught in itself, recorded because both nearly produced a false conclusion
+
+1. Its first source probes called `g().map(f)`, which fails at **method lookup**, not at stepping — it briefly read that as a stepping bug. The helpers are only reachable on sources inheriting `Iterator.prototype`; a generator must be reached as `Iterator.prototype.map.call(g(), f)`, exactly as test262 does.
+2. It asserted `filter` with a truthy-**object** predicate should keep 1 element. A truthy object *is* truthy, so 2 is correct — the test was wrong, not the engine.
+
+#### Conformance
+
+`built-ins/Iterator` 202/654 = 30.9 % (was 2.1 % at session start). In-scope failures **6 345 → 6 264**.
+
 <!-- Future entries go above this line -->

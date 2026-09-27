@@ -1755,6 +1755,82 @@ impl Interp<'_> {
 // Callback-taking built-ins
 // ---------------------------------------------------------------------------
 
+/// A helper's source iterator plus the `next` method resolved once when the
+/// helper was called (spec 7.4.3: `GetIteratorDirect` fetches `next` a single
+/// time, so a `next` getter that returns a different function per read is
+/// observed once).
+struct HelperSource {
+    iter: JsValue,
+    next: JsValue,
+}
+
+/// Mirror of the helper-wrapper element layout and state machine owned by
+/// `v12_engine::builtins::iterator`.
+///
+/// The engine crate *depends* on this one, so the constants cannot be imported
+/// from there — the engine is downstream. They are duplicated deliberately and
+/// must stay in step; `crates/v12-engine/tests/iterator_helpers.rs` pins both
+/// sides against real behaviour (a wrapper built here, stepped here, drained by
+/// the engine, and vice versa), so a drift fails the build rather than a
+/// conformance run.
+mod helper_layout {
+    /// `v12_engine::builtins::iterator::ITER_KIND_HELPER_TAKE`.
+    pub const ITER_KIND_HELPER_TAKE: i32 = 8;
+    /// `v12_engine::builtins::iterator::ITER_KIND_HELPER_DROP`.
+    pub const ITER_KIND_HELPER_DROP: i32 = 9;
+    /// `v12_engine::builtins::iterator::ITER_KIND_HELPER_MAP`.
+    pub const ITER_KIND_HELPER_MAP: i32 = 10;
+    /// `v12_engine::builtins::iterator::ITER_KIND_HELPER_FILTER`.
+    pub const ITER_KIND_HELPER_FILTER: i32 = 11;
+    /// `v12_engine::builtins::iterator::ITER_KIND_HELPER_FLATMAP`.
+    pub const ITER_KIND_HELPER_FLATMAP: i32 = 12;
+
+    pub const SLOT_KIND: usize = 0;
+    pub const SLOT_SOURCE: usize = 1;
+    pub const SLOT_INDEX: usize = 2;
+    /// The source's `next` method, or `undefined` when the chain is
+    /// machine-free.
+    pub const SLOT_SOURCE_NEXT: usize = 3;
+    /// The `limit` (`take`/`drop`) or the callback (`map`/`filter`/`flatMap`).
+    pub const SLOT_ARG: usize = 4;
+    /// `flatMap` only: the array whose elements are still to be yielded.
+    pub const SLOT_PENDING: usize = 5;
+    /// `flatMap` only: the cursor into [`SLOT_PENDING`].
+    pub const SLOT_PENDING_INDEX: usize = 6;
+
+    /// The element-store kinds (every kind at or below
+    /// `ENGINE_KIND_MAX`): the iterators the engine's own `iterator_next` can
+    /// step with no machine and no user code.
+    pub const ENGINE_KIND_MAX: i32 = 7;
+    pub const ENGINE_KINDS: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+    /// `take`/`drop`: the kinds whose `SLOT_ARG` is a limit and whose counter
+    /// tracks emitted or discarded values.
+    pub const LIMIT_KINDS: [i32; 2] = [ITER_KIND_HELPER_TAKE, ITER_KIND_HELPER_DROP];
+
+    /// What a wrapper's `next` must do. Mirrors
+    /// `v12_engine::builtins::iterator::WrapperStep`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum WrapperStep {
+        Done,
+        Skip(usize),
+        Emit,
+    }
+
+    /// Mirrors `v12_engine::builtins::iterator::wrapper_step`.
+    pub const fn wrapper_step(kind: i32, count: usize, limit: usize) -> WrapperStep {
+        if kind == ITER_KIND_HELPER_TAKE {
+            if count >= limit {
+                return WrapperStep::Done;
+            }
+        } else if kind == ITER_KIND_HELPER_DROP {
+            if count < limit {
+                return WrapperStep::Skip(limit - count);
+            }
+        }
+        WrapperStep::Emit
+    }
+}
+
 impl Interp<'_> {
     /// The built-ins whose spec algorithms take a user callback: they must
     /// re-enter the machine, so they cannot run as registry natives (the
@@ -1840,6 +1916,17 @@ impl Interp<'_> {
             | NativeId::IteratorSome
             | NativeId::IteratorEvery
             | NativeId::IteratorFind => Some(self.run_iterator_callback(id, this_v, args)),
+            // `take`/`drop`/`toArray` are pure-heap in the engine, but the spec
+            // brand check is a `GetMethod(O, "next")` and a wrapper over a
+            // generator or a plain object has to be stepped by the machine, so
+            // the seam decides whether to hand the call over.
+            NativeId::IteratorTake | NativeId::IteratorDrop | NativeId::IteratorToArray => {
+                Some(self.run_iterator_passthrough(id, this_v, args))
+            }
+            // `next` on one of our lazy wrappers. `None` for every other
+            // receiver, so element-store iterators and the machine-free
+            // `take`/`drop` wrappers keep going to the engine's `iterator_next`.
+            NativeId::IteratorNext => self.run_iterator_next_native(this_v),
             // Object/Reflect statics whose spec algorithm invokes a Proxy
             // handler trap: only intercepted when the receiver is a proxy
             // (otherwise the registry native stays authoritative).
@@ -4400,174 +4487,580 @@ impl Interp<'_> {
         Ok(JsValue::undefined())
     }
 
-    /// `Iterator.prototype` callback helpers. Each pulls values by calling
-    /// the iterator's `next` through the native seam, then invokes the user
-    /// callback via `call_object`.
+    /// `Iterator.prototype` helper methods (ES2025, spec 27.1.4-27.1.5).
+    ///
+    /// `map`/`filter`/`flatMap` return a **lazy** iterator: the callback is
+    /// stored, never called, and the wrapper's `next` (intercepted below as
+    /// `NativeId::IteratorNext`) runs it one value at a time.
+    /// `reduce`/`forEach`/`some`/`every`/`find` consume the source and return
+    /// a value, so they drain eagerly with an early exit.
+    ///
+    /// The two halves delegate where they can: building a wrapper is pure
+    /// allocation and goes to the engine's `iterator_map`/`filter`/`flatmap`
+    /// through the registry seam, which is where the wrapper's element layout
+    /// lives; `take`/`drop` do the same, handing over the resolved `next`
+    /// method so the engine knows whether *it* can step the wrapper or the
+    /// machine has to.
     fn run_iterator_callback(
         &mut self,
         id: NativeId,
         this_v: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
-        let Some(obj) = this_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: Iterator method called on non-object"),
-            ));
-        };
-        if self.heap.get(obj).kind != Kind::Iterator {
-            return Err(JSException(
-                self.error_value("TypeError: Iterator method called on non-iterator"),
-            ));
+        // Spec 27.1.4.5 steps 1-5, in this order — the order is observable:
+        // `IsCallable(mapper)` is checked *before* `GetIteratorDirect`, so a
+        // non-callable callback throws without ever reading `next`
+        // (`argument-effect-order`), and it closes the receiver on the way out
+        // (`argument-validation-failure-closes-underlying`).
+        if this_v.as_object().is_none() {
+            return Err(JSException(self.error_value(
+                "TypeError: Iterator.prototype method called on a non-object",
+            )));
         }
-        let Some(cb) = args
-            .first()
-            .copied()
-            .and_then(|v| self.callback_is_callable(v))
-        else {
-            return Err(JSException(
-                self.error_value("TypeError: callback is not a function"),
-            ));
-        };
-        self.heap.add_root(JsValue::object(cb));
-        let this_arg = if id == NativeId::IteratorReduce {
-            args.get(2).copied().unwrap_or(JsValue::undefined())
-        } else {
-            args.get(1).copied().unwrap_or(JsValue::undefined())
-        };
-        // Drain via the registry `next` (reads/publishes iterator state).
-        // A bounded drain: an unbounded iterator is a RangeError rather
-        // than a silent truncation.
-        const MAX_ITERATOR_DRAIN: usize = 1_000_000;
-        let mut values: Vec<JsValue> = Vec::new();
-        loop {
-            self.gc_protect();
-            let r = self
-                .natives
-                .call_native(self.heap, this_v, &[], NativeId::IteratorNext);
-            let r = r.map_err(|t| JSException::from_throw(self.heap, t))?;
-            let Some(ro) = r.as_object() else { break };
-            let done = self
-                .heap
-                .get(ro)
-                .properties
-                .get(1)
-                .copied()
-                .unwrap_or(JsValue::undefined());
-            if done.is_true() {
-                break;
+        let callback = match args.first().copied().filter(|v| {
+            v.as_object()
+                .is_some_and(|h| matches!(self.heap.get(h).kind, Kind::Function | Kind::Proxy))
+        }) {
+            Some(v) => v,
+            None => {
+                // Step 4.b: `IteratorClose(O, ThrowCompletion(TypeError))` —
+                // the original abrupt wins, so close errors are swallowed.
+                let _ = self.op_iterator_close(this_v, true);
+                return Err(JSException(self.error_value(
+                    "TypeError: Iterator.prototype callback is not a function",
+                )));
             }
-            let v = self
-                .heap
-                .get(ro)
-                .properties
-                .first()
-                .copied()
-                .unwrap_or(JsValue::undefined());
-            values.push(v);
-            if values.len() > MAX_ITERATOR_DRAIN {
+        };
+        // Step 5: `GetIteratorDirect(O, sync)`.
+        let source = self.helper_source_open(this_v)?;
+        // Everything the helper carries across a call has to live in a stack
+        // slot: `gc_protect` clears the root set and re-publishes the value
+        // stack, so an `add_root`-ed value does not survive it (the same
+        // discipline `op_iterator_next` uses). Park for the whole helper and
+        // release on every path.
+        let base = self.park(&[source.next, source.iter, callback]);
+        let out = match id {
+            NativeId::IteratorMap | NativeId::IteratorFilter | NativeId::IteratorFlatMap => {
+                self.build_helper_wrapper(id, source, callback)
+            }
+            _ => self.drain_helper(id, source, callback, args),
+        };
+        self.unpark(base);
+        out
+    }
+
+    /// Copies `values` into fresh value-stack slots and re-publishes the stack
+    /// as the GC root set. The returned depth is what [`Self::unpark`] takes.
+    fn park(&mut self, values: &[JsValue]) -> usize {
+        let base = self.stack.len();
+        self.stack.extend_from_slice(values);
+        self.gc_protect();
+        base
+    }
+
+    /// Releases slots opened by [`Self::park`]. Every call between the two must
+    /// be balanced on its own `Ok` and `Err` path (as `op_iterator_next` is), so
+    /// truncating back to `base` cannot cut into a live frame.
+    fn unpark(&mut self, base: usize) {
+        self.stack.truncate(base);
+    }
+
+    /// `take`/`drop`/`toArray` (spec 27.1.4.3-27.1.4.5, 27.1.4.9).
+    ///
+    /// All three need the spec brand check, which lives here because it is a
+    /// `GetMethod(O, "next")` — user code on a user object. The construction
+    /// and the machine-free drain are the engine's; the drain is taken over
+    /// only when the source cannot be stepped without the machine.
+    fn run_iterator_passthrough(
+        &mut self,
+        id: NativeId,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let source = self.helper_source_open(this_v)?;
+        if id == NativeId::IteratorToArray && self.helper_engine_can_drive(&source) {
+            // A plain element-store iterator: the engine's own `drain_iterator`
+            // reads it positionally and needs no machine.
+            return self
+                .natives
+                .call_native(self.heap, this_v, &[], NativeId::IteratorToArray)
+                .map_err(|t| JSException::from_throw(self.heap, t));
+        }
+        if id == NativeId::IteratorToArray {
+            let base = self.park(&[source.next, source.iter]);
+            let out = self.drain_to_array(source);
+            self.unpark(base);
+            return out;
+        }
+        let source_next = self.helper_source_next_for_engine(&source);
+        let limit = args.first().copied().unwrap_or(JsValue::undefined());
+        // Park across the engine builder: it allocates, and `gc_protect` would
+        // drop an `add_root`-ed `next`/`limit` on the floor.
+        let base = self.park(&[this_v, source_next, limit]);
+        let out = self
+            .natives
+            .call_native(self.heap, this_v, &[limit, source_next], id)
+            .map_err(|t| JSException::from_throw(self.heap, t));
+        self.unpark(base);
+        out
+    }
+
+    /// `next` on one of our lazy helper wrappers, for the wrappers the engine
+    /// cannot step: anything whose source is a generator, a plain object, or
+    /// itself a wrapper. Returns `None` for every other receiver so the caller
+    /// falls through to the registry seam and the engine's own `iterator_next`
+    /// (element-store iterators and the machine-free `take`/`drop` wrappers)
+    /// stays authoritative.
+    fn run_iterator_next_native(
+        &mut self,
+        this_v: JsValue,
+    ) -> Option<Result<JsValue, JSException>> {
+        let obj = this_v.as_object()?;
+        if self.heap.get(obj).kind != Kind::Iterator {
+            return None;
+        }
+        let kind = self.wrapper_kind(obj)?;
+        // An element-store iterator is the engine's own, always.
+        if kind >= 0 && kind <= helper_layout::ENGINE_KIND_MAX {
+            return None;
+        }
+        // `source_next` is `undefined` exactly when the whole chain is
+        // machine-free, which is the case the engine handles.
+        let source_next = self.wrapper_slot(obj, helper_layout::SLOT_SOURCE_NEXT);
+        if source_next.as_object().is_none() {
+            return None;
+        }
+        Some(self.step_helper_wrapper(obj, kind))
+    }
+
+    /// Builds the lazy `map`/`filter`/`flatMap` wrapper through the engine's
+    /// builder, which owns the wrapper's element layout.
+    fn build_helper_wrapper(
+        &mut self,
+        id: NativeId,
+        source: HelperSource,
+        callback: JsValue,
+    ) -> Result<JsValue, JSException> {
+        // A callback wrapper ALWAYS needs the machine, even over a
+        // machine-free source: running the stored callback is the whole point
+        // of its `next`. So the real `next` method always goes in, and the
+        // interpreter's `IteratorNext` arm always drives the wrapper.
+        self.natives
+            .call_native(self.heap, source.iter, &[callback, source.next], id)
+            .map_err(|t| JSException::from_throw(self.heap, t))
+    }
+
+    /// One `next` of a lazy wrapper, driven from the machine. The control flow
+    /// comes from the engine's `wrapper_step` mirror below, which is the same
+    /// state machine `v12_engine::builtins::iterator::helper_wrapper_next`
+    /// runs for the machine-free case — one decision, two executors.
+    fn step_helper_wrapper(
+        &mut self,
+        obj: Handle<JsObject>,
+        kind: i32,
+    ) -> Result<JsValue, JSException> {
+        let limit = if helper_layout::LIMIT_KINDS.contains(&kind) {
+            self.wrapper_limit(obj)
+        } else {
+            0
+        };
+        let mut source = HelperSource {
+            iter: self.wrapper_slot(obj, helper_layout::SLOT_SOURCE),
+            next: self.wrapper_slot(obj, helper_layout::SLOT_SOURCE_NEXT),
+        };
+        let mut count = self.wrapper_count(obj);
+        // `filter` loops rather than recursing when the predicate rejects a
+        // value: the spec's Iterator Helper Closure pulls again, and a
+        // Rust frame per rejection would overflow the stack on a long run.
+        'pull: loop {
+            loop {
+                match helper_layout::wrapper_step(kind, count, limit) {
+                    helper_layout::WrapperStep::Done => return Ok(self.done_result()),
+                    helper_layout::WrapperStep::Skip(0) => break,
+                    helper_layout::WrapperStep::Skip(n) => {
+                        for _ in 0..n {
+                            if self.helper_source_step(&mut source)?.is_none() {
+                                return Ok(self.done_result());
+                            }
+                            count += 1;
+                        }
+                        self.set_wrapper_count(obj, helper_layout::SLOT_INDEX, count);
+                    }
+                    helper_layout::WrapperStep::Emit => break,
+                }
+            }
+            // `flatMap` first: while a stashed array has elements left, one `next`
+            // yields one of them without touching the source at all.
+            if kind == helper_layout::ITER_KIND_HELPER_FLATMAP {
+                let pending = self.wrapper_slot(obj, helper_layout::SLOT_PENDING);
+                if let Some(h) = pending.as_object() {
+                    let elements = self.heap.get(h).elements_snapshot();
+                    let cursor = self
+                        .wrapper_slot(obj, helper_layout::SLOT_PENDING_INDEX)
+                        .as_smi()
+                        .and_then(|n| usize::try_from(n).ok())
+                        .unwrap_or(0);
+                    if let Some(&value) = elements.get(cursor) {
+                        self.set_wrapper_count(obj, helper_layout::SLOT_PENDING_INDEX, cursor + 1);
+                        return Ok(self.make_iterator_result(value, false));
+                    }
+                    // Drained: clear it and pull the next source value in this
+                    // same frame rather than recursing.
+                    self.set_wrapper_slot(obj, helper_layout::SLOT_PENDING, JsValue::undefined());
+                    count = self.wrapper_count(obj);
+                    continue 'pull;
+                }
+            }
+            let Some(value) = self.helper_source_step(&mut source)? else {
+                return Ok(self.done_result());
+            };
+            let emitted = if helper_layout::LIMIT_KINDS.contains(&kind) {
+                if kind == helper_layout::ITER_KIND_HELPER_TAKE {
+                    count += 1;
+                }
+                self.set_wrapper_count(obj, helper_layout::SLOT_INDEX, count);
+                value
+            } else {
+                // `map`/`filter`/`flatMap` count *pulled* values, so the counter
+                // advances once per source value whether or not it is kept.
+                self.set_wrapper_count(obj, helper_layout::SLOT_INDEX, count + 1);
+                let callback = self.wrapper_slot(obj, helper_layout::SLOT_ARG);
+                self.heap.add_root(callback);
+                let counter = JsValue::from_f64(count as f64);
+                self.heap.add_root(counter);
+                // Spec 27.1.4.5 step 5.b.iv: `Call(mapper, undefined, « value,
+                // 𝔽(counter) »)` — two arguments and no thisArgument.
+                let mapped = self
+                    .call_value(callback, JsValue::undefined(), &[value, counter])
+                    .map_err(|e| {
+                        let _ = self.op_iterator_close(source.iter, true);
+                        e
+                    })?;
+                self.heap.add_root(mapped);
+                match kind {
+                    helper_layout::ITER_KIND_HELPER_FILTER => {
+                        if !ops::to_boolean(self.heap, mapped) {
+                            // Rejected: pull the next candidate in this same frame.
+                            count = self.wrapper_count(obj);
+                            continue 'pull;
+                        }
+                        // `filter` yields the *source* value, not the predicate's.
+                        value
+                    }
+                    helper_layout::ITER_KIND_HELPER_FLATMAP => {
+                        // Spec 27.1.4.5 step 5.b.vii-ix: an array result is
+                        // walked one element per `next`, so `flatMap` over a
+                        // long array is as lazy as `map`. Stash it with a
+                        // cursor and loop back; a non-array result is appended
+                        // whole, which is the only other case
+                        // `GetIteratorFlattenable` unwraps.
+                        if self.value_is_array(mapped) {
+                            self.set_wrapper_slot(obj, helper_layout::SLOT_PENDING, mapped);
+                            self.set_wrapper_count(obj, helper_layout::SLOT_PENDING_INDEX, 0);
+                            count = self.wrapper_count(obj);
+                            continue 'pull;
+                        }
+                        mapped
+                    }
+                    // `map` passes the callback's result through unchanged.
+                    helper_layout::ITER_KIND_HELPER_MAP => mapped,
+                    _ => mapped,
+                }
+            };
+            return Ok(self.make_iterator_result(emitted, false));
+        }
+    }
+
+    /// Spec 27.1.4.5's flatten step: one level of an Array result, anything
+    /// else appended whole (`GetIteratorFlattenable` on an array fast path).
+    /// True when `value` is a JS Array — the one case spec 27.1.4.5's
+    /// `GetIteratorFlattenable` unwraps.
+    fn value_is_array(&self, value: JsValue) -> bool {
+        value
+            .as_object()
+            .is_some_and(|h| self.heap.get(h).kind == Kind::Array)
+    }
+
+    /// `reduce`/`forEach`/`some`/`every`/`find`: consume the source and return
+    /// a value, short-circuiting as the spec's algorithms do.
+    fn drain_helper(
+        &mut self,
+        id: NativeId,
+        mut source: HelperSource,
+        callback: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let acc_slot = self.stack.len();
+        self.stack.push(JsValue::undefined());
+        self.gc_protect();
+        // Spec 27.1.4.9 step 6 asks whether `initialValue` is *present*, not
+        // whether it is `undefined`: `reduce(fn, undefined)` seeds with
+        // `undefined`. `args` is the exact call window, so its length is the
+        // arity.
+        let mut acc_is_unset = true;
+        let initial = if id == NativeId::IteratorReduce && args.len() >= 2 {
+            acc_is_unset = false;
+            Some(args[1])
+        } else {
+            None
+        };
+        if let Some(v) = initial {
+            self.stack[acc_slot] = v;
+            acc_is_unset = false;
+            self.gc_protect();
+        }
+        let mut count = 0usize;
+        while let Some(value) = self.helper_source_step(&mut source)? {
+            let index = JsValue::from_f64(count as f64);
+            let result = if id == NativeId::IteratorReduce {
+                let memo = self.stack[acc_slot];
+                if memo.is_undefined() && acc_is_unset {
+                    // No initial value: the first value *is* the seed, and the
+                    // callback is not called for it. `undefined` is a legal
+                    // initial value, so the "unset" flag — not the slot — is
+                    // what distinguishes the two.
+                    self.stack[acc_slot] = value;
+                    self.gc_protect();
+                    acc_is_unset = false;
+                    count += 1;
+                    continue;
+                }
+                // Spec 27.1.4.9 step 4.d: `Call(reducer, undefined, « acc,
+                // value, 𝔽(counter) »)`.
+                let r = self.call_value(callback, JsValue::undefined(), &[memo, value, index]);
+                let r = match r {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = self.op_iterator_close(source.iter, true);
+                        return Err(e);
+                    }
+                };
+                self.stack[acc_slot] = r;
+                self.gc_protect();
+                count += 1;
+                continue;
+            } else {
+                // Spec 27.1.4.7/27.1.4.11-27.1.4.13: `Call(fn, undefined, «
+                // value, 𝔽(counter) »)`.
+                match self.call_value(callback, JsValue::undefined(), &[value, index]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = self.op_iterator_close(source.iter, true);
+                        return Err(e);
+                    }
+                }
+            };
+            match id {
+                NativeId::IteratorForEach => {}
+                NativeId::IteratorSome => {
+                    if ops::to_boolean(self.heap, result) {
+                        self.op_iterator_close(source.iter, false)?;
+                        return Ok(JsValue::from_bool(true));
+                    }
+                }
+                NativeId::IteratorEvery => {
+                    if !ops::to_boolean(self.heap, result) {
+                        self.op_iterator_close(source.iter, false)?;
+                        return Ok(JsValue::from_bool(false));
+                    }
+                }
+                NativeId::IteratorFind => {
+                    if ops::to_boolean(self.heap, result) {
+                        self.op_iterator_close(source.iter, false)?;
+                        return Ok(value);
+                    }
+                }
+                _ => {}
+            }
+            count += 1;
+        }
+        let out = match id {
+            NativeId::IteratorForEach => JsValue::undefined(),
+            NativeId::IteratorSome => JsValue::from_bool(false),
+            NativeId::IteratorEvery => JsValue::from_bool(true),
+            NativeId::IteratorFind => JsValue::undefined(),
+            // Spec 27.1.4.9: an empty source with no initial value is a
+            // TypeError. A supplied `undefined` initial value is NOT that case,
+            // which is what `acc_is_unset` (not the slot) decides.
+            _ if acc_is_unset => {
+                return Err(JSException(self.error_value(
+                    "TypeError: Reduce of empty iterator with no initial value",
+                )));
+            }
+            _ => self.stack[acc_slot],
+        };
+        self.stack.truncate(acc_slot);
+        Ok(out)
+    }
+
+    /// `Iterator.prototype.toArray()` (spec 27.1.4.9) over a source the engine
+    /// cannot step: the drain runs here so each `next` is a real call. Bounded
+    /// like the engine's, so a runaway iterator is a `RangeError` rather than
+    /// an out-of-memory abort.
+    fn drain_to_array(&mut self, mut source: HelperSource) -> Result<JsValue, JSException> {
+        const MAX_DRAIN: usize = 1_000_000;
+        let mut out: Vec<JsValue> = Vec::new();
+        while let Some(value) = self.helper_source_step(&mut source)? {
+            self.heap.add_root(value);
+            out.push(value);
+            if out.len() > MAX_DRAIN {
                 return Err(JSException(self.error_value(
                     "RangeError: iterator drain exceeds 1,000,000 values",
                 )));
             }
         }
-        let mut mapped: Vec<JsValue> = Vec::new();
-        let mut acc: Option<JsValue> = if id == NativeId::IteratorReduce {
-            match args.get(1).copied() {
-                Some(v) if !v.is_undefined() => Some(v),
-                _ => None,
+        Ok(crate::call::alloc_array(self, out))
+    }
+
+    /// ES `GetIteratorDirect` for the helpers: spec 27.1.4 steps 1-3 require an
+    /// Object receiver and a callable `next`. The method is resolved **once**
+    /// and carried on the record, so a `next` getter runs a single time
+    /// (spec 7.4.3 step 3, and what the `get-next-method-only-once` tests
+    /// pin) and later mutations of the property are not observed.
+    fn helper_source_open(&mut self, this_v: JsValue) -> Result<HelperSource, JSException> {
+        if this_v.as_object().is_none() {
+            return Err(JSException(self.error_value(
+                "TypeError: Iterator.prototype method called on a non-object",
+            )));
+        }
+        let next_key = self.new_temp_key("next");
+        let next_v = self.get_property(0, 0, this_v, next_key)?;
+        let next =
+            next_v
+                .as_object()
+                .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
+                .ok_or_else(|| {
+                    JSException(self.error_value(
+                        "TypeError: Iterator.prototype method requires a callable next",
+                    ))
+                })?;
+        self.heap.add_root(JsValue::object(next));
+        self.heap.add_root(this_v);
+        Ok(HelperSource {
+            iter: this_v,
+            next: JsValue::object(next),
+        })
+    }
+
+    /// One `IteratorStepValue` over a helper source: call the cached `next`,
+    /// require an Object result (spec 7.4.2 step 3), then read `done` and only
+    /// then `value` — so a throwing `value` getter on a `done` result is never
+    /// observed.
+    fn helper_source_step(
+        &mut self,
+        source: &mut HelperSource,
+    ) -> Result<Option<JsValue>, JSException> {
+        // Same discipline as `op_iterator_next`: park the callee and the
+        // receiver on the value stack so the `gc_protect` below keeps them
+        // alive, and pop on both the `Ok` and the `Err` path.
+        let base = self.park(&[source.next, source.iter]);
+        let stepped = (|| {
+            let result = self.call_value(source.next, source.iter, &[])?;
+            if result.as_object().is_none() {
+                return Err(JSException(
+                    self.error_value("TypeError: iterator next() returned a non-object"),
+                ));
             }
+            self.heap.add_root(result);
+            let done_key = self.new_temp_key("done");
+            let done = self.get_property(0, 0, result, done_key)?;
+            if ops::to_boolean(self.heap, done) {
+                return Ok(None);
+            }
+            let value_key = self.new_temp_key("value");
+            let value = self.get_property(0, 0, result, value_key)?;
+            Ok(Some(value))
+        })();
+        self.unpark(base);
+        stepped
+    }
+
+    /// The `next` method to hand the engine builder: `undefined` when the
+    /// engine can step the resulting wrapper on its own (a plain element-store
+    /// iterator with a machine-free chain), the resolved method otherwise.
+    fn helper_source_next_for_engine(&mut self, source: &HelperSource) -> JsValue {
+        if self.helper_engine_can_drive(source) {
+            JsValue::undefined()
         } else {
-            None
+            source.next
+        }
+    }
+
+    /// True when the engine's `iterator_next` can step this source without the
+    /// machine: a `Kind::Iterator` whose kind is an element-store kind, or one
+    /// of our wrappers that is itself already machine-free.
+    fn helper_engine_can_drive(&mut self, source: &HelperSource) -> bool {
+        let Some(obj) = source.iter.as_object() else {
+            return false;
         };
-        for (i, v) in values.iter().enumerate() {
-            let idx = JsValue::from_f64(i as f64);
-            let result = if id == NativeId::IteratorReduce {
-                match acc {
-                    Some(a) => {
-                        let call_args = [a, *v, idx];
-                        let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
-                        self.heap.add_root(r);
-                        acc = Some(r);
-                        continue;
-                    }
-                    None => {
-                        acc = Some(*v);
-                        continue;
-                    }
-                }
-            } else {
-                let call_args = [*v, idx, this_v];
-                let r = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
-                self.heap.add_root(r);
-                r
-            };
-            match id {
-                NativeId::IteratorMap | NativeId::IteratorFlatMap => mapped.push(result),
-                NativeId::IteratorFilter => {
-                    if result.is_true() {
-                        mapped.push(*v);
-                    }
-                }
-                NativeId::IteratorSome => {
-                    if result.is_true() {
-                        return Ok(JsValue::from_bool(true));
-                    }
-                }
-                NativeId::IteratorEvery => {
-                    if !result.is_true() {
-                        return Ok(JsValue::from_bool(false));
-                    }
-                }
-                NativeId::IteratorFind => {
-                    if result.is_true() {
-                        return Ok(*v);
-                    }
-                }
-                NativeId::IteratorForEach => {}
-                _ => {}
-            }
+        if self.heap.get(obj).kind != Kind::Iterator {
+            return false;
         }
-        match id {
-            NativeId::IteratorMap => {
-                self.gc_protect();
-                let arr = crate::call::alloc_array(self, mapped);
-                self.heap.add_root(arr);
-                Ok(arr)
-            }
-            NativeId::IteratorFilter => {
-                self.gc_protect();
-                let arr = crate::call::alloc_array(self, mapped);
-                self.heap.add_root(arr);
-                Ok(arr)
-            }
-            NativeId::IteratorFlatMap => {
-                self.gc_protect();
-                let mut flat: Vec<JsValue> = Vec::with_capacity(mapped.len());
-                for v in &mapped {
-                    if let Some(h) = v
-                        .as_object()
-                        .filter(|h| self.heap.get(*h).kind == Kind::Array)
-                    {
-                        flat.extend(self.heap.get(h).elements_snapshot());
-                    } else {
-                        flat.push(*v);
-                    }
-                }
-                let arr = crate::call::alloc_array(self, flat);
-                self.heap.add_root(arr);
-                Ok(arr)
-            }
-            NativeId::IteratorReduce => match acc {
-                Some(v) => Ok(v),
-                None => Err(JSException(self.error_value(
-                    "TypeError: Reduce of empty iterator with no initial value",
-                ))),
-            },
-            NativeId::IteratorSome => Ok(JsValue::from_bool(false)),
-            NativeId::IteratorEvery => Ok(JsValue::from_bool(true)),
-            NativeId::IteratorFind => Ok(JsValue::undefined()),
-            _ => Ok(JsValue::undefined()),
+        let Some(kind) = self.wrapper_kind(obj) else {
+            return false;
+        };
+        if helper_layout::ENGINE_KINDS.contains(&kind) {
+            return true;
         }
+        // A wrapper is machine-free exactly when it was handed `undefined` as
+        // its source's `next` method.
+        self.wrapper_slot(obj, helper_layout::SLOT_SOURCE_NEXT)
+            .as_object()
+            .is_none()
+    }
+
+    /// `{value: undefined, done: true}`.
+    fn done_result(&mut self) -> JsValue {
+        self.make_iterator_result(JsValue::undefined(), true)
+    }
+
+    // -- wrapper element access (layout mirror, see `helper_layout`) ---------
+
+    fn wrapper_kind(&mut self, obj: Handle<JsObject>) -> Option<i32> {
+        self.wrapper_slot(obj, helper_layout::SLOT_KIND)
+            .as_smi()
+            .and_then(|k| i32::try_from(k).ok())
+    }
+
+    fn wrapper_slot(&mut self, obj: Handle<JsObject>, slot: usize) -> JsValue {
+        self.heap
+            .get(obj)
+            .elements
+            .get(slot)
+            .copied()
+            .unwrap_or(JsValue::undefined())
+    }
+
+    /// The counter at [`helper_layout::SLOT_INDEX`]: values emitted, discarded
+    /// or pulled, per wrapper kind.
+    fn wrapper_count(&mut self, obj: Handle<JsObject>) -> usize {
+        self.wrapper_slot(obj, helper_layout::SLOT_INDEX)
+            .as_smi()
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0)
+    }
+
+    fn set_wrapper_slot(&mut self, obj: Handle<JsObject>, slot: usize, value: JsValue) {
+        if let Some(cell) = self.heap.get_mut(obj).elements.get_mut(slot) {
+            *cell = value;
+        }
+    }
+
+    fn set_wrapper_count(&mut self, obj: Handle<JsObject>, slot: usize, count: usize) {
+        self.set_wrapper_slot(
+            obj,
+            slot,
+            JsValue::from_i32_smi(count as i32).unwrap_or(JsValue::undefined()),
+        );
+    }
+
+    fn wrapper_limit(&mut self, obj: Handle<JsObject>) -> usize {
+        let arg = self.wrapper_slot(obj, helper_layout::SLOT_ARG);
+        let n = crate::ops::to_number(self.heap, arg);
+        if !n.is_finite() || n <= 0.0 {
+            return 0;
+        }
+        n.trunc().max(0.0) as usize
     }
 
     /// `Array.prototype.sort(comparefn?)` — the comparator needs re-entry, so

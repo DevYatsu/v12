@@ -990,15 +990,21 @@ define_builtins! {
     },
     // `%Iterator.prototype%`: the ES2025 iterator helpers (spec 27.1.4-27.1.5).
     // `take`/`drop`/`toArray` are pure-heap (a lazy wrapper / a drain) and run
-    // as registry natives; the other eight take a user callback and are
-    // intercepted at the interpreter seam, so their arm is the stub.
+    // as registry natives.
+    //
+    // `map`/`filter`/`flatMap` carry a real body: the interpreter intercepts
+    // the JS call (the callback must be *stored*, not called, and `next` needs
+    // the machine) and then calls this builder through the registry seam with
+    // `args = [callback, source next method]`, so the wrapper layout has a
+    // single home. `reduce`/`forEach`/`some`/`every`/`find` are consumed on the
+    // seam and keep the `callback_stub` placeholder.
     IteratorProto {
         "take" (1) => IteratorTake => |heap, this, args| call_ctx(iterator::iterator_take, heap, this, args),
         "drop" (1) => IteratorDrop => |heap, this, args| call_ctx(iterator::iterator_drop, heap, this, args),
         "toArray" (0) => IteratorToArray => |heap, this, args| call_ctx(iterator::iterator_to_array, heap, this, args),
-        "map" (1) => IteratorMap => callback_stub,
-        "filter" (1) => IteratorFilter => callback_stub,
-        "flatMap" (1) => IteratorFlatMap => callback_stub,
+        "map" (1) => IteratorMap => |heap, this, args| call_ctx(iterator::iterator_map, heap, this, args),
+        "filter" (1) => IteratorFilter => |heap, this, args| call_ctx(iterator::iterator_filter, heap, this, args),
+        "flatMap" (1) => IteratorFlatMap => |heap, this, args| call_ctx(iterator::iterator_flatmap, heap, this, args),
         "reduce" (1) => IteratorReduce => callback_stub,
         "forEach" (1) => IteratorForEach => callback_stub,
         "some" (1) => IteratorSome => callback_stub,
@@ -1217,12 +1223,7 @@ define_builtins! {
     IteratorNext => |heap, this, args| call_ctx(iterator::iterator_next, heap, this, args),
     // The `Iterator` constructor's body and the shared
     // `%Iterator.prototype%[Symbol.iterator]()`. Both are wired by the realm
-    // (a callable field / a symbol key), so they are dispatch-only ids. The
-    // eight callback-taking *helpers* are declared in the `IteratorProto`
-    // group above; their bodies are intercepted at the interpreter seam
-    // (`Interp::run_iterator_callback`) before any dispatch, so their registry
-    // arm is the `callback_stub` placeholder — the same contract the Array
-    // `map`/`filter`/… family uses. Only the body lives on the other side.
+    // (a callable field / a symbol key), so they are dispatch-only ids.
     IteratorConstruct => |heap, this, args| call_ctx(iterator::iterator_construct, heap, this, args),
     IteratorSelf => |heap, this, args| call_ctx(iterator::iterator_self, heap, this, args),
     SymbolConstruct => |heap, this, args| call_ctx(symbol::symbol_construct, heap, this, args),

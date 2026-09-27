@@ -53,30 +53,107 @@ pub const ITER_KIND_SET_VALUES: i32 = 6;
 /// Iterator kind: Set entries (`[value, value]` pairs).
 pub const ITER_KIND_SET_ENTRIES: i32 = 7;
 /// Iterator kind: a helper wrapper that emits at most `limit` values pulled
-/// from its source iterator (`Iterator.prototype.take`). `elements` is
-/// `[kind, source iterator, values emitted, limit]`.
+/// from its source iterator (`Iterator.prototype.take`).
 pub const ITER_KIND_HELPER_TAKE: i32 = 8;
 /// Iterator kind: a helper wrapper that discards the first `limit` values
-/// pulled from its source iterator (`Iterator.prototype.drop`). Same
-/// `elements` layout as [`ITER_KIND_HELPER_TAKE`]; the counter at
-/// [`SLOT_INDEX`] counts *discarded* values.
+/// pulled from its source iterator (`Iterator.prototype.drop`).
 pub const ITER_KIND_HELPER_DROP: i32 = 9;
+/// Iterator kind: the lazy `map` wrapper.
+pub const ITER_KIND_HELPER_MAP: i32 = 10;
+/// Iterator kind: the lazy `filter` wrapper.
+pub const ITER_KIND_HELPER_FILTER: i32 = 11;
+/// Iterator kind: the lazy `flatMap` wrapper.
+pub const ITER_KIND_HELPER_FLATMAP: i32 = 12;
 
-/// True for the two lazily-pulling helper wrapper kinds.
-const fn is_helper_wrapper(kind: i32) -> bool {
+/// Every kind at or below this discriminant is an *element-store* iterator:
+/// one whose `next` scans the source object's element vector with no user code
+/// and no machine. A helper wrapper over one of those can be stepped by this
+/// file alone; anything else must be driven by the interpreter, which stores
+/// the source's `next` method in the wrapper so it can call back into the
+/// machine. This bound is the single source the interpreter's
+/// `helper_layout::ENGINE_KINDS` mirror is checked against.
+pub const ENGINE_KIND_MAX: i32 = ITER_KIND_HELPER_TAKE - 1;
+
+/// True for a `take`/`drop` wrapper.
+pub const fn is_limit_wrapper(kind: i32) -> bool {
     kind == ITER_KIND_HELPER_TAKE || kind == ITER_KIND_HELPER_DROP
 }
 
+/// True for a `map`/`filter`/`flatMap` wrapper: the three helpers that hold a
+/// user callback, and so cannot be stepped without the machine.
+pub const fn is_callback_wrapper(kind: i32) -> bool {
+    matches!(
+        kind,
+        ITER_KIND_HELPER_MAP | ITER_KIND_HELPER_FILTER | ITER_KIND_HELPER_FLATMAP
+    )
+}
+
+/// True for any of the five lazy helper wrappers.
+pub const fn is_helper_wrapper(kind: i32) -> bool {
+    is_limit_wrapper(kind) || is_callback_wrapper(kind)
+}
+
+/// What a helper wrapper's `next` must do, given its counter and (for
+/// `take`/`drop`) its limit. The *decision* lives here so the two executors —
+/// this file's machine-free pull and `v12-interp`'s machine-capable step — can
+/// never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapperStep {
+    /// Report `done`: the limit is reached, or the source ran out during the
+    /// `drop` phase.
+    Done,
+    /// Discard this many more source values before emitting (the `drop`
+    /// phase). `0` means the discards are finished and this step emits.
+    Skip(usize),
+    /// Pull one source value and emit it.
+    Emit,
+}
+
+/// The wrapper state machine, shared by both executors.
+pub const fn wrapper_step(kind: i32, count: usize, limit: usize) -> WrapperStep {
+    if kind == ITER_KIND_HELPER_TAKE {
+        if count >= limit {
+            return WrapperStep::Done;
+        }
+    } else if kind == ITER_KIND_HELPER_DROP {
+        if count < limit {
+            return WrapperStep::Skip(limit - count);
+        }
+    }
+    WrapperStep::Emit
+}
+
 /// Index of the state slots inside an iterator's `elements` vector.
-const SLOT_KIND: usize = 0;
-const SLOT_SOURCE: usize = 1;
-const SLOT_INDEX: usize = 2;
-/// Fourth slot, present only on helper wrappers: the `take`/`drop` limit.
-const SLOT_LIMIT: usize = 3;
+///
+/// Every helper wrapper uses the same fixed seven slots:
+///
+/// - `[0]` kind discriminant (Smi)
+/// - `[1]` the source iterator object
+/// - `[2]` the counter: values emitted (`take`), values discarded (`drop`),
+///   or values pulled from the source (`map`/`filter`/`flatMap`)
+/// - `[3]` the source's `next` method, resolved once when the wrapper was
+///   built — or `undefined` when the whole chain is machine-free and this
+///   file steps it through [`pull`]
+/// - `[4]` the wrapper's argument: the `limit` for `take`/`drop`, the callback
+///   for `map`/`filter`/`flatMap`
+/// - `[5]` `flatMap` only: the array whose elements are still to be yielded
+/// - `[6]` `flatMap` only: the cursor into slot `[5]`
+pub const SLOT_KIND: usize = 0;
+pub const SLOT_SOURCE: usize = 1;
+pub const SLOT_INDEX: usize = 2;
+pub const SLOT_SOURCE_NEXT: usize = 3;
+pub const SLOT_ARG: usize = 4;
+pub const SLOT_PENDING: usize = 5;
+pub const SLOT_PENDING_INDEX: usize = 6;
+
+/// Number of slots every helper wrapper carries. Two of them are `flatMap`-only
+/// (the pending array and its cursor); the rest are `undefined` for the kinds
+/// that do not use them, so the vector is one fixed size for every wrapper.
+pub const WRAPPER_SLOTS: usize = SLOT_PENDING_INDEX + 1;
 
 /// Upper bound on a single eager drain, so a runaway iterator reports a
 /// `RangeError` instead of exhausting memory.
-const MAX_DRAIN: usize = 1_000_000;
+pub const MAX_DRAIN: usize = 1_000_000;
 
 /// Builds an iterator object over `source` with the given kind.
 fn create_iterator(ctx: &mut Ctx, source: Handle<JsObject>, kind: i32) -> Handle<JsObject> {
@@ -91,27 +168,38 @@ fn create_iterator(ctx: &mut Ctx, source: Handle<JsObject>, kind: i32) -> Handle
     })
 }
 
-/// Builds a lazy helper wrapper: an iterator that pulls from `source` (itself
-/// any v12 iterator, wrappers included) instead of scanning a source object's
-/// element store. Nothing is consumed until the wrapper's `next` runs, which
-/// is what makes `take`/`drop` lazy per spec 27.1.4.
-fn create_helper_iterator(
+/// Builds a lazy helper wrapper: an iterator that pulls from `source` (any
+/// iterator) instead of scanning a source object's element store. Nothing is
+/// consumed until the wrapper's `next` runs, which is what makes the helpers
+/// lazy per spec 27.1.4.
+///
+/// `source_next` is the source's `next` method, resolved once by the caller.
+/// Pass [`JsValue::undefined`] when the whole chain is machine-free, in which
+/// case this file steps the wrapper through [`pull`]; pass the real method when
+/// the chain needs the machine, in which case the interpreter intercepts
+/// `next` and drives it. `arg` is the `limit` (take/drop) or the callback
+/// (map/filter/flatMap).
+pub fn create_helper_iterator(
     ctx: &mut Ctx,
-    source: Handle<JsObject>,
+    source: JsValue,
     kind: i32,
-    limit: usize,
+    arg: JsValue,
+    source_next: JsValue,
 ) -> JsValue {
-    ctx.alloc_obj(JsObject {
+    let mut elements = vec![
+        helpers::smi_or_f64(i64::from(kind)),
+        source,
+        helpers::smi_or_f64(0),
+        source_next,
+        arg,
+    ];
+    elements.resize(WRAPPER_SLOTS, JsValue::undefined());
+    let obj = ctx.alloc_obj(JsObject {
         kind: v12_heap::Kind::Iterator,
-        elements: vec![
-            helpers::smi_or_f64(i64::from(kind)),
-            JsValue::object(source),
-            helpers::smi_or_f64(0),
-            helpers::smi_or_f64(limit as i64),
-        ],
+        elements,
         ..JsObject::default()
-    })
-    .into()
+    });
+    JsValue::object(obj)
 }
 
 /// The one generic engine behind every helper: a single `next` pull against
@@ -136,10 +224,11 @@ fn pull(ctx: &mut Ctx, iter: JsValue) -> Result<Option<JsValue>, Throw> {
     Ok(Some(props.first().copied().unwrap_or(JsValue::undefined())))
 }
 
-/// `next` for the two lazy helper wrapper kinds: `take` stops after `limit`
-/// emissions, `drop` discards `limit` values first. Both delegate every real
-/// read to the shared pull, so an underlying iterator is advanced only as far
-/// as the wrapper actually needs.
+/// `next` for a `take`/`drop` wrapper whose chain is machine-free, so every
+/// real read goes through [`pull`]. The control flow comes from
+/// [`wrapper_step`], shared with the interpreter's machine-capable executor;
+/// a callback wrapper is rejected here because running a callback needs the
+/// machine, which this signature cannot reach.
 fn helper_wrapper_next(
     ctx: &mut Ctx,
     iter: Handle<JsObject>,
@@ -148,21 +237,30 @@ fn helper_wrapper_next(
     limit: usize,
     source: JsValue,
 ) -> Result<JsValue, Throw> {
+    if is_callback_wrapper(kind) {
+        return Err(
+            ctx.type_error("TypeError: this iterator helper must be driven by the interpreter")
+        );
+    }
     let mut count = count;
-    if kind == ITER_KIND_HELPER_TAKE {
-        if count >= limit {
-            return Ok(iterator_result(ctx, JsValue::undefined(), true));
-        }
-    } else {
-        while count < limit {
-            if pull(ctx, source)?.is_none() {
-                return Ok(iterator_result(ctx, JsValue::undefined(), true));
+    loop {
+        match wrapper_step(kind, count, limit) {
+            WrapperStep::Done => return Ok(iterator_result(ctx, JsValue::undefined(), true)),
+            WrapperStep::Skip(0) => break,
+            WrapperStep::Skip(n) => {
+                for _ in 0..n {
+                    if pull(ctx, source)?.is_none() {
+                        return Ok(iterator_result(ctx, JsValue::undefined(), true));
+                    }
+                    count += 1;
+                }
+                // The discards are done: the wrapper now passes the source
+                // through, so its counter stops moving and a later `next`
+                // resumes here.
+                ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(count as i64);
             }
-            count += 1;
+            WrapperStep::Emit => break,
         }
-        // The discards are done: the wrapper now passes the source through, so
-        // its counter stops moving and a later `next` resumes here.
-        ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(count as i64);
     }
     match pull(ctx, source)? {
         Some(value) => {
@@ -290,13 +388,15 @@ pub fn iterator_construct(
     Ok(JsValue::object(obj))
 }
 
-/// Brand check shared by every `Iterator.prototype` helper: the receiver must
-/// be one of v12's iterator objects. The spec only requires "an object with a
-/// `next` method", but v1's iterator surface is the concrete `Kind::Iterator`
-/// (the same gate `run_iterator_callback` applies on the interpreter seam), so
-/// one check here keeps the whole helper family consistent.
+/// Brand check shared by every `Iterator.prototype` helper: spec 27.1.4
+/// step 1-3 only requires an Object receiver, because the `next` method lookup
+/// that follows is what rejects a non-iterator. Since the interpreter now owns
+/// the `GetMethod(O, "next")` gate (it has to — the method may be a getter on
+/// a user object), this side only enforces object-ness, which is what lets
+/// `take`/`drop` wrap a generator or a plain `{next(){}}` object.
 fn require_iterator(ctx: &mut Ctx, this: JsValue, name: &str) -> Result<Handle<JsObject>, Throw> {
-    ctx.this_object(this, name, Some(v12_heap::Kind::Iterator))
+    this.as_object()
+        .ok_or_else(|| ctx.type_error(format!("TypeError: {name} called on a non-object")))
 }
 
 /// `iterator.next()` — shared by all four iterator kinds. Advances the
@@ -309,20 +409,17 @@ pub fn iterator_next(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<
     let kind = ctx.heap.get(iter).elements[SLOT_KIND]
         .as_smi()
         .unwrap_or(ITER_KIND_ARRAY_VALUES);
-    // Helper wrappers (`take`/`drop`) carry a fourth slot and pull from the
-    // iterator in `elements[1]` instead of scanning an element store. No
-    // exhaustion flag is needed: a `take` past its limit and a `drop` over a
-    // drained source both keep answering `done` on every later `next`, which
-    // is the spec's requirement for a completed iterator.
+    // A helper wrapper pulls from the iterator in `elements[1]`, and its
+    // `limit`/`callback` argument lives in `elements[4]`. No exhaustion flag is
+    // needed: a `take` past its limit and a `drop` over a drained source both
+    // keep answering `done` on every later `next`, which is the spec's
+    // requirement for a completed iterator.
     if is_helper_wrapper(kind) {
-        let limit = ctx
-            .heap
-            .get(iter)
-            .elements
-            .get(SLOT_LIMIT)
-            .and_then(|v| v.as_smi())
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(0);
+        let limit = if is_limit_wrapper(kind) {
+            wrapper_limit(ctx, ctx.heap.get(iter).elements[SLOT_ARG])
+        } else {
+            0
+        };
         return helper_wrapper_next(ctx, iter, kind, index, limit, JsValue::object(source));
     }
     let mut index = index;
@@ -450,6 +547,18 @@ pub fn iterator_to_array(
     Ok(JsValue::object(arr))
 }
 
+/// The stored `limit` of a `take`/`drop` wrapper, read back through
+/// `ToNumber` on every `next` (the value was already coerced once at call time
+/// by [`take_limit`]; re-reading the stored Smi is a no-op conversion and keeps
+/// the slot type uniform).
+fn wrapper_limit(ctx: &mut Ctx, arg: JsValue) -> usize {
+    let n = ctx.to_number(arg);
+    if !n.is_finite() || n <= 0.0 {
+        return 0;
+    }
+    n.trunc().min(MAX_DRAIN as f64) as usize
+}
+
 /// Parses the `limit` argument via `ctx.to_number` (spec `ToNumber`);
 /// non-finite/negative values clamp to 0.
 fn take_limit(ctx: &mut Ctx, args: &[JsValue]) -> usize {
@@ -464,28 +573,81 @@ fn take_limit(ctx: &mut Ctx, args: &[JsValue]) -> usize {
 /// `Iterator.prototype.take(limit)` — a lazy iterator over the first `limit`
 /// values of `this`. Nothing is pulled until the result is consumed, and no
 /// more than `limit` values are ever pulled from `this`.
+///
+/// `args[0]` is the raw `limit` (spec 27.1.4.3 step 2 `ToNumber` runs here, at
+/// call time, not at the first pull) and `args[1]` is the source's `next`
+/// method as resolved by the interpreter, or `undefined` when the chain is
+/// machine-free and this file will step the wrapper itself.
 pub fn iterator_take(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let source = require_iterator(ctx, this, "Iterator.prototype.take")?;
     let limit = take_limit(ctx, args);
+    let source_next = args.get(1).copied().unwrap_or(JsValue::undefined());
     Ok(create_helper_iterator(
         ctx,
-        source,
+        JsValue::object(source),
         ITER_KIND_HELPER_TAKE,
-        limit,
+        helpers::smi_or_f64(limit as i64),
+        source_next,
     ))
 }
 
 /// `Iterator.prototype.drop(limit)` — a lazy iterator over everything after
 /// the first `limit` values. The discards happen on the first pull, not here.
+/// `args` is shaped exactly as for [`iterator_take`].
 pub fn iterator_drop(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let source = require_iterator(ctx, this, "Iterator.prototype.drop")?;
     let limit = take_limit(ctx, args);
+    let source_next = args.get(1).copied().unwrap_or(JsValue::undefined());
     Ok(create_helper_iterator(
         ctx,
-        source,
+        JsValue::object(source),
         ITER_KIND_HELPER_DROP,
-        limit,
+        helpers::smi_or_f64(limit as i64),
+        source_next,
     ))
+}
+
+/// Builds one of the three lazy callback wrappers (`map`/`filter`/`flatMap`).
+///
+/// These are pure allocation: the callback is *stored*, never called, so the
+/// wrapper is returned before any value is pulled (spec 27.1.4.5 step 6). The
+/// interpreter owns the `next` half, because calling the callback needs the
+/// machine.
+///
+/// `args[0]` is the callback, `args[1]` the source's `next` method as resolved
+/// once by the interpreter.
+pub fn create_callback_iterator(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+    kind: i32,
+) -> Result<JsValue, Throw> {
+    let _ = require_iterator(ctx, this, "Iterator.prototype helper")?;
+    let callback = args.first().copied().unwrap_or(JsValue::undefined());
+    let source_next = args.get(1).copied().unwrap_or(JsValue::undefined());
+    Ok(create_helper_iterator(
+        ctx,
+        this,
+        kind,
+        callback,
+        source_next,
+    ))
+}
+
+/// `Iterator.prototype.map(mapper)` — the wrapper builder; see
+/// [`create_callback_iterator`].
+pub fn iterator_map(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    create_callback_iterator(ctx, this, args, ITER_KIND_HELPER_MAP)
+}
+
+/// `Iterator.prototype.filter(predicate)` — see [`create_callback_iterator`].
+pub fn iterator_filter(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    create_callback_iterator(ctx, this, args, ITER_KIND_HELPER_FILTER)
+}
+
+/// `Iterator.prototype.flatMap(mapper)` — see [`create_callback_iterator`].
+pub fn iterator_flatmap(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    create_callback_iterator(ctx, this, args, ITER_KIND_HELPER_FLATMAP)
 }
 
 /// `Iterator.from(value)` — if already an iterator return it, else wrap an
