@@ -261,18 +261,23 @@ pub trait NativeRegistry {
     ///
     /// `derived` is `resultCapability.[[Promise]]`: the object the
     /// species-selected constructor constructed, which for `%Promise%` is an
-    /// ordinary promise and for a subclass is that subclass's own. The
-    /// *settlement* of it still writes the handler's return value straight in
-    /// (adoption through the capability's `[[Resolve]]` is later work), so a
-    /// subclass that supplies a custom resolving function is not honoured yet.
+    /// ordinary promise and for a subclass is that subclass's own.
+    /// `resolve`/`reject` are `resultCapability`'s pair — the implementation
+    /// settles `derived` by *calling* them (spec 27.5.2.1 step 4), so a
+    /// returned thenable is adopted and a subclass that supplies its own
+    /// resolving functions is honoured. Either half can be user code, so the
+    /// engine calls them from a job rather than from a `NativeHandler`.
     ///
     /// The default implementation refuses: a registry with no promise
     /// machinery has no reactions to install.
+    #[allow(clippy::too_many_arguments)]
     fn promise_perform_then(
         &mut self,
         _heap: &mut Heap,
         _promise: JsValue,
         _derived: JsValue,
+        _resolve: JsValue,
+        _reject: JsValue,
         _on_fulfilled: JsValue,
         _on_rejected: JsValue,
     ) -> Result<(), Throw> {
@@ -284,14 +289,18 @@ pub trait NativeRegistry {
     /// The watching half of `Promise.prototype.finally` (spec 27.5.5.8 steps
     /// 5-13) behind a `derived` promise the caller already has: enqueue the
     /// callback job when `promise` settles, and settle `derived` with the
-    /// watched outcome.
+    /// watched outcome. `resolve`/`reject` are `resultCapability`'s pair and
+    /// are the settlement route, as in [`Self::promise_perform_then`].
     ///
     /// Default implementation refuses, like [`Self::promise_perform_then`].
+    #[allow(clippy::too_many_arguments)]
     fn promise_watch_finally(
         &mut self,
         _heap: &mut Heap,
         _promise: JsValue,
         _derived: JsValue,
+        _resolve: JsValue,
+        _reject: JsValue,
         _on_finally: JsValue,
     ) -> Result<(), Throw> {
         Err(Throw::Message(

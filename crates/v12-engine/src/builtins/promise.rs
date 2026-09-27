@@ -11,9 +11,15 @@
 //! - `properties[1]`: `[[Result]]` — the settled payload
 //! - `properties[2]`: `[[Reactions]]` — array of reaction records
 //!
-//! A reaction record is an ordinary object with
-//! `properties[0..3] == [fulfill handler, reject handler, derived promise]`;
-//! a handler may be `undefined` (pass-through to the derived promise).
+//! A `PromiseReaction` record (spec 27.5.1.2) is an ordinary object with
+//! `properties[0..5] == [fulfill handler, reject handler, derived promise,
+//! [[Capability]].[[Resolve]], [[Capability]].[[Reject]]]`; a handler may be
+//! `undefined` (pass-through to the derived promise), and the pair is what
+//! 27.5.2.1 step 4 routes the handler's result through. A three-slot record is
+//! the *adoption* record [`settle_with_adoption`] installs, where
+//! `properties[0..3]` is the capability pair plus the promise it settles — the
+//! two shapes are told apart by their slot count in
+//! [`drain_reaction_jobs`].
 //!
 //! `new Promise(executor)` splits across the two crates: the capability
 //! ([`promise_capability`] — the promise plus the resolving pair) is engine
@@ -54,15 +60,12 @@
 //! JobCtx)>`) therefore died there, and the next `settle` wrote through a
 //! stale handle. The pinned set is marked separately and is never cleared.
 //!
-//! Still out of scope: adoption when a *reaction handler's* return value is a
-//! thenable (`settle` writes the handler's value straight into the derived
-//! promise — routing it through the capability's `[[Resolve]]` is the next
-//! task). The species *selection* half is not out of scope any more: the
-//! accessor exists (see [`promise_species_get`]) and
-//! `Interp::species_constructor` reads it, but the derived promise a
-//! species-selected constructor hands back is settled by writing straight into
-//! it, so a subclass that gives itself a custom `[[Resolve]]` is not honoured
-//! yet.
+//! Still out of scope: the `await` path. `settle_async_completion` settles an
+//! async function's completion promise through the same
+//! [`capability_settle`] body, so adoption there is already 27.5.1.3's — but
+//! it is driven by the interpreter's own settlement queue rather than by a
+//! [`Job`], and its test262 surface is large enough that changing its routing
+//! is a separate call.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -101,7 +104,7 @@ fn pin(heap: &mut Heap, value: JsValue) {
     }
 }
 
-/// Pins the three values a [`reaction_job`] closure captures.
+/// Pins the values a [`reaction_job`] closure captures.
 ///
 /// A `Box<dyn FnOnce(&mut JobCtx)>` is opaque to the collector, so a job's
 /// captures are roots by virtue of being pinned here and nowhere else. The
@@ -109,15 +112,51 @@ fn pin(heap: &mut Heap, value: JsValue) {
 /// promise: the record that holds a handler is drained (its elements taken)
 /// before the job runs, and the settled promise carrying the payload may be
 /// unreachable from script the moment `then` returns.
+///
+/// The capability pair is pinned for the same reason, and it is the sharpest
+/// case in the module — a species-selected constructor hands `executor`
+/// functions of *its own* (27.5.1.5 step 4: the pair is whatever `C`'s code
+/// passed in), so nothing about them is engine-allocated. There are four
+/// independent routes, and this is the one that states the invariant the
+/// collector cannot infer:
+///
+/// 1. **the producer's contract** — `make_capability` pins both halves, and
+///    `capability_executor` pins the `PromiseCapability` record whose
+///    `properties` hold the pair, "for the rest of the run". This is the
+///    load-bearing one: it is what a species constructor's pair has.
+/// 2. the record itself, pinned in [`install_then_record`] and never unpinned,
+///    with `JsObject::trace` walking `properties` — so `[[Capability]]` is
+///    marked transitively. This is the only route for the *pending* arm that
+///    does not also depend on (1).
+/// 3. the explicit `pin` below, which covers the *immediate* arm of
+///    [`install_then_record`] (a promise that is already settled gets its job
+///    built directly, with no record in existence) and the adoption-record
+///    drain, where the pair read out of the record is about to leave the
+///    record's reach as a job capture.
+///
+/// (1) and (2) are each sufficient on their own; (3) is the belt to that
+/// braces, and the only one of the three that is local to this function.
+///
+/// Measured, not assumed: `the_species_capability_survives_a_collection_between_then_and_the_job`
+/// forces a full mark-sweep plus 4000 allocations into the window and still
+/// passes with (1)'s `capability_executor` pin, (1)'s `make_capability` pins,
+/// (2) and (3) *all* removed. So the pair's liveness rests on (1) as a
+/// documented contract, not on the record slots — do not read the slots as the
+/// root.
 fn pin_job_captures(
     heap: &mut Heap,
     handler: JsValue,
     payload: JsValue,
     derived: v12_heap::Handle<JsObject>,
+    capability: Option<(JsValue, JsValue)>,
 ) {
     pin(heap, handler);
     pin(heap, payload);
     heap.add_pinned_root(derived);
+    if let Some((resolve, reject)) = capability {
+        pin(heap, resolve);
+        pin(heap, reject);
+    }
 }
 
 /// Structural promise check: a `Kind::Promise` object carrying the three
@@ -294,7 +333,13 @@ pub fn promise_then(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     let prototype = ctx.heap.get(promise).prototype;
     let derived = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
     let derived_v = JsValue::object(derived);
-    install_then_record(ctx, this, handler, on_rejected, derived_v)?;
+    // No species selection and no interpreter here, so the capability is the
+    // ordinary one over the promise just allocated — which is exactly what
+    // 27.5.1.5 builds for `%Promise%`, and the interpreter seam's pair is
+    // built the same way for a species that selects it back.
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let (resolve, reject) = make_capability(ctx.heap, &sink, derived);
+    install_then_record(ctx, this, handler, on_rejected, derived_v, resolve, reject)?;
     Ok(derived_v)
 }
 
@@ -321,13 +366,19 @@ pub fn promise_species_get(
 /// The pending/settled split and the reaction job are the engine's (jobs live
 /// here); only the derived-promise allocation moved out, because 27.5.5.4 step
 /// 5 makes it `resultCapability.[[Promise]]` — the object the selected
-/// constructor constructed, which is user code for a subclass.
+/// constructor constructed, which is user code for a subclass. The
+/// `resultCapability` itself is the *other* half that moved out, for 27.5.2.1
+/// step 4: the record carries `[[Capability]]`'s pair, so the job settles the
+/// derived promise the way the selected constructor asked rather than by
+/// writing into it.
 fn install_then_record(
     ctx: &mut Ctx,
     this: JsValue,
     handler: JsValue,
     on_rejected: JsValue,
     derived: JsValue,
+    resolve: JsValue,
+    reject: JsValue,
 ) -> Result<(), Throw> {
     let promise = this.as_object().expect("checked by the caller");
     let sink = ctx.pending.clone().unwrap_or_default();
@@ -338,6 +389,10 @@ fn install_then_record(
     // this function, and `alloc`/`add_property` below can collect, so it is
     // pinned rather than rooted (the same reasoning as `push_record`'s dummy).
     ctx.heap.add_pinned_root(derived);
+    // Same window for the pair: the `alloc` of the record below can collect,
+    // and both halves live in Rust locals across it.
+    pin(ctx.heap, resolve);
+    pin(ctx.heap, reject);
     let (state, payload) = {
         let p = ctx.heap.get(promise);
         (
@@ -351,8 +406,14 @@ fn install_then_record(
                 .as_object()
                 .expect("promise carries a reactions array");
             let record = ctx.heap.alloc(JsObject::ordinary(
-                smallvec::smallvec![handler, on_rejected, JsValue::object(derived)],
-                smallvec::smallvec![None; 3],
+                smallvec::smallvec![
+                    handler,
+                    on_rejected,
+                    JsValue::object(derived),
+                    resolve,
+                    reject
+                ],
+                smallvec::smallvec![None; 5],
             ));
             ctx.heap.add_pinned_root(record);
             ctx.heap
@@ -367,6 +428,7 @@ fn install_then_record(
             payload,
             derived,
             false,
+            (resolve, reject),
         ),
         _ => enqueue_reaction(
             ctx.heap,
@@ -375,6 +437,7 @@ fn install_then_record(
             payload,
             derived,
             true,
+            (resolve, reject),
         ),
     }
     Ok(())
@@ -386,13 +449,23 @@ pub(crate) fn promise_perform_then(
     ctx: &mut Ctx,
     promise: JsValue,
     derived: JsValue,
+    resolve: JsValue,
+    reject: JsValue,
     on_fulfilled: JsValue,
     on_rejected: JsValue,
 ) -> Result<(), Throw> {
     if !is_promise(ctx.heap, promise) {
         return Err(ctx.type_error("Promise.prototype.then requires a promise"));
     }
-    install_then_record(ctx, promise, on_fulfilled, on_rejected, derived)
+    install_then_record(
+        ctx,
+        promise,
+        on_fulfilled,
+        on_rejected,
+        derived,
+        resolve,
+        reject,
+    )
 }
 
 /// The [`promise_finally`] half behind a derived promise the caller already
@@ -401,6 +474,8 @@ pub(crate) fn promise_watch_finally(
     ctx: &mut Ctx,
     promise: JsValue,
     derived: JsValue,
+    resolve: JsValue,
+    reject: JsValue,
     on_finally: JsValue,
 ) -> Result<(), Throw> {
     if !is_promise(ctx.heap, promise) {
@@ -412,8 +487,11 @@ pub(crate) fn promise_watch_finally(
     let promise_h = promise.as_object().expect("checked above");
     // Watched for the same reason as `install_then_record`'s derived: pinned,
     // because the settlement job below captures it in a closure the collector
-    // cannot see.
+    // cannot see. The pair is the `[[Capability]]` half of the same argument,
+    // and it is pinned for the same reason.
     ctx.heap.add_pinned_root(derived);
+    pin(ctx.heap, resolve);
+    pin(ctx.heap, reject);
     pin(ctx.heap, on_finally);
     let sink = ctx.pending.clone().unwrap_or_default();
     let (state, payload) = {
@@ -425,34 +503,53 @@ pub(crate) fn promise_watch_finally(
     };
     if state == STATE_PENDING {
         let sink_f = Rc::clone(&sink);
+        let (res_f, rej_f) = (resolve, reject);
         let fulfill = alloc_host(ctx.heap, move |_heap, _this, args| {
             let value = args.first().copied().unwrap_or_else(JsValue::undefined);
-            sink_f.borrow_mut().push(finally_settle_job(
+            let job = finally_settle_job(
                 derived,
                 on_finally,
+                res_f,
+                rej_f,
                 STATE_FULFILLED,
                 value,
-            ));
+                Rc::clone(&sink_f),
+            );
+            sink_f.borrow_mut().push(job);
             Ok(JsValue::undefined())
         });
         let sink_r = Rc::clone(&sink);
-        let reject = alloc_host(ctx.heap, move |_heap, _this, args| {
+        let (res_r, rej_r) = (resolve, reject);
+        // Named `rejection`, not `reject`: the local shadows the pair's
+        // reject half, and the second half of the closure is built after it.
+        let rejection = alloc_host(ctx.heap, move |_heap, _this, args| {
             let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
-            sink_r.borrow_mut().push(finally_settle_job(
+            let job = finally_settle_job(
                 derived,
                 on_finally,
+                res_r,
+                rej_r,
                 STATE_REJECTED,
                 reason,
-            ));
+                Rc::clone(&sink_r),
+            );
+            sink_r.borrow_mut().push(job);
             Ok(JsValue::undefined())
         });
-        push_record(ctx.heap, promise_h, fulfill, reject);
+        push_record(ctx.heap, promise_h, fulfill, rejection);
     } else {
         // `this` is settled, so nothing else holds its payload once the
         // watcher record is not installed: pin it for the job below.
         pin(ctx.heap, payload);
-        sink.borrow_mut()
-            .push(finally_settle_job(derived, on_finally, state, payload));
+        sink.borrow_mut().push(finally_settle_job(
+            derived,
+            on_finally,
+            resolve,
+            reject,
+            state,
+            payload,
+            Rc::clone(&sink),
+        ));
     }
     Ok(())
 }
@@ -476,19 +573,38 @@ pub fn queue_microtask(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resul
 }
 
 /// Builds one reaction-settling job. The job calls the handler with the
-/// payload (or passes the payload straight through when the handler is
-/// absent), then settles the derived promise — which in turn schedules that
-/// promise's own queued reactions.
+/// payload (or stands in for the payload when the handler is absent), then
+/// settles the derived promise *through the reaction's `[[Capability]]`* — the
+/// two `Call`s of spec 27.5.2.1 step 4, which is where adoption comes from.
+///
+/// `capability` is `« [[Resolve]], [[Reject]] »`. Under `%Promise%` those are
+/// 27.5.1.3's own functions, so the call lands in `capability_settle` and a
+/// thenable handler result is adopted by the machinery that already exists;
+/// for a species-selected constructor they are that constructor's *own*
+/// functions, which is the whole observable point of reading them from the
+/// record instead of writing into the derived promise. Either way the call is
+/// the interpreter's ([`JobCtx::call_object`]), because either half can be
+/// user code.
+///
+/// `None` is the fallback for a record that carries no `[[Capability]]` pair:
+/// the derived promise is written directly, which is what this function did
+/// before the pair existed. Kept so a malformed record degrades to a
+/// non-adopting settlement instead of panicking inside a job.
 fn reaction_job(
     handler: JsValue,
     payload: JsValue,
     derived: v12_heap::Handle<JsObject>,
+    capability: Option<(JsValue, JsValue)>,
     rejecting: bool,
 ) -> Job {
     Box::new(move |ctx: &mut JobCtx<'_, '_>| {
         let callable = handler
             .as_object()
             .is_some_and(|h| ctx.heap_mut().get(h).kind == Kind::Function);
+        // 27.5.2.1 step 3-4: `handlerResult` is the handler's return value,
+        // or — when the handler is absent — the value the reaction was
+        // invoked with (`undefined` is not a completion, so the pass-through
+        // is modelled as the payload going through the same two calls).
         let outcome = if callable {
             let h = handler.as_object().expect("checked above");
             ctx.call_object(h, JsValue::undefined(), &[payload])
@@ -499,18 +615,90 @@ fn reaction_job(
             // Absent fulfill handler: pass the payload through.
             Ok(payload)
         };
-        match outcome {
-            Ok(v) => settle(ctx, derived, STATE_FULFILLED, v),
-            Err(JSException(e)) => settle(ctx, derived, STATE_REJECTED, e),
+        // Step 4: abrupt → `Call([[Reject]], undefined, « handlerResult »)`,
+        // normal → `Call([[Resolve]], undefined, « handlerResult »)`.
+        let (settler, handler_result, fallback_state) = match outcome {
+            Ok(v) => (capability.map(|(r, _)| r), v, STATE_FULFILLED),
+            Err(JSException(e)) => (capability.map(|(_, j)| j), e, STATE_REJECTED),
+        };
+        if !settler.is_some_and(|f| call_capability(ctx, f, handler_result)) {
+            settle(ctx, derived, fallback_state, handler_result);
         }
     })
+}
+
+/// Calls one half of a `[[Capability]]` through the interpreter, because for a
+/// species-selected constructor either half is *user* code and a
+/// `NativeHandler` cannot reach the machine (this runs from a [`Job`], whose
+/// [`JobCtx`] holds the [`Interp`]). A throwing `[[Resolve]]`/`[[Reject]]`
+/// leaves the derived promise as its handler left it: the reaction job has no
+/// `IfAbruptRejectPromise` of its own to route it through.
+///
+/// Returns `false` when `f` is not a callable object, so the caller can fall
+/// back to writing the derived promise directly.
+fn call_capability(ctx: &mut JobCtx<'_, '_>, f: JsValue, value: JsValue) -> bool {
+    let Some(handle) = f.as_object() else {
+        return false;
+    };
+    let _ = ctx.call_object(handle, JsValue::undefined(), &[value]);
+    true
+}
+
+/// A job that calls one half of a capability with one already-known value. Used
+/// by [`adopt_finally_result`]'s forwarding handlers, which run inside a
+/// reaction and must not settle anything themselves.
+fn capability_call_job(f: JsValue, value: JsValue) -> Job {
+    let handle = f.as_object();
+    Box::new(move |ctx: &mut JobCtx<'_, '_>| {
+        if let Some(handle) = handle {
+            let _ = ctx.call_object(handle, JsValue::undefined(), &[value]);
+        }
+    })
+}
+
+/// Whether settling a promise with `value` would *defer* — the same condition
+/// [`start_thenable_adoption`] tests, read without the side effect of enqueuing
+/// the job. Used by [`adopt_finally_result`] to keep the common
+/// `finally(() => {})` shape on a single hop.
+fn may_adopt(heap: &mut Heap, value: JsValue) -> bool {
+    is_promise(heap, value)
+        || value
+            .as_object()
+            .is_some_and(|o| read_then(heap, o).is_some())
+}
+
+/// A rejection reason the engine itself has to produce for a settlement —
+/// today only the 27.5.1.3.2 step 8 self-resolution guard.
+///
+/// [`registry::error_object`] is the shape `Ctx::type_error` builds (own
+/// `name`/`message` plus the realm `TypeError` `constructor` link, which is
+/// what `Promise/resolve/resolve-self.js` asserts on), but the settlement path
+/// has a bare `&mut Heap` and no `Ctx`, so the realm's global comes off the
+/// heap. v1 has exactly one realm, so `realm_globals` holds it or nothing; with
+/// nothing the object still carries its `name`/`message` own properties.
+///
+/// Pinned, not rooted: `error_object` registers an `add_root`, and
+/// `gc_protect` republishes the root set from the value stack, so a rooted
+/// error is gone by the time script reads the rejection. The module contract
+/// is that a value written into `[[Result]]` was pinned by whoever produced it.
+fn self_resolution_type_error(heap: &mut Heap) -> JsValue {
+    let global = heap.realm_globals().first().copied();
+    let err = super::registry::error_object(
+        heap,
+        global,
+        "TypeError",
+        "Chaining cycle detected for promise",
+    );
+    heap.add_pinned_root(err.as_object().expect("error_object makes an object"));
+    err
 }
 
 /// Builds one reaction-settling job and hands it to `push`.
 ///
 /// The job calls the handler with the payload (or passes the payload straight
-/// through when the handler is absent), then settles the derived promise —
-/// which in turn schedules that promise's own queued reactions.
+/// through when the handler is absent), then settles the derived promise
+/// through the reaction's `[[Capability]]` — which in turn schedules that
+/// promise's own queued reactions.
 fn enqueue_reaction(
     heap: &mut Heap,
     push: &mut dyn FnMut(Job),
@@ -518,17 +706,30 @@ fn enqueue_reaction(
     payload: JsValue,
     derived: v12_heap::Handle<JsObject>,
     rejecting: bool,
+    capability: (JsValue, JsValue),
 ) {
     // A job closure is invisible to the collector, and `this`'s own promise
     // (and any record on it) can be reclaimed the moment the drain moves on,
     // so every value the job captures is pinned here — not just the record.
-    pin_job_captures(heap, handler, payload, derived);
-    push(reaction_job(handler, payload, derived, rejecting));
+    pin_job_captures(heap, handler, payload, derived, Some(capability));
+    push(reaction_job(
+        handler,
+        payload,
+        derived,
+        Some(capability),
+        rejecting,
+    ));
 }
 
 /// Takes `promise`'s queued reaction records and builds one settling job per
 /// record for the given settlement. The records are consumed (the reactions
 /// array is emptied); the returned jobs still need an enqueue sink.
+///
+/// Two record shapes arrive here, told apart by slot count (see the module
+/// docs): the five-slot 27.5.1.2 record `«fulfill, reject, derived,
+/// [[Resolve]], [[Reject]]»`, and the three-slot *adoption* record
+/// `«[[Resolve]], [[Reject]], promise»` that [`settle_with_adoption`] installs
+/// — which is a `PromiseReaction` whose handlers already *are* the pair.
 fn drain_reaction_jobs(
     heap: &mut Heap,
     promise: v12_heap::Handle<JsObject>,
@@ -544,9 +745,15 @@ fn drain_reaction_jobs(
         let Some(record) = record_v.as_object() else {
             continue;
         };
-        let (fulfill, reject, derived_v) = {
+        let (fulfill, reject, derived_v, capability) = {
             let r = heap.get(record);
-            (r.properties[0], r.properties[1], r.properties[2])
+            let cap = if r.properties.len() >= 5 {
+                Some((r.properties[3], r.properties[4]))
+            } else {
+                // The adoption record's own pair doubles as its capability.
+                Some((r.properties[0], r.properties[1]))
+            };
+            (r.properties[0], r.properties[1], r.properties[2], cap)
         };
         let Some(derived) = derived_v.as_object() else {
             continue;
@@ -556,8 +763,8 @@ fn drain_reaction_jobs(
         } else {
             (reject, true)
         };
-        pin_job_captures(heap, handler, value, derived);
-        jobs.push(reaction_job(handler, value, derived, rejecting));
+        pin_job_captures(heap, handler, value, derived, capability);
+        jobs.push(reaction_job(handler, value, derived, capability, rejecting));
     }
     jobs
 }
@@ -649,6 +856,25 @@ fn settle_with_adoption(
     }
     if !rejecting && is_promise(heap, value) {
         let value_obj = value.as_object().expect("checked above");
+        if value_obj == promise {
+            // 27.5.1.3.2 step 8: resolving a promise with itself rejects with a
+            // freshly created `TypeError` rather than continuing. Without this
+            // the promise-adoption branch below attaches its record to
+            // `promise`'s *own* reactions array and nothing ever drains it,
+            // so the checkpoint spins until the deadline — which is what
+            // `Promise/resolve/resolve-self.js` did before the guard.
+            //
+            // The spec reads `Get(value, "then")` before this step; the fast
+            // path for a promise value never reads it (see the module docs),
+            // so the identity check runs where that read would have been.
+            let state = STATE_REJECTED;
+            let err = self_resolution_type_error(heap);
+            heap.get_mut(promise).properties[0] = smi(state);
+            heap.get_mut(promise).properties[1] = err;
+            let jobs = drain_reaction_jobs(heap, promise, state, err);
+            sink.borrow_mut().extend(jobs);
+            return Ok(JsValue::undefined());
+        }
         let (v_state, v_payload) = {
             let o = heap.get(value_obj);
             (
@@ -1981,30 +2207,133 @@ pub fn promise_finally(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result
         STATE_PENDING,
         JsValue::undefined(),
     ));
-    promise_watch_finally(ctx, this, derived, on_finally)?;
+    // No species selection without an interpreter, so the pair is the ordinary
+    // one over the promise just allocated — 27.5.1.5 for `%Promise%`.
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let derived_h = derived.as_object().expect("just allocated");
+    let (resolve, reject) = make_capability(ctx.heap, &sink, derived_h);
+    promise_watch_finally(ctx, this, derived, resolve, reject, on_finally)?;
     Ok(derived)
 }
 
 /// One settlement job for [`promise_finally`]: calls the callback (when
-/// callable) and settles `derived` with the watched outcome — or with the
-/// callback's thrown value when the callback throws.
+/// callable) and settles `derived` through `resultCapability`'s pair — the
+/// callback's thrown value on the abrupt arm, the watched outcome otherwise,
+/// but only after the callback's own result has been adopted (27.5.5.8 steps
+/// 1-5).
 fn finally_settle_job(
     derived: v12_heap::Handle<JsObject>,
     on_finally: JsValue,
+    resolve: JsValue,
+    reject: JsValue,
     state: i32,
     payload: JsValue,
+    sink: Rc<RefCell<Vec<Job>>>,
 ) -> Job {
     Box::new(move |ctx: &mut JobCtx<'_, '_>| {
         let callable = on_finally
             .as_object()
             .is_some_and(|h| ctx.heap_mut().get(h).kind == Kind::Function);
-        if callable {
+        // Step 1-2. A non-callable `onFinally` is not called at all, so there
+        // is no result to adopt and the outcome passes straight through.
+        let callback_result = if callable {
             let handler = on_finally.as_object().expect("checked above");
-            if let Err(JSException(thrown)) = ctx.call_object(handler, JsValue::undefined(), &[]) {
-                settle(ctx, derived, STATE_REJECTED, thrown);
-                return;
+            match ctx.call_object(handler, JsValue::undefined(), &[]) {
+                Ok(v) => v,
+                Err(JSException(thrown)) => {
+                    // `IfAbruptRejectPromise(result, resultCapability)`.
+                    call_capability(ctx, reject, thrown);
+                    return;
+                }
             }
+        } else {
+            JsValue::undefined()
+        };
+        // Steps 3-5. An adoptable result takes over the settlement: a *normal*
+        // outcome of the adoption hands the watched value on, an abrupt one
+        // replaces it (which is what makes
+        // `p.finally(() => Promise.reject(e))` reject with `e`).
+        if adopt_finally_result(
+            ctx.heap_mut(),
+            &sink,
+            callback_result,
+            resolve,
+            reject,
+            payload,
+        ) {
+            return;
         }
-        settle(ctx, derived, state, payload);
+        let watched = if state == STATE_FULFILLED {
+            resolve
+        } else {
+            reject
+        };
+        if !call_capability(ctx, watched, payload) {
+            settle(ctx, derived, state, payload);
+        }
     })
+}
+
+/// 27.5.5.8 steps 3-5: the callback's result is adopted
+/// (`PromiseResolve(%Promise%, result)`) and a *normal* settlement of it hands
+/// the **watched** outcome to `resultCapability`'s pair — the callback's return
+/// value never becomes the derived promise's value.
+///
+/// Modelled as a scratch promise holding a forwarding record, so the result's
+/// own adoption runs through the machinery that already exists rather than a
+/// second adoption implementation. Returns `false` when `result` is not
+/// adoptable, so the caller passes the watched outcome on in the same job: the
+/// overwhelmingly common `finally(() => {})` shape, where the spec's extra hop
+/// cannot change the answer.
+fn adopt_finally_result(
+    heap: &mut Heap,
+    sink: &Rc<RefCell<Vec<Job>>>,
+    result: JsValue,
+    resolve: JsValue,
+    reject: JsValue,
+    payload: JsValue,
+) -> bool {
+    if !may_adopt(heap, result) {
+        return false;
+    }
+    // The pair is a job capture from here on (the forwarding handlers hand it
+    // to `capability_call_job`), so it is pinned on this side of the boundary
+    // too.
+    pin(heap, resolve);
+    pin(heap, reject);
+    pin(heap, payload);
+    let scratch = create_promise(heap, None, STATE_PENDING, JsValue::undefined());
+    // Step 5's `then`: a normal settlement of the adopted result resolves the
+    // derived promise with the watched outcome, an abrupt one rejects it with
+    // the reason the adoption failed with.
+    let sink_ok = Rc::clone(sink);
+    let on_ok = alloc_host(heap, move |_heap, _this, _args| {
+        sink_ok
+            .borrow_mut()
+            .push(capability_call_job(resolve, payload));
+        Ok(JsValue::undefined())
+    });
+    let sink_err = Rc::clone(sink);
+    let on_err = alloc_host(heap, move |heap, _this, args| {
+        let reason = args.first().copied().unwrap_or_else(JsValue::undefined);
+        pin(heap, reason);
+        sink_err
+            .borrow_mut()
+            .push(capability_call_job(reject, reason));
+        Ok(JsValue::undefined())
+    });
+    push_record(heap, scratch, on_ok, on_err);
+    // `NewPromiseCapability(%Promise%)` over the scratch, then resolve it with
+    // the callback's result: the adoption this branch exists for.
+    let (scratch_resolve, scratch_reject) = make_capability(heap, sink, scratch);
+    let _ = capability_settle(
+        heap,
+        sink,
+        scratch,
+        scratch_resolve,
+        scratch_reject,
+        result,
+        false,
+    );
+    true
 }

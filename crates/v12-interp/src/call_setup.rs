@@ -4098,11 +4098,13 @@ impl Interp<'_> {
     /// `resultCapability.[[Promise]]`, the object the *selected* constructor
     /// built, which is the whole observable point of the species read.
     ///
-    /// The handler's return value still lands in the derived promise by direct
-    /// write (`reaction_job`), not through the capability's `[[Resolve]]` — so a
-    /// species constructor that supplies a custom resolving function is not
-    /// honoured yet. The derived-promise creation is shaped for that change
-    /// (the capability is built here, and its `[[Resolve]]` is one call away).
+    /// `resultCapability`'s pair rides along to the engine: 27.5.2.1 step 4
+    /// settles the derived promise by `Call`ing `[[Resolve]]`/`[[Reject]]`` with
+    /// the handler's result, and that is what adopts a returned thenable and
+    /// what lets a species constructor supply resolving functions of its own.
+    /// The engine calls them from the reaction job, where a `JobCtx` holds this
+    /// interpreter — a `NativeHandler` cannot, because either half may be user
+    /// code.
     fn run_promise_then(
         &mut self,
         this_v: JsValue,
@@ -4117,12 +4119,17 @@ impl Interp<'_> {
         let on_rejected = args.get(1).copied().unwrap_or_else(JsValue::undefined);
         let default_ctor = self.promise_ctor_value();
         let ctor = self.species_constructor(this_v, default_ctor)?;
-        let (derived, _resolve, _reject) = self.new_promise_capability(ctor)?;
+        let (derived, resolve, reject) = self.new_promise_capability(ctor)?;
         // Park the derived promise across the engine seam: the record install
         // allocates, and `gc_protect` (run by the allocation) republishes the
         // value stack as the root set, so a Rust local would not survive it.
+        // The pair is parked for the same reason — it is live in Rust locals
+        // across the same allocation, and the record that roots it is built on
+        // the other side of it.
         let base = self.stack.len();
         self.stack.push(derived);
+        self.stack.push(resolve);
+        self.stack.push(reject);
         self.stack.push(on_fulfilled);
         self.stack.push(on_rejected);
         self.gc_protect();
@@ -4130,6 +4137,8 @@ impl Interp<'_> {
             self.heap,
             this_v,
             derived,
+            resolve,
+            reject,
             on_fulfilled,
             on_rejected,
         );
@@ -4154,13 +4163,14 @@ impl Interp<'_> {
     ///
     /// Steps 1-4 mirror [`Self::run_promise_then`]: the species selection and
     /// `NewPromiseCapability` happen here so the derived promise is the one the
-    /// selected constructor built. Steps 5-13 are the engine's watcher.
+    /// selected constructor built, and the pair is the derived promise's
+    /// settlement route. Steps 5-13 are the engine's watcher.
     ///
-    /// The callback's *result* is not adopted through the capability's
-    /// `[[Resolve]]`/`[[Reject]]` (27.5.5.8 steps 8-9) — the engine's
-    /// settlement job passes the watched outcome through and only the
-    /// callback's thrown value replaces it. That is the same deferred adoption
-    /// `then` has.
+    /// The callback's result is adopted by the engine's settlement job
+    /// (27.5.5.8 steps 3-5), but the *watched* value is what the derived
+    /// promise ends up with: a returned thenable is resolved first, so a
+    /// rejecting one turns the outcome into a rejection, and a plain return
+    /// value is discarded.
     fn run_promise_finally(
         &mut self,
         this_v: JsValue,
@@ -4174,13 +4184,15 @@ impl Interp<'_> {
         let on_finally = args.first().copied().unwrap_or_else(JsValue::undefined);
         let default_ctor = self.promise_ctor_value();
         let ctor = self.species_constructor(this_v, default_ctor)?;
-        let (derived, _resolve, _reject) = self.new_promise_capability(ctor)?;
+        let (derived, resolve, reject) = self.new_promise_capability(ctor)?;
         let base = self.stack.len();
         self.stack.push(derived);
+        self.stack.push(resolve);
+        self.stack.push(reject);
         self.gc_protect();
         let installed = self
             .natives
-            .promise_watch_finally(self.heap, this_v, derived, on_finally);
+            .promise_watch_finally(self.heap, this_v, derived, resolve, reject, on_finally);
         self.stack.truncate(base);
         installed.map_err(|t| JSException::from_throw(self.heap, t))?;
         Ok(derived)

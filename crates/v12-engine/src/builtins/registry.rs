@@ -308,28 +308,49 @@ impl v12_native::NativeRegistry for NativeRegistry {
     }
 
     /// `PerformPromiseThen` behind a species-selected derived promise.
+    ///
+    /// `resolve`/`reject` are `resultCapability`'s pair: the reaction job
+    /// settles `derived` by calling them (27.5.2.1 step 4), which is where a
+    /// returned thenable is adopted and where a species constructor's own
+    /// resolving functions get their say.
     fn promise_perform_then(
         &mut self,
         heap: &mut Heap,
         promise: JsValue,
         derived: JsValue,
+        resolve: JsValue,
+        reject: JsValue,
         on_fulfilled: JsValue,
         on_rejected: JsValue,
     ) -> Result<(), Throw> {
         let mut ctx = self.promise_ctx(heap);
-        promise::promise_perform_then(&mut ctx, promise, derived, on_fulfilled, on_rejected)
+        promise::promise_perform_then(
+            &mut ctx,
+            promise,
+            derived,
+            resolve,
+            reject,
+            on_fulfilled,
+            on_rejected,
+        )
     }
 
     /// The `finally` watcher behind a species-selected derived promise.
+    ///
+    /// `resolve`/`reject` are `resultCapability`'s pair, for the same reason as
+    /// in [`Self::promise_perform_then`]: 27.5.5.8's `thenFinally` settles the
+    /// derived promise through them once the callback's own result settles.
     fn promise_watch_finally(
         &mut self,
         heap: &mut Heap,
         promise: JsValue,
         derived: JsValue,
+        resolve: JsValue,
+        reject: JsValue,
         on_finally: JsValue,
     ) -> Result<(), Throw> {
         let mut ctx = self.promise_ctx(heap);
-        promise::promise_watch_finally(&mut ctx, promise, derived, on_finally)
+        promise::promise_watch_finally(&mut ctx, promise, derived, resolve, reject, on_finally)
     }
 
     /// The streaming `Promise.all` / `Promise.race` seam. The interpreter
