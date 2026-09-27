@@ -618,17 +618,56 @@ impl Interp<'_> {
         false
     }
 
-    /// `%IteratorPrototype%`-family instances resolve `next` from the const
-    /// method table.
+    /// `%IteratorPrototype%`-family instances resolve the helper methods from
+    /// the const method table.
+    ///
+    /// Two receiver kinds are spec-correct to expose them, and the kind is the
+    /// discriminator in both cases — a prototype-chain walk is not needed and
+    /// not affordable here (see below):
+    ///
+    /// - `Kind::Iterator` — v12's own iterators. Their surface has always been
+    ///   synthesized: `create_iterator` leaves `prototype` as `None`, so there
+    ///   is no chain to consult.
+    /// - `Kind::Generator` — spec 27.4.2 puts `%IteratorPrototype%` in a
+    ///   generator's `[[Prototype]]` chain (via
+    ///   `%GeneratorFunction.prototype.prototype%`). A generator is the one
+    ///   iterator shape v12 does *not* link that way: `execute.rs` stores the
+    ///   captured environment in its `prototype` field, so the chain leads
+    ///   nowhere. The kind is exact — `Kind::Generator` is only ever a generator,
+    ///   so this cannot expose a helper on a plain object.
+    ///
+    /// Ordinary objects are deliberately *not* admitted, even though
+    /// `class X extends Iterator {}` instances are spec-correct to have the
+    /// helpers: `iterator_construct` links such an instance to the real
+    /// `%Iterator.prototype%` object, and that object carries the eleven
+    /// helpers as ordinary installed properties, so the normal prototype lookup
+    /// already finds them. Widening to `Kind::Ordinary` — the kind of nearly
+    /// every object — would put `.map` on `{ map: … }`-shaped plain objects,
+    /// and a chain walk to tell them apart would run on every property read in
+    /// the engine, since this surface is probed before the shape/lookup.
+    ///
+    /// Cost of the ordering below: `method_native` is keyed on the key alone
+    /// (`v12_native::lookup_method`), returns `None` for every key that is not
+    /// one of the twelve table names, and allocates nothing, so a read of any
+    /// other property pays only that match.
     pub(crate) fn iterator_method_surface(
         &mut self,
         obj: Handle<JsObject>,
         key_v: JsValue,
     ) -> Option<Result<JsValue, JSException>> {
-        if self.heap.get(obj).kind != Kind::Iterator {
+        let id = self.method_native(Kind::Iterator, key_v)?;
+        let kind = self.heap.get(obj).kind;
+        if !matches!(kind, Kind::Iterator | Kind::Generator) {
             return None;
         }
-        let id = self.method_native(Kind::Iterator, key_v)?;
+        // A generator's own `next` is the *generator* method, served by
+        // `generator_surface`. That surface is probed earlier in
+        // `get_property`, so this arm is currently unreachable for `next` — but
+        // the invariant is cheap to make local rather than dependent on probe
+        // order: never let the element-store `next` answer for a generator.
+        if kind == Kind::Generator && id == NativeId::IteratorNext {
+            return None;
+        }
         Some(Ok(self.map_set_method(id)))
     }
 

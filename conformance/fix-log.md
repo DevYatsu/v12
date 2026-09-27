@@ -1169,4 +1169,49 @@ Laziness did change the wrapper shape: the layout grew 4 slots → 7, slot 3 cha
 
 `built-ins/Iterator` 202/654 = 30.9 % (was 2.1 % at session start). In-scope failures **6 345 → 6 264**.
 
+### 2026-09-27 — Generators reach the Iterator helper surface [plan follow-up to Task 5]
+
+- **Filter:** `built-ins` (24 061) — fail-set gate against `/tmp/bi-iter2.json`
+- **Result:** **FIXED 76, BROKE 0, MARGINAL 1** (the marginal is `decodeURIComponent/S15.1.3.2_A2.5_T1.js`, near the kill window, unrelated). `net pass delta: +75`, all 76 in `built-ins/Iterator`. `built-ins/Iterator` 202 → **278** pass (42.5 %). Workspace `cargo nextest run --workspace` → **1 105 passed / 2 skipped**. `cargo clippy --workspace --all-targets` → 0 errors. **43 lines, one file.**
+- **Change:** `iterator_method_surface` (`crates/v12-interp/src/property.rs`) resolves the const-table id first (key-only, allocation-free), then admits `Kind::Iterator | Kind::Generator`, with an explicit `id == IteratorNext` guard so a generator's own `next` is never answered by the element-store `iterator_next`. New `crates/v12-engine/tests/iterator_surface_reachability.rs` (16 tests): the fix, a full negative matrix, and the generator `next`/`return` invariants.
+
+#### ⚠ The brief's premise was half wrong, and measuring first changed the design
+
+**`class X extends Iterator` instances were never surface-blocked.** `iterator_construct` links them to the real, materialized `%Iterator.prototype%`, which carries the eleven helpers as ordinary installed properties, so the normal prototype lookup already found them (`typeof new X().map === "function"`, and the helper runs). Only **generators** were genuinely blocked — 83 of the 127, not all 127.
+
+**And a `[[Prototype]]` chain walk would not have found them either.** `execute.rs:1083` stores a generator's `prototype` field as the *captured environment*, not `%GeneratorPrototype%`, so the chain dead-ends. A walk would only ever have served the `extends Iterator` shape, which needs no surface — it would have bought **zero** tests while adding a walk to the hottest path in the engine.
+
+**Chosen: the kind check**, `Kind::Iterator | Kind::Generator`, on three independent grounds — a walk cannot find generators anyway; `iterator_method_surface` is probed *before* the shape/proto lookup for every property read in the engine and `Kind::Ordinary` is nearly every object, so a walk would run for every `plainObject.someHelperName`; and `Kind::Generator` is a closed set, so it cannot over-expose.
+
+Options 1 and 3 (a heap flag bit, or a cached flag) were unavailable: `JsObject::flags` bits 0–2 are the integrity levels and bit 3 is `REALM_GLOBAL_FLAG`, so there is no free iterator bit, and setting one needs a `v12-heap` change. **Hot-path cost accepted:** `method_native(Kind::Iterator, key_v)` moved *above* the kind test. It is keyed on the key alone, returns `None` for every key outside the twelve table names, and allocates nothing — `flatten_key` already ran earlier in `get_property`, so the added work is one bounded `match` for receivers that previously exited on the kind test. No allocation was added on any path.
+
+**Negative matrix verified** (one behaviour per eval, so no throw could mask a later row): `{}.map`, `({}).filter`, `Object.prototype.{map,filter,reduce}`, `new (class A {}).map`, a plain object's `.map`/`.toArray`/`.take`, `'string'.map`, `(42).map`, `(true).map`, `new Map()/.map`, `new Set()/.map`, `Promise.resolve(1).map`, `/x/.map`, `Date.map`, `Error.map`, `Math.map`, `JSON.map`, `function f.map`, arrow `.map`, `Symbol('s').map` — all `undefined`; `null.map`/`undefined.map` throw. And `[1,2,3].reduce(add)` still returns `6` and `[1,2,3,4].filter(even)` still returns `2,4`, asserted as behaviour rather than type, so a shadowing regression would be caught.
+
+#### ⚠ Next-largest finding, and it is NOT an iterator bug: `InternalError: environment slot out of range`
+
+**25 tests across 6 topics** — Iterator 16, **Promise 5**, Array 1, Object 1, Reflect 1, String 1. A user callback that throws, invoked from a native, leaves a dangling environment slot. **It reproduces with no iterator involved**, so it belongs to the `cdb2cb04` family (`MAX_CALL_DEPTH` / `gc_protect` discipline) and needs `crates/v12-interp/src/lib.rs`, which was out of scope. Not attempted.
+
+This is a crash-class defect in the *callback re-entrancy* path — the exact machinery the Promise combinators and every callback-taking Array builtin use — so its true blast radius is plausibly wider than the 25 tests that currently reach it, because many other tests may fail earlier on a different error. Worth treating as a correctness item in its own right rather than a 25-test conformance item.
+
+#### Remaining in the eight callback directories: 135 → 71, none surface-blocked
+
+| blocker | n | detail |
+|---|---|---|
+| `class X extends Iterator` | 33 | **16 `InternalError`** (above) + 9 `return`-forwarding + 5 `get-next-method-only-once` + 3 |
+| generator receiver | 19 | 3 `instanceof Iterator`, 3 `get-next-method-only-once`, 3 `generator-is-running`, 10 `flatMap` close/flatten |
+| other plain receiver | 11 | 8 `argument-validation-failure-closes-underlying`, 3 `this-non-callable-next` |
+| `Iterator.prototype.x.call` only | 8 | all `proto.js` |
+
+Still blocked on the same three things, unmoved by this task: `return` forwarding (~9, needs a `return` method on the helper iterator plus `Symbol.dispose`) — `op_iterator_close` already runs on an abrupt, there is simply nothing to call; `instanceof Iterator` (3, needs `%IteratorHelperPrototype%` in the result's chain, deferred in Task 5); and the 8 `proto.js` (engine-wide single-`prototype`-field limitation, affects every built-in function).
+
+`get-next-method-only-once` on a `next` **getter** (8 tests) reports `SameValue(«function() {}», «N»)` — the count is wrong even though probes show the getter read exactly once. Coupled to the environment-slot bug, not to the `HelperSource` caching.
+
+#### Conformance
+
+```
+full: 24061 tests, 8998 pass   raw  = 37.4 %
+core: 15266 tests, 8996 pass   core = 58.9 %
+```
+
+In-scope failures **6 264 → 6 178**. `built-ins/Iterator` is now 278/654 = 42.5 %, from 14/654 = 2.1 % at session start.
 <!-- Future entries go above this line -->
