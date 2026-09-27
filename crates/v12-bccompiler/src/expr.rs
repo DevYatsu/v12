@@ -142,26 +142,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Expression::Identifier(id) => {
                 self.read_identifier(id.name.as_str(), id.reference_id.get(), id.span)
             }
-            Expression::ThisExpression(t) => {
-                let dst = self.new_temp();
-                let home = self.comp.plans.this_home(self.unit);
-                if home == self.unit {
-                    self.move_reg(dst, REG_THIS, t.span);
-                } else {
-                    let plan = &self.comp.plans.units[home];
-                    if let Some(slot) = plan.this_slot {
-                        let depth = self.comp.plans.env_depth_between(self.unit, home);
-                        self.emit_get_env(dst, depth, slot, t.span);
-                    } else {
-                        // Home did not allocate a `this` env slot (e.g. class
-                        // field initializer `this` not walked during collect).
-                        // Fall back to direct `this` register — the arrow
-                        // captures the same frame's REG_THIS.
-                        self.move_reg(dst, REG_THIS, t.span);
-                    }
-                }
-                Ok(dst)
-            }
+            Expression::ThisExpression(t) => self.read_this(t.span),
             Expression::ArrayExpression(arr) => self.array_literal(arr.elements.iter(), arr.span),
             Expression::ObjectExpression(o) => self.object_literal(o),
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression),
@@ -222,8 +203,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     return self.optional_deref(s.span, obj, key);
                 }
                 let dst = self.new_temp();
-                self.emit_reg3(Opcode::GetProperty, dst, obj, key, s.span);
-                Ok(dst)
+                self.emit_member_load(dst, obj, key, s.object.is_super(), s.span)
             }
             Expression::ComputedMemberExpression(c) => {
                 // Bucket 4: evaluate key expr into temp, then base. Runtime
@@ -234,8 +214,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     return self.optional_deref(c.span, obj, key);
                 }
                 let dst = self.new_temp();
-                self.emit_reg3(Opcode::GetProperty, dst, obj, key, c.span);
-                Ok(dst)
+                self.emit_member_load(dst, obj, key, c.object.is_super(), c.span)
             }
             Expression::PrivateFieldExpression(p) => {
                 let obj = self.expr(&p.object)?;
@@ -1217,12 +1196,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 };
                 let (obj, key) = self.member_parts(m)?;
                 let old = self.new_temp();
-                self.emit_reg3(Opcode::GetProperty, old, obj, key, span);
+                self.emit_member_load(old, obj, key, m.object().is_super(), span)?;
                 let one = self.new_temp();
                 self.load_int(one, delta, span);
                 let new = self.new_temp();
                 self.emit_reg3(Opcode::Add, new, old, one, span);
-                self.emit_reg3(Opcode::SetProperty, obj, key, new, span);
+                self.emit_member_store(m, obj, key, new, span)?;
                 Ok(if prefix { new } else { old })
             }
         }
@@ -1349,13 +1328,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     None => rhs,
                     Some(opcode) => {
                         let cur = self.new_temp();
-                        self.emit_reg3(Opcode::GetProperty, cur, obj, key, span);
+                        self.emit_member_load(cur, obj, key, m.object().is_super(), span)?;
                         let out = self.new_temp();
                         self.emit_reg3(opcode, out, cur, rhs, span);
                         out
                     }
                 };
-                self.emit_reg3(Opcode::SetProperty, obj, key, value, span);
+                self.emit_member_store(m, obj, key, value, span)?;
                 Ok(value)
             }
         }
@@ -1571,7 +1550,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             _ => {
                 if let Some(m) = target.as_member_expression() {
                     let (obj, key) = self.member_parts(m)?;
-                    self.emit_reg3(Opcode::SetProperty, obj, key, val, span);
+                    self.emit_member_store(m, obj, key, val, span)?;
                     Ok(())
                 } else {
                     Err(self.err(span, "unsupported assignment target"))
@@ -1929,7 +1908,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // Storage slot pair: (read register, writer closure context).
         enum Target {
             Id(VarAccess),
-            Member { obj: u16, key: u16 },
+            Member { obj: u16, key: u16, is_super: bool },
         }
         let target = match simple {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
@@ -1954,15 +1933,31 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     ));
                 };
                 let (obj, key) = self.member_parts(m)?;
-                Target::Member { obj, key }
+                Target::Member {
+                    obj,
+                    key,
+                    is_super: m.object().is_super(),
+                }
             }
         };
         // Read current value.
         let cur = self.new_temp();
         match &target {
             Target::Id(access) => self.read_access(*access, cur, span),
-            Target::Member { obj, key } => {
-                self.emit_reg3(Opcode::GetProperty, cur, *obj, *key, span)
+            Target::Member { obj, key, is_super } => {
+                if *is_super {
+                    let receiver = self.read_this(span)?;
+                    let words = v12_bytecode::WideOp::GetSuperW {
+                        dst: cur,
+                        base: *obj,
+                        key: *key,
+                        receiver,
+                    }
+                    .encode();
+                    self.emit_words(words, span);
+                } else {
+                    self.emit_reg3(Opcode::GetProperty, cur, *obj, *key, span);
+                }
             }
         }
 
@@ -1988,8 +1983,20 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let rhs = self.expr(right)?;
         match &target {
             Target::Id(access) => self.store_access(*access, rhs, span),
-            Target::Member { obj, key } => {
-                self.emit_reg3(Opcode::SetProperty, *obj, *key, rhs, span)
+            Target::Member { obj, key, is_super } => {
+                if *is_super {
+                    let receiver = self.read_this(span)?;
+                    let words = v12_bytecode::WideOp::SetPropertyR {
+                        base: *obj,
+                        key: *key,
+                        value: rhs,
+                        receiver,
+                    }
+                    .encode();
+                    self.emit_words(words, span);
+                } else {
+                    self.emit_reg3(Opcode::SetProperty, *obj, *key, rhs, span);
+                }
             }
         }
         self.bind(end);
@@ -2116,9 +2123,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 // `super.x(...)` uses `this` as the receiver (the home object
                 // supplies the method, the current `this` the receiver).
                 let (obj, key) = self.member_parts(m)?;
-                self.emit_reg3(Opcode::GetProperty, block, obj, key, c.span);
+                self.emit_member_load(block, obj, key, m.object().is_super(), c.span)?;
                 if m.object().is_super() {
-                    self.move_reg(block + 1, REG_THIS, c.span);
+                    let this = self.read_this(c.span)?;
+                    self.move_reg(block + 1, this, c.span);
                 } else {
                     self.move_reg(block + 1, obj, c.span);
                 }
@@ -2160,9 +2168,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.move_reg(block + 1, REG_THIS, c.span);
         } else if let Some(m) = c.callee.as_member_expression() {
             let (obj, key) = self.member_parts(m)?;
-            self.emit_reg3(Opcode::GetProperty, block, obj, key, c.span);
+            self.emit_member_load(block, obj, key, m.object().is_super(), c.span)?;
             if m.object().is_super() {
-                self.move_reg(block + 1, REG_THIS, c.span);
+                let this = self.read_this(c.span)?;
+                self.move_reg(block + 1, this, c.span);
             } else {
                 self.move_reg(block + 1, obj, c.span);
             }
@@ -2228,6 +2237,123 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         depth
     }
 
+    /// Emits the load half of a member read whose base (`obj`) and key
+    /// registers are already laid out, returning the destination register.
+    ///
+    /// `super.x` is not an ordinary member read: ES 13.2.5.1 `GetValue` on a
+    /// super reference is `HomeObject.[[GetPrototypeOf]]()[[Get]](key, this)`,
+    /// so the search starts at the base `obj` holds while the accessor that
+    /// answers keeps the method's `this` as its receiver. Narrow `GetProperty`
+    /// uses its base as both, which is why a super read of an inherited
+    /// accessor would run it against the prototype.
+    pub(crate) fn emit_member_load(
+        &mut self,
+        dst: u16,
+        obj: u16,
+        key: u16,
+        is_super: bool,
+        span: Span,
+    ) -> Res<u16> {
+        if is_super {
+            let receiver = self.read_this(span)?;
+            let words = v12_bytecode::WideOp::GetSuperW {
+                dst,
+                base: obj,
+                key,
+                receiver,
+            }
+            .encode();
+            self.emit_words(words, span);
+        } else {
+            self.emit_reg3(Opcode::GetProperty, dst, obj, key, span);
+        }
+        Ok(dst)
+    }
+
+    /// Emits the store half of an assignment whose target is `m`, given the
+    /// already-emitted base (`obj`) and key registers.
+    ///
+    /// `super.x = v` is not an ordinary member store: ES 6.2.3.2 `PutValue` on
+    /// a Super Reference is `base.[[Set]](key, v, thisValue)` — the lookup
+    /// *starts* at the super base but the write lands on the receiver (an
+    /// inherited setter runs with the receiver as `this`, and with no setter
+    /// the property is created on the receiver). Narrow `SetProperty` uses its
+    /// first operand as both search base and receiver, so the super form needs
+    /// the receiver-carrying wide op.
+    pub(crate) fn emit_member_store(
+        &mut self,
+        m: &MemberExpression<'_>,
+        obj: u16,
+        key: u16,
+        value: u16,
+        span: Span,
+    ) -> Res<()> {
+        if m.object().is_super() {
+            let receiver = self.read_this(span)?;
+            let words = v12_bytecode::WideOp::SetPropertyR {
+                base: obj,
+                key,
+                value,
+                receiver,
+            }
+            .encode();
+            self.emit_words(words, span);
+        } else {
+            self.emit_reg3(Opcode::SetProperty, obj, key, value, span);
+        }
+        Ok(())
+    }
+
+    /// `this` as seen from the current unit: the frame's own `REG_THIS`, or
+    /// the enclosing unit's `this` env slot when the current unit is an arrow
+    /// (arrows have no own `this` binding, they close over the nearest
+    /// non-arrow function's).
+    pub(crate) fn read_this(&mut self, span: Span) -> Res<u16> {
+        let dst = self.new_temp();
+        let home = self.comp.plans.this_home(self.unit);
+        if home == self.unit {
+            self.move_reg(dst, REG_THIS, span);
+            return Ok(dst);
+        }
+        let plan = &self.comp.plans.units[home];
+        if let Some(slot) = plan.this_slot {
+            let depth = self.comp.plans.env_depth_between(self.unit, home);
+            self.emit_get_env(dst, depth, slot, span);
+        } else {
+            // Home did not allocate a `this` env slot (e.g. class field
+            // initializer `this` not walked during collect). Fall back to
+            // direct `this` register — the arrow captures the same frame's
+            // REG_THIS.
+            self.move_reg(dst, REG_THIS, span);
+        }
+        Ok(dst)
+    }
+
+    /// The unit that owns the `super` binding in scope: the nearest enclosing
+    /// non-arrow unit that uses `super`. Arrows inherit the binding, so the
+    /// owner is not always [`Self::unit`].
+    fn super_owner_unit(&self) -> Option<usize> {
+        let units = &self.comp.plans.units;
+        let mut cur = Some(self.unit);
+        while let Some(u) = cur {
+            if !units[u].is_arrow && units[u].uses_super {
+                return Some(u);
+            }
+            cur = units[u].parent;
+        }
+        // Fallback for a `super` the collect pass never marked (an optional
+        // chain body, say): an object-literal method owns `super` outright, so
+        // the nearest enclosing one is the owner regardless of the flag.
+        let mut cur = Some(self.unit);
+        while let Some(u) = cur {
+            if !units[u].is_arrow && units[u].is_object_method {
+                return Some(u);
+            }
+            cur = units[u].parent;
+        }
+        None
+    }
+
     /// `super` in expression position: resolves the parent constructor from
     /// the class env. For member access the caller additionally dereferences
     /// `.prototype` for instance methods.
@@ -2252,11 +2378,29 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Ok(d)
     }
 
-    /// Lowers `super` used as a member object: `superCtor.prototype` for
-    /// instance methods, `superCtor` for static methods and constructors.
+    /// Lowers `super` used as a member object. Two shapes, per who owns the
+    /// `super` binding:
+    ///
+    /// - class instance method → `superCtor.prototype`, static method or
+    ///   constructor → `superCtor`;
+    /// - object-literal method → the literal's own `[[Prototype]]`. The engine
+    ///   has no `[[HomeObject]]` slot, so the receiver stands in for the
+    ///   HomeObject: ES §13.2.5.1 `GetValue` on a super reference starts the
+    ///   lookup at `HomeObject.[[GetPrototypeOf]]()`, never on the HomeObject
+    ///   itself, so `super.x` must skip the literal's own `x`.
+    ///
+    /// Returning the receiver outright (the previous lowering) turned
+    /// `{ get x() { return super.x } }` into a self-call whenever the literal
+    /// owns an `x` — unbounded Rust recursion, i.e. a stack overflow.
     fn super_expr(&mut self, span: Span) -> Res<u16> {
-        if self.comp.plans.units[self.unit].is_object_method {
-            return Ok(crate::model::REG_THIS);
+        let Some(owner) = self.super_owner_unit() else {
+            return Err(self.err(span, "`super` outside a class method is not supported"));
+        };
+        if self.comp.plans.units[owner].is_object_method {
+            let this = self.read_this(span)?;
+            let base = self.new_temp();
+            self.emit_reg3(Opcode::GetPrototype, base, this, 0, span);
+            return Ok(base);
         }
         let ctor = self.super_ctor(span)?;
         let is_static = self.comp.plans.units[self.unit].static_method;

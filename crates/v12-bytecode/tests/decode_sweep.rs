@@ -251,9 +251,10 @@ fn known_discriminants_exactly_match_opcode_enum() {
 /// "unknown discriminant" diagnostic.
 #[test]
 fn wide_headers_with_unknown_discriminants_error_cleanly() {
-    // Discriminants 15.. are unassigned (7..14 name RegExt, ClosureW,
-    // NewEnvironmentW, ConstructW, GetPrivateW, SetPrivateW, DefinePrivateW, HasPrivateW).
-    for disc in [15u32, 31, 99, 255] {
+    // Discriminants 17.. are unassigned (7..16 name RegExt, ClosureW,
+    // NewEnvironmentW, ConstructW, GetPrivateW, SetPrivateW, DefinePrivateW,
+    // HasPrivateW, SetPropertyR, GetSuperW).
+    for disc in [17u32, 31, 99, 255] {
         let words = [
             Instr::new_imm24(Opcode::Wide, disc),
             Instr(0x1234_5678),

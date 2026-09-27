@@ -1871,6 +1871,62 @@ fn object_method_super_property_is_allowed() {
     assert!(err.contains("super()"), "got: {err}");
 }
 
+/// ES §13.2.5.1: a super reference in an object-literal method reads the
+/// receiver's *prototype*, never the receiver itself. Lowering it to the
+/// receiver register (`this.x`) turned `{ get x() { return super.x } }` into
+/// a self-call, so the lowering must emit `GetPrototype(this)` first.
+#[test]
+fn object_method_super_reads_the_receiver_prototype() {
+    let fb = compile_source_with_strings("var o = { m() { return super.x; } };").unwrap();
+    let body = fb.0.functions.last().expect("method unit");
+    assert!(
+        body.instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::GetPrototype)),
+        "object-method `super.x` must start at `[[GetPrototypeOf]](this)`: {body}"
+    );
+    // A class method keeps the constructor-based lowering instead.
+    let fb = compile_source_with_strings("class C { m() { return super.x; } }").unwrap();
+    let body = fb.0.functions.last().expect("method unit");
+    assert!(
+        !body
+            .instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::GetPrototype)),
+        "class-method `super.x` must keep resolving through the constructor: {body}"
+    );
+}
+
+/// ES §6.2.3.2 `PutValue` on a super reference is
+/// `base.[[Set]](key, value, thisValue)`: the search starts at the super base
+/// but the write lands on the receiver, which narrow `SetProperty` (base ==
+/// receiver) cannot express.
+#[test]
+fn object_method_super_assignment_uses_the_receiver_carrying_store() {
+    let fb = compile_source_with_strings("var o = { m() { super.x = 1; } };").unwrap();
+    let body = fb.0.functions.last().expect("method unit");
+    assert!(
+        body.instrs.iter().any(|i| i.op() == Some(Opcode::Wide)),
+        "`super.x = v` needs the receiver-carrying wide store: {body}"
+    );
+    assert!(
+        !body
+            .instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::SetProperty)),
+        "`super.x = v` must not use the base-as-receiver `SetProperty`: {body}"
+    );
+    // Plain member assignment is untouched.
+    let fb = compile_source_with_strings("var o = { m(p) { p.x = 1; } };").unwrap();
+    let body = fb.0.functions.last().expect("method unit");
+    assert!(
+        body.instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::SetProperty)),
+        "ordinary member assignment still uses `SetProperty`: {body}"
+    );
+}
+
 /// ES §15.7.1: a class declares `constructor` at most once and a private name
 /// at most once per class (get/set pairs excepted).
 #[test]

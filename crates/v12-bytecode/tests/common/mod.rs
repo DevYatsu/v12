@@ -29,9 +29,10 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     73, 74, // GetGlobalLenient, GenResumeMode
     75, // ToPropertyKey
     76, // GetAsyncIterator
+    77, // GetPrototype
 ];
 
-pub const EXPECTED_OPCODE_COUNT: usize = 71;
+pub const EXPECTED_OPCODE_COUNT: usize = 72;
 
 /// Seeded splitmix64. Deterministic across platforms and runs.
 pub struct Rng(u64);
@@ -76,14 +77,14 @@ pub fn fn_with(len: u32, handlers: Vec<HandlerRange>) -> FunctionBytecode {
 }
 
 /// Wide payload word count per discriminant (header excluded).
-pub const WIDE_PAYLOAD_WORDS: [u32; 15] = [2, 3, 2, 2, 2, 2, 2, 1, 1, 1, 2, 3, 3, 3, 3];
+pub const WIDE_PAYLOAD_WORDS: [u32; 17] = [2, 3, 2, 2, 2, 2, 2, 1, 1, 1, 2, 3, 3, 3, 3, 2, 2];
 
 /// Total encoded width per discriminant (header included).
-pub const WIDE_TOTAL_WORDS: [u32; 15] = [3, 4, 3, 3, 3, 3, 3, 2, 2, 2, 3, 4, 4, 4, 4];
+pub const WIDE_TOTAL_WORDS: [u32; 17] = [3, 4, 3, 3, 3, 3, 3, 2, 2, 2, 3, 4, 4, 4, 4, 3, 3];
 
 /// Builds a random `WideOp` for structured roundtrip fuzzing.
 pub fn random_wide_op(rng: &mut Rng) -> WideOp {
-    match rng.below(15) {
+    match rng.below(17) {
         0 => WideOp::LoadConstW {
             dst: rng.next_u32() as u16,
             const_id: rng.next_u32(),
@@ -156,10 +157,22 @@ pub fn random_wide_op(rng: &mut Rng) -> WideOp {
             class_id: rng.next_u32(),
             name_id: rng.next_u32(),
         },
-        _ => WideOp::ConstructW {
+        14 => WideOp::ConstructW {
             dst: rng.next_u32() as u16,
             func: rng.next_u32() as u16,
             argc: rng.next_u32() as u16,
+        },
+        15 => WideOp::SetPropertyR {
+            base: rng.next_u32() as u16,
+            key: rng.next_u32() as u16,
+            value: rng.next_u32() as u16,
+            receiver: rng.next_u32() as u16,
+        },
+        _ => WideOp::GetSuperW {
+            dst: rng.next_u32() as u16,
+            base: rng.next_u32() as u16,
+            key: rng.next_u32() as u16,
+            receiver: rng.next_u32() as u16,
         },
     }
 }

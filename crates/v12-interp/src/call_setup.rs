@@ -4,7 +4,9 @@
 
 use v12_heap::{Attrs, Descriptor, Handle, HeapExt, JsObject, JsValue, Kind, PropKey};
 
-use super::{CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH, intrinsic_slot};
+use super::{
+    CallOutcome, Frame, Interp, JSException, MAX_CALL_DEPTH, MAX_RESUME_DEPTH, intrinsic_slot,
+};
 use crate::execute::decode_parked_call;
 use crate::ops;
 use crate::property::OwnDesc;
@@ -446,6 +448,23 @@ impl Interp<'_> {
                 // bytecode resolves against the accessor's own program, which
                 // lets eval-created accessors be invoked from the outer
                 // program.
+                //
+                // Each level of accessor re-entry nests a Rust `execute` call
+                // (below), so it spends *native* stack, not frame-stack
+                // budget: a getter that resolves to itself — `super.x` landing
+                // back on the receiver's own accessor, or two objects whose
+                // same-key accessors alias — recursed until the process
+                // aborted with `fatal runtime error: stack overflow`. The
+                // ordinary call seams' `MAX_CALL_DEPTH` is far too high to
+                // fire first here (a few thousand levels already exhaust an
+                // 8 MiB thread stack in a debug build), so this seam is
+                // governed by `MAX_RESUME_DEPTH`, the budget that exists
+                // precisely for nested `execute()` re-entries.
+                if self.resume_depth >= MAX_RESUME_DEPTH {
+                    return Err(JSException(
+                        self.error_value("RangeError: maximum call stack size exceeded"),
+                    ));
+                }
                 let funcs = self.functions_for_program(func_program);
                 if (fn_idx as usize) >= funcs.len() {
                     // Out-of-range accessor target: route known natives
@@ -501,7 +520,9 @@ impl Interp<'_> {
                 // clobber the outer `stop_at_frames`.
                 let saved = self.stop_at_frames;
                 self.stop_at_frames = Some(self.frames.len() - 1);
+                self.resume_depth += 1;
                 let exec_result = self.execute();
+                self.resume_depth -= 1;
                 self.stop_at_frames = saved;
                 exec_result?;
                 Ok(self.top_result.take().unwrap_or(JsValue::undefined()))
@@ -521,6 +542,16 @@ impl Interp<'_> {
         this: JsValue,
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
+        // Like [`Self::call_accessor_with`], the bytecode arm below nests a
+        // Rust `execute()` call, so it spends native stack and needs the
+        // `MAX_RESUME_DEPTH` budget rather than `MAX_CALL_DEPTH`. A callback
+        // that re-enters its own callback-taking builtin (`arr.map(x =>
+        // arr.map(f))`) otherwise recurses until the process aborts.
+        if self.resume_depth >= MAX_RESUME_DEPTH {
+            return Err(JSException(
+                self.error_value("RangeError: maximum call stack size exceeded"),
+            ));
+        }
         let (target, captured_env, func_program) = {
             let o = self.heap.get(func);
             (o.callable, o.captured_env, o.program_id)
@@ -615,7 +646,9 @@ impl Interp<'_> {
                 // this call's `stop_at_frames`.
                 let saved = self.stop_at_frames;
                 self.stop_at_frames = Some(self.frames.len() - 1);
+                self.resume_depth += 1;
                 let exec_result = self.execute();
+                self.resume_depth -= 1;
                 self.stop_at_frames = saved;
                 exec_result?;
                 Ok(self.top_result.take().unwrap_or(JsValue::undefined()))

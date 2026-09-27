@@ -165,7 +165,9 @@ impl<'p> Mini<'p> {
                         | WideOp::GetPrivateW { .. }
                         | WideOp::SetPrivateW { .. }
                         | WideOp::DefinePrivateW { .. }
-                        | WideOp::HasPrivateW { .. } => {
+                        | WideOp::HasPrivateW { .. }
+                        | WideOp::SetPropertyR { .. }
+                        | WideOp::GetSuperW { .. } => {
                             panic!("wide op not expected in mini-interp snippets")
                         }
                     }
@@ -263,6 +265,13 @@ impl<'p> Mini<'p> {
                     // Reference interpreter: objects carry an optional proto
                     // in the value; approximate by tracking on the object's
                     // property store is out of scope — treat as no-op.
+                    pc += 1;
+                }
+                Opcode::GetPrototype => {
+                    // Same gap as `SetPrototype`: the mini `Val` has no
+                    // prototype slot to read, so `super.x` in a mini program
+                    // sees `null`.
+                    regs[instr.a() as usize] = Val::Null;
                     pc += 1;
                 }
                 Opcode::LoopHeader => pc += 1,

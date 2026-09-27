@@ -1200,6 +1200,160 @@ impl Interp<'_> {
         }
     }
 
+    /// ES 6.2.3.2 `PutValue` on a Super Reference: `base.[[Set]](key, value,
+    /// receiver)`. The lookup *starts* at `base` but the write lands on
+    /// `receiver` — an inherited setter runs with the receiver as `this`, and
+    /// with no setter anywhere on `base`'s chain the property is created on the
+    /// receiver.
+    ///
+    /// Narrow `set_property` always uses its first operand as both, which is
+    /// right for every ordinary `obj.x = v` (this is that path) and wrong here.
+    pub(crate) fn set_property_from(
+        &mut self,
+        base_v: JsValue,
+        key_v: JsValue,
+        value: JsValue,
+        receiver_v: JsValue,
+        strict: bool,
+    ) -> Result<(), JSException> {
+        // Spec steps 1-2: an undefined/null base and a non-object receiver both
+        // throw, whatever the mode. A primitive *base* has no internal method,
+        // so it takes `set_property`'s primitive rules.
+        if base_v.is_null() || base_v.is_undefined() {
+            return Err(JSException(self.error_value(
+                "TypeError: cannot set properties of null or undefined",
+            )));
+        }
+        if receiver_v.as_object().is_none() {
+            return Err(JSException(self.error_value(
+                "TypeError: super assignment receiver is not an object",
+            )));
+        }
+        let Some(mut cur) = base_v.as_object() else {
+            return self.set_property(base_v, key_v, value, strict);
+        };
+        self.flatten_key(key_v);
+        let key = self.property_key(key_v)?;
+        // Steps 3-9: walk `base`'s own chain for the first descriptor of
+        // `key`. Only the *governing* descriptor matters — an accessor routes
+        // to `receiver.[[Set]]`, a non-writable one blocks, a writable one
+        // (or no descriptor at all) falls through to the receiver write.
+        loop {
+            if self.heap.get(cur).kind == Kind::Proxy {
+                let ok = self.proxy_op_set(cur, receiver_v, key_v, value)?;
+                if !ok && strict {
+                    return Err(JSException(
+                        self.error_value("TypeError: 'set' on proxy returned false"),
+                    ));
+                }
+                return Ok(());
+            }
+            if let Some(d) = self.ordinary_own_descriptor(cur, key) {
+                if d.is_accessor() {
+                    if d.set.is_undefined() {
+                        if strict {
+                            return Err(JSException(self.error_value(
+                                "TypeError: cannot assign to accessor without setter",
+                            )));
+                        }
+                        return Ok(());
+                    }
+                    return self.set_property(receiver_v, key_v, value, strict);
+                }
+                if d.has_writable && !d.writable {
+                    if strict {
+                        return Err(JSException(
+                            self.error_value("TypeError: cannot assign to read-only property"),
+                        ));
+                    }
+                    return Ok(());
+                }
+                break;
+            }
+            match self.heap.get(cur).prototype {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        // Step 5/7.e: nothing writable governs the write, so it is an ordinary
+        // `receiver[key] = value` — which re-walks the receiver's chain,
+        // finds the same writable/absent descriptor, and creates the own
+        // property on the receiver.
+        self.set_property(receiver_v, key_v, value, strict)
+    }
+
+    /// ES 7.3.3 `Get(V, P, Receiver)` with `V` = `base_v`: the search walks
+    /// `base_v`'s own chain, but an accessor (or proxy `get` trap) met on the
+    /// way runs with `receiver_v` as `this`. Plain [`Self::get_property`]
+    /// passes its base as the receiver too, which is right for `obj.x` and
+    /// wrong for a super read.
+    ///
+    /// Everything that does not depend on the receiver — a data property (its
+    /// value is the same whoever asked), or no property at all — is answered
+    /// by re-reading from the receiver, whose prototype chain starts at `base`
+    /// and so reaches the same descriptor.
+    /// ES 7.3.3 `Get(V, P, Receiver)` with `V` = `base_v`: the search walks
+    /// `base_v`'s own chain, but an accessor (or proxy `get` trap) met on the
+    /// way runs with `receiver_v` as `this`. Plain [`Self::get_property`]
+    /// passes its base as the receiver too, which is right for `obj.x` and
+    /// wrong for a super read.
+    ///
+    /// The receiver is never consulted for the *value* — spec `Get` starts at
+    /// `V` — so the owning object is read directly once located. That is the
+    /// whole point of `super`: `o.toString = null; super.toString` must still
+    /// answer `Object.prototype.toString`.
+    pub(crate) fn get_property_from(
+        &mut self,
+        base_v: JsValue,
+        key_v: JsValue,
+        receiver_v: JsValue,
+    ) -> Result<JsValue, JSException> {
+        // Spec step 1: `Get` on a nullish base throws.
+        if base_v.is_null() || base_v.is_undefined() {
+            return Err(JSException(self.error_value(
+                "TypeError: cannot read properties of null or undefined",
+            )));
+        }
+        // A primitive base has no internal method. The object-literal `super`
+        // lowering never produces one (`[[GetPrototypeOf]]` already threw),
+        // so this only guards a hand-written program.
+        let Some(mut cur) = base_v.as_object() else {
+            return self.get_property(0, 0, base_v, key_v);
+        };
+        self.flatten_key(key_v);
+        let key = self.property_key(key_v)?;
+        loop {
+            // A deferred module namespace met on the way triggers its body
+            // before the key is inspected (ES 7.3.29 / `GetModuleExportsList`),
+            // the same observation `get_property` performs.
+            if self.heap.get(cur).kind == Kind::ModuleNamespace {
+                self.trigger_module_namespace(cur, Some(key), false)?;
+            }
+            // Proxy exotic in the chain: its `get` trap sees the original
+            // receiver (ES 10.5.8, OrdinaryGet step 3).
+            if self.heap.get(cur).kind == Kind::Proxy {
+                return self.proxy_op_get(cur, receiver_v, key_v);
+            }
+            if let Some(d) = self.ordinary_own_descriptor(cur, key) {
+                if d.is_accessor() {
+                    return match d.get.as_object() {
+                        Some(getter) => self.call_accessor(getter, receiver_v),
+                        None => Ok(JsValue::undefined()),
+                    };
+                }
+                // A data property: its value does not depend on the receiver,
+                // and reading it through the owner (which owns the key) keeps
+                // the receiver's own properties out of the answer.
+                return self.get_property(0, 0, JsValue::object(cur), key_v);
+            }
+            match self.heap.get(cur).prototype {
+                Some(p) => cur = p,
+                // Nothing on the whole chain: `Get` answers `undefined`.
+                None => return Ok(JsValue::undefined()),
+            }
+        }
+    }
+
     /// `SetProperty`: overwrite own writable slots, create new own properties
     /// through shape transitions, shadow writable inherited ones, and route
     /// canonical indices on arrays through the element store. Blocked writes

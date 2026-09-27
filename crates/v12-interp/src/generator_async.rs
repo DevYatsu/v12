@@ -1148,6 +1148,13 @@ impl Interp<'_> {
         });
         self.top_result = None;
         let frames_before = self.frames.len();
+        // The caller's own boundary has to survive this resume: `execute` and
+        // `unwind` both consult `stop_at_frames`, and a nested resume that
+        // leaves it at `None` lets the next unwind drain the *caller's*
+        // frames too, after which the caller's `execute` is still driving a
+        // frame whose register window no longer exists (the `index out of
+        // bounds` panic in the `Call` arm).
+        let saved_stop = self.stop_at_frames;
         let exec_res = if is_throw {
             // Arm the boundary BEFORE unwinding: `unwind` consults
             // `stop_at_frames` to decide where to stop. A stale boundary
@@ -1183,12 +1190,12 @@ impl Interp<'_> {
                 return Err(e);
             }
             let r = self.execute();
-            self.stop_at_frames = None;
+            self.stop_at_frames = saved_stop;
             r
         } else {
             self.stop_at_frames = Some(self.frames.len() - 1);
             let r = self.execute();
-            self.stop_at_frames = None;
+            self.stop_at_frames = saved_stop;
             r
         };
         match exec_res {

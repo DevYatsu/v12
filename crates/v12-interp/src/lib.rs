@@ -315,13 +315,26 @@ const WK_ASYNC_ITERATOR: usize = 37;
 /// megabytes of stack slots; mainstream engines converge on the same order.
 const MAX_CALL_DEPTH: usize = 10_000;
 
-/// Maximum simultaneous native `execute()` re-entries (generator resumes and
-/// similar host→JS re-entry). Each level costs several KiB of *native* stack,
-/// so this cap — not [`MAX_CALL_DEPTH`] — is what keeps a self-resuming
-/// generator (`function* g() { g().next(); }`) from overflowing the thread
-/// stack and aborting the process; ordinary recursion stays governed by
-/// `MAX_CALL_DEPTH`, which this budget will not exhaust first.
-const MAX_RESUME_DEPTH: usize = 1_000;
+/// Maximum simultaneous native `execute()` re-entries.
+///
+/// Every seam that re-enters the dispatch loop recursively — a compiled
+/// accessor body ([`Interp::call_accessor_with`]), an inline call
+/// ([`Interp::call_inline`]), a value call ([`Interp::call_value_nested`]), and
+/// generator resumes — costs roughly 12 KiB of *native* stack per level in a
+/// debug build, unlike ordinary JS calls which are iterative. `MAX_CALL_DEPTH`
+/// alone therefore cannot protect any of them: at 10 000 levels the process
+/// aborts with `fatal runtime error: stack overflow` long before the frame cap
+/// fires, which is exactly what a 1 000 budget did here. 64 levels is ~0.8 MiB
+/// of native stack: measured on the ~1.2 MiB test threads `cargo nextest`
+/// gives each test, a nested accessor cycle still aborts the process at 96
+/// levels and survives at 64, and an 8 MiB main thread has 10× the headroom.
+/// The cap sits far above any legitimate nesting — a long prototype chain of
+/// getters resolves iteratively inside one `execute`, not by nesting. What it
+/// bounds are genuine cycles: a self-referential getter, mutually recursive
+/// getters, a callback re-entering its own callback-taking builtin, a
+/// self-resuming generator. Each now reports a catchable `RangeError` instead
+/// of killing the process.
+const MAX_RESUME_DEPTH: usize = 64;
 
 /// How often (in dispatch iterations) the cooperative deadline is sampled.
 ///

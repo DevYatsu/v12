@@ -345,6 +345,31 @@ impl Interp<'_> {
                             let dst_val = attempt!(self.op_copy_array_rest(src_v, start));
                             self.stack[base + usize::from(dst)] = dst_val;
                         }
+                        WideOp::SetPropertyR {
+                            base: base_reg,
+                            key: key_reg,
+                            value: value_reg,
+                            receiver: receiver_reg,
+                        } => {
+                            let base_v = self.stack[base + usize::from(base_reg)];
+                            let key_v = self.stack[base + usize::from(key_reg)];
+                            let val = self.stack[base + usize::from(value_reg)];
+                            let recv = self.stack[base + usize::from(receiver_reg)];
+                            let strict = funcs[fn_idx as usize].is_strict;
+                            attempt!(self.set_property_from(base_v, key_v, val, recv, strict));
+                        }
+                        WideOp::GetSuperW {
+                            dst,
+                            base: base_reg,
+                            key: key_reg,
+                            receiver: receiver_reg,
+                        } => {
+                            let base_v = self.stack[base + usize::from(base_reg)];
+                            let key_v = self.stack[base + usize::from(key_reg)];
+                            let recv = self.stack[base + usize::from(receiver_reg)];
+                            let v = attempt!(self.get_property_from(base_v, key_v, recv));
+                            self.stack[base + usize::from(dst)] = v;
+                        }
                         // RegExt is decoded by `decode_instr` before dispatch
                         // (it merges the wide register halves into the narrow
                         // operand); reaching this arm means corrupt bytecode.
@@ -791,6 +816,12 @@ impl Interp<'_> {
                     let obj_v = self.stack[base + usize::from(rb)];
                     let proto_v = self.stack[base + usize::from(rc)];
                     attempt!(self.op_set_prototype(obj_v, proto_v));
+                    self.set_pc(pc + op_width);
+                }
+                Opcode::GetPrototype => {
+                    let obj_v = self.stack[base + usize::from(rb)];
+                    let proto = attempt!(self.op_get_prototype(obj_v));
+                    self.stack[base + usize::from(ra)] = proto;
                     self.set_pc(pc + op_width);
                 }
                 Opcode::GetIterator => {

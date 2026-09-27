@@ -329,6 +329,20 @@ impl Interp<'_> {
         }
     }
 
+    /// ES 10.5.1 `[[GetPrototypeOf]]` as a bytecode operand: the prototype of
+    /// `obj_v` (`null` when absent). A proxy dispatches its `getPrototypeOf`
+    /// trap; a primitive has no internal method and throws, which is the
+    /// observable bound on the `super.x` object-literal lowering.
+    pub(crate) fn op_get_prototype(&mut self, obj_v: JsValue) -> Result<JsValue, JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(self.error_value(
+                "TypeError: cannot read the prototype of a primitive",
+            )));
+        };
+        self.gc_protect();
+        self.object_proto_of(obj)
+    }
+
     /// ES GetIterator (7.4.1): `iter = iterable[Symbol.iterator]()`, then
     /// require the result to be an object.
     ///

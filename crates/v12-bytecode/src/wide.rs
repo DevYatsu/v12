@@ -36,6 +36,8 @@ use crate::{BytecodeError, Instr, Opcode};
 /// | `RegExt`          | slot mask       | `a_hi << 16 \| b_hi << 8 \| c_hi`                    |
 /// | `ClosureW`        | 0               | `dst << 16 \| function_index`                        |
 /// | `NewEnvironmentW` | 0               | `depth << 16 \| slots`                               |
+/// | `SetPropertyR`    | 0               | `base << 16 \| key`, `value << 16 \| receiver`       |
+/// | `GetSuperW`       | 0               | `dst << 16 \| base`, `key << 16 \| receiver`          |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WideOp {
     LoadConstW {
@@ -132,6 +134,28 @@ pub enum WideOp {
         class_id: u32,
         name_id: u32,
     },
+    /// `base[key] = value` with an explicit receiver — ES `base.[[Set]](key,
+    /// value, receiver)`. Narrow `SetProperty` always uses `base` as the
+    /// receiver, which is wrong for a super assignment (`super.x = v` sets on
+    /// the receiver, having searched from the super base), and four register
+    /// operands do not fit an `Instr`'s three 8-bit slots.
+    SetPropertyR {
+        base: u16,
+        key: u16,
+        value: u16,
+        receiver: u16,
+    },
+    /// ES 7.3.3 `Get(V, P, Receiver)`: `dst = base[key]` with `receiver` as
+    /// the *receiver*, so an inherited accessor runs with that object as
+    /// `this`. Narrow `GetProperty` uses its base as both, which is wrong for
+    /// a super read (`super.x` searches from the super base but keeps the
+    /// method's `this`); four register operands do not fit an `Instr`.
+    GetSuperW {
+        dst: u16,
+        base: u16,
+        key: u16,
+        receiver: u16,
+    },
 }
 
 fn pack_hi_lo(hi: u16, lo: u16) -> u32 {
@@ -159,6 +183,8 @@ impl WideOp {
     pub const DISC_SET_PRIVATE_W: u32 = 12;
     pub const DISC_DEFINE_PRIVATE_W: u32 = 13;
     pub const DISC_HAS_PRIVATE_W: u32 = 14;
+    pub const DISC_SET_PROPERTY_R: u32 = 15;
+    pub const DISC_GET_SUPER_W: u32 = 16;
 
     /// Serializes to a header word plus the documented payload words.
     ///
@@ -281,6 +307,26 @@ impl WideOp {
                 Instr(pack_hi_lo(dst, obj)),
                 Instr(class_id),
                 Instr(name_id),
+            ],
+            Self::SetPropertyR {
+                base,
+                key,
+                value,
+                receiver,
+            } => vec![
+                hdr(0, Self::DISC_SET_PROPERTY_R),
+                Instr(pack_hi_lo(base, key)),
+                Instr(pack_hi_lo(value, receiver)),
+            ],
+            Self::GetSuperW {
+                dst,
+                base,
+                key,
+                receiver,
+            } => vec![
+                hdr(0, Self::DISC_GET_SUPER_W),
+                Instr(pack_hi_lo(dst, base)),
+                Instr(pack_hi_lo(key, receiver)),
             ],
         }
     }
@@ -446,6 +492,32 @@ impl WideOp {
                     4,
                 ))
             }
+            Self::DISC_SET_PROPERTY_R => {
+                let (base, key) = unpack_hi_lo(payload(1)?);
+                let (value, receiver) = unpack_hi_lo(payload(2)?);
+                Ok((
+                    Self::SetPropertyR {
+                        base,
+                        key,
+                        value,
+                        receiver,
+                    },
+                    3,
+                ))
+            }
+            Self::DISC_GET_SUPER_W => {
+                let (dst, base) = unpack_hi_lo(payload(1)?);
+                let (key, receiver) = unpack_hi_lo(payload(2)?);
+                Ok((
+                    Self::GetSuperW {
+                        dst,
+                        base,
+                        key,
+                        receiver,
+                    },
+                    3,
+                ))
+            }
             other => Err(BytecodeError::UnknownWideDiscriminant {
                 discriminant: other,
             }),
@@ -532,6 +604,24 @@ impl fmt::Display for WideOp {
                 f,
                 "has_private_w r{dst}, r{obj}, class={class_id} name={name_id}"
             ),
+            Self::SetPropertyR {
+                base,
+                key,
+                value,
+                receiver,
+            } => write!(
+                f,
+                "set_property_r r{base}, r{key}, r{value}, receiver=r{receiver}"
+            ),
+            Self::GetSuperW {
+                dst,
+                base,
+                key,
+                receiver,
+            } => write!(
+                f,
+                "get_super_w r{dst}, r{base}, r{key}, receiver=r{receiver}"
+            ),
         }
     }
 }
@@ -614,6 +704,30 @@ mod wide_tests {
             WideOp::NewEnvironmentW {
                 depth: 0,
                 slots: 300,
+            },
+            WideOp::SetPropertyR {
+                base: 1,
+                key: 2,
+                value: 3,
+                receiver: 4,
+            },
+            WideOp::SetPropertyR {
+                base: 300,
+                key: 0xFFFF,
+                value: 1,
+                receiver: 258,
+            },
+            WideOp::GetSuperW {
+                dst: 5,
+                base: 6,
+                key: 7,
+                receiver: 8,
+            },
+            WideOp::GetSuperW {
+                dst: 300,
+                base: 0xFFFF,
+                key: 1,
+                receiver: 259,
             },
         ];
         for op in ops {

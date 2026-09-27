@@ -6,7 +6,7 @@
 
 use v12_heap::JsValue;
 
-use super::{CallOutcome, Interp, JSException, MAX_CALL_DEPTH};
+use super::{CallOutcome, Interp, JSException, MAX_CALL_DEPTH, MAX_RESUME_DEPTH};
 
 impl Interp<'_> {
     /// Invoke any callable value through the interpreter's normal call path.
@@ -27,6 +27,19 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
         if self.frames.len() >= MAX_CALL_DEPTH {
+            return Err(JSException(
+                self.error_value("RangeError: maximum call stack size exceeded"),
+            ));
+        }
+        // `prepare_call` + `execute` below nest a Rust call per value-call
+        // (a callback-taking builtin whose callback calls it again), so this
+        // seam spends *native* stack like the accessor and inline-call seams
+        // and is bounded by the same budget. `MAX_CALL_DEPTH` is far too high
+        // to fire first: a few hundred nested levels already exhaust an 8 MiB
+        // thread stack in a debug build, and the process aborts with
+        // `fatal runtime error: stack overflow` before the frame cap is
+        // reached.
+        if self.resume_depth >= MAX_RESUME_DEPTH {
             return Err(JSException(
                 self.error_value("RangeError: maximum call stack size exceeded"),
             ));
@@ -61,7 +74,9 @@ impl Interp<'_> {
 
         let result = match self.prepare_call(base, caller_max_regs, 0, argc, false, 0) {
             Ok(CallOutcome::Pushed) => {
+                self.resume_depth += 1;
                 let execution = self.execute();
+                self.resume_depth -= 1;
                 self.cleanup_nested_call_frames(boundary, base);
                 execution.and_then(|()| {
                     self.top_result.take().ok_or_else(|| {

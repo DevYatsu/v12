@@ -156,6 +156,12 @@ pub enum Opcode {
     /// awaits the results itself). Validates that the result is an object.
     /// `r{c}` is unused.
     GetAsyncIterator = 76,
+    /// ES 10.5.1 `[[GetPrototypeOf]]`: `r{a} = r{b}`'s prototype (`null`
+    /// when there is none). A proxy receiver dispatches its `getPrototypeOf`
+    /// trap; a primitive receiver throws a TypeError. `r{c}` is unused.
+    /// Emitted by the `super.x` lowering in an object-literal method, which
+    /// must start the lookup one link above the receiver instead of on it.
+    GetPrototype = 77,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -235,6 +241,7 @@ impl TryFrom<u8> for Opcode {
             74 => Ok(Self::GenResumeMode),
             75 => Ok(Self::ToPropertyKey),
             76 => Ok(Self::GetAsyncIterator),
+            77 => Ok(Self::GetPrototype),
             other => Err(other),
         }
     }

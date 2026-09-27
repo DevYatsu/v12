@@ -1632,6 +1632,13 @@ impl<'s> Collector<'s> {
                         .parent
                         .expect("arrow below main unit");
                 }
+                // An object-literal method's super base is the receiver's
+                // prototype, so a `super` reached from inside an arrow needs
+                // the owner to thread `this` through its environment — the
+                // same requirement a bare `this` in that arrow creates.
+                if self.plans.units[owner].is_object_method && owner != self.cur_unit() {
+                    self.plans.units[owner].needs_this = true;
+                }
                 self.plans.units[owner].uses_super = true;
             }
             Expression::FunctionExpression(f) => {
