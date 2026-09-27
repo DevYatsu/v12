@@ -23,8 +23,8 @@ use rayon::prelude::*;
 
 use crate::report::{Summary, emit_json, emit_summary, emit_tap};
 use crate::runner::{
-    HarnessConfig, Status, TestOutcome, discover_tests, encode_slim, run_single_test,
-    run_single_test_isolated,
+    DEFAULT_TEST_TIMEOUT_MS, HarnessConfig, Status, TestOutcome, Timeouts, discover_tests,
+    encode_slim, run_single_test, run_single_test_isolated,
 };
 
 /// Default parallelism: number of logical CPUs, capped at 16 to bound memory.
@@ -116,11 +116,24 @@ struct Cli {
     list: bool,
 
     /// Run each test in a killable child process (default). A test that has
-    /// not finished within the 5s hard-kill window is logged as stalled and
-    /// killed, and the run proceeds. A child crash (stack overflow, abort)
-    /// also costs only that test instead of the whole run.
+    /// not finished within the hard-kill window (`--test-timeout-ms` plus its
+    /// grace margin) is logged as stalled and killed, and the run proceeds. A
+    /// child crash (stack overflow, abort) also costs only that test instead
+    /// of the whole run.
     #[arg(long)]
     in_process: bool,
+
+    /// Per-test time budget in milliseconds (default 30000).
+    ///
+    /// This is the engine's cooperative deadline; the parent's hard kill
+    /// fires a fixed grace margin later (see `runner::HARD_KILL_GRACE_MS`).
+    /// The default clears the slowest legitimate test by a wide margin,
+    /// because a window that races real work makes a run undiffable: at the
+    /// old 5s default two runs of one binary over `built-ins/RegExp` flipped
+    /// 157 tests. Lower it to iterate quickly on a fast slice; raise it if
+    /// slow tests still report `timeout: stalled`.
+    #[arg(long, value_name = "MS", default_value_t = DEFAULT_TEST_TIMEOUT_MS)]
+    test_timeout_ms: u64,
 
     /// Hidden: execute one test file, print a single JSON outcome line on
     /// stdout, and exit. Used by the parent runner for per-test process
@@ -141,7 +154,10 @@ fn main() {
             .name("internal-exec".into())
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                let config = HarnessConfig::new(resolve_test262_root(root.as_deref()));
+                let config = HarnessConfig::with_timeouts(
+                    resolve_test262_root(root.as_deref()),
+                    Timeouts::from_window_ms(cli.test_timeout_ms),
+                );
                 run_single_test(&path, &config)
             });
         let exec_path = cli.internal_exec.clone().expect("checked above");
@@ -219,7 +235,10 @@ fn run(cli: Cli) {
         std::process::exit(2);
     }
 
-    let harness_config = HarnessConfig::new(test262_root.clone());
+    let harness_config = HarnessConfig::with_timeouts(
+        test262_root.clone(),
+        Timeouts::from_window_ms(cli.test_timeout_ms),
+    );
     if harness_config.harness_dir.is_none() {
         eprintln!(
             "warning: harness directory not found under `{}` — \
@@ -251,9 +270,11 @@ fn run(cli: Cli) {
     }
 
     eprintln!(
-        "test262-runner: {} tests matched (filter={:?}, jobs={jobs}, root={})",
+        "test262-runner: {} tests matched (filter={:?}, jobs={jobs}, timeout_ms={}/{}, root={})",
         files.len(),
         cli.filter,
+        harness_config.timeouts.cooperative_ms,
+        harness_config.timeouts.hard_kill_ms,
         test262_root.display()
     );
 
@@ -336,7 +357,12 @@ fn run(cli: Cli) {
 
     if wants_json {
         let mut buf = Vec::new();
-        emit_json(&sorted, &summary, &mut buf);
+        emit_json(
+            &sorted,
+            &summary,
+            harness_config.timeouts.hard_kill_ms,
+            &mut buf,
+        );
         if !wants_tap {
             // If TAP already printed to stdout, avoid interleaving JSON there
             // unless the user explicitly asked for both on stdout. When both
@@ -372,9 +398,11 @@ fn run(cli: Cli) {
         print!("{}", String::from_utf8_lossy(&buf));
     }
 
-    // Always print a one-line summary to stderr for CI log tailing.
+    // Always print a one-line summary to stderr for CI log tailing. The kill
+    // window is included because a run's comparability depends on it: two
+    // reports with different windows are not diffable.
     eprintln!(
-        "summary: total={} pass={} fail={} skip={} pass_rate={}",
+        "summary: total={} pass={} fail={} skip={} pass_rate={} timeout_ms={}",
         summary.total,
         summary.passed,
         summary.failed,
@@ -382,7 +410,8 @@ fn run(cli: Cli) {
         summary
             .pass_rate
             .map(|r| format!("{r:.1}%"))
-            .unwrap_or_else(|| "—".to_string())
+            .unwrap_or_else(|| "—".to_string()),
+        harness_config.timeouts.hard_kill_ms,
     );
 
     // Per-suite detail to stderr in verbose mode.

@@ -19,23 +19,95 @@ use crate::harness::{MINIMAL_HARNESS_POLYFILL, load_harness_includes};
 /// Maximum test source size (after harness prepending) in bytes.
 const MAX_COMBINED_SOURCE_LEN: usize = 2_000_000;
 
-/// Maximum time a single test may run before we mark it as timed out.
+/// Default per-test time budget, in milliseconds (`--test-timeout-ms`).
 ///
-/// The engine's cooperative deadline (sampled in the interpreter dispatch
-/// loop) aborts a runaway script from the inside; this value feeds that
-/// deadline.
-const TEST_TIMEOUT_MS: u128 = 5_000;
+/// This number is set by measurement, not taste. The slowest *legitimate*
+/// tests are the generated Unicode property-escape cases under
+/// `built-ins/RegExp` (`property-escapes/generated/*`). The previous 5 000 ms
+/// default sat *inside* their cost band, so the kill window raced genuine
+/// work: two runs of the identical binary over the identical slice flipped 157
+/// tests (123 fail->pass, 34 pass->fail), every one of them with a duration
+/// above 4500 ms in at least one run, while the stable population had a 2 ms
+/// median.
+///
+/// Those tests turn out to be slow, not hung: at this window a full `built-ins`
+/// run (24 061 tests) records zero stalls and every test completes. The
+/// property-escape cases are also load-sensitive — the same test measured
+/// 8.7 s in one run and 19.8 s in the next on the same box — so the window has
+/// to clear the high-variance worst case, not the median one. Observed worst
+/// case across two back-to-back runs of `built-ins/RegExp`: 19.8 s, giving
+/// ~1.5x headroom here and ~4x over the original 5 s default's typical band.
+///
+/// The cost is measured too: a full `built-ins` run takes 350 s at this window
+/// versus 289 s at a 5000 ms budget (+21%), and that delta buys back 74 tests
+/// (8 733 vs 8 659 passing) that the old window killed. The pathological case
+/// — a test that truly never terminates — would now hold a worker for 30 s
+/// instead of 5 s, but no such test exists in the corpus today.
+pub const DEFAULT_TEST_TIMEOUT_MS: u64 = 30_000;
 
-/// Hard per-test wall-clock budget enforced by the parent process: a test
-/// that has not reported a result within this window is logged as stalled,
-/// its process is killed, and the run proceeds with the next test.
+/// Slack added to the cooperative deadline to obtain the parent hard kill.
 ///
-/// The cooperative deadline above normally fires first, but it cannot reach
-/// every stall: the parser/AST lowering, native builtins with internal
-/// loops, and stack overflows (which abort the process and are uncatchable)
-/// never sample it. Process-level isolation is the only reliable stop for
-/// those, so `run_single_test_isolated` re-execs this binary per test.
-const TEST_HARD_KILL_MS: u64 = 5_000;
+/// The two windows must differ, or one of them is redundant. They exist for
+/// different jobs:
+///
+/// - The **cooperative deadline** ([`Timeouts::cooperative_ms`]) is installed
+///   inside the engine and sampled in the interpreter dispatch loop, so a
+///   runaway script unwinds cleanly and is reported as an ordinary timeout.
+///   It starts *after* process spawn, file read, frontmatter parsing, and
+///   harness preamble assembly, none of which it can pre-empt.
+/// - The **hard kill** ([`Timeouts::hard_kill_ms`]) is the parent's wall-clock
+///   backstop. It must therefore be the cooperative deadline plus enough
+///   slack to cover everything the deadline cannot reach or does not cover:
+///   the pre-engine setup above, and the stalls the deadline can never sample
+///   at all — the parser/AST lowering, native builtins with internal loops,
+///   and stack overflows (which abort the process and are uncatchable).
+///   Process-level isolation is the only reliable stop for those, so
+///   `run_single_test_isolated` re-execs this binary per test.
+///
+/// With 5 s of grace the ordering is unambiguous: the cooperative deadline
+/// wins by a wide margin whenever it can fire at all, and the hard kill only
+/// ever catches what it structurally cannot.
+pub const HARD_KILL_GRACE_MS: u64 = 5_000;
+
+/// Message prefix identifying an outcome the parent killed at the hard-kill
+/// window, as opposed to one the engine's cooperative deadline stopped.
+///
+/// Machine-readable on purpose: `report::emit_json` copies it into a `stalled`
+/// boolean so the regression gate (`conformance/faildiff.sh`) can tell a
+/// timing kill from a logic failure without parsing prose.
+pub const STALLED_MESSAGE_PREFIX: &str = "timeout: stalled";
+
+/// The two per-test time windows, derived from one user-facing budget.
+///
+/// See [`DEFAULT_TEST_TIMEOUT_MS`] and [`HARD_KILL_GRACE_MS`] for why they
+/// differ and how they were chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// Engine cooperative deadline, in milliseconds.
+    pub cooperative_ms: u128,
+    /// Parent hard-kill window, in milliseconds. Always greater than
+    /// `cooperative_ms`.
+    pub hard_kill_ms: u64,
+}
+
+impl Timeouts {
+    /// Builds the window pair from the user-facing budget: the budget becomes
+    /// the cooperative deadline, and the hard kill is the budget plus
+    /// [`HARD_KILL_GRACE_MS`].
+    #[must_use]
+    pub fn from_window_ms(window_ms: u64) -> Self {
+        Self {
+            cooperative_ms: u128::from(window_ms),
+            hard_kill_ms: window_ms.saturating_add(HARD_KILL_GRACE_MS),
+        }
+    }
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self::from_window_ms(DEFAULT_TEST_TIMEOUT_MS)
+    }
+}
 
 /// JS preamble defining the `print` sink and the `$262` host object that
 /// Test262 harness files expect. Output is captured in a global array that
@@ -123,6 +195,18 @@ impl TestOutcome {
     pub fn is_skip(&self) -> bool {
         self.status == Status::Skip
     }
+
+    /// True iff this outcome is a *timing* kill (the parent hit the hard-kill
+    /// window) rather than a logic failure.
+    ///
+    /// A stall says nothing about correctness — the test may pass, fail, or
+    /// never terminate once given a bigger window — so tooling that reacts to
+    /// status changes must be able to tell the two apart. See
+    /// [`STALLED_MESSAGE_PREFIX`].
+    #[must_use]
+    pub fn is_stalled(&self) -> bool {
+        self.status == Status::Fail && self.message.starts_with(STALLED_MESSAGE_PREFIX)
+    }
 }
 
 /// Resolved harness configuration for the runner.
@@ -133,12 +217,24 @@ pub struct HarnessConfig {
     pub test262_root: PathBuf,
     /// Absolute path to the harness directory, if available.
     pub harness_dir: Option<PathBuf>,
+    /// Per-test time windows. Carried here (rather than passed per call) so
+    /// the parent and the isolated child derive the same pair from the same
+    /// budget, and `run_single_test` stays signature-compatible.
+    pub timeouts: Timeouts,
 }
 
 impl HarnessConfig {
-    /// Creates a new config probing for the harness directory.
+    /// Creates a new config probing for the harness directory, using the
+    /// default per-test time budget.
     #[must_use]
     pub fn new(test262_root: PathBuf) -> Self {
+        Self::with_timeouts(test262_root, Timeouts::default())
+    }
+
+    /// Same as [`HarnessConfig::new`] with an explicit per-test time budget
+    /// (`--test-timeout-ms`).
+    #[must_use]
+    pub fn with_timeouts(test262_root: PathBuf, timeouts: Timeouts) -> Self {
         let harness_dir = {
             let candidate = test262_root.join("harness");
             if candidate.is_dir() {
@@ -150,6 +246,7 @@ impl HarnessConfig {
         Self {
             test262_root,
             harness_dir,
+            timeouts,
         }
     }
 }
@@ -358,7 +455,8 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     // a recognizable error if it elapses. This is the wall-clock backstop behind
     // the advisory post-check below.
     let exec_start = Instant::now();
-    let deadline = exec_start + std::time::Duration::from_millis(TEST_TIMEOUT_MS as u64);
+    let deadline =
+        exec_start + std::time::Duration::from_millis(config.timeouts.cooperative_ms as u64);
     let is_module = frontmatter.has_flag("module");
     let base_path = file_path.parent().unwrap_or_else(|| Path::new("."));
     let exec_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -398,7 +496,7 @@ pub fn run_single_test(file_path: &Path, config: &HarnessConfig) -> TestOutcome 
     let duration_ms = start.elapsed().as_millis();
 
     // Advisory timeout (after the fact, no preemption).
-    if exec_start.elapsed().as_millis() > TEST_TIMEOUT_MS {
+    if exec_start.elapsed().as_millis() > config.timeouts.cooperative_ms {
         return TestOutcome {
             path: file_path.to_path_buf(),
             relative,
@@ -567,7 +665,7 @@ fn fail_outcome(
 ///
 /// The child is this binary re-invoked with the hidden `--internal-exec`
 /// flag; it prints one [`SlimOutcome`] JSON line to stdout. The parent polls
-/// for up to [`TEST_HARD_KILL_MS`]:
+/// for up to [`Timeouts::hard_kill_ms`]:
 ///
 /// - reported in time → child's own outcome (the engine's cooperative
 ///   deadline already classifies most runaways as timeouts);
@@ -577,12 +675,19 @@ fn fail_outcome(
 ///   naming the exit status. A child crash loses only that test, whereas an
 ///   in-process stack overflow would abort the entire run.
 ///
+/// The child is given the *same* `--test-timeout-ms` budget as the parent, so
+/// the cooperative deadline it installs is the parent's window rather than
+/// the default: without this the parent would happily wait out a child that
+/// had already given up at the old constant, and every slow test would still
+/// be killed — just later and with a worse reason.
+///
 /// Spawn overhead is a few milliseconds per test, dominated by the engine
 /// work itself.
 pub fn run_single_test_isolated(file_path: &Path, config: &HarnessConfig) -> TestOutcome {
     let relative = relative_suite_path(file_path, &config.test262_root);
     let suite = suite_for(&relative);
     let start = Instant::now();
+    let hard_kill_ms = config.timeouts.hard_kill_ms;
 
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -602,6 +707,10 @@ pub fn run_single_test_isolated(file_path: &Path, config: &HarnessConfig) -> Tes
         .arg(file_path)
         .arg("--test262-root")
         .arg(&config.test262_root)
+        // Keep the child's cooperative deadline in step with ours; see the
+        // doc comment above.
+        .arg("--test-timeout-ms")
+        .arg(config.timeouts.cooperative_ms.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         // Child stderr (panic messages, abort diagnostics) is useful inline.
@@ -628,7 +737,7 @@ pub fn run_single_test_isolated(file_path: &Path, config: &HarnessConfig) -> Tes
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if start.elapsed().as_millis() >= u128::from(TEST_HARD_KILL_MS) {
+                if start.elapsed().as_millis() >= u128::from(hard_kill_ms) {
                     timed_out = true;
                     break None;
                 }
@@ -652,12 +761,12 @@ pub fn run_single_test_isolated(file_path: &Path, config: &HarnessConfig) -> Tes
         let _ = child.kill();
         let _ = child.wait();
         let duration_ms = start.elapsed().as_millis();
-        eprintln!("STALLED (killed after {TEST_HARD_KILL_MS} ms): {relative}");
+        eprintln!("STALLED (killed after {hard_kill_ms} ms): {relative}");
         return fail_outcome(
             file_path,
             relative,
             suite,
-            format!("timeout: stalled, killed after {TEST_HARD_KILL_MS} ms"),
+            format!("{STALLED_MESSAGE_PREFIX}, killed after {hard_kill_ms} ms"),
             duration_ms,
         );
     }
@@ -1171,6 +1280,50 @@ mod tests {
         let _ = fs::write(tmp.join("harness").join("assert.js"), "");
         let cfg = HarnessConfig::new(tmp.clone());
         (cfg, tmp)
+    }
+
+    #[test]
+    fn timeouts_split_cooperative_from_hard_kill() {
+        let t = Timeouts::from_window_ms(DEFAULT_TEST_TIMEOUT_MS);
+        assert_eq!(t.cooperative_ms, 30_000);
+        assert_eq!(t.hard_kill_ms, 30_000 + HARD_KILL_GRACE_MS);
+        // The whole point of the split: the hard kill must never be the same
+        // window as the deadline it backs up, or the two are indistinguishable
+        // and a race decides which one fires.
+        assert!(t.hard_kill_ms as u128 > t.cooperative_ms);
+    }
+
+    #[test]
+    fn timeouts_saturate_instead_of_overflowing() {
+        let t = Timeouts::from_window_ms(u64::MAX);
+        assert_eq!(t.cooperative_ms, u128::from(u64::MAX));
+        assert_eq!(t.hard_kill_ms, u64::MAX);
+    }
+
+    #[test]
+    fn stalled_marker_distinguishes_kill_from_logic_failure() {
+        let mut o = TestOutcome {
+            path: PathBuf::from("t.js"),
+            relative: "t.js".to_string(),
+            suite: "language".to_string(),
+            status: Status::Fail,
+            message: format!("{STALLED_MESSAGE_PREFIX}, killed after 35000 ms"),
+            skip_reason: None,
+            duration_ms: 35_000,
+            frontmatter: Frontmatter::default(),
+        };
+        assert!(o.is_stalled());
+        o.status = Status::Pass;
+        assert!(!o.is_stalled(), "a pass is never a stall");
+        o.status = Status::Fail;
+        o.message = "expected 1 but got 2".to_string();
+        assert!(!o.is_stalled(), "a logic failure is not a stall");
+    }
+
+    #[test]
+    fn default_config_uses_default_window() {
+        let cfg = HarnessConfig::new(PathBuf::from("/nonexistent"));
+        assert_eq!(cfg.timeouts, Timeouts::default());
     }
 
     #[test]

@@ -993,4 +993,29 @@ Fix tracked as the next task: raise the window so legitimately-slow tests finish
 - **Also found, not yet fixed:** `String.fromCharCode` has the identical write-path bug at `string.rs:951` — it interns `String::from_utf16_lossy(&units)`, so `String.fromCharCode(0xDC00)` stores U+FFFD (verified: `.length` 1, `charCodeAt(0)` 65533). Same file, same one-line shape as the applied fix.
 - **Harness footgun worth recording:** `--format json --json-out F` **silently writes no file**; `main.rs:337-357` honours `json_out` only when TAP is also requested. Use `--format tap,json --json-out F`. A report that was assumed to exist was missing for this reason.
 
+### 2026-09-27 — Conformance harness: deterministic measurement [defect found during Task 4]
+
+- **Filter:** `built-ins/RegExp` (1 962 tests) for the determinism proof; full `built-ins` (24 061) for the cost measurement
+- **The defect:** two runs of the **identical binary** over the same slice disagreed on **157 of 1 962 tests** (123 fail→pass, 34 pass→fail, net +89 on an unchanged binary). Every flipping test had `duration_ms > 4500` in at least one run; stable tests had a **2 ms median**. Samples: `property-escapes/generated/Emoji_Presentation.js` killed at 5005 ms then finished at 4477 ms; `General_Category_-_Paragraph_Separator.js` finished at 4084 ms then killed at 5009 ms.
+- **Cause:** `TEST_TIMEOUT_MS` (`runner.rs:27`, the engine's cooperative deadline) and `TEST_HARD_KILL_MS` (`runner.rs:38`, the parent backstop) were **both 5 000 ms**, while the generated Unicode property-escape tests legitimately take several seconds. The boundary raced the 8-way parallel load, so a test finishing at 4.1 s in one run was killed at 5.0 s in the next.
+- **Why it mattered:** `conformance/faildiff.sh` reports pass→fail as `BROKE`, so with this noise a lane could appear to break 34 tests having broken none, and a real regression among slow tests was invisible. Ten conformance tasks were queued behind a gate that could not distinguish the two.
+- **Fix:** one user-facing `--test-timeout-ms` (default **30 000**) now derives two structurally different windows via `Timeouts::from_window_ms()` — a 30 000 ms cooperative deadline and a 35 000 ms hard kill. Because the hard kill is the deadline plus a fixed grace, the cooperative one always wins when it can fire, so the old race is **gone by construction** rather than by tuning: no window value reproduces it with this binary. `HarnessConfig` carries the pair so parent and `--internal-exec` child agree, and `run_single_test_isolated` now forwards the flag — without that the child would have kept the old constant and the widening would have bought nothing. The JSON report gained top-level `timeout_ms` and per-test `stalled`.
+- **After:** **0 flips** over 1 962 tests (1 241 pass in both runs), 0 stall events on a full `built-ins` run.
+- **Cost:** **+61 s on a 350 s `built-ins` run (+21 %)**, and it recovered **74 tests** (72 RegExp + 2 annexB) the 5 s limit was killing. Verified by diffing a full-corpus report at `--test-timeout-ms 5000` against one at the default.
+- **Corrections to the Task 4 diagnosis** (recorded because the reasoning was wrong, not the conclusion):
+  - **Nothing in the corpus hangs.** A full run at the new window logs zero stalls, and all 1 962 RegExp tests complete. The ~109 tests that "consistently time out" at 5 s are slow, not stuck. The feared ~7 min extra cost does not exist.
+  - **The slow tests are far more load-sensitive than first measured.** `General_Category_-_Symbol.js` 8.7 s → 19.8 s between runs; `Terminal_Punctuation.js` 4.3 s → 14.9 s; `Script_-_Greek.js` 3.0 s → 13.0 s. 30 000 ms is ~1.5× headroom over the observed worst case, **not** 6×. It held at 0 flips over 1 962 tests, but a future lane producing a test above ~25 s should raise the flag — the cliff is closer than the old 5 s figure implied.
+- **MARGINAL, not gating:** `faildiff.sh` routes kill-window flips (stalled, or `duration_ms >= 0.8 * timeout_ms`) into a `MARGINAL` bucket that never counts as a regression and never silently disappears — above 5 it prints a WARNING that the verdict is a tie. Rationale: after the window fix there should be almost none, so a non-zero count is evidence the measurement is weak and the operator must see it rather than be blocked by it. Exit code is still 1 only on real regressions. The script also warns when two reports used different kill windows (timings then not comparable) and degrades explicitly for reports predating `timeout_ms`.
+- **Files:** `conformance/harness/src/runner.rs` (+197/-…), `main.rs`, `report.rs`, `conformance/faildiff.sh` (+115/-…), `conformance/README.md` (flag + JSON schema + faildiff docs), `CONTEXT.md` (conformance numbers, determinism rule, fail-set rule, lone-surrogate state)
+- **Runner:** `cargo nextest run --workspace` → **1 044 passed / 2 skipped** (was 1 039). `cargo clippy -p test262-runner --all-targets` → no findings in the harness.
+
+#### Conformance after this commit (first trustworthy full-corpus measurement)
+
+```
+full corpus: total=24061 pass=8733 fail=6454 skip=8874   raw   = 36.3 %
+core       : total=15266 pass=8731 fail=6443            core  = 57.2 %
+```
+
+**Track core %; raw % is capped by scope, not by engine quality.** Progression this session: core 54.5 % (noisy harness, pre-Task-1) → **57.2 %**. Of the +417 passes, +74 is the timeout widening (not an engine change) and the remainder is Task 4's surrogate fix. In-scope failures remaining: **6 443**.
+
 <!-- Future entries go above this line -->

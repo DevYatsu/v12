@@ -74,10 +74,43 @@ Options:
 
   --test262-root <PATH>   Over-ride auto-discovery of the checkout.
 
+  --test-timeout-ms MS    Per-test budget. The engine's cooperative deadline is
+                          MS; the parent hard kill is MS + a 5 s grace, so the
+                          cooperative one always wins when it can fire.
+                          Default 30000.
+
   --tap-out <PATH>        Also write TAP to a file.
   --json-out <PATH>       Also write JSON to a file.
   --list                  List matching tests and exit (dry run).
 ```
+
+### The per-test timeout, and why it is 30 s
+
+`TEST_TIMEOUT_MS` and `TEST_HARD_KILL_MS` were both 5 000 ms. The generated
+Unicode property-escape tests legitimately take several seconds, so the 5 s
+boundary raced the parallel load: **two runs of the identical binary over the
+same `built-ins/RegExp` slice disagreed on 157 of 1 962 tests** (123
+fail→pass, 34 pass→fail), with every flipping test above 4 500 ms and a 2 ms
+median for the stable ones. One user-facing `--test-timeout-ms` now derives two
+structurally different windows, which removes the race by construction rather
+than by tuning. Measured after: **0 flips**. Widening also recovered **74 tests
+on the full corpus** that the old limit was killing, for +61 s (+21 %) on a 350 s
+`built-ins` run. Nothing in the corpus actually hangs — a full run logs 0 stalls.
+
+### Comparing two runs
+
+`conformance/faildiff.sh BEFORE.json AFTER.json [--topic SUBSTR]` classifies
+per-test changes as FIXED / BROKE / REGRESSED / NEW_FAIL / MARGINAL and exits 1 if
+any pass regressed. Use it instead of comparing pass rates: a net rise can hide
+new failures, and a net *zero* can hide a one-for-one swap. Tests within 20 % of
+the kill window (or explicitly stalled) are reported as MARGINAL and never
+counted as a regression, so a noisy measurement is visible instead of blocking.
+
+**Footgun:** `--format json --json-out F` **writes no file**. `json_out` is
+honoured only when TAP is also requested — use `--format tap,json --json-out F`.
+
+The JSON report is `{timeout_ms, summary, results[]}`; each result carries
+`path`, `suite`, `status`, `message`, `duration_ms` and `stalled`.
 
 Examples:
 

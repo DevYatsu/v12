@@ -136,10 +136,23 @@ pub fn emit_tap(outcomes: &[TestOutcome], verbose: bool, mut writer: impl std::i
     }
 }
 
-/// Emits a JSON report: `{summary, results}`.
-pub fn emit_json(outcomes: &[TestOutcome], summary: &Summary, mut writer: impl std::io::Write) {
+/// Emits a JSON report: `{timeout_ms, summary, results}`.
+///
+/// `timeout_ms` is the run's *effective* kill window (cooperative budget plus
+/// hard-kill grace) and each result carries a `stalled` boolean. Together
+/// they let a consumer tell a timing kill from a logic failure and know how
+/// close to the window a test came — which is what makes two runs of the
+/// same slice diffable. Without them a killed test is indistinguishable from
+/// a broken one, and a slow one from a stably-failing one.
+pub fn emit_json(
+    outcomes: &[TestOutcome],
+    summary: &Summary,
+    timeout_ms: u64,
+    mut writer: impl std::io::Write,
+) {
     #[derive(Serialize)]
     struct JsonReport<'a> {
+        timeout_ms: u64,
         summary: &'a Summary,
         results: Vec<JsonResult<'a>>,
     }
@@ -150,6 +163,7 @@ pub fn emit_json(outcomes: &[TestOutcome], summary: &Summary, mut writer: impl s
         status: &'a str,
         message: &'a str,
         duration_ms: u128,
+        stalled: bool,
     }
     let results = outcomes
         .iter()
@@ -163,9 +177,14 @@ pub fn emit_json(outcomes: &[TestOutcome], summary: &Summary, mut writer: impl s
             },
             message: &o.message,
             duration_ms: o.duration_ms,
+            stalled: o.is_stalled(),
         })
         .collect::<Vec<_>>();
-    let report = JsonReport { summary, results };
+    let report = JsonReport {
+        timeout_ms,
+        summary,
+        results,
+    };
     let json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
     let _ = writeln!(writer, "{json}");
 }
@@ -301,10 +320,26 @@ mod tests {
         let outcomes = vec![outcome("language/a.js", Status::Pass)];
         let summary = Summary::from_outcomes(&outcomes);
         let mut buf = Vec::new();
-        emit_json(&outcomes, &summary, &mut buf);
+        emit_json(&outcomes, &summary, 30_000, &mut buf);
         let s = String::from_utf8(buf).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert!(v.get("summary").is_some());
         assert!(v.get("results").is_some());
+        // The kill window is part of the report so a diff can tell whether
+        // two runs are even comparable.
+        assert_eq!(v["timeout_ms"], 30_000);
+    }
+
+    #[test]
+    fn emit_json_flags_stalled_outcomes() {
+        let mut o = outcome("language/slow.js", Status::Fail);
+        o.message = "timeout: stalled, killed after 35000 ms".to_string();
+        let outcomes = vec![o, outcome("language/ok.js", Status::Pass)];
+        let summary = Summary::from_outcomes(&outcomes);
+        let mut buf = Vec::new();
+        emit_json(&outcomes, &summary, 35_000, &mut buf);
+        let v: serde_json::Value = serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
+        assert_eq!(v["results"][0]["stalled"], true);
+        assert_eq!(v["results"][1]["stalled"], false);
     }
 }
