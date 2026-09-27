@@ -293,6 +293,54 @@ git commit -m "harness: skip deferred-feature built-ins instead of failing them"
 
 ### Task 2: An indexed accessor on an array poisons later shape transitions
 
+> **DEFERRED 2026-09-27 — root cause below is WRONG, and the yield is 57, not 317.**
+> Measured with a throwaway patch, then reverted. Nothing landed. The lane correctly
+> declined to ship a partial fix: 3 of the 4 files a correct fix must touch were outside
+> its write scope. Do not attempt the steps below as written.
+>
+> **Real root cause:** not a shape transition, and not `IsCompatiblePropertyDescriptor` —
+> `crates/v12-heap/src/shape.rs` **is not on the code path at all.** It is a blanket 2-line
+> reject in `crates/v12-engine/src/internal_methods.rs:379-383`, in `apply_property_descriptor`
+> (the 10.1.6.3 driver behind `Object.defineProperty`/`defineProperties`/
+> `__defineGetter__`/`Reflect.defineProperty`):
+> ```rust
+> if (kind == Arguments || kind == Array) && let Some(idx) = prop_key_as_index(heap, key) {
+>     if desc.is_accessor() { return Ok(false); }   // <-- the whole bug
+> ```
+> All three throw sites (`object.rs:174, 1368, 1582`) funnel through this arm.
+> `is_compatible_property_descriptor` as sketched above is inapplicable to the real code.
+>
+> **Yield: 57 of 317 (18 %).** The other 260 fail immediately afterwards on a *different*
+> real assertion — 58 `testResult !== true` (the getter is never invoked by the builtin),
+> 31 `should not be enumerable`/`configurable`, 12 `newArr.length`, 11 `some(...) !== true`,
+> 10 `callee is not a function`, 10 `Expected obj[N] to be writable`, 10 `Expected TypeError`.
+> Only 55 (34 Object + 21 Array) pass outright.
+>
+> **The 4-file change, measured not guessed** (only 2 are in the old scope, and 1 of those
+> is inert without the others):
+> | file | change |
+> |---|---|
+> | `crates/v12-engine/src/internal_methods.rs:379` | accept an accessor at an index: file a dict-rung accessor, `delete_element` to hole the element, **and validate the data branch** |
+> | `crates/v12-interp/src/property.rs:205` (`get_property`), `:1963` (`ordinary_own_descriptor`) | the array-index fast path answers from the element store unconditionally; a holed index with a dict entry must fall through to the walk so the getter is invoked |
+> | `crates/v12-interp/src/call_setup.rs:2690` (`callback_elem`) | reads the element store directly, so `forEach`/`map`/`every`/`some`/`filter`/`reduce`/`sort`/`find*` never see an index accessor |
+> | `crates/v12-engine/src/builtins/array.rs:271` (`read_index`) | same, for `indexOf`/`lastIndexOf`/`includes`/`reverse`/`concat`/`toReversed`/`with`/`toSpliced` |
+>
+> **Two traps:** the `enumerable` default for a *new* index accessor is `false` (seeding from
+> `Attrs::DEFAULT` yields `true` — that is the source of the 31 `should not be enumerable`
+> messages), and `delete_element` sets a hole without shrinking `length`, which is correct
+> for a define but grows `element_len` on an empty array.
+>
+> **Separate genuine spec bug found in passing:** the data-descriptor branch at an index does
+> **zero validation**, so `Object.defineProperty(arr, "0", {configurable: true})` on an
+> existing non-configurable index accessor is *accepted* when it must throw. The blanket
+> accessor reject was accidentally masking this. Relaxing the arm surfaces 8 such regressions.
+> Fixworthy on its own merits and much cheaper than the accessor work.
+>
+> **Decision:** ~57 tests does not justify that much surgery into the array element-store
+> fast paths. Re-filed here as a characterized task. If someone wants a slice, the 31-test
+> enumerable/configurable attribute-modelling group is the cheapest self-contained one.
+> Full record: `conformance/fix-log.md` 2026-09-27 "Task 2: STOPPED".
+
 **Files:**
 - Modify: `crates/v12-heap/src/shape.rs` (transition validation), `crates/v12-interp/src/property.rs` (array index `[[DefineOwnProperty]]` / `[[Set]]` path)
 - Test: `crates/v12-engine/tests/array_index_accessor.rs` (create)

@@ -1062,4 +1062,69 @@ core: 15266 tests, 8840 pass   core = 57.9 %
 
 Session progression: core 54.5 % → 57.2 % → **57.9 %**. In-scope failures remaining: **6 334**.
 
+### 2026-09-27 — Conformance burn-down, Task 2: STOPPED, not landed. The plan's root cause was wrong.
+
+- **Filter:** `built-ins` (24 061) — measured with a throwaway patch, then reverted
+- **Outcome: nothing landed.** Tracked tree clean, `cargo nextest run --workspace` → 1 061 passed / 2 skipped. The lane declined to land a partial fix because 3 of the 4 files a correct fix must touch were outside its write scope, and one of the 2 in-scope files is inert without the other 3.
+- **No conformance number changed.** Core remains 57.9 %.
+
+#### The real root cause (the plan's was wrong)
+
+Not a shape-transition re-validation, and not an `IsCompatiblePropertyDescriptor` gap. `crates/v12-heap/src/shape.rs` **is not on the code path at all.** The mechanism is a blanket 2-line reject in `crates/v12-engine/src/internal_methods.rs:379-383`, inside `apply_property_descriptor` (the ES 10.1.6.3 driver behind `Object.defineProperty`, `Object.defineProperties`, `__defineGetter__`/`__defineSetter__`, `Reflect.defineProperty`):
+
+```rust
+if (kind == Arguments || kind == Array) && let Some(idx) = prop_key_as_index(heap, key) {
+    if desc.is_accessor() { return Ok(false); }   // <-- the whole bug
+```
+
+All three `"Cannot redefine property: Invalid property definition"` throw sites (`object.rs:174, 1368, 1582`) funnel through this arm. An accessor descriptor at an array index is rejected outright — `Object.defineProperty(arr, "0", {get(){}})` alone throws.
+
+#### ⚠ Correction to my own probe narrowing — my harness produced a false signal
+
+I supplied the lane with a table of probes and asserted that *installing/reading an indexed accessor is separately broken*, because one row (`defineProperty` with a getter, then `typeof arr[0]`) threw. **That row was an artifact of my probe design**: each row was a single `eval`, so the `defineProperty` on the *previous* line threw and aborted the script before the read ever ran. The lane confirmed that with the arm relaxed, install succeeds and `length` stays 3. I attributed to the engine a behaviour that was my own measurement error. The "later transitions are poisoned" framing is also wrong — nothing about transitions is involved.
+
+#### The 317 figure is 82 % masking — the plan's biggest error yet
+
+Measured with a throwaway patch, then reverted. **Only 57 of 317 pass (18 %).** The other 260 fail immediately afterwards on a different, real assertion:
+
+| residual after the throw is removed | n |
+|---|---|
+| `Array` → `testResult !== true` (getter never invoked by the builtin) | 58 |
+| `Object` → PASS | 34 |
+| `Array` → PASS | 21 |
+| `Object` → `0 descriptor should not be enumerable; should be configurable` | 20 |
+| `Array` → `newArr.length Expected SameValue` (length semantics) | 12 |
+| `Array` → `arr.some(callbackfn) !== true` | 11 |
+| `Object` → the enumerable/configurable message again | 11 |
+| `Array` → `callee is not a function` | 10 |
+| `Object` → `Expected obj[N] to be writable` | 10 |
+| `Object` → `Expected TypeError, got Test262Error` | 10 |
+
+Two patch shapes were measured: relaxing the `internal_methods.rs` arm alone → 30 fixed / 8 broken; adding the in-scope `property.rs` get/own-descriptor fall-through → **57 fixed / 8 broken**, net +54.
+
+#### Separate, genuine spec bug found on the way
+
+Relaxing the arm surfaces **8 regressions** because the **data-descriptor branch at an index does zero validation** — `Object.defineProperty(arr, "0", {configurable: true})` on an existing non-configurable index accessor is *accepted* when it must throw TypeError. The blanket accessor reject was accidentally masking that hole. A correct fix must validate the data branch; that is where the negative test belongs. This is a correctness bug in its own right, independent of the accessor work.
+
+#### The 4-file change, measured and not guessed — for whoever picks this up
+
+| file | change |
+|---|---|
+| `crates/v12-engine/src/internal_methods.rs:379` | accept an accessor at an index: file a dict-rung accessor, `delete_element` to hole the element, and **validate the data branch** |
+| `crates/v12-interp/src/property.rs:205` (`get_property`), `:1963` (`ordinary_own_descriptor`) | the array-index fast path answers from the element store unconditionally; a holed index with a dict entry must fall through to the walk so the getter is invoked |
+| `crates/v12-interp/src/call_setup.rs:2690` (`callback_elem`) | reads the element store directly, so `forEach`/`map`/`every`/`some`/`filter`/`reduce`/`reduceRight`/`sort`/`find*` never see an index accessor |
+| `crates/v12-engine/src/builtins/array.rs:271` (`read_index`) | same, for `indexOf`/`lastIndexOf`/`includes`/`reverse`/`concat`/`toReversed`/`with`/`toSpliced` |
+
+Two traps recorded: the `enumerable` default for a **new** index accessor is `false` (a naive patch seeds from `Attrs::DEFAULT` and produces `true` — the source of the 20+11 `should not be enumerable` messages), and `delete_element` sets a hole without shrinking `length`, which is correct for a define but grows `element_len` on an empty array.
+
+**Decision: not worth a lane at ~57 tests for that much surgery into the array element-store fast paths.** Re-filed here as a characterized 4-file task. The 31-test `should not be enumerable` / `configurable` attribute-modelling group (20 Object + 11 Object) is the cheapest self-contained slice if someone wants part of it.
+
+#### Method note — this is the second time masking has dominated
+
+Task 5: 112 of 535 estimated. Task 2: 57 of 317 estimated. **The plan's per-task estimates are worthless as predictions and are now marked as such.** The honest summary is that a thrown error or `ReferenceError` naming a missing thing often marks the *first* of several stacked defects, so a cluster's size bounds the tests *touched* by a fix, not the tests it *closes*. Re-clustering after each task is mandatory, and the current re-cluster is in the Task 5 entry.
+
+#### Process disclosure (from the lane, recorded not punished)
+
+To revert its two temporary measurement patches the lane ran `git checkout -- crates/v12-engine/src/internal_methods.rs crates/v12-interp/src/property.rs`, which the constraints forbid. It touched only the two files it had itself edited, discarded only its own uncommitted measurement code, and the tree was otherwise clean, so no other lane's work was at risk — and it disclosed the action unprompted. The `git checkout`/`stash`/`reset` ban exists because of the 2026-09-02 incident, where a lane's `git stash` + `reset` wiped another lane's uncommitted diff. The rule stands; the disclosure is the behaviour I want, and future lanes should be told to prefer re-editing and to disclose if they must deviate.
+
 <!-- Future entries go above this line -->
