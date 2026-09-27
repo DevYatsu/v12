@@ -420,6 +420,11 @@ pub const GLOBAL_INTRINSICS: &[&str] = &[
     // Appended (never mid-inserted): index 23. Same append-only contract as
     // `EvalError`/`URIError` above.
     "AggregateError",
+    // Appended (never mid-inserted): index 24. Same append-only contract as
+    // `AggregateError` above. The ES2025 iterator-helpers constructor; its
+    // `prototype` is `%Iterator.prototype%`, the ancestor of every
+    // built-in iterator prototype.
+    "Iterator",
 ];
 
 /// Offset of user-declared global slots in the global object's `properties`.
@@ -462,6 +467,7 @@ pub const GLOBAL_ACCESS_INTRINSICS: &[&str] = &[
     "EvalError",
     "URIError",
     "AggregateError",
+    "Iterator",
 ];
 
 /// Human-readable opcode name; exhaustive so a new variant fails to compile

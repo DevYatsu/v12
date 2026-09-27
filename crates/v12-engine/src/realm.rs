@@ -339,6 +339,43 @@ impl Realm {
         heap.get_mut(map_proto).prototype = Some(object_proto);
         let set_proto = alloc_root(heap);
         heap.get_mut(set_proto).prototype = Some(object_proto);
+        // `%Iterator.prototype%` (ES2025 iterator helpers). A real ordinary
+        // object: the eleven helper methods install on it as ordinary
+        // properties, so descriptors, `Object.getOwnPropertyNames` and
+        // deletion all behave per spec. Its own `[[Prototype]]` is
+        // `%Object.prototype%`, and every built-in iterator object inherits
+        // from it in the spec — v1's iterator objects have no `[[Prototype]]`
+        // link at all (their method surface is synthesized by the
+        // interpreter's `Kind::Iterator` const table, `property.rs:623`), so
+        // nothing here can shadow or expose that chain.
+        let iterator_proto = alloc_root(heap);
+        heap.get_mut(iterator_proto).prototype = Some(object_proto);
+        // The `Iterator` constructor: `Iterator()` is a TypeError, `new
+        // Iterator()` returns a fresh `%Iterator.prototype%`-based object.
+        // `install_ctor` gives the spec-attr `prototype` property
+        // (non-writable, non-enumerable, non-configurable — exactly
+        // `Iterator/prototype/initial-value.js`) plus the `constructor`
+        // back-link.
+        if let Some(ctor) = intrinsics.get("Iterator").and_then(|v| v.as_object()) {
+            crate::builtins::install_ctor(heap, ctor, iterator_proto);
+            // `Iterator.length` is 0 (`Iterator/length.js`): the intrinsic
+            // placeholder carries neither `length` nor `name`, and
+            // `install_ctor` stamps neither.
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            let ctor_name = ctx.heap.intern_text("Iterator");
+            for (prop, value) in [
+                ("length", JsValue::from_i32_smi(0).expect("0 fits Smi")),
+                ("name", JsValue::string(ctor_name)),
+            ] {
+                ctx.define_data_prop_with_attrs(
+                    ctor,
+                    prop,
+                    value,
+                    v12_heap::Attrs::new(false, false, true),
+                );
+            }
+            wire_callable(heap, &intrinsics, "Iterator", NativeId::IteratorConstruct);
+        }
 
         // Link the intrinsic constructors to their prototypes through the
         // unified install family (`install_ctor`: `prototype` field +
@@ -392,8 +429,51 @@ impl Realm {
             date: None,
             date_proto,
             reflect: None,
+            iterator: intrinsics.get("Iterator").and_then(|v| v.as_object()),
+            iterator_proto,
         };
         crate::builtins::install_builtins(heap, &targets);
+
+        // `Iterator.prototype[Symbol.iterator]()` returns `this` (spec
+        // 27.1.4) and `[Symbol.toStringTag]` is `"Iterator"` (spec
+        // 27.1.4). Both need a symbol key, so neither can ride the macro's
+        // string install; `[@@iterator]` is a `CreateBuiltinFunction` result
+        // and is built here the same way `Date.prototype[@@toPrimitive]` is.
+        {
+            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
+            let self_fn = ctx.alloc_obj(JsObject {
+                kind: v12_heap::Kind::Function,
+                callable: FunctionTarget::Bytecode(u32::from(NativeId::IteratorSelf)),
+                ..Default::default()
+            });
+            for (prop, value) in [
+                ("length", JsValue::from_i32_smi(0).expect("0 fits Smi")),
+                (
+                    "name",
+                    JsValue::string(ctx.heap.intern_text("[Symbol.iterator]")),
+                ),
+            ] {
+                ctx.define_data_prop_with_attrs(
+                    self_fn,
+                    prop,
+                    value,
+                    v12_heap::Attrs::new(false, false, true),
+                );
+            }
+            ctx.define_symbol_data_prop_with_attrs(
+                iterator_proto,
+                symbol_iterator,
+                JsValue::object(self_fn),
+                v12_heap::Attrs::new(true, false, true),
+            );
+            let tag = ctx.heap.intern_text("Iterator");
+            ctx.define_symbol_data_prop_with_attrs(
+                iterator_proto,
+                symbol_to_string_tag,
+                JsValue::string(tag),
+                v12_heap::Attrs::new(false, false, true),
+            );
+        }
 
         // Replace the macro's placeholder functions with the realm's canonical
         // well-known symbols. Both properties are non-writable,
@@ -684,6 +764,8 @@ impl Realm {
             date: None,
             date_proto,
             reflect: Some(reflect),
+            iterator: None,
+            iterator_proto,
         };
         crate::builtins::install_reflect_builtins(heap, &reflect_targets);
         // `Reflect` is a global property with the standard builtin attrs

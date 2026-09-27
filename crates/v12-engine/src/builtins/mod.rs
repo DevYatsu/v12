@@ -72,6 +72,14 @@ pub struct BuiltinTargets {
     /// static methods install on it (same mechanism as `Date`: a plain
     /// shape-bound global property, not a `GLOBAL_INTRINSICS` slot).
     pub reflect: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    /// The `Iterator` constructor (ES2025 iterator helpers). `Iterator.from`
+    /// installs on it; the constructor's own callable is wired by the realm
+    /// (like `Promise`), so no method is installed here.
+    pub iterator: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    /// `%Iterator.prototype%`. Always exists (the realm allocates it before
+    /// the install pass), so it is a plain handle like `array_proto`. The
+    /// eleven helper methods install here.
+    pub iterator_proto: v12_heap::Handle<v12_heap::JsObject>,
 }
 
 pub(crate) fn builtin_install_prop(
@@ -367,6 +375,23 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::ReflectPreventExtensions => Some(1),
         NativeId::ReflectSet => Some(3),
         NativeId::ReflectSetPrototypeOf => Some(2),
+        // Iterator helpers (ES2025). `toArray` is the only arity-0 member;
+        // every other helper takes exactly one argument (`reduce`'s
+        // `initialValue` is optional, so it does not count).
+        NativeId::IteratorConstruct => Some(0),
+        NativeId::IteratorSelf => Some(0),
+        NativeId::IteratorFrom => Some(1),
+        NativeId::IteratorMap => Some(1),
+        NativeId::IteratorFilter => Some(1),
+        NativeId::IteratorTake => Some(1),
+        NativeId::IteratorDrop => Some(1),
+        NativeId::IteratorFlatMap => Some(1),
+        NativeId::IteratorReduce => Some(1),
+        NativeId::IteratorToArray => Some(0),
+        NativeId::IteratorForEach => Some(1),
+        NativeId::IteratorSome => Some(1),
+        NativeId::IteratorEvery => Some(1),
+        NativeId::IteratorFind => Some(1),
         _ => None,
     }
 }
@@ -523,10 +548,10 @@ macro_rules! __builtin_emit_install {
         $crate::builtins::install_native($heap, Some($targets.set_proto), $name, $id)
     };
     (Iterator, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, $targets.iterator, $name, $id)
     };
     (IteratorProto, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
-        $crate::builtins::install_native($heap, None, $name, $id)
+        $crate::builtins::install_native($heap, Some($targets.iterator_proto), $name, $id)
     };
     // Value-constant groups: the handler is evaluated once at install time
     // (see `install_value`) and the result is stored as a plain data property.
@@ -695,6 +720,24 @@ macro_rules! __builtin_emit_install {
         $crate::builtins::install_native_with_length(
             $heap,
             $targets.reflect,
+            $name,
+            $id,
+            Some($len),
+        )
+    };
+    (Iterator, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length(
+            $heap,
+            $targets.iterator,
+            $name,
+            $id,
+            Some($len),
+        )
+    };
+    (IteratorProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_native_with_length(
+            $heap,
+            Some($targets.iterator_proto),
             $name,
             $id,
             Some($len),
@@ -941,6 +984,27 @@ define_builtins! {
         "keys" (0) => SetKeys => |heap, this, args| call_ctx(map::set_keys, heap, this, args),
         "values" (0) => SetValues => |heap, this, args| call_ctx(map::set_values, heap, this, args),
     },
+    // The `Iterator` constructor's one static (spec 27.1.3).
+    Iterator {
+        "from" (1) => IteratorFrom => |heap, this, args| call_ctx(iterator::iterator_from, heap, this, args),
+    },
+    // `%Iterator.prototype%`: the ES2025 iterator helpers (spec 27.1.4-27.1.5).
+    // `take`/`drop`/`toArray` are pure-heap (a lazy wrapper / a drain) and run
+    // as registry natives; the other eight take a user callback and are
+    // intercepted at the interpreter seam, so their arm is the stub.
+    IteratorProto {
+        "take" (1) => IteratorTake => |heap, this, args| call_ctx(iterator::iterator_take, heap, this, args),
+        "drop" (1) => IteratorDrop => |heap, this, args| call_ctx(iterator::iterator_drop, heap, this, args),
+        "toArray" (0) => IteratorToArray => |heap, this, args| call_ctx(iterator::iterator_to_array, heap, this, args),
+        "map" (1) => IteratorMap => callback_stub,
+        "filter" (1) => IteratorFilter => callback_stub,
+        "flatMap" (1) => IteratorFlatMap => callback_stub,
+        "reduce" (1) => IteratorReduce => callback_stub,
+        "forEach" (1) => IteratorForEach => callback_stub,
+        "some" (1) => IteratorSome => callback_stub,
+        "every" (1) => IteratorEvery => callback_stub,
+        "find" (1) => IteratorFind => callback_stub,
+    },
     Object {
         "assign" (2) => ObjectAssign => |heap, this, args| call_ctx(object::object_assign, heap, this, args),
         "is" (2) => ObjectIs => |heap, this, args| call_ctx(object::object_is, heap, this, args),
@@ -1151,23 +1215,20 @@ define_builtins! {
     SetConstruct => |heap, this, args| call_ctx(map::set_construct, heap, this, args),
     SetSize => |heap, this, args| call_ctx(map::set_size, heap, this, args),
     IteratorNext => |heap, this, args| call_ctx(iterator::iterator_next, heap, this, args),
-    IteratorToArray => |heap, this, args| call_ctx(iterator::iterator_to_array, heap, this, args),
-    IteratorTake => |heap, this, args| call_ctx(iterator::iterator_take, heap, this, args),
-    IteratorDrop => |heap, this, args| call_ctx(iterator::iterator_drop, heap, this, args),
-    IteratorFrom => |heap, this, args| call_ctx(iterator::iterator_from, heap, this, args),
-    IteratorMap => callback_stub,
-    IteratorFilter => callback_stub,
-    IteratorFlatMap => callback_stub,
-    IteratorReduce => callback_stub,
-    IteratorForEach => callback_stub,
-    IteratorSome => callback_stub,
-    IteratorEvery => callback_stub,
-    IteratorFind => callback_stub,
+    // The `Iterator` constructor's body and the shared
+    // `%Iterator.prototype%[Symbol.iterator]()`. Both are wired by the realm
+    // (a callable field / a symbol key), so they are dispatch-only ids. The
+    // eight callback-taking *helpers* are declared in the `IteratorProto`
+    // group above; their bodies are intercepted at the interpreter seam
+    // (`Interp::run_iterator_callback`) before any dispatch, so their registry
+    // arm is the `callback_stub` placeholder — the same contract the Array
+    // `map`/`filter`/… family uses. Only the body lives on the other side.
+    IteratorConstruct => |heap, this, args| call_ctx(iterator::iterator_construct, heap, this, args),
+    IteratorSelf => |heap, this, args| call_ctx(iterator::iterator_self, heap, this, args),
     SymbolConstruct => |heap, this, args| call_ctx(symbol::symbol_construct, heap, this, args),
     ProxyConstruct => |heap, this, args| call_ctx(proxy::proxy_construct, heap, this, args),
     MapIterator => |heap, this, args| call_ctx(iterator::map_iterator, heap, this, args),
     SetIterator => |heap, this, args| call_ctx(iterator::set_iterator, heap, this, args),
-    IteratorSelf => |heap, this, args| call_ctx(iterator::iterator_self, heap, this, args),
     RegExpConstruct => |heap, this, args| call_ctx(regexp::regexp_construct, heap, this, args),
     RegExpToString => |heap, this, args| call_ctx(regexp::regexp_to_string, heap, this, args),
     ObjectEnumerableOwnKeys => |heap, this, args| call_ctx(object::object_enumerable_own_keys, heap, this, args),

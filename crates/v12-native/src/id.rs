@@ -496,6 +496,13 @@ pub enum NativeId {
     ReflectSet = 2911,
     /// `Reflect.setPrototypeOf(target, proto)`.
     ReflectSetPrototypeOf = 2912,
+    // Iterator helpers (ES2025 "Iterator Helpers"). The `2920-2999` block is
+    // free above `Reflect`'s `29xx`; nothing else uses it.
+    /// The `Iterator` constructor (spec 27.1.2.1). Distinguished from the
+    /// prototype methods by the receiver the interpreter passes: a plain
+    /// `Iterator()` call presents `undefined` as `this` and is a `TypeError`,
+    /// while `new Iterator()` presents the constructor itself.
+    IteratorConstruct = 2920,
 }
 
 /// The serialized index of a native function.

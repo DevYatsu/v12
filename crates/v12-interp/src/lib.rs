@@ -180,6 +180,7 @@ fn intrinsic_slot(text: &str) -> Option<usize> {
         "AggregateError" => {
             Some(intrinsic_idx("AggregateError").expect("intrinsic 'AggregateError' present"))
         }
+        "Iterator" => Some(intrinsic_idx("Iterator").expect("intrinsic 'Iterator' present")),
         _ => None,
     }
 }

@@ -12,6 +12,20 @@
 
 ---
 
+## ⚠ METHOD CORRECTION (2026-09-27, after Task 5) — the estimates below are not predictions
+
+Tasks 1, 4 and 5 are executed. Task 5 was estimated at **535 tests and delivered 112**.
+
+**The plan sized every task by how many tests shared a failure message. That measures symptom frequency, not fix effort.** Where one missing thing masks a deeper set of gaps, the cluster overstates the yield by a large factor. Installing the `Iterator` global fixed 112 of the 410 tests that reported `ReferenceError: Iterator is not defined`; the other ~298 unblocked and immediately failed one layer deeper — `built-ins/Iterator`'s top cause is now **232 × `callee is not a function`**, the same tests shifted.
+
+**Therefore:**
+- **Re-cluster after every task lands** (`./conformance/faildiff.sh <before> <after>`, then group the residual failures by message). Never predict a task's yield from the pre-fix cluster.
+- **The ~67 % core projection is not credible on this evidence.** Treat it as a loose bound and re-measure. Actual: core 54.5 % → 57.2 % → 57.9 % after three tasks.
+- **Overestimation risk is highest** where the blocking error is a `ReferenceError` or a "not a function" that hides unimplemented behaviour — **Task 6 (RegExp.prototype, est. ~300) is the biggest exposure and should be re-scoped on evidence first.** Risk is lowest where each test exercises one self-contained method or one specific thrown error — Tasks 2, 3, 7, 8, 11, 12.
+- **A second, already-identified item is missing from the task list:** the eight `Iterator` callback helpers (`map`/`filter`/`flatMap`/`reduce`/`forEach`/`some`/`every`/`find`) already had bodies before Task 5, but eager, and `map`/`filter`/`flatMap` return an **Array** rather than an iterator (`Interp::run_iterator_callback`, `crates/v12-interp/src/call_setup.rs:4406`). That is ≈232 tests and is the true cause of the 125 `callee is not a function` failures in this area.
+
+---
+
 ## Baseline (measured, not estimated)
 
 Measured on `cdb2cb04` with `./conformance/run.sh --filter built-ins --jobs 0 --format human,json --json-out /tmp/bi-head.json`:

@@ -1018,4 +1018,48 @@ core       : total=15266 pass=8731 fail=6443            core  = 57.2 %
 
 **Track core %; raw % is capped by scope, not by engine quality.** Progression this session: core 54.5 % (noisy harness, pre-Task-1) → **57.2 %**. Of the +417 passes, +74 is the timeout widening (not an engine change) and the remainder is Task 4's surrogate fix. In-scope failures remaining: **6 443**.
 
+### 2026-09-27 — Conformance burn-down, Task 5: the `Iterator` global and its prototype helpers
+
+- **Filter:** `built-ins` (full corpus, 24 061) — fail-set gate against the post-determinism baseline
+- **Result:** **FIXED 112, BROKE 0, MARGINAL 3.** `net pass delta: +109`. `built-ins/Iterator` 14 → 126 pass. Workspace `cargo nextest run --workspace` → **1 061 passed / 2 skipped**. `cargo clippy --workspace --all-targets` → 0 errors.
+- **The plan estimated 535 for this task. It delivered 112 — a 4.8× miss, and the reason matters more than the number.**
+
+#### ⚠ METHOD CORRECTION: cluster frequency ≠ addressable yield
+
+The plan sized every task by how many tests shared a failure message. That measures **symptom frequency, not fix effort**. Where one missing thing masks a deeper set of gaps, the cluster wildly overstates the yield.
+
+Concretely: 410 tests failed with `ReferenceError: Iterator is not defined`. Installing the global fixed 112. The other ~298 did not pass — they unblocked and immediately failed one layer deeper. The top cause inside `built-ins/Iterator` is now **232 × `TypeError: callee is not a function`**, the *same* tests, shifted. So the yield of any task must be re-derived by re-clustering after it lands, not predicted from the pre-fix cluster.
+
+**Consequences for the queued tasks:** the risk is highest where the blocking error is a `ReferenceError` or a "not a function" that hides unimplemented behaviour, and lowest where each test exercises one self-contained method. Task 6 (RegExp.prototype, est. ~300) carries the highest overestimation risk and should be re-scoped on evidence rather than trusted. Tasks 2/3/7/8/11/12 address specific thrown errors or single self-contained methods and are the better bets. **The plan's ~67 % core projection is not credible on this evidence and should be treated as a lower bound to be re-measured, not a target.**
+
+#### Known follow-up, cause already identified (≈232 tests, not yet done)
+
+`NativeId::IteratorMap/Filter/FlatMap/Reduce/ForEach/Some/Every/Find` and the `IteratorProto` group already existed before this task, with **bodies** — but eager, at `Interp::run_iterator_callback` (`crates/v12-interp/src/call_setup.rs:4406`), and `map`/`filter`/`flatMap` answer with an **Array** rather than an iterator. So `it.map(f).toArray()` dies on `Array.prototype.toArray` being undefined. That is the real cause of the 125 `callee is not a function` failures attributed to this area, not an absent install. `take`/`drop`/`toArray` were rewritten here into lazy pull-through wrappers; the eight callback helpers were not.
+
+#### Deviations and scope
+
+- **One line outside the declared write scope, deliberate and reported:** `crates/v12-interp/src/lib.rs` `intrinsic_slot` gained `"Iterator" => Some(intrinsic_idx("Iterator")…)`. Without it `typeof Iterator` is `undefined` and the task is void. It matches the arms above it. Accepted.
+- **Latent hazard found alongside it:** the crate's own `intrinsic_slot_guard` re-derives each name via `intrinsic_idx` but never checks that `intrinsic_slot` has an arm for it, so the omission compiled and tested clean. **The next intrinsic added will hit the same trap.** Closing that gap is a small, separate, high-value task.
+- `toArray.length` is **0**, not 1 — the plan's "every helper is arity 1" is wrong; test262 `Iterator/prototype/toArray/length.js` pins `0`.
+- The `Iterator` constructor is **not** abstract-throwing: spec 27.1.2.1 is `Iterator()` (no `new`) → TypeError, while `new Iterator()` returns an object inheriting `%Iterator.prototype%` (verified against `Iterator/subclassable.js`). The plan's "constructor whose body throws" would have failed it.
+- The plan's `every_helper_is_installed_on_the_prototype` test was a **no-op**: `names.filter(function(n) { return typeof Iterator.prototype[n]; })` filters on a string, which is always truthy, and never returns `undefined`, so it asserted nothing. Replaced with an explicit `typeof` check per name.
+- The plan's `drive_iterator_helper` sketch is not achievable as written: a single `eager: bool` collapses a design where `map`/`filter` return iterators and `find`/`some` return values, and `make_iterator_from_vec` would have been eager, re-breaking laziness on a second composition. The lazy-wrapper-plus-one-pull shape is what composes.
+- `%ArrayIteratorPrototype%` and siblings are **not real objects** in v12: `create_iterator` leaves `prototype: None` and the interpreter synthesizes the method surface from the `Kind::Iterator` const table (`property.rs:623` `iterator_method_surface`), which runs *before* shape/proto lookup in `get_property`. So iterator objects cannot be re-parented onto `%Iterator.prototype%` without a `v12-heap` + `v12-interp` change, and nothing on the new prototype can shadow the synthesized surface. Left alone deliberately; `ArrayIteratorPrototype`/`MapIteratorPrototype`/`SetIteratorPrototype`/`StringIteratorPrototype` are bit-identical.
+- **IteratorClose does not apply in v12:** no built-in iterator has a `return` method, so `op_iterator_close` is a no-op and the `*-closes-underlying*` / `exhaustion-calls-return` test262 files cannot pass. No close path was added. This is why a helper throwing mid-iteration is not a correctness risk *here* — and also why those tests stay red.
+- Re-entrancy: none of the three new helpers needed the `cdb2cb04` treatment — they run as pure `&mut Ctx` registry natives and never re-enter the dispatch loop. The eight callback helpers already route through `run_callback_builtin` → `Interp::call_value`, the existing guarded path (`MAX_CALL_DEPTH`).
+- **Claim not substantiated:** the lane reported an incidental parser bug — `throw [f(x), g(y)].join(s)` failing with "Expected a semicolon … or an implicit semicolon", array collapsing to its last element. I probed it directly and it **does not reproduce**: `[String(1), String(2)].join("-")` → `1-2` and `throw [String(1).length, String(2).length].join("-")` → `1-1`, with and without a space after the comma, in `return`, `var`-assignment and `throw` positions. Not recorded as a finding.
+
+#### Files
+
+`crates/v12-bytecode/src/lib.rs` (+6, `"Iterator"` at intrinsic index 24, `GLOBAL_VAR_OFFSET` still derived), `crates/v12-interp/src/lib.rs` (+1), `crates/v12-native/src/id.rs` (+7, `IteratorConstruct = 2920` from the free block), `crates/v12-engine/src/builtins/{iterator.rs,mod.rs,realm.rs}` (+436/-83), new `crates/v12-engine/tests/iterator_surface.rs` (17 tests).
+
+#### Conformance after this commit
+
+```
+full: 24061 tests, 8842 pass   raw  = 36.7 %
+core: 15266 tests, 8840 pass   core = 57.9 %
+```
+
+Session progression: core 54.5 % → 57.2 % → **57.9 %**. In-scope failures remaining: **6 334**.
+
 <!-- Future entries go above this line -->

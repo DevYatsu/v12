@@ -1,18 +1,29 @@
 //! Iterator built-ins: `%ArrayIteratorPrototype%` and the Array/Map/Set
 //! iterator objects behind `Symbol.iterator` (`for-of`, spread, `yield*`).
 //!
-//! An iterator object is an ordinary object (prototype-linked to
-//! `%IteratorPrototype%` where available) carrying its state in the internal
+//! An iterator object is an ordinary object carrying its state in the internal
 //! `elements` vector: `[kind, source, index]`.
 //!
 //! - `elements[0]`: iterator kind discriminant (Smi).
-//! - `elements[1]`: the source object being iterated (array, map, or set).
-//! - `elements[2]`: next index (Smi).
+//! - `elements[1]`: the source object being iterated (array, map, or set) —
+//!   for the two helper-wrapper kinds ([`ITER_KIND_HELPER_TAKE`],
+//!   [`ITER_KIND_HELPER_DROP`]) it is a *source iterator* instead, and a
+//!   fourth slot carries the limit.
+//! - `elements[2]`: next index (Smi) — emitted (`take`) or discarded (`drop`)
+//!   values for a wrapper.
 //!
 //! `next` is a native function routed through the registry
 //! ([`NATIVE_ARRAY_ITERATOR_NEXT`]); each `next` call reads the state, walks
-//! the source's elements, and produces an ES iterator result object
-//! (`{value, done}`).
+//! the source's elements (or pulls from the source iterator, for a wrapper),
+//! and produces an ES iterator result object (`{value, done}`).
+//!
+//! The ES2025 iterator helpers split across two homes. `Iterator.from`,
+//! `take`, `drop` and `toArray` are pure-heap and live here: `take`/`drop`
+//! build a lazy wrapper and consume nothing, `toArray` drains. The eight
+//! helpers that take a user callback (`map`/`filter`/`flatMap`/`reduce`/
+//! `forEach`/`some`/`every`/`find`) cannot be — calling JS needs the machine —
+//! so their bodies are at the interpreter seam
+//! (`Interp::run_iterator_callback`) and this file only installs them.
 //!
 //! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
 //! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
@@ -41,11 +52,31 @@ pub const ITER_KIND_MAP_VALUES: i32 = 5;
 pub const ITER_KIND_SET_VALUES: i32 = 6;
 /// Iterator kind: Set entries (`[value, value]` pairs).
 pub const ITER_KIND_SET_ENTRIES: i32 = 7;
+/// Iterator kind: a helper wrapper that emits at most `limit` values pulled
+/// from its source iterator (`Iterator.prototype.take`). `elements` is
+/// `[kind, source iterator, values emitted, limit]`.
+pub const ITER_KIND_HELPER_TAKE: i32 = 8;
+/// Iterator kind: a helper wrapper that discards the first `limit` values
+/// pulled from its source iterator (`Iterator.prototype.drop`). Same
+/// `elements` layout as [`ITER_KIND_HELPER_TAKE`]; the counter at
+/// [`SLOT_INDEX`] counts *discarded* values.
+pub const ITER_KIND_HELPER_DROP: i32 = 9;
+
+/// True for the two lazily-pulling helper wrapper kinds.
+const fn is_helper_wrapper(kind: i32) -> bool {
+    kind == ITER_KIND_HELPER_TAKE || kind == ITER_KIND_HELPER_DROP
+}
 
 /// Index of the state slots inside an iterator's `elements` vector.
 const SLOT_KIND: usize = 0;
 const SLOT_SOURCE: usize = 1;
 const SLOT_INDEX: usize = 2;
+/// Fourth slot, present only on helper wrappers: the `take`/`drop` limit.
+const SLOT_LIMIT: usize = 3;
+
+/// Upper bound on a single eager drain, so a runaway iterator reports a
+/// `RangeError` instead of exhausting memory.
+const MAX_DRAIN: usize = 1_000_000;
 
 /// Builds an iterator object over `source` with the given kind.
 fn create_iterator(ctx: &mut Ctx, source: Handle<JsObject>, kind: i32) -> Handle<JsObject> {
@@ -58,6 +89,90 @@ fn create_iterator(ctx: &mut Ctx, source: Handle<JsObject>, kind: i32) -> Handle
         ],
         ..JsObject::default()
     })
+}
+
+/// Builds a lazy helper wrapper: an iterator that pulls from `source` (itself
+/// any v12 iterator, wrappers included) instead of scanning a source object's
+/// element store. Nothing is consumed until the wrapper's `next` runs, which
+/// is what makes `take`/`drop` lazy per spec 27.1.4.
+fn create_helper_iterator(
+    ctx: &mut Ctx,
+    source: Handle<JsObject>,
+    kind: i32,
+    limit: usize,
+) -> JsValue {
+    ctx.alloc_obj(JsObject {
+        kind: v12_heap::Kind::Iterator,
+        elements: vec![
+            helpers::smi_or_f64(i64::from(kind)),
+            JsValue::object(source),
+            helpers::smi_or_f64(0),
+            helpers::smi_or_f64(limit as i64),
+        ],
+        ..JsObject::default()
+    })
+    .into()
+}
+
+/// The one generic engine behind every helper: a single `next` pull against
+/// any v12 iterator, through the same `iterator_next` the JS `next` method
+/// uses. `None` means the source is exhausted. Because it recurses through
+/// [`iterator_next`] rather than reading the source's element store, a helper
+/// composed on a helper (`it.take(1).drop(1)`) works unchanged.
+fn pull(ctx: &mut Ctx, iter: JsValue) -> Result<Option<JsValue>, Throw> {
+    let result = iterator_next(ctx, iter, &[])?;
+    let Some(obj) = result.as_object() else {
+        return Err(ctx.type_error("TypeError: iterator next() did not return an object"));
+    };
+    let props = ctx.heap.get(obj).properties.clone();
+    if props
+        .get(1)
+        .copied()
+        .unwrap_or(JsValue::undefined())
+        .is_true()
+    {
+        return Ok(None);
+    }
+    Ok(Some(props.first().copied().unwrap_or(JsValue::undefined())))
+}
+
+/// `next` for the two lazy helper wrapper kinds: `take` stops after `limit`
+/// emissions, `drop` discards `limit` values first. Both delegate every real
+/// read to the shared pull, so an underlying iterator is advanced only as far
+/// as the wrapper actually needs.
+fn helper_wrapper_next(
+    ctx: &mut Ctx,
+    iter: Handle<JsObject>,
+    kind: i32,
+    count: usize,
+    limit: usize,
+    source: JsValue,
+) -> Result<JsValue, Throw> {
+    let mut count = count;
+    if kind == ITER_KIND_HELPER_TAKE {
+        if count >= limit {
+            return Ok(iterator_result(ctx, JsValue::undefined(), true));
+        }
+    } else {
+        while count < limit {
+            if pull(ctx, source)?.is_none() {
+                return Ok(iterator_result(ctx, JsValue::undefined(), true));
+            }
+            count += 1;
+        }
+        // The discards are done: the wrapper now passes the source through, so
+        // its counter stops moving and a later `next` resumes here.
+        ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(count as i64);
+    }
+    match pull(ctx, source)? {
+        Some(value) => {
+            if kind == ITER_KIND_HELPER_TAKE {
+                ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(count as i64 + 1);
+            }
+            Ok(iterator_result(ctx, value, false))
+        }
+        None => Ok(iterator_result(ctx, JsValue::undefined(), true)),
+    }
 }
 
 /// Allocates an ES iterator result `{value, done}`.
@@ -153,6 +268,37 @@ pub fn iterator_for(ctx: &mut Ctx, this: JsValue, kind: i32) -> Result<JsValue, 
     Ok(JsValue::object(create_iterator(ctx, obj, kind)))
 }
 
+/// `Iterator( )` (spec 27.1.2.1). The interpreter presents the constructor
+/// itself as `this` for `new Iterator()` and `undefined` for a plain call, so
+/// the receiver *is* the `NewTarget` test the spec opens with: a plain call is
+/// a `TypeError`, a construct returns a fresh object inheriting
+/// `Iterator.prototype` (which is what makes `class S extends Iterator {}`
+/// constructible).
+pub fn iterator_construct(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let Some(ctor) = this.as_object() else {
+        return Err(ctx.type_error("TypeError: Iterator requires new"));
+    };
+    let proto = ctx.heap.get(ctor).prototype;
+    let obj = ctx.alloc_obj(JsObject {
+        prototype: proto,
+        ..JsObject::default()
+    });
+    Ok(JsValue::object(obj))
+}
+
+/// Brand check shared by every `Iterator.prototype` helper: the receiver must
+/// be one of v12's iterator objects. The spec only requires "an object with a
+/// `next` method", but v1's iterator surface is the concrete `Kind::Iterator`
+/// (the same gate `run_iterator_callback` applies on the interpreter seam), so
+/// one check here keeps the whole helper family consistent.
+fn require_iterator(ctx: &mut Ctx, this: JsValue, name: &str) -> Result<Handle<JsObject>, Throw> {
+    ctx.this_object(this, name, Some(v12_heap::Kind::Iterator))
+}
+
 /// `iterator.next()` — shared by all four iterator kinds. Advances the
 /// internal index and produces `{value, done}`.
 pub fn iterator_next(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
@@ -163,6 +309,22 @@ pub fn iterator_next(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<
     let kind = ctx.heap.get(iter).elements[SLOT_KIND]
         .as_smi()
         .unwrap_or(ITER_KIND_ARRAY_VALUES);
+    // Helper wrappers (`take`/`drop`) carry a fourth slot and pull from the
+    // iterator in `elements[1]` instead of scanning an element store. No
+    // exhaustion flag is needed: a `take` past its limit and a `drop` over a
+    // drained source both keep answering `done` on every later `next`, which
+    // is the spec's requirement for a completed iterator.
+    if is_helper_wrapper(kind) {
+        let limit = ctx
+            .heap
+            .get(iter)
+            .elements
+            .get(SLOT_LIMIT)
+            .and_then(|v| v.as_smi())
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0);
+        return helper_wrapper_next(ctx, iter, kind, index, limit, JsValue::object(source));
+    }
     let mut index = index;
     loop {
         let len = source_len(ctx.heap, source);
@@ -262,46 +424,18 @@ pub fn array_iterator_keys(
     iterator_for(ctx, this, ITER_KIND_ARRAY_KEYS)
 }
 
-/// Collects all remaining `next()` values of `this` iterator into a Vec.
+/// Eagerly drains `this` through the shared pull into a `Vec`. Used by the
+/// helpers whose spec algorithm consumes the whole iterator at once
+/// (`toArray`); the lazy helpers return a wrapper instead.
 fn drain_iterator(ctx: &mut Ctx, this: JsValue) -> Result<Vec<JsValue>, Throw> {
     let mut out = Vec::new();
-    loop {
-        let r = iterator_next(ctx, this, &[])?;
-        let Some(o) = r.as_object() else { break };
-        let done = ctx
-            .heap
-            .get(o)
-            .properties
-            .get(1)
-            .copied()
-            .unwrap_or(JsValue::undefined());
-        if done.is_true() {
-            break;
-        }
-        let v = ctx
-            .heap
-            .get(o)
-            .properties
-            .first()
-            .copied()
-            .unwrap_or(JsValue::undefined());
+    while let Some(v) = pull(ctx, this)? {
         out.push(v);
-        if out.len() > 1_000_000 {
-            break;
+        if out.len() > MAX_DRAIN {
+            return Err(ctx.range_error("RangeError: iterator drain exceeds 1,000,000 values"));
         }
     }
     Ok(out)
-}
-
-/// Builds an array iterator (kind values) over `values`.
-fn array_values_iterator(ctx: &mut Ctx, values: Vec<JsValue>) -> Result<JsValue, Throw> {
-    let arr = ctx.alloc_obj(JsObject::array(values));
-    let h = arr;
-    Ok(JsValue::object(create_iterator(
-        ctx,
-        h,
-        ITER_KIND_ARRAY_VALUES,
-    )))
 }
 
 /// `Iterator.prototype.toArray()` — drains `this` into an array.
@@ -310,11 +444,7 @@ pub fn iterator_to_array(
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let _ = ctx.this_object(
-        this,
-        "Iterator.prototype.toArray",
-        Some(v12_heap::Kind::Iterator),
-    )?;
+    require_iterator(ctx, this, "Iterator.prototype.toArray")?;
     let values = drain_iterator(ctx, this)?;
     let arr = ctx.alloc_obj(JsObject::array(values));
     Ok(JsValue::object(arr))
@@ -328,37 +458,34 @@ fn take_limit(ctx: &mut Ctx, args: &[JsValue]) -> usize {
     if !n.is_finite() || n <= 0.0 {
         return 0;
     }
-    n.trunc().min(1_000_000.0) as usize
+    n.trunc().min(MAX_DRAIN as f64) as usize
 }
 
-/// `Iterator.prototype.take(limit)` — first `limit` values as an iterator.
+/// `Iterator.prototype.take(limit)` — a lazy iterator over the first `limit`
+/// values of `this`. Nothing is pulled until the result is consumed, and no
+/// more than `limit` values are ever pulled from `this`.
 pub fn iterator_take(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let _ = ctx.this_object(
-        this,
-        "Iterator.prototype.take",
-        Some(v12_heap::Kind::Iterator),
-    )?;
+    let source = require_iterator(ctx, this, "Iterator.prototype.take")?;
     let limit = take_limit(ctx, args);
-    let mut values = drain_iterator(ctx, this)?;
-    values.truncate(limit.min(values.len()));
-    array_values_iterator(ctx, values)
+    Ok(create_helper_iterator(
+        ctx,
+        source,
+        ITER_KIND_HELPER_TAKE,
+        limit,
+    ))
 }
 
-/// `Iterator.prototype.drop(limit)` — values after the first `limit`.
+/// `Iterator.prototype.drop(limit)` — a lazy iterator over everything after
+/// the first `limit` values. The discards happen on the first pull, not here.
 pub fn iterator_drop(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let _ = ctx.this_object(
-        this,
-        "Iterator.prototype.drop",
-        Some(v12_heap::Kind::Iterator),
-    )?;
+    let source = require_iterator(ctx, this, "Iterator.prototype.drop")?;
     let limit = take_limit(ctx, args);
-    let values = drain_iterator(ctx, this)?;
-    let rest = if limit < values.len() {
-        values[limit..].to_vec()
-    } else {
-        Vec::new()
-    };
-    array_values_iterator(ctx, rest)
+    Ok(create_helper_iterator(
+        ctx,
+        source,
+        ITER_KIND_HELPER_DROP,
+        limit,
+    ))
 }
 
 /// `Iterator.from(value)` — if already an iterator return it, else wrap an
