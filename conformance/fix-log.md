@@ -959,4 +959,38 @@ Copy the block below for each fix. Keep it under 20 lines.
   - 8 794 is the *total* test count of the 17 deferred topics; 8 313 of them fail. The plan mislabelled 8 794 as "failing" and predicted `skip 9 365 / fail 6 383`; the real figures are `skip 8 874 / fail 6 873` (479 were already skips, 2 pass).
   - `skip_reason_for` gained a third parameter. It is private to a `bin` crate, so there is no external breakage.
 
+### 2026-09-27 — Conformance burn-down wave 1, Task 4: `String.fromCodePoint` accepts surrogates + HARNESS NONDETERMINISM FOUND [plan: docs/superpowers/plans/2026-09-27-test262-builtins-coverage.md]
+
+- **Filter:** `built-ins/RegExp` (1 962 tests with the annexB substring), plus `built-ins/String`
+- **Change:** `string_from_code_point` (`crates/v12-engine/src/builtins/string.rs`) now accumulates a `Vec<u16>`, emits a surrogate pair for `cp > 0xFFFF`, and interns via `V12Str::utf16` (`StrStorage::Utf16`, `crates/v12-heap/src/string.rs:106`). It previously used `char::from_u32`, which returns `None` for 0xD800-0xDFFF because a Rust `char` is a scalar value and excludes surrogates, so every surrogate code point raised `RangeError: Invalid code point` — a spec violation, since ECMA-262 22.1.3.15 imposes only `0 <= cp <= 0x10FFFF`. The raise site moved from `ctx.type_error("RangeError: …")` to `ctx.range_error(...)`, which already existed at `ctx.rs:222` and is the file's convention.
+- **Unit tests:** 6 new in `crates/v12-engine/tests/lone_surrogates.rs`. **4 pass, 2 `#[ignore]`d.** The 2 ignored assert the end-to-end behaviour (`charCodeAt` reading the surrogate back) and are parked, not weakened — the write path is correct (`.length` is 1 and the heap holds 0xDC00) but the read path decodes `StrStorage::Utf16` with `String::from_utf16_lossy` (`Ctx::string_text` at `builtins/ctx.rs:337-344`, twin `helpers::string_text_cow` at `builtins/helpers.rs:36-43`), substituting U+FFFD. A Rust `String` cannot hold a surrogate, so this needs a code-unit boundary refactor across every `String.prototype` method, not a patch.
+- **A partial read fix was measured and rejected:** wiring `charCodeAt`/`codePointAt` straight to the handle makes 6/6 pass and the workspace green, but conformance gets *worse* — 381 fixed / 9 broken versus 406 fixed / 3 broken — because `charCodeAt` then reports the true surrogate while the RegExp engine still matches a U+FFFD-substituted copy of the same string. The read path must move all at once or not at all. **Recorded so nobody retries it as a quick win.**
+- **Runner:** `cargo nextest run --workspace` → **1 039 passed / 2 skipped** (2 skipped = the ignored tests above; nextest counts `#[ignore]` as skipped, so the ROADMAP's "0 skipped" convention is now 2 by decision, precedent `CONTEXT.md` resizable-arraybuffer).
+- **Files:** `crates/v12-engine/src/builtins/string.rs` (modified), `crates/v12-engine/tests/lone_surrogates.rs` (new)
+
+---
+
+#### ⚠ HARNESS DEFECT FOUND — every conformance number so far carries ~±157 test noise
+
+**This invalidates the per-test reliability of `conformance/faildiff.sh` and of the plan's yield estimates. It does not invalidate Task 1's gating, which is path-based and never executes a gated test.**
+
+Measured: two runs of the **identical binary** over the **same** `built-ins/RegExp` slice differ by **123 fail→pass and 34 pass→fail** (net +89 on a slice of 1 962). Every single flipping test has `duration_ms > 4500` in at least one run; the stable tests have a **2 ms median**. Samples:
+
+| test | run 1 | run 2 | outcome |
+|---|---|---|---|
+| `property-escapes/generated/Emoji_Presentation.js` | 5005 ms (killed) | 4477 ms | fail → pass |
+| `property-escapes/generated/General_Category_-_Paragraph_Separator.js` | 4084 ms | 5009 ms (killed) | pass → fail |
+
+Mechanism: `TEST_TIMEOUT_MS` (`conformance/harness/src/runner.rs:27`, the engine's cooperative deadline) and `TEST_HARD_KILL_MS` (`:38`, the parent-process backstop) are **both 5 000 ms**, while the generated Unicode property-escape tests legitimately take 3.3-5.1 s. The 5 s boundary therefore races 8-way parallel load: a test that would pass at 4.1 s is killed at 5.0 s in the next run. 109 further tests sit stably above 4500 ms and consistently time out, which is why the noise is bounded rather than unbounded.
+
+Consequences, stated plainly:
+- `faildiff.sh` reports timeout flips as `BROKE`. A lane can appear to break 34 tests having broken none, and a genuine regression among slow tests is lost in the noise. **The gate as built is not sound until the window is fixed.**
+- The plan's "~422 tests" and the lane's "406/404 fixed" are within noise of each other and of the baseline. Direction is right — the unit tests prove the mechanism, and the RegExp tests were failing on `RangeError` before — but **no exact yield figure from this task should be quoted.**
+- `BROKE` is only trustworthy as a signal for tests that complete in well under the window. The 2 ms median means the overwhelming majority of tests are; the ~157 marginal ones are not.
+
+Fix tracked as the next task: raise the window so legitimately-slow tests finish deterministically, and make `faildiff.sh` classify kill-window tests separately from logic failures.
+
+- **Also found, not yet fixed:** `String.fromCharCode` has the identical write-path bug at `string.rs:951` — it interns `String::from_utf16_lossy(&units)`, so `String.fromCharCode(0xDC00)` stores U+FFFD (verified: `.length` 1, `charCodeAt(0)` 65533). Same file, same one-line shape as the applied fix.
+- **Harness footgun worth recording:** `--format json --json-out F` **silently writes no file**; `main.rs:337-357` honours `json_out` only when TAP is also requested. Use `--format tap,json --json-out F`. A report that was assumed to exist was missing for this reason.
+
 <!-- Future entries go above this line -->

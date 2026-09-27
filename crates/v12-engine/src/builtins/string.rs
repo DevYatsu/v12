@@ -957,18 +957,29 @@ pub fn string_from_code_point(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let mut text = String::new();
+    // Build UTF-16 code units, not Rust `char`s: spec 22.1.3.15 imposes only
+    // the range precondition `0 <= cp <= 0x10FFFF`, and 0xD800-0xDFFF is
+    // inside it — a lone surrogate is a legal code point that produces a
+    // one-unit string. Rust's `char` is a Unicode scalar value and excludes
+    // surrogates, so `char::from_u32` returns `None` for them; that was the
+    // bug. Code points above 0xFFFF are emitted as a surrogate pair, per
+    // `String.fromCodePoint` step 4.
+    let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for &v in args {
         let n = ctx.to_number(v);
         if !n.is_finite() || n < 0.0 || n > 0x10FFFFu32 as f64 || n.fract() != 0.0 {
-            return Err(ctx.type_error("RangeError: Invalid code point"));
+            return Err(ctx.range_error("RangeError: Invalid code point"));
         }
-        let Some(cp) = char::from_u32(n as u32) else {
-            return Err(ctx.type_error("RangeError: Invalid code point"));
-        };
-        text.push(cp);
+        let cp = n as u32;
+        if cp <= 0xFFFF {
+            units.push(cp as u16);
+        } else {
+            let rest = cp - 0x10000;
+            units.push(0xD800 + (rest >> 10) as u16);
+            units.push(0xDC00 + (rest & 0x3FF) as u16);
+        }
     }
-    Ok(JsValue::string(ctx.heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_string(V12Str::utf16(units))))
 }
 
 /// `String.prototype.trimLeft` – Annex B alias of `trimStart`.
