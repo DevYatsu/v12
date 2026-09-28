@@ -1415,6 +1415,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Statement::WhileStatement(w) => self.while_loop(&w.test, &w.body, Some(name)),
             Statement::DoWhileStatement(d) => self.do_while_loop(&d.body, &d.test, Some(name)),
             Statement::ForStatement(f) => self.for_loop(f, Some(name)),
+            // `for-of`/`for-in` are loops too, so a labeled `continue` on them
+            // is legal (13.12 LabelledItems) and must resolve to the
+            // continuation point. They used to fall through to the arm below,
+            // which registers a break-only target and made
+            // `continue someLabel` a compile error.
+            Statement::ForOfStatement(f) => self.for_of_loop(f, Some(name)),
+            Statement::ForInStatement(f) => self.for_in_loop(f, Some(name)),
             Statement::SwitchStatement(s) => self.switch_stmt(s, Some(name)),
             // Labeled non-loop statement: break-only target.
             body => {

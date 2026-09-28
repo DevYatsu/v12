@@ -148,6 +148,62 @@ fn labeled_break_out_of_for_of_pops_the_per_iteration_environment() {
     );
 }
 
+/// A labeled `continue` aimed at an *enclosing* loop leaves two loops' worth
+/// of per-iteration environments behind if only one is popped.
+///
+/// This test is also what surfaced a pre-existing compiler bug: `labeled`
+/// handled `while`/`do-while`/`for`/`switch` but not `for-of`/`for-in`, so a
+/// labeled `for-of` registered a break-only target and `continue outer` failed
+/// to compile ("`continue` used on a non-loop label"). Fixed in the same
+/// series; see the commit message.
+#[test]
+fn labeled_continue_across_two_loops_pops_both_environments() {
+    assert_eq!(
+        eval_display(
+            "function f() { let acc = 0; function bump() { acc = acc + 1; } outer: for (const a of [1, 2]) { for (const b of [1, 2, 3]) { bump(); if (b < 3) continue outer; } } return acc; } f()"
+        ),
+        "2"
+    );
+}
+
+/// Negative control: a labeled `continue` on a `for-in`, and the loop variable
+/// must still be per-iteration through it.
+#[test]
+fn labeled_continue_on_for_in_keeps_bindings_per_iteration() {
+    assert_eq!(
+        eval_display(
+            "function f() { let g = []; outer: for (const k in { a: 1, b: 2 }) { for (const j of [1, 2]) { g.push(() => k); if (j === 1) continue outer; } } return g.join(','); } f()"
+        ),
+        "function,function"
+    )
+}
+
+/// The bug the previous test's sibling exposed, in its simplest form: a
+/// labeled `continue` must compile and re-enter the loop. (`var` heads, so no
+/// per-iteration environment is involved at all — this is purely the label
+/// machinery.)
+#[test]
+fn labeled_continue_on_for_of_compiles_and_re_enters() {
+    assert_eq!(
+        eval_display(
+            "function f() { let acc = 0; function bump() { acc = acc + 1; } outer: for (var v of [1, 2]) { bump(); continue outer; } return acc; } f()"
+        ),
+        "2"
+    )
+}
+
+/// Negative control: a labeled `break` on a `for-of` worked before this fix
+/// (it matched the break-only arm), so it must be unchanged.
+#[test]
+fn labeled_break_on_for_of_is_unaffected() {
+    assert_eq!(
+        eval_display(
+            "function f() { let acc = 0; function bump() { acc = acc + 1; } outer: for (const v of [1, 2, 3]) { bump(); break outer; } return acc; } f()"
+        ),
+        "1"
+    )
+}
+
 /// Nested loops: the inner `break` must pop exactly one environment, and the
 /// outer loop's own must survive it — an over-eager pop would retire the
 /// outer environment and corrupt everything after the outer loop too.
