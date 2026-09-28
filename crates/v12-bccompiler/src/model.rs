@@ -554,6 +554,19 @@ pub struct LoopCtx {
     /// 7.4.6 — the close error is itself the completion). The handler tests
     /// the guard and rethrows the original abrupt without re-closing.
     pub close_guard: Option<u16>,
+    /// This loop body runs inside a per-iteration Environment pushed by
+    /// [`crate::FnCtx::emit_per_iteration_env`] (spec
+    /// `CreatePerIterationEnvironment`).
+    ///
+    /// The push is *not* balanced by the body's own fallthrough alone: every
+    /// abrupt exit out of the body has to retire it too, and the runtime chain
+    /// grows one hop per iteration if it does not. That is why the flag lives
+    /// on the loop context — it is what lets
+    /// [`crate::FnCtx::emit_per_iteration_pops`] find the environments a
+    /// `break`/`continue` is leaving behind. The environment's live range is
+    /// the whole body, so `return` (which discards the frame) and a `throw`
+    /// that escapes the frame are the only exits that may skip the pop.
+    pub per_iter_env: bool,
 }
 /// One active `try … finally` region; intercepted exits (`return`, crossing
 /// `break`/`continue`) duplicate its finalizer inline — completion-dispatch
@@ -907,12 +920,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// where a `CompileError` aborts the whole unit anyway. `break` lands at
     /// `break_label`; `continue`, when the construct has a continuation
     /// point, at `continue_label`.
+    ///
+    /// `per_iter_env` records that the body runs inside a per-iteration
+    /// environment (see [`LoopCtx::per_iter_env`]); it must be the same value
+    /// the loop's push was emitted under, and `f` is responsible for emitting
+    /// the matching `emit_env_pop` on the body's fallthrough.
     pub fn with_loop<R>(
         &mut self,
         break_label: Label,
         continue_label: Option<Label>,
         name: Option<String>,
         close_iter: Option<u16>,
+        per_iter_env: bool,
         f: impl FnOnce(&mut Self) -> Result<R, CompileError>,
     ) -> Result<R, CompileError> {
         self.loops.push(LoopCtx {
@@ -922,6 +941,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             finally_base: self.finallies.len(),
             close_iter,
             close_guard: None,
+            per_iter_env,
         });
         let out = f(self);
         self.loops.pop();
@@ -930,6 +950,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// Like [`Self::with_loop`] but for a `for-of` loop that carries an
     /// iterator-close guard register (see [`LoopCtx::close_guard`]).
+    // The for-of extras (iterator, guard, per-iteration flag) have already
+    // taken this past clippy's argument budget; splitting them into a context
+    // struct would be churn for one caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_for_of_loop<R>(
         &mut self,
         break_label: Label,
@@ -937,6 +961,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         name: Option<String>,
         close_iter: u16,
         close_guard: u16,
+        per_iter_env: bool,
         f: impl FnOnce(&mut Self) -> Result<R, CompileError>,
     ) -> Result<R, CompileError> {
         self.loops.push(LoopCtx {
@@ -946,10 +971,38 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             finally_base: self.finallies.len(),
             close_iter: Some(close_iter),
             close_guard: Some(close_guard),
+            per_iter_env,
         });
         let out = f(self);
         self.loops.pop();
         out
+    }
+
+    /// Emits one `PopEnvironment` per per-iteration environment belonging to a
+    /// loop being exited (`self.loops[until..]`, innermost first) — the
+    /// abrupt-exit half of the balance that the body's fallthrough pop (see
+    /// [`Self::emit_env_pop`]) provides for normal completion.
+    ///
+    /// Without this the runtime chain grows one hop per *runtime* iteration,
+    /// which no compile-time depth bias can model: the loop environment's
+    /// parent is the previous iteration's loop environment, so the chain depth
+    /// is only known while running. `break`/`continue` jumping with the
+    /// environment still live would leave it dangling for the rest of the
+    /// frame.
+    ///
+    /// The pops deliberately do **not** touch `env_bias`: this runs at the
+    /// `break`/`continue` site, where the code emitted afterwards is still
+    /// (unreachable) lexically inside the body and must keep resolving against
+    /// the loop environment.
+    pub fn emit_per_iteration_pops(&mut self, until: usize) {
+        let pops = self.loops[until..]
+            .iter()
+            .rev()
+            .filter(|ctx| ctx.per_iter_env)
+            .count();
+        for _ in 0..pops {
+            self.emit_env_pop(oxc_span::Span::default());
+        }
     }
 
     /// Emits `IteratorClose r{iter}` for every loop being exited, innermost
@@ -1394,6 +1447,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// this without a matching `emit_scoped_env` would underflow the bias.
     pub fn emit_pop_env(&mut self, span: oxc_span::Span) {
         self.env_bias = self.env_bias.saturating_sub(1);
+        self.emit_spanned(Instr::new(Opcode::PopEnvironment, 0, 0, 0), span);
+    }
+
+    /// Retires an environment that is *not* a biased scope: the frame's
+    /// innermost environment is retired without touching `env_bias`.
+    ///
+    /// This is the pop half of a per-iteration environment (see
+    /// [`crate::FnCtx::emit_per_iteration_env`]), which unlike a class scope
+    /// replaces the unit's *own* environment — same slot count, same slot
+    /// indices — rather than shadowing it, so both the push and the pop leave
+    /// `env_bias` alone.
+    pub fn emit_env_pop(&mut self, span: oxc_span::Span) {
         self.emit_spanned(Instr::new(Opcode::PopEnvironment, 0, 0, 0), span);
     }
 
