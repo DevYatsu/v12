@@ -907,6 +907,33 @@ impl Heap {
         self.get(start).find_descriptor(key)
     }
 
+    /// Grows `obj`'s property storage so it can address every slot its bound
+    /// shape declares, filling the gap with `hole`/`None`.
+    ///
+    /// [`Self::define_accessor`] bumps the shape's `num_own` — an accessor
+    /// occupies a slot index for layout stability — but stores no value, so an
+    /// object whose properties were installed as *data* first ends up with
+    /// `properties.len() < num_own`. The next `add_property` then hands out
+    /// slot `num_own` while `Ctx::define_data_prop_with_attrs`'s `push` lands
+    /// the value at the short `len`, and every later read of that slot indexes
+    /// out of bounds.
+    ///
+    /// Every accessor install must therefore pad once. The pre-existing
+    /// callers (`Map`/`Set` `size`, `get [Symbol.species]`) were masked because
+    /// the interpreter answers those reads from a synthesized surface before the
+    /// shape walk; only a *new* accessor that no surface masks — the
+    /// `RegExp.prototype` data accessors — exposed the skew.
+    pub fn pad_properties_to_num_own(&mut self, obj: Handle<JsObject>) {
+        let n = self.get(self.shape_of(obj)).num_own as usize;
+        let settings = self.get_mut(obj);
+        if settings.properties.len() < n {
+            settings.properties.resize(n, JsValue::hole());
+        }
+        if settings.property_keys.len() < n {
+            settings.property_keys.resize(n, None);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Validity cells
     // ------------------------------------------------------------------

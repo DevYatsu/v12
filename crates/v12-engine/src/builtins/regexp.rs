@@ -100,6 +100,188 @@ pub(crate) fn link_regexp_proto(ctx: &mut Ctx, h: Handle<JsObject>) {
     }
 }
 
+/// The `this` value of a `%RegExp.prototype%` accessor, resolved per spec
+/// 22.2.6.x steps 2-3.
+///
+/// Every one of those accessors has the same two-step guard: a `this` that is
+/// not an object is a `TypeError`, and so is an object that does not carry the
+/// RegExp internal slots — *except* `%RegExp.prototype%` itself, which the spec
+/// admits by identity and which each getter then answers differently (`"(?:)"`
+/// for `source`, `""` for `flags`, `undefined` for a single-flag getter).
+/// Collapsing that shared guard here keeps the ten getters one-liners and keeps
+/// the one place that has to change if the brand check ever widens.
+enum RegExpThis {
+    /// A real RegExp exotic object (`Kind::RegExp`).
+    Instance(Handle<JsObject>),
+    /// `%RegExp.prototype%`: an ordinary object per 10.4.1, not a RegExp.
+    Prototype,
+}
+
+/// Resolves `this` for a `RegExp.prototype` accessor, or throws the
+/// `TypeError` that step 2/3 of the spec getter prescribes.
+fn regexp_this(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<RegExpThis, Throw> {
+    let Some(obj) = this.as_object() else {
+        return Err(ctx.type_error(format!("{method} called on non-object")));
+    };
+    if ctx.heap.get(obj).kind == v12_heap::Kind::RegExp {
+        return Ok(RegExpThis::Instance(obj));
+    }
+    // SameValue(R, %RegExp.prototype%) — resolved through the realm's `RegExp`
+    // constructor `prototype` field, the same source `link_regexp_proto` uses.
+    let proto = ctx
+        .intrinsic("RegExp")
+        .and_then(|v| v.as_object())
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
+    if proto == Some(obj) {
+        return Ok(RegExpThis::Prototype);
+    }
+    Err(ctx.type_error(format!("{method} called on non-RegExp object")))
+}
+
+/// The internal slots of a real RegExp receiver, as `(source, flags)` string
+/// values straight out of `properties` — no text materialization, since both
+/// are already interned heap strings.
+fn regexp_slots(heap: &Heap, obj: Handle<JsObject>) -> (JsValue, JsValue) {
+    (
+        heap.get(obj).properties[SLOT_SOURCE],
+        heap.get(obj).properties[SLOT_FLAGS],
+    )
+}
+
+/// `get RegExp.prototype.source` (ES 22.2.6.1). Returns the receiver's
+/// `[[OriginalSource]]` verbatim — escaping and the `\/` rewrite are the
+/// pattern compiler's job, not the getter's.
+pub fn regexp_get_source(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    match regexp_this(ctx, this, "get RegExp.prototype.source")? {
+        RegExpThis::Prototype => {
+            let h = ctx.heap.intern_text("(?:)");
+            Ok(JsValue::string(h))
+        }
+        RegExpThis::Instance(re) => Ok(regexp_slots(ctx.heap, re).0),
+    }
+}
+
+/// `get RegExp.prototype.flags` (ES 22.2.6.2).
+///
+/// The spec assembles the string from eight `Get(R, "<flag>")` calls in
+/// canonical `dgimsuvy` order. That order is observable only when `R` shadows
+/// a flag with an own property, which a plain RegExp cannot; the stored
+/// `[[OriginalFlags]]` is the same string for every receiver that has the
+/// slots, so this reads the slot directly.
+pub fn regexp_get_flags(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+    match regexp_this(ctx, this, "get RegExp.prototype.flags")? {
+        RegExpThis::Prototype => {
+            let h = ctx.heap.intern_text("");
+            Ok(JsValue::string(h))
+        }
+        RegExpThis::Instance(re) => Ok(regexp_slots(ctx.heap, re).1),
+    }
+}
+
+/// The single-flag getters (`global`/`ignoreCase`/`multiline`/`dotAll`/
+/// `unicode`/`unicodeSets`/`sticky`/`hasIndices`, ES 22.2.6.3-22.2.6.6 and
+/// 22.2.6.8-22.2.6.10): each is `ToBoolean` of one flag slot, `undefined` for
+/// `%RegExp.prototype%`, `TypeError` for anything without the slots.
+fn regexp_flag_getter(
+    ctx: &mut Ctx,
+    this: JsValue,
+    method: &str,
+    flag: char,
+) -> Result<JsValue, Throw> {
+    match regexp_this(ctx, this, method)? {
+        RegExpThis::Prototype => Ok(JsValue::undefined()),
+        RegExpThis::Instance(re) => {
+            let (_, flags) = regexp_slots(ctx.heap, re);
+            let Some(h) = flags.as_string() else {
+                return Ok(JsValue::false_());
+            };
+            Ok(JsValue::from_bool(flag_in(ctx.heap, h, flag)))
+        }
+    }
+}
+
+/// Membership test of `flag` in the interned flag string `h`, without
+/// materializing the text (the flag string is one of the eight canonical
+/// short forms, so a latin1 byte scan is exact).
+fn flag_in(heap: &mut Heap, h: Handle<V12Str>, flag: char) -> bool {
+    heap.flatten(h);
+    match &heap.get(h).storage {
+        v12_heap::StrStorage::Latin1(bytes) => bytes.contains(&(flag as u8)),
+        // A non-latin1 flag string cannot exist (the canonicalizer only ever
+        // emits ASCII), so treat it as "flag absent" rather than allocating.
+        _ => false,
+    }
+}
+
+macro_rules! flag_getter {
+    ($name:ident, $flag:literal, $label:literal) => {
+        pub fn $name(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
+            regexp_flag_getter(ctx, this, $label, $flag)
+        }
+    };
+}
+
+flag_getter!(regexp_get_global, 'g', "get RegExp.prototype.global");
+flag_getter!(
+    regexp_get_ignore_case,
+    'i',
+    "get RegExp.prototype.ignoreCase"
+);
+flag_getter!(regexp_get_multiline, 'm', "get RegExp.prototype.multiline");
+flag_getter!(regexp_get_dot_all, 's', "get RegExp.prototype.dotAll");
+flag_getter!(regexp_get_unicode, 'u', "get RegExp.prototype.unicode");
+flag_getter!(
+    regexp_get_unicode_sets,
+    'v',
+    "get RegExp.prototype.unicodeSets"
+);
+flag_getter!(regexp_get_sticky, 'y', "get RegExp.prototype.sticky");
+flag_getter!(
+    regexp_get_has_indices,
+    'd',
+    "get RegExp.prototype.hasIndices"
+);
+
+/// `get RegExp.prototype.lastIndex` — the receiver's `lastIndex` slot,
+/// canonicalized to a JS number.
+pub fn regexp_get_last_index(
+    ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    match regexp_this(ctx, this, "get RegExp.prototype.lastIndex")? {
+        RegExpThis::Prototype => Ok(JsValue::undefined()),
+        RegExpThis::Instance(re) => Ok(helpers::js_number(last_index(ctx.heap, re))),
+    }
+}
+
+/// `set RegExp.prototype.lastIndex` — `ToNumber` then store.
+pub fn regexp_set_last_index(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    if let RegExpThis::Instance(re) = regexp_this(ctx, this, "set RegExp.prototype.lastIndex")? {
+        let v = ctx.to_number(args.first().copied().unwrap_or(JsValue::undefined()));
+        set_last_index(ctx.heap, re, v);
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `get RegExp [ @@species ]` (ES 22.2.6.4): the whole body is
+/// `1. Return the this value.`
+pub fn regexp_species_get(
+    _ctx: &mut Ctx,
+    this: JsValue,
+    _args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    Ok(this)
+}
+
 /// ES ToString for the RegExp constructor's pattern/flags arguments.
 /// `undefined` → `""`, everything else via `ctx.to_string` (`null` renders
 /// `"null"` through the display subset).
@@ -274,6 +456,15 @@ pub fn regexp_exec(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
 
 /// Builds the `exec` result array: `[whole, ...groups]` with `index`,
 /// `input`, and `groups` (named captures) properties.
+///
+/// Goes through [`Ctx::alloc_array`] so the result carries
+/// `%Array.prototype%` and the canonical `root --length--> child` shape. The
+/// engine builds this array outside the interpreter's `NewArray` arm, so
+/// without that linkage `Array.isArray(result)` is `false` and
+/// `result.constructor` is `undefined` — which is a whole conformance cluster
+/// on its own. `index`/`input` are then installed as ordinary spec-attr
+/// properties (`{writable, enumerable, configurable}`) rather than written
+/// into raw slots, so the shape and the storage stay in lockstep.
 fn match_result(
     ctx: &mut Ctx,
     m: &v12_regex::Match,
@@ -294,43 +485,20 @@ fn match_result(
             None => elements.push(JsValue::undefined()),
         }
     }
-    let arr = ctx.alloc_obj(JsObject::array(elements));
-    // `index`, `input` named properties via shape transitions. Build the
-    // shape as root → length → index → input so the array's `length` stays at
-    // physical slot 0 (the interpreter's array fast path reads
-    // `properties[0]` for length) and the named props land at slots 1/2.
-    let length_key = ctx.heap.intern_text("length");
-    let index_key = ctx.heap.intern_text("index");
-    let input_key = ctx.heap.intern_text("input");
-    let shape0 = ctx.heap.root_shape();
-    let shape_len = ctx.heap.add_property(
-        shape0,
-        v12_heap::PropKey::from_string(length_key),
-        v12_heap::Attrs::DEFAULT,
-    );
-    let shape_idx = ctx.heap.add_property(
-        shape_len,
-        v12_heap::PropKey::from_string(index_key),
-        v12_heap::Attrs::DEFAULT,
-    );
-    let shape_in = ctx.heap.add_property(
-        shape_idx,
-        v12_heap::PropKey::from_string(input_key),
-        v12_heap::Attrs::DEFAULT,
-    );
-    ctx.heap.bind_shape(arr, shape_in);
-    // `properties[0]` is the length Smi (from `JsObject::array`); slots 1/2
-    // get index/input.
-    if ctx.heap.get(arr).properties.len() < 3 {
-        ctx.heap
-            .get_mut(arr)
-            .properties
-            .resize(3, JsValue::undefined());
-        ctx.heap.get_mut(arr).property_keys.resize(3, None);
-    }
-    ctx.heap.get_mut(arr).properties[1] = helpers::smi_or_f64(m.start() as i64);
+    let arr = ctx.alloc_array(elements);
     let input_h = ctx.heap.intern_text(input_text);
-    ctx.heap.get_mut(arr).properties[2] = JsValue::string(input_h);
+    ctx.define_data_prop_with_attrs(
+        arr,
+        "index",
+        helpers::smi_or_f64(m.start() as i64),
+        v12_heap::Attrs::DEFAULT,
+    );
+    ctx.define_data_prop_with_attrs(
+        arr,
+        "input",
+        JsValue::string(input_h),
+        v12_heap::Attrs::DEFAULT,
+    );
     JsValue::object(arr)
 }
 

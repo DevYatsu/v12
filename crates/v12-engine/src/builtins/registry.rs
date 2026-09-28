@@ -249,6 +249,64 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
                 string::string_match_all(&mut ctx, this, args)
             }
+            // The `%RegExp.prototype%` accessor surface (ES 22.2.6). These
+            // need no compiled pattern, but they share this arm rather than
+            // the compile-time table so the whole RegExp prototype has one
+            // dispatch home — and so a future `define_builtins!` entry for
+            // one of them cannot silently bypass the cache the protocol
+            // methods below require.
+            NativeId::RegExpProtoGetSource => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_source(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetFlags => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_flags(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetGlobal => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_global(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetIgnoreCase => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_ignore_case(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetMultiline => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_multiline(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetDotAll => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_dot_all(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetUnicode => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_unicode(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetUnicodeSets => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_unicode_sets(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetSticky => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_sticky(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetHasIndices => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_has_indices(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoGetLastIndex => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_get_last_index(&mut ctx, this, args)
+            }
+            NativeId::RegExpProtoSetLastIndex => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_set_last_index(&mut ctx, this, args)
+            }
+            NativeId::RegExpSymbolSpeciesGet => {
+                let mut ctx = self.promise_ctx(heap);
+                regexp::regexp_species_get(&mut ctx, this, args)
+            }
             // Module import seam: loader-aware when installed (static imports
             // answer from the module map; dynamic `import()` returns a
             // promise backed by a load job), otherwise the spec-shaped
