@@ -307,6 +307,34 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 let mut ctx = self.promise_ctx(heap);
                 regexp::regexp_species_get(&mut ctx, this, args)
             }
+            // The 22.2.7 symbol-keyed protocol methods. `@@match`, `@@matchAll`,
+            // `@@search` and `@@split` only ever call the *internal*
+            // `[[RegExpMatcher]]`, never user code, so they are pure heap work
+            // once the `&mut Heap` signature is all they get. `@@replace` is
+            // intercepted at the interpreter seam whenever the replacement is
+            // callable (`Interp::run_callback_builtin`); the arm here is the
+            // string-replacement half, which is the fallback for an embedder
+            // that drives the registry directly.
+            NativeId::RegExpSymbolMatch => {
+                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_symbol_match(&mut ctx, this, args)
+            }
+            NativeId::RegExpSymbolMatchAll => {
+                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_symbol_match_all(&mut ctx, this, args)
+            }
+            NativeId::RegExpSymbolReplace => {
+                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_symbol_replace(&mut ctx, this, args)
+            }
+            NativeId::RegExpSymbolSearch => {
+                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_symbol_search(&mut ctx, this, args)
+            }
+            NativeId::RegExpSymbolSplit => {
+                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                regexp::regexp_symbol_split(&mut ctx, this, args)
+            }
             // Module import seam: loader-aware when installed (static imports
             // answer from the module map; dynamic `import()` returns a
             // promise backed by a load job), otherwise the spec-shaped

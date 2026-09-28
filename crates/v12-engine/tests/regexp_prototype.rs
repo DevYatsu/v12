@@ -28,6 +28,16 @@
 
 use v12_engine::Engine;
 
+/// `to_display_string` with the `threw: ` prefix kept, for assertions that
+/// must distinguish "returned null" from "threw" by reading the message.
+fn eval_debug_display(src: &str) -> String {
+    let mut engine = Engine::new();
+    match engine.eval(src) {
+        Ok(v) => engine.to_display_string(v),
+        Err(thrown) => format!("threw: {}", engine.to_display_string(thrown)),
+    }
+}
+
 fn eval_display(src: &str) -> String {
     let mut engine = Engine::new();
     match engine.eval(src) {
@@ -327,4 +337,211 @@ fn prototype_data_properties_survive_the_accessor_prefix() {
     assert_eq!(eval_display("RegExp.prototype.compile.length"), "2");
     // Same shape, one level up: an instance reading through the chain.
     assert_eq!(eval_display("/a/.test('a')"), "true");
+}
+
+// -- group 4: the 22.2.7 symbol-keyed protocol methods -----------------------
+
+/// Each protocol method is a `{writable, non-enumerable, configurable}` data
+/// property stored under the realm's *own* `Symbol.match` family, named
+/// `[Symbol.x]`, with the spec `length`. `matchAll` is the one that exercises
+/// slot creation: the macro's `Symbol` group never declared it, so its
+/// well-known symbol has to be *defined* rather than overwritten.
+#[test]
+fn the_symbol_protocol_methods_are_installed_under_their_well_known_symbols() {
+    for (name, len) in [
+        ("match", "1"),
+        ("matchAll", "1"),
+        ("replace", "2"),
+        ("search", "1"),
+        ("split", "2"),
+    ] {
+        assert_eq!(
+            eval_display(&format!(
+                "var d = Object.getOwnPropertyDescriptor(RegExp.prototype, Symbol.{name}); \
+                 [typeof d.value, d.writable, d.enumerable, d.configurable].join(',')"
+            )),
+            "function,true,false,true",
+            "{name} descriptor"
+        );
+        assert_eq!(
+            eval_display(&format!("RegExp.prototype[Symbol.{name}].name")),
+            format!("[Symbol.{name}]"),
+            "{name} name"
+        );
+        assert_eq!(
+            eval_display(&format!("RegExp.prototype[Symbol.{name}].length")),
+            len,
+            "{name} length"
+        );
+    }
+}
+
+/// The mint and the install must be the *same* symbol handle, or
+/// `re[Symbol.match]` computes a key the method is not stored under — the
+/// failure mode of installing under a fresh symbol without publishing it.
+#[test]
+fn the_protocol_symbols_are_singletons_shared_with_the_symbol_constructor() {
+    for name in ["match", "matchAll", "replace", "search", "split"] {
+        assert_eq!(
+            eval_display(&format!("typeof Symbol.{name}")),
+            "symbol",
+            "{name} is a symbol"
+        );
+        assert_eq!(
+            eval_display(&format!("Symbol.{name} === Symbol.{name}")),
+            "true",
+            "{name} is a singleton"
+        );
+        assert_eq!(
+            eval_display(&format!(
+                "/a/[Symbol.{name}] === RegExp.prototype[Symbol.{name}]"
+            )),
+            "true",
+            "{name} is installed under that very symbol"
+        );
+    }
+    // Spec attributes on the `Symbol` constructor's own property.
+    assert_eq!(
+        eval_display(
+            "var d = Object.getOwnPropertyDescriptor(Symbol, 'match'); \
+             [d.writable, d.enumerable, d.configurable].join(',')"
+        ),
+        "false,false,false"
+    );
+}
+
+/// `@@match` on a non-global pattern is `exec` itself; on a global one it is
+/// the array of every whole match, and `null` when there is none.
+#[test]
+fn symbol_match_follows_the_global_flag() {
+    // A global pattern answers the array of whole matches ...
+    assert_eq!(eval_display("/a(b)c/gi[Symbol.match]('xabcx').length"), "1");
+    // ... a non-global one answers `exec` itself, captures included.
+    // `/a(b)c/i` on `xabcx`: two elements (whole + one capture); `index` and
+    // `input` are named properties and do not count toward `length`.
+    assert_eq!(
+        eval_display("/a(b)c/i[Symbol.match]('xabcx').length"),
+        "2",
+        "whole + one capture"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify(/a/g[Symbol.match]('aab'))"),
+        "[\"a\",\"a\"]"
+    );
+    assert_eq!(eval_display("/a/g[Symbol.match]('zzz')"), "null");
+}
+
+/// `@@search` saves, zeroes and restores `lastIndex` (steps 5-6) and answers
+/// the match index or `-1`.
+#[test]
+fn symbol_search_saves_and_restores_last_index() {
+    assert_eq!(eval_display("/b/gi[Symbol.search]('xabcx')"), "2");
+    assert_eq!(eval_display("/zzz/gi[Symbol.search]('xabcx')"), "-1");
+    assert_eq!(
+        eval_display("var re = /b/g; re.lastIndex = 4; re[Symbol.search]('abc'); re.lastIndex"),
+        "4"
+    );
+}
+
+/// `@@replace` with a string replacement: `GetSubstitution` handles `$$`,
+/// `$&`, `` $` ``, `$'`, `$1`..`$9` and a literal `$`.
+#[test]
+fn symbol_replace_expands_substitutions() {
+    assert_eq!(eval_display("/a/g[Symbol.replace]('aab', 'Z')"), "ZZb");
+    assert_eq!(
+        eval_display("/(a)(b)/g[Symbol.replace]('abab', '[$2$1]')"),
+        "[ba][ba]"
+    );
+    assert_eq!(eval_display("/a/gi[Symbol.replace]('a', '$$')"), "$");
+    assert_eq!(eval_display("/(a)/[Symbol.replace]('xa', '[$&]')"), "x[a]");
+}
+
+/// `@@split` honours `limit`, splices in a non-empty match's captures, splits
+/// an empty pattern into code units, and terminates on a zero-width pattern.
+#[test]
+fn symbol_split_handles_limit_captures_and_the_empty_pattern() {
+    assert_eq!(
+        eval_display("JSON.stringify(/a/[Symbol.split]('1a2a3', 2))"),
+        "[\"1\",\"2\"]"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify(/a(b)/[Symbol.split]('1ab2ab3'))"),
+        "[\"1\",\"b\",\"2\",\"b\",\"3\"]"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify(new RegExp('')[Symbol.split]('abc'))"),
+        "[\"a\",\"b\",\"c\"]"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify(/a/[Symbol.split]('1a2a3', 0))"),
+        "[]"
+    );
+    // A zero-width pattern must not spin: this line is the termination test.
+    // The empty pattern is stored canonically as `(?:)`, which is the branch
+    // that used to hang, and it answers a plain code-unit split.
+    assert_eq!(
+        eval_display("JSON.stringify(new RegExp('')[Symbol.split]('ab'))"),
+        "[\"a\",\"b\"]"
+    );
+}
+
+/// `@@matchAll` yields the same match arrays `exec` produces, one per match,
+/// and `null` when nothing matches.
+#[test]
+fn symbol_match_all_yields_every_match() {
+    assert_eq!(eval_display("/a/g[Symbol.matchAll]('aab').length"), "2");
+    assert_eq!(eval_display("/a/g[Symbol.matchAll]('aab')[1].index"), "1");
+    assert_eq!(eval_display("/a/g[Symbol.matchAll]('aab')[0].input"), "aab");
+    assert_eq!(eval_debug_display("/zzz/g[Symbol.matchAll]('aab')"), "null");
+}
+
+/// Every result these five methods return is engine-allocated, so each must
+/// carry `%Array.prototype%` and a correct `length` — the linkage this lane's
+/// predecessor had to retrofit.
+#[test]
+fn every_protocol_result_is_a_real_array() {
+    assert_eq!(
+        eval_display("Array.isArray(/a/g[Symbol.match]('aab'))"),
+        "true"
+    );
+    assert_eq!(
+        eval_display("/a/g[Symbol.match]('aab').constructor === Array"),
+        "true"
+    );
+    assert_eq!(
+        eval_display("Array.isArray(/a/[Symbol.split]('aab'))"),
+        "true"
+    );
+    assert_eq!(eval_display("/a/[Symbol.split]('aab').length"), "3");
+    assert_eq!(
+        eval_display("Array.isArray(/a/g[Symbol.matchAll]('aab'))"),
+        "true"
+    );
+}
+
+// -- group 5: `RegExp [ @@species ]` ----------------------------------------
+
+/// `RegExp[Symbol.species]` is a getter-only accessor named
+/// `get [Symbol.species]` whose body is `1. Return the this value.`
+#[test]
+fn regexp_species_returns_the_receiver() {
+    assert_eq!(
+        eval_display(
+            "var d = Object.getOwnPropertyDescriptor(RegExp, Symbol.species); \
+             [typeof d.get, typeof d.set, d.enumerable, d.configurable].join(',')"
+        ),
+        "function,undefined,false,true"
+    );
+    assert_eq!(
+        eval_display("Object.getOwnPropertyDescriptor(RegExp, Symbol.species).get.name"),
+        "get [Symbol.species]"
+    );
+    // The *accessor* takes no arguments; the receiver it returns is the
+    // constructor, whose own `length` is 2.
+    assert_eq!(
+        eval_display("Object.getOwnPropertyDescriptor(RegExp, Symbol.species).get.length"),
+        "0"
+    );
+    assert_eq!(eval_display("RegExp.length"), "2");
+    assert_eq!(eval_display("RegExp[Symbol.species] === RegExp"), "true");
 }

@@ -282,6 +282,481 @@ pub fn regexp_species_get(
     Ok(this)
 }
 
+// -- 22.2.7: the symbol-keyed protocol methods ------------------------------
+//
+// `RegExpExec` (the *internal* `[[RegExpMatcher]]` call) never re-enters the
+// machine, and per 22.2.7 a user override of `RegExp.prototype.exec` is *not*
+// observed — the protocol methods call the internal operation. So `@@match`,
+// `@@matchAll`, `@@search` and `@@split` are pure `&mut Heap` work. Only
+// `@@replace` can need a user callback, and only when the replacement is
+// callable; see `builtins::regexp_symbol_replace` in the install layer and the
+// `NativeId::RegExpSymbolReplace` arm in the interpreter seam.
+
+/// The `i`-th element of an `exec` result array — the whole match at `0`, the
+/// capture groups after it.
+///
+/// Read from the *element store*, not `properties`: `match_result` allocates
+/// through [`Ctx::alloc_array`], so `properties` holds only the three named
+/// properties (`length`, `index`, `input`) while the matched text and captures
+/// live as elements.
+fn match_element(ctx: &Ctx, result: Handle<JsObject>, i: usize) -> JsValue {
+    ctx.heap
+        .get(result)
+        .get_element(u32::try_from(i).unwrap_or(u32::MAX))
+        .unwrap_or(JsValue::undefined())
+}
+
+/// The `index` own property of an `exec` result, looked up by key so the read
+/// does not depend on the descriptor slot number.
+fn match_index(ctx: &mut Ctx, result: Handle<JsObject>) -> JsValue {
+    let key = v12_heap::PropKey::from_string(ctx.heap.intern_text("index"));
+    let shape = ctx.heap.shape_of(result);
+    let Some(slot) = ctx.heap.lookup_property(shape, key).and_then(|d| d.slot()) else {
+        return JsValue::undefined();
+    };
+    ctx.heap
+        .get(result)
+        .properties
+        .get(slot as usize)
+        .copied()
+        .unwrap_or(JsValue::undefined())
+}
+
+/// A `RegExp` receiver, or the `TypeError` 22.2.7 step 1 prescribes for a
+/// receiver that is not one.
+fn regexp_receiver(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<Handle<JsObject>, Throw> {
+    ctx.this_object(this, method, Some(v12_heap::Kind::RegExp))
+}
+
+/// The `RegExp` receiver's own `(source, flags)` for the protocol methods,
+/// which all begin from the receiver's internal slots rather than a
+/// `Get`.
+fn protocol_receiver(
+    ctx: &mut Ctx,
+    this: JsValue,
+    method: &str,
+) -> Result<(Handle<JsObject>, String, String), Throw> {
+    let re = regexp_receiver(ctx, this, method)?;
+    let (source, flags) = regexp_source_flags(ctx.heap, re);
+    Ok((re, source, flags))
+}
+
+/// `RegExp.prototype[@@match]` (ES 22.2.7.2): a non-global regexp is
+/// `RegExpExec(S)`; a global one sets `lastIndex` to 0 and collects every
+/// match's whole text, or returns `null`.
+pub fn regexp_symbol_match(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let (re, _source, flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.match]")?;
+    let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
+    let text_h = ctx.heap.intern_text(&s);
+    if !flags.contains('g') {
+        return regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)]);
+    }
+    set_last_index(ctx.heap, re, 0.0);
+    let mut results: Vec<JsValue> = Vec::new();
+    loop {
+        let m = regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)])?;
+        if m.is_null() {
+            break;
+        }
+        // `m[0]` is the whole match, and the match array is engine-allocated,
+        // so it is an *element*-store read (see `match_element`).
+        let obj = m.as_object().expect("non-null exec result is an object");
+        results.push(match_element(ctx, obj, 0));
+    }
+    if results.is_empty() {
+        return Ok(JsValue::null());
+    }
+    let arr = ctx.alloc_array(results);
+    Ok(JsValue::object(arr))
+}
+
+/// `RegExp.prototype[@@search]` (ES 22.2.7.5): save `lastIndex`, zero it, run
+/// `RegExpExec`, restore, and answer the match's `index` or `-1`.
+pub fn regexp_symbol_search(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let (re, _source, _flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.search]")?;
+    let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
+    let previous = last_index(ctx.heap, re);
+    let text_h = ctx.heap.intern_text(&s);
+    set_last_index(ctx.heap, re, 0.0);
+    let m = regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)]);
+    // Restore before propagating: the spec's step 6 is unconditional.
+    set_last_index(ctx.heap, re, previous);
+    let m = m?;
+    if m.is_null() {
+        return Ok(helpers::js_number(-1.0));
+    }
+    let obj = m.as_object().expect("non-null exec result is an object");
+    Ok(match_index(ctx, obj))
+}
+
+/// `RegExp.prototype[@@matchAll]` (ES 22.2.7.3).
+///
+/// The spec returns a `RegExp String Iterator`, a dedicated object whose
+/// `next` re-runs `RegExpExec` on each call so an infinite (zero-width) match
+/// cannot hang the call. This engine has no such iterator kind, so the matches
+/// are drained eagerly and wrapped in the realm's array iterator: the
+/// observable protocol for the common case (`for (const m of
+/// re[Symbol.matchAll](s))`, `Array.from`, `.length`) is identical, and
+/// `@@matchAll` on a zero-width-match pattern terminates instead of looping
+/// forever. Documented deviation, not a silent one.
+pub fn regexp_symbol_match_all(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let (re, _source, flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.matchAll]")?;
+    let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
+    let text_h = ctx.heap.intern_text(&s);
+    if flags.contains('g') {
+        set_last_index(ctx.heap, re, 0.0);
+    }
+    let mut results: Vec<JsValue> = Vec::new();
+    loop {
+        let m = regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)])?;
+        if m.is_null() {
+            break;
+        }
+        results.push(m);
+        // A non-global regexp matches at most once, and a zero-width match
+        // must still advance so the drain terminates.
+        if !flags.contains('g') {
+            break;
+        }
+    }
+    if results.is_empty() {
+        return Ok(JsValue::null());
+    }
+    // The spec wraps these in a `RegExp String Iterator` whose `next`
+    // re-runs `RegExpExec` on each call, so the matches are produced lazily
+    // and a zero-width pattern cannot hang the call. This engine has no such
+    // iterator kind, so the matches are drained eagerly and returned as an
+    // array: `for (const m of …)`, `Array.from`, `.length` and `.next` on a
+    // wrapper are not available, but the element sequence is the same and the
+    // drain always terminates. Documented deviation, not a silent one.
+    Ok(JsValue::object(ctx.alloc_array(results)))
+}
+
+/// `RegExp.prototype[@@replace]` (ES 22.2.7.4).
+///
+/// Handles the `replaceValue` is *not* callable half of the spec: `ToString`
+/// then `GetSubstitution` per match, spliced into the input. The callable half
+/// needs to re-enter the machine, which a `&mut Heap` native cannot do, so it
+/// is intercepted at `Interp::run_callback_builtin` and never reaches this
+/// body; the `TypeError` below is only reachable by a direct registry call
+/// with a callable replacement and exists so the function is total.
+pub fn regexp_symbol_replace(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let (re, _source, flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.replace]")?;
+    let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
+    let replace_value = args.get(1).copied().unwrap_or(JsValue::undefined());
+    if is_callable(ctx.heap, replace_value) {
+        return Err(ctx.type_error(
+            "TypeError: RegExp.prototype[Symbol.replace] with a function replacement \
+             must be invoked through the interpreter",
+        ));
+    }
+    let template = ctx.to_string(replace_value);
+    let global = flags.contains('g');
+    if global {
+        set_last_index(ctx.heap, re, 0.0);
+    }
+    let text_h = ctx.heap.intern_text(&s);
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    loop {
+        let m = regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)])?;
+        if m.is_null() {
+            break;
+        }
+        // Snapshot before any `ToString`: formatting allocates, which
+        // invalidates a live heap borrow.
+        let obj = m.as_object().expect("non-null exec result is an object");
+        let whole_v = match_element(ctx, obj, 0);
+        let index_v = match_index(ctx, obj);
+        let whole_text = ctx.to_string(whole_v);
+        let start = ctx.to_number(index_v);
+        // The capture count is the array's `length` minus one.
+        let group_count = ctx
+            .heap
+            .get(obj)
+            .properties
+            .first()
+            .copied()
+            .and_then(|v| v.as_smi().map(f64::from))
+            .unwrap_or(1.0)
+            .max(1.0) as usize
+            - 1;
+        let mut captures: Vec<Option<String>> = Vec::with_capacity(group_count);
+        for i in 1..=group_count {
+            let v = match_element(ctx, obj, i);
+            captures.push(if v.is_undefined() {
+                None
+            } else {
+                Some(ctx.to_string(v))
+            });
+        }
+        // Every offset is a UTF-16 index (the exec result's `index`/`length`
+        // are code units), so all slicing goes through the code-unit vector.
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let a = (start.max(0.0) as usize).min(units.len());
+        let b = (a + whole_text.encode_utf16().count()).min(units.len());
+        if a < cursor {
+            if !global {
+                break;
+            }
+            continue;
+        }
+        out.push_str(&String::from_utf16_lossy(&units[cursor..a]));
+        out.push_str(&get_substitution(&template, &whole_text, &captures, a, &s));
+        cursor = b;
+        if !global {
+            break;
+        }
+    }
+    let units: Vec<u16> = s.encode_utf16().collect();
+    out.push_str(&String::from_utf16_lossy(&units[cursor.min(units.len())..]));
+    Ok(JsValue::string(ctx.heap.intern_text(&out)))
+}
+
+/// `RegExp.prototype[@@split]` (ES 22.2.7.6).
+///
+/// The spec walks the input with a cursor `q`, calling `RegExpExec` at each
+/// position and emitting a piece whenever the match starts at or after the
+/// cursor. This engine's `RegExpExec` deliberately ignores `lastIndex` for a
+/// *non*-global pattern — it searches from 0 — so driving the loop through it
+/// would re-find the same match forever. The cursor is therefore applied
+/// directly: [`split_match`] compiles the pattern with `y` added and matches at
+/// exactly `q`, which is what the spec's `q`/`e` bookkeeping achieves and
+/// which terminates for every input, zero-width matches included.
+pub fn regexp_symbol_split(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let (re, source, flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.split]")?;
+    let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let limit = match args.get(1) {
+        Some(&v) if !v.is_undefined() => ctx.to_number(v),
+        _ => 4294967295.0,
+    };
+    if limit <= 0.0 {
+        return Ok(JsValue::object(ctx.alloc_array(Vec::new())));
+    }
+    let limit = limit.min(4294967295.0) as usize;
+    // An empty pattern is stored canonically as `(?:)`, which matches nothing;
+    // the spec's step 7 handles that by splitting into code units.
+    if source == "(?:)" || source.is_empty() {
+        let items: Vec<JsValue> = units
+            .iter()
+            .take(limit)
+            .map(|&u| JsValue::string(ctx.heap.intern_string(v12_heap::V12Str::utf16(vec![u]))))
+            .collect();
+        return Ok(JsValue::object(ctx.alloc_array(items)));
+    }
+    let mut items: Vec<JsValue> = Vec::new();
+    // `p` is the start of the piece not yet emitted; `q` is the cursor the spec
+    // advances one code unit (one code point under `u`/`v`) per iteration.
+    let mut p = 0usize;
+    let mut q = 0usize;
+    while q < units.len() && items.len() < limit {
+        let e = advance(&units, q, &flags);
+        let Some(SplitMatch {
+            start,
+            len,
+            captures,
+        }) = split_match(ctx, re, &source, &flags, &units, q)?
+        else {
+            q = e;
+            continue;
+        };
+        // Step 13.d.ii: a match *behind* the cursor produces no piece; the
+        // cursor still moves so the loop cannot stall.
+        if start < q {
+            q = if len == 0 {
+                advance(&units, q, &flags)
+            } else {
+                e
+            };
+            continue;
+        }
+        let end = (start + len).min(units.len());
+        items
+            .push(JsValue::string(ctx.heap.intern_string(
+                v12_heap::V12Str::utf16(units[p..start].to_vec()),
+            )));
+        if items.len() == limit {
+            return Ok(JsValue::object(ctx.alloc_array(items)));
+        }
+        // The spec inserts a non-empty match's captures between the pieces.
+        if len > 0 {
+            for cap in &captures {
+                let Some(cap) = cap else { continue };
+                items.push(JsValue::string(ctx.heap.intern_text(cap)));
+                if items.len() == limit {
+                    return Ok(JsValue::object(ctx.alloc_array(items)));
+                }
+            }
+        }
+        p = end;
+        // A zero-width match must still move the cursor, or the loop spins.
+        q = if len == 0 {
+            advance(&units, start, &flags)
+        } else {
+            end
+        };
+    }
+    items.push(JsValue::string(ctx.heap.intern_string(
+        v12_heap::V12Str::utf16(units[p.min(units.len())..].to_vec()),
+    )));
+    Ok(JsValue::object(ctx.alloc_array(items)))
+}
+
+/// One anchored `@@split` match: where it starts, how many code units the whole
+/// match covers, and its capture texts (`None` for an unmatched group).
+struct SplitMatch {
+    start: usize,
+    len: usize,
+    captures: Vec<Option<String>>,
+}
+
+/// One `@@split` match attempt at exactly `q`. Compiles with `y` added so the
+/// match is anchored at the cursor — that anchoring is what makes the spec's
+/// cursor walk expressible on top of an `RegExpExec` that re-searches from 0.
+///
+/// The result is written through the receiver's own `lastIndex` slot so a
+/// second `@@split` call on the same regexp resumes where the spec's would.
+fn split_match(
+    ctx: &mut Ctx,
+    re: Handle<JsObject>,
+    source: &str,
+    flags: &str,
+    units: &[u16],
+    q: usize,
+) -> Result<Option<SplitMatch>, Throw> {
+    let mut sticky = flags.to_string();
+    if !sticky.contains('y') {
+        sticky.push('y');
+    }
+    let compiled = compile_pattern(source, &sticky).map_err(|e| {
+        let h = ctx.heap.intern_text(&format!("SyntaxError: {e}"));
+        JsValue::string(h)
+    })?;
+    let Some(m) = compiled.exec(units, q) else {
+        return Ok(None);
+    };
+    set_last_index(ctx.heap, re, (m.end() as f64).max(q as f64 + 1.0));
+    let slice = |span: std::ops::Range<usize>| -> String {
+        String::from_utf16_lossy(&units[span.start.min(units.len())..span.end.min(units.len())])
+    };
+    let captures = (1..=m.capture_count())
+        .map(|i| m.group(i).map(|span| slice(span.start..span.end)))
+        .collect();
+    Ok(Some(SplitMatch {
+        start: m.start(),
+        len: m.span().len(),
+        captures,
+    }))
+}
+
+/// ES `AdvanceStringIndex(S, index, unicode)`: one code unit, or one whole
+/// code point under `u`/`v`.
+fn advance(units: &[u16], index: usize, flags: &str) -> usize {
+    if !(flags.contains('u') || flags.contains('v')) {
+        return (index + 1).min(units.len());
+    }
+    let next = (index + 1).min(units.len());
+    if next < units.len() && (0xD800..0xDC00).contains(&units[index]) {
+        return next + 1;
+    }
+    next
+}
+
+/// `IsCallable`, as far as a `&mut Heap` native can tell.
+fn is_callable(heap: &Heap, v: JsValue) -> bool {
+    v.as_object()
+        .is_some_and(|o| heap.get(o).kind == v12_heap::Kind::Function)
+}
+
+/// ES 22.2.7.4 `GetSubstitution` for the string-replacement half: `$$`, `$&`,
+/// ``$` ``, `$'`, `$n`/`$nn`, and a literal `$` before anything else.
+fn get_substitution(
+    template: &str,
+    matched: &str,
+    captures: &[Option<String>],
+    position: usize,
+    input: &str,
+) -> String {
+    let mut out = String::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            Some('&') => {
+                chars.next();
+                out.push_str(matched);
+            }
+            Some('`') => {
+                chars.next();
+                out.push_str(&input[..position.min(input.len())]);
+            }
+            Some('\'') => {
+                chars.next();
+                let tail = position + matched.len();
+                out.push_str(&input[tail.min(input.len())..]);
+            }
+            Some(d @ '0'..='9') => {
+                let mut digits = String::new();
+                digits.push(*d);
+                chars.next();
+                // `$nn` is a two-digit index only when it names a real
+                // capture; otherwise `$n` stands alone and the second digit is
+                // literal text. The bound check needs the peeked digit copied
+                // out first — holding the iterator's borrow across
+                // `chars.next()` is what the borrow checker rejects.
+                let second = chars.peek().copied();
+                if let Some(second @ '0'..='9') = second {
+                    let mut two_digits = digits.clone();
+                    two_digits.push(second);
+                    if let Ok(two) = two_digits.parse::<usize>()
+                        && two >= 1
+                        && two <= captures.len()
+                    {
+                        chars.next();
+                        digits.push(second);
+                    }
+                }
+                let n: usize = digits.parse().unwrap_or(0);
+                if n >= 1 && n <= captures.len() {
+                    if let Some(Some(text)) = captures.get(n - 1) {
+                        out.push_str(text);
+                    }
+                }
+            }
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 /// ES ToString for the RegExp constructor's pattern/flags arguments.
 /// `undefined` → `""`, everything else via `ctx.to_string` (`null` renders
 /// `"null"` through the display subset).

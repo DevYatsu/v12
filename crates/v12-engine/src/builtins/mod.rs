@@ -620,7 +620,6 @@ fn install_regexp_methods(heap: &mut Heap, global: v12_heap::Handle<v12_heap::Js
 /// the JS read `re[Symbol.match]` would compute a key the method is not stored
 /// under. `@@species` is the exception: the realm's canonical handle must be
 /// reused, so `RegExp[@@species]` is installed by [`install_regexp_species`].
-#[expect(dead_code, reason = "installed by the group-4 commit")]
 fn install_regexp_protocol(heap: &mut Heap, targets: &BuiltinTargets) {
     let Some(symbol_ctor) = targets.symbol else {
         return;
@@ -638,9 +637,32 @@ fn install_regexp_protocol(heap: &mut Heap, targets: &BuiltinTargets) {
     ];
     for (name, id, len) in protocol {
         let sym = ctx.fresh_symbol();
-        ctx.overwrite_data_prop(symbol_ctor, name, JsValue::symbol(sym));
+        install_well_known_symbol(&mut ctx, symbol_ctor, name, sym);
         install_symbol_method(&mut ctx, proto, sym, id, &format!("[Symbol.{name}]"), len);
     }
+}
+
+/// Publishes a well-known symbol on the `Symbol` constructor with the spec
+/// attributes `{ writable: false, enumerable: false, configurable: false }`.
+///
+/// The macro's `Symbol` group installed a *handler function* placeholder for
+/// each name it knew about, so most of these overwrite an existing slot (the
+/// same `overwrite_data_prop` swap the realm performs for `toPrimitive` and
+/// `species`). `matchAll` is the exception: the macro never declared it, so the
+/// slot has to be created here. Either way the value written is this function's
+/// own handle, which is what makes `re[Symbol.match]` compute a key the method
+/// is actually stored under.
+fn install_well_known_symbol(
+    ctx: &mut Ctx,
+    symbol_ctor: v12_heap::Handle<v12_heap::JsObject>,
+    name: &str,
+    sym: Handle<v12_heap::V12Symbol>,
+) {
+    let spec_attrs = v12_heap::Attrs::new(false, false, false);
+    if ctx.redefine_data_prop_with_attrs(symbol_ctor, name, JsValue::symbol(sym), spec_attrs) {
+        return;
+    }
+    ctx.define_data_prop_with_attrs(symbol_ctor, name, JsValue::symbol(sym), spec_attrs);
 }
 
 /// Allocates a symbol-keyed method (`CreateBuiltinFunction` + the symbol
@@ -1115,6 +1137,7 @@ macro_rules! define_builtins {
             install_regexp_accessors(heap, targets.global);
             install_regexp_last_index(heap, targets.global);
             install_regexp_methods(heap, targets.global);
+            install_regexp_protocol(heap, targets);
         }
     };
 }
