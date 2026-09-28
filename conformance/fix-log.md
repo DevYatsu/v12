@@ -1287,4 +1287,61 @@ Direction 1 is smaller and avoids touching the decoder sweep; direction 2 is mor
 The dispatched lane was pointed at `/tmp/bi-iter3.json` for its fail-set baseline and it no longer existed, so it could not produce FIXED/BROKE/MARGINAL. It correctly refused to substitute a pass-rate eyeball, and instead noted the tree is byte-identical to `290c5d7f` so nothing could have regressed, with its run at 8 997 pass vs the briefed 8 998 — a −1 run-to-run delta against a vanished baseline. That is the right call, and it is a reminder that `/tmp` is not a durable store: **conformance baselines belong in the repo or in a named, checked-in location, not in `/tmp`.**
 
 Workspace gate unchanged at **1 105 passed / 2 skipped**. No conformance number moved.
+### 2026-09-27 — `class … extends` env leak: Direction 1 (compiler depth bias) tried, measured, REVERTED
+
+Follow-up to the critical finding recorded above. **No fix shipped.** Tracked tree byte-identical to `a28edda0` except one new test file.
+
+- **Result of the experiment:** Direction 1 (a compile-time `env_bias` in `FnCtx`, applied in `access()`/`access_location()` and incremented by a new `emit_scoped_env` in `class_expression`) was implemented, measured, and reverted. Fail-set gate with the bias applied: **BROKE 44, FIXED 2, MARGINAL 5** → `RESULT: REGRESSION`. After revert: **BROKE 0 / FIXED 0 / MARGINAL 0**, net delta `+0`, tree verified byte-clean.
+- **It did fix the first symptom**, which is why it looked promising:
+
+| case | pre-fix | with bias | correct |
+|---|---|---|---|
+| closure write after extending class | `function() {}` | `1` | `1` |
+| three closure writes | `function() {}` | `3` | `3` |
+| heritage reads outer captured `Base` | `TypeError: prototype must be an object or null` | `true` | `true` |
+| direct write (control) | `5` | `5` | `5` |
+| class w/o `extends` (control) | `1` | `1` | `1` |
+| `super()` (control) | `derived:base` | `derived:base` | `derived:base` |
+
+- **And it provably cannot fix the second symptom, which is fatal:**
+  ```js
+  function f() {
+    let iterator = { tag: "real" };
+    class T extends Object { m() {} }
+    const get = function () { return iterator.tag; };   // closure AFTER the class
+    return get();
+  }
+  // f() === "undefined"   (correct: "real") — STILL broken with the bias
+  ```
+  `Opcode::Closure` captures `frame.env` implicitly (`crates/v12-interp/src/execute.rs:769`), so a closure emitted after the class statement captures **the class scope itself** as its root environment. Its structurally-computed `depth 0` is off by one, and **no static correction to the enclosing unit's depths can reach it, because the captured root genuinely is the class scope.** This is exactly why the 44 `built-ins/Iterator` tests broke: `next-method-throws.js` and siblings construct the `assert.throws` callback *after* `class ThrowingIterator extends Iterator`, so the callback captured the class scope and `iterator.every` resolved against the super-constructor slot.
+- **Conclusion: the environment must be retired, not compensated for.** Only a real `PopEnvironment` does that. Needs a `PopEnvironment` variant (next free discriminant — `NewEnvironment = 47`, enum runs to ~75) in **`crates/v12-bytecode/src/opcode.rs`** (the `Opcode` enum at `:54` and `from_u8` decoder at `:214` — **not** `lib.rs`, which holds only the name table at `:518` and `Display` at `:610`), one `from_u8` arm, an `execute.rs` arm restoring `frame.env` and popping `frame.env_display`, and an emission from `class_expression` after the class is fully built (so the ctor/method closures have already captured it) and after the super-constructor write.
+
+#### Two further silent-corruption paths found and independently confirmed
+
+1. **Per-iteration loop env — same leak, and a bias is *not* sufficient here either.** `emit_per_iteration_env` (`crates/v12-bccompiler/src/stmt.rs:774-787`) pushes an environment and never pops it. Verified:
+   ```js
+   function f() { let acc = 0; function bump() { acc = acc + 1; }
+     for (const x of [1,2]) { fns.push(function(){ return x; }); }
+     bump(); return acc; }
+   // v12: 0   correct: 1
+   ```
+   The loop env's parent is the *previous iteration's* loop env, so the chain grows one deep per **runtime** iteration while the compiler emits one instruction — a compile-time constant cannot model that. Needs a real pop as well.
+2. **Per-iteration `let` binding aliasing** (separate, pre-existing): `for (let i=0;i<3;i++) g.push(()=>i); g[0]()` returns **3**, correct **0** — all closures capture the last iteration's binding. Spec requires a fresh binding per iteration.
+
+#### Landed: `crates/v12-engine/tests/class_env_scope.rs`
+
+4 **active** negative controls (no class; class without `extends`; direct write after an extending class; `super()` reaching the parent ctor) — these pass today and must keep passing, so a fix that over-corrects is caught. Plus 6 `#[ignore]`d reproductions of both symptoms. **Workspace gate: 1 109 passed / 8 skipped** (skip count moved 2 → 8 by decision; the 6 new skips encode a known critical bug and go green when `PopEnvironment` lands — the `CONTEXT.md` lone-surrogate convention). The file's header documents both symptoms and why a compile-time bias is structurally insufficient.
+
+#### Pristine `language/` baseline, for whoever lands the fix
+
+```
+language/  total=24590  pass=19009  fail=5540  skip=41  pass_rate=77.4 %
+```
+Not re-measured under the bias — the built-ins gate already ruled that direction out, and a second 25-minute run to confirm a null result was not worth spending. The class-env bug's `language/` exposure is therefore **still unmeasured**; 22 built-ins tests remains a floor, not an estimate.
+
+#### Deferred-topic invariance
+
+`--filter built-ins/BigInt` = `total=77 pass=2 fail=11 skip=64`, identical to baseline. (B) `BigInt ToString` **not touched** — it stays secondary while (A) is unsolid. Chokepoint remains `crates/v12-interp/src/ops.rs:299-303` (`to_js_string`); it needs only decimal formatting of `sign` + little-endian base-256 `magnitude_le`, no BigInt arithmetic.
+
+In-scope built-ins failures: **6 190**. Top clusters unchanged: `callee is not a function` 658 · `Expected a TypeError to be thrown` 337 · `Cannot redefine property` 317 · `Expected a Test262Error but got a TypeError` 173.
 <!-- Future entries go above this line -->
