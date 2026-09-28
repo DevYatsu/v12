@@ -269,3 +269,227 @@ pub fn set_keys(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsVal
 pub fn set_values(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     super::iterator::iterator_for(ctx, this, super::iterator::ITER_KIND_SET_VALUES)
 }
+
+// ---------------------------------------------------------------------------
+// Set relational methods (ECMA-262 24.2.3, the "new Set methods" proposal)
+// ---------------------------------------------------------------------------
+
+/// Which side of a relational operation the receiver plays, for the two
+/// algorithms that differ only in which operand's order is preserved.
+///
+/// `SetIntersection` and `SetDifference` both build a *table* from the argument
+/// and then walk the receiver, so the result order follows `this` in both
+/// cases. The asymmetry the spec actually has is in the *early exits*:
+/// `intersection` returns the empty result immediately when either size is
+/// zero, and `isSupersetOf` short-circuits on a size comparison, so both need
+/// the two sizes without materialising the other set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetOp {
+    Union,
+    Intersection,
+    Difference,
+    SymmetricDifference,
+    IsSubsetOf,
+    IsSupersetOf,
+    IsDisjointFrom,
+}
+
+/// A fresh empty `Set` with `%Set.prototype%`.
+///
+/// Spec 24.2.3 opens every relational method with `Let resultSet be ! new
+/// Set()` (a `Construct`, not an allocation from the receiver), so the prototype
+/// comes from the realm's `Set` constructor rather than from `this`. Reading it
+/// off `this` would happen to work for a plain Set — a Set instance's
+/// `[[Prototype]]` *is* `%Set.prototype%` — but it would silently do the wrong
+/// thing for a subclass instance, whose prototype is the subclass's.
+fn new_set(ctx: &mut Ctx) -> JsValue {
+    let ctor = ctx
+        .intrinsic("Set")
+        .expect("a realm Set constructor is always present; bare-heap callers get an orphan Set");
+    construct(ctx, Kind::Set, ctor).expect("empty Set allocation cannot fail")
+}
+
+/// `GetSetFromIterable(other)` (24.2.3.1) reduced to what a `&mut Heap` native
+/// can do: drain the argument structurally and collapse duplicates with
+/// SameValueZero, first occurrence winning.
+///
+/// The dedupe is not an optimisation — the spec builds a real `Set` from the
+/// argument before any of the seven algorithms run, so `union([2,2])` adds `2`
+/// once and `isSubsetOf` measures the *set* of the argument, not its length.
+fn argument_set(ctx: &mut Ctx, method: &str, args: &[JsValue]) -> Result<Vec<JsValue>, Throw> {
+    let arg = args.first().copied().unwrap_or(JsValue::undefined());
+    // Step 1 is `RequireObjectCoercible`, so `undefined`/`null` are a TypeError
+    // before any iteration is attempted.
+    ctx.require_object_coercible(arg)?;
+    let Some(values) = super::iterator::drain_iterable(ctx, arg)? else {
+        return Err(ctx.type_error(format!("TypeError: {method} argument is not iterable")));
+    };
+    let mut out: Vec<JsValue> = Vec::with_capacity(values.len());
+    for v in values {
+        if !out.iter().any(|&seen| same_value_zero(seen, v)) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}
+
+/// Shared body of all seven relational methods.
+///
+/// `op` selects the algorithm; everything else is common: the `[[SetData]]`
+/// brand check on `this` (24.2.3 step 1 for every one of them), the
+/// `GetSetFromIterable` of the argument, and then the combination.
+fn set_relational(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+    op: SetOp,
+) -> Result<JsValue, Throw> {
+    let name = match op {
+        SetOp::Union => "Set.prototype.union",
+        SetOp::Intersection => "Set.prototype.intersection",
+        SetOp::Difference => "Set.prototype.difference",
+        SetOp::SymmetricDifference => "Set.prototype.symmetricDifference",
+        SetOp::IsSubsetOf => "Set.prototype.isSubsetOf",
+        SetOp::IsSupersetOf => "Set.prototype.isSupersetOf",
+        SetOp::IsDisjointFrom => "Set.prototype.isDisjointFrom",
+    };
+    // `RequireInternalSlot(O, [[SetData]])` — a plain object, a Map, or a
+    // primitive receiver is a TypeError before the argument is even looked at.
+    let obj = ctx.this_object(this, name, Some(Kind::Set))?;
+    let mine: Vec<JsValue> = entries(ctx.heap, obj, Kind::Set)
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .filter(|e| !e.is_hole())
+        .collect();
+    let other = argument_set(ctx, name, args)?;
+    let mine_has = |v: JsValue| mine.iter().any(|&m| same_value_zero(m, v));
+    let other_has = |v: JsValue| other.iter().any(|&o| same_value_zero(o, v));
+
+    match op {
+        // 24.2.3.4: every element of O, then every element of other that O
+        // does not already have. Duplicates cannot occur: `O` is a Set and the
+        // argument went through `GetSetFromIterable`.
+        SetOp::Union => {
+            let result = new_set(ctx);
+            let h = result.as_object().expect("new_set returns an object");
+            let store = &mut ctx.heap.get_mut(h).elements;
+            store.extend(mine.iter().copied());
+            store.extend(other.iter().copied().filter(|&v| !mine_has(v)));
+            Ok(result)
+        }
+        // 24.2.3.5: an empty operand short-circuits to the empty result;
+        // otherwise the table is the *argument* and the walk is `this`, so the
+        // result order is `this`'s.
+        SetOp::Intersection => {
+            if mine.is_empty() || other.is_empty() {
+                return Ok(new_set(ctx));
+            }
+            let result = new_set(ctx);
+            let h = result.as_object().expect("new_set returns an object");
+            let store = &mut ctx.heap.get_mut(h).elements;
+            store.extend(mine.iter().copied().filter(|&v| other_has(v)));
+            Ok(result)
+        }
+        // 24.2.3.6: `this`'s elements absent from the argument.
+        SetOp::Difference => {
+            let result = new_set(ctx);
+            let h = result.as_object().expect("new_set returns an object");
+            let store = &mut ctx.heap.get_mut(h).elements;
+            store.extend(mine.iter().copied().filter(|&v| !other_has(v)));
+            Ok(result)
+        }
+        // 24.2.3.7: `this`-only elements, then argument-only elements — the
+        // order is *this* first, which is the observable the spec fixes.
+        SetOp::SymmetricDifference => {
+            let result = new_set(ctx);
+            let h = result.as_object().expect("new_set returns an object");
+            let store = &mut ctx.heap.get_mut(h).elements;
+            store.extend(mine.iter().copied().filter(|&v| !other_has(v)));
+            store.extend(other.iter().copied().filter(|&v| !mine_has(v)));
+            Ok(result)
+        }
+        // 24.2.3.8: every element of `this` is in the argument.
+        SetOp::IsSubsetOf => {
+            for v in &mine {
+                if !other_has(*v) {
+                    return Ok(JsValue::false_());
+                }
+            }
+            Ok(JsValue::true_())
+        }
+        // 24.2.3.9: the size comparison comes first (step 3) and is what makes
+        // an argument larger than `this` an immediate `false`.
+        SetOp::IsSupersetOf => {
+            if other.len() > mine.len() {
+                return Ok(JsValue::false_());
+            }
+            for v in &other {
+                if !mine_has(*v) {
+                    return Ok(JsValue::false_());
+                }
+            }
+            Ok(JsValue::true_())
+        }
+        // 24.2.3.10: no element of `this` is in the argument.
+        SetOp::IsDisjointFrom => {
+            for v in &mine {
+                if other_has(*v) {
+                    return Ok(JsValue::false_());
+                }
+            }
+            Ok(JsValue::true_())
+        }
+    }
+}
+
+/// `Set.prototype.union(other)` — see [`set_relational`].
+pub fn set_union(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    set_relational(ctx, this, args, SetOp::Union)
+}
+
+/// `Set.prototype.intersection(other)` — see [`set_relational`].
+pub fn set_intersection(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    set_relational(ctx, this, args, SetOp::Intersection)
+}
+
+/// `Set.prototype.difference(other)` — see [`set_relational`].
+pub fn set_difference(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    set_relational(ctx, this, args, SetOp::Difference)
+}
+
+/// `Set.prototype.symmetricDifference(other)` — see [`set_relational`].
+pub fn set_symmetric_difference(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    set_relational(ctx, this, args, SetOp::SymmetricDifference)
+}
+
+/// `Set.prototype.isSubsetOf(other)` — see [`set_relational`].
+pub fn set_is_subset_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    set_relational(ctx, this, args, SetOp::IsSubsetOf)
+}
+
+/// `Set.prototype.isSupersetOf(other)` — see [`set_relational`].
+pub fn set_is_superset_of(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    set_relational(ctx, this, args, SetOp::IsSupersetOf)
+}
+
+/// `Set.prototype.isDisjointFrom(other)` — see [`set_relational`].
+pub fn set_is_disjoint_from(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    set_relational(ctx, this, args, SetOp::IsDisjointFrom)
+}

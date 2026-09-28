@@ -392,6 +392,30 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::IteratorSome => Some(1),
         NativeId::IteratorEvery => Some(1),
         NativeId::IteratorFind => Some(1),
+        // Set relational methods (24.2.3). All seven take exactly one
+        // argument, `other`; the three predicates are not key-mapped (the
+        // proposal's rejected `*ByKey` variants are not part of the standard).
+        NativeId::SetUnion => Some(1),
+        NativeId::SetIntersection => Some(1),
+        NativeId::SetDifference => Some(1),
+        NativeId::SetSymmetricDifference => Some(1),
+        NativeId::SetIsSubsetOf => Some(1),
+        NativeId::SetIsSupersetOf => Some(1),
+        NativeId::SetIsDisjointFrom => Some(1),
+        // Iterator helpers added by the same proposal round: `includes` and
+        // `join` default their argument but are declared with one parameter,
+        // and `zip`/`zipKeyed`/`concat` are rest-parameter statics that still
+        // report `length` 1.
+        NativeId::IteratorIncludes => Some(1),
+        NativeId::IteratorJoin => Some(1),
+        NativeId::IteratorWindows => Some(1),
+        NativeId::IteratorChunks => Some(1),
+        NativeId::IteratorZip => Some(1),
+        NativeId::IteratorZipKeyed => Some(1),
+        NativeId::IteratorConcat => Some(1),
+        // Keyed promise combinators (27.2.4).
+        NativeId::PromiseAllKeyed => Some(1),
+        NativeId::PromiseAllSettledKeyed => Some(1),
         _ => None,
     }
 }
@@ -1031,6 +1055,18 @@ define_builtins! {
         "entries" (0) => SetEntries => |heap, this, args| call_ctx(map::set_entries, heap, this, args),
         "keys" (0) => SetKeys => |heap, this, args| call_ctx(map::set_keys, heap, this, args),
         "values" (0) => SetValues => |heap, this, args| call_ctx(map::set_values, heap, this, args),
+        // 24.2.3. The seven relational methods. They are pure `&mut Heap`
+        // natives: each drains `other` through
+        // `iterator::drain_iterable`, which covers the iterable kinds whose
+        // iteration needs no user code (see that function's doc for the
+        // boundary).
+        "union" (1) => SetUnion => |heap, this, args| call_ctx(map::set_union, heap, this, args),
+        "intersection" (1) => SetIntersection => |heap, this, args| call_ctx(map::set_intersection, heap, this, args),
+        "difference" (1) => SetDifference => |heap, this, args| call_ctx(map::set_difference, heap, this, args),
+        "symmetricDifference" (1) => SetSymmetricDifference => |heap, this, args| call_ctx(map::set_symmetric_difference, heap, this, args),
+        "isSubsetOf" (1) => SetIsSubsetOf => |heap, this, args| call_ctx(map::set_is_subset_of, heap, this, args),
+        "isSupersetOf" (1) => SetIsSupersetOf => |heap, this, args| call_ctx(map::set_is_superset_of, heap, this, args),
+        "isDisjointFrom" (1) => SetIsDisjointFrom => |heap, this, args| call_ctx(map::set_is_disjoint_from, heap, this, args),
     },
     // The `Iterator` constructor's one static (spec 27.1.3).
     Iterator {

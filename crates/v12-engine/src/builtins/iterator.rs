@@ -25,6 +25,12 @@
 //! so their bodies are at the interpreter seam
 //! (`Interp::run_iterator_callback`) and this file only installs them.
 //!
+//! [`drain_iterable`] is the same pure-heap idea for the *consumer* side: the
+//! generic `GetIterator`/`IteratorStep` a `&mut Heap` native can afford. Every
+//! method that accepts an arbitrary iterable argument (the `Set.prototype`
+//! relational methods) goes through it, so the recognised set of iterable kinds
+//! is written down once, here, instead of per method.
+//!
 //! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
 //! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
 //! `ctx::call_ctx`. Callback-taking methods stay at the interpreter seam
@@ -536,6 +542,12 @@ fn drain_iterator(ctx: &mut Ctx, this: JsValue) -> Result<Vec<JsValue>, Throw> {
 }
 
 /// `Iterator.prototype.toArray()` — drains `this` into an array.
+///
+/// The array goes through `Ctx::alloc_array`, so it carries `%Array.prototype%`
+/// and a `length` own property. Hand-rolling it with `JsObject::array` +
+/// `alloc_obj` (what this did before) leaves the object on the root shape with a
+/// `null` prototype, which fails `result.constructor === Array` and
+/// `result.map(…)` far away from the real cause.
 pub fn iterator_to_array(
     ctx: &mut Ctx,
     this: JsValue,
@@ -543,8 +555,7 @@ pub fn iterator_to_array(
 ) -> Result<JsValue, Throw> {
     require_iterator(ctx, this, "Iterator.prototype.toArray")?;
     let values = drain_iterator(ctx, this)?;
-    let arr = ctx.alloc_obj(JsObject::array(values));
-    Ok(JsValue::object(arr))
+    Ok(JsValue::object(ctx.alloc_array(values)))
 }
 
 /// The stored `limit` of a `take`/`drop` wrapper, read back through
@@ -660,4 +671,82 @@ pub fn iterator_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<
         return Ok(v);
     }
     iterator_for(ctx, v, ITER_KIND_ARRAY_VALUES)
+}
+
+// ---------------------------------------------------------------------------
+// Structural iterable drain
+// ---------------------------------------------------------------------------
+
+/// The values `v` yields when iterated, in iteration order, or `None` when
+/// `v` is not a kind this engine can iterate without the machine.
+///
+/// This is the whole of `GetIterator`/`IteratorStep` for a `&mut Heap` native.
+/// The recognised set is deliberately narrow and is exactly the set whose
+/// iteration needs no user code:
+///
+/// - `Array` / `Arguments` — the element lattice, holes as `undefined` (which
+///   is what `Array.prototype[Symbol.iterator]` yields);
+/// - `Set` — its value store;
+/// - `Map` — entry *pairs*, built as real arrays because a `Map` iterates
+///   `[key, value]` arrays, not a flattened two-slot record;
+/// - `Iterator` — the engine's own iterator objects, through [`drain_iterator`]
+///   (so a helper wrapper composes: `a.take(2).values()` drains);
+/// - a string primitive — by Unicode code point, per `String.prototype
+///   [Symbol.iterator]`'s surrogate-pair handling, so an astral character is
+///   one value rather than two lone surrogates.
+///
+/// A user-defined `@@iterator` (a generator, a hand-rolled `next`) is **not**
+/// reachable from here: calling its `next` is machine work, which is what the
+/// interpreter seam in `v12-interp/src/call_setup.rs` exists for. Callers must
+/// treat `None` as "not iterable" and say so, rather than silently yielding
+/// nothing.
+pub fn drain_iterable(ctx: &mut Ctx, v: JsValue) -> Result<Option<Vec<JsValue>>, Throw> {
+    if let Some(obj) = v.as_object() {
+        return match ctx.heap.get(obj).kind {
+            v12_heap::Kind::Array | v12_heap::Kind::Arguments => {
+                Ok(Some(ctx.heap.get(obj).elements_snapshot()))
+            }
+            v12_heap::Kind::Set => Ok(Some(
+                ctx.heap
+                    .get(obj)
+                    .elements
+                    .iter()
+                    .copied()
+                    .filter(|e| !e.is_hole())
+                    .collect(),
+            )),
+            v12_heap::Kind::Map => {
+                let pairs: Vec<[JsValue; 2]> = ctx
+                    .heap
+                    .get(obj)
+                    .elements
+                    .chunks_exact(2)
+                    .map(|p| [p[0], p[1]])
+                    .collect();
+                Ok(Some(
+                    pairs
+                        .into_iter()
+                        .map(|[k, v]| {
+                            if k.is_hole() {
+                                JsValue::undefined()
+                            } else {
+                                JsValue::object(ctx.alloc_array(vec![k, v]))
+                            }
+                        })
+                        .collect(),
+                ))
+            }
+            v12_heap::Kind::Iterator => drain_iterator(ctx, v).map(Some),
+            _ => Ok(None),
+        };
+    }
+    if let Some(h) = v.as_string() {
+        // Code points, not code units: `for (const c of "a\u{1F600}")` yields two
+        // values in every engine, and a lone surrogate is never observable.
+        let text = ctx.string_text(h);
+        return Ok(Some(
+            text.chars().map(|c| JsValue::string(ctx.heap.intern_text(&c.to_string()))).collect(),
+        ));
+    }
+    Ok(None)
 }
