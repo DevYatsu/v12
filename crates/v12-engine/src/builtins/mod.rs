@@ -484,6 +484,33 @@ pub(crate) fn install_value(
     }
 }
 
+/// [`install_value`] with explicit attributes, for the well-known `Symbol`
+/// properties.
+///
+/// Why this exists rather than reusing [`builtin_install_prop`]'s `BUILTIN`
+/// attrs: spec 20.4.2 gives every `Symbol` static — unlike every other data
+/// property in clauses 18-26 — `{ [[Writable]]: false, [[Enumerable]]: false,
+/// [[Configurable]]: true }`. `BUILTIN` is writable, so `Symbol.dispose = 1`
+/// would silently succeed where the spec makes it a no-op (or a `TypeError` in
+/// strict mode).
+///
+/// The handler still runs exactly once, at install time, so the stored value
+/// is this realm's singleton symbol and `Symbol.dispose === Symbol.dispose`
+/// holds through a plain shape lookup on every later read.
+pub(crate) fn install_value_with_attrs(
+    heap: &mut Heap,
+    target: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    name: &str,
+    id: NativeId,
+    attrs: v12_heap::Attrs,
+) {
+    let Some(obj) = target else { return };
+    let Some(Ok(value)) = builtin_dispatch(id, heap, JsValue::undefined(), &[]) else {
+        return;
+    };
+    Ctx::new(heap, None, None).define_data_prop_with_attrs(obj, name, value, attrs);
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __builtin_emit_install {
@@ -569,6 +596,18 @@ macro_rules! __builtin_emit_install {
     };
     (Symbol, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, $targets.symbol, $name, $id)
+    };
+    // Well-known `Symbol` statics: the property *value* is the realm's
+    // singleton symbol, minted once here, with spec 20.4.2's non-writable
+    // attribute triple. See `install_value_with_attrs`.
+    (SymbolValue, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_value_with_attrs(
+            $heap,
+            $targets.symbol,
+            $name,
+            $id,
+            v12_heap::Attrs::new(false, false, true),
+        )
     };
     (Proxy, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, $targets.proxy, $name, $id)
@@ -673,6 +712,15 @@ macro_rules! __builtin_emit_install {
     };
     (Symbol, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length($heap, $targets.symbol, $name, $id, Some($len))
+    };
+    (SymbolValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_value_with_attrs(
+            $heap,
+            $targets.symbol,
+            $name,
+            $id,
+            v12_heap::Attrs::new(false, false, true),
+        )
     };
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length(
@@ -1140,6 +1188,15 @@ define_builtins! {
         "toString" (0) => SymbolProtoToString => |heap, this, args| call_ctx(symbol::symbol_proto_to_string, heap, this, args),
         "valueOf" (0) => SymbolProtoValueOf => |heap, this, args| call_ctx(symbol::symbol_proto_value_of, heap, this, args),
         "description" => SymbolProtoDescription => |heap, this, args| call_ctx(symbol::symbol_proto_description, heap, this, args),
+    },
+    // Well-known symbols with no engine-internal consumer: the value installed
+    // is the singleton itself, so `Symbol.dispose === Symbol.dispose` holds
+    // through a shape lookup. Every name in the `Symbol` group above installs
+    // a *handler function* that the realm overwrites with its own canonical
+    // symbol (see `symbol.rs`'s module doc for why there are two routes).
+    SymbolValue {
+        "dispose" => SymbolWellKnownDispose => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
+        "asyncDispose" => SymbolWellKnownAsyncDispose => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
     },
     Proxy {
         "revocable" (2) => ProxyRevocable => |heap, this, args| call_ctx(proxy::proxy_revocable, heap, this, args),
