@@ -338,6 +338,12 @@ impl<'p> Mini<'p> {
                     });
                     pc += 1;
                 }
+                // Exact inverse of the head-shift above; mirrors the
+                // `PopEnvironment` arm in `v12-interp`'s dispatch loop.
+                Opcode::PopEnvironment => {
+                    cur_env = cur_env.parent.clone().unwrap_or(cur_env);
+                    pc += 1;
+                }
                 Opcode::GetEnvSlot => {
                     let e = walk_env(&cur_env, u16::from(instr.b()));
                     regs[instr.a() as usize] = e.slots.borrow()[instr.c() as usize].clone();

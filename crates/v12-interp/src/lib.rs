@@ -441,10 +441,11 @@ struct Frame {
     env: Option<Handle<JsObject>>,
     /// Cached innermost environments: `env_display[i]` is the environment
     /// `i` hops out, mirroring the parent-link chain exactly. Built once
-    /// at frame creation ([`Interp::env_display_for`]) and head-shifted by
-    /// `NewEnvironment` only — never otherwise mutated — so it stays exact
-    /// for the frame's whole life. Entries are chain members, hence rooted
-    /// transitively through `env` at every safepoint; no extra rooting.
+    /// at frame creation ([`Interp::env_display_for`]), head-shifted by
+    /// `NewEnvironment`, and rebuilt wholesale by `PopEnvironment` — never
+    /// otherwise mutated — so it stays exact for the frame's whole life.
+    /// Entries are chain members, hence rooted transitively through `env` at
+    /// every safepoint; no extra rooting.
     env_display: [Option<Handle<JsObject>>; ENV_DISPLAY_CAP],
     /// Associated generator object when this frame is a generator activation.
     generator: Option<Handle<JsObject>>,

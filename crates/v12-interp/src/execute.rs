@@ -802,6 +802,33 @@ impl Interp<'_> {
                     }
                     self.set_pc(pc + op_width);
                 }
+                Opcode::PopEnvironment => {
+                    // Exact inverse of the `NewEnvironment` head-shift above:
+                    // retire the frame's innermost environment and restore its
+                    // parent, which is where every statically resolved
+                    // `GetEnvSlot`/`SetEnvSlot` depth was counted from.
+                    //
+                    // The display is *rebuilt* with the same bounded walk
+                    // `env_display_for` uses rather than shifted back. A shift
+                    // would have to reconstruct the tail that a truncated push
+                    // evicted, and `env_at` reads `env_display[d]` directly for
+                    // every `d < ENV_DISPLAY_CAP`, so a lost tail entry would
+                    // surface as a spurious "environment depth exceeds live
+                    // chain". Rebuilding goes through the parent-link walk that
+                    // `env_at` falls back to past the cap, so the two agree by
+                    // construction. The retired environment stays reachable
+                    // through the closures that captured it.
+                    let parent = self
+                        .frames
+                        .last()
+                        .and_then(|frame| frame.env)
+                        .and_then(|env| self.heap.get(env).prototype);
+                    let display = self.env_display_for(parent);
+                    let frame = self.frames.last_mut().expect("frame");
+                    frame.env = parent;
+                    frame.env_display = display;
+                    self.set_pc(pc + op_width);
+                }
                 Opcode::GetEnvSlot => {
                     let v = attempt!(self.env_read(rb, rc));
                     self.stack[base + usize::from(ra)] = v;

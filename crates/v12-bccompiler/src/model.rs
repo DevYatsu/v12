@@ -596,6 +596,28 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     /// so far, when there is one. The main unit emits a `Return` of it so
     /// `eval` gets the spec-compliant script completion value.
     pub last_expr_reg: Option<u16>,
+    /// Transient environments currently pushed *on top of* this unit's own
+    /// base environment, which the structural model in [`Plans::env_depth`]
+    /// cannot see.
+    ///
+    /// A class scope needs a real environment to hold the parent constructor
+    /// for `super`, and `Closure` captures `frame.env`, so that environment
+    /// must be the frame's innermost one while the constructor and method
+    /// closures are built. While it is current, every statically resolved
+    /// access in this unit is physically one hop deeper than `env_depth`
+    /// reports, so `access`/`access_location` add this counter.
+    ///
+    /// [`Self::emit_scoped_env`] and [`Self::emit_pop_env`] are the only
+    /// mutators, and they are balanced: the push emits `NewEnvironment` and
+    /// increments, the pop emits `PopEnvironment` and decrements, so code
+    /// after the construct is back to the structural depths.
+    ///
+    /// Only *statically resolved* depths are biased. Emissions that pass a
+    /// literal depth (the class scope's own super-constructor write, the
+    /// per-iteration copy-forward) are relative to the current head and stay
+    /// unbiased, which is why they call the raw `emit_get_env`/`emit_set_env`
+    /// rather than going through `access`.
+    env_bias: u8,
     scope_stack: Vec<ScopeId>,
     overflow: Option<CompileError>,
 }
@@ -614,6 +636,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             finallies: Vec::new(),
             with_objs: Vec::new(),
             last_expr_reg: None,
+            env_bias: 0,
             scope_stack: Vec::new(),
             overflow: None,
         }
@@ -712,7 +735,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         match loc {
             VarLoc::Reg(r) => VarAccess::Reg(r),
             VarLoc::Env(slot) => VarAccess::Env {
-                depth: plans.env_depth(self.unit, sym),
+                depth: self.biased_depth(plans.env_depth(self.unit, sym)),
                 slot,
             },
             VarLoc::Global => VarAccess::Global { sym },
@@ -757,7 +780,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     pub fn access_location(&self, loc: VarLoc) -> VarAccess {
         match loc {
             VarLoc::Reg(reg) => VarAccess::Reg(reg),
-            VarLoc::Env(slot) => VarAccess::Env { depth: 0, slot },
+            // A block-function lexical binding lives in the current unit's own
+            // environment, which sits `env_bias` hops below the current head
+            // while a class scope is pushed in this unit.
+            VarLoc::Env(slot) => VarAccess::Env {
+                depth: self.biased_depth(0),
+                slot,
+            },
             VarLoc::Global => VarAccess::Global {
                 sym: self
                     .comp
@@ -1347,6 +1376,32 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             .encode();
             self.emit_words(words, span);
         }
+    }
+
+    /// A *scoped* environment: pushed on top of this unit's own environment for
+    /// the duration of a construct, and retired again by
+    /// [`Self::emit_pop_env`].
+    ///
+    /// The unit's base environment (the prologue) is not scoped and does not go
+    /// through here — it *is* the origin every structural depth counts from.
+    pub fn emit_scoped_env(&mut self, depth: u8, slots: u16, span: oxc_span::Span) {
+        self.emit_new_env(depth, slots, span);
+        self.env_bias += 1;
+    }
+
+    /// Retires the environment [`Self::emit_scoped_env`] pushed, so the unit is
+    /// back to its structural env depths. Balanced by construction: emitting
+    /// this without a matching `emit_scoped_env` would underflow the bias.
+    pub fn emit_pop_env(&mut self, span: oxc_span::Span) {
+        self.env_bias = self.env_bias.saturating_sub(1);
+        self.emit_spanned(Instr::new(Opcode::PopEnvironment, 0, 0, 0), span);
+    }
+
+    /// The depth a statically resolved access must be emitted with: the
+    /// structural hop count plus every scoped environment currently on the
+    /// chain. Saturating because the structural count is already a `u8` budget.
+    fn biased_depth(&self, depth: u8) -> u8 {
+        depth.saturating_add(self.env_bias)
     }
 
     /// `Closure dst, fn#idx` — escapes to `ClosureW` once the function

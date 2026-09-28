@@ -1,32 +1,34 @@
 //! A class scope with a heritage (`class T extends X`) needs a real
 //! environment to hold the parent constructor for `super`, and
-//! `NewEnvironment` installs it as the frame's innermost environment with no
-//! matching pop — there is no `PopEnvironment` opcode. Nothing ever retires
-//! that head, so for the rest of the unit it shadows the unit's own
-//! environment.
+//! `NewEnvironment` installs it as the frame's innermost environment. Because
+//! `Closure` captures `frame.env`, that scope has to be the innermost one while
+//! the constructor and method closures are built — but it also has to be
+//! retired afterwards, which used to be impossible: there was no
+//! `PopEnvironment` opcode, so the class scope shadowed the enclosing
+//! function's own environment for the rest of the unit.
 //!
-//! Two distinct symptoms follow, and both are **silent** because the class
-//! scope holds exactly one slot (the parent constructor), so a misdirected
-//! `GetEnvSlot`/`SetEnvSlot` at `depth=0` reads back a constructor instead of
+//! Two distinct symptoms followed, both **silent** because the class scope
+//! holds exactly one slot (the parent constructor), so a misdirected
+//! `GetEnvSlot`/`SetEnvSlot` at `depth=0` read back a constructor rather than
 //! raising:
 //!
-//! 1. accesses emitted by the *enclosing* unit after the class statement
-//!    resolve one hop too shallow (`acc` reads back `Object`);
-//! 2. a closure created after the class statement captures the class scope as
-//!    its root environment (`Closure` takes `frame.env` — see
-//!    `v12-interp/src/execute.rs`), so *inside* that closure every env access
-//!    resolves one hop too shallow.
+//! 1. accesses emitted by the enclosing unit after the class statement
+//!    resolved one hop too shallow (`acc` read back `Object`);
+//! 2. a closure created after the class statement captured the class scope as
+//!    its root environment, so *inside* that closure every env access resolved
+//!    one hop too shallow (`iterator.tag` read `undefined`).
 //!
-//! Symptom 2 is why a compile-time depth bias is not a sufficient fix: the
-//! closure's captured root genuinely *is* the class scope, so no static
-//! correction to the enclosing unit's depths can reach it. The fix has to
-//! retire the environment, which needs a `PopEnvironment` opcode — currently
-//! blocked on write scope for `crates/v12-bytecode/src/opcode.rs` (the `Opcode`
-//! enum and its `from_u8` decoder live there, not in `lib.rs`).
+//! Symptom 2 is why a compile-time depth bias alone is not a sufficient fix:
+//! the closure's captured root genuinely *is* the class scope, so no static
+//! correction to the enclosing unit's depths can reach it. The fix pairs both
+//! halves — `FnCtx::env_bias` shifts the depths resolved *while* the scope is
+//! current (the heritage expression and computed keys are evaluated there), and
+//! `PopEnvironment` retires it so everything after is back to the structural
+//! depths. See `class_expression` in `v12-bccompiler`.
 //!
-//! The four active tests are the negative controls: they pass today and must
-//! keep passing, so a future fix that over-corrects (breaking `super()`, or
-//! perturbing the two non-triggering shapes) is caught.
+//! The four control tests are the negative controls: they pass both before and
+//! after the fix, so an over-correction (breaking `super()`, or perturbing the
+//! two shapes that never triggered) is caught.
 
 use v12_engine::Engine;
 
@@ -86,9 +88,7 @@ fn super_call_still_reaches_the_parent_constructor() {
 }
 
 /// Symptom 1: a closure writing a captured `let` in a scope that also declares
-/// an extending class reads back the parent constructor. Today: `function() {}`.
 #[test]
-#[ignore = "class scope is never popped; needs a PopEnvironment opcode"]
 fn closure_write_after_extending_class_reads_back_written_value() {
     assert_eq!(
         eval_display(
@@ -99,10 +99,8 @@ fn closure_write_after_extending_class_reads_back_written_value() {
 }
 
 /// Symptom 1, repeated: the write was always fine, only the read-back was
-/// corrupted, so assert the value survives several mutations. Today:
-/// `function() {}`.
+/// corrupted, so assert the value survives several mutations.
 #[test]
-#[ignore = "class scope is never popped; needs a PopEnvironment opcode"]
 fn closure_writes_accumulate_across_repeated_calls() {
     assert_eq!(
         eval_display(
@@ -113,9 +111,7 @@ fn closure_writes_accumulate_across_repeated_calls() {
 }
 
 /// Symptom 1 with two class scopes, so any fix has to handle more than one
-/// outstanding head. Today: `function() {}`.
 #[test]
-#[ignore = "class scope is never popped; needs a PopEnvironment opcode"]
 fn two_extending_classes_accumulate_the_bias() {
     assert_eq!(
         eval_display(
@@ -126,9 +122,7 @@ fn two_extending_classes_accumulate_the_bias() {
 }
 
 /// A class *expression* takes the same `class_expression` path, so it leaks the
-/// same way. Today: `function() {}`.
 #[test]
-#[ignore = "class scope is never popped; needs a PopEnvironment opcode"]
 fn class_expression_after_capture_is_unaffected() {
     assert_eq!(
         eval_display(
@@ -140,10 +134,8 @@ fn class_expression_after_capture_is_unaffected() {
 
 /// The heritage expression is evaluated *after* the class scope is pushed, and
 /// the class scope's single slot is still `undefined` at that point, so a
-/// misdirected read makes `T` extend `undefined`. Today: throws
 /// `TypeError: prototype must be an object or null`.
 #[test]
-#[ignore = "class scope is never popped; needs a PopEnvironment opcode"]
 fn heritage_expression_reads_outer_captured_binding() {
     assert_eq!(
         eval_display(
@@ -155,9 +147,7 @@ fn heritage_expression_reads_outer_captured_binding() {
 
 /// Symptom 2, and the case that rules out a compile-time depth bias: the
 /// closure is created *after* the class statement, so `Closure` captures the
-/// class scope as its root environment. Today: `undefined`.
 #[test]
-#[ignore = "class scope is never popped; needs a PopEnvironment opcode"]
 fn closure_created_after_class_captures_the_right_environment() {
     assert_eq!(
         eval_display(

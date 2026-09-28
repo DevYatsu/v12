@@ -39,8 +39,20 @@ pub(crate) fn class_expression(
     //    method capture it; populated once `extends` has been evaluated.
     //    `NewEnvironment` installs it as the current frame's innermost env
     //    (no destination register).
+    //
+    //    It is *scoped*: step 7 retires it with `PopEnvironment`. Leaving it
+    //    in place let it shadow the enclosing function's own environment for
+    //    the rest of the unit, so every later `GetEnvSlot`/`SetEnvSlot` at
+    //    `depth=0` — and every closure created after the class, which captures
+    //    the frame's innermost env as its root — resolved one hop too shallow.
+    //    That was silent, not an error: the scope holds one slot (the parent
+    //    constructor), so a misdirected access read the constructor back.
+    //
+    //    `emit_scoped_env` also records the push in `env_bias`, because the
+    //    heritage expression and the computed keys in steps 2 and 6 are
+    //    evaluated while this environment is the frame's innermost one.
     if has_super {
-        cx.emit_new_env(0, SUPER_ENV_SLOTS, span);
+        cx.emit_scoped_env(0, SUPER_ENV_SLOTS, span);
     }
 
     // 1. Compile the constructor unit (registered during collect) and create
@@ -95,6 +107,16 @@ pub(crate) fn class_expression(
 
     // 6. Define the class elements (methods, getters/setters, statics).
     define_elements(cx, &c.body, ctor, proto)?;
+
+    // 7. Retire the class scope. Everything the scope existed for is already
+    //    built — the constructor and every method closure captured it, and the
+    //    `super` slot is populated — so the rest of the unit runs against the
+    //    enclosing function's own environment again. Done before the name
+    //    store so that binding, like all following code, resolves at the
+    //    structural depth the plan computed.
+    if has_super {
+        cx.emit_pop_env(span);
+    }
 
     // Class declarations bind the constructor to the class name.
     if is_statement

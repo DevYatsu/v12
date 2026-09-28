@@ -162,6 +162,20 @@ pub enum Opcode {
     /// Emitted by the `super.x` lowering in an object-literal method, which
     /// must start the lookup one link above the receiver instead of on it.
     GetPrototype = 77,
+    /// Retires the current frame's innermost environment, restoring its
+    /// parent. The exact inverse of [`Opcode::NewEnvironment`], which
+    /// installs the new head with no way to take it back.
+    ///
+    /// A class scope (`class T extends X`) needs a real environment to carry
+    /// the parent constructor to the constructor and method closures — and
+    /// `Closure` captures `frame.env`, so the scope has to be the frame's
+    /// innermost environment while those closures are built. Left unretired it
+    /// then shadows the enclosing function's own environment for the rest of
+    /// the unit: every later `GetEnvSlot`/`SetEnvSlot` at `depth=0`, and every
+    /// closure created after it, resolves one hop too shallow.
+    ///
+    /// No operands.
+    PopEnvironment = 78,
 }
 
 impl TryFrom<u8> for Opcode {
@@ -242,6 +256,7 @@ impl TryFrom<u8> for Opcode {
             75 => Ok(Self::ToPropertyKey),
             76 => Ok(Self::GetAsyncIterator),
             77 => Ok(Self::GetPrototype),
+            78 => Ok(Self::PopEnvironment),
             other => Err(other),
         }
     }
