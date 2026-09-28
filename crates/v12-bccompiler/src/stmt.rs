@@ -792,6 +792,41 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// Returns whether a push was actually emitted, so the caller can hand the
     /// same answer to the loop context and to the fallthrough pop. Nothing is
     /// pushed when the unit owns no environment at all (`env_slot_count == 0`).
+    ///
+    /// # Known gap: block-scoped bindings in a loop body still alias
+    ///
+    /// This covers the *loop variable* only. A `let`/`const` declared in the
+    /// loop **body block** aliases across iterations too, and is not fixed:
+    ///
+    /// ```js
+    /// var j = 0; while (j < 3) { let k = j; out.push(() => k); j++; }
+    /// // out[0]() -- spec: 0, got: 2
+    /// ```
+    ///
+    /// Two things are missing, and the first is the blocker.
+    ///
+    /// 1. **Detection.** [`Self::per_iteration_env_needed`] answers "is *this
+    ///    binding pattern* env-resident", which is the right question for a
+    ///    loop head because the head is a pattern. A block body is a statement
+    ///    list, so the question becomes "does *this block* declare an
+    ///    env-resident binding", and nothing in the plan can answer it:
+    ///    `UnitPlan` is per-*unit* (`vars`, `env_slots`, `env_slot_count` are all
+    ///    unit-wide) with no per-block record. Answering it needs a new
+    ///    per-block structure in `Plans`/`UnitPlan` plus a `collect.rs` walk to
+    ///    populate it — the data-model change to weigh before attempting this.
+    /// 2. **Exit bookkeeping.** `LoopCtx::per_iter_env` is a per-loop *bool*,
+    ///    which is sufficient only while loops are the sole creators of these
+    ///    environments: an abrupt exit then pops exactly one per exited loop.
+    ///    Block environments nest arbitrarily, so an exit has to pop a *count*
+    ///    relative to its target. That means recording a scoped-environment
+    ///    depth in `LoopCtx` and `FinallyCtx` and updating `jump_out` and
+    ///    `run_finally_copies` — which duplicates finalizers *inline* at every
+    ///    exit point, so a duplicated finalizer containing a `break` needs the
+    ///    same depth bookkeeping, recursively.
+    ///
+    /// Do not paper over this with a bias: CONTEXT.md records that a
+    /// compile-time bias for the sibling class-scope defect broke 44 tests to
+    /// fix 2. The honest gate is the spec value in the snippet above.
     fn emit_per_iteration_env(&mut self, span: Span) -> bool {
         let slots = self.comp.plans.units[self.unit].env_slot_count;
         if slots == 0 {
