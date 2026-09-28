@@ -294,7 +294,7 @@ enum SetOp {
     IsDisjointFrom,
 }
 
-/// A fresh empty `Set` with `%Set.prototype%`.
+/// A fresh empty `Set` with `%Set.prototype%`, as a `Handle`.
 ///
 /// Spec 24.2.3 opens every relational method with `Let resultSet be ! new
 /// Set()` (a `Construct`, not an allocation from the receiver), so the prototype
@@ -302,11 +302,18 @@ enum SetOp {
 /// off `this` would happen to work for a plain Set — a Set instance's
 /// `[[Prototype]]` *is* `%Set.prototype%` — but it would silently do the wrong
 /// thing for a subclass instance, whose prototype is the subclass's.
-fn new_set(ctx: &mut Ctx) -> JsValue {
-    let ctor = ctx
-        .intrinsic("Set")
-        .expect("a realm Set constructor is always present; bare-heap callers get an orphan Set");
-    construct(ctx, Kind::Set, ctor).expect("empty Set allocation cannot fail")
+///
+/// The result is a `Result` because `ctx.intrinsic("Set")` is `None` outside a
+/// realm (a bare-heap engine test), where there is no `%Set.prototype%` to link
+/// and the caller reports that as the `TypeError` it already owes.
+fn new_set(ctx: &mut Ctx) -> Result<Handle<JsObject>, Throw> {
+    let Some(ctor) = ctx.intrinsic("Set").and_then(|v| v.as_object()) else {
+        return Err(ctx.type_error("TypeError: Set relational methods need a realm"));
+    };
+    let value = construct(ctx, Kind::Set, JsValue::object(ctor))?;
+    value
+        .as_object()
+        .ok_or_else(|| ctx.type_error("TypeError: Set construction produced a non-object"))
 }
 
 /// `GetSetFromIterable(other)` (24.2.3.1) reduced to what a `&mut Heap` native
@@ -371,43 +378,38 @@ fn set_relational(
         // does not already have. Duplicates cannot occur: `O` is a Set and the
         // argument went through `GetSetFromIterable`.
         SetOp::Union => {
-            let result = new_set(ctx);
-            let h = result.as_object().expect("new_set returns an object");
+            let h = new_set(ctx)?;
             let store = &mut ctx.heap.get_mut(h).elements;
             store.extend(mine.iter().copied());
             store.extend(other.iter().copied().filter(|&v| !mine_has(v)));
-            Ok(result)
+            Ok(JsValue::object(h))
         }
         // 24.2.3.5: an empty operand short-circuits to the empty result;
         // otherwise the table is the *argument* and the walk is `this`, so the
         // result order is `this`'s.
         SetOp::Intersection => {
-            if mine.is_empty() || other.is_empty() {
-                return Ok(new_set(ctx));
+            let h = new_set(ctx)?;
+            if !(mine.is_empty() || other.is_empty()) {
+                let store = &mut ctx.heap.get_mut(h).elements;
+                store.extend(mine.iter().copied().filter(|&v| other_has(v)));
             }
-            let result = new_set(ctx);
-            let h = result.as_object().expect("new_set returns an object");
-            let store = &mut ctx.heap.get_mut(h).elements;
-            store.extend(mine.iter().copied().filter(|&v| other_has(v)));
-            Ok(result)
+            Ok(JsValue::object(h))
         }
         // 24.2.3.6: `this`'s elements absent from the argument.
         SetOp::Difference => {
-            let result = new_set(ctx);
-            let h = result.as_object().expect("new_set returns an object");
+            let h = new_set(ctx)?;
             let store = &mut ctx.heap.get_mut(h).elements;
             store.extend(mine.iter().copied().filter(|&v| !other_has(v)));
-            Ok(result)
+            Ok(JsValue::object(h))
         }
         // 24.2.3.7: `this`-only elements, then argument-only elements — the
         // order is *this* first, which is the observable the spec fixes.
         SetOp::SymmetricDifference => {
-            let result = new_set(ctx);
-            let h = result.as_object().expect("new_set returns an object");
+            let h = new_set(ctx)?;
             let store = &mut ctx.heap.get_mut(h).elements;
             store.extend(mine.iter().copied().filter(|&v| !other_has(v)));
             store.extend(other.iter().copied().filter(|&v| !mine_has(v)));
-            Ok(result)
+            Ok(JsValue::object(h))
         }
         // 24.2.3.8: every element of `this` is in the argument.
         SetOp::IsSubsetOf => {

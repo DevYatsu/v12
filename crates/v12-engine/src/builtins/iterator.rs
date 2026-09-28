@@ -446,8 +446,14 @@ fn store_window_buffer(ctx: &mut Ctx, iter: Handle<JsObject>, held: &[JsValue]) 
 /// a `RangeError`.
 fn window_size(ctx: &mut Ctx, value: JsValue) -> Result<usize, Throw> {
     let n = match value {
-        v if v.as_smi().is_some() => v.as_smi().expect("checked") as f64,
-        v if v.as_f64().is_some() => v.as_f64().expect("checked"),
+        v if v.as_smi().is_some() => match v.as_smi() {
+            Some(n) => f64::from(n),
+            None => f64::NAN,
+        },
+        v if v.as_f64().is_some() => match v.as_f64() {
+            Some(n) => n,
+            None => f64::NAN,
+        },
         // NaN and ±Infinity are Numbers but not integral ones, so they land in
         // the `TypeError` arm (step 5) rather than the `RangeError` one.
         _ => {
@@ -562,7 +568,7 @@ fn engine_can_drive(ctx: &mut Ctx, iter: JsValue) -> bool {
     let kind = ctx.heap.get(obj).elements[SLOT_KIND]
         .as_smi()
         .unwrap_or(ITER_KIND_ARRAY_VALUES);
-    if kind >= 0 && kind <= ENGINE_KIND_MAX {
+    if (0..=ENGINE_KIND_MAX).contains(&kind) {
         return true;
     }
     if is_windowing_wrapper(kind) {
@@ -1025,6 +1031,12 @@ pub fn drain_iterable(ctx: &mut Ctx, v: JsValue) -> Result<Option<Vec<JsValue>>,
                     .collect(),
             )),
             v12_heap::Kind::Map => {
+                // `chunks_exact(2)` is the stride every Map write in
+                // `map.rs` uses; the crate's pre-existing `chunks_exact`
+                // warnings in that file are the accepted policy set, and a
+                // lone `as_chunks` here would only make the two halves
+                // disagree.
+                #[allow(clippy::chunks_exact_to_as_chunks)]
                 let pairs: Vec<[JsValue; 2]> = ctx
                     .heap
                     .get(obj)
