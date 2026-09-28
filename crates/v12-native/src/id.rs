@@ -556,9 +556,9 @@ pub enum NativeId {
     IteratorConcat = 3515,
     // Keyed promise combinators (spec 27.2.4.x).
     //
-    // Bodies and dispatch arms are landed, but the *install* site is
-    // `realm.rs`'s `Promise` statics table, which is outside this lane's file
-    // ownership. See the report note: one line there completes the surface.
+    // These need no interpreter seam, so they are installed by
+    // `builtins::install_keyed_promise_combinators` rather than by the realm's
+    // `Promise` statics table — see that function for why.
     /// `Promise.allKeyed(iterable)`.
     PromiseAllKeyed = 3516,
     /// `Promise.allSettledKeyed(iterable)`.
