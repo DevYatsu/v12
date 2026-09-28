@@ -197,3 +197,139 @@ fn long_loop_without_captured_bindings_is_unaffected() {
         "1000"
     )
 }
+
+// ---------------------------------------------------------------------------
+// C-style `for` (D2): the loop form that had no per-iteration environment at
+// all.
+//
+// `for-of` and `for-in` call `emit_per_iteration_env`; `for_loop` never did, so
+// a captured `let` counter was one slot aliased across every iteration and
+// every closure saw the final value:
+//     for (let i = 0; i < 3; i++) g.push(() => i)   // 3,3,3 -- spec: 0,1,2
+// The fix reuses D1's machinery wholesale: same push, same bias rule, same
+// `LoopCtx::per_iter_env` pop on every exit.
+// ---------------------------------------------------------------------------
+
+/// The defect itself: a captured `for` counter is per-iteration (spec
+/// `ForBodyEvaluation`'s `perIterationBindings`).
+#[test]
+fn for_statement_binding_is_per_iteration() {
+    assert_eq!(
+        eval_display(
+            "function f() { let g = []; for (let i = 0; i < 3; i++) { g.push(() => i); } return [g[0](), g[1](), g[2]()].join(','); } f()"
+        ),
+        "0,1,2"
+    );
+}
+
+/// Two captured bindings in one head: the gate checks *every* declarator, so a
+/// first-declarator-only check would regress this.
+#[test]
+fn for_statement_with_two_captured_bindings_is_per_iteration() {
+    assert_eq!(
+        eval_display(
+            "function f() { let g = []; for (let i = 0, j = 10; i < 3; i++, j++) { g.push(() => i + ':' + j); } return [g[0](), g[1](), g[2]()].join(','); } f()"
+        ),
+        "0:10,1:11,2:12"
+    );
+}
+
+/// A `const` head is a per-iteration binding too, and the update expression
+/// cannot assign to it -- so this also pins that the gate is the declaration
+/// *kind*, not assignability.
+#[test]
+fn const_for_statement_binding_is_per_iteration() {
+    assert_eq!(
+        eval_display(
+            "function f() { let g = []; for (const c = 7, n = 0; n < 3; n++) { g.push(() => c); } return [g[0](), g[1](), g[2]()].join(','); } f()"
+        ),
+        "7,7,7"
+    )
+}
+
+/// The `continue` path, and the reason the push sits *after* the test: `i` has
+/// to be incremented exactly once per iteration, which only holds if the update
+/// expression runs against the enclosing environment the test also read.
+#[test]
+fn continue_in_for_statement_still_advances_the_counter_once() {
+    assert_eq!(
+        eval_display(
+            "function f() { let g = []; for (let i = 0; i < 4; i++) { if (i === 2) continue; g.push(() => i); } return [g[0](), g[1](), g[2]()].join(','); } f()"
+        ),
+        "0,1,3"
+    );
+}
+
+/// `break` out of a C-style `for`: the pop has to be on that path too, or the
+/// rest of the frame resolves one hop too shallow.
+#[test]
+fn break_out_of_for_statement_pops_the_per_iteration_environment() {
+    assert_eq!(
+        eval_display(
+            "function f() { let acc = 0; function bump() { acc = acc + 1; } for (let i = 0; i < 5; i++) { bump(); break; } bump(); return acc; } f()"
+        ),
+        "2"
+    )
+}
+
+/// A `for` with no test (`for (;;)`) has no exit test, so the push is
+/// unconditional there; the `break` is the only way out and must pop.
+#[test]
+fn infinite_for_statement_break_pops_the_per_iteration_environment() {
+    assert_eq!(
+        eval_display(
+            "function f() { let acc = 0; function bump() { acc = acc + 1; } let i = 0; for (;;) { bump(); i++; if (i === 3) break; } return acc; } f()"
+        ),
+        "3"
+    )
+}
+
+/// Nested C-style `for`s with a labeled `break` and a labeled `continue`: two
+/// per-iteration environments are created, and each exit has to retire the
+/// right number of them.
+#[test]
+fn nested_for_statements_pop_exactly_the_exited_environments() {
+    assert_eq!(
+        eval_display(
+            "function f() { let g = []; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { g.push(() => i + ':' + j); if (j === 1) continue outer; } } return g.map(function (fn) { return fn(); }).join(','); } f()"
+        ),
+        "0:0,0:1,1:0,1:1,2:0,2:1"
+    )
+}
+
+/// Negative control: an uncaptured C-style `for` counter is a register local
+/// and must never get an environment.
+#[test]
+fn uncaptured_for_statement_counter_is_unaffected() {
+    assert_eq!(
+        eval_display("function f() { let acc = 0; for (let i = 0; i < 100; i++) { acc = acc + i; } return acc; } f()"),
+        "4950"
+    )
+}
+
+/// Negative control: `var` in a C-style `for` head has no per-iteration
+/// bindings and must keep aliasing (spec 14.7.4.7).
+#[test]
+fn var_for_statement_counter_still_aliases() {
+    assert_eq!(
+        eval_display(
+            "function f() { let g = []; for (var i = 0; i < 3; i++) { g.push(() => i); } return [g[0](), g[1](), g[2]()].join(','); } f()"
+        ),
+        "3,3,3"
+    )
+}
+
+/// Negative control: a captured counter mixed with a *closure created after*
+/// the loop, which is the case that rules out a compile-time-only correction:
+/// `Closure` captures `frame.env` implicitly, so the loop environment must
+/// really be retired or this closure's depths are off by one.
+#[test]
+fn closure_created_after_a_for_statement_captures_the_right_environment() {
+    assert_eq!(
+        eval_display(
+            "function f() { let tag = 'real'; let n = 0; for (let i = 0; i < 3; i++) { n = n + i; } const get = function () { return tag + n; }; return get(); } f()"
+        ),
+        "real3"
+    )
+}
+

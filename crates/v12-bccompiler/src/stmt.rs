@@ -1343,6 +1343,26 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn for_loop(&mut self, f: &'a oxc_ast::ast::ForStatement<'a>, name: Option<String>) -> Res<()> {
+        // Whether the loop head declares a captured `let`/`const` binding, which
+        // is what makes a per-iteration environment necessary (spec
+        // `ForBodyEvaluation` runs `CreatePerIterationEnvironment` only when
+        // `perIterationBindings` is non-empty). `var` and plain expression
+        // initializers get no per-iteration bindings and keep the single-slot
+        // behavior. Every declarator counts, not just the first: the gate is
+        // "is anything in the head env-resident", so checking one would miss
+        // `for (let i = 0, j = 1; ...)`.
+        let per_iter_decl = match &f.init {
+            Some(ForStatementInit::VariableDeclaration(v)) => {
+                matches!(
+                    v.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                ) && v
+                    .declarations
+                    .iter()
+                    .any(|d| self.per_iteration_env_needed(&d.id))
+            }
+            _ => false,
+        };
         match &f.init {
             None => {}
             Some(ForStatementInit::VariableDeclaration(v)) => self.var_decl(v)?,
@@ -1368,7 +1388,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             let cond = self.expr(test)?;
             self.emit_jump(Opcode::JumpIfFalse, cond, end);
         }
-        self.with_loop(end, Some(cont), name, None, false, |s| s.stmt(&f.body))?;
+        // Pushed *after* the test, so the test and the update expression both
+        // read and write the enclosing environment while the body works in a
+        // copy. That is what makes the counter advance once per iteration
+        // rather than once per body entry.
+        let per_iter_env = per_iter_decl && self.emit_per_iteration_env(f.span);
+        self.with_loop(end, Some(cont), name, None, per_iter_env, |s| s.stmt(&f.body))?;
+        // Normal completion leaves the per-iteration environment before `cont`
+        // (which `continue` targets) and before `end`; `break` and `continue`
+        // pop it inline in `jump_out`.
+        if per_iter_env {
+            self.emit_env_pop(f.span);
+        }
         self.bind(cont); // `continue` re-runs the update expression
         if let Some(update) = &f.update {
             self.expr(update)?;
