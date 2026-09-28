@@ -44,6 +44,30 @@ fn eval_display(src: &str) -> String {
     }
 }
 
+/// Runs `setup`, drains the microtask queue, then evaluates `read`.
+///
+/// `setup` must declare its recording slot with `var`, not `let`: a
+/// script-level `let` lives in a declarative environment that a second
+/// `Engine::eval` cannot see, so the read would fail with a `ReferenceError`
+/// rather than observing the settled value.
+///
+/// Promise assertions are meaningless without the drain: `allKeyed(…).then(…)`
+/// runs its callback in a job, so reading the recorded value in the *same* turn
+/// would see `pending` and pass vacuously — exactly the hazard this file exists
+/// to catch. Splitting setup from read is what makes the assertion about the
+/// settled value rather than about the synchronous return.
+fn eval_then(setup: &str, read: &str) -> String {
+    let mut engine = Engine::new();
+    if let Err(thrown) = engine.eval(setup) {
+        return format!("setup threw: {}", engine.to_display_string(thrown));
+    }
+    engine.run_jobs();
+    match engine.eval(read) {
+        Ok(v) => engine.to_display_string(v),
+        Err(thrown) => format!("threw: {}", engine.to_display_string(thrown)),
+    }
+}
+
 /// Own-property attribute triple of `target[key]`, or a diagnostic string.
 ///
 /// Returns `"MISSING"` when the key is absent, `"ACCESSOR"` when the slot is a
@@ -688,5 +712,163 @@ fn concat_chains_inputs_in_argument_order() {
     assert_eq!(
         eval_display("Iterator.concat(...[[1],[2,3]]).toArray().join('-')"),
         "1-2-3"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Group 4 — keyed promise combinators
+// ---------------------------------------------------------------------------
+
+/// Both statics install with the spec attributes and `length` 1.
+#[test]
+fn keyed_promise_combinators_are_installed() {
+    for name in ["allKeyed", "allSettledKeyed"] {
+        assert_eq!(
+            attr_triple_on("Promise", &format!("'{name}'")),
+            "true,false,true",
+            "Promise.{name}"
+        );
+        assert_eq!(eval_display(&format!("typeof Promise.{name}")), "function");
+    }
+    assert_eq!(eval_display("Promise.allKeyed.length"), "1");
+    assert_eq!(eval_display("Promise.allSettledKeyed.length"), "1");
+}
+
+/// The argument is an **object**, and the fulfillment value is a *null-prototype*
+/// object keyed by its own enumerable string keys (27.2.4.4 /
+/// `CreateKeyedPromiseCombinatorResultObject`).
+///
+/// `eval_then` reads the settled value: without the job drain the
+/// callback would not have run and the assertion would pass on `pending`.
+#[test]
+fn all_keyed_resolves_with_a_null_prototype_object() {
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allKeyed({first: 1, second: 2}).then(r => {
+               out = (Object.getPrototypeOf(r) === null ? 'null-proto' : 'has-proto')
+                     + '|' + Object.keys(r).join('-') + '|' + r.first + ',' + r.second; });",
+            "out",
+        ),
+        "null-proto|first-second|1,2"
+    );
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allKeyed({}).then(r => { out = String(Object.keys(r).length); });",
+            "out",
+        ),
+        "0"
+    );
+}
+
+/// Each result property is a data property with default attributes, and the
+/// whole object is extensible.
+#[test]
+fn all_keyed_result_properties_are_plain_data_properties() {
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allKeyed({a: 1}).then(r => {
+               const d = Object.getOwnPropertyDescriptor(r, 'a');
+               out = [d.writable, d.enumerable, d.configurable].join(',')
+                     + '|' + Object.isExtensible(r); });",
+            "out",
+        ),
+        "true,true,true|true"
+    );
+}
+
+/// An inherited key is not an element and a non-enumerable own key is not
+/// either: the spec filters on `[[OwnPropertyKeys]]` then
+/// `[[GetOwnProperty]].[[Enumerable]]`, in that order.
+#[test]
+fn all_keyed_ignores_inherited_and_non_enumerable_keys() {
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             const input = Object.create({inherited: 1});
+             input.own = 2;
+             Object.defineProperty(input, 'hidden', {value: 3, enumerable: false});
+             Promise.allKeyed(input).then(r => { out = Object.keys(r).join(','); });",
+            "out",
+        ),
+        "own"
+    );
+}
+
+/// A promise value is unwrapped and its payload lands under the key.
+#[test]
+fn all_keyed_unwraps_promise_values() {
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allKeyed({a: Promise.resolve(5)}).then(r => { out = String(r.a); });",
+            "out",
+        ),
+        "5"
+    );
+}
+
+/// A non-object argument **rejects** the returned promise; it does not throw
+/// synchronously (`arg-not-object-reject.js`). Both halves are asserted, since
+/// an implementation that threw would leave `out` at `pending` and the
+/// throw-half would show it.
+#[test]
+fn all_keyed_rejects_a_non_object_argument_instead_of_throwing() {
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allKeyed(5).then(() => { out = 'fulfilled'; },
+                                () => { out = 'rejected'; });",
+            "out",
+        ),
+        "rejected"
+    );
+    // And the call itself did not throw — a synchronous throw would surface
+    // here instead.
+    assert_eq!(
+        eval_display(
+            "(() => { try { Promise.allKeyed(undefined); return 'no sync throw'; } catch (e) { return 'threw'; } })()"
+        ),
+        "no sync throw"
+    );
+}
+
+/// `allSettledKeyed` wraps each element in a `{status, value}` record and never
+/// rejects.
+#[test]
+fn all_settled_keyed_wraps_each_element_in_a_status_record() {
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allSettledKeyed({a: 1}).then(r => { out = r.a.status + ':' + r.a.value; });",
+            "out",
+        ),
+        "fulfilled:1"
+    );
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allSettledKeyed({}).then(r => {
+               out = (Object.getPrototypeOf(r) === null ? 'null-proto' : 'has-proto'); });",
+            "out",
+        ),
+        "null-proto"
+    );
+}
+
+/// A rejected element is a `rejected` record, and the aggregate still fulfils.
+#[test]
+fn all_settled_keyed_records_a_rejection_without_rejecting() {
+    assert_eq!(
+        eval_then(
+            "var out = 'pending';
+             Promise.allSettledKeyed({a: Promise.reject(new Error('x'))}).then(
+               r => { out = r.a.status; },
+               () => { out = 'AGGREGATE REJECTED'; });",
+            "out",
+        ),
+        "rejected"
     );
 }

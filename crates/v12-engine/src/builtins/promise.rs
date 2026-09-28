@@ -2175,6 +2175,268 @@ pub fn promise_race(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     Ok(aggregate_v)
 }
 
+/// `Promise.allKeyed(iterable)` — 27.2.4.4.
+///
+/// The argument is an **object**, not an iterable of `[key, value]` pairs: the
+/// spec reads `[[OwnPropertyKeys]]`, filters by each key's `[[Enumerable]]`,
+/// then `[[Get]]s` every survivor, and the fulfillment value is an object
+/// keyed the same way. Reading it as a two-value iterator per element — which
+/// is roughly what an object argument *looks like* from the inside — would
+/// produce an array where the spec has an object, and would include inherited
+/// and non-enumerable keys the spec excludes.
+///
+/// The result object is `OrdinaryObjectCreate(null)` — a *null* prototype —
+/// with one all-default-attribute data property per key, in key order
+/// (`CreateKeyedPromiseCombinatorResultObject`). That is the whole observable
+/// of the fulfillment value and `result-property-descriptors.js` checks it.
+///
+/// A non-object argument **rejects** the aggregate (27.2.4.4 step 3) rather
+/// than throwing: `arg-not-object-reject.js` asserts the rejection, so a
+/// synchronous throw would be a different, wrong behaviour.
+///
+/// Known boundary: a *thenable* (an object with a `then` method) is treated as
+/// a plain value, so `allKeyed({a: {then(f){…}}})` fulfils with the thenable
+/// rather than adopting it. Unwrapping one is a `Call` on user code, which is
+/// what `Interp::run_promise_combinator` exists for — in the barred
+/// `call_setup.rs`. Real promise objects, the overwhelmingly common input, go
+/// through the settlement machinery below.
+pub fn promise_all_keyed(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    keyed_combinator(ctx, this, args, false)
+}
+
+/// `Promise.allSettledKeyed(iterable)` — 27.2.4.5. Same argument and result
+/// shape as [`promise_all_keyed`]; each element becomes a
+/// `{status, value}` / `{status, reason}` record instead of being propagated,
+/// and the aggregate never rejects.
+pub fn promise_all_settled_keyed(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    keyed_combinator(ctx, this, args, true)
+}
+
+/// Shared body of the two keyed combinators. `settled` selects
+/// `PerformPromiseAllKeyed` from `PerformPromiseAllSettledKeyed`.
+fn keyed_combinator(
+    ctx: &mut Ctx,
+    this: JsValue,
+    args: &[JsValue],
+    settled: bool,
+) -> Result<JsValue, Throw> {
+    let prototype = this
+        .as_object()
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
+    let aggregate = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
+    let aggregate_v = JsValue::object(aggregate);
+    let sink = ctx.pending.clone().unwrap_or_default();
+    let arg = args.first().copied().unwrap_or(JsValue::undefined());
+
+    let Some(input) = arg.as_object() else {
+        let reason = ctx
+            .type_error(format!(
+                "TypeError: Promise.{} requires an object",
+                if settled { "allSettledKeyed" } else { "allKeyed" }
+            ))
+            .into_js(ctx.heap);
+        settle_sync(ctx.heap, &sink, aggregate, STATE_REJECTED, reason);
+        return Ok(aggregate_v);
+    };
+
+    // Own keys first, then the enumerability filter: an inherited or hidden key
+    // is not an element, and its absence shows up in the result's own key set.
+    let (shape, own_keys) = {
+        let o = ctx.heap.get(input);
+        (ctx.heap.shape_of(input), o.property_keys.clone())
+    };
+    let mut keys: Vec<v12_heap::PropKey> = Vec::new();
+    let mut values: Vec<JsValue> = Vec::new();
+    for key in own_keys.into_iter().flatten() {
+        let Some(desc) = ctx.heap.lookup_property(shape, key) else {
+            continue;
+        };
+        if !desc.attrs().enumerable() {
+            continue;
+        }
+        let value = crate::internal_methods::dispatch_get(ctx.heap, input, key, arg)
+            .map_err(Throw::Value)?;
+        keys.push(key);
+        values.push(value);
+    }
+
+    // Pending inputs are watched by host-closure reaction records appended to
+    // each input's own reactions — the same no-polling shape `promise_all` uses,
+    // so a never-settling input costs nothing and cannot spin the drain. The
+    // per-element payloads land in a scratch array; the keys are shared behind
+    // an `Rc` because a `FnMut` job capture has to be `'static`.
+    let slots = ctx.heap.alloc(JsObject::array(vec![
+        JsValue::undefined();
+        values.len()
+    ]));
+    ctx.heap.add_pinned_root(slots);
+    let shared_keys = Rc::new(keys);
+    let remaining = Rc::new(RefCell::new(values.len()));
+    for (index, value) in values.iter().copied().enumerate() {
+        match promise_settlement(ctx.heap, value) {
+            Some((_, STATE_FULFILLED, payload)) => {
+                let recorded = if settled {
+                    fulfilled_record(ctx.heap, payload)
+                } else {
+                    payload
+                };
+                ctx.heap.get_mut(slots).set_element(index as u32, recorded);
+                *remaining.borrow_mut() -= 1;
+            }
+            Some((input_obj, STATE_PENDING, _)) => {
+                let slots_f = slots;
+                let keys_f = Rc::clone(&shared_keys);
+                let rem_f = Rc::clone(&remaining);
+                let agg = aggregate;
+                let sink_f = Rc::clone(&sink);
+                let fulfill = alloc_host(ctx.heap, move |heap, _this, args| {
+                    let payload = args.first().copied().unwrap_or(JsValue::undefined());
+                    heap.get_mut(slots_f).set_element(index as u32, payload);
+                    *rem_f.borrow_mut() -= 1;
+                    if *rem_f.borrow() == 0 {
+                        let done = build_keyed_result(heap, &keys_f, slots_f, settled);
+                        settle_sync(heap, &sink_f, agg, STATE_FULFILLED, done);
+                    }
+                    Ok(JsValue::undefined())
+                });
+                let agg = aggregate;
+                let sink_r = Rc::clone(&sink);
+                let keys_r = Rc::clone(&shared_keys);
+                let rem_r = Rc::clone(&remaining);
+                let reject = alloc_host(ctx.heap, move |heap, _this, args| {
+                    let reason = args.first().copied().unwrap_or(JsValue::undefined());
+                    if !settled {
+                        // `allKeyed` rejects the aggregate at once.
+                        settle_sync(heap, &sink_r, agg, STATE_REJECTED, reason);
+                        return Ok(JsValue::undefined());
+                    }
+                    // `allSettledKeyed` records the rejection and carries on.
+                    let record = rejected_record(heap, reason);
+                    heap.get_mut(slots).set_element(index as u32, record);
+                    *rem_r.borrow_mut() -= 1;
+                    if *rem_r.borrow() == 0 {
+                        let done = build_keyed_result(heap, &keys_r, slots, settled);
+                        settle_sync(heap, &sink_r, agg, STATE_FULFILLED, done);
+                    }
+                    Ok(JsValue::undefined())
+                });
+                push_record(ctx.heap, input_obj, fulfill, reject);
+            }
+            Some((_, _, reason)) => {
+                if !settled {
+                    // Already-rejected input: the aggregate rejects at once, and
+                    // the pending inputs' watchers no-op against it.
+                    settle_sync(ctx.heap, &sink, aggregate, STATE_REJECTED, reason);
+                    return Ok(aggregate_v);
+                }
+                let record = rejected_record(ctx.heap, reason);
+                ctx.heap.get_mut(slots).set_element(index as u32, record);
+                *remaining.borrow_mut() -= 1;
+            }
+            None => {
+                // A non-promise value counts as fulfilled with itself.
+                let recorded = if settled {
+                    fulfilled_record(ctx.heap, value)
+                } else {
+                    value
+                };
+                ctx.heap.get_mut(slots).set_element(index as u32, recorded);
+                *remaining.borrow_mut() -= 1;
+            }
+        }
+    }
+    if *remaining.borrow() == 0 {
+        let result = build_keyed_result(ctx.heap, &shared_keys, slots, settled);
+        settle_sync(ctx.heap, &sink, aggregate, STATE_FULFILLED, result);
+    }
+    Ok(aggregate_v)
+}
+
+/// `{status: "fulfilled", value}` — the `allSettledKeyed` record for a
+/// fulfilment (27.2.4.5 step 8). An ordinary object with default attributes.
+fn fulfilled_record(heap: &mut Heap, value: JsValue) -> JsValue {
+    let obj = heap.alloc(JsObject::default());
+    heap.add_pinned_root(obj);
+    let status = JsValue::string(heap.intern_text("fulfilled"));
+    let status_key = record_key(heap, "status");
+    let value_key = record_key(heap, "value");
+    add_keyed_data_prop(heap, obj, status_key, status);
+    add_keyed_data_prop(heap, obj, value_key, value);
+    JsValue::object(obj)
+}
+
+/// `{status: "rejected", reason}` — the `allSettledKeyed` record for a
+/// rejection.
+fn rejected_record(heap: &mut Heap, reason: JsValue) -> JsValue {
+    let obj = heap.alloc(JsObject::default());
+    heap.add_pinned_root(obj);
+    let status = JsValue::string(heap.intern_text("rejected"));
+    let status_key = record_key(heap, "status");
+    let reason_key = record_key(heap, "reason");
+    add_keyed_data_prop(heap, obj, status_key, status);
+    add_keyed_data_prop(heap, obj, reason_key, reason);
+    JsValue::object(obj)
+}
+
+/// Interns a record field's name into a `PropKey`.
+fn record_key(heap: &mut Heap, name: &str) -> v12_heap::PropKey {
+    v12_heap::PropKey::from_string(heap.intern_text(name))
+}
+
+/// The keyed aggregate's fulfillment value:
+/// `CreateKeyedPromiseCombinatorResultObject(entries)` — a null-prototype
+/// object with one default-attribute data property per key, in key order.
+fn build_keyed_result(
+    heap: &mut Heap,
+    keys: &[v12_heap::PropKey],
+    slots: v12_heap::Handle<JsObject>,
+    _settled: bool,
+) -> JsValue {
+    let result = heap.alloc(JsObject::default());
+    heap.add_pinned_root(result);
+    let payloads = heap.get(slots).elements_snapshot();
+    for (index, key) in keys.iter().enumerate() {
+        let value = payloads
+            .get(index)
+            .copied()
+            .unwrap_or(JsValue::undefined());
+        add_keyed_data_prop(heap, result, *key, value);
+    }
+    JsValue::object(result)
+}
+
+/// `CreateDataPropertyOrThrow(obj, key, value)` with default attributes, on a
+/// bare `&mut Heap`.
+///
+/// `Ctx` exposes string-keyed and symbol-keyed installs but not the general
+/// case, and these bodies run inside a job where only `&mut Heap` is
+/// available; `ctx.rs` is outside this lane's ownership. Mirrors
+/// `Ctx::define_data_prop_with_attrs` step for step.
+fn add_keyed_data_prop(
+    heap: &mut Heap,
+    obj: v12_heap::Handle<JsObject>,
+    key: v12_heap::PropKey,
+    value: JsValue,
+) {
+    let shape = heap.shape_of_mut(obj);
+    let child = heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
+    heap.bind_shape(obj, child);
+    let slot = (heap.get(child).num_own - 1) as usize;
+    let settings = heap.get_mut(obj);
+    if settings.properties.len() <= slot {
+        settings.properties.resize(slot + 1, JsValue::hole());
+    }
+    if settings.property_keys.len() <= slot {
+        settings.property_keys.resize(slot + 1, None);
+    }
+    settings.properties[slot] = value;
+    settings.property_keys[slot] = Some(key);
+}
+
 /// `Promise.prototype.finally(on_finally)`: runs `on_finally` when `this`
 /// settles, passing the original outcome through.
 ///

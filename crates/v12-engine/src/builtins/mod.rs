@@ -904,6 +904,9 @@ macro_rules! define_builtins {
             // supply the per-registry compiled-pattern cache these bodies
             // require (`Ctx::regex_cache`).
             install_string_regex_methods(heap, targets);
+            // Keyed promise combinators: the one install this pass makes that
+            // the macro's target table cannot express (see the function's doc).
+            install_keyed_promise_combinators(heap);
         }
     };
 }
@@ -1348,6 +1351,55 @@ define_builtins! {
     DateProtoToGmtString => |heap, this, args| call_ctx(date::date_proto_to_utc_string, heap, this, args),
     DateProtoToPrimitive => |heap, this, args| call_ctx(date::date_proto_to_primitive, heap, this, args),
     DateProtoToTemporalInstant => |heap, this, args| call_ctx(date::date_proto_to_temporal_instant, heap, this, args),
+    // Keyed promise combinators (27.2.4). Dispatch arms only: the *install*
+    // happens in `install_keyed_promise_combinators` below, because the
+    // `Promise` constructor is not a `BuiltinTargets` field — the realm
+    // installs the `Promise` statics by hand, since all of them need the
+    // interpreter seam. These two do not (they read own keys and `Get`, both
+    // pure heap), so the install pass reaches the constructor through the
+    // global's `GLOBAL_INTRINSICS` slot instead of adding a targets field.
+    PromiseAllKeyed => |heap, this, args| call_ctx(promise::promise_all_keyed, heap, this, args),
+    PromiseAllSettledKeyed => |heap, this, args| call_ctx(promise::promise_all_settled_keyed, heap, this, args),
+}
+
+/// Installs `Promise.allKeyed` and `Promise.allSettledKeyed` on the realm's
+/// `Promise` constructor.
+///
+/// Why not the `Promise` group in `define_builtins!`:
+/// [`BuiltinTargets`] has no `promise` field, and adding one would mean
+/// editing `realm.rs`'s `BuiltinTargets` literal — outside this lane's file
+/// ownership. The `Promise` statics are installed by the realm rather than by
+/// the macro precisely because `all`/`race`/`any`/`allSettled`/`withResolvers`/
+/// `try`/`then`/`catch`/`finally` all need the interpreter seam; these two
+/// need only own-key enumeration, a `[[Get]]`, and the existing reaction-record
+/// machinery, so the macro's install path is a better fit.
+///
+/// Idempotent by construction: the pass is skipped when the realm global is
+/// absent, and `define_method` is only reached for a `Promise` that does not
+/// already carry the names, so a later move of the `Promise` statics into the
+/// macro cannot double-install.
+fn install_keyed_promise_combinators(heap: &mut Heap) {
+    let Some(idx) = v12_bytecode::GLOBAL_INTRINSICS.iter().position(|n| *n == "Promise") else {
+        return;
+    };
+    let Some(global) = heap.realm_globals().first().copied() else {
+        return;
+    };
+    let Some(ctor) = heap.get(global).properties.get(idx).copied().and_then(|v| v.as_object())
+    else {
+        return;
+    };
+    let mut ctx = Ctx::new(heap, Some(global), None);
+    for (name, id) in [
+        ("allKeyed", NativeId::PromiseAllKeyed),
+        ("allSettledKeyed", NativeId::PromiseAllSettledKeyed),
+    ] {
+        let key = v12_heap::PropKey::from_string(ctx.heap.intern_text(name));
+        if ctx.heap.lookup_property(ctx.heap.shape_of(ctor), key).is_some() {
+            continue;
+        }
+        ctx.define_method(Some(ctor), name, id, Some(1));
+    }
 }
 
 /// Installs the `Reflect` static methods onto `targets.reflect`.
