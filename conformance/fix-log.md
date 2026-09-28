@@ -1214,4 +1214,77 @@ core: 15266 tests, 8996 pass   core = 58.9 %
 ```
 
 In-scope failures **6 264 → 6 178**. `built-ins/Iterator` is now 278/654 = 42.5 %, from 14/654 = 2.1 % at session start.
+### 2026-09-27 — ⚠ CRITICAL: `class … extends` leaks a permanent environment; closure writes silently corrupt
+
+Found while diagnosing an `InternalError: environment slot out of range` cluster. **No code landed** — the fix sites are in `v12-bccompiler` and `v12-bytecode`, outside the dispatched write scope. This is the highest-severity finding of the burn-down and it is recorded here so it is not lost.
+
+#### The structural gap
+
+`crates/v12-bccompiler/src/class.rs:42-44`:
+
+```rust
+if has_super {
+    cx.emit_new_env(0, SUPER_ENV_SLOTS, span);
+}
+```
+
+This emits `NewEnvironment` for the class scope, which the interpreter implements as a **permanent, un-popped head-shift of the frame's env chain** — `crates/v12-interp/src/execute.rs:795-799` (narrow) and `:314-321` (wide):
+
+```rust
+let h = self.heap.alloc(JsObject::environment(slots, parent));
+env_display_push(&mut frame.env_display, h);
+frame.env = Some(h);
+```
+
+**There is no `PopEnvironment` opcode anywhere in the workspace** (verified: `grep -rn "PopEnvironment\|pop_environment" crates/` returns nothing). So the compiler's static env-depth model never accounts for the class env, while the runtime chain permanently gains it. Every later `GetEnvSlot`/`SetEnvSlot` at `depth=0` in that unit resolves against the class env instead of the function's own env, raising the error at `crates/v12-interp/src/lib.rs:1582` (read) / `:1617` (write). The gate is `has_super`: a class without heritage emits no env and is unaffected.
+
+#### Independently verified — and it is SILENT DATA CORRUPTION, not just a thrown error
+
+I confirmed the mechanism by probe against the current binary. The trigger is narrow and specific:
+
+| case | v12 result | correct |
+|---|---|---|
+| closure writes an outer `let`, **no class** | `1` | ✓ |
+| same, `class T { m(){} }` (no `extends`) | `1` | ✓ |
+| same, **`class T extends Object { m(){} }`** | **`function`** | ✗ |
+| *direct* write after an extending class (`acc = 5`) | `5` | ✓ |
+
+```js
+function h() {
+  let acc = 0;
+  function bump() { acc = acc + 1; }
+  class T extends Object { m() {} }   // <-- the trigger
+  bump();
+  return acc;                          // v12: "function", spec: 1
+}
+```
+
+**The read path and the direct write path are both correct.** Only a *closure writing a captured `let`* corrupts, and it corrupts to a wrong **value** rather than raising. Any script combining `class X extends Y`, an env-allocated local, and a closure write to that local is silently wrong — whether or not it surfaces as one of the 22 failing tests. That is a much larger exposure than any pass count suggests.
+
+**Correction to the original diagnosis:** the minimal repro offered with this finding (`class` at top level, reading two env locals afterwards) does **not** reproduce — it returns the correct value. The class must be inside the function that owns the captured env. The correlation and mechanism are sound; the reduction was imprecise.
+
+#### Blast radius: 22 measured, `language/` unmeasured
+
+**22/22** of the tests failing with `environment slot out of range` contain `class … extends` — the three apparently unrelated families are all the same bug: the Promise tests declare `class Custom extends Promise {}`, the String test `class RE extends RegExp`, the Iterator tests `class TestIterator extends Iterator`. The `*-throws` filenames are coincidental; what matters is an env-resident access *after* the class statement.
+
+Because the defect is in the **compiler**, its exposure to `language/` has not been measured. 22 is a floor, not an estimate. Any `language/` failure involving an extending class plus closures should be re-checked against this.
+
+#### Fix shape — the information does not exist at runtime today
+
+The bytecode carries no scope-exit marker, so the interpreter cannot know where the class scope ends. Two viable directions:
+
+1. **Compiler-side** — do not leave the class env as the frame's innermost env (compile the class scope so it is popped or not installed as the frame head). Keeps the opcode set unchanged.
+2. **New opcode** — add `PopEnvironment` (plus its `v12-bytecode` width/decoder table entry) and have `class.rs` emit it after the class unit is built.
+
+Direction 1 is smaller and avoids touching the decoder sweep; direction 2 is more general and would also serve any future construct that needs a transient env. Either spans `v12-bccompiler` and `v12-bytecode`, which is why the dispatched lane could not land it.
+
+#### Also found: `BigInt ToString` chokepoint (3 tests, not fixed)
+
+`crates/v12-interp/src/ops.rs:299-303` in `to_js_string`. Every path funnels there — `String()` via `run_string_construct` (`call_setup.rs:2717`) only delegates to `to_string_value` (`ops.rs:619`), and `+`, templates, property keys and display likewise, so the interpreter is a pure caller and no correct fix is reachable from `call_setup.rs`/`execute.rs`/`lib.rs`. **It does not need BigInt arithmetic:** `V12BigInt` is `sign: bool` plus a little-endian base-256 `magnitude_le` (`crates/v12-heap/src/object.rs:867-873`), so decimal conversion is a short self-contained routine. A real 3-test win once scope allows. Deferred-topic invariance held: `built-ins/BigInt` still reports `skip=64` of 77.
+
+#### Process note: a briefed baseline file had gone missing
+
+The dispatched lane was pointed at `/tmp/bi-iter3.json` for its fail-set baseline and it no longer existed, so it could not produce FIXED/BROKE/MARGINAL. It correctly refused to substitute a pass-rate eyeball, and instead noted the tree is byte-identical to `290c5d7f` so nothing could have regressed, with its run at 8 997 pass vs the briefed 8 998 — a −1 run-to-run delta against a vanished baseline. That is the right call, and it is a reminder that `/tmp` is not a durable store: **conformance baselines belong in the repo or in a named, checked-in location, not in `/tmp`.**
+
+Workspace gate unchanged at **1 105 passed / 2 skipped**. No conformance number moved.
 <!-- Future entries go above this line -->
