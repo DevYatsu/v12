@@ -771,20 +771,79 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// that iteration's binding instead of aliasing one slot across all
     /// iterations. `var` bindings keep the old single-slot behavior
     /// (caller-gated on the declaration kind).
-    fn emit_per_iteration_env(&mut self, span: Span) {
+    ///
+    /// The push goes through the raw [`Self::emit_new_env`], **not**
+    /// [`Self::emit_scoped_env`], and deliberately leaves `env_bias` at zero.
+    /// A per-iteration environment is not a foreign scope shadowing the unit's
+    /// own environment the way a class scope is: it is a fresh *instance of
+    /// the unit's own* environment — the same `env_slot_count` slots at the
+    /// same indices, which is exactly what the copy-forward below relies on.
+    /// So depth 0 must keep naming it, and biasing the body would send every
+    /// `let` read/write in the body into the copy's *parent* instead.
+    ///
+    /// The matching [`Self::emit_env_pop`] is mandatory, on every exit. A
+    /// per-iteration environment whose parent is the previous iteration's
+    /// environment makes the chain grow one hop per runtime iteration, which
+    /// no compile-time depth bias can model: the bias is fixed at compile time
+    /// but the chain depth is not. The body's fallthrough pop and the
+    /// abrupt-exit pops ([`Self::emit_per_iteration_pops`], driven by
+    /// `LoopCtx::per_iter_env`) are what keep it bounded.
+    ///
+    /// Returns whether a push was actually emitted, so the caller can hand the
+    /// same answer to the loop context and to the fallthrough pop. Nothing is
+    /// pushed when the unit owns no environment at all (`env_slot_count == 0`).
+    ///
+    /// # Known gap: block-scoped bindings in a loop body still alias
+    ///
+    /// This covers the *loop variable* only. A `let`/`const` declared in the
+    /// loop **body block** aliases across iterations too, and is not fixed:
+    ///
+    /// ```js
+    /// var j = 0; while (j < 3) { let k = j; out.push(() => k); j++; }
+    /// // out[0]() -- spec: 0, got: 2
+    /// ```
+    ///
+    /// Two things are missing, and the first is the blocker.
+    ///
+    /// 1. **Detection.** [`Self::per_iteration_env_needed`] answers "is *this
+    ///    binding pattern* env-resident", which is the right question for a
+    ///    loop head because the head is a pattern. A block body is a statement
+    ///    list, so the question becomes "does *this block* declare an
+    ///    env-resident binding", and nothing in the plan can answer it:
+    ///    `UnitPlan` is per-*unit* (`vars`, `env_slots`, `env_slot_count` are all
+    ///    unit-wide) with no per-block record. Answering it needs a new
+    ///    per-block structure in `Plans`/`UnitPlan` plus a `collect.rs` walk to
+    ///    populate it — the data-model change to weigh before attempting this.
+    /// 2. **Exit bookkeeping.** `LoopCtx::per_iter_env` is a per-loop *bool*,
+    ///    which is sufficient only while loops are the sole creators of these
+    ///    environments: an abrupt exit then pops exactly one per exited loop.
+    ///    Block environments nest arbitrarily, so an exit has to pop a *count*
+    ///    relative to its target. That means recording a scoped-environment
+    ///    depth in `LoopCtx` and `FinallyCtx` and updating `jump_out` and
+    ///    `run_finally_copies` — which duplicates finalizers *inline* at every
+    ///    exit point, so a duplicated finalizer containing a `break` needs the
+    ///    same depth bookkeeping, recursively.
+    ///
+    /// Do not paper over this with a bias: CONTEXT.md records that a
+    /// compile-time bias for the sibling class-scope defect broke 44 tests to
+    /// fix 2. The honest gate is the spec value in the snippet above.
+    fn emit_per_iteration_env(&mut self, span: Span) -> bool {
         let slots = self.comp.plans.units[self.unit].env_slot_count;
         if slots == 0 {
-            return;
+            return false;
         }
         self.emit_new_env(0, slots, span);
         // The fresh env shadows the prologue env at depth 0: copy every
         // slot forward from the parent so sibling bindings already captured
-        // stay visible at their static slot indices.
+        // stay visible at their static slot indices. Literal depths on
+        // purpose — these are relative to the new head, not resolved
+        // through `access`, so they must not pick up `env_bias`.
         for s in 0..slots {
             let tmp = self.new_temp();
             self.emit_get_env(tmp, 1, s, span);
             self.emit_set_env(0, s, tmp, span);
         }
+        true
     }
 
     /// True when `pat` declares at least one symbol stored in the current
@@ -821,7 +880,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), test.span());
         let cond = self.expr(test)?;
         self.emit_jump(Opcode::JumpIfFalse, cond, end);
-        self.with_loop(end, Some(cont), name, None, |s| s.stmt(body))?;
+        self.with_loop(end, Some(cont), name, None, false, |s| s.stmt(body))?;
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
         self.bind(end);
@@ -839,7 +898,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let end = self.label();
         self.bind(top);
         self.emit_spanned(Instr::new_imm24(Opcode::LoopHeader, 0), body.span());
-        self.with_loop(end, Some(cont), name, None, |s| s.stmt(body))?;
+        self.with_loop(end, Some(cont), name, None, false, |s| s.stmt(body))?;
         self.bind(cont);
         let cond = self.expr(test)?;
         self.emit_jump(Opcode::JumpIfTrue, cond, top);
@@ -909,19 +968,23 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.emit_reg3(Opcode::Await, awaited, value, 0, span);
             self.move_reg(value, awaited, span);
         }
+        // 4b. `let`/`const` loop variables get a fresh per-iteration
+        //     environment when captured; `var` keeps single-slot stores. The
+        //     push must sit *before* the binding store (the store is what the
+        //     iteration's closures end up capturing) and is balanced by the
+        //     pop after the body plus the abrupt-exit pops in `jump_out`.
+        let mut per_iter_env = false;
         match &f.left {
             oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
                 if v.declarations.len() != 1 {
                     return Err(self.err(span, "for-of requires exactly one binding"));
                 }
-                // `let`/`const` loop variables get a fresh per-iteration
-                // environment when captured; `var` keeps single-slot stores.
                 let is_lexical = matches!(
                     v.kind,
                     VariableDeclarationKind::Let | VariableDeclarationKind::Const
                 );
                 if is_lexical && self.per_iteration_env_needed(&v.declarations[0].id) {
-                    self.emit_per_iteration_env(span);
+                    per_iter_env = self.emit_per_iteration_env(span);
                 }
                 self.lower_binding_pattern(&v.declarations[0].id, value)?;
             }
@@ -951,9 +1014,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         // 5. Body: `break` closes the iterator (via the loop ctx); the
         //    exception range closes it when a throw escapes the body.
-        self.with_for_of_loop(end, Some(cont), name, iter, close_guard, |s| {
-            s.stmt(&f.body)
-        })?;
+        self.with_for_of_loop(
+            end,
+            Some(cont),
+            name,
+            iter,
+            close_guard,
+            per_iter_env,
+            |s| s.stmt(&f.body),
+        )?;
+        // Normal completion of the body leaves the per-iteration environment
+        // before `cont`, so `continue` and the `end` label both see the
+        // enclosing chain again. `break` pops it inline in `jump_out`.
+        if per_iter_env {
+            self.emit_env_pop(span);
+        }
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
         // Normal completion exits here WITHOUT closing (spec 14.7.4.8) —
@@ -1285,12 +1360,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
         // `let`/`const` loop variables get a fresh per-iteration environment
         // when captured; `var` keeps the old single-slot behavior.
-        if is_lexical && self.per_iteration_env_needed(pattern) {
-            self.emit_per_iteration_env(f.span);
-        }
+        let per_iter_env =
+            is_lexical && self.per_iteration_env_needed(pattern) && self.emit_per_iteration_env(f.span);
         self.lower_binding_pattern(pattern, key_reg)?;
 
-        self.with_loop(end, Some(cont), name, None, |s| s.stmt(&f.body))?;
+        self.with_loop(end, Some(cont), name, None, per_iter_env, |s| s.stmt(&f.body))?;
+        // Normal completion leaves the per-iteration environment before `cont`;
+        // `break`/`continue` pop it inline in `jump_out`.
+        if per_iter_env {
+            self.emit_env_pop(f.span);
+        }
 
         self.bind(cont);
         self.emit_jump(Opcode::Jump, 0, top);
@@ -1299,6 +1378,26 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     fn for_loop(&mut self, f: &'a oxc_ast::ast::ForStatement<'a>, name: Option<String>) -> Res<()> {
+        // Whether the loop head declares a captured `let`/`const` binding, which
+        // is what makes a per-iteration environment necessary (spec
+        // `ForBodyEvaluation` runs `CreatePerIterationEnvironment` only when
+        // `perIterationBindings` is non-empty). `var` and plain expression
+        // initializers get no per-iteration bindings and keep the single-slot
+        // behavior. Every declarator counts, not just the first: the gate is
+        // "is anything in the head env-resident", so checking one would miss
+        // `for (let i = 0, j = 1; ...)`.
+        let per_iter_decl = match &f.init {
+            Some(ForStatementInit::VariableDeclaration(v)) => {
+                matches!(
+                    v.kind,
+                    VariableDeclarationKind::Let | VariableDeclarationKind::Const
+                ) && v
+                    .declarations
+                    .iter()
+                    .any(|d| self.per_iteration_env_needed(&d.id))
+            }
+            _ => false,
+        };
         match &f.init {
             None => {}
             Some(ForStatementInit::VariableDeclaration(v)) => self.var_decl(v)?,
@@ -1324,7 +1423,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             let cond = self.expr(test)?;
             self.emit_jump(Opcode::JumpIfFalse, cond, end);
         }
-        self.with_loop(end, Some(cont), name, None, |s| s.stmt(&f.body))?;
+        // Pushed *after* the test, so the test and the update expression both
+        // read and write the enclosing environment while the body works in a
+        // copy. That is what makes the counter advance once per iteration
+        // rather than once per body entry.
+        let per_iter_env = per_iter_decl && self.emit_per_iteration_env(f.span);
+        self.with_loop(end, Some(cont), name, None, per_iter_env, |s| s.stmt(&f.body))?;
+        // Normal completion leaves the per-iteration environment before `cont`
+        // (which `continue` targets) and before `end`; `break` and `continue`
+        // pop it inline in `jump_out`.
+        if per_iter_env {
+            self.emit_env_pop(f.span);
+        }
         self.bind(cont); // `continue` re-runs the update expression
         if let Some(update) = &f.update {
             self.expr(update)?;
@@ -1340,11 +1450,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             Statement::WhileStatement(w) => self.while_loop(&w.test, &w.body, Some(name)),
             Statement::DoWhileStatement(d) => self.do_while_loop(&d.body, &d.test, Some(name)),
             Statement::ForStatement(f) => self.for_loop(f, Some(name)),
+            // `for-of`/`for-in` are loops too, so a labeled `continue` on them
+            // is legal (13.12 LabelledItems) and must resolve to the
+            // continuation point. They used to fall through to the arm below,
+            // which registers a break-only target and made
+            // `continue someLabel` a compile error.
+            Statement::ForOfStatement(f) => self.for_of_loop(f, Some(name)),
+            Statement::ForInStatement(f) => self.for_in_loop(f, Some(name)),
             Statement::SwitchStatement(s) => self.switch_stmt(s, Some(name)),
             // Labeled non-loop statement: break-only target.
             body => {
                 let end = self.label();
-                self.with_loop(end, None, Some(name), None, |s| s.stmt(body))?;
+                self.with_loop(end, None, Some(name), None, false, |s| s.stmt(body))?;
                 self.bind(end);
                 Ok(())
             }
@@ -1411,7 +1528,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
         // Phase 2: bodies in source order (fallthrough = straight-line flow).
         self.push_scope(s.scope_id.get());
-        let result = self.with_loop(end, None, name, None, |cx| {
+        let result = self.with_loop(end, None, name, None, false, |cx| {
             let mut bound_default = false;
             for (case, entry) in s.cases.iter().zip(entries) {
                 match entry {
@@ -1482,6 +1599,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         } else {
             self.emit_iterator_closes(pos);
         }
+        // Retire the per-iteration environments of the loops being left, so a
+        // `break`/`continue` does not strand one on the chain. Innermost
+        // first, and *after* the finalizers and iterator closes above: those
+        // belong to code entered inside the loop body, which runs with the
+        // loop's own environment still current.
+        //
+        // Unlike the iterator closes above, the target loop's own environment
+        // goes too even for a `continue` aimed at it: `continue` reaches the
+        // loop's `cont` label, which re-runs the update and jumps back to
+        // `top`, and `top` pushes a *fresh* per-iteration environment. Leaving
+        // the old one on the chain is exactly the unbounded growth this pop
+        // exists to stop. So every loop from `pos` outwards is popped.
+        self.emit_per_iteration_pops(pos);
         self.emit_jump(Opcode::Jump, 0, target);
         Ok(())
     }
