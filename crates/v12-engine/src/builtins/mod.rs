@@ -402,17 +402,18 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::SetIsSubsetOf => Some(1),
         NativeId::SetIsSupersetOf => Some(1),
         NativeId::SetIsDisjointFrom => Some(1),
-        // Iterator helpers added by the same proposal round: `includes` and
-        // `join` default their argument but are declared with one parameter,
-        // and `zip`/`zipKeyed`/`concat` are rest-parameter statics that still
-        // report `length` 1.
+        // Iterator helpers added by the same proposal round. `includes` and
+        // `join` default their argument but are declared with one parameter.
+        // `windows`/`chunks` take one; `windows` takes a second, optional
+        // `undersized`. `zip`/`zipKeyed` take `(iterables, options)` and so
+        // report 1, while `concat` is a rest-parameter static and reports 0.
         NativeId::IteratorIncludes => Some(1),
         NativeId::IteratorJoin => Some(1),
         NativeId::IteratorWindows => Some(1),
         NativeId::IteratorChunks => Some(1),
         NativeId::IteratorZip => Some(1),
         NativeId::IteratorZipKeyed => Some(1),
-        NativeId::IteratorConcat => Some(1),
+        NativeId::IteratorConcat => Some(0),
         // Keyed promise combinators (27.2.4).
         NativeId::PromiseAllKeyed => Some(1),
         NativeId::PromiseAllSettledKeyed => Some(1),
@@ -1071,6 +1072,11 @@ define_builtins! {
     // The `Iterator` constructor's one static (spec 27.1.3).
     Iterator {
         "from" (1) => IteratorFrom => |heap, this, args| call_ctx(iterator::iterator_from, heap, this, args),
+        // Joint iteration (spec 27.1.3). `zip`/`zipKeyed` take
+        // `(iterables, options)`; `concat` is the rest-parameter one.
+        "zip" (1) => IteratorZip => |heap, this, args| call_ctx(iterator::iterator_zip, heap, this, args),
+        "zipKeyed" (1) => IteratorZipKeyed => |heap, this, args| call_ctx(iterator::iterator_zip_keyed, heap, this, args),
+        "concat" (0) => IteratorConcat => |heap, this, args| call_ctx(iterator::iterator_concat, heap, this, args),
     },
     // `%Iterator.prototype%`: the ES2025 iterator helpers (spec 27.1.4-27.1.5).
     // `take`/`drop`/`toArray` are pure-heap (a lazy wrapper / a drain) and run
@@ -1094,6 +1100,14 @@ define_builtins! {
         "some" (1) => IteratorSome => callback_stub,
         "every" (1) => IteratorEvery => callback_stub,
         "find" (1) => IteratorFind => callback_stub,
+        // Eager / lazy helpers added by the same proposal round. `includes` and
+        // `join` drain through the engine's own `pull`, so they work over any
+        // machine-free iterator chain; `windows`/`chunks` build a buffer wrapper
+        // that this engine steps itself (see `iterator::is_windowing_wrapper`).
+        "includes" (1) => IteratorIncludes => |heap, this, args| call_ctx(iterator::iterator_includes, heap, this, args),
+        "join" (1) => IteratorJoin => |heap, this, args| call_ctx(iterator::iterator_join, heap, this, args),
+        "windows" (1) => IteratorWindows => |heap, this, args| call_ctx(iterator::iterator_windows, heap, this, args),
+        "chunks" (1) => IteratorChunks => |heap, this, args| call_ctx(iterator::iterator_chunks, heap, this, args),
     },
     Object {
         "assign" (2) => ObjectAssign => |heap, this, args| call_ctx(object::object_assign, heap, this, args),

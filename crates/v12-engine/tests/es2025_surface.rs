@@ -343,3 +343,350 @@ fn a_string_argument_iterates_by_code_point() {
     );
     assert_eq!(eval_display("new Set().union('\u{1F600}').size"), "1");
 }
+
+// ---------------------------------------------------------------------------
+// Group 3 — Iterator helpers
+// ---------------------------------------------------------------------------
+
+/// `includes`/`join`/`windows`/`chunks` are prototype methods; `zip`/`zipKeyed`/
+/// `concat` are *statics on the `Iterator` constructor*. The second half is the
+/// observable that catches a misreading of the spec — putting them on the
+/// prototype passes every behavioural test that only uses the prototype.
+///
+/// The converse ("and not also on the constructor") is deliberately not
+/// asserted: this realm links `Iterator`'s `[[Prototype]]` to
+/// `%Iterator.prototype%` rather than `%Function.prototype%`, so the prototype's
+/// members read off the constructor. That is a pre-existing link defect in
+/// `realm.rs`, not a property of this install.
+#[test]
+fn iterator_helpers_are_installed_on_the_right_objects() {
+    for name in ["includes", "join", "windows", "chunks"] {
+        assert_eq!(
+            attr_triple_on("Iterator.prototype", &format!("'{name}'")),
+            "true,false,true",
+            "Iterator.prototype.{name}"
+        );
+        assert_eq!(
+            eval_display(&format!("typeof Iterator.prototype.{name}")),
+            "function"
+        );
+    }
+    for name in ["zip", "zipKeyed", "concat"] {
+        assert_eq!(
+            attr_triple_on("Iterator", &format!("'{name}'")),
+            "true,false,true",
+            "Iterator.{name}"
+        );
+        assert_eq!(
+            eval_display(&format!("typeof Iterator.{name}")),
+            "function"
+        );
+        assert_eq!(
+            eval_display(&format!("typeof Iterator.prototype.{name}")),
+            "undefined",
+            "Iterator.{name} must not be a prototype method"
+        );
+    }
+}
+
+/// `zip`/`zipKeyed` take `(iterables, options)` and so report `length` 1;
+/// `concat` is a rest parameter and reports 0. Getting this backwards still
+/// *works* for `concat(a, b)`-shaped calls and only shows up in the arity.
+#[test]
+fn iterator_statics_declare_the_spec_arity() {
+    assert_eq!(eval_display("Iterator.zip.length"), "1");
+    assert_eq!(eval_display("Iterator.zipKeyed.length"), "1");
+    assert_eq!(eval_display("Iterator.concat.length"), "0");
+    assert_eq!(eval_display("Iterator.prototype.includes.length"), "1");
+    assert_eq!(eval_display("Iterator.prototype.join.length"), "1");
+    assert_eq!(eval_display("Iterator.prototype.windows.length"), "1");
+    assert_eq!(eval_display("Iterator.prototype.chunks.length"), "1");
+}
+
+/// An iterator object inherits `%Iterator.prototype%`, so a helper reached only
+/// by ordinary property lookup resolves. The interpreter's `Kind::Iterator`
+/// method table synthesizes the older helpers by name, which masked this: a
+/// method missing from that table read `undefined` on a real iterator while
+/// being perfectly callable off the prototype.
+#[test]
+fn iterator_objects_inherit_the_iterator_prototype() {
+    assert_eq!(
+        eval_display("Object.getPrototypeOf([1,2].values()) === Iterator.prototype"),
+        "true"
+    );
+    assert_eq!(
+        eval_display(
+            "Object.getPrototypeOf(new Set([1]).values()) === Iterator.prototype"
+        ),
+        "true"
+    );
+    assert_eq!(
+        eval_display("typeof [1,2].values().includes"),
+        "function"
+    );
+    assert_eq!(eval_display("[1,2,3].values().includes(2)"), "true");
+}
+
+/// `includes` uses SameValueZero and short-circuits: the iterator is left
+/// partially consumed at the match, not drained.
+#[test]
+fn includes_matches_same_value_zero_and_short_circuits() {
+    assert_eq!(eval_display("[1,2,3].values().includes(2)"), "true");
+    assert_eq!(eval_display("[1,2,3].values().includes(9)"), "false");
+    // SameValueZero: `NaN` matches `NaN`.
+    assert_eq!(eval_display("[NaN].values().includes(NaN)"), "true");
+    // SameValueZero: `-0` matches `+0`.
+    assert_eq!(eval_display("[-0].values().includes(0)"), "true");
+    assert_eq!(eval_display("typeof [1].values().includes(1)"), "boolean");
+    // The short circuit is observable: the values after the match are still
+    // there for a later pull.
+    assert_eq!(
+        eval_display(
+            "(() => { const it = [1,2,3,4,5].values(); it.includes(2);
+               return it.toArray().join('-'); })()"
+        ),
+        "3-4-5"
+    );
+}
+
+/// `join` applies ToString to each value and defaults the separator to `","`.
+#[test]
+fn join_stringifies_values_and_defaults_the_separator() {
+    assert_eq!(eval_display("[1,2,3].values().join()"), "1,2,3");
+    assert_eq!(eval_display("[1,2,3].values().join('-')"), "1-2-3");
+    // An explicit `undefined` takes the default, per the optional parameter.
+    assert_eq!(eval_display("[1,2].values().join(undefined)"), "1,2");
+    assert_eq!(eval_display("[1,'a',true].values().join()"), "1,a,true");
+    assert_eq!(eval_display("new Set([1,2]).values().join('|')"), "1|2");
+    assert_eq!(eval_display("[].values().join()"), "");
+    // An empty separator concatenates with nothing between.
+    assert_eq!(eval_display("[1,2].values().join('')"), "12");
+}
+
+/// `windows(n)` yields overlapping groups of exactly `n`; `chunks(n)` yields
+/// consecutive non-overlapping ones, and `chunks` keeps a short final group
+/// while the default `windows` mode drops it.
+#[test]
+fn windows_overlaps_and_chunks_partitions() {
+    assert_eq!(
+        eval_display("JSON.stringify([1,2,3,4].values().windows(2).toArray())"),
+        "[[1,2],[2,3],[3,4]]"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify([1,2,3,4,5].values().windows(3).toArray())"),
+        "[[1,2,3],[2,3,4],[3,4,5]]"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify([1,2,3,4].values().chunks(2).toArray())"),
+        "[[1,2],[3,4]]"
+    );
+    // A short final chunk is kept by `chunks`…
+    assert_eq!(
+        eval_display("JSON.stringify([1,2,3].values().chunks(2).toArray())"),
+        "[[1,2],[3]]"
+    );
+    // …and dropped by the default `windows` undersized mode.
+    assert_eq!(
+        eval_display("JSON.stringify([1,2,3].values().windows(5).toArray())"),
+        "[]"
+    );
+    // …unless `"allow-partial"` asks for it.
+    assert_eq!(
+        eval_display(
+            "JSON.stringify([1,2,3].values().windows(5, 'allow-partial').toArray())"
+        ),
+        "[[1,2,3]]"
+    );
+    // A group size of 1 makes `windows` the identity, one fresh array each.
+    assert_eq!(
+        eval_display("JSON.stringify([1,2,3].values().windows(1).toArray())"),
+        "[[1],[2],[3]]"
+    );
+}
+
+/// Each window/chunk is a *distinct* array, not a view over a shared buffer —
+/// mutating one must not be visible in the next.
+#[test]
+fn window_results_are_distinct_arrays() {
+    assert_eq!(
+        eval_display(
+            "(() => { const w = [1,2,3].values().windows(2).toArray();
+               w[0][0] = 99; return w[1][0]; })()"
+        ),
+        "2"
+    );
+}
+
+/// Spec 27.1.4.8 steps 4-7: the size must *already* be a Number (never coerced),
+/// integral, and inside `[1, 2^32-1]`. A non-Number or non-integral value is a
+/// `TypeError`; an out-of-range Number is a `RangeError`. Using `ToNumber` here
+/// — the obvious implementation — would make `'1'` succeed and `NaN` a
+/// `RangeError`, both wrong.
+#[test]
+fn windows_and_chunks_validate_the_size_argument() {
+    for name in ["windows", "chunks"] {
+        for arg in ["undefined", "'1'", "true", "null", "{}", "NaN", "1.5", "Infinity"] {
+            assert_eq!(
+                eval_display(&format!(
+                    "(() => {{ try {{ [1,2].values().{name}({arg}); return 'NO THROW'; }}
+                       catch (e) {{ return e.constructor.name; }} }})()"
+                )),
+                "TypeError",
+                "{name}({arg})"
+            );
+        }
+        for arg in ["0", "-0", "-1", "2 ** 32", "2 ** 53"] {
+            assert_eq!(
+                eval_display(&format!(
+                    "(() => {{ try {{ [1,2].values().{name}({arg}); return 'NO THROW'; }}
+                       catch (e) {{ return e.constructor.name; }} }})()"
+                )),
+                "RangeError",
+                "{name}({arg})"
+            );
+        }
+        // The boundary values are valid and must not throw.
+        assert_eq!(
+            eval_display(&format!("[1,2,3].values().{name}(1).toArray().length > 0")),
+            "true",
+            "{name}(1)"
+        );
+    }
+}
+
+/// The `undersized` option of `windows` is a closed set of two strings
+/// (step 5-6); anything else is a `TypeError`.
+#[test]
+fn windows_rejects_an_invalid_undersized_option() {
+    for arg in ["null", "''", "'something else'", "0", "true", "{}"] {
+        assert_eq!(
+            eval_display(&format!(
+                "(() => {{ try {{ [1,2].values().windows(1, {arg}); return 'NO THROW'; }}
+                   catch (e) {{ return e.constructor.name; }} }})()"
+            )),
+            "TypeError",
+            "windows(1, {arg})"
+        );
+    }
+    for arg in ["undefined", "'only-full'", "'allow-partial'"] {
+        assert_eq!(
+            eval_display(&format!("[1,2,3].values().windows(1, {arg}).toArray().length")),
+            "3",
+            "windows(1, {arg})"
+        );
+    }
+}
+
+/// A window/chunk result array carries `%Array.prototype%` and a correct
+/// `length` — the `Ctx::alloc_array` contract, asserted because a hand-rolled
+/// array here fails `result.constructor` far from its cause.
+#[test]
+fn window_results_are_real_arrays() {
+    assert_eq!(
+        eval_display(
+            "Object.getPrototypeOf([1,2,3].values().windows(2).toArray()[0]) === Array.prototype"
+        ),
+        "true"
+    );
+    assert_eq!(eval_display("[1,2,3].values().windows(2).toArray()[0].length"), "2");
+    assert_eq!(eval_display("[1,2,3].values().chunks(2).toArray()[1].length"), "1");
+    assert_eq!(eval_display("[1,2,3,4,5].values().windows(3).toArray()[0].length"), "3");
+}
+
+/// `toArray` (and therefore everything built on it) must return a real Array.
+#[test]
+fn to_array_results_are_real_arrays() {
+    assert_eq!(
+        eval_display("Object.getPrototypeOf([1,2].values().toArray()) === Array.prototype"),
+        "true"
+    );
+    assert_eq!(eval_display("[1,2].values().toArray().length"), "2");
+    assert_eq!(eval_display("typeof [1,2].values().toArray().map"), "function");
+}
+
+/// `Iterator.zip` takes a *list* of iterables, yields one array per position,
+/// and stops at the shortest input by default (spec 27.1.3.2).
+#[test]
+fn zip_stops_at_the_shortest_input() {
+    assert_eq!(
+        eval_display("JSON.stringify(Iterator.zip([[1,2,3],[10,20]]).toArray())"),
+        "[[1,10],[2,20]]"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify(Iterator.zip([[1],[2,3]]).toArray())"),
+        "[[1,2]]"
+    );
+    // `mode: "longest"` pads the short row with `undefined`, which
+    // `JSON.stringify` renders as `null` inside an array.
+    assert_eq!(
+        eval_display("JSON.stringify(Iterator.zip([[1,2],[10]], {mode:'longest'}).toArray())"),
+        "[[1,10],[2,null]]"
+    );
+    // Each row is a fresh, packed, real Array.
+    assert_eq!(eval_display("Array.isArray(Iterator.zip([[1],[2]]).toArray()[0])"), "true");
+    assert_eq!(eval_display("Iterator.zip([[1],[2]]).toArray()[0].length"), "2");
+}
+
+/// `zipKeyed` takes an *object* of iterables and yields one null-prototype
+/// object per position, keyed by the input's own enumerable keys.
+#[test]
+fn zip_keyed_yields_null_prototype_objects_per_position() {
+    assert_eq!(
+        eval_display("JSON.stringify(Iterator.zipKeyed({a:[1,2], b:[3,4]}).toArray())"),
+        "[{\"a\":1,\"b\":3},{\"a\":2,\"b\":4}]"
+    );
+    assert_eq!(
+        eval_display(
+            "Object.getPrototypeOf(Iterator.zipKeyed({a:[1]}).toArray()[0]) === null"
+        ),
+        "true"
+    );
+    // A non-enumerable own key is excluded (the spec's `[[GetOwnProperty]]`
+    // filter), and an inherited key never appears.
+    assert_eq!(
+        eval_display(
+            "(() => { const input = Object.create({inherited:[9]});
+               input.own = [1];
+               Object.defineProperty(input, 'hidden', {value:[2], enumerable:false});
+               return Object.keys(Iterator.zipKeyed(input).toArray()[0]).join(','); })()"
+        ),
+        "own"
+    );
+    // `undefined` values are skipped entirely.
+    assert_eq!(
+        eval_display("Object.keys(Iterator.zipKeyed({a:[1], b:undefined}).toArray()[0]).length"),
+        "1"
+    );
+}
+
+/// The three statics return real iterators, not bare objects.
+#[test]
+fn iterator_statics_return_real_iterators() {
+    for expr in [
+        "Iterator.zip([[1,2],[3,4]])",
+        "Iterator.zipKeyed({a:[1]})",
+        "Iterator.concat([1],[2])",
+    ] {
+        assert_eq!(
+            eval_display(&format!("Object.getPrototypeOf({expr}) === Iterator.prototype")),
+            "true",
+            "{expr}"
+        );
+        assert_eq!(eval_display(&format!("typeof {expr}.next")), "function", "{expr}");
+    }
+}
+
+/// `Iterator.concat(...items)` is the rest-parameter one: every input, in
+/// argument order.
+#[test]
+fn concat_chains_inputs_in_argument_order() {
+    assert_eq!(
+        eval_display("Iterator.concat([1,2],[3],[4,5]).toArray().join('-')"),
+        "1-2-3-4-5"
+    );
+    assert_eq!(eval_display("Iterator.concat().toArray().length"), "0");
+    assert_eq!(
+        eval_display("Iterator.concat(...[[1],[2,3]]).toArray().join('-')"),
+        "1-2-3"
+    );
+}
