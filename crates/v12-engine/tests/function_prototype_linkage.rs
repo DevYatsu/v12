@@ -289,15 +289,21 @@ fn regexp_prototype_object_brands_as_object_but_instances_do_not() {
 
 // --- negative controls -----------------------------------------------------
 
-/// Negative control: an ordinary closure is still *unlinked* — that is a
-/// separate, larger change (`alloc_closure` lives in `v12-interp/src/lib.rs`).
-/// This test pins that this lane did not silently link it, so the synthesized
-/// `function_method_surface` is still the live path for `f.call` and the
-/// deferral added there is what will later retire it.
+/// Positive control: an ordinary closure **is** linked to
+/// `%Function.prototype%`.
+///
+/// This assertion used to read `=== null` and be named
+/// `ordinary_closures_are_still_unlinked`. That was a deliberate negative
+/// control pinning the *gap* — `alloc_closure` lives in `v12-interp/src/lib.rs`
+/// and was outside the lane that wrote this file, so the test asserted the bug
+/// to keep it from being forgotten. Closing the gap makes the old assertion
+/// false, and that is the correct outcome: it is now the positive control that
+/// `alloc_closure` links what ES 10.2.4 requires, and it must not be weakened
+/// back into a tautology.
 #[test]
-fn ordinary_closures_are_still_unlinked() {
+fn ordinary_closures_are_linked_to_function_prototype() {
     assert_eq!(
-        eval_display("Object.getPrototypeOf(function () {}) === null"),
+        eval_display("Object.getPrototypeOf(function () {}) === Function.prototype"),
         "true"
     );
 }

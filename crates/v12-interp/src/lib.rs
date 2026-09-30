@@ -838,6 +838,18 @@ impl<'a> Interp<'a> {
     /// Allocates a closure function object, stamping this interpreter's
     /// program id so `Bytecode(fn_idx)` resolves against the right table.
     ///
+    /// Every closure is linked to `%Function.prototype%` as its
+    /// `[[Prototype]]` (ES 10.2.4 / `MakeFunction` step 27 sets
+    /// `[[Prototype]]` to `%Function.prototype%`; ES 10.4.1.1 does the same
+    /// for bound functions). This holds for *arrow* functions too — an arrow
+    /// is not a constructor and has no `prototype` property, but it is a
+    /// function object, so its chain is `%Function.prototype%` →
+    /// `%Object.prototype%` like any other. What the arrow flag decides is
+    /// only the `prototype` property below and constructibility, both of which
+    /// are read from the function table by
+    /// [`Self::is_constructor_object`] / `prepare_construct`, never from the
+    /// link.
+    ///
     /// Non-arrow functions also get their spec-mandated `prototype` property
     /// (a fresh object whose `constructor` points back at the function) so
     /// `F.prototype` reads and `new F` work without lazy materialization.
@@ -856,6 +868,15 @@ impl<'a> Interp<'a> {
         let mut obj = JsObject::function(v12_heap::FunctionTarget::Bytecode(fn_idx), env);
         obj.program_id = program_id;
         let h = self.heap.alloc(obj);
+        // ES 10.2.4: `[[Prototype]]` is `%Function.prototype%`. Set before
+        // any property install so `install_function_length` / `name` /
+        // `materialize_function_prototype` all run against the final chain.
+        //
+        // GC-safe: `link_function_proto` only *reads* (intern of an already
+        // interned string plus a shape lookup — see
+        // `Interp::function_prototype`) and writes a `Handle` field, so it
+        // cannot allocate and cannot invalidate `h`.
+        self.link_function_proto(h);
         // Every closure carries its own `length` (ExpectedArgumentCount), so
         // `f.length` reads never depend on the property surfaces.
         self.install_function_length(h, expected_args);
@@ -1548,9 +1569,23 @@ impl<'a> Interp<'a> {
             // Empty/missing message (e.g. `new Test262Error()` with no
             // message argument): fall back to `constructor.name` so the
             // runner can classify the throw (it requires "Test262Error").
-            if let Some(co) = self
-                .chain_prop(obj, "constructor")
-                .and_then(|v| v.as_object())
+            //
+            // A function object is excluded, and it has to be: the walk below
+            // reaches `constructor` through the `[[Prototype]]` chain, and
+            // since `alloc_closure` links every closure to
+            // `%Function.prototype%` a closure now resolves
+            // `constructor` → `Function` and `name` → `"Function"`. Without
+            // this guard `[fn].join(",")` renders `"Function"` instead of the
+            // `"function"` that `ops::to_js_string`'s explicit
+            // `Kind::Function` arm has always produced — an error-rendering
+            // fallback silently taking over from the function renderer.
+            // This is the same reason the message/name branch above is fine to
+            // keep unconditional: those are own-shape lookups, so only an
+            // explicitly user-assigned `f.message` reaches them.
+            if self.heap.get(obj).kind != Kind::Function
+                && let Some(co) = self
+                    .chain_prop(obj, "constructor")
+                    .and_then(|v| v.as_object())
                 && let Some(nh) = self.chain_prop(co, "name").and_then(|v| v.as_string())
             {
                 let name = self.string_text(nh);
