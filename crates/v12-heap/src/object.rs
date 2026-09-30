@@ -532,14 +532,28 @@ impl JsObject {
         source: crate::Handle<crate::V12Str>,
         flags: crate::Handle<crate::V12Str>,
     ) -> Self {
+        // `source` and `flags` are the `[[OriginalSource]]` and
+        // `[[OriginalFlags]]` **internal slots**, not properties, so they live
+        // in `elements` and `properties` starts empty. That is not cosmetic:
+        // `Heap::add_property` assigns a new descriptor `slot = shape.num_own`,
+        // so a `properties` vector pre-seeded with keyless entries would be
+        // indexed from 0 by the shape and the first real property installed on
+        // the object would overwrite the internal slot. `elements` is the same
+        // separation `Kind::Array` uses for its indexed payload.
+        //
+        // `lastIndex` is likewise not here: ES 10.4.1 gives every RegExp
+        // instance an own `lastIndex` **data property** with `{writable: true,
+        // enumerable: false, configurable: false}`, so it goes through the
+        // shape and the ordinary [[Get]]/[[Set]] — a raw slot bypasses the
+        // descriptor, and `Object.defineProperty(r, "lastIndex", {writable:
+        // false})` must turn the engine's next `Set` into a `TypeError`. The
+        // owner installs it in `regexp::alloc_regexp`.
         Self {
             kind: Kind::RegExp,
-            properties: smallvec::smallvec![
+            elements: vec![
                 crate::JsValue::string(source),
                 crate::JsValue::string(flags),
-                crate::JsValue::from_i32_smi(0).expect("0 fits Smi"),
             ],
-            property_keys: smallvec::smallvec![None; 3],
             ..Self::default()
         }
     }

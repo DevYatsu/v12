@@ -391,9 +391,12 @@ impl Engine {
     /// [source, flags, lastIndex]`, both strings; see `builtins/regexp.rs`).
     /// `None` when the shape is unexpected, letting the caller fall through
     /// to the generic object path.
+    /// `/source/flags` from the object's two internal slots. They live in
+    /// `elements`, not `properties` — see [`v12_heap::JsObject::regexp`], and
+    /// `properties[0]` is now the real `lastIndex` data property.
     fn regexp_text(&mut self, obj: v12_heap::Handle<v12_heap::JsObject>) -> Option<String> {
-        let source_h = self.heap.get(obj).properties.first()?.as_string()?;
-        let flags_h = self.heap.get(obj).properties.get(1)?.as_string()?;
+        let source_h = self.heap.get(obj).elements.first()?.as_string()?;
+        let flags_h = self.heap.get(obj).elements.get(1)?.as_string()?;
         let source = self.heap_string_text(source_h);
         let flags = self.heap_string_text(flags_h);
         Some(format!("/{source}/{flags}"))
