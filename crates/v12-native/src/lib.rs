@@ -27,7 +27,7 @@ pub mod promise_capability;
 pub mod promise_combinator;
 
 pub use convert::DecodeError;
-pub use id::{NativeId, UnknownNativeId};
+pub use id::{NativeId, UnknownNativeId, is_non_constructible, native_is_constructor_id};
 pub use methods::lookup_method;
 pub use registry::{
     CompiledEval, EmptyNativeRegistry, EvalBindingKind, EvalCallerFacts, EvalCompileFacts,

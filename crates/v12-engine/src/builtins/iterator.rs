@@ -122,10 +122,7 @@ pub const fn is_helper_wrapper(kind: i32) -> bool {
 /// not steppable, and building one over such a source is rejected rather than
 /// silently mis-stepped. See [`iterator_windows`].
 pub const fn is_windowing_wrapper(kind: i32) -> bool {
-    matches!(
-        kind,
-        ITER_KIND_HELPER_WINDOWS | ITER_KIND_HELPER_CHUNKS
-    )
+    matches!(kind, ITER_KIND_HELPER_WINDOWS | ITER_KIND_HELPER_CHUNKS)
 }
 
 /// What a helper wrapper's `next` must do, given its counter and (for
@@ -421,7 +418,7 @@ fn windowing_wrapper_next(
         held.push(value);
         if held.len() > MAX_DRAIN {
             return Err(
-                ctx.range_error("RangeError: iterator window buffer exceeds 1,000,000 values"),
+                ctx.range_error("RangeError: iterator window buffer exceeds 1,000,000 values")
             );
         }
     }
@@ -457,14 +454,14 @@ fn window_size(ctx: &mut Ctx, value: JsValue) -> Result<usize, Throw> {
         // NaN and ±Infinity are Numbers but not integral ones, so they land in
         // the `TypeError` arm (step 5) rather than the `RangeError` one.
         _ => {
-            return Err(
-                ctx.type_error("TypeError: Iterator.prototype window size must be an integral Number")
-            );
+            return Err(ctx.type_error(
+                "TypeError: Iterator.prototype window size must be an integral Number",
+            ));
         }
     };
     if !n.is_finite() || n.trunc() != n {
         return Err(
-            ctx.type_error("TypeError: Iterator.prototype window size must be an integral Number"),
+            ctx.type_error("TypeError: Iterator.prototype window size must be an integral Number")
         );
     }
     if n < 1.0 || n > 4_294_967_295.0 {
@@ -576,7 +573,9 @@ fn engine_can_drive(ctx: &mut Ctx, iter: JsValue) -> bool {
     }
     // Every other wrapper was handed its source's real `next` method, which is
     // an object exactly when the chain needs the machine.
-    ctx.heap.get(obj).elements[SLOT_SOURCE_NEXT].as_object().is_none()
+    ctx.heap.get(obj).elements[SLOT_SOURCE_NEXT]
+        .as_object()
+        .is_none()
 }
 
 /// `Iterator.prototype.windows(windowSize[, undersized])` — overlapping groups
@@ -1087,11 +1086,7 @@ pub fn drain_iterable(ctx: &mut Ctx, v: JsValue) -> Result<Option<Vec<JsValue>>,
 /// iterator pulls two values and leaves the rest. The spec requires the early
 /// exit, and the observable consequence (the iterator is left where the match
 /// was found, not exhausted) is asserted in `es2025_surface.rs`.
-pub fn iterator_includes(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn iterator_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     require_iterator(ctx, this, "Iterator.prototype.includes")?;
     let needle = args.first().copied().unwrap_or(JsValue::undefined());
     let mut taken = 0usize;
@@ -1100,7 +1095,9 @@ pub fn iterator_includes(
             Some(value) => {
                 taken += 1;
                 if taken > MAX_DRAIN {
-                    return Err(ctx.range_error("RangeError: iterator drain exceeds 1,000,000 values"));
+                    return Err(
+                        ctx.range_error("RangeError: iterator drain exceeds 1,000,000 values")
+                    );
                 }
                 if same_value_zero(value, needle) {
                     return Ok(JsValue::true_());
@@ -1180,11 +1177,19 @@ fn zip_result_iterator(ctx: &mut Ctx, values: Vec<JsValue>) -> JsValue {
     JsValue::object(iter)
 }
 
-/// Drains one entry of a `zip`/`zipKeyed` input list. `TypeError` for a value
-/// this engine cannot iterate, which is the spec's `GetIteratorFlattenable`
-/// failure for the kinds a pure native cannot reach.
+/// Drains one entry of a `zip`/`zipKeyed`/`concat` input list.
+///
+/// All three statics open with the same `IsObject` gate, and it is `IsObject`
+/// rather than "is iterable": spec 27.1.3.2 step 1 reads *"If iterables is not
+/// an Object, throw a TypeError exception"*, `GetIteratorFlattenable` step 2
+/// reads the same of every element, and `Iterator.concat` step 3 does the same
+/// of every item. A primitive string is iterable, so the previous
+/// `require_object_coercible` + structural-drain let `Iterator.zip("")` and
+/// `Iterator.concat("abc")` through instead of throwing.
 fn drain_one(ctx: &mut Ctx, method: &str, value: JsValue) -> Result<Vec<JsValue>, Throw> {
-    ctx.require_object_coercible(value)?;
+    if value.as_object().is_none() {
+        return Err(ctx.type_error(format!("TypeError: {method} argument is not an object")));
+    }
     super::iterator::drain_iterable(ctx, value)?
         .ok_or_else(|| ctx.type_error(format!("TypeError: {method} argument is not iterable")))
 }
@@ -1222,7 +1227,10 @@ fn zip_mode(ctx: &mut Ctx, options: JsValue) -> Result<bool, Throw> {
 /// shadows it. Only `undefined` and a data value are possible here; a getter is
 /// machine work and is reported as absent, which is the honest answer for a
 /// pure native rather than a wrong one.
-fn own_or_inherited_read(ctx: &mut Ctx, obj: JsValue, name: &str) -> Result<JsValue, Throw> {
+///
+/// `pub` because `map::argument_set` implements the same `Get` for the set-like
+/// validation of the Set relational methods.
+pub fn own_or_inherited_read(ctx: &mut Ctx, obj: JsValue, name: &str) -> Result<JsValue, Throw> {
     let Some(h) = obj.as_object() else {
         return Ok(JsValue::undefined());
     };
@@ -1239,8 +1247,15 @@ fn own_or_inherited_read(ctx: &mut Ctx, obj: JsValue, name: &str) -> Result<JsVa
 /// first argument is then the whole list and the rest is ignored, which yields
 /// rows of length 1 instead of 2.
 pub fn iterator_zip(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let longest = zip_mode(ctx, args.get(1).copied().unwrap_or(JsValue::undefined()))?;
+    // Order is observable: step 1 gates `iterables` before step 2 ever touches
+    // `options`, which `iterables-primitive.js` pins with an `options` object
+    // whose `mode`/`padding` getters throw. Validating the argument first is
+    // what makes that test pass, so the `options` read cannot be hoisted.
     let list = args.first().copied().unwrap_or(JsValue::undefined());
+    if list.as_object().is_none() {
+        return Err(ctx.type_error("TypeError: Iterator.zip argument is not an object"));
+    }
+    let longest = zip_mode(ctx, args.get(1).copied().unwrap_or(JsValue::undefined()))?;
     let entries = drain_one(ctx, "Iterator.zip", list)?;
     let mut columns: Vec<Vec<JsValue>> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -1253,7 +1268,10 @@ pub fn iterator_zip(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<J
     };
     let mut out = Vec::with_capacity(rows);
     for i in 0..rows {
-        let row: Vec<JsValue> = columns.iter().map(|c| c.get(i).copied().unwrap_or(JsValue::undefined())).collect();
+        let row: Vec<JsValue> = columns
+            .iter()
+            .map(|c| c.get(i).copied().unwrap_or(JsValue::undefined()))
+            .collect();
         out.push(JsValue::object(ctx.alloc_array(row)));
     }
     Ok(zip_result_iterator(ctx, out))
@@ -1328,9 +1346,7 @@ pub fn iterator_zip_keyed(
 fn define_keyed_prop(ctx: &mut Ctx, obj: Handle<JsObject>, key: v12_heap::PropKey, value: JsValue) {
     let shape = ctx.heap.shape_of_mut(obj);
     debug_assert!(ctx.heap.lookup_property(shape, key).is_none());
-    let child = ctx
-        .heap
-        .add_property(shape, key, v12_heap::Attrs::DEFAULT);
+    let child = ctx.heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
     ctx.heap.bind_shape(obj, child);
     let slot = (ctx.heap.get(child).num_own - 1) as usize;
     let settings = ctx.heap.get_mut(obj);
@@ -1346,11 +1362,7 @@ fn define_keyed_prop(ctx: &mut Ctx, obj: Handle<JsObject>, key: v12_heap::PropKe
 
 /// `Iterator.concat(...items)` (spec 27.1.3.4) — every input, in order. This
 /// one *is* a rest parameter (`length` 0).
-pub fn iterator_concat(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn iterator_concat(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let mut all: Vec<JsValue> = Vec::new();
     for arg in args {
         all.extend(drain_one(ctx, "Iterator.concat", *arg)?);

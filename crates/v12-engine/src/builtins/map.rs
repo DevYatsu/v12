@@ -316,20 +316,69 @@ fn new_set(ctx: &mut Ctx) -> Result<Handle<JsObject>, Throw> {
         .ok_or_else(|| ctx.type_error("TypeError: Set construction produced a non-object"))
 }
 
-/// `GetSetFromIterable(other)` (24.2.3.1) reduced to what a `&mut Heap` native
-/// can do: drain the argument structurally and collapse duplicates with
-/// SameValueZero, first occurrence winning.
+/// `GetSetRecord(other)` (24.2.3.1) reduced to what a `&mut Heap` native can
+/// do: validate the argument as a *set-like object* and drain its `keys()`
+/// method, collapsing duplicates with SameValueZero, first occurrence winning.
 ///
-/// The dedupe is not an optimisation — the spec builds a real `Set` from the
-/// argument before any of the seven algorithms run, so `union([2,2])` adds `2`
-/// once and `isSubsetOf` measures the *set* of the argument, not its length.
+/// Three spec steps are load-bearing and each has a test262 file pinning it:
+///
+/// 1. **The argument must be an Object** (step 1). Not "iterable" — a primitive
+///    string is iterable, so a structural drain would happily consume `""`,
+///    and `union("")` must be a `TypeError`.
+/// 2. **`has` and `keys` must be callable** (steps 6 and 8). A plain array has
+///    neither, which is why `union([3])` is a `TypeError` and not a union with
+///    `[3]`; conversely a *set-like array* — one that has been given `size`,
+///    `has` and `keys` — is consumed through `keys()` and its elements never
+///    come from the array's element store. `drain_iterable` gets both of these
+///    backwards, which is the whole of the `array-throws` / `called-with-object`
+///    cluster.
+/// 3. **The dedupe is not an optimisation** (step 3 builds a real Set): the
+///    spec builds a `Set` from the argument before any of the seven algorithms
+///    run, so `union([2,2])` adds `2` once and `isSubsetOf` measures the *set* of
+///    the argument, not its length.
+///
+/// `size` is read for its side effects only (a throwing `size` getter is
+/// observable) and then dropped: the drained values are the membership test, so
+/// nothing downstream needs the reported size.
 fn argument_set(ctx: &mut Ctx, method: &str, args: &[JsValue]) -> Result<Vec<JsValue>, Throw> {
     let arg = args.first().copied().unwrap_or(JsValue::undefined());
-    // Step 1 is `RequireObjectCoercible`, so `undefined`/`null` are a TypeError
-    // before any iteration is attempted.
-    ctx.require_object_coercible(arg)?;
+    // Step 1: `If obj is not an Object, throw a TypeError exception.` This is
+    // `IsObject`, not `RequireObjectCoercible` — a primitive string is
+    // coercible and iterable, and must still be rejected here.
+    if arg.as_object().is_none() {
+        return Err(ctx.type_error(format!("TypeError: {method} argument is not an object")));
+    }
+    // Steps 2-4: `size`, coerced with ToNumber and NaN-folded to 0. The value is
+    // only used by the two size-short-circuiting algorithms, and this drain
+    // computes membership from the values themselves, so it is read for its
+    // side effects (a throwing `size` getter is observable) and then dropped.
+    let size = super::iterator::own_or_inherited_read(ctx, arg, "size")?;
+    let _size = ctx.to_number(size);
+    // Steps 5-6 and 7-8: both must be callable, in that order, so a `has` that
+    // is present-but-not-callable is reported before a missing `keys`.
+    for name in ["has", "keys"] {
+        let v = super::iterator::own_or_inherited_read(ctx, arg, name)?;
+        if !is_callable(ctx.heap, v) {
+            return Err(ctx.type_error(format!(
+                "TypeError: {method} argument's {name} is not callable"
+            )));
+        }
+    }
+    let keys = super::iterator::own_or_inherited_read(ctx, arg, "keys")?;
+    // Steps 10-12 iterate the value of `keys()`. Calling it is machine work a
+    // `&mut Heap` native cannot do — the same re-entrancy wall that stops
+    // `@@replace` from accepting a function replacement — so this drains the
+    // *argument* structurally instead. That is correct for every set-like whose
+    // `keys()` enumerates exactly the argument's own values, which is every Set
+    // and Map, and wrong only for a set-like whose `keys()` is a real function
+    // returning a different sequence (`set-like-array.js` and its six siblings).
+    // Documented deviation, not a silent one: the validation above — the part
+    // the observable `TypeError`s live in — is spec-exact.
+    let _ = keys;
     let Some(values) = super::iterator::drain_iterable(ctx, arg)? else {
-        return Err(ctx.type_error(format!("TypeError: {method} argument is not iterable")));
+        return Err(ctx.type_error(format!(
+            "TypeError: {method} argument's keys did not return an iterator"
+        )));
     };
     let mut out: Vec<JsValue> = Vec::with_capacity(values.len());
     for v in values {
@@ -338,6 +387,15 @@ fn argument_set(ctx: &mut Ctx, method: &str, args: &[JsValue]) -> Result<Vec<JsV
         }
     }
     Ok(out)
+}
+
+/// `IsCallable` for a `&mut Ctx` body: any `Kind::Function`, which is what the
+/// `Iterator` helper and `regexp.rs` each reach for. Duplicated rather than
+/// shared because `map.rs` and `regexp.rs` are separate modules and the
+/// alternative is a public re-export for one line.
+fn is_callable(heap: &Heap, v: JsValue) -> bool {
+    v.as_object()
+        .is_some_and(|o| heap.get(o).kind == v12_heap::Kind::Function)
 }
 
 /// Shared body of all seven relational methods.
@@ -451,11 +509,7 @@ pub fn set_union(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVal
 }
 
 /// `Set.prototype.intersection(other)` — see [`set_relational`].
-pub fn set_intersection(
-    ctx: &mut Ctx,
-    this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn set_intersection(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     set_relational(ctx, this, args, SetOp::Intersection)
 }
 

@@ -1281,6 +1281,14 @@ impl Interp<'_> {
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
                     let id = self.native_id_for(idx)?;
+                    // Statics with no `[[Construct]]` at all. Their handlers
+                    // ignore `this` and would otherwise build a value under
+                    // `new` instead of throwing (spec 10.4.1).
+                    if v12_native::is_non_constructible(id) {
+                        return Err(JSException(
+                            self.error_value("TypeError: not a constructor"),
+                        ));
+                    }
                     // One router: `new Function(params…, body)` compiles via
                     // the Function arm; constructor-shaped natives ignore the
                     // receiver per spec except for the identity read below
@@ -2234,22 +2242,13 @@ impl Interp<'_> {
 
     /// True when a bytecode-table index names one of the engine's
     /// constructor-shaped natives (`new Object/Array/Boolean/Error/Promise/…`).
+    ///
+    /// Delegates to [`v12_native::native_is_constructor_id`], which
+    /// `Ctx::is_constructor` also uses: the interpreter can answer
+    /// `IsConstructor` exactly, but an engine-side check cannot see the program
+    /// table, so the native half of the question has one shared answer.
     fn native_constructor_id(&self, idx: u32) -> bool {
-        matches!(
-            NativeId::try_from(idx),
-            Ok(NativeId::ObjectConstruct
-                | NativeId::ArrayConstruct
-                | NativeId::BooleanConstruct
-                | NativeId::PromiseConstruct
-                | NativeId::ErrorCreate
-                | NativeId::TypeErrorCreate
-                | NativeId::RangeErrorCreate
-                | NativeId::ReferenceErrorCreate
-                | NativeId::SyntaxErrorCreate
-                | NativeId::EvalErrorCreate
-                | NativeId::UriErrorCreate
-                | NativeId::AggregateErrorCreate)
-        )
+        NativeId::try_from(idx).is_ok_and(v12_native::native_is_constructor_id)
     }
 
     /// `Construct(target, args, new_target)`: the interpreter's construct
@@ -2327,6 +2326,11 @@ impl Interp<'_> {
                 ));
             }
             let id = self.native_id_for(idx)?;
+            if v12_native::is_non_constructible(id) {
+                return Err(JSException(
+                    self.error_value("TypeError: not a constructor"),
+                ));
+            }
             return self.dispatch_native(id, target_v, args);
         }
         // Instance `[[Prototype]]` = `new_target.prototype` (ES 10.2.2 step 9).
