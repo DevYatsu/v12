@@ -1665,10 +1665,22 @@ impl Interp<'_> {
                 // allocates nothing (it reads two already-resident slots), so
                 // this needs no rooting beyond what `gc_protect` above gave.
                 self.link_function_proto(bound);
-                // Spec: the bound function's `length` is
-                // max(0, target.length - boundArgCount) and its `name` is
-                // `"bound " + target.name`. Read the target's own props
-                // before mutating `bound`; install both as own data props.
+                // ES 19.2.3.2 `Function.prototype.bind` step 6: `length` is
+                // `max(0, ToIntegerOrInfinity(target.length) - argCount)`, and
+                // `SetFunctionLength` (10.2.4) then clamps to 2^53-1 and maps
+                // NaN to +0.
+                //
+                // The value is a *Number*, never a Smi. The target's `length` is
+                // ordinary writable user data, so it can be `2147483648` or
+                // `Number.MAX_SAFE_INTEGER`; the previous Smi-only read turned
+                // both into `0`. `NaN` is the "absent or not a Number" marker
+                // (`Type(targetLen) is not Number, let L be 0`) and is resolved
+                // by the `is_nan` arm below, because `f64::min` propagates the
+                // *other* operand on NaN and would silently yield `argCount`.
+                //
+                // Step 12-15 for `name`: a non-String target name is the empty
+                // string, so the result is `"bound "` **with** its trailing
+                // space — the previous `"bound"` was missing it.
                 let (target_len, target_name) = {
                     let shape = self.shape_of(target);
                     let len_key = self.heap.intern_text("length");
@@ -1682,9 +1694,8 @@ impl Interp<'_> {
                             .properties
                             .get(*slot as usize)
                             .copied()
-                            .and_then(|v| v.as_smi())
-                            .map_or(0, |n| n.max(0) as usize),
-                        _ => 0,
+                            .map_or(f64::NAN, number_value),
+                        _ => f64::NAN,
                     };
                     let name_key = self.heap.intern_text("name");
                     let target_name = match self
@@ -1702,10 +1713,21 @@ impl Interp<'_> {
                     };
                     (target_len, target_name)
                 };
-                let bound_len = target_len.saturating_sub(bound_args.len());
+                // 2^53 - 1, the `SetFunctionLength` ceiling.
+                const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+                let bound_len = if target_len.is_nan() {
+                    0.0
+                } else if target_len == f64::INFINITY {
+                    MAX_SAFE_INTEGER
+                } else {
+                    // `ToIntegerOrInfinity` truncates toward zero, so a
+                    // fractional target `length` floors toward +0 (and the
+                    // `.max(0.0)` then absorbs the negative side).
+                    (target_len.trunc() - bound_args.len() as f64).clamp(0.0, MAX_SAFE_INTEGER)
+                };
                 let bound_name = match target_name {
                     Some(h) => format!("bound {}", self.string_text(h)),
-                    None => "bound".to_string(),
+                    None => "bound ".to_string(),
                 };
                 // ES 10.4.1.1 `BoundFunctionCreate` defines `length` and `name`
                 // with `DefinePropertyOrThrow`, both at
@@ -1729,7 +1751,7 @@ impl Interp<'_> {
                 self.gc_protect();
                 let bound_attrs = Attrs::new(false, false, true);
                 let len_key = JsValue::string(self.heap.intern_text("length"));
-                let len_v = JsValue::from_i32_smi(bound_len as i32).expect("bound arity fits Smi");
+                let len_v = JsValue::from_f64(bound_len);
                 self.define_own_data_attrs(JsValue::object(bound), len_key, len_v, bound_attrs)?;
                 let name_key = JsValue::string(self.heap.intern_text("name"));
                 let name_h = self.heap.intern_text(&bound_name);
@@ -5256,5 +5278,19 @@ fn prop_key_value(key: PropKey) -> JsValue {
         JsValue::symbol(y)
     } else {
         JsValue::undefined()
+    }
+}
+
+/// The `Number` payload of `v`, or `NaN` for every non-numeric value.
+///
+/// `JsValue::as_f64` only decodes the raw-`f64` representation, so a Smi needs
+/// the `as_smi` arm; the `NaN` result is deliberately indistinguishable from
+/// `Number(NaN)` because every caller here wants the spec's
+/// `Type(x) is not Number, let L be 0` answer for both.
+fn number_value(v: JsValue) -> f64 {
+    if let Some(n) = v.as_smi() {
+        f64::from(n)
+    } else {
+        v.as_f64().unwrap_or(f64::NAN)
     }
 }

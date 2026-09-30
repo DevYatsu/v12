@@ -782,22 +782,74 @@ impl Interp<'_> {
             }
             return Some(Ok(self.closure_constructor(obj)));
         }
-        let constant = if self.key_is_wk(key, WK_CALL) {
-            NativeId::FunctionCall
+        let (name, constant) = if self.key_is_wk(key, WK_CALL) {
+            ("call", NativeId::FunctionCall)
         } else if self.key_is_wk(key, WK_APPLY) {
-            NativeId::FunctionApply
+            ("apply", NativeId::FunctionApply)
         } else if self.key_is_wk(key, WK_BIND) {
-            NativeId::FunctionBind
+            ("bind", NativeId::FunctionBind)
         } else if self.key_is_wk(key, WK_TO_STRING) {
-            NativeId::FunctionProtoToString
+            ("toString", NativeId::FunctionProtoToString)
         } else if self.key_is_wk(key, WK_VALUE_OF) {
-            NativeId::ObjectProtoValueOf
+            ("valueOf", NativeId::ObjectProtoValueOf)
         } else if self.key_is_wk(key, WK_HAS_OWN_PROPERTY) {
-            NativeId::ObjectHasOwnProperty
+            ("hasOwnProperty", NativeId::ObjectHasOwnProperty)
         } else {
             return None;
         };
+        // Serve the *real* `%Function.prototype%` method when one exists.
+        //
+        // The receiver is unlinked (that is why this surface is here at all),
+        // so `ic_lookup` cannot reach the method through a `[[Prototype]]`
+        // chain. But the object the spec's chain would hand back is a fixed,
+        // already-installed function object, so reading it directly produces
+        // the *same value* the chain would — not an approximation. That matters
+        // because the synthesized alternative could not: it allocated a fresh
+        // function object per read (so `f.call !== f.call`) and carried no
+        // `length` or `name` of its own, which is what
+        // `built-ins/Function/prototype/call/S15.3.4.4_A2_T2.js` and the
+        // `name.js` family assert.
+        if let Some(method) = self.function_proto_method(name) {
+            return Some(Ok(method));
+        }
         Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// The named member of `%Function.prototype%` (own or inherited), as a
+    /// plain prototype-chain read — the value `f.<name>` must produce for a
+    /// function object that has no link of its own.
+    ///
+    /// `None` outside a realm, or when the name is genuinely absent, in which
+    /// case the caller falls back to synthesizing a method object.
+    fn function_proto_method(&mut self, name: &str) -> Option<JsValue> {
+        let proto = self.function_prototype()?;
+        let h = self.heap.intern_text(name);
+        let pk = PropKey::from_string(h);
+        let mut cur = Some(proto);
+        while let Some(o) = cur {
+            if let Some(entry) = self
+                .heap
+                .get(o)
+                .dictionary
+                .as_ref()
+                .and_then(|m| m.get(&pk))
+                .copied()
+            {
+                if entry.is_accessor {
+                    return None;
+                }
+                let idx = self.global_slot_index(o, entry.slot as usize);
+                return self.heap.get(o).properties.get(idx).copied();
+            }
+            let shape = self.shape_of(o);
+            if let Some(desc) = self.heap.lookup_property(shape, pk) {
+                let slot = desc.slot()?;
+                let idx = self.global_slot_index(o, slot as usize);
+                return self.heap.get(o).properties.get(idx).copied();
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        None
     }
 
     /// This realm's `%Function.prototype%`, resolved through the `Function`

@@ -137,6 +137,16 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::BooleanProtoToString => Some(0),
         NativeId::BooleanProtoValueOf => Some(0),
         NativeId::FunctionProtoToString => Some(0),
+        // `Function.prototype.call` / `apply` / `bind` (ES 10.2.3-10.2.5). These
+        // three have no `define_builtins!` entry — their bodies live in the
+        // interpreter router (`Interp::dispatch_native`), because `call` and
+        // `apply` must re-enter the machine to invoke the target — so nothing
+        // else declares their arity. Without these arms
+        // `install_function_proto_methods` could not stamp a `length`, and
+        // `Function.prototype.call.length` read `undefined`.
+        NativeId::FunctionCall => Some(1),
+        NativeId::FunctionApply => Some(2),
+        NativeId::FunctionBind => Some(1),
         NativeId::GlobalDecodeUri => Some(1),
         NativeId::GlobalDecodeUriComponent => Some(1),
         NativeId::GlobalEncodeUri => Some(1),
@@ -1189,6 +1199,9 @@ macro_rules! define_builtins {
             // prototype object rather than a bare callable. See
             // `install_function_proto_identity`.
             install_function_proto_identity(heap, targets);
+            // `Function.prototype.call` / `apply` / `bind`, installed rather
+            // than macro-declared. See `install_function_proto_methods`.
+            install_function_proto_methods(heap, targets);
             // Bare ids are dispatch-only; silence unused warnings.
             $( let _ = NativeId::$bare_id; )*
             // Regex-backed `String.prototype` methods: installed here, but
@@ -1871,7 +1884,10 @@ fn define_method_length_and_name(heap: &mut Heap, func: Handle<v12_heap::JsObjec
     ctx.define_data_prop_with_attrs(
         func,
         "length",
-        JsValue::from_i32_smi(0).expect("0 fits Smi"),
+        // +0 as a plain `f64`: `SetFunctionLength` stores a Number, and `+0`
+        // is its only legal zero, so the Smi and double spellings are
+        // indistinguishable to `SameValue` and to `typeof`.
+        JsValue::from_f64(0.0),
         v12_heap::Attrs::new(false, false, true),
     );
     // `%Function.prototype%.name` is the empty string (ES 10.2.4), not the
@@ -1883,4 +1899,44 @@ fn define_method_length_and_name(heap: &mut Heap, func: Handle<v12_heap::JsObjec
         JsValue::string(empty),
         v12_heap::Attrs::new(false, false, true),
     );
+}
+
+/// Installs `Function.prototype.call` (arity 1), `.apply` (arity 2) and
+/// `.bind` (arity 1) as real own properties of `%Function.prototype%`
+/// (ES 10.2.3, 10.2.4, 10.2.5).
+///
+/// **Why not a `define_builtins!` `FunctionProto` group entry.** The macro is
+/// two things at once: it emits an install *and* a `builtin_dispatch` arm whose
+/// body is a `(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, Throw>`
+/// closure. These three have no such body — they are implemented by the
+/// interpreter router (`Interp::dispatch_native`, `v12-interp/src/call_setup.rs`),
+/// because `call` and `apply` have to *re-enter the machine* to invoke their
+/// target with a computed `this` and argument list, and `bind` has to compile
+/// and register nothing but must read the target's `length`/`name`. A macro
+/// entry would need a duplicate second implementation behind it, so this pass
+/// borrows the established hand-written-install shape instead — the same
+/// reason `install_string_regex_methods` and `install_regexp_methods` exist.
+///
+/// Each goes through [`Ctx::define_method`], so each gets the same
+/// `{ writable: false, enumerable: false, configurable: true }` `length` and
+/// `name` own properties every other built-in function object has, and the
+/// arity is read from [`builtin_length`] rather than repeated here (that is
+/// also what `define_method`'s own `debug_assert` checks). The install is
+/// `{ writable: true, enumerable: false, configurable: true }` — `BUILTIN`,
+/// which `define_method`'s final `define_data_prop` uses.
+///
+/// Before this pass the only way to reach these three was the interpreter's
+/// synthesized `function_method_surface`, which allocated a bare function
+/// object per read: no `length`, no `name`, and no identity
+/// (`Function.prototype.call !== Function.prototype.call`).
+pub(crate) fn install_function_proto_methods(heap: &mut Heap, targets: &BuiltinTargets) {
+    let mut ctx = Ctx::new(heap, None, None);
+    let proto = Some(targets.function_proto);
+    for (name, id) in [
+        ("call", NativeId::FunctionCall),
+        ("apply", NativeId::FunctionApply),
+        ("bind", NativeId::FunctionBind),
+    ] {
+        ctx.define_method(proto, name, id, builtin_length(id));
+    }
 }
