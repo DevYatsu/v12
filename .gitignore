@@ -10,3 +10,7 @@
 
 # Isolated parallel-implementation worktrees (per-lane git worktrees)
 .worktrees/
+
+# Scratch shell wrapper (0 bytes, mode 600) left in the repo root.
+# Do not commit: one `git add -A` would otherwise pick it up.
+snip
