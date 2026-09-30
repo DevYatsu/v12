@@ -852,21 +852,37 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 depth: self.biased_depth(0),
                 slot,
             },
-            VarLoc::Global => VarAccess::Global {
-                sym: self
-                    .comp
-                    .plans
-                    .symbol_names
+            VarLoc::Global => {
+                let plans = &self.comp.plans;
+                let unit = &plans.units[self.unit];
+                // Iterate `decl_order` — a `Vec`, in declaration order — rather
+                // than `symbol_names`, a `HashMap`. One identifier text has one
+                // SymbolId per DECLARING SCOPE, so a hash-order scan can pick a
+                // different symbol on each run and stamp the global access with
+                // the wrong variable name. Same defect class as the
+                // eval-metadata lookup fixed in `unit.rs`: make the choice a
+                // function of the program, never of the hash seed.
+                let by_decl_order = unit
+                    .decl_order
                     .iter()
-                    .find_map(|(sym, _)| {
-                        self.comp.plans.units[self.unit]
-                            .vars
-                            .get(sym)
-                            .is_some_and(|candidate| *candidate == VarLoc::Global)
-                            .then_some(*sym)
-                    })
-                    .expect("global block-function location has a symbol"),
-            },
+                    .copied()
+                    .find(|sym| unit.vars.get(sym) == Some(&VarLoc::Global));
+                // `collect.rs` assigns locations by walking `decl_order`, so it
+                // covers every symbol that has a `vars` entry. The minimum-id
+                // scan is a completeness backstop for anything added by another
+                // pass, and is deterministic by construction.
+                let sym = by_decl_order.or_else(|| {
+                    plans
+                        .symbol_names
+                        .keys()
+                        .copied()
+                        .filter(|sym| unit.vars.get(sym) == Some(&VarLoc::Global))
+                        .min()
+                });
+                VarAccess::Global {
+                    sym: sym.expect("global block-function location has a symbol"),
+                }
+            }
         }
     }
 
