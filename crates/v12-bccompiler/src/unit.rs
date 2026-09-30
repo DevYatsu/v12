@@ -432,18 +432,40 @@ pub fn compile_unit(
                     if bindings.iter().any(|(old, _)| old == name) {
                         continue;
                     }
-                    let Some((symbol, _)) = comp
-                        .plans
-                        .symbol_names
-                        .iter()
-                        .find(|(_, binding_name)| *binding_name == name)
-                    else {
+                    // Scope-aware resolution, NOT a flat name lookup.
+                    // `symbol_names` is a `HashMap<SymbolId, String>` and the
+                    // same identifier text legitimately has one symbol per
+                    // declaring scope, so `.iter().find(by name)` returned
+                    // whichever candidate the randomized hash order happened
+                    // to yield first — making the compiled Program itself
+                    // nondeterministic run to run. Walk the unit's own parent
+                    // chain instead and take the nearest enclosing scope that
+                    // declares the name, which is what lexical resolution
+                    // means and is stable by construction.
+                    let symbol = {
+                        let plans = &comp.plans;
+                        let mut cur = Some(idx);
+                        let mut found = None;
+                        while let Some(unit) = cur {
+                            if let Some(sym) = plans.units[unit]
+                                .decl_order
+                                .iter()
+                                .find(|s| plans.symbol_names.get(*s) == Some(name))
+                            {
+                                found = Some(*sym);
+                                break;
+                            }
+                            cur = plans.units[unit].parent;
+                        }
+                        found
+                    };
+                    let Some(symbol) = symbol else {
                         continue;
                     };
-                    let Some(home) = comp.plans.home_of.get(symbol) else {
+                    let Some(home) = comp.plans.home_of.get(&symbol) else {
                         continue;
                     };
-                    let Some(location) = comp.plans.units[*home].vars.get(symbol) else {
+                    let Some(location) = comp.plans.units[*home].vars.get(&symbol) else {
                         continue;
                     };
                     bindings.push((
