@@ -10,10 +10,22 @@ start, small in memory, and correct enough to run real programs.
 > **Status: early development — full pipeline works: compile → run → optimize.**
 > The compiler, heap, interpreter, baseline JIT, embedding facade, the `v12`
 > CLI, a Test262 harness, and a Tier-2 optimizer scaffold are implemented and
-> tested (563 tests, `cargo nextest run --workspace`). Generators, async
-> functions, and Promise microtasks are wired end to end. Test262 `language`
-> conformance is at **32.1 % pass** (7 561 / 23 580 executable tests, 427
-> skipped) — the Phase 1 target is ≥60 %. Expect breaking changes.
+> tested. Generators, async functions, and Promise microtasks are wired end to
+> end. Expect breaking changes.
+>
+> Measured on 2026-10-01 at `e925647d`:
+> - `cargo nextest run --workspace` → **1 295 tests, 1 295 passed, 2 skipped**
+>   (~14 s). This is the canonical gate; see `CONTEXT.md`.
+> - Test262 `language` → **77.6 % pass** (19 080 / 24 590; 41 skipped) — the
+>   Phase 1 target is ≥60 %, so it is met. The committed baseline is
+>   `conformance/baseline/language.json`; CI gates on **fail sets** via
+>   `conformance/faildiff.sh`, not on pass rate.
+>
+> These two numbers were stale for weeks (the README claimed 563 tests and
+> 32.1 %) precisely because they were hand-maintained. If you change them, pin
+> the commit and date as above — and regenerate the baseline only via
+>   `scripts/update-conformance-baseline.sh`, which requires a `faildiff`
+>   showing BROKE 0 to justify the raise.
 
 ## Why another engine?
 
