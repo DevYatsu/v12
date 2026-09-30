@@ -1649,6 +1649,22 @@ impl Interp<'_> {
                     v12_heap::FunctionTarget::Bound(state_h),
                     None,
                 ));
+                // ES 10.2.4 / `BoundFunctionCreate` (10.4.1.1): a bound
+                // function's `[[Prototype]]` is `%Function.prototype%`, the
+                // same as its target's. Without this the object had no
+                // prototype link at all, so
+                // `Object.getPrototypeOf(f.bind(x)) === Function.prototype`
+                // was `false` and the inherited `Object.prototype` members
+                // (`hasOwnProperty`, `toString`, `valueOf`) resolved only
+                // through the interpreter's synthesized
+                // `function_method_surface`, which produced a *fresh* method
+                // object per read — so `bf.call !== bf.call`.
+                //
+                // `bound` is reachable through the value stack only after the
+                // `set_property` calls further down, and `function_prototype`
+                // allocates nothing (it reads two already-resident slots), so
+                // this needs no rooting beyond what `gc_protect` above gave.
+                self.link_function_proto(bound);
                 // Spec: the bound function's `length` is
                 // max(0, target.length - boundArgCount) and its `name` is
                 // `"bound " + target.name`. Read the target's own props
@@ -1691,22 +1707,38 @@ impl Interp<'_> {
                     Some(h) => format!("bound {}", self.string_text(h)),
                     None => "bound".to_string(),
                 };
-                // Park `bound` on the value stack: the two `set_property`
-                // calls below allocate (interning + shape transition) and
-                // `gc_protect` clears/repopulates the root vector.
+                // ES 10.4.1.1 `BoundFunctionCreate` defines `length` and `name`
+                // with `DefinePropertyOrThrow`, both at
+                // `{ writable: false, enumerable: false, configurable: true }`.
+                //
+                // `set_property` (a `[[Set]]`) is the wrong operation and was
+                // observably wrong once the bound function gained its
+                // `[[Prototype]]`: `%Function.prototype%.length` is itself
+                // non-writable, so `[[Set]]` found the inherited
+                // non-writable data property, declined, and installed *no*
+                // own property — `bf.length` then read the inherited `0`
+                // instead of the computed bound arity. `define_own_data_attrs`
+                // is unconditional, so it installs the own property the spec
+                // requires and the inherited one is shadowed.
+                //
+                // `bound` is parked on the value stack across the two installs:
+                // each allocates (interning + shape transition) and
+                // `gc_protect` clears/repopulates the root vector, so a local
+                // `Handle` alone is not a root.
                 self.stack.push(JsValue::object(bound));
                 self.gc_protect();
+                let bound_attrs = Attrs::new(false, false, true);
                 let len_key = JsValue::string(self.heap.intern_text("length"));
                 let len_v = JsValue::from_i32_smi(bound_len as i32).expect("bound arity fits Smi");
-                let _ = self.set_property(JsValue::object(bound), len_key, len_v, false);
+                self.define_own_data_attrs(JsValue::object(bound), len_key, len_v, bound_attrs)?;
                 let name_key = JsValue::string(self.heap.intern_text("name"));
                 let name_h = self.heap.intern_text(&bound_name);
-                let _ = self.set_property(
+                self.define_own_data_attrs(
                     JsValue::object(bound),
                     name_key,
                     JsValue::string(name_h),
-                    false,
-                );
+                    bound_attrs,
+                )?;
                 self.stack.pop();
                 Ok(JsValue::object(bound))
             }

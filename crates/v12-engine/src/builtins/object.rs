@@ -545,25 +545,134 @@ pub fn object_proto_property_is_enumerable(
     Ok(JsValue::from_bool(enumerable))
 }
 
+/// ES 20.1.3.6 `Object.prototype.toString`.
+///
+/// The previous body answered from `JsObject::kind` alone and had neither the
+/// primitive pair nor the `@@toStringTag` step, so every value that is not an
+/// `Array`/`RegExp` instance — including every *function* object — came back
+/// `"[object Object]"`.
+///
+/// The spec's own order is reproduced, and the order is the whole point:
+///
+/// * steps 1-2 answer the primitive pair (`undefined`/`null`) *before*
+///   `ToObject`, so no wrapper is needed for them;
+/// * steps 4-13 pick `builtinTag` from the receiver's internal slots;
+/// * step 15 *then* reads `@@toStringTag`, and step 16 lets a **String** value
+///   replace whatever `builtinTag` said. A user-installed tag therefore beats
+///   the brand table — including for an array — which is why this does **not**
+///   early-return on `IsArray` the way a "check Array first" reading would.
+///   `Get` is the full `[[Get]]` dispatch, so a getter installed as
+///   `@@toStringTag` runs and a throwing one propagates.
+///
+/// `ToObject` (step 3) has no wrapper exotic object to produce in v1, so a
+/// primitive receiver's `builtinTag` is always `"Object"` and its
+/// `@@toStringTag` is read off the corresponding *wrapper prototype*
+/// (`Number.prototype`, `Symbol.prototype`, …). That is faithful rather than
+/// convenient: the spec's `Number.prototype[@@toStringTag]` is `"Number"`, and
+/// the day this engine installs it, `call(1)` starts answering
+/// `"[object Number]"` with no change here.
 pub fn object_proto_to_string(
     ctx: &mut Ctx,
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    // ES 20.1.3.6 step 6 brand table. `RegExp` is special-cased in the spec
-    // (a RegExp exotic object is branded by `[[RegExpMatcher]]`, *not* by a
-    // `@@toStringTag` property — `built-ins/RegExp/prototype/15.10.6.js`
-    // requires `Object.prototype.toString.call(RegExp.prototype)` to stay
-    // `"[object Object]"`, so nothing may be installed under `@@toStringTag`
-    // to fake it). `Map`/`Set`/`Date`/`Error` carry the brand through their
-    // own `@@toStringTag` installs and are out of this file's lane.
-    let kind = this.as_object().map(|o| ctx.heap.get(o).kind);
-    let text = match kind {
-        Some(v12_heap::Kind::Array) => "[object Array]",
-        Some(v12_heap::Kind::RegExp) => "[object RegExp]",
-        _ => "[object Object]",
+    if this.is_undefined() {
+        return Ok(JsValue::string(ctx.heap.intern_text("[object Undefined]")));
+    }
+    if this.is_null() {
+        return Ok(JsValue::string(ctx.heap.intern_text("[object Null]")));
+    }
+    // Steps 3-13: `O` and its `builtinTag`. For a primitive, `O` is the
+    // wrapper prototype the spec's `ToObject` would have produced an instance
+    // *from* — the tag lives on the prototype either way — and a wrapper object
+    // has no row in the brand table, hence `"Object"`.
+    let (o, builtin): (JsValue, &str) = if let Some(obj) = this.as_object() {
+        (JsValue::object(obj), builtin_tag(ctx, obj))
+    } else {
+        (primitive_wrapper_prototype(ctx, this), "Object")
     };
-    Ok(JsValue::string(ctx.heap.intern_text(text)))
+    // Steps 15-16: `Get(O, @@toStringTag)`, and a String value replaces
+    // `builtinTag`.
+    let tag_source = o.as_object();
+    let tag = match tag_source {
+        None => None,
+        Some(obj) => {
+            let sym = ctx
+                .heap
+                .well_known_symbol(v12_heap::WellKnownSymbol::ToStringTag);
+            let key = v12_heap::PropKey::from_symbol(sym);
+            let got = crate::internal_methods::dispatch_get(
+                &mut *ctx.heap,
+                obj,
+                key,
+                JsValue::object(obj),
+            )
+            .map_err(Throw::Value)?;
+            got.as_string().map(|h| ctx.string_text(h))
+        }
+    };
+    let text = format!("[object {}]", tag.as_deref().unwrap_or(builtin));
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
+}
+
+/// The `@@toStringTag` prototype a primitive receiver would inherit its brand
+/// from once `ToObject` has wrapped it (ES 20.1.3.6 step 3).
+///
+/// Returns `JsValue::undefined()` — which makes the caller skip the `Get`
+/// entirely and fall back to `builtinTag` — when v1 has no such wrapper
+/// (`BigInt`), when the intrinsic is not resolvable (a bare-heap engine test),
+/// or when the constructor has no `prototype` object. The tag is read off the
+/// *constructor's* `prototype` field rather than through a hardcoded index, so
+/// a second realm (`$262.createRealm`) resolves its own.
+fn primitive_wrapper_prototype(ctx: &Ctx, primitive: JsValue) -> JsValue {
+    let ctor_name = if primitive.is_boolean() {
+        "Boolean"
+    } else if primitive.is_smi() || primitive.is_f64() {
+        "Number"
+    } else if primitive.is_string() {
+        "String"
+    } else if primitive.is_symbol() {
+        "Symbol"
+    } else {
+        // `BigInt` is not a `GLOBAL_INTRINSICS` slot, and the two internal
+        // markers (`Hole`, `Empty`) never reach a built-in's `this`.
+        return JsValue::undefined();
+    };
+    ctx.intrinsic(ctor_name)
+        .and_then(|ctor| ctor.as_object())
+        .and_then(|ctor| ctx.heap.get(ctor).prototype)
+        .map_or(JsValue::undefined(), JsValue::object)
+}
+
+/// ES 20.1.3.6 steps 4-13: the `builtinTag` table, one arm per internal-slot
+/// set v12 actually represents.
+///
+/// An object with a `[[Call]]` internal method brands as `Function` — that is
+/// step 13 and the `Kind::Function` arm, and it is what makes
+/// `Object.prototype.toString.call(fn)` answer `"[object Function]"` for bound
+/// functions, closures, and `%Function.prototype%` itself.
+///
+/// `Promise`, `Map`, `Set` and the iterator objects are *absent* on purpose:
+/// per the spec table they have no `builtinTag`, and their brands come from the
+/// `@@toStringTag` of step 15.
+///
+/// `RegExp` has no row either. Its `Kind::RegExp` arm hoists
+/// `RegExp.prototype[@@toStringTag]` (which v1 does not install) up to the
+/// kind, so an *instance* brands as `RegExp` while `RegExp.prototype` — an
+/// `Ordinary` object — falls through to `"[object Object]"`, which
+/// `built-ins/RegExp/prototype/15.10.6.js` requires.
+fn builtin_tag(ctx: &Ctx<'_>, obj: v12_heap::Handle<v12_heap::JsObject>) -> &'static str {
+    match ctx.heap.get(obj).kind {
+        // Step 6: `IsArray(O)` — a `Kind::Array` *is* an array in v12, so the
+        // spec's `IsArray` abstract op and this match arm are the same test.
+        v12_heap::Kind::Array => "Array",
+        v12_heap::Kind::Function => "Function",
+        v12_heap::Kind::Arguments => "Arguments",
+        v12_heap::Kind::Error => "Error",
+        v12_heap::Kind::Date => "Date",
+        v12_heap::Kind::RegExp => "RegExp",
+        _ => "Object",
+    }
 }
 
 pub fn object_proto_value_of(

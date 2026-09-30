@@ -1182,6 +1182,13 @@ macro_rules! define_builtins {
         /// compiler can inline and no rodata table is emitted.
         pub fn install_builtins(heap: &mut Heap, targets: &BuiltinTargets) {
             $( $( $crate::__builtin_emit_install!($target, heap, targets, $name, NativeId::$id $(, $len)?); )* )*
+            // `%Function.prototype%`'s own identity: its `[[Prototype]]` link
+            // and its `length`/`name` own properties. The macro's
+            // `FunctionProto` group can only *add* named methods, and it runs
+            // before this, so this pass is what makes the object the spec
+            // prototype object rather than a bare callable. See
+            // `install_function_proto_identity`.
+            install_function_proto_identity(heap, targets);
             // Bare ids are dispatch-only; silence unused warnings.
             $( let _ = NativeId::$bare_id; )*
             // Regex-backed `String.prototype` methods: installed here, but
@@ -1804,4 +1811,76 @@ pub(crate) fn module_import(
         Throw::Value(v) => Ok(promise::make_rejected_promise(heap, v)),
         other => Err(other),
     }
+}
+
+/// Gives `%Function.prototype%` the identity the spec gives it (ES 10.2.4):
+/// the `[[Prototype]]` link to `%Object.prototype%`, plus the `length` and
+/// `name` own data properties every built-in function object carries.
+///
+/// **Why a separate pass and not macro entries.** The realm allocates
+/// `%Function.prototype%` as a bare `Kind::Function`
+/// (`realm.rs`: `JsObject::function(FunctionTarget::Bytecode(u32::MAX), None)`)
+/// and links only the `constructor` back-link through `install_ctor`. Two of
+/// the three things above are not *named methods*, so `define_builtins!` has no
+/// syntax for them: the `[[Prototype]]` is a heap field, not a property, and
+/// `length`/`name` are per-object attributes that must precede the method
+/// group for `built-ins/Function/prototype/property-order.js` (which asserts
+/// `name` immediately follows `length` in `getOwnPropertyNames`). The realm
+/// owns the allocation and is not this lane's file, so the pass runs from
+/// `install_builtins`, which the realm calls with both handles already wired.
+///
+/// `length`/`name` carry the standard built-in-function attributes
+/// `{ writable: false, enumerable: false, configurable: true }` (ES 10.2.4 /
+/// the "Properties of the Function Prototype Object" clause), which is
+/// `define_method`'s own shape — so the install goes through
+/// `Ctx::define_method` on the prototype object itself rather than
+/// `define_data_prop_with_attrs` by hand, keeping one install shape.
+pub(crate) fn install_function_proto_identity(heap: &mut Heap, targets: &BuiltinTargets) {
+    let proto = targets.function_proto;
+    // ES 10.2.4: "%Function.prototype%'s [[Prototype]] internal slot is a
+    // reference to %Object.prototype%". Without this link every inherited
+    // `Object.prototype` member (`valueOf`, `hasOwnProperty`, and a
+    // user-installed `indicator`) reads `undefined` off the function
+    // prototype object, and `Object.getPrototypeOf(Function.prototype)`
+    // answers `null`.
+    heap.get_mut(proto).prototype = Some(targets.object_proto);
+    // The `constructor` back-link that `install_ctor` already installed is the
+    // prototype's *only* own property here; `length` then `name` follow it in
+    // insertion order, which is what `property-order.js` measures.
+    define_method_length_and_name(heap, proto);
+}
+
+/// Installs the `length` and `name` own data properties on an *existing*
+/// function object, with the standard built-in-function attributes
+/// `{ writable: false, enumerable: false, configurable: true }` and in that
+/// order.
+///
+/// `Ctx::define_method` stamps the same two properties, but it also *allocates*
+/// the function object from a `NativeId` — `%Function.prototype%` is
+/// allocated by the realm and has no id of its own (its callable is the
+/// `u32::MAX` placeholder). This is the same shape, factored over the two
+/// cases.
+///
+/// Order is load-bearing, not cosmetic: `CreateBuiltinFunction` (ES 10.1.8)
+/// defines `length` then `name`, and
+/// `built-ins/Function/prototype/property-order.js` asserts that
+/// `getOwnPropertyNames` lists them adjacently in that order.
+fn define_method_length_and_name(heap: &mut Heap, func: Handle<v12_heap::JsObject>) {
+    let mut ctx = Ctx::new(heap, None, None);
+    // `length` first: see the order note above.
+    ctx.define_data_prop_with_attrs(
+        func,
+        "length",
+        JsValue::from_i32_smi(0).expect("0 fits Smi"),
+        v12_heap::Attrs::new(false, false, true),
+    );
+    // `%Function.prototype%.name` is the empty string (ES 10.2.4), not the
+    // absent property the object had before.
+    let empty = ctx.heap.intern_text("");
+    ctx.define_data_prop_with_attrs(
+        func,
+        "name",
+        JsValue::string(empty),
+        v12_heap::Attrs::new(false, false, true),
+    );
 }
