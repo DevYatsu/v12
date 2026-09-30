@@ -157,6 +157,9 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::GlobalParseInt => Some(2),
         NativeId::JsonParse => Some(2),
         NativeId::JsonStringify => Some(3),
+        // `JSON.rawJSON ( value )` and `JSON.isRawJSON ( value )` each declare
+        // one required parameter, so both report length 1 (25.5.2.1 / 25.5.2.2).
+        NativeId::JsonRawJson | NativeId::JsonIsRawJson => Some(1),
         NativeId::MathAbs => Some(1),
         NativeId::MathAcos => Some(1),
         NativeId::MathAcosh => Some(1),
@@ -1525,6 +1528,8 @@ define_builtins! {
     Json {
         "parse" (2) => JsonParse => |heap, this, args| call_ctx(json::json_parse, heap, this, args),
         "stringify" (3) => JsonStringify => |heap, this, args| call_ctx(json::json_stringify, heap, this, args),
+        "rawJSON" (1) => JsonRawJson => |heap, this, args| call_ctx(json::json_raw_json, heap, this, args),
+        "isRawJSON" (1) => JsonIsRawJson => |heap, this, args| call_ctx(json::json_is_raw_json, heap, this, args),
     },
     BooleanProto {
         "toString" (0) => BooleanProtoToString => |heap, this, args| call_ctx(boolean::boolean_proto_to_string, heap, this, args),

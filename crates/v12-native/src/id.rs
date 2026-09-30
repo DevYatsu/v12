@@ -224,6 +224,8 @@ pub enum NativeId {
     // JSON
     JsonParse = 2600,
     JsonStringify = 2601,
+    JsonRawJson = 2602,
+    JsonIsRawJson = 2603,
     // Global URI
     GlobalEncodeUri = 2404,
     GlobalDecodeUri = 2405,
