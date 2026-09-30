@@ -960,11 +960,56 @@ impl Interp<'_> {
     }
 
     /// Creates a realm-linked error value for embedder/module-loader failures.
+    ///
+    /// **Permissive prefix split**: any `"<anything>: <msg>"` head becomes the
+    /// `name` verbatim. That is the behaviour every existing call site was
+    /// written against, so it is frozen — see [`Self::error_value_kind`] for
+    /// the validating counterpart, and do not make this delegate to it.
     pub fn error_value(&mut self, text: &str) -> JsValue {
         let (kind, message) = match text.split_once(": ") {
             Some((n, m)) => (n, m),
             None => ("Error", text),
         };
+        self.make_error_object(kind, message)
+    }
+
+    /// Creates a realm-linked error value, honoring a `"Kind: message"` prefix
+    /// only when `Kind` is a known error kind (`v12_native::parse_error_text`).
+    ///
+    /// The mirror of `Ctx::make_error`
+    /// (`crates/v12-engine/src/builtins/ctx.rs`), reachable from the
+    /// interpreter where `Ctx` is not: `v12-engine` depends on `v12-interp`,
+    /// so the `Ctx` wrappers cannot be called from here. An unrecognized head
+    /// falls back to `default_kind` and stays part of the `message`, so the
+    /// stored `message` never duplicates the `name`.
+    pub fn error_value_kind(&mut self, default_kind: &str, text: &str) -> JsValue {
+        let (kind, message) = v12_native::parse_error_text(text, default_kind);
+        self.make_error_object(kind, message)
+    }
+
+    /// Real `TypeError` object (validating prefix split).
+    pub fn type_error(&mut self, msg: &str) -> JsValue {
+        self.error_value_kind("TypeError", msg)
+    }
+
+    /// Real `RangeError` object (validating prefix split).
+    pub fn range_error(&mut self, msg: &str) -> JsValue {
+        self.error_value_kind("RangeError", msg)
+    }
+
+    /// Real `SyntaxError` object (validating prefix split).
+    pub fn syntax_error(&mut self, msg: &str) -> JsValue {
+        self.error_value_kind("SyntaxError", msg)
+    }
+
+    /// Real `ReferenceError` object (validating prefix split).
+    pub fn reference_error(&mut self, msg: &str) -> JsValue {
+        self.error_value_kind("ReferenceError", msg)
+    }
+
+    /// Builds a realm-linked error object with an explicit `name`/`message`.
+    /// Extracted from `error_value` so both prefix strategies share one body.
+    fn make_error_object(&mut self, kind: &str, message: &str) -> JsValue {
         self.gc_protect();
         let obj = self.heap.alloc(JsObject {
             kind: Kind::Error,
