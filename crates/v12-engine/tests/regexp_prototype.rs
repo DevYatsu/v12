@@ -545,3 +545,266 @@ fn regexp_species_returns_the_receiver() {
     assert_eq!(eval_display("RegExp.length"), "2");
     assert_eq!(eval_display("RegExp[Symbol.species] === RegExp"), "true");
 }
+
+// -- group 6: `SpeciesConstructor` (ES 7.3.22) --------------------------------
+//
+// The defect this group exists for: the implementation tested
+// `IsConstructor(O.constructor)` where the spec says `Type(O.constructor) is
+// Object`, so any receiver whose `constructor` was a plain object — the shape
+// `Symbol.matchAll/species-regexp-get-{global,unicode}-throws.js` uses — threw
+// a `TypeError` no engine produces. The two steps also disagree in the *other*
+// direction, so one predicate cannot serve both: an object `constructor` passes
+// step 3 and can still be rejected at step 7 by a non-constructible
+// `@@species`. Each step below is therefore asserted on its own.
+
+/// Runs `body` with `r`'s `constructor` set to the expression `ctor_expr`,
+/// and reports the outcome of `r[Symbol.matchAll]('')` as a compact tag:
+/// `"ok"`, `"<ErrorName>"` for a thrown value, or `"no-throw"` when the
+/// matcher found nothing in the empty string (also a pass, per the spec).
+fn match_all_with_constructor(ctor_expr: &str) -> String {
+    eval_display(&format!(
+        "var r = /./; r.constructor = {ctor_expr}; var out; \
+         try {{ r[Symbol.matchAll](''); out = 'ok'; }} \
+         catch (e) {{ out = (e && e.constructor) ? e.constructor.name : 'threw'; }} \
+         out"
+    ))
+}
+
+/// Steps 2 and 3: `undefined` selects the default, and *only* a non-Object
+/// `constructor` throws. `Symbol.matchAll/species-constructor-is-not-object-
+/// throws.js` pins the `null`/`true`/`""`/`Symbol()`/`1` half.
+#[test]
+fn species_step_2_and_3_turn_on_type_c_not_is_constructor() {
+    // Step 2 — `If ctor is undefined, return defaultCtor.` No throw.
+    assert_eq!(
+        eval_display(
+            "var r = /\\w/g; r.constructor = undefined; \
+             r[Symbol.matchAll]('a*b').length"
+        ),
+        "2"
+    );
+    // Step 3 — the throw cases, verbatim from the corpus test.
+    for ctor in ["null", "true", "false", "\"\"", "Symbol()", "1", "0", "86"] {
+        assert_eq!(
+            match_all_with_constructor(ctor),
+            "TypeError",
+            "`constructor = {ctor}` must be a TypeError (spec step 3)"
+        );
+    }
+}
+
+/// Step 3 is `Type(ctor) is Object`, *not* `IsConstructor(ctor)`: every one of
+/// these `constructor` values is a non-constructor Object, and the spec runs
+/// them straight through to a result. This is the regression.
+#[test]
+fn an_object_constructor_is_not_a_type_error_even_when_it_is_not_a_constructor() {
+    for ctor in [
+        "{}",
+        "Object.create(null)",
+        "[]",
+        "function(){}",
+        "{ [Symbol.species]: function(){} }",
+        "Object.defineProperty({}, Symbol.species, { value: RegExp })",
+        "new Proxy({}, {})",
+    ] {
+        assert_ne!(
+            match_all_with_constructor(ctor),
+            "TypeError",
+            "`constructor = {ctor}` is an Object: step 3 must not fire (this \
+             is the `species-regexp-get-*-throws.js` regression)"
+        );
+    }
+}
+
+/// Steps 4 and 5: a `@@species` that is `undefined` or `null` selects the
+/// default, so a *function-valued* `constructor` that never had `@@species`
+/// installed takes the default path — the case the `Type`-only misreading
+/// would have rejected.
+#[test]
+fn species_step_5_selects_the_default_for_undefined_and_null() {
+    for species in ["undefined", "null"] {
+        assert_eq!(
+            eval_display(&format!(
+                "var r = /\\w/g; \
+                 r.constructor = {{ [Symbol.species]: {species} }}; \
+                 r[Symbol.matchAll]('a*b').length"
+            )),
+            "2",
+            "`@@species = {species}` selects the default constructor"
+        );
+    }
+    // A function `constructor` with no `@@species` at all is the same path.
+    assert_eq!(
+        eval_display(
+            "var r = /\\w/g; r.constructor = function(){}; \
+             r[Symbol.matchAll]('a*b').length"
+        ),
+        "2"
+    );
+}
+
+/// Steps 6 and 7 are a second, *different* predicate on a second, different
+/// value: `@@species` must be a constructor, and step 7 **throws** rather than
+/// falling back to the default. This is the half a `Type`-only reading of
+/// step 3 would lose, so it is asserted explicitly.
+#[test]
+fn species_step_7_throws_rather_than_falling_back_to_the_default() {
+    for species in ["{}", "[]", "0", "\"\"", "Symbol()", "true", "/x/"] {
+        assert_eq!(
+            match_all_with_constructor(&format!("{{ [Symbol.species]: {species} }}")),
+            "TypeError",
+            "`@@species = {species}` is not a constructor: spec step 7 throws"
+        );
+    }
+}
+
+/// Step 6: a genuine constructor is returned and *used*. `Construct(C, « R,
+/// flags »)` copies `R`'s source and flags, so the drain still finds `R`'s
+/// matches — a species constructor that returns a different pattern is not
+/// reachable from a `&mut Ctx` native (see `construct_species_matcher`) and is
+/// covered by `the_documented_species_constructor_gap` instead.
+#[test]
+fn species_step_6_returns_a_constructor_and_the_matcher_is_built_from_it() {
+    assert_eq!(
+        eval_display(
+            "var r = /\\w/g; r.constructor = { [Symbol.species]: RegExp }; \
+             r[Symbol.matchAll]('a*b').length"
+        ),
+        "2"
+    );
+    // `Construct(%RegExp%, « R, flags »)` must clone `R`'s source *and* flags,
+    // so the drain finds `R`'s matches and not the receiver's whole text.
+    assert_eq!(
+        eval_display(
+            "var r = /\\d/g; \
+             r.constructor = { [Symbol.species]: RegExp }; \
+             r[Symbol.matchAll]('a1b').map(function(m) { return m[0]; }).join(',')"
+        ),
+        "1"
+    );
+}
+
+/// Steps 1 and 4 are `Get`s, so a throwing getter on `constructor` or on
+/// `@@species` should propagate — that is what
+/// `Symbol.matchAll/species-constructor-get-constructor-throws.js` and
+/// `…/species-constructor-get-species-throws.js` assert.
+///
+/// **Neither works, and both are asserted as a known gap rather than as
+/// correct behaviour.** `internal_methods::invoke_accessor_getter` answers
+/// `undefined` for a *bytecode* getter: running bytecode needs the interpreter,
+/// which a `&mut Ctx` native cannot re-enter, so the read falls through to
+/// "property absent" — step 1 selects the default, step 4 selects the default,
+/// and neither throw is observed. The accessor *is* reachable from a script
+/// (`r.constructor[Symbol.species]` calls it), which is how the gap stays
+/// invisible outside `@@matchAll`.
+///
+/// The fix is to route the read through the interpreter's `get_property`,
+/// i.e. `crates/v12-interp/**`. These two assertions fail today **on purpose**,
+/// so the gap is visible if it ever changes; flip them to `"ERR:RangeError: \
+/// boom"` when that lands.
+#[test]
+fn throwing_constructor_and_species_getters_are_a_documented_gap() {
+    assert_eq!(
+        eval_display(
+            "var r = /./; \
+             Object.defineProperty(r, 'constructor', { get(){ throw new RangeError('boom'); } }); \
+             var out; try { r[Symbol.matchAll](''); out = 'ok'; } \
+             catch (e) { out = 'ERR:' + e; } out"
+        ),
+        "ok",
+        "step 1's `Get` cannot invoke a bytecode getter from a `&mut Ctx` native"
+    );
+    assert_eq!(
+        eval_display(
+            "var r = /./; \
+             r.constructor = { get [Symbol.species](){ throw new RangeError('boom'); } }; \
+             var out; try { r[Symbol.matchAll](''); out = 'ok'; } \
+             catch (e) { out = 'ERR:' + e; } out"
+        ),
+        "ok",
+        "step 4's `Get` cannot invoke a bytecode getter either"
+    );
+    // The accessor really is reachable from script, so this is the internal
+    // read path and not the accessor itself.
+    assert_eq!(
+        eval_display(
+            "var o = { get [Symbol.species](){ return RegExp; } }; \
+             var out; try { o[Symbol.species]; out = 'ok'; } catch (e) { out = 'ERR'; } out"
+        ),
+        "ok"
+    );
+    // A *data* property at `@@species` is read correctly, so the gap is
+    // specifically the accessor path and not the `@@species` key lookup.
+    assert_eq!(
+        match_all_with_constructor("{ [Symbol.species]: 0 }"),
+        "TypeError"
+    );
+}
+
+/// `@@matchAll` reads the receiver's `lastIndex` once and drives a *separate*
+/// matcher with it, leaving `R.lastIndex` untouched — ES 22.2.6.9's
+/// `Set(matcher, "lastIndex", lastIndex, true)`. Asserted by
+/// `Symbol.matchAll/this-lastindex-cached.js` in the corpus.
+#[test]
+fn match_all_copies_last_index_onto_a_fresh_matcher() {
+    assert_eq!(
+        eval_display(
+            "var r = /./g; r.lastIndex = 2; \
+             var it = r[Symbol.matchAll]('abcd'); \
+             r.lastIndex = 0; \
+             it.map(function(m){ return m[0]; }).join('')"
+        ),
+        "cd"
+    );
+    assert_eq!(
+        eval_display(
+            "var r = /./g; r.lastIndex = 2; \
+             r[Symbol.matchAll]('abcd'); r.lastIndex"
+        ),
+        "2",
+        "the drain must not write through to the receiver's own `lastIndex`"
+    );
+}
+
+/// ES 22.2.6.11 `RegExp.prototype[@@replace]` has no `SpeciesConstructor` step
+/// (an earlier draft did; it was removed), so a receiver with a non-object
+/// `constructor` must replace normally instead of throwing.
+#[test]
+fn replace_does_not_select_a_species_constructor() {
+    for ctor in ["null", "1", "\"s\"", "Symbol()"] {
+        assert_eq!(
+            eval_display(&format!(
+                "var r = /x/g; r.constructor = {ctor}; r[Symbol.replace]('axb', 'y')"
+            )),
+            "ayb",
+            "`@@replace` must not call SpeciesConstructor (`constructor = {ctor}`)"
+        );
+    }
+}
+
+/// The gap `construct_species_matcher` documents: a user `@@species` is a
+/// bytecode closure, and `Construct` on it needs the interpreter's construct
+/// seam, which a `&mut Ctx` native cannot reach. The receiver is used as the
+/// matcher instead, so a species constructor that returns a *different
+/// pattern* is not honoured.
+///
+/// Asserted as a known gap for the same reason as the step-4 getter above —
+/// it fails today on purpose. `Symbol.matchAll/species-constructor.js` and
+/// `Symbol.split/species-ctor.js` are the corpus tests it will flip.
+#[test]
+fn the_documented_species_constructor_gap_is_untested_yet() {
+    // The species constructor returns /\w/g, which would match "a" in "a*b".
+    // The answer is `null` because the *receiver* (\d) is used as the matcher.
+    // Flip this to "a" when `Construct` becomes reachable from a `&mut Ctx`
+    // native; `Symbol.matchAll/species-constructor.js` is the corpus test.
+    assert_eq!(
+        eval_display(
+            "var r = /\\d/u; \
+             r.constructor = { [Symbol.species]: function(){ return /\\w/g; } }; \
+             String(r[Symbol.matchAll]('a*b'))"
+        ),
+        "null",
+        "the receiver is used as the matcher because `Construct` is not \
+         reachable from a `&mut Ctx` native; see `construct_species_matcher`"
+    );
+}
