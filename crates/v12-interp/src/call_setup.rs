@@ -1299,6 +1299,19 @@ impl Interp<'_> {
                         .dispatch_native(id, callee_v, &args_slice)
                         .map(CallOutcome::Value);
                 }
+                // `IsConstructor` (ES 10.1.14) for a source-defined function.
+                // This arm used to fall straight through, so `new (()=>{})`,
+                // `new (function*(){})` and `new (async function(){})` all
+                // built an instance instead of throwing — and because a bound
+                // function's `[[Construct]]` forwards to its target, it also
+                // made `new (arrow.bind())` silently succeed. The prototype
+                // materialization below is what papered it over: an arrow has
+                // no `prototype`, so the fallback allocated one.
+                if !self.bytecode_is_constructor(idx, callee_program) {
+                    return Err(JSException(
+                        self.error_value("TypeError: value is not a constructor"),
+                    ));
+                }
                 idx
             }
             v12_heap::FunctionTarget::Native(f) => {
@@ -1323,14 +1336,27 @@ impl Interp<'_> {
                 ));
             }
             v12_heap::FunctionTarget::Bound(_) => {
-                // A bound function is constructible only if its target is.
-                // The A1 scope treats every bound function as non-constructible
-                // (`new (f.bind(x))()` is rare in the target slice); the full
-                // [[Construct]] forwarding (clear bound `this`, concat prefix,
-                // construct the target) is deferred.
-                return Err(JSException(
-                    self.error_value("TypeError: value is not a constructor"),
-                ));
+                // `new bf(...)` is `Construct(bf, args, bf)` (ES 10.2.2
+                // step 13) — the *bound function itself* is the newTarget.
+                // `construct_object` is the interpreter's nested construct
+                // entry and already implements ES 10.4.1.1 `[[Construct]]`,
+                // including step 3's `SameValue(F, newTarget)` rewrite that
+                // turns that `newTarget` into the bound target. Delegating
+                // (rather than inlining a second copy here) keeps the `new`
+                // opcode, `Reflect.construct`, and the proxy `construct` trap
+                // on one implementation, which is the whole point: they differ
+                // only in where the args come from.
+                //
+                // Safe to nest `execute()` from here: the `Kind::Proxy` arm
+                // above already does exactly this, and `construct_object`
+                // brackets itself with `stop_at_frames` + a stack truncate back
+                // to the window it pushed, so the caller's frame is untouched.
+                let args_start = callee_slot + 2;
+                let args_end = args_start + usize::from(argc);
+                let args_vec = self.stack[args_start..args_end].to_vec();
+                return self
+                    .construct_object(callee_obj, &args_vec, callee_v)
+                    .map(CallOutcome::Value);
             }
         };
 
@@ -1801,9 +1827,27 @@ impl Interp<'_> {
                 let global = self.global;
                 let programs = self.programs();
                 self.gc_protect();
-                self.natives
+                let made = self
+                    .natives
                     .function_construct(self.heap, args, global, programs)
-                    .map_err(|t| JSException::from_throw(self.heap, t))
+                    .map_err(|t| JSException::from_throw(self.heap, t))?;
+                // `CreateDynamicFunction` (ES 19.2.1.1) step 31 is
+                // `MakeConstructor`, and `MakeConstructor`'s `[[Prototype]]`
+                // is `%Function.prototype%` — but the dynamic path in
+                // `builtins/registry.rs` builds the object with
+                // `JsObject::function(..)` and never links it, because a bare
+                // `&mut Heap` cannot name this realm's `%Function.prototype%`
+                // (that needs the `Function` global property read
+                // `Interp::function_prototype` performs). This interp seam is
+                // the first point that has both, so the link happens here.
+                //
+                // Without it `Object.getPrototypeOf(new Function(""))` was
+                // `null` — the one remaining unlinked function object after
+                // `alloc_closure` stopped emitting them.
+                if let Some(h) = made.as_object() {
+                    self.link_function_proto(h);
+                }
+                Ok(made)
             }
             // Any other native id: callback-taking built-ins re-enter the
             // machine and cannot run as registry natives, so try the interp
@@ -2265,7 +2309,7 @@ impl Interp<'_> {
                     v12_heap::FunctionTarget::Bytecode(idx) => {
                         let funcs = self.functions_for_program(program);
                         if (idx as usize) < funcs.len() {
-                            !funcs[idx as usize].is_arrow
+                            self.bytecode_is_constructor(idx, program)
                         } else {
                             // Out-of-range index: an engine native. Only the
                             // registered constructor-shaped ids qualify.
@@ -2302,6 +2346,30 @@ impl Interp<'_> {
         self.is_constructor_object(obj)
     }
 
+    /// `IsConstructor` (ES 10.1.14) for a function whose callable is an
+    /// in-range `FunctionTarget::Bytecode(idx)`.
+    ///
+    /// One predicate, two callers that must not disagree:
+    /// [`Self::is_constructor_object`] (the `instanceof`/`Reflect.construct`/
+    /// proxy oracle) and [`Self::prepare_construct`] (the `new` opcode). When
+    /// these were two independent expressions they did disagree — the oracle
+    /// consulted `is_arrow` and the `new` path consulted nothing at all — and
+    /// `new (arrow.bind())` was the visible symptom: the oracle said "not a
+    /// constructor", the opcode disagreed, and the bound forward built an
+    /// instance.
+    ///
+    /// `is_arrow`, `is_generator` and `is_async` are the three source-level
+    /// constructs ES 10.1.14 excludes from `[[Construct]]`. **Methods are also
+    /// non-constructible and are not covered**: v12's `FunctionBytecode` has no
+    /// `is_method` flag, so `new o.m()` still succeeds. Closing that needs a
+    /// field in `crates/v12-bytecode` and a set in
+    /// `crates/v12-bccompiler` — neither is this lane's to touch.
+    fn bytecode_is_constructor(&mut self, idx: u32, program: u32) -> bool {
+        self.functions_for_program(program)
+            .get(idx as usize)
+            .is_some_and(|f| !f.is_arrow && !f.is_generator && !f.is_async)
+    }
+
     /// True when a bytecode-table index names one of the engine's
     /// constructor-shaped natives (`new Object/Array/Boolean/Error/Promise/…`).
     ///
@@ -2327,8 +2395,28 @@ impl Interp<'_> {
         if self.heap.get(target).kind == Kind::Proxy {
             return self.proxy_construct(target, args, new_target);
         }
-        // Bound-function targets: forward with the bound prefix and clear
-        // `this` (the constructed instance wins).
+        // Bound-function targets: ES 10.4.1.1 `[[Construct]](args, newTarget)`.
+        //   1. Let target be the bound target.
+        //   2. If SameValue(target, newTarget) is false, throw a TypeError.
+        //   3. If SameValue(F, newTarget) is true, set newTarget to target.
+        //   4. Return ? Construct(target, args, newTarget).
+        //
+        // Step 3 is the one that is easy to miss and it is observable: it is
+        // the *only* reason `new (f.bind())(...)` allocates from `f.prototype`
+        // rather than from the bound function's (absent) `prototype`, and it is
+        // what makes `newTarget` read inside a bound *derived class* the class
+        // itself — `bind/instance-construct-newtarget-*` asserts exactly that.
+        // Step 2 is the bound form of `IsConstructor`; the outer
+        // `Reflect.construct` / proxy `construct` checks
+        // `is_constructor_object`, which recurses, but a proxy wrapping a
+        // bound-of-arrow reaches this arm with an answer the recursion already
+        // gave as `false` for the *inner* target only, so re-assert here.
+        //
+        // The bound `this` is intentionally dropped: for a constructor call the
+        // `this` binding is the freshly created instance (or `undefined` in the
+        // class-throws case), which `prepare_construct` below supplies. Step 4
+        // recurses, so a doubly-bound function chains correctly and `newTarget`
+        // is rewritten once per hop.
         if let v12_heap::FunctionTarget::Bound(state_h) = self.heap.get(target).callable {
             let (inner, _this_arg, prefix) = {
                 let st = self.heap.get(state_h);
@@ -2340,9 +2428,23 @@ impl Interp<'_> {
                     st.elements[2..].to_vec(),
                 )
             };
+            // Step 2: `IsConstructor(target)` false ⇒ TypeError (ES 10.1.14).
+            // Covers an arrow target and a native target with no `[[Construct]]`.
+            if !self.is_constructor_object(inner) {
+                return Err(JSException(
+                    self.error_value("TypeError: target is not a constructor"),
+                ));
+            }
+            // Step 3.
+            let inner_v = JsValue::object(inner);
+            let effective_new_target = if new_target == target_v {
+                inner_v
+            } else {
+                new_target
+            };
             let mut call_args = prefix;
             call_args.extend_from_slice(args);
-            return self.construct_object(inner, &call_args, new_target);
+            return self.construct_object(inner, &call_args, effective_new_target);
         }
         if self.heap.get(target).kind != Kind::Function {
             return Err(JSException(
