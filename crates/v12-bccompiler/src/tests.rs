@@ -1170,6 +1170,31 @@ fn compile_ast_reuses_caller_pipeline_identically() {
 // ---------------------------------------------------------------------------
 
 /// Every `Const::Str32` payload across the program's constant pools.
+/// Strings the compiler interns on the program's behalf rather than reading
+/// from the source: the `ReferenceError` intrinsic name and one TDZ message per
+/// guarded `let`/`const` binding.
+///
+/// The interner is shared across a whole compilation session, so an assertion
+/// that "interner size == distinct pooled strings" has to subtract these first
+/// (see `distinct_identifiers_get_distinct_keys`).
+fn compiler_introduced_strings(prog: &Program, interner: &Interner) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in str_ids(prog) {
+        let Some(spur) = spur_of_str_id(id) else {
+            continue;
+        };
+        let text = interner.resolve(&spur);
+        if text == "ReferenceError"
+            || text.starts_with("Cannot access '") && text.ends_with("' before initialization")
+        {
+            out.push(text.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn str_ids(prog: &Program) -> Vec<u32> {
     prog.functions
         .iter()
@@ -1213,7 +1238,7 @@ fn distinct_identifiers_get_distinct_keys() {
             .copied()
             .collect::<std::collections::HashSet<_>>()
             .len(),
-        interner.len(),
+        interner.len() - compiler_introduced_strings(&program, &interner).len(),
         "each distinct interned string maps to exactly one key"
     );
 
@@ -1230,6 +1255,10 @@ fn frozen_resolver_maps_str_ids_back_to_identifiers() {
     let mut interner = Interner::default();
     let program = compile_source_with_interner(src, &mut interner).unwrap();
 
+    // Everything the program pools is either written in the source or is one
+    // of the fixed strings the TDZ guard introduces (`ReferenceError` plus one
+    // `Cannot access 'x' before initialization` message per guarded binding).
+    let extra = compiler_introduced_strings(&program, &interner);
     let resolver = freeze_interner(interner);
     let texts: Vec<&str> = str_ids(&program)
         .iter()
@@ -1241,8 +1270,8 @@ fn frozen_resolver_maps_str_ids_back_to_identifiers() {
 
     for text in &texts {
         assert!(
-            src.contains(text),
-            "resolved {text:?} must come from the compiled source"
+            src.contains(text) || extra.iter().any(|e| e == text),
+            "resolved {text:?} must come from the compiled source or the TDZ guard"
         );
     }
     for expected in ["counter", "done"] {

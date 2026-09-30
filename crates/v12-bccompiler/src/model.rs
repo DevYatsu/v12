@@ -92,6 +92,10 @@ pub const NATIVE_OBJECT_ENUMERABLE_OWN_KEYS: u32 = 1003;
 /// are the only conversion points between the two representations.
 pub type Interner = lasso::Rodeo<lasso::Spur>;
 
+/// Emission result alias, shared by the emit modules (`expr.rs`, `stmt.rs`
+/// declare the same shape locally).
+pub type Res<T> = Result<T, CompileError>;
+
 /// The [`v12_bytecode::Const::Str32`] payload for `key`.
 ///
 /// `Str32(u32)` and [`lasso::Spur`] encode the same sequential table index in
@@ -277,6 +281,18 @@ pub struct UnitPlan {
     pub env_slots: HashMap<SymbolId, u16>,
     pub this_slot: Option<u16>,
     pub env_slot_count: u16,
+    /// TDZ ("temporal dead zone") flag locations for the unit's `let`/`const`
+    /// bindings — see [`UnitPlan::tdz_flag_of`].
+    ///
+    /// A `let`/`const` binding exists from the moment its scope is entered but
+    /// holds no value until its declaration *executes*; a reference in between
+    /// is a `ReferenceError` (ES §9.1.1 step 2 / §8.5.2). There is no such
+    /// state in `vars`, so each guarded binding gets one *parallel* cell that
+    /// lives in the same storage class as its value (see
+    /// [`VarLoc::Reg`]/[`VarLoc::Env`]). `undefined` is the uninitialized
+    /// state, which is free: registers start `undefined` per the frame ABI
+    /// and `JsObject::environment` fills fresh slots with `undefined`.
+    pub tdz_flags: HashMap<SymbolId, VarLoc>,
     /// Number of top-level formal parameters (excluding a rest parameter).
     /// `r{i+1}` receives formal `i` by the call ABI (`r0` is `this`).
     pub arity: usize,
@@ -351,6 +367,7 @@ impl UnitPlan {
             env_slots: HashMap::new(),
             this_slot: None,
             env_slot_count: 0,
+            tdz_flags: HashMap::new(),
             arity: 0,
             formal_idents: Vec::new(),
             rest_ident: None,
@@ -378,6 +395,18 @@ impl UnitPlan {
             block_functions: Vec::new(),
             function_scope: None,
         }
+    }
+
+    /// Where `sym`'s TDZ flag lives, or `None` when `sym` is never in a TDZ.
+    ///
+    /// Only `let`/`const` bindings get a flag. Function declarations hoist and
+    /// are initialized at scope entry (ES §9.2.12), `var` bindings are created
+    /// with the function's environment record and initialized to `undefined`
+    /// there (ES §9.1.1 step 11), and formal parameters are bound before the
+    /// body runs — so none of them can be observed uninitialized, and adding a
+    /// flag for them would only cost a check.
+    pub(crate) fn tdz_flag_of(&self, sym: SymbolId) -> Option<VarLoc> {
+        self.tdz_flags.get(&sym).copied()
     }
 }
 
@@ -596,6 +625,27 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     pub(crate) handler_max: u32,
     pub loops: Vec<LoopCtx>,
     pub finallies: Vec<FinallyCtx<'a>>,
+    /// Nesting depth of non-straight-line regions (branch bodies, loop bodies,
+    /// `switch`, `try`/`catch`/`finally`, `with`) in the unit being emitted.
+    ///
+    /// A declarator emitted while this is non-zero cannot be *proven* to have
+    /// run before a later reference: control may have reached that reference
+    /// without passing the declarator at all (`switch` clauses share one block
+    /// scope, and a `try` body may resume after a throw). Inside such a region
+    /// [`FnCtx::tdz_init`] therefore still writes the flag but does not record
+    /// the binding as definitely initialized, so the guard stays.
+    tdz_region_depth: u32,
+    /// `let`/`const` bindings whose declarator was emitted in straight-line
+    /// code, and which therefore dominate every later reference in this unit.
+    ///
+    /// This is what keeps the guard off the hot path: a reference that cannot
+    /// be in a TDZ costs nothing, so only genuinely order-sensitive reads pay
+    /// for the check. It is also what keeps ordinary functions compilable by
+    /// the baseline JIT — a guard expands to `JumpIfNullish` plus a
+    /// `ReferenceError` construction, none of which that template supports, so
+    /// a function that referenced *every* `let` unconditionally could not be
+    /// JIT-compiled at all.
+    tdz_initialized: HashSet<SymbolId>,
     /// Registers holding the scope objects of the enclosing `with` statements,
     /// innermost last (spec `ObjectEnvironmentRecord` chain). Identifier
     /// *reads* are dynamically probed against these before static resolution.
@@ -651,6 +701,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             last_expr_reg: None,
             env_bias: 0,
             scope_stack: Vec::new(),
+            tdz_region_depth: 0,
+            tdz_initialized: HashSet::new(),
             overflow: None,
         }
     }
@@ -818,6 +870,200 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
     }
 
+    // -- TDZ (temporal dead zone) ------------------------------------------
+
+    /// Resolves a binding's TDZ flag to a runtime access, or `None` when the
+    /// binding is never in a TDZ.
+    ///
+    /// The flag lives in the *home* unit, exactly like the value it guards, so
+    /// the hop count is the one [`FnCtx::access`] already computes. A
+    /// register-local flag is only ever reachable from its own unit — which is
+    /// correct, because a register-local binding is by definition never
+    /// captured by an inner function.
+    fn tdz_flag_access(&self, sym: SymbolId) -> Option<VarAccess> {
+        let plans = &self.comp.plans;
+        let home = *plans.home_of.get(&sym)?;
+        let loc = plans.units[home].tdz_flag_of(sym)?;
+        Some(match loc {
+            VarLoc::Reg(r) => VarAccess::Reg(r),
+            VarLoc::Env(slot) => VarAccess::Env {
+                depth: self.biased_depth(plans.env_depth(self.unit, sym)),
+                slot,
+            },
+            // No `let`/`const` binding aliases the global object: top-level
+            // `var`/`function` do, and those are never TDZ-guarded.
+            VarLoc::Global => return None,
+        })
+    }
+
+    /// Emits the `ReferenceError` throw for a reference to `sym` made while
+    /// its binding is still uninitialized. `JumpIfNullish` on the flag is the
+    /// whole test: `undefined` means "not yet initialized", anything else
+    /// means initialized (the marker written by [`FnCtx::tdz_init`] is `1`).
+    fn emit_tdz_throw(&mut self, sym: SymbolId, span: oxc_span::Span) -> Res<()> {
+        let name = self.comp.scoping.symbol_name(sym);
+        // `new ReferenceError(msg)`: [callee][this][msg] per the `Call` ABI.
+        let block = self.new_temps(3);
+        // The intrinsic table is consulted before the global object's own
+        // properties (`resolve_global`), so a user-shadowed `ReferenceError`
+        // global cannot disarm the check.
+        let ctor = self.global_name_id("ReferenceError");
+        self.emit_get_global(block, ctor, span);
+        self.move_reg(block + 1, self.undef_reg(), span);
+        let msg = format!("Cannot access '{name}' before initialization");
+        self.load_str(block + 2, &msg, span)?;
+        let err = self.new_temp();
+        self.emit_call(err, block, 1, span);
+        self.emit_reg3(Opcode::Throw, err, 0, 0, span);
+        Ok(())
+    }
+
+    /// Emits the TDZ *test* for a reference to `sym`, returning the label the
+    /// uninitialized case lands on. `None` when the binding can never be in a
+    /// TDZ and no check is needed.
+    ///
+    /// Split in two halves because the throw cannot sit between the test and
+    /// the reference itself: the guarded code (a load or a store) has to fall
+    /// through from the test and *then* jump past the `ReferenceError`, which
+    /// is only expressible if the throw is emitted after that code. Callers
+    /// emit their one-or-two instructions and then call
+    /// [`FnCtx::tdz_guard_end`]:
+    ///
+    /// ```text
+    ///     read flag -> f
+    ///     JumpIfNullish f -> uninit      ; still undefined => dead
+    ///     <the reference>                ; fallthrough: binding is initialized
+    ///     Jump cont
+    /// uninit:
+    ///     new ReferenceError(...); Throw
+    /// cont:
+    /// ```
+    pub(crate) fn tdz_test(&mut self, sym: SymbolId, span: oxc_span::Span) -> Res<Option<Label>> {
+        // Dominance shortcut: straight-line code that already initialized this
+        // binding cannot reach a TDZ, whatever the reference looks like.
+        if self.tdz_initialized.contains(&sym) {
+            return Ok(None);
+        }
+        let Some(access) = self.tdz_flag_access(sym) else {
+            return Ok(None);
+        };
+        // `undefined` *is* the uninitialized state: registers start
+        // `undefined` per the frame ABI and `JsObject::environment` fills fresh
+        // slots with `undefined`, so no sentinel needs installing.
+        let flag = self.new_temp();
+        self.read_access(access, flag, span);
+        let uninit = self.label();
+        self.emit_jump(Opcode::JumpIfNullish, flag, uninit);
+        Ok(Some(uninit))
+    }
+
+    /// Closes a [`FnCtx::tdz_test`]: jumps past the throw, emits it on the
+    /// uninitialized path, and leaves `pc` on the continuation.
+    pub(crate) fn tdz_guard_end(
+        &mut self,
+        sym: SymbolId,
+        uninit: Label,
+        span: oxc_span::Span,
+    ) -> Res<()> {
+        let cont = self.label();
+        self.emit_jump(Opcode::Jump, 0, cont);
+        self.bind(uninit);
+        self.emit_tdz_throw(sym, span)?;
+        self.bind(cont);
+        Ok(())
+    }
+
+    /// Marks `sym`'s binding initialized, ending its TDZ.
+    ///
+    /// Called once per declarator *after* the whole initializer expression has
+    /// evaluated — that ordering is the spec's (ES §8.5.2 `BindingInitialization`
+    /// evaluates the initializer first, then creates the binding), and it is
+    /// what makes `let x = x` a TDZ *read* of the new binding rather than a
+    /// self-assignment.
+    pub(crate) fn tdz_init(&mut self, sym: SymbolId, span: oxc_span::Span) -> Res<()> {
+        let Some(access) = self.tdz_flag_access(sym) else {
+            return Ok(());
+        };
+        let one = self.new_temp();
+        self.load_int(one, 1, span);
+        self.store_access(access, one, span);
+        // The flag write is unconditional — a closure created here may run the
+        // read long after this unit finished. Only the dominance *record* is
+        // conditional, and only for straight-line declarators (see
+        // `FnCtx::tdz_region_depth`).
+        if self.tdz_region_depth == 0 {
+            self.tdz_initialized.insert(sym);
+        }
+        Ok(())
+    }
+
+    /// Marks the start of a region whose statements are not guaranteed to run
+    /// (or not guaranteed to run before everything after them). Pairs with
+    /// [`FnCtx::exit_tdz_region`].
+    pub fn enter_tdz_region(&mut self) {
+        self.tdz_region_depth += 1;
+    }
+
+    /// Runs `body` inside a non-straight-line region: nothing declared while
+    /// it runs is recorded as dominating anything after it (see
+    /// [`FnCtx::tdz_region_depth`]).
+    pub fn tdz_region<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, CompileError>,
+    ) -> Result<T, CompileError> {
+        self.enter_tdz_region();
+        let out = body(self);
+        self.exit_tdz_region();
+        out
+    }
+
+    /// Marks the end of a region opened by [`FnCtx::enter_tdz_region`].
+    ///
+    /// A `CompileError` raised while a region is open aborts the whole unit,
+    /// so the depth is only unwound on the success path.
+    pub fn exit_tdz_region(&mut self) {
+        debug_assert!(self.tdz_region_depth > 0, "unbalanced TDZ region");
+        self.tdz_region_depth = self.tdz_region_depth.saturating_sub(1);
+    }
+
+    /// Reads a lexical binding by symbol into a caller-chosen register: TDZ
+    /// guard first, then the load.
+    ///
+    /// Every plain identifier read routes through here (and therefore through
+    /// `typeof`, `o.x` receivers, destructuring defaults, …), which is what
+    /// makes the guard a property of *references* rather than of the
+    /// syntactic form that contains them.
+    pub fn read_binding_into(&mut self, sym: SymbolId, dst: u16, span: oxc_span::Span) -> Res<()> {
+        let uninit = self.tdz_test(sym, span)?;
+        self.read_access(self.access_in_scope(sym), dst, span);
+        if let Some(uninit) = uninit {
+            self.tdz_guard_end(sym, uninit, span)?;
+        }
+        Ok(())
+    }
+
+    /// Stores into a lexical binding that is being *reassigned* (`x = v`).
+    ///
+    /// ES §9.1.1 step 2 throws on a reference to an uninitialized binding for
+    /// `PutValue` as well as `GetValue`, so the guard precedes the store.
+    /// Callers that already emitted [`FnCtx::read_binding`] for the same
+    /// symbol (compound assignment `x += v`, `x++`) must use
+    /// [`FnCtx::store_access`] directly: reaching the store already proves
+    /// the binding was initialized.
+    pub fn store_binding_reassign(
+        &mut self,
+        sym: SymbolId,
+        src: u16,
+        span: oxc_span::Span,
+    ) -> Res<()> {
+        let uninit = self.tdz_test(sym, span)?;
+        self.store_access(self.access_in_scope(sym), src, span);
+        if let Some(uninit) = uninit {
+            self.tdz_guard_end(sym, uninit, span)?;
+        }
+        Ok(())
+    }
+
     pub fn push_scope(&mut self, scope: Option<ScopeId>) {
         if let Some(scope) = scope {
             self.scope_stack.push(scope);
@@ -943,7 +1189,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             close_guard: None,
             per_iter_env,
         });
+        // The body is the one non-straight-line region every loop shares, and
+        // it is entered *after* the head: a `for (let i = 0; ...)` declarator
+        // runs on every path into the body, so it still dominates references
+        // there (which is why the region starts here rather than around the
+        // whole loop lowering in the statement dispatcher).
+        self.enter_tdz_region();
         let out = f(self);
+        self.exit_tdz_region();
         self.loops.pop();
         out
     }
@@ -973,7 +1226,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             close_guard: Some(close_guard),
             per_iter_env,
         });
+        // Same body region as `with_loop` (see the note there).
+        self.enter_tdz_region();
         let out = f(self);
+        self.exit_tdz_region();
         self.loops.pop();
         out
     }
