@@ -170,12 +170,16 @@ fn bound_length_survives_values_past_the_smi_range() {
     );
 }
 
-/// `SetFunctionLength` (ES 10.2.4) clamps: `+Infinity` becomes 2^53-1, `NaN`
-/// becomes +0, and `ToIntegerOrInfinity` truncates toward zero.
+/// `SetFunctionLength` (ES 10.2.4) resolves a non-Number and `-Infinity` to +0
+/// and otherwise stores the `ToIntegerOrInfinity` result *unclamped* — the 2^53-1
+/// ceiling it used to impose was removed normatively, so a `+Infinity` target
+/// `length` carries through as `+Infinity`
+/// (`bind/instance-length-tointeger.js`), while `ToIntegerOrInfinity` truncates
+/// toward zero.
 #[test]
-fn bound_length_clamps_and_truncates() {
+fn bound_length_resolves_the_infinities_and_truncates() {
     let cases = [
-        ("Infinity", "9007199254740991"),
+        ("Infinity", "Infinity"),
         ("-Infinity", "0"),
         ("NaN", "0"),
         ("3.7", "3"),

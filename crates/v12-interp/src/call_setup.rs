@@ -1713,17 +1713,25 @@ impl Interp<'_> {
                     };
                     (target_len, target_name)
                 };
-                // 2^53 - 1, the `SetFunctionLength` ceiling.
-                const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+                // `SetFunctionLength` (10.2.4) resolves a non-Number to +0 and
+                // `-Infinity` to +0, and otherwise stores the
+                // `ToIntegerOrInfinity` result *unclamped* — the 2^53-1 ceiling
+                // it used to impose was removed normatively, so a target whose
+                // own `length` is `+Infinity` yields a bound function whose
+                // `length` is `+Infinity`
+                // (`built-ins/Function/prototype/bind/instance-length-tointeger.js`).
+                //
+                // `NaN` is the "absent or not a Number" marker (step 6.b
+                // `Type(targetLen) is not Number, let L be 0`) and is resolved
+                // by the first arm, because `f64::clamp` propagates the *other*
+                // operand on NaN and would silently yield `-bound_args.len()`.
                 let bound_len = if target_len.is_nan() {
                     0.0
-                } else if target_len == f64::INFINITY {
-                    MAX_SAFE_INTEGER
                 } else {
                     // `ToIntegerOrInfinity` truncates toward zero, so a
-                    // fractional target `length` floors toward +0 (and the
-                    // `.max(0.0)` then absorbs the negative side).
-                    (target_len.trunc() - bound_args.len() as f64).clamp(0.0, MAX_SAFE_INTEGER)
+                    // fractional target `length` floors (and the `max(0.0)`
+                    // absorbs the negative side, including `-Infinity`).
+                    (target_len.trunc() - bound_args.len() as f64).max(0.0)
                 };
                 let bound_name = match target_name {
                     Some(h) => format!("bound {}", self.string_text(h)),
