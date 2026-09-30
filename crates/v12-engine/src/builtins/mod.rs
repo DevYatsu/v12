@@ -137,6 +137,16 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::BooleanProtoToString => Some(0),
         NativeId::BooleanProtoValueOf => Some(0),
         NativeId::FunctionProtoToString => Some(0),
+        // `Function.prototype.call` / `apply` / `bind` (ES 10.2.3-10.2.5). These
+        // three have no `define_builtins!` entry — their bodies live in the
+        // interpreter router (`Interp::dispatch_native`), because `call` and
+        // `apply` must re-enter the machine to invoke the target — so nothing
+        // else declares their arity. Without these arms
+        // `install_function_proto_methods` could not stamp a `length`, and
+        // `Function.prototype.call.length` read `undefined`.
+        NativeId::FunctionCall => Some(1),
+        NativeId::FunctionApply => Some(2),
+        NativeId::FunctionBind => Some(1),
         NativeId::GlobalDecodeUri => Some(1),
         NativeId::GlobalDecodeUriComponent => Some(1),
         NativeId::GlobalEncodeUri => Some(1),
@@ -1182,6 +1192,16 @@ macro_rules! define_builtins {
         /// compiler can inline and no rodata table is emitted.
         pub fn install_builtins(heap: &mut Heap, targets: &BuiltinTargets) {
             $( $( $crate::__builtin_emit_install!($target, heap, targets, $name, NativeId::$id $(, $len)?); )* )*
+            // `%Function.prototype%`'s own identity: its `[[Prototype]]` link
+            // and its `length`/`name` own properties. The macro's
+            // `FunctionProto` group can only *add* named methods, and it runs
+            // before this, so this pass is what makes the object the spec
+            // prototype object rather than a bare callable. See
+            // `install_function_proto_identity`.
+            install_function_proto_identity(heap, targets);
+            // `Function.prototype.call` / `apply` / `bind`, installed rather
+            // than macro-declared. See `install_function_proto_methods`.
+            install_function_proto_methods(heap, targets);
             // Bare ids are dispatch-only; silence unused warnings.
             $( let _ = NativeId::$bare_id; )*
             // Regex-backed `String.prototype` methods: installed here, but
@@ -1803,5 +1823,120 @@ pub(crate) fn module_import(
     match err {
         Throw::Value(v) => Ok(promise::make_rejected_promise(heap, v)),
         other => Err(other),
+    }
+}
+
+/// Gives `%Function.prototype%` the identity the spec gives it (ES 10.2.4):
+/// the `[[Prototype]]` link to `%Object.prototype%`, plus the `length` and
+/// `name` own data properties every built-in function object carries.
+///
+/// **Why a separate pass and not macro entries.** The realm allocates
+/// `%Function.prototype%` as a bare `Kind::Function`
+/// (`realm.rs`: `JsObject::function(FunctionTarget::Bytecode(u32::MAX), None)`)
+/// and links only the `constructor` back-link through `install_ctor`. Two of
+/// the three things above are not *named methods*, so `define_builtins!` has no
+/// syntax for them: the `[[Prototype]]` is a heap field, not a property, and
+/// `length`/`name` are per-object attributes that must precede the method
+/// group for `built-ins/Function/prototype/property-order.js` (which asserts
+/// `name` immediately follows `length` in `getOwnPropertyNames`). The realm
+/// owns the allocation and is not this lane's file, so the pass runs from
+/// `install_builtins`, which the realm calls with both handles already wired.
+///
+/// `length`/`name` carry the standard built-in-function attributes
+/// `{ writable: false, enumerable: false, configurable: true }` (ES 10.2.4 /
+/// the "Properties of the Function Prototype Object" clause), which is
+/// `define_method`'s own shape — so the install goes through
+/// `Ctx::define_method` on the prototype object itself rather than
+/// `define_data_prop_with_attrs` by hand, keeping one install shape.
+pub(crate) fn install_function_proto_identity(heap: &mut Heap, targets: &BuiltinTargets) {
+    let proto = targets.function_proto;
+    // ES 10.2.4: "%Function.prototype%'s [[Prototype]] internal slot is a
+    // reference to %Object.prototype%". Without this link every inherited
+    // `Object.prototype` member (`valueOf`, `hasOwnProperty`, and a
+    // user-installed `indicator`) reads `undefined` off the function
+    // prototype object, and `Object.getPrototypeOf(Function.prototype)`
+    // answers `null`.
+    heap.get_mut(proto).prototype = Some(targets.object_proto);
+    // The `constructor` back-link that `install_ctor` already installed is the
+    // prototype's *only* own property here; `length` then `name` follow it in
+    // insertion order, which is what `property-order.js` measures.
+    define_method_length_and_name(heap, proto);
+}
+
+/// Installs the `length` and `name` own data properties on an *existing*
+/// function object, with the standard built-in-function attributes
+/// `{ writable: false, enumerable: false, configurable: true }` and in that
+/// order.
+///
+/// `Ctx::define_method` stamps the same two properties, but it also *allocates*
+/// the function object from a `NativeId` — `%Function.prototype%` is
+/// allocated by the realm and has no id of its own (its callable is the
+/// `u32::MAX` placeholder). This is the same shape, factored over the two
+/// cases.
+///
+/// Order is load-bearing, not cosmetic: `CreateBuiltinFunction` (ES 10.1.8)
+/// defines `length` then `name`, and
+/// `built-ins/Function/prototype/property-order.js` asserts that
+/// `getOwnPropertyNames` lists them adjacently in that order.
+fn define_method_length_and_name(heap: &mut Heap, func: Handle<v12_heap::JsObject>) {
+    let mut ctx = Ctx::new(heap, None, None);
+    // `length` first: see the order note above.
+    ctx.define_data_prop_with_attrs(
+        func,
+        "length",
+        // +0 as a plain `f64`: `SetFunctionLength` stores a Number, and `+0`
+        // is its only legal zero, so the Smi and double spellings are
+        // indistinguishable to `SameValue` and to `typeof`.
+        JsValue::from_f64(0.0),
+        v12_heap::Attrs::new(false, false, true),
+    );
+    // `%Function.prototype%.name` is the empty string (ES 10.2.4), not the
+    // absent property the object had before.
+    let empty = ctx.heap.intern_text("");
+    ctx.define_data_prop_with_attrs(
+        func,
+        "name",
+        JsValue::string(empty),
+        v12_heap::Attrs::new(false, false, true),
+    );
+}
+
+/// Installs `Function.prototype.call` (arity 1), `.apply` (arity 2) and
+/// `.bind` (arity 1) as real own properties of `%Function.prototype%`
+/// (ES 10.2.3, 10.2.4, 10.2.5).
+///
+/// **Why not a `define_builtins!` `FunctionProto` group entry.** The macro is
+/// two things at once: it emits an install *and* a `builtin_dispatch` arm whose
+/// body is a `(&mut Heap, JsValue, &[JsValue]) -> Result<JsValue, Throw>`
+/// closure. These three have no such body — they are implemented by the
+/// interpreter router (`Interp::dispatch_native`, `v12-interp/src/call_setup.rs`),
+/// because `call` and `apply` have to *re-enter the machine* to invoke their
+/// target with a computed `this` and argument list, and `bind` has to compile
+/// and register nothing but must read the target's `length`/`name`. A macro
+/// entry would need a duplicate second implementation behind it, so this pass
+/// borrows the established hand-written-install shape instead — the same
+/// reason `install_string_regex_methods` and `install_regexp_methods` exist.
+///
+/// Each goes through [`Ctx::define_method`], so each gets the same
+/// `{ writable: false, enumerable: false, configurable: true }` `length` and
+/// `name` own properties every other built-in function object has, and the
+/// arity is read from [`builtin_length`] rather than repeated here (that is
+/// also what `define_method`'s own `debug_assert` checks). The install is
+/// `{ writable: true, enumerable: false, configurable: true }` — `BUILTIN`,
+/// which `define_method`'s final `define_data_prop` uses.
+///
+/// Before this pass the only way to reach these three was the interpreter's
+/// synthesized `function_method_surface`, which allocated a bare function
+/// object per read: no `length`, no `name`, and no identity
+/// (`Function.prototype.call !== Function.prototype.call`).
+pub(crate) fn install_function_proto_methods(heap: &mut Heap, targets: &BuiltinTargets) {
+    let mut ctx = Ctx::new(heap, None, None);
+    let proto = Some(targets.function_proto);
+    for (name, id) in [
+        ("call", NativeId::FunctionCall),
+        ("apply", NativeId::FunctionApply),
+        ("bind", NativeId::FunctionBind),
+    ] {
+        ctx.define_method(proto, name, id, builtin_length(id));
     }
 }

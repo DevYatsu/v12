@@ -751,6 +751,22 @@ impl Interp<'_> {
         if self.heap.get(obj).kind != Kind::Function {
             return None;
         }
+        // Defer to a *real* property whenever the object (or anything on its
+        // `[[Prototype]]` chain) actually carries one. The synthesized method
+        // below is a fallback for the v1 shortcut where a function object has
+        // no prototype link; once a function really is linked to
+        // `%Function.prototype%` — which is now true for `%Function.prototype%`
+        // itself and for bound functions — the installed own property is the
+        // spec answer, and it carries the `length`/`name`/descriptor data a
+        // synthesized function object cannot. Empirically the unlinked case
+        // also produced a *different* object per read
+        // (`Function.prototype.call !== Function.prototype.call`), so
+        // deferring also restores identity.
+        if let Some(k) = key
+            && self.chain_has_property(obj, k)
+        {
+            return None;
+        }
         if self.key_is_wk(key, WK_CONSTRUCTOR) {
             // `f.constructor` on closures: closures carry no [[Prototype]]
             // link to `%Function.prototype%`, so without this surface the
@@ -766,22 +782,129 @@ impl Interp<'_> {
             }
             return Some(Ok(self.closure_constructor(obj)));
         }
-        let constant = if self.key_is_wk(key, WK_CALL) {
-            NativeId::FunctionCall
+        let (name, constant) = if self.key_is_wk(key, WK_CALL) {
+            ("call", NativeId::FunctionCall)
         } else if self.key_is_wk(key, WK_APPLY) {
-            NativeId::FunctionApply
+            ("apply", NativeId::FunctionApply)
         } else if self.key_is_wk(key, WK_BIND) {
-            NativeId::FunctionBind
+            ("bind", NativeId::FunctionBind)
         } else if self.key_is_wk(key, WK_TO_STRING) {
-            NativeId::FunctionProtoToString
+            ("toString", NativeId::FunctionProtoToString)
         } else if self.key_is_wk(key, WK_VALUE_OF) {
-            NativeId::ObjectProtoValueOf
+            ("valueOf", NativeId::ObjectProtoValueOf)
         } else if self.key_is_wk(key, WK_HAS_OWN_PROPERTY) {
-            NativeId::ObjectHasOwnProperty
+            ("hasOwnProperty", NativeId::ObjectHasOwnProperty)
         } else {
             return None;
         };
+        // Serve the *real* `%Function.prototype%` method when one exists.
+        //
+        // The receiver is unlinked (that is why this surface is here at all),
+        // so `ic_lookup` cannot reach the method through a `[[Prototype]]`
+        // chain. But the object the spec's chain would hand back is a fixed,
+        // already-installed function object, so reading it directly produces
+        // the *same value* the chain would — not an approximation. That matters
+        // because the synthesized alternative could not: it allocated a fresh
+        // function object per read (so `f.call !== f.call`) and carried no
+        // `length` or `name` of its own, which is what
+        // `built-ins/Function/prototype/call/S15.3.4.4_A2_T2.js` and the
+        // `name.js` family assert.
+        if let Some(method) = self.function_proto_method(name) {
+            return Some(Ok(method));
+        }
         Some(Ok(self.map_set_method(constant)))
+    }
+
+    /// The named member of `%Function.prototype%` (own or inherited), as a
+    /// plain prototype-chain read — the value `f.<name>` must produce for a
+    /// function object that has no link of its own.
+    ///
+    /// `None` outside a realm, or when the name is genuinely absent, in which
+    /// case the caller falls back to synthesizing a method object.
+    fn function_proto_method(&mut self, name: &str) -> Option<JsValue> {
+        let proto = self.function_prototype()?;
+        let h = self.heap.intern_text(name);
+        let pk = PropKey::from_string(h);
+        let mut cur = Some(proto);
+        while let Some(o) = cur {
+            if let Some(entry) = self
+                .heap
+                .get(o)
+                .dictionary
+                .as_ref()
+                .and_then(|m| m.get(&pk))
+                .copied()
+            {
+                if entry.is_accessor {
+                    return None;
+                }
+                let idx = self.global_slot_index(o, entry.slot as usize);
+                return self.heap.get(o).properties.get(idx).copied();
+            }
+            let shape = self.shape_of(o);
+            if let Some(desc) = self.heap.lookup_property(shape, pk) {
+                let slot = desc.slot()?;
+                let idx = self.global_slot_index(o, slot as usize);
+                return self.heap.get(o).properties.get(idx).copied();
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        None
+    }
+
+    /// This realm's `%Function.prototype%`, resolved through the `Function`
+    /// global property's `prototype` field (installed by `install_ctor` at
+    /// realm build). Mirrors [`Interp::object_prototype`] /
+    /// [`Interp::array_prototype`] — same source, same `None` bail-out, so a
+    /// bare-heap interpreter that never built a realm links nothing instead of
+    /// panicking.
+    ///
+    /// Needed because v12 has no `Realm` handle in `Interp`: the
+    /// `Function`-shaped lookup is the only way to name the object, and
+    /// `Function` is deliberately *not* a `GLOBAL_INTRINSICS` slot (adding one
+    /// would need a matching `intrinsic_slot` arm in `lib.rs`).
+    pub(crate) fn function_prototype(&mut self) -> Option<Handle<JsObject>> {
+        let global = self.global?;
+        let ctor = self
+            .global_own_constructor(global, "Function")?
+            .as_object()?;
+        self.heap.get(ctor).prototype
+    }
+
+    /// Stamps the realm's `%Function.prototype%` as `h`'s `[[Prototype]]`
+    /// (no-op when unresolvable; see [`Self::function_prototype`]).
+    pub(crate) fn link_function_proto(&mut self, h: Handle<JsObject>) {
+        if let Some(p) = self.function_prototype() {
+            self.heap.get_mut(h).prototype = Some(p);
+        }
+    }
+
+    /// Does `key` resolve anywhere on `obj`'s prototype chain (both the own
+    /// slot and the dictionary overflow store, mirroring `ic_lookup`'s
+    /// two-rung discipline)?
+    ///
+    /// Used only to decide whether a synthesized surface may answer at all,
+    /// never to produce the value — the real read still goes through
+    /// `ic_lookup`. Bounded by chain length.
+    fn chain_has_property(&mut self, obj: Handle<JsObject>, key: PropKey) -> bool {
+        let mut cur = Some(obj);
+        while let Some(o) = cur {
+            if self
+                .heap
+                .get(o)
+                .dictionary
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&key))
+            {
+                return true;
+            }
+            let shape = self.shape_of(o);
+            if self.heap.lookup_property(shape, key).is_some() {
+                return true;
+            }
+            cur = self.heap.get(o).prototype;
+        }
+        false
     }
 
     /// The realm constructor matching a closure's bytecode kind: plain

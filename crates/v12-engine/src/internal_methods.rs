@@ -506,17 +506,25 @@ pub(crate) fn apply_property_descriptor(
             convert_key_to_data(heap, obj, key, new_attrs, desc.value);
             return Ok(true);
         }
+        // Step 5 of `ValidateAndApplyPropertyDescriptor` runs *only* when
+        // `current.[[Configurable]]` is false; `validate_redefine` above is
+        // that step and has already rejected every illegal redefinition, so
+        // reaching here means the write is permitted. Gating it a second time
+        // on `attrs.writable()` dropped the value for a property that is
+        // **configurable but not writable** — which is the exact shape of a
+        // function's `length`/`name` and of every `Object.defineProperty(o, k,
+        // { value, writable: false, configurable: true })`, so
+        // `Object.defineProperty(f, 'length', { value: 5 })` silently kept the
+        // old arity.
         if let Some(v) = desc.value
-            && attrs.writable()
+            && let Some(slot) = existing.slot()
         {
-            if let Some(slot) = existing.slot() {
-                let idx = slot as usize;
-                let obj_mut = heap.get_mut(obj);
-                if obj_mut.properties.len() <= idx {
-                    obj_mut.properties.resize(idx + 1, JsValue::hole());
-                }
-                obj_mut.properties[idx] = v;
+            let idx = slot as usize;
+            let obj_mut = heap.get_mut(obj);
+            if obj_mut.properties.len() <= idx {
+                obj_mut.properties.resize(idx + 1, JsValue::hole());
             }
+            obj_mut.properties[idx] = v;
         }
         if new_attrs != attrs {
             let next_shape = heap.update_data_attrs(shape, key, new_attrs);
