@@ -392,6 +392,31 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         NativeId::IteratorSome => Some(1),
         NativeId::IteratorEvery => Some(1),
         NativeId::IteratorFind => Some(1),
+        // Set relational methods (24.2.3). All seven take exactly one
+        // argument, `other`; the three predicates are not key-mapped (the
+        // proposal's rejected `*ByKey` variants are not part of the standard).
+        NativeId::SetUnion => Some(1),
+        NativeId::SetIntersection => Some(1),
+        NativeId::SetDifference => Some(1),
+        NativeId::SetSymmetricDifference => Some(1),
+        NativeId::SetIsSubsetOf => Some(1),
+        NativeId::SetIsSupersetOf => Some(1),
+        NativeId::SetIsDisjointFrom => Some(1),
+        // Iterator helpers added by the same proposal round. `includes` and
+        // `join` default their argument but are declared with one parameter.
+        // `windows`/`chunks` take one; `windows` takes a second, optional
+        // `undersized`. `zip`/`zipKeyed` take `(iterables, options)` and so
+        // report 1, while `concat` is a rest-parameter static and reports 0.
+        NativeId::IteratorIncludes => Some(1),
+        NativeId::IteratorJoin => Some(1),
+        NativeId::IteratorWindows => Some(1),
+        NativeId::IteratorChunks => Some(1),
+        NativeId::IteratorZip => Some(1),
+        NativeId::IteratorZipKeyed => Some(1),
+        NativeId::IteratorConcat => Some(0),
+        // Keyed promise combinators (27.2.4).
+        NativeId::PromiseAllKeyed => Some(1),
+        NativeId::PromiseAllSettledKeyed => Some(1),
         _ => None,
     }
 }
@@ -484,6 +509,33 @@ pub(crate) fn install_value(
     }
 }
 
+/// [`install_value`] with explicit attributes, for the well-known `Symbol`
+/// properties.
+///
+/// Why this exists rather than reusing [`builtin_install_prop`]'s `BUILTIN`
+/// attrs: spec 20.4.2 gives every `Symbol` static — unlike every other data
+/// property in clauses 18-26 — `{ [[Writable]]: false, [[Enumerable]]: false,
+/// [[Configurable]]: true }`. `BUILTIN` is writable, so `Symbol.dispose = 1`
+/// would silently succeed where the spec makes it a no-op (or a `TypeError` in
+/// strict mode).
+///
+/// The handler still runs exactly once, at install time, so the stored value
+/// is this realm's singleton symbol and `Symbol.dispose === Symbol.dispose`
+/// holds through a plain shape lookup on every later read.
+pub(crate) fn install_value_with_attrs(
+    heap: &mut Heap,
+    target: Option<v12_heap::Handle<v12_heap::JsObject>>,
+    name: &str,
+    id: NativeId,
+    attrs: v12_heap::Attrs,
+) {
+    let Some(obj) = target else { return };
+    let Some(Ok(value)) = builtin_dispatch(id, heap, JsValue::undefined(), &[]) else {
+        return;
+    };
+    Ctx::new(heap, None, None).define_data_prop_with_attrs(obj, name, value, attrs);
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __builtin_emit_install {
@@ -569,6 +621,18 @@ macro_rules! __builtin_emit_install {
     };
     (Symbol, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, $targets.symbol, $name, $id)
+    };
+    // Well-known `Symbol` statics: the property *value* is the realm's
+    // singleton symbol, minted once here, with spec 20.4.2's non-writable
+    // attribute triple. See `install_value_with_attrs`.
+    (SymbolValue, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
+        $crate::builtins::install_value_with_attrs(
+            $heap,
+            $targets.symbol,
+            $name,
+            $id,
+            v12_heap::Attrs::new(false, false, true),
+        )
     };
     (Proxy, $heap:expr, $targets:expr, $name:expr, $id:expr) => {
         $crate::builtins::install_native($heap, $targets.proxy, $name, $id)
@@ -673,6 +737,15 @@ macro_rules! __builtin_emit_install {
     };
     (Symbol, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length($heap, $targets.symbol, $name, $id, Some($len))
+    };
+    (SymbolValue, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
+        $crate::builtins::install_value_with_attrs(
+            $heap,
+            $targets.symbol,
+            $name,
+            $id,
+            v12_heap::Attrs::new(false, false, true),
+        )
     };
     (SymbolProto, $heap:expr, $targets:expr, $name:expr, $id:expr, $len:expr) => {
         $crate::builtins::install_native_with_length(
@@ -831,6 +904,9 @@ macro_rules! define_builtins {
             // supply the per-registry compiled-pattern cache these bodies
             // require (`Ctx::regex_cache`).
             install_string_regex_methods(heap, targets);
+            // Keyed promise combinators: the one install this pass makes that
+            // the macro's target table cannot express (see the function's doc).
+            install_keyed_promise_combinators(heap);
         }
     };
 }
@@ -983,10 +1059,27 @@ define_builtins! {
         "entries" (0) => SetEntries => |heap, this, args| call_ctx(map::set_entries, heap, this, args),
         "keys" (0) => SetKeys => |heap, this, args| call_ctx(map::set_keys, heap, this, args),
         "values" (0) => SetValues => |heap, this, args| call_ctx(map::set_values, heap, this, args),
+        // 24.2.3. The seven relational methods. They are pure `&mut Heap`
+        // natives: each drains `other` through
+        // `iterator::drain_iterable`, which covers the iterable kinds whose
+        // iteration needs no user code (see that function's doc for the
+        // boundary).
+        "union" (1) => SetUnion => |heap, this, args| call_ctx(map::set_union, heap, this, args),
+        "intersection" (1) => SetIntersection => |heap, this, args| call_ctx(map::set_intersection, heap, this, args),
+        "difference" (1) => SetDifference => |heap, this, args| call_ctx(map::set_difference, heap, this, args),
+        "symmetricDifference" (1) => SetSymmetricDifference => |heap, this, args| call_ctx(map::set_symmetric_difference, heap, this, args),
+        "isSubsetOf" (1) => SetIsSubsetOf => |heap, this, args| call_ctx(map::set_is_subset_of, heap, this, args),
+        "isSupersetOf" (1) => SetIsSupersetOf => |heap, this, args| call_ctx(map::set_is_superset_of, heap, this, args),
+        "isDisjointFrom" (1) => SetIsDisjointFrom => |heap, this, args| call_ctx(map::set_is_disjoint_from, heap, this, args),
     },
     // The `Iterator` constructor's one static (spec 27.1.3).
     Iterator {
         "from" (1) => IteratorFrom => |heap, this, args| call_ctx(iterator::iterator_from, heap, this, args),
+        // Joint iteration (spec 27.1.3). `zip`/`zipKeyed` take
+        // `(iterables, options)`; `concat` is the rest-parameter one.
+        "zip" (1) => IteratorZip => |heap, this, args| call_ctx(iterator::iterator_zip, heap, this, args),
+        "zipKeyed" (1) => IteratorZipKeyed => |heap, this, args| call_ctx(iterator::iterator_zip_keyed, heap, this, args),
+        "concat" (0) => IteratorConcat => |heap, this, args| call_ctx(iterator::iterator_concat, heap, this, args),
     },
     // `%Iterator.prototype%`: the ES2025 iterator helpers (spec 27.1.4-27.1.5).
     // `take`/`drop`/`toArray` are pure-heap (a lazy wrapper / a drain) and run
@@ -1010,6 +1103,14 @@ define_builtins! {
         "some" (1) => IteratorSome => callback_stub,
         "every" (1) => IteratorEvery => callback_stub,
         "find" (1) => IteratorFind => callback_stub,
+        // Eager / lazy helpers added by the same proposal round. `includes` and
+        // `join` drain through the engine's own `pull`, so they work over any
+        // machine-free iterator chain; `windows`/`chunks` build a buffer wrapper
+        // that this engine steps itself (see `iterator::is_windowing_wrapper`).
+        "includes" (1) => IteratorIncludes => |heap, this, args| call_ctx(iterator::iterator_includes, heap, this, args),
+        "join" (1) => IteratorJoin => |heap, this, args| call_ctx(iterator::iterator_join, heap, this, args),
+        "windows" (1) => IteratorWindows => |heap, this, args| call_ctx(iterator::iterator_windows, heap, this, args),
+        "chunks" (1) => IteratorChunks => |heap, this, args| call_ctx(iterator::iterator_chunks, heap, this, args),
     },
     Object {
         "assign" (2) => ObjectAssign => |heap, this, args| call_ctx(object::object_assign, heap, this, args),
@@ -1141,6 +1242,15 @@ define_builtins! {
         "valueOf" (0) => SymbolProtoValueOf => |heap, this, args| call_ctx(symbol::symbol_proto_value_of, heap, this, args),
         "description" => SymbolProtoDescription => |heap, this, args| call_ctx(symbol::symbol_proto_description, heap, this, args),
     },
+    // Well-known symbols with no engine-internal consumer: the value installed
+    // is the singleton itself, so `Symbol.dispose === Symbol.dispose` holds
+    // through a shape lookup. Every name in the `Symbol` group above installs
+    // a *handler function* that the realm overwrites with its own canonical
+    // symbol (see `symbol.rs`'s module doc for why there are two routes).
+    SymbolValue {
+        "dispose" => SymbolWellKnownDispose => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
+        "asyncDispose" => SymbolWellKnownAsyncDispose => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
+    },
     Proxy {
         "revocable" (2) => ProxyRevocable => |heap, this, args| call_ctx(proxy::proxy_revocable, heap, this, args),
     },
@@ -1241,6 +1351,55 @@ define_builtins! {
     DateProtoToGmtString => |heap, this, args| call_ctx(date::date_proto_to_utc_string, heap, this, args),
     DateProtoToPrimitive => |heap, this, args| call_ctx(date::date_proto_to_primitive, heap, this, args),
     DateProtoToTemporalInstant => |heap, this, args| call_ctx(date::date_proto_to_temporal_instant, heap, this, args),
+    // Keyed promise combinators (27.2.4). Dispatch arms only: the *install*
+    // happens in `install_keyed_promise_combinators` below, because the
+    // `Promise` constructor is not a `BuiltinTargets` field — the realm
+    // installs the `Promise` statics by hand, since all of them need the
+    // interpreter seam. These two do not (they read own keys and `Get`, both
+    // pure heap), so the install pass reaches the constructor through the
+    // global's `GLOBAL_INTRINSICS` slot instead of adding a targets field.
+    PromiseAllKeyed => |heap, this, args| call_ctx(promise::promise_all_keyed, heap, this, args),
+    PromiseAllSettledKeyed => |heap, this, args| call_ctx(promise::promise_all_settled_keyed, heap, this, args),
+}
+
+/// Installs `Promise.allKeyed` and `Promise.allSettledKeyed` on the realm's
+/// `Promise` constructor.
+///
+/// Why not the `Promise` group in `define_builtins!`:
+/// [`BuiltinTargets`] has no `promise` field, and adding one would mean
+/// editing `realm.rs`'s `BuiltinTargets` literal — outside this lane's file
+/// ownership. The `Promise` statics are installed by the realm rather than by
+/// the macro precisely because `all`/`race`/`any`/`allSettled`/`withResolvers`/
+/// `try`/`then`/`catch`/`finally` all need the interpreter seam; these two
+/// need only own-key enumeration, a `[[Get]]`, and the existing reaction-record
+/// machinery, so the macro's install path is a better fit.
+///
+/// Idempotent by construction: the pass is skipped when the realm global is
+/// absent, and `define_method` is only reached for a `Promise` that does not
+/// already carry the names, so a later move of the `Promise` statics into the
+/// macro cannot double-install.
+fn install_keyed_promise_combinators(heap: &mut Heap) {
+    let Some(idx) = v12_bytecode::GLOBAL_INTRINSICS.iter().position(|n| *n == "Promise") else {
+        return;
+    };
+    let Some(global) = heap.realm_globals().first().copied() else {
+        return;
+    };
+    let Some(ctor) = heap.get(global).properties.get(idx).copied().and_then(|v| v.as_object())
+    else {
+        return;
+    };
+    let mut ctx = Ctx::new(heap, Some(global), None);
+    for (name, id) in [
+        ("allKeyed", NativeId::PromiseAllKeyed),
+        ("allSettledKeyed", NativeId::PromiseAllSettledKeyed),
+    ] {
+        let key = v12_heap::PropKey::from_string(ctx.heap.intern_text(name));
+        if ctx.heap.lookup_property(ctx.heap.shape_of(ctor), key).is_some() {
+            continue;
+        }
+        ctx.define_method(Some(ctor), name, id, Some(1));
+    }
 }
 
 /// Installs the `Reflect` static methods onto `targets.reflect`.

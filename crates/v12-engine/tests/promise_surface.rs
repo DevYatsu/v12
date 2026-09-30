@@ -19,7 +19,10 @@ fn promise_constructor_and_prototype_own_property_names() {
             "throw [Object.getOwnPropertyNames(Promise).sort().join(','), \
              Object.getOwnPropertyNames(Promise.prototype).sort().join(',')].join(' | ');"
         ),
-        "all,allSettled,any,length,name,prototype,race,reject,resolve,try,withResolvers \
+        // `allKeyed` / `allSettledKeyed` are part of the surface (27.2.4) and are
+        // installed by `install_keyed_promise_combinators`.
+        "all,allKeyed,allSettled,allSettledKeyed,any,length,name,prototype,race,reject,resolve,\
+         try,withResolvers \
          | catch,constructor,finally,then"
     );
 }

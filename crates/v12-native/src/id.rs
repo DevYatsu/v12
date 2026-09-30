@@ -503,6 +503,66 @@ pub enum NativeId {
     /// `Iterator()` call presents `undefined` as `this` and is a `TypeError`,
     /// while `new Iterator()` presents the constructor itself.
     IteratorConstruct = 2920,
+
+    // -- `surface` lane band, 3500-3599 -------------------------------------
+    //
+    // Reserved, exclusive band. Nothing above 3000 was allocated before this
+    // block, so a sibling lane picking its own range cannot collide with this
+    // one by construction rather than by luck. Every variant below is
+    // append-only: the discriminants above are stable and a future insertion
+    // must never renumber them.
+    //
+    // Well-known `Symbol` properties (ECMA-262 20.4.2). These differ from the
+    // `25xx` family above in *how they are installed*: the `25xx` entries
+    // install a handler function that the realm later overwrites with the
+    // realm's canonical symbol, because the well-known symbol has to be
+    // addressable as a key. These two have no engine-internal consumer yet, so
+    // they install the singleton itself as the property value — see
+    // `builtins::install_value_with_attrs`.
+    /// `Symbol.dispose`.
+    SymbolWellKnownDispose = 3500,
+    /// `Symbol.asyncDispose`.
+    SymbolWellKnownAsyncDispose = 3501,
+    // Set methods (ECMA-262 24.2.3, the "new Set methods" proposal).
+    /// `Set.prototype.union(other)`.
+    SetUnion = 3502,
+    /// `Set.prototype.intersection(other)`.
+    SetIntersection = 3503,
+    /// `Set.prototype.difference(other)`.
+    SetDifference = 3504,
+    /// `Set.prototype.symmetricDifference(other)`.
+    SetSymmetricDifference = 3505,
+    /// `Set.prototype.isSubsetOf(other)`.
+    SetIsSubsetOf = 3506,
+    /// `Set.prototype.isSupersetOf(other)`.
+    SetIsSupersetOf = 3507,
+    /// `Set.prototype.isDisjointFrom(other)`.
+    SetIsDisjointFrom = 3508,
+    // Iterator helpers, prototype side (spec 27.1.4.x).
+    /// `Iterator.prototype.includes(value)`.
+    IteratorIncludes = 3509,
+    /// `Iterator.prototype.join(separator)`.
+    IteratorJoin = 3510,
+    /// `Iterator.prototype.windows(size)`.
+    IteratorWindows = 3511,
+    /// `Iterator.prototype.chunks(size)`.
+    IteratorChunks = 3512,
+    // Iterator helpers, constructor statics (spec 27.1.3.x).
+    /// `Iterator.zip(...iterables)`.
+    IteratorZip = 3513,
+    /// `Iterator.zipKeyed(...iterables)`.
+    IteratorZipKeyed = 3514,
+    /// `Iterator.concat(...iterables)`.
+    IteratorConcat = 3515,
+    // Keyed promise combinators (spec 27.2.4.x).
+    //
+    // These need no interpreter seam, so they are installed by
+    // `builtins::install_keyed_promise_combinators` rather than by the realm's
+    // `Promise` statics table — see that function for why.
+    /// `Promise.allKeyed(iterable)`.
+    PromiseAllKeyed = 3516,
+    /// `Promise.allSettledKeyed(iterable)`.
+    PromiseAllSettledKeyed = 3517,
 }
 
 /// The serialized index of a native function.
