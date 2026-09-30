@@ -12,6 +12,25 @@
 # a hit in a file not listed for its TAG fails, as does a hit count above
 # the number of allowlist entries for that (TAG, file).
 #
+# TEST CODE IS OUT OF SCOPE. The three idioms are architecture debt in
+# production paths; a hit in test code is not a violation, and counting it
+# only dilutes the signal (it did: the guard went red on 2 test files while
+# 14 real violations were missed). The rule is a property of the PATH, never
+# a list of file names:
+#   * any path component named `tests`  -> crates/*/tests/*.rs (integration)
+#   * any basename named `tests.rs`     -> the `#[cfg(test)] mod tests;` file
+# Implemented as `--exclude-dir=tests --exclude=tests.rs`.
+# Deliberate consequences:
+#   * `#[cfg(test)] mod tests { … }` INLINE inside a production file stays IN
+#     scope: it is not a path, and parsing line ranges to exclude it would be
+#     fragile enough to hide real sites. `crates/v12-interp/src/feedback.rs:360`
+#     is such a file and currently has zero hits, so nothing is affected.
+#   * `crates/v12-bccompiler/src/tests.rs` is excluded by the same rule even
+#     though it holds no hits today; the rule must not depend on the tree.
+#   * `crates/v12-engine/src/lib.rs` (host-API tests, `mod tests;`) stays IN
+#     scope: its `tests` is a module name, not a path component. It has no
+#     hits today, so this costs nothing and keeps the rule path-shaped.
+#
 # Usage: ./scripts/freeze-lint.sh        # exit 0 = frozen, 1 = new violation
 # CI: .github/workflows/ci.yml, `architecture` job. No runtime behavior change.
 #
@@ -34,7 +53,7 @@ check() {
     tmp_allowed="$(mktemp)"
     trap 'rm -f "$tmp_hits" "$tmp_allowed"' RETURN
 
-    grep -rFn --include='*.rs' -e "$pat" crates/ 2>/dev/null | cut -d: -f1 | sort | uniq -c | awk '{print $2" "$1}' | sort > "$tmp_hits" || true
+    grep -rFn --include='*.rs' --exclude-dir=tests --exclude='tests.rs' -e "$pat" crates/ 2>/dev/null | cut -d: -f1 | sort | uniq -c | awk '{print $2" "$1}' | sort > "$tmp_hits" || true
     # allowlist: "<TAG> <file>[:<line>]" -> "<file> <count>"
     awk -v t="$tag" '$1 == t { f=$2; sub(/:[0-9]+$/, "", f); print f }' "$ALLOW" | sort | uniq -c | awk '{print $2" "$1}' | sort > "$tmp_allowed"
 

@@ -1,86 +1,264 @@
-# Phase 1 (Freeze) grandfather list — docs/builtins-arch-plan.md §5 step 1.
+# Phase 1 (Freeze) grandfather list — see scripts/freeze-lint.sh.
 #
-# Format: one entry per grandfathered site: "<TAG> <file>:<line> # <reason>".
-# TAG is one of: PK_PUSH | PROP_GET1 | ERR_VAL (see scripts/freeze-lint.sh).
+# Format: one entry per grandfathered site: "<TAG> <file>:<line> # <reason>".  The
+# reason is the literal error text (ERR_VAL) or the shape of the write, so the
+# list describes the debt rather than merely counting it.
+# TAG is one of: PK_PUSH | PROP_GET1 | ERR_VAL.
 #
-# Matching rule (see script header): a file listed for a TAG stays legal for
+# Matching rule (see the script header): a file listed for a TAG stays legal for
 # that TAG, but its hit COUNT must not grow past the number of entries below.
 # :line numbers are documentary (they drift with edits); enforcement is
-# file-membership + per-file count cap. Any hit in an unlisted file fails.
+# file-membership + per-file count cap.  Any hit in an unlisted file fails.
+# Test code is out of scope for all three TAGs and is excluded by path by the
+# script, so it needs no entries here.
 #
-# Generated from the tree on 2026-09-06. Do not append without a plan reference.
-
-# --- PK_PUSH: direct `property_keys.push` (target: only the Ctx install family, §3) ---
-PK_PUSH crates/v12-engine/src/builtins/ctx.rs:306 # Ctx install family (define_data_prop_with_attrs) — the canonical path; everything else funnels here
-PK_PUSH crates/v12-engine/src/builtins/object.rs:583 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
-PK_PUSH crates/v12-engine/src/builtins/json.rs:235 # ad-hoc object creation in builtin body; migrate to ctx.define_data_prop in step 3
-PK_PUSH crates/v12-interp/src/property.rs:777 # generic set-property fallback; stays until the install family owns all writes (step 4)
-
-# --- PROP_GET1: hardcoded `properties.get(1)` slot reads (target: Ctx realm/intrinsic reader, §1.1) ---
-PROP_GET1 crates/v12-heap/src/object.rs:585 # promise_value helper reading the value slot; centralize into Ctx in step 2
-PROP_GET1 crates/v12-engine/src/builtins/string.rs:320 # match-index read in string builtin; replace with Ctx accessor in step 3
-PROP_GET1 crates/v12-interp/src/call_setup.rs:1773 # iterator-result `done` slot read; replace with Ctx accessor in step 3
-
-# --- ERR_VAL: stringly `error_value("` construction (target: ctx.{type,range,syntax,reference}_error, §4.2) ---
-# Counts per file on 2026-09-06: call_setup.rs 27, object_ops.rs 15,
-# generator_async.rs 7, lib.rs 7, execute.rs 4 (60 total). One entry per site.
-ERR_VAL crates/v12-interp/src/call_setup.rs:29 # call-arity/constructor guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:34 # call-arity/constructor guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:358 # stack-overflow guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/call_setup.rs:860 # corrupt-call-header guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/call_setup.rs:868 # corrupt-call-header guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/call_setup.rs:1028 # callee/args guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1033 # callee/args guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1048 # callee/args guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1053 # callee/args guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1100 # stack-overflow guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/call_setup.rs:1195 # not-a-constructor guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1200 # not-a-constructor guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1256 # not-a-constructor guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1262 # not-a-constructor guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1297 # not-a-constructor guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1303 # stack-overflow guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/call_setup.rs:1533 # Array-method receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1541 # non-function callback guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1663 # Reduce empty-array guard; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1699 # forEach receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1706 # forEach receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1711 # non-function callback guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1744 # Iterator-method guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1749 # Iterator-method guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1754 # non-function callback guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1781 # iterator-drain limit guard; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/call_setup.rs:1872 # Reduce empty-iterator guard; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:13 # destructure/spread guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:19 # destructure/spread guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:203 # accessor/prototype guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:230 # accessor/prototype guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:244 # accessor/prototype guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:255 # cyclic-prototype guard; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:332 # iterator-protocol guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:339 # iterator-protocol guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:386 # spread/destination guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:391 # spread/destination guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:400 # spread/destination guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:405 # spread/destination guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:410 # spread/destination guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:415 # spread/destination guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/object_ops.rs:459 # Array join receiver guard; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/generator_async.rs:87 # generator-receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/generator_async.rs:91 # generator-receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/generator_async.rs:145 # generator-receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/generator_async.rs:149 # generator-receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/generator_async.rs:174 # generator-receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/generator_async.rs:178 # generator-receiver guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/generator_async.rs:283 # stack-overflow guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/lib.rs:1085 # call-completed-without-result guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/lib.rs:1108 # private-member guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/lib.rs:1112 # private-member guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/lib.rs:1149 # private-member guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/lib.rs:1166 # private-member guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/lib.rs:1171 # private-member guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/lib.rs:1469 # not-a-function guard; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/execute.rs:170 # execution-deadline guard; Ctx errors in step 2
-ERR_VAL crates/v12-interp/src/execute.rs:883 # yield-outside-generator guard; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/execute.rs:902 # await-outside-async guards; Ctx errors in step 3
-ERR_VAL crates/v12-interp/src/execute.rs:907 # await-outside-async guards; Ctx errors in step 3
+# ===================== RATCHET POLICY =====================
+# Re-baselined 2026-10-01 (Track 0 / W0.2).  The previous list was generated
+# 2026-09-06 and nothing had run the guard since, so it drifted: 67 entries
+# against 129 real sites (62 unaccounted for), plus one stale PROP_GET1 entry
+# pointing at a call_setup.rs site that had already been migrated.
+# Decision: raise every cap ONCE to the measured current count, then only
+# ratchet DOWN.  Concretely:
+#   * Do not raise a cap again.  A new site in an allowlisted file fails and
+#     must either be ported or, if genuinely unavoidable, reviewed as an
+#     explicit cap raise with a reason here.
+#   * Each migration commit DELETES the entries it retired; the cap follows
+#     automatically because the script counts entries.
+#   * This file must therefore shrink monotonically from here.  The three
+#     stages to aim for, in order of size: call_setup.rs 53 -> 0, then
+#     object_ops.rs 20 -> 0, then the 10-site files.
+#
+# ===================== MIGRATION TARGETS =====================
+# ERR_VAL -> real error objects with a kind and a realm link.
+#   engine layer: Ctx::{type_error,range_error,syntax_error,reference_error}
+#     (crates/v12-engine/src/builtins/ctx.rs:217-250).  ctx.rs:239
+#     (make_error) already routes through v12_native::parse_error_text, so the
+#     "Kind: message" spelling used by every entry below survives the port
+#     and each site becomes a bare message argument.
+#   interpreter layer: Ctx is UNREACHABLE from crates/v12-interp — v12-engine
+#     depends on v12-interp, not the reverse (v12-interp/Cargo.toml deps are
+#     v12-bytecode, v12-heap, v12-native only).  The reachable shared target is
+#     the same pair Ctx uses: v12_native::{parse_error_text,error_object}
+#     (crates/v12-native/src/throw.rs:44,57), wrapped once as
+#     Interp::{type_error,range_error,syntax_error,reference_error} beside
+#     Interp::error_value (crates/v12-interp/src/call_setup.rs:963).  That
+#     wrapper batch is a prerequisite for retiring 118 of the 119 sites.
+# PK_PUSH -> ctx.define_data_prop_with_attrs (ctx.rs:482) is the sole legal
+#   push.  Sites that write an internal slot or a fixed record layout, and the
+#   interpreter's dictionary/sparse storage core, are structurally exempt and
+#   are marked as such below; the rest are blocked on its &str key signature.
+# PROP_GET1 -> Ctx::intrinsic (ctx.rs:119), which resolves a
+#   GLOBAL_INTRINSICS name to a slot with no hardcoded index at the call site.
+#
+#
+# --- PK_PUSH: direct `property_keys.push` (target: only the Ctx install family, ctx.rs:482) ---
+#
+# crates/v12-engine/src/builtins/ctx.rs — 1 site remaining
+# define_data_prop_with_attrs (ctx.rs:482) — the sole legal
+# push; every other install in the workspace is meant to funnel here.
+PK_PUSH crates/v12-engine/src/builtins/ctx.rs:512 # property_keys.push
+#
+# crates/v12-engine/src/builtins/date.rs — 1 site remaining
+# [[DateValue]] internal slot written before alloc; an internal slot, not a
+# user-visible property, so it cannot use the data-property installer. Migrate
+# only when DateValue becomes a first-class field.
+PK_PUSH crates/v12-engine/src/builtins/date.rs:302 # property_keys.push
+#
+# crates/v12-engine/src/builtins/object.rs — 1 site remaining
+# ad-hoc object construction in a builtin body; migrate to ctx.define_data_prop.
+PK_PUSH crates/v12-engine/src/builtins/object.rs:1729 # property_keys.push
+#
+# crates/v12-engine/src/builtins/json.rs — 1 site remaining
+# ad-hoc object construction in a builtin body; migrate to ctx.define_data_prop.
+PK_PUSH crates/v12-engine/src/builtins/json.rs:301 # property_keys.push
+#
+# crates/v12-engine/src/builtins/promise.rs — 1 site remaining
+# promise state record: fixed-slot layout initialised to holes so SLOT_ERRORS is
+# never a hole. Internal record, not a property install.
+PK_PUSH crates/v12-engine/src/builtins/promise.rs:1624 # property_keys.push
+#
+# crates/v12-engine/src/module_namespace.rs — 3 sites remaining
+# module namespace exotic [[OwnPropertyKeys]] export registration (3 sites). Exotic
+# object with a spec-mandated key order; not an ordinary property install.
+PK_PUSH crates/v12-engine/src/module_namespace.rs:93 # property_keys.push
+PK_PUSH crates/v12-engine/src/module_namespace.rs:142 # property_keys.push
+PK_PUSH crates/v12-engine/src/module_namespace.rs:201 # property_keys.push
+#
+# crates/v12-interp/src/object_ops.rs — 1 site remaining
+# define_elements: installs a BUILTIN-attrs class method on a shape-bound object.
+# Blocked on define_data_prop_with_attrs taking &str instead of a PropKey.
+PK_PUSH crates/v12-interp/src/object_ops.rs:280 # property_keys.push
+#
+# crates/v12-interp/src/property.rs — 3 sites remaining
+# dictionary-mode and sparse-storage writes in the interpreter's property core,
+# each paired with a dict_seq publish. Below the builtin layer by design.
+PK_PUSH crates/v12-interp/src/property.rs:1761 # property_keys.push
+PK_PUSH crates/v12-interp/src/property.rs:1798 # property_keys.push
+PK_PUSH crates/v12-interp/src/property.rs:1859 # property_keys.push
+#
+# --- PROP_GET1: hardcoded `properties.get(1)` slot reads (target: Ctx::intrinsic, ctx.rs:119) ---
+#
+# crates/v12-heap/src/object.rs — 1 site remaining
+# promise_value helper reading the value slot; centralize into the Ctx reader.
+PROP_GET1 crates/v12-heap/src/object.rs:758 # properties.get(1)
+#
+# crates/v12-engine/src/builtins/string.rs — 1 site remaining
+# match-index read in a String builtin; replace with Ctx::intrinsic.
+PROP_GET1 crates/v12-engine/src/builtins/string.rs:416 # properties.get(1)
+#
+# --- ERR_VAL: stringly `error_value("` construction (target: the Ctx / v12-native error wrappers) ---
+# 119 sites remain, listed below per file with the migration rationale for that file.
+#
+# crates/v12-interp/src/call_setup.rs — 53 sites remaining
+# call/construct ABI guards (arity, stack depth, corrupt call
+# header, callee/args) plus every Proxy/Reflect trap dispatch. Largest batch in
+# the list at 45% of all ERR_VAL sites, so it goes first.
+ERR_VAL crates/v12-interp/src/call_setup.rs:65 # "TypeError: callee is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:79 # "TypeError: callee is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:257 # "RangeError: maximum call stack size exceeded"
+ERR_VAL crates/v12-interp/src/call_setup.rs:465 # "RangeError: maximum call stack size exceeded"
+ERR_VAL crates/v12-interp/src/call_setup.rs:552 # "RangeError: maximum call stack size exceeded"
+ERR_VAL crates/v12-interp/src/call_setup.rs:815 # "TypeError: corrupt call header"
+ERR_VAL crates/v12-interp/src/call_setup.rs:823 # "TypeError: corrupt call header"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1039 # "TypeError: callee is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1047 # "TypeError: args is not an array"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1063 # "TypeError: callee is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1078 # "TypeError: args is not an array"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1140 # "RangeError: maximum call stack size exceeded"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1238 # "TypeError: value is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1252 # "TypeError: value is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1277 # "TypeError: not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1289 # "TypeError: not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1312 # "TypeError: value is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1329 # "TypeError: value is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1335 # "TypeError: value is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1393 # "TypeError: value is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:1399 # "RangeError: maximum call stack size exceeded"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2132 # "TypeError: Reflect.apply target is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2139 # "TypeError: Reflect.apply target is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2197 # "TypeError: target is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2207 # "TypeError: 'apply' trap must be a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2212 # "TypeError: 'apply' trap must be a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2237 # "TypeError: target is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2247 # "TypeError: 'construct' trap must be a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2252 # "TypeError: 'construct' trap must be a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2435 # "TypeError: target is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2451 # "TypeError: target is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2474 # "TypeError: target is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2489 # "TypeError: not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2495 # "TypeError: not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2658 # "TypeError: Cannot redefine property"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2796 # "TypeError: Property description must be an object"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2813 # "TypeError: prototype must be an object or null"
+ERR_VAL crates/v12-interp/src/call_setup.rs:2825 # "TypeError: properties must be an object"
+ERR_VAL crates/v12-interp/src/call_setup.rs:3003 # "TypeError: Array method called on non-object"
+ERR_VAL crates/v12-interp/src/call_setup.rs:3015 # "TypeError: callback is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:3218 # "TypeError: collection adder is not callable"
+ERR_VAL crates/v12-interp/src/call_setup.rs:3253 # "TypeError: Map iterator entry is not an object"
+ERR_VAL crates/v12-interp/src/call_setup.rs:3746 # "TypeError: AggregateError is not available"
+ERR_VAL crates/v12-interp/src/call_setup.rs:3793 # "TypeError: combinator element has no record"
+ERR_VAL crates/v12-interp/src/call_setup.rs:3798 # "TypeError: combinator index is not Smi"
+ERR_VAL crates/v12-interp/src/call_setup.rs:4143 # "TypeError: Promise.try requires an object receiver"
+ERR_VAL crates/v12-interp/src/call_setup.rs:4207 # "TypeError: Promise constructor requires 'new'"
+ERR_VAL crates/v12-interp/src/call_setup.rs:4331 # "TypeError: species constructor is not an object"
+ERR_VAL crates/v12-interp/src/call_setup.rs:4353 # "TypeError: species is not a constructor"
+ERR_VAL crates/v12-interp/src/call_setup.rs:4612 # "TypeError: forEach called on non-object"
+ERR_VAL crates/v12-interp/src/call_setup.rs:4619 # "TypeError: forEach called on incompatible receiver"
+ERR_VAL crates/v12-interp/src/call_setup.rs:4628 # "TypeError: callback is not a function"
+ERR_VAL crates/v12-interp/src/call_setup.rs:5129 # "TypeError: iterator next() returned a non-object"
+#
+# crates/v12-interp/src/object_ops.rs — 20 sites remaining
+# destructure/spread, prototype-chain and accessor-prototype guards. 20
+# sites; second-largest batch.
+ERR_VAL crates/v12-interp/src/object_ops.rs:17 # "TypeError: cannot destructure non-iterable"
+ERR_VAL crates/v12-interp/src/object_ops.rs:23 # "TypeError: spread/rest source is not an array"
+ERR_VAL crates/v12-interp/src/object_ops.rs:216 # "TypeError: cannot define accessor on non-object"
+ERR_VAL crates/v12-interp/src/object_ops.rs:249 # "TypeError: cannot define method on non-object"
+ERR_VAL crates/v12-interp/src/object_ops.rs:272 # "TypeError: cannot redefine accessor as method"
+ERR_VAL crates/v12-interp/src/object_ops.rs:296 # "TypeError: cannot set prototype of a primitive"
+ERR_VAL crates/v12-interp/src/object_ops.rs:310 # "TypeError: prototype must be an object or null"
+ERR_VAL crates/v12-interp/src/object_ops.rs:321 # "TypeError: cyclic [[Prototype]] value"
+ERR_VAL crates/v12-interp/src/object_ops.rs:606 # "TypeError: IteratorNext called on non-object"
+ERR_VAL crates/v12-interp/src/object_ops.rs:616 # "TypeError: iterator.next is not a function"
+ERR_VAL crates/v12-interp/src/object_ops.rs:631 # "TypeError: iterator.next() returned a non-object"
+ERR_VAL crates/v12-interp/src/object_ops.rs:690 # "TypeError: iterator.return is not a function"
+ERR_VAL crates/v12-interp/src/object_ops.rs:700 # "TypeError: iterator.return() returned a non-object"
+ERR_VAL crates/v12-interp/src/object_ops.rs:716 # "TypeError: spread source is not an array"
+ERR_VAL crates/v12-interp/src/object_ops.rs:721 # "TypeError: spread source is not an array"
+ERR_VAL crates/v12-interp/src/object_ops.rs:734 # "TypeError: destination is not an object"
+ERR_VAL crates/v12-interp/src/object_ops.rs:739 # "TypeError: destination is not an array"
+ERR_VAL crates/v12-interp/src/object_ops.rs:744 # "TypeError: spread source is not an array"
+ERR_VAL crates/v12-interp/src/object_ops.rs:749 # "TypeError: spread source is not an array"
+ERR_VAL crates/v12-interp/src/object_ops.rs:793 # "TypeError: Array.prototype.join requires an array"
+#
+# crates/v12-interp/src/property.rs — 16 sites remaining
+# proxy trap type guards plus [[Set]]/[[DefineOwnProperty]] failure paths.
+# 16 sites.
+ERR_VAL crates/v12-interp/src/property.rs:1415 # "TypeError: 'set' on proxy returned false"
+ERR_VAL crates/v12-interp/src/property.rs:1435 # "TypeError: cannot assign to read-only property"
+ERR_VAL crates/v12-interp/src/property.rs:1565 # "TypeError: 'set' on proxy returned false"
+ERR_VAL crates/v12-interp/src/property.rs:1626 # "TypeError: cannot assign to read-only property"
+ERR_VAL crates/v12-interp/src/property.rs:1675 # "TypeError: cannot assign to read-only property"
+ERR_VAL crates/v12-interp/src/property.rs:1694 # "TypeError: 'set' on proxy returned false"
+ERR_VAL crates/v12-interp/src/property.rs:1717 # "TypeError: cannot assign to read-only property"
+ERR_VAL crates/v12-interp/src/property.rs:1816 # "TypeError: cannot define property on non-object"
+ERR_VAL crates/v12-interp/src/property.rs:2406 # "TypeError: 'isExtensible' trap result mismatch"
+ERR_VAL crates/v12-interp/src/property.rs:2941 # "TypeError: 'set' trap must be a function"
+ERR_VAL crates/v12-interp/src/property.rs:2946 # "TypeError: 'set' trap must be a function"
+ERR_VAL crates/v12-interp/src/property.rs:3151 # "TypeError: 'has' trap must be a function"
+ERR_VAL crates/v12-interp/src/property.rs:3156 # "TypeError: 'has' trap must be a function"
+ERR_VAL crates/v12-interp/src/property.rs:3228 # "TypeError: 'get' trap must be a function"
+ERR_VAL crates/v12-interp/src/property.rs:3233 # "TypeError: 'get' trap must be a function"
+ERR_VAL crates/v12-interp/src/property.rs:3336 # "TypeError: 'ownKeys' trap result must be an object"
+#
+# crates/v12-interp/src/lib.rs — 8 sites remaining
+# private-member brand checks and call-completed-without-result guard. 8 sites.
+ERR_VAL crates/v12-interp/src/lib.rs:1428 # "TypeError: Cannot read private member from an object whose class did not declare it"
+ERR_VAL crates/v12-interp/src/lib.rs:1432 # "TypeError: Cannot read private member from an object whose class did not declare it"
+ERR_VAL crates/v12-interp/src/lib.rs:1470 # "TypeError: Cannot read private member from an object whose class did not declare it"
+ERR_VAL crates/v12-interp/src/lib.rs:1487 # "TypeError: Cannot set private member on non-object"
+ERR_VAL crates/v12-interp/src/lib.rs:1492 # "TypeError: Cannot read private member from an object whose class did not declare it"
+ERR_VAL crates/v12-interp/src/lib.rs:1624 # "InternalError: environment slot out of range"
+ERR_VAL crates/v12-interp/src/lib.rs:1659 # "InternalError: environment slot out of range"
+ERR_VAL crates/v12-interp/src/lib.rs:2032 # "TypeError: not a function"
+#
+# crates/v12-interp/src/generator_async.rs — 7 sites remaining
+# generator/async receiver guards. 7 sites.
+ERR_VAL crates/v12-interp/src/generator_async.rs:626 # "TypeError: generator next called on non-object"
+ERR_VAL crates/v12-interp/src/generator_async.rs:630 # "TypeError: not a generator"
+ERR_VAL crates/v12-interp/src/generator_async.rs:711 # "TypeError: generator return called on non-object"
+ERR_VAL crates/v12-interp/src/generator_async.rs:715 # "TypeError: not a generator"
+ERR_VAL crates/v12-interp/src/generator_async.rs:780 # "TypeError: generator throw called on non-object"
+ERR_VAL crates/v12-interp/src/generator_async.rs:784 # "TypeError: not a generator"
+ERR_VAL crates/v12-interp/src/generator_async.rs:1067 # "RangeError: maximum call stack size exceeded"
+#
+# crates/v12-interp/src/execute.rs — 5 sites remaining
+# execution-deadline, yield-outside-generator and await-outside-async guards.
+# 5 sites.
+ERR_VAL crates/v12-interp/src/execute.rs:174 # "ScriptRuntimeError: execution deadline exceeded"
+ERR_VAL crates/v12-interp/src/execute.rs:704 # "TypeError: cannot set properties of null or undefined"
+ERR_VAL crates/v12-interp/src/execute.rs:732 # "TypeError: Cannot delete property of an object"
+ERR_VAL crates/v12-interp/src/execute.rs:1136 # "SyntaxError: yield outside generator"
+ERR_VAL crates/v12-interp/src/execute.rs:1171 # "SyntaxError: await outside async"
+#
+# crates/v12-interp/src/call_capability.rs — 5 sites remaining
+# call-depth limit and call-arity guards. 5 sites.
+ERR_VAL crates/v12-interp/src/call_capability.rs:31 # "RangeError: maximum call stack size exceeded"
+ERR_VAL crates/v12-interp/src/call_capability.rs:44 # "RangeError: maximum call stack size exceeded"
+ERR_VAL crates/v12-interp/src/call_capability.rs:60 # "RangeError: too many call arguments"
+ERR_VAL crates/v12-interp/src/call_capability.rs:66 # "RangeError: too many call arguments"
+ERR_VAL crates/v12-interp/src/call_capability.rs:84 # "InternalError: call completed without a result"
+#
+# crates/v12-interp/src/eval_context.rs — 3 sites remaining
+# direct-eval program-compile and eval-local binding guards. 3 sites.
+ERR_VAL crates/v12-interp/src/eval_context.rs:241 # "TypeError: invalid eval program"
+ERR_VAL crates/v12-interp/src/eval_context.rs:411 # "ReferenceError: invalid eval-local binding"
+ERR_VAL crates/v12-interp/src/eval_context.rs:430 # "ReferenceError: arguments owner is unavailable"
+#
+# crates/v12-interp/src/ops.rs — 1 site remaining
+# Symbol-to-string conversion guard. 1 site.
+ERR_VAL crates/v12-interp/src/ops.rs:634 # "TypeError: Cannot convert a Symbol value to a string"
+#
+# crates/v12-engine/src/module_loader.rs — 1 site remaining
+# re-entrant module evaluation guard. 1 site.
+ERR_VAL crates/v12-engine/src/module_loader.rs:437 # "TypeError: Cannot evaluate a module while it is already evaluating"
