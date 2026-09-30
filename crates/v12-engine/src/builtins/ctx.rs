@@ -1000,16 +1000,6 @@ impl<'a> Ctx<'a> {
         settings.properties[slot] = value;
         settings.property_keys[slot] = Some(key);
     }
-
-    /// Mints a fresh, rooted symbol (identity is the handle) for a well-known
-    /// `Symbol` property value. Deliberately NOT registered with
-    /// `Heap::symbol_for_key`, so `Symbol.keyFor` returns `undefined` for it
-    /// per spec.
-    pub fn fresh_symbol(&mut self) -> Handle<v12_heap::V12Symbol> {
-        let h = self.heap.alloc(v12_heap::V12Symbol);
-        self.heap.add_root(JsValue::symbol(h));
-        h
-    }
 }
 
 /// Reads an own data property `name` from `obj` (shape lookup, no prototype

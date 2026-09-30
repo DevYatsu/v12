@@ -314,18 +314,12 @@ pub enum NativeId {
     SymbolProtoToString = 2503,
     SymbolProtoValueOf = 2504,
     SymbolProtoDescription = 2505,
-    SymbolWellKnownIterator = 2506,
-    SymbolWellKnownAsyncIterator = 2507,
-    SymbolWellKnownHasInstance = 2508,
-    SymbolWellKnownIsConcatSpreadable = 2509,
-    SymbolWellKnownMatch = 2510,
-    SymbolWellKnownReplace = 2511,
-    SymbolWellKnownSearch = 2512,
-    SymbolWellKnownSpecies = 2513,
-    SymbolWellKnownSplit = 2514,
-    SymbolWellKnownToPrimitive = 2515,
-    SymbolWellKnownToStringTag = 2516,
-    SymbolWellKnownUnscopables = 2517,
+    // The `25xx` band *had* twelve `SymbolWellKnown*` ids here. A well-known
+    // symbol is data, not behaviour, so they are gone: the values now come from
+    // `v12_heap::WellKnownSymbol` and `Heap::well_known_symbol`, and
+    // `builtins::symbol::install_well_known_singletons` publishes them. The band
+    // is left as a hole rather than renumbered, so the ids that survive keep
+    // their serialized values.
     // Iterator
     IteratorNext = 2200,
     IteratorSelf = 2204,
@@ -549,17 +543,9 @@ pub enum NativeId {
     // append-only: the discriminants above are stable and a future insertion
     // must never renumber them.
     //
-    // Well-known `Symbol` properties (ECMA-262 20.4.2). These differ from the
-    // `25xx` family above in *how they are installed*: the `25xx` entries
-    // install a handler function that the realm later overwrites with the
-    // realm's canonical symbol, because the well-known symbol has to be
-    // addressable as a key. These two have no engine-internal consumer yet, so
-    // they install the singleton itself as the property value — see
-    // `builtins::install_value_with_attrs`.
-    /// `Symbol.dispose`.
-    SymbolWellKnownDispose = 3500,
-    /// `Symbol.asyncDispose`.
-    SymbolWellKnownAsyncDispose = 3501,
+    // `SymbolWellKnownDispose = 3500` and `SymbolWellKnownAsyncDispose = 3501`
+    // used to live here, like the `25xx` family. They went the same way: the
+    // well-known symbols are data, so the `35xx` band starts at `SetUnion`.
     // Set methods (ECMA-262 24.2.3, the "new Set methods" proposal).
     /// `Set.prototype.union(other)`.
     SetUnion = 3502,

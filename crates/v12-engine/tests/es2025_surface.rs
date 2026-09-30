@@ -148,17 +148,58 @@ fn symbol_dispose_is_a_singleton() {
     );
 }
 
-/// Spec 20.4.2 gives every `Symbol` static
-/// `{writable: false, enumerable: false, configurable: true}` — the one place
-/// in clauses 18-26 that departs from the `{true, false, true}` default, and
-/// the reason `install_value_with_attrs` exists next to `install_value`.
+/// Spec 20.4.2 gives every `Symbol` well-known property
+/// `{writable: false, enumerable: false, configurable: false}`.
+///
+/// This asserted `configurable: true`. The spec text and the corpus disagree
+/// with that in the same direction — `Symbol/dispose/prop-desc.js` and
+/// `Symbol/asyncDispose/prop-desc.js` both `verifyProperty(..., {writable:
+/// false, enumerable: false, configurable: false})` and both were *failing* at
+/// master, which is what a `{true, false, true}` default produces. The old
+/// `install_value_with_attrs` route is gone, replaced by
+/// `symbol::install_well_known_singletons`, which writes the spec triple for
+/// all fifteen names from the shared table.
 #[test]
-fn well_known_symbols_carry_the_non_writable_attribute_triple() {
-    assert_eq!(attr_triple_on("Symbol", "'dispose'"), "false,false,true");
-    assert_eq!(
-        attr_triple_on("Symbol", "'asyncDispose'"),
-        "false,false,true"
-    );
+fn well_known_symbols_carry_the_spec_attribute_triple() {
+    for name in ["'dispose'", "'asyncDispose'"] {
+        assert_eq!(
+            attr_triple_on("Symbol", name),
+            "false,false,false",
+            "{name}"
+        );
+    }
+    // Every well-known name, not just the two the merge lane added — the
+    // `25xx`-band handler placeholders used to leave these as
+    // `{true, false, true}` functions, which is how
+    // `Symbol/hasInstance/prop-desc.js` and its two siblings were failing with
+    // `typeof Symbol.hasInstance === "function"`.
+    for name in [
+        "'asyncIterator'",
+        "'hasInstance'",
+        "'isConcatSpreadable'",
+        "'iterator'",
+        "'match'",
+        "'matchAll'",
+        "'replace'",
+        "'search'",
+        "'species'",
+        "'split'",
+        "'toPrimitive'",
+        "'toStringTag'",
+        "'unscopables'",
+    ] {
+        assert_eq!(
+            eval_display(&format!("typeof Symbol[{}]", name)),
+            "symbol",
+            "{} must be a symbol",
+            name
+        );
+        assert_eq!(
+            attr_triple_on("Symbol", name),
+            "false,false,false",
+            "{name}"
+        );
+    }
 }
 
 /// A well-known symbol is never in the registry, so `Symbol.keyFor` answers
