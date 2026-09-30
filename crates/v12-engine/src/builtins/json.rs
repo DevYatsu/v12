@@ -600,6 +600,14 @@ fn write_value(
     if ctx.heap.get(obj).kind == v12_heap::Kind::Function {
         return Ok(false);
     }
+    // `SerializeJSONProperty` step 4: a raw JSON value is spliced in *verbatim*
+    // — not quoted, not escaped, not walked. The check sits after the callable
+    // test and before the cycle bookkeeping, because a backdoor is a leaf: it has
+    // no nested values to visit and so can never be part of a cycle.
+    if let Some(serialized) = raw_json_of(ctx, obj) {
+        out.push_str(&serialized);
+        return Ok(true);
+    }
     // Cycle detection: an object already on the ancestor stack re-entering
     // is a circular structure (a `Throw`), not a skip.
     if seen.contains(&obj) {
@@ -842,4 +850,127 @@ fn intern_key(heap: &mut Heap, name: &str) -> v12_heap::PropKey {
         heap.intern_string(V12Str::utf16(name.encode_utf16().collect()))
     };
     v12_heap::PropKey::from_string(h)
+}
+
+// -- JSON.rawJSON / JSON.isRawJSON (25.5.2.1 / 25.5.2.2) --------------------
+
+/// The serialized text of a "raw JSON" backdoor object, or `None` when `obj` is
+/// not one.
+///
+/// The spec brands these objects with a `[[RawJSON]]` *internal slot*, which
+/// this engine does not have, so the identity is recovered structurally: the
+/// object has exactly one own enumerable property, `rawJSON`, and its value is a
+/// String (25.5.2.2 steps 3-4). The single-property requirement is the whole
+/// safety property of the feature — it is what stops an ordinary
+/// `{ rawJSON: "..." }` literal from being injected into a `stringify` result as
+/// *unescaped* text — so it is checked here rather than assumed.
+///
+/// The prototype chain is deliberately *not* consulted. `isRawJSON` does look at
+/// an inherited raw-JSON proto (steps 5-14), but `SerializeJSONProperty` honours
+/// only the per-object internal slot. Keeping the two checks separate is what
+/// makes an object that merely inherits a well-formed proto report `true` from
+/// `isRawJSON` while still being serialized as an ordinary object.
+fn raw_json_of(ctx: &mut Ctx, obj: Handle<JsObject>) -> Option<String> {
+    let keys = enumerable_own_keys(ctx, obj);
+    if keys.len() != 1 {
+        return None;
+    }
+    let (name, value) = keys.into_iter().next()?;
+    if ctx.string_text(name) != "rawJSON" {
+        return None;
+    }
+    let text = value.as_string()?;
+    Some(ctx.string_text(text))
+}
+
+/// `Get(proto, "rawJSON")` for the `isRawJSON` prototype walk.
+///
+/// Kept apart from `Iterator`'s `own_or_inherited_read` because the read must not
+/// throw: `isRawJSON` is a predicate over arbitrary user objects, so an accessor
+/// that throws there would turn a type test into an exception.
+fn inherited_raw_json_prop(ctx: &mut Ctx, proto: Handle<JsObject>) -> Option<Handle<JsObject>> {
+    let key = v12_heap::PropKey::from_string(ctx.heap.intern_text("rawJSON"));
+    let value = crate::internal_methods::dispatch_get(ctx.heap, proto, key, JsValue::object(proto))
+        .ok()?;
+    value.as_object()
+}
+
+/// Steps 5-14: is `proto` a raw-JSON proto?
+fn is_raw_json_proto(ctx: &mut Ctx, proto: Handle<JsObject>) -> bool {
+    let Some(raw) = inherited_raw_json_prop(ctx, proto) else {
+        return false;
+    };
+    // Steps 7-12: it must be an Array of length exactly 1.
+    if ctx.heap.get(raw).kind != v12_heap::Kind::Array || array_length(ctx, raw) != 1 {
+        return false;
+    }
+    // Steps 13-14: exactly one own enumerable key, and it is "0".
+    let keys = enumerable_own_keys(ctx, raw);
+    keys.len() == 1 && ctx.string_text(keys[0].0) == "0"
+}
+
+/// `JSON.isRawJSON(value)` (25.5.2.2).
+///
+/// Steps 1-4 are the own-property shape [`raw_json_of`] recognises; steps 5-14
+/// additionally accept an object whose *prototype* carries a well-formed raw-JSON
+/// proto, which is the shape a raw JSON value takes once something has copied it
+/// rather than moved it.
+pub fn json_is_raw_json(
+    ctx: &mut Ctx,
+    _this: JsValue,
+    args: &[JsValue],
+) -> Result<JsValue, Throw> {
+    let value = args.first().copied().unwrap_or(JsValue::undefined());
+    let Some(obj) = value.as_object() else {
+        // Step 1: a primitive is never raw JSON.
+        return Ok(JsValue::from_bool(false));
+    };
+    if raw_json_of(ctx, obj).is_some() {
+        return Ok(JsValue::from_bool(true));
+    }
+    // Steps 5-6: no prototype (or a non-object one) ends the walk.
+    let proto = ctx.heap.get(obj).prototype;
+    Ok(JsValue::from_bool(
+        proto.is_some_and(|p| is_raw_json_proto(ctx, p)),
+    ))
+}
+
+/// `JSON.rawJSON(text)` (25.5.2.1).
+///
+/// 1. A non-String `text` is a `TypeError` — deliberately *not* coerced, since
+///    the text is trusted verbatim and a coerced `Symbol` would throw a
+///    different error than the spec mandates.
+/// 2. Any code unit in `U+0000..=U+001F` is a `SyntaxError`: those cannot appear
+///    literally in JSON text, so accepting one would produce output `JSON.parse`
+///    cannot read back.
+/// 3. The backdoor is an `OrdinaryObjectCreate(null)` with a single `rawJSON`
+///    data property — null prototype and one own key, which is exactly what
+///    [`raw_json_of`] later looks for.
+pub fn json_raw_json(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
+    let text = args.first().copied().unwrap_or(JsValue::undefined());
+    let Some(h) = text.as_string() else {
+        return Err(throw_kind(
+            ctx,
+            "TypeError",
+            "JSON.rawJSON requires a string argument",
+        ));
+    };
+    // Step 2 reads code *units*, so this must not go through the lossy
+    // `string_text` decoder: a lone surrogate is not a control character and has
+    // to survive untouched.
+    let units = heap_units(ctx.heap, h);
+    if let Some(bad) = units.iter().copied().find(|&u| u <= 0x001F) {
+        return Err(throw_kind(
+            ctx,
+            "SyntaxError",
+            &format!(
+                "JSON.rawJSON text contains an unescaped control character U+{bad:04X}"
+            ),
+        ));
+    }
+    let serialized = ctx.string_text(h);
+    let backdoor = ctx.alloc_obj(JsObject::default());
+    let serialized_h = ctx.heap.intern_text(&serialized);
+    ctx.define_data_prop(backdoor, "rawJSON", JsValue::string(serialized_h));
+    Ok(JsValue::object(backdoor))
 }

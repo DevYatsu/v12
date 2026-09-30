@@ -241,16 +241,35 @@ fn helpers_reject_a_non_object_receiver() {
 
 #[test]
 fn take_clamps_a_non_positive_or_non_finite_limit_to_zero() {
-    // Spec 27.1.4.3 step 3: a `Math.trunc`ed, `ToIntegerOrInfinity`-clamped
-    // limit — 0, negative and `NaN` all mean "no values".
+    // Corrected against spec 27.1.4.3 steps 6-9 (quoted in test262's
+    // `take/limit-rangeerror.js`): a `NaN` limit, a finite limit above
+    // `2**53 - 1`, and a negative truncated limit each throw a `RangeError`.
+    // They used to be clamped to "no values", which is why this test had to
+    // change — the old comment cited a step that never said that. `0` and a
+    // fractional limit are still clamped, and `2.9` truncates down to 2.
     assert_eq!(
         thrown(
             "throw [[1,2,3].values().take(0).toArray().length, \
-                   [1,2,3].values().take(-1).toArray().length, \
-                   [1,2,3].values().take(NaN).toArray().length, \
                    [1,2,3].values().take(2.9).toArray().join(',')].join(',');"
         ),
-        "0,0,0,1,2"
+        "0,1,2"
+    );
+    // `thrown` reports "<Class>: <message>", so the class prefix is what the
+    // assertion below is really checking — the message text is not part of the
+    // spec.
+    assert!(thrown("[1,2,3].values().take(-1);").starts_with("RangeError"));
+    assert!(thrown("[1,2,3].values().take(NaN);").starts_with("RangeError"));
+    assert!(thrown("[1,2,3].values().take();").starts_with("RangeError"));
+    assert!(
+        thrown("[1,2,3].values().take(Number.MAX_SAFE_INTEGER + 1);")
+            .starts_with("RangeError")
+    );
+    // The two counter-cases the spec deliberately exempts: `-0.5` truncates to
+    // `-0` (and `-0 < 0` is false) and `Infinity` is not finite.
+    assert_eq!(thrown("[1,2,3].values().take(-0.5).toArray().length;"), "0");
+    assert_eq!(
+        thrown("[1,2,3].values().take(Infinity).toArray().join(',');"),
+        "1,2,3"
     );
 }
 
