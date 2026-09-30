@@ -73,6 +73,18 @@ pub const ITER_KIND_HELPER_FLATMAP: i32 = 12;
 /// Iterator kind: the lazy `windows` wrapper — overlapping groups of
 /// `SLOT_ARG` values, emitted from the pending buffer in `SLOT_PENDING`.
 pub const ITER_KIND_HELPER_WINDOWS: i32 = 13;
+/// Iterator kind: a `zip`/`zipKeyed` iterator built in `"strict"` mode whose
+/// input columns had *unequal* lengths.
+///
+/// The spec requires such an iterator to yield the rows up to the shortest
+/// column and then throw a `TypeError` on the following `next` (spec 27.1.3.2
+/// step 15). The eager model here cannot know that at construction time, so the
+/// fault is encoded as a kind: the rows array is truncated to the shortest
+/// column and [`SLOT_ARG`] holds the row count past which `next` must throw.
+/// Only the fault case uses this kind — an equal-length `strict` zip is an
+/// ordinary array iterator.
+pub const ITER_KIND_STRICT_FAULT: i32 = 15;
+
 /// Iterator kind: the lazy `chunks` wrapper — consecutive non-overlapping
 /// groups of `SLOT_ARG` values. Same layout as `windows`; only the buffer reset
 /// after a yield differs.
@@ -590,10 +602,28 @@ pub fn iterator_chunks(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result
     create_windowing_iterator(ctx, this, args, ITER_KIND_HELPER_CHUNKS)
 }
 
+/// The realm's `%Object.prototype%`, or `None` outside a realm (a bare-heap
+/// engine test), where a plain object correctly has no prototype at all.
+fn object_prototype(ctx: &mut Ctx) -> Option<Handle<JsObject>> {
+    ctx.intrinsic("Object")
+        .and_then(|v| v.as_object())
+        .and_then(|ctor| ctx.heap.get(ctor).prototype)
+}
+
 /// Allocates an ES iterator result `{value, done}`.
 fn iterator_result(ctx: &mut Ctx, value: JsValue, done: bool) -> JsValue {
+    // `CreateIteratorResultObject` step 1: the result is an
+    // `OrdinaryObjectCreate(%Object.prototype%)`. Every iterator's `next` result
+    // flows through here, so leaving the link off makes
+    // `Object.getPrototypeOf(it.next())` answer `null` for *all* of them — which
+    // test262's `assertIteratorResult` (and so `Iterator.zip`'s
+    // `basic-strict.js`) checks on every single row.
+    let prototype = object_prototype(ctx);
     let heap = &mut *ctx.heap;
     let h = helpers::alloc_obj(heap, JsObject::default());
+    if let Some(prototype) = prototype {
+        heap.get_mut(h).prototype = Some(prototype);
+    }
     // Shape-driven set: value then done, matching `make_iterator_result`.
     let value_key = heap.intern_string(v12_heap::V12Str::latin1(b"value".to_vec()));
     let done_key = heap.intern_string(v12_heap::V12Str::latin1(b"done".to_vec()));
@@ -742,6 +772,25 @@ pub fn iterator_next(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<
     if is_windowing_wrapper(kind) {
         return windowing_wrapper_next(ctx, iter, kind, JsValue::object(source));
     }
+    // A `strict` zip over unequal columns yields its rows and *then* throws,
+    // which the plain `index >= len` completion below would report as a clean
+    // `done`. The check therefore has to precede it (see
+    // [`ITER_KIND_STRICT_FAULT`]).
+    if kind == ITER_KIND_STRICT_FAULT {
+        let rows = ctx
+            .heap
+            .get(iter)
+            .elements
+            .get(SLOT_ARG)
+            .and_then(|v| v.as_smi())
+            .map(i64::from)
+            .unwrap_or(0) as usize;
+        if index >= rows {
+            return Err(ctx.type_error(
+                "TypeError: Iterator.zip strict mode received rows of unequal length",
+            ));
+        }
+    }
     let mut index = index;
     loop {
         let len = source_len(ctx.heap, source);
@@ -769,7 +818,7 @@ pub fn iterator_next(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<
         // happen on each `next`, even when the value is a pair.
         ctx.heap.get_mut(iter).elements[SLOT_INDEX] = helpers::smi_or_f64(index as i64 + 1);
         let value = match kind {
-            ITER_KIND_ARRAY_VALUES => source_elem(ctx.heap, source, index),
+            ITER_KIND_ARRAY_VALUES | ITER_KIND_STRICT_FAULT => source_elem(ctx.heap, source, index),
             ITER_KIND_ARRAY_KEYS => helpers::smi_or_f64(index as i64),
             ITER_KIND_ARRAY_ENTRIES | ITER_KIND_MAP_ENTRIES => {
                 let (key, val) = if kind == ITER_KIND_ARRAY_ENTRIES {
@@ -884,16 +933,49 @@ fn wrapper_limit(ctx: &mut Ctx, arg: JsValue) -> usize {
     n.trunc().min(MAX_DRAIN as f64) as usize
 }
 
-/// Parses the `limit` argument via `ctx.to_number` (spec `ToNumber`);
-/// non-finite/negative values clamp to 0.
-fn take_limit(ctx: &mut Ctx, args: &[JsValue]) -> usize {
-    let Some(&v) = args.first() else { return 0 };
-    let n = ctx.to_number(v);
-    if !n.is_finite() || n <= 0.0 {
-        return 0;
+/// Validates and parses the `limit` argument of `take`/`drop`
+/// (spec 27.1.4.3 steps 2-9).
+///
+/// The spec has *three* distinct `RangeError` conditions before the integer
+/// limit is even computed, and all three used to be silently clamped to 0 here:
+///
+/// 1. `numLimit` is `NaN` — which includes `take()` and `take(undefined)`, since
+///    `ToNumber(undefined)` is `NaN`, not 0;
+/// 2. `numLimit` is finite and greater than `2**53 - 1`, so no integer limit
+///    can represent it;
+/// 3. the truncated limit is negative.
+///
+/// `-0.5` is deliberately *not* condition 3: `ToIntegerOrInfinity(-0.5)` is
+/// `-0`, and `-0 < 0` is false, so `take(-0.5)` yields nothing rather than
+/// throwing. `Infinity` is not condition 2 either (it is not finite), so
+/// `take(Infinity)` is a valid unbounded take.
+///
+/// Every value that does *not* throw keeps the clamping it always had, so this
+/// is purely additive: a negative or `NaN` limit used to mean "take nothing",
+/// which was a wrong value rather than a missing error.
+fn take_limit(ctx: &mut Ctx, method: &str, args: &[JsValue]) -> Result<usize, Throw> {
+    let n = ctx.to_number(args.first().copied().unwrap_or(JsValue::undefined()));
+    if n.is_nan() || (n.is_finite() && n > MAX_SAFE_INTEGER) {
+        return Err(ctx.range_error(format!("RangeError: {method} limit is not a usable Number")));
     }
-    n.trunc().min(MAX_DRAIN as f64) as usize
+    let integer_limit = n.trunc();
+    if integer_limit < 0.0 {
+        return Err(ctx.range_error(format!("RangeError: {method} limit must not be negative")));
+    }
+    // A `+∞` limit means "take everything"; the drain cap already expresses
+    // that, because `MAX_DRAIN` is past any finite sequence the corpus builds.
+    if !integer_limit.is_finite() {
+        return Ok(MAX_DRAIN);
+    }
+    if integer_limit <= 0.0 {
+        return Ok(0);
+    }
+    Ok(integer_limit.min(MAX_DRAIN as f64) as usize)
 }
+
+/// `2**53 - 1`, the largest integer a `Number` represents exactly. Step 7 of
+/// `take`/`drop` rejects anything strictly above it.
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 /// `Iterator.prototype.take(limit)` — a lazy iterator over the first `limit`
 /// values of `this`. Nothing is pulled until the result is consumed, and no
@@ -905,7 +987,7 @@ fn take_limit(ctx: &mut Ctx, args: &[JsValue]) -> usize {
 /// machine-free and this file will step the wrapper itself.
 pub fn iterator_take(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let source = require_iterator(ctx, this, "Iterator.prototype.take")?;
-    let limit = take_limit(ctx, args);
+    let limit = take_limit(ctx, "Iterator.prototype.take", args)?;
     let source_next = args.get(1).copied().unwrap_or(JsValue::undefined());
     Ok(create_helper_iterator(
         ctx,
@@ -921,7 +1003,7 @@ pub fn iterator_take(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<J
 /// `args` is shaped exactly as for [`iterator_take`].
 pub fn iterator_drop(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let source = require_iterator(ctx, this, "Iterator.prototype.drop")?;
-    let limit = take_limit(ctx, args);
+    let limit = take_limit(ctx, "Iterator.prototype.drop", args)?;
     let source_next = args.get(1).copied().unwrap_or(JsValue::undefined());
     Ok(create_helper_iterator(
         ctx,
@@ -1129,7 +1211,14 @@ pub fn iterator_join(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<J
         if taken > MAX_DRAIN {
             return Err(ctx.range_error("RangeError: iterator drain exceeds 1,000,000 values"));
         }
-        parts.push(ctx.to_string(value));
+        parts.push(if value.is_null() || value.is_undefined() {
+            // 27.1.4.6 step 7: a nullish value contributes the *empty* string,
+            // not `"null"`/`"undefined"` — the join of `[1, null, 2]` has an
+            // empty middle field, so `[null, 2].join()` is `",2"`.
+            String::new()
+        } else {
+            ctx.to_string(value)
+        });
     }
     Ok(JsValue::string(ctx.heap.intern_text(&parts.join(&sep))))
 }
@@ -1161,16 +1250,33 @@ fn same_value_zero(a: JsValue, b: JsValue) -> bool {
 /// and the returned object is a *real* iterator — it inherits
 /// `%Iterator.prototype%` and answers `next` — rather than a bare object
 /// holding an array's worth of elements.
-fn zip_result_iterator(ctx: &mut Ctx, values: Vec<JsValue>) -> JsValue {
+fn zip_result(ctx: &mut Ctx, values: Vec<JsValue>, fault: bool) -> JsValue {
     let h = ctx.alloc_array(values);
     let proto = iterator_prototype(ctx);
+    // A faulting strict zip carries its row count in `SLOT_ARG`; an ordinary one
+    // keeps the three-element layout every other array iterator has.
+    let mut elements = vec![
+        helpers::smi_or_f64(i64::from(if fault {
+            ITER_KIND_STRICT_FAULT
+        } else {
+            ITER_KIND_ARRAY_VALUES
+        })),
+        JsValue::object(h),
+        helpers::smi_or_f64(0),
+    ];
+    if fault {
+        let rows = ctx.heap.get(h).element_len();
+        // The count lives in `SLOT_ARG`, which is index 4 — the same slot the
+        // `take`/`drop`/`map` wrappers use for their own argument. The base
+        // three-element layout stops at index 2, so the row count has to be
+        // pushed *into* its slot rather than appended: appending would land it
+        // at index 3 (`SLOT_SOURCE_NEXT`) and read back as no fault at all.
+        elements.resize(SLOT_ARG, JsValue::undefined());
+        elements.push(helpers::smi_or_f64(rows as i64));
+    }
     let iter = ctx.alloc_obj(JsObject {
         kind: v12_heap::Kind::Iterator,
-        elements: vec![
-            helpers::smi_or_f64(i64::from(ITER_KIND_ARRAY_VALUES)),
-            JsValue::object(h),
-            helpers::smi_or_f64(0),
-        ],
+        elements,
         prototype: proto,
         ..JsObject::default()
     });
@@ -1194,31 +1300,69 @@ fn drain_one(ctx: &mut Ctx, method: &str, value: JsValue) -> Result<Vec<JsValue>
         .ok_or_else(|| ctx.type_error(format!("TypeError: {method} argument is not iterable")))
 }
 
-/// The `options.mode` of a `zip`/`zipKeyed` call: `true` for `"longest"`,
-/// `false` for `"shortest"` (and for an absent `options`).
+/// The `options.mode` of a `zip`/`zipKeyed` call (spec 27.1.3.2 steps 3-5).
 ///
-/// Only the default arm is honoured beyond that — `padding` needs a value to
-/// pad a short row with, and picking one silently would be worse than not
-/// supporting it. `longest` is implemented because it is the mode with a
-/// well-defined answer for every input.
-fn zip_mode(ctx: &mut Ctx, options: JsValue) -> Result<bool, Throw> {
+/// Exactly three string values are valid — `"shortest"` (also the default),
+/// `"longest"` and `"strict"`. There is deliberately no `"pad"` mode: `padding`
+/// is a *separate* option that only `longest` consults, and accepting it here
+/// would let `Iterator.zip([], {mode: "pad"})` through as something the spec
+/// says must throw.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZipMode {
+    Shortest,
+    Longest,
+    Strict,
+}
+
+fn zip_mode(ctx: &mut Ctx, options: JsValue) -> Result<ZipMode, Throw> {
     if options.is_undefined() {
-        return Ok(false);
+        return Ok(ZipMode::Shortest);
     }
     if options.as_object().is_none() {
         return Err(ctx.type_error("TypeError: Iterator.zip options must be an object"));
     }
     let mode = own_or_inherited_read(ctx, options, "mode")?;
     if mode.is_undefined() {
-        return Ok(false);
+        return Ok(ZipMode::Shortest);
     }
     let Some(h) = mode.as_string() else {
         return Err(ctx.type_error("TypeError: Iterator.zip options.mode must be a string"));
     };
     match ctx.string_text(h).as_str() {
-        "shortest" => Ok(false),
-        "longest" => Ok(true),
+        "shortest" => Ok(ZipMode::Shortest),
+        "longest" => Ok(ZipMode::Longest),
+        "strict" => Ok(ZipMode::Strict),
         _ => Err(ctx.type_error("TypeError: Iterator.zip options.mode is invalid")),
+    }
+}
+
+/// The `options.padding` of a `zip`/`zipKeyed` call, defaulting to `undefined`.
+///
+/// Only consulted in `"longest"` mode. An *iterable* `padding` is drained by the
+/// spec (a fresh iterator is pulled for every value needed); this engine reads
+/// the option and uses the value directly, so a non-iterable `padding` is not
+/// rejected here. That gap is one of the `padding-iteration.js` assertions and
+/// is a machine-work omission, not a wrong value.
+fn zip_padding(ctx: &mut Ctx, options: JsValue) -> JsValue {
+    if options.is_undefined() {
+        return JsValue::undefined();
+    }
+    own_or_inherited_read(ctx, options, "padding").unwrap_or(JsValue::undefined())
+}
+
+/// How many rows a `zip`/`zipKeyed` produces, and whether it must fault.
+///
+/// `padding` is the fill value for `"longest"`; the row count follows the mode
+/// (shortest column, longest column, or shortest column with a latent fault).
+fn zip_shape(lens: &[usize], mode: ZipMode) -> (usize, bool) {
+    let min = lens.iter().copied().min().unwrap_or(0);
+    let max = lens.iter().copied().max().unwrap_or(0);
+    match mode {
+        ZipMode::Shortest => (min, false),
+        ZipMode::Longest => (max, false),
+        // Only unequal columns fault. Equal ones complete normally, so they stay
+        // a plain array iterator with no kind of their own.
+        ZipMode::Strict => (min, min != max),
     }
 }
 
@@ -1255,26 +1399,27 @@ pub fn iterator_zip(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<J
     if list.as_object().is_none() {
         return Err(ctx.type_error("TypeError: Iterator.zip argument is not an object"));
     }
-    let longest = zip_mode(ctx, args.get(1).copied().unwrap_or(JsValue::undefined()))?;
+    let options = args.get(1).copied().unwrap_or(JsValue::undefined());
+    let mode = zip_mode(ctx, options)?;
+    let padding = zip_padding(ctx, options);
     let entries = drain_one(ctx, "Iterator.zip", list)?;
     let mut columns: Vec<Vec<JsValue>> = Vec::with_capacity(entries.len());
     for entry in entries {
         columns.push(drain_one(ctx, "Iterator.zip", entry)?);
     }
-    let rows = if longest {
-        columns.iter().map(Vec::len).max().unwrap_or(0)
-    } else {
-        columns.iter().map(Vec::len).min().unwrap_or(0)
-    };
+    let (rows, fault) = zip_shape(
+        &columns.iter().map(Vec::len).collect::<Vec<_>>(),
+        mode,
+    );
     let mut out = Vec::with_capacity(rows);
     for i in 0..rows {
         let row: Vec<JsValue> = columns
             .iter()
-            .map(|c| c.get(i).copied().unwrap_or(JsValue::undefined()))
+            .map(|c| c.get(i).copied().unwrap_or(padding))
             .collect();
         out.push(JsValue::object(ctx.alloc_array(row)));
     }
-    Ok(zip_result_iterator(ctx, out))
+    Ok(zip_result(ctx, out, fault))
 }
 
 /// `Iterator.zipKeyed(iterables[, options])` (spec 27.1.3.3) — one
@@ -1290,7 +1435,9 @@ pub fn iterator_zip_keyed(
     _this: JsValue,
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let longest = zip_mode(ctx, args.get(1).copied().unwrap_or(JsValue::undefined()))?;
+    let options = args.get(1).copied().unwrap_or(JsValue::undefined());
+    let mode = zip_mode(ctx, options)?;
+    let padding = zip_padding(ctx, options);
     let input = args.first().copied().unwrap_or(JsValue::undefined());
     let Some(obj) = input.as_object() else {
         return Err(ctx.type_error("TypeError: Iterator.zipKeyed requires an object"));
@@ -1318,23 +1465,20 @@ pub fn iterator_zip_keyed(
         }
         columns.push((key, drain_one(ctx, "Iterator.zipKeyed", value)?));
     }
-    let rows = if longest {
-        columns.iter().map(|(_, c)| c.len()).max().unwrap_or(0)
-    } else {
-        columns.iter().map(|(_, c)| c.len()).min().unwrap_or(0)
-    };
+    let lens: Vec<usize> = columns.iter().map(|(_, c)| c.len()).collect();
+    let (rows, fault) = zip_shape(&lens, mode);
     let mut out = Vec::with_capacity(rows);
     for i in 0..rows {
         // `OrdinaryObjectCreate(null)`: the result has a *null* prototype, so
         // it is allocated with no `prototype` link and never inherits anything.
         let result = ctx.alloc_obj(JsObject::default());
         for (key, column) in &columns {
-            let value = column.get(i).copied().unwrap_or(JsValue::undefined());
+            let value = column.get(i).copied().unwrap_or(padding);
             define_keyed_prop(ctx, result, *key, value);
         }
         out.push(JsValue::object(result));
     }
-    Ok(zip_result_iterator(ctx, out))
+    Ok(zip_result(ctx, out, fault))
 }
 
 /// Shape-bound install of a data property under an arbitrary `PropKey`.
@@ -1370,5 +1514,5 @@ pub fn iterator_concat(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resul
             return Err(ctx.range_error("RangeError: Iterator.concat exceeds 1,000,000 values"));
         }
     }
-    Ok(zip_result_iterator(ctx, all))
+    Ok(zip_result(ctx, all, false))
 }
