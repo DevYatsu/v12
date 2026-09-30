@@ -4,6 +4,8 @@
 //! `v12-bytecode` test binaries. Depends on the real compiler so callers
 //! get `eval_src`-style source-in, value-out helpers.
 
+#![forbid(unsafe_code)]
+
 pub mod interp_util;
 pub mod mini;
 pub use interp_util::*;

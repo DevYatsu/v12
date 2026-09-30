@@ -9,19 +9,21 @@ rust-version = "1.90"
 license = "MIT OR Apache-2.0"
 repository = ""
 
-# Design-boundary guardrails. Engine-core crates opt into these via
-# `[lints] workspace = true`; control-path crates may stay outside.
-# `unsafe_code` is deny (not forbid) so the audited site can keep its scoped
+# Design-boundary guardrails. Every workspace member opts into the
+# unwrap/expect/panic lints — `[lints] workspace = true` for the crates, and
+# conformance/harness spells the same three out under `[lints.clippy]` because
+# it keeps a stricter `unsafe_code = "forbid"` override there. `unsafe_code` is
+# deny (not forbid) elsewhere so the audited site can keep its scoped
 # `#[allow(unsafe_code)]`: the `HostClosure` raw-pointer handle
 # (v12-heap/src/function.rs).
 #
-# The unwrap/expect/panic lints are warn-level here, and are NOT yet a gate:
+# The unwrap/expect/panic lints are warn-level here, and are not yet a gate:
 # scripts/check-architecture.sh runs clippy report-only, because
-# `cargo clippy --workspace --all-features` emits 275 warnings on 92e10484 and
-# `-D warnings` already fails. Promoting them to errors requires BOTH a
-# zero-warning count AND the audited-site allowlist
-# (scripts/unwrap-allowlist.txt, task W0.3) — otherwise `-D warnings` turns
-# all 114 existing sites red simultaneously.
+# `cargo clippy --workspace --all-features` emits 301 warnings (293 lints + 8
+# per-crate summary lines) and `-D warnings` already fails. Promoting them to
+# errors requires BOTH a zero-warning count AND the audited-site allowlist
+# (scripts/unwrap-allowlist.txt, enforced by scripts/unwrap-lint.sh, task
+# W0.3) — otherwise `-D warnings` turns all 566 existing sites red at once.
 # See docs/architecture-maintainability-plan.md §4.
 [workspace.lints.rust]
 unsafe_code = "deny"

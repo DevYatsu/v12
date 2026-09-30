@@ -20,3 +20,6 @@ v12-bccompiler.workspace = true
 v12-bytecode.workspace = true
 lasso.workspace = true
 rustyline = "14"
+
+[lints]
+workspace = true

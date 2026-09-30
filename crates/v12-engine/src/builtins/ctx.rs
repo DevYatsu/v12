@@ -817,17 +817,26 @@ impl<'a> Ctx<'a> {
             .lookup_property(bound, key)
             .copied()
             .expect("freshly installed symbol key must resolve");
-        match desc {
-            v12_heap::Descriptor::Accessor {
-                getter: g,
-                setter: s,
-                ..
-            } => {
-                debug_assert_eq!(g, Some(getter));
-                debug_assert_eq!(s, None, "species accessor has no set accessor");
-            }
-            other => panic!("species slot must be an accessor, found {other:?}"),
-        }
+        // Non-accessor is unreachable by construction: `desc` is read back out
+        // of the very shape `define_accessor` + `bind_shape` wrote five lines
+        // above, in the same call, with no intervening mutation. It used to
+        // `panic!`, which made this a LIVE release-build panic (W0.3): a
+        // non-accessor here means the heap is corrupt, and there is no
+        // spec-visible error an engine could throw in its place — this runs
+        // during builtin installation, with no JS frame or specifier to blame.
+        // So the check stays a debug assertion and the release build proceeds.
+        debug_assert!(
+            matches!(
+                desc,
+                v12_heap::Descriptor::Accessor {
+                    getter: Some(g),
+                    setter: None,
+                    ..
+                } if g == getter
+            ),
+            "species slot must be an accessor whose only getter is the one \
+             installed here, found {desc:?}"
+        );
         debug_assert_eq!(
             desc.attrs(),
             v12_heap::Attrs::new(false, false, true),
@@ -840,6 +849,15 @@ impl<'a> Ctx<'a> {
     /// `name` whose stored value is `expected`. Fresh builtin function objects
     /// are storage-lockstep (one push per descriptor), so the descriptor slot
     /// indexes `properties` directly.
+    ///
+    /// The whole check is a `debug_assert_eq!`, including the "is it a data
+    /// descriptor at all?" probe. The probe used to `panic!` outside any
+    /// `debug_assert`, so it was a live release-build panic (W0.3). It is
+    /// unreachable by construction: every caller installs `name` as an own data
+    /// property via `define_data_prop_with_attrs` on the preceding line, so the
+    /// shape lookup cannot miss and cannot return an accessor. With nothing to
+    /// throw (builtin installation, no JS frame), the honest form is a debug
+    /// assertion that reports both failure modes in one message.
     fn assert_own_data_value(&mut self, obj: Handle<JsObject>, name: &str, expected: JsValue) {
         use v12_heap::{PropKey, V12Str};
         let probe = if name.is_ascii() {
@@ -850,17 +868,21 @@ impl<'a> Ctx<'a> {
                 .intern_string(V12Str::utf16(name.encode_utf16().collect()))
         };
         let shape = self.heap.shape_of(obj);
-        let slot = match self
+        let found = match self
             .heap
             .lookup_property(shape, PropKey::from_string(probe))
+            .copied()
         {
-            Some(v12_heap::Descriptor::Data { slot, .. }) => *slot as usize,
-            other => panic!("expected own data prop `{name}`, found {other:?}"),
+            Some(v12_heap::Descriptor::Data { slot, .. }) => {
+                self.heap.get(obj).properties.get(slot as usize).copied()
+            }
+            // Missing or accessor — unreachable, see the doc comment above.
+            _ => None,
         };
         debug_assert_eq!(
-            self.heap.get(obj).properties.get(slot),
-            Some(&expected),
-            "installed `{name}` value must match declaration"
+            found,
+            Some(expected),
+            "installed `{name}` must be an own data property with the declared value"
         );
     }
 

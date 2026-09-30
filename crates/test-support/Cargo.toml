@@ -10,3 +10,6 @@ v12-bytecode = { workspace = true }
 v12-bccompiler = { workspace = true }
 v12-heap = { workspace = true }
 v12-interp = { workspace = true }
+
+[lints]
+workspace = true

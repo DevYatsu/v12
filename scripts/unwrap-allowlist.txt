@@ -1,0 +1,607 @@
+# scripts/unwrap-allowlist.txt — audited unwrap/expect/panic inventory.
+# Enforced by scripts/unwrap-lint.sh (W0.3); see that script's header for the
+# policy, the path-based test exclusion, and why :line is documentary while
+# per-(file, KIND) counts are not.
+#
+# POLICY
+#   This file is the AUDITED SET. It exists so that the warn-level
+#   unwrap_used/expect_used/panic lints in [workspace.lints.clippy] can
+#   eventually become errors: every entry below is debt that was looked at and
+#   accepted, and the guard fails if a site appears that is not here. New sites
+#   must NOT be added to this file to make a gate green — replace the unwrap.
+#
+# FORMAT
+#   "<path>:<line>  <KIND>  <note>"
+#     KIND is one of: unwrap | expect | panic | unreachable
+#     note is the trimmed source line, truncated; `cfg-test` marks an inline
+#     #[cfg(test)] mod tests block (in scope by the path rule, see the script).
+#
+# RATCHET POLICY
+#   Counts only ever go DOWN. scripts/unwrap-lint.sh fails on surplus entries,
+#   so removing a site forces its line to be deleted here in the same commit.
+#
+# TOTALS: 566 sites
+#   conformance/harness      34
+#   test-support             17
+#   v12-api                  16
+#   v12-bccompiler           33
+#   v12-bytecode             15
+#   v12-cli                  27
+#   v12-engine               111
+#   v12-heap                 53
+#   v12-interp               132
+#   v12-intl                 52
+#   v12-jit-baseline         38
+#   v12-jit-opt              38
+#   expect                   291
+#   panic                    32
+#   unreachable              25
+#   unwrap                   218
+#
+# --- entries ---
+conformance/harness/src/frontmatter.rs:407  expect  [cfg-test] let neg = fm.negative.expect("should have negative");
+conformance/harness/src/frontmatter.rs:422  unwrap  [cfg-test] let neg = fm.negative.unwrap();
+conformance/harness/src/frontmatter.rs:455  unwrap  [cfg-test] let d = fm.description.unwrap();
+conformance/harness/src/frontmatter.rs:472  unwrap  [cfg-test] assert_eq!(fm.negative.as_ref().unwrap().phase, "resolution");
+conformance/harness/src/harness.rs:183  unwrap  [cfg-test] fs::write(tmp.join("a.js"), "var A = 1;").unwrap();
+conformance/harness/src/harness.rs:184  unwrap  [cfg-test] fs::write(tmp.join("b.js"), "var B = 2;").unwrap();
+conformance/harness/src/harness.rs:190  unwrap  [cfg-test] assert!(src.find("var A").unwrap() < src.find("var B").unwrap());
+conformance/harness/src/harness.rs:190  unwrap  [cfg-test] assert!(src.find("var A").unwrap() < src.find("var B").unwrap());
+conformance/harness/src/main.rs:51  expect  .expect("PROGRESS_TEMPLATE is a valid indicatif template")
+conformance/harness/src/main.rs:163  expect  let exec_path = cli.internal_exec.clone().expect("checked above");
+conformance/harness/src/main.rs:185  expect  .expect("spawn sweep thread");
+conformance/harness/src/report.rs:287  unwrap  let rate = ss.pass_rate().unwrap();
+conformance/harness/src/report.rs:311  unwrap  let s = String::from_utf8(buf).unwrap();
+conformance/harness/src/report.rs:324  unwrap  let s = String::from_utf8(buf).unwrap();
+conformance/harness/src/report.rs:325  unwrap  let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+conformance/harness/src/report.rs:341  unwrap  let v: serde_json::Value = serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap
+conformance/harness/src/report.rs:341  unwrap  let v: serde_json::Value = serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap
+conformance/harness/src/runner.rs:774  expect  let status = exit_status.expect("exit_status is Some when not timed out");
+conformance/harness/src/runner.rs:1386  expect  [cfg-test] .expect("pinned test262 checkout must be present");
+conformance/harness/src/runner.rs:1503  expect  [cfg-test] .expect("pinned test262 checkout must be present")
+conformance/harness/src/runner.rs:1645  expect  [cfg-test] engine.eval(src).expect("eval");
+conformance/harness/src/runner.rs:1272  unwrap  [cfg-test] .unwrap()
+conformance/harness/src/runner.rs:1529  unwrap  [cfg-test] fs::write(&path, "var x = 1;").unwrap();
+conformance/harness/src/runner.rs:1541  unwrap  [cfg-test] fs::write(&path, "throw 'oops';").unwrap();
+conformance/harness/src/runner.rs:1547  unwrap  [cfg-test] .unwrap();
+conformance/harness/src/runner.rs:1550  unwrap  [cfg-test] fs::write(&path2, "/*---\nincludes: [sta.js]\n---*/\nthrow 'oops';").unwrap();
+conformance/harness/src/runner.rs:1565  unwrap  [cfg-test] .unwrap();
+conformance/harness/src/runner.rs:1581  unwrap  [cfg-test] .unwrap();
+conformance/harness/src/runner.rs:1592  unwrap  [cfg-test] fs::write(tmp.join("test").join("language").join("a.js"), "").unwrap();
+conformance/harness/src/runner.rs:1600  unwrap  [cfg-test] .unwrap();
+conformance/harness/src/runner.rs:1608  unwrap  [cfg-test] .unwrap();
+conformance/harness/src/runner.rs:1618  unwrap  [cfg-test] fs::write(tmp.join("test").join("language").join("x.js"), "").unwrap();
+conformance/harness/src/runner.rs:1661  unwrap  [cfg-test] fs::write(harness_dir.join("assert.js"), "var ASSERT_LOADED = true;").unwrap();
+conformance/harness/src/runner.rs:1669  unwrap  [cfg-test] .unwrap();
+crates/test-support/src/interp_util.rs:17  expect  let mut interp = Interp::from_source(&mut heap, src).expect("compile");
+crates/test-support/src/interp_util.rs:10  panic  Ok(()) => panic!("expected an uncaught exception"),
+crates/test-support/src/mini.rs:87  expect  let f = self.prog.functions.get(idx).expect("function index");
+crates/test-support/src/mini.rs:136  expect  let (wide, width) = WideOp::try_decode(&f.instrs[pc..]).expect("wide decode");
+crates/test-support/src/mini.rs:497  expect  cur = cur.parent.clone().expect("env depth out of range");
+crates/test-support/src/mini.rs:682  expect  let (prog, strings) = v12_bccompiler::compile_source_with_strings(&wrapped).expect("comp
+crates/test-support/src/mini.rs:688  expect  .expect_err("completion value thrown")
+crates/test-support/src/mini.rs:100  panic  panic!("mini-interp budget exhausted (infinite loop?)");
+crates/test-support/src/mini.rs:106  panic  panic!("bad opcode at {pc}")
+crates/test-support/src/mini.rs:171  panic  panic!("wide op not expected in mini-interp snippets")
+crates/test-support/src/mini.rs:429  panic  panic!(
+crates/test-support/src/mini.rs:478  panic  Some(other) => panic!("unexpected const {other:?}"),
+crates/test-support/src/mini.rs:479  panic  None => panic!("constant id {id} out of range"),
+crates/test-support/src/mini.rs:699  panic  other => panic!("{src}: expected number, got {other:?}"),
+crates/test-support/src/mini.rs:706  panic  other => panic!("{src}: expected bool, got {other:?}"),
+crates/test-support/src/mini.rs:713  panic  other => panic!("{src}: expected string, got {other:?}"),
+crates/test-support/src/mini.rs:602  unreachable  _ => unreachable!("not a comparison"),
+crates/v12-api/src/context.rs:169  unwrap  .unwrap();
+crates/v12-api/src/context.rs:178  unwrap  .unwrap();
+crates/v12-api/src/context.rs:190  unwrap  .unwrap();
+crates/v12-api/src/context.rs:191  unwrap  ctx.eval::<()>("bump(); bump(); bump();").unwrap();
+crates/v12-api/src/context.rs:202  unwrap  .unwrap();
+crates/v12-api/src/context.rs:211  unwrap  .unwrap();
+crates/v12-api/src/context.rs:212  unwrap  let s: String = ctx.call("greet", &["bob".to_string()]).unwrap();
+crates/v12-api/src/context.rs:220  unwrap  .unwrap();
+crates/v12-api/src/context.rs:221  unwrap  let n: f64 = ctx.call("sum", &[2.0, 3.0]).unwrap();
+crates/v12-api/src/context.rs:228  unwrap  ctx.eval::<()>("function ok() {}").unwrap();
+crates/v12-api/src/context.rs:239  unwrap  .unwrap();
+crates/v12-api/src/lib.rs:53  expect  [cfg-test] let _: () = ctx.eval("var x = 3;").expect("ok");
+crates/v12-api/src/lib.rs:61  expect  [cfg-test] let _: () = ctx.eval("var s = 'hello';").expect("ok");
+crates/v12-api/src/lib.rs:69  expect  [cfg-test] let _: () = ctx.eval("var t = true;").expect("ok");
+crates/v12-api/src/lib.rs:78  panic  [cfg-test] other => panic!("expected Thrown, got {other:?}"),
+crates/v12-api/src/lib.rs:12  unwrap  //! let n: f64 = ctx.eval("1 + 2").unwrap();
+crates/v12-bccompiler/src/collect.rs:386  expect  *self.unit_stack.last().expect("unit stack underflow")
+crates/v12-bccompiler/src/collect.rs:500  expect  .expect("arrow below main unit");
+crates/v12-bccompiler/src/collect.rs:1641  expect  .expect("arrow below main unit");
+crates/v12-bccompiler/src/collect.rs:1660  expect  .expect("arrow below main unit");
+crates/v12-bccompiler/src/collect.rs:2081  expect  owner_index = plans.units[owner_index].parent.expect("arrow has owner");
+crates/v12-bccompiler/src/collect.rs:2372  expect  plan.env_slot = u16::try_from(slot).expect("module binding slots fit u16");
+crates/v12-bccompiler/src/collect.rs:2048  unreachable  _ => unreachable!("collect update target on non-update expression"),
+crates/v12-bccompiler/src/expr.rs:1751  expect  member: cur.as_member_expression().expect("static member"),
+crates/v12-bccompiler/src/expr.rs:1759  expect  member: cur.as_member_expression().expect("computed member"),
+crates/v12-bccompiler/src/expr.rs:1775  expect  member: cur.as_member_expression().expect("private field"),
+crates/v12-bccompiler/src/expr.rs:1793  expect  member: cx.expression.member_expression().expect("static member"),
+crates/v12-bccompiler/src/expr.rs:1801  expect  member: cx.expression.member_expression().expect("computed member"),
+crates/v12-bccompiler/src/expr.rs:1817  expect  member: cx.expression.member_expression().expect("private field"),
+crates/v12-bccompiler/src/expr.rs:1888  expect  let x = arg.as_expression().expect("non-spread argument");
+crates/v12-bccompiler/src/expr.rs:2089  expect  let x = arg.as_expression().expect("non-spread argument");
+crates/v12-bccompiler/src/expr.rs:2113  expect  .expect("non-spread argument is an expression");
+crates/v12-bccompiler/src/expr.rs:637  unreachable  ArrayExpressionElement::SpreadElement(_) => unreachable!(),
+crates/v12-bccompiler/src/expr.rs:769  unreachable  (None, None) => unreachable!("accessor with neither half"),
+crates/v12-bccompiler/src/expr.rs:1250  unreachable  unreachable!("destructuring handled above");
+crates/v12-bccompiler/src/expr.rs:2004  unreachable  _ => unreachable!("only logical ops routed here"),
+crates/v12-bccompiler/src/expr.rs:2051  unreachable  _ => unreachable!("only logical ops routed here"),
+crates/v12-bccompiler/src/expr.rs:252  unwrap  let iterable = self.expr(y.argument.as_ref().unwrap())?;
+crates/v12-bccompiler/src/model.rs:113  expect  u32::try_from(key.into_usize()).expect("a Spur always names a 32-bit table index")
+crates/v12-bccompiler/src/model.rs:500  expect  cur = self.units[cur].parent.expect("arrow below main unit");
+crates/v12-bccompiler/src/model.rs:883  expect  sym: sym.expect("global block-function location has a symbol"),
+crates/v12-bccompiler/src/model.rs:1514  expect  let k = u16::try_from(name_id).expect("global name id fits u16");
+crates/v12-bccompiler/src/model.rs:1521  expect  let k = u16::try_from(name_id).expect("global name id fits u16");
+crates/v12-bccompiler/src/model.rs:1619  expect  let k = u16::try_from(name_id).expect("global name id fits u16");
+crates/v12-bccompiler/src/peephole.rs:90  unreachable  _ => unreachable!("filtered above"),
+crates/v12-bccompiler/src/stmt.rs:305  expect  .expect("default export binding plan")
+crates/v12-bccompiler/src/stmt.rs:1667  expect  let ctx = self.finallies.pop().expect("finally stack underflow");
+crates/v12-bccompiler/src/stmt.rs:268  unreachable  unreachable!("only module-declaration statement variants route here")
+crates/v12-bccompiler/src/stmt.rs:1736  unreachable  (None, None) => unreachable!("checked above"),
+crates/v12-bytecode/src/builder.rs:287  unwrap  [cfg-test] let k1 = b.add_const(Const::BigU64(7)).unwrap();
+crates/v12-bytecode/src/builder.rs:288  unwrap  [cfg-test] let k2 = b.add_const(Const::BigU64(7)).unwrap();
+crates/v12-bytecode/src/builder.rs:289  unwrap  [cfg-test] let k3 = b.add_const(Const::Str32(1)).unwrap();
+crates/v12-bytecode/src/lib.rs:697  unwrap  let first = pool.insert(Const::F64(1.5)).unwrap();
+crates/v12-bytecode/src/lib.rs:698  unwrap  let second = pool.insert(Const::F64(1.5)).unwrap();
+crates/v12-bytecode/src/lib.rs:702  unwrap  let s1 = pool.insert(Const::Str32(42)).unwrap();
+crates/v12-bytecode/src/lib.rs:703  unwrap  let s2 = pool.insert(Const::Str32(42)).unwrap();
+crates/v12-bytecode/src/lib.rs:712  unwrap  let pos_zero = pool.insert(Const::F64(0.0)).unwrap();
+crates/v12-bytecode/src/lib.rs:713  unwrap  let neg_zero = pool.insert(Const::F64(-0.0)).unwrap();
+crates/v12-bytecode/src/lib.rs:716  unwrap  let nan1 = pool.insert(Const::F64(f64::NAN)).unwrap();
+crates/v12-bytecode/src/lib.rs:717  unwrap  let nan2 = pool.insert(Const::F64(f64::NAN)).unwrap();
+crates/v12-bytecode/src/lib.rs:726  unwrap  pool.insert(Const::Str32(i as u32)).unwrap();
+crates/v12-bytecode/src/lib.rs:731  unwrap  assert_eq!(pool.insert(Const::Str32(0)).unwrap(), 0);
+crates/v12-bytecode/src/lib.rs:844  unwrap  let k = pool.insert(Const::F64(1.5)).unwrap();
+crates/v12-bytecode/src/wide.rs:740  unwrap  let (back, width) = WideOp::try_decode(&words).unwrap();
+crates/v12-cli/src/bin/check.rs:71  panic  _ => panic!("not str"),
+crates/v12-cli/src/bin/check.rs:7  unwrap  let prog = compile_source_with_interner(src, &mut interner).unwrap();
+crates/v12-cli/src/bin/check.rs:62  unwrap  .unwrap();
+crates/v12-cli/src/bin/check.rs:68  unwrap  .unwrap();
+crates/v12-cli/src/bin/check.rs:69  unwrap  let load_const_str_id = match arrow.consts.get(load_const_pool_idx).unwrap() {
+crates/v12-cli/src/main.rs:409  expect  [cfg-test] let parsed = parse_args(&args).expect("should parse");
+crates/v12-cli/src/main.rs:423  expect  [cfg-test] let parsed = parse_args(&args).expect("should parse");
+crates/v12-cli/src/main.rs:437  expect  [cfg-test] let parsed = parse_args(&args).expect("should parse");
+crates/v12-cli/src/main.rs:451  expect  [cfg-test] let parsed = parse_args(&args).expect("should parse");
+crates/v12-cli/src/main.rs:539  expect  [cfg-test] fs::write(&path, "throw 42;").expect("write temp file");
+crates/v12-cli/src/main.rs:541  expect  [cfg-test] .arg(path.to_str().expect("utf8 path"))
+crates/v12-cli/src/main.rs:543  expect  [cfg-test] .expect("cargo run failed");
+crates/v12-cli/src/main.rs:560  expect  [cfg-test] fs::write(&path, "let x = 1 + 2;").expect("write temp file");
+crates/v12-cli/src/main.rs:562  expect  [cfg-test] .arg(path.to_str().expect("utf8 path"))
+crates/v12-cli/src/main.rs:564  expect  [cfg-test] .expect("cargo run failed");
+crates/v12-cli/src/main.rs:579  expect  [cfg-test] .arg(missing.to_str().expect("utf8 path"))
+crates/v12-cli/src/main.rs:581  expect  [cfg-test] .expect("cargo run failed");
+crates/v12-cli/src/main.rs:594  expect  [cfg-test] fs::write(&path, "let x = 1;").expect("write temp file");
+crates/v12-cli/src/main.rs:597  expect  [cfg-test] .arg(path.to_str().expect("utf8 path"))
+crates/v12-cli/src/main.rs:599  expect  [cfg-test] .expect("cargo run failed");
+crates/v12-cli/src/main.rs:617  expect  [cfg-test] fs::write(&path, "let x = ;").expect("write temp file");
+crates/v12-cli/src/main.rs:620  expect  [cfg-test] .arg(path.to_str().expect("utf8 path"))
+crates/v12-cli/src/main.rs:622  expect  [cfg-test] .expect("cargo run failed");
+crates/v12-cli/src/main.rs:635  expect  [cfg-test] fs::write(&path, "throw 7;").expect("write temp file");
+crates/v12-cli/src/main.rs:638  expect  [cfg-test] .arg(path.to_str().expect("utf8 path"))
+crates/v12-cli/src/main.rs:640  expect  [cfg-test] .expect("cargo run failed");
+crates/v12-cli/src/main.rs:586  unwrap  [cfg-test] stderr.contains(missing.to_str().unwrap()) || stderr.contains("No such file"),
+crates/v12-engine/src/builtins/array.rs:576  expect  let h = item.as_object().expect("checked spread");
+crates/v12-engine/src/builtins/ctx.rs:521  expect  .expect("freshly installed key must resolve");
+crates/v12-engine/src/builtins/ctx.rs:567  expect  let len_v = JsValue::from_i32_smi(len as i32).expect("arity fits Smi");
+crates/v12-engine/src/builtins/ctx.rs:640  expect  JsValue::from_i32_smi(length as i32).expect("getter arity fits Smi"),
+crates/v12-engine/src/builtins/ctx.rs:709  expect  .expect("freshly installed accessor key must resolve");
+crates/v12-engine/src/builtins/ctx.rs:731  expect  let len = super::builtin_length(id).expect("accessor arity declared");
+crates/v12-engine/src/builtins/ctx.rs:732  expect  let len_v = JsValue::from_i32_smi(len as i32).expect("accessor arity fits Smi");
+crates/v12-engine/src/builtins/ctx.rs:776  expect  JsValue::from_i32_smi(length as i32).expect("getter arity fits Smi"),
+crates/v12-engine/src/builtins/ctx.rs:787  expect  JsValue::from_i32_smi(length as i32).expect("getter arity fits Smi"),
+crates/v12-engine/src/builtins/ctx.rs:819  expect  .expect("freshly installed symbol key must resolve");
+crates/v12-engine/src/builtins/ctx.rs:934  expect  .expect("ctor must carry an own `prototype` prop");
+crates/v12-engine/src/builtins/ctx.rs:949  expect  .expect("prototype must carry an own `constructor` back-link");
+crates/v12-engine/src/builtins/date.rs:286  expect  .expect("Date object always carries its [[DateValue]] slot");
+crates/v12-engine/src/builtins/error.rs:110  expect  let ctor_obj = ctor.as_object().expect("checked above");
+crates/v12-engine/src/builtins/error.rs:193  expect  let obj = value.as_object().expect("error_object returns an object");
+crates/v12-engine/src/builtins/json.rs:89  expect  self.expect(b'{')?;
+crates/v12-engine/src/builtins/json.rs:101  expect  self.expect(b':')?;
+crates/v12-engine/src/builtins/json.rs:117  expect  self.expect(b'[')?;
+crates/v12-engine/src/builtins/json.rs:143  expect  self.expect(b'"')?;
+crates/v12-engine/src/builtins/json.rs:798  expect  entries.push((key.string().expect("string key"), v));
+crates/v12-engine/src/builtins/json.rs:210  unwrap  let c = s.chars().next().unwrap();
+crates/v12-engine/src/builtins/map.rs:58  unreachable  _ => unreachable!("collection construction accepts Map and Set only"),
+crates/v12-engine/src/builtins/mod.rs:622  expect  JsValue::from_i32_smi(2).expect("RegExp arity fits Smi"),
+crates/v12-engine/src/builtins/mod.rs:729  expect  let len_v = JsValue::from_i32_smi(len as i32).expect("protocol arity fits Smi");
+crates/v12-engine/src/builtins/mod.rs:682  unreachable  unreachable!("RegExp protocol name {name} is not a well-known symbol")
+crates/v12-engine/src/builtins/number.rs:209  expect  let (mantissa, exp) = sci.split_once('e').expect("LowerExp always emits 'e'");
+crates/v12-engine/src/builtins/number.rs:210  expect  let exp: i32 = exp.parse().expect("LowerExp exponent is an integer");
+crates/v12-engine/src/builtins/number.rs:398  expect  let (mantissa, exp) = sci.split_once('e').expect("LowerExp always emits 'e'");
+crates/v12-engine/src/builtins/number.rs:399  expect  let exp: i32 = exp.parse().expect("LowerExp exponent is an integer");
+crates/v12-engine/src/builtins/number.rs:453  expect  let (mantissa, exp) = sci.split_once('e').expect("LowerExp always emits 'e'");
+crates/v12-engine/src/builtins/number.rs:454  expect  let exp: i32 = exp.parse().expect("LowerExp exponent is an integer");
+crates/v12-engine/src/builtins/object.rs:1507  expect  let obj = arg.as_object().expect("object arm");
+crates/v12-engine/src/builtins/object.rs:124  unreachable  _ => unreachable!(),
+crates/v12-engine/src/builtins/object.rs:1265  unwrap  let obj = arg.as_object().unwrap();
+crates/v12-engine/src/builtins/promise.rs:95  expect  JsValue::from_i32_smi(v).expect("state fits Smi")
+crates/v12-engine/src/builtins/promise.rs:330  expect  let promise = this.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:383  expect  let promise = this.as_object().expect("checked by the caller");
+crates/v12-engine/src/builtins/promise.rs:387  expect  .expect("the derived promise is an object");
+crates/v12-engine/src/builtins/promise.rs:407  expect  .expect("promise carries a reactions array");
+crates/v12-engine/src/builtins/promise.rs:487  expect  let promise_h = promise.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:567  expect  let cb_obj = cb.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:609  expect  let h = handler.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:692  expect  heap.add_pinned_root(err.as_object().expect("error_object makes an object"));
+crates/v12-engine/src/builtins/promise.rs:858  expect  let value_obj = value.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:1128  expect  let then = then_v.as_object().expect("callability checked above");
+crates/v12-engine/src/builtins/promise.rs:1261  expect  let func = executor.as_object().expect("alloc_host returns an object");
+crates/v12-engine/src/builtins/promise.rs:1394  expect  JsValue::from_i32_smi(arity).expect("builtin arity fits Smi"),
+crates/v12-engine/src/builtins/promise.rs:1465  expect  let obj = v.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:2012  expect  *length = JsValue::from_i32_smi(after as i32).expect("array length fits Smi");
+crates/v12-engine/src/builtins/promise.rs:2472  expect  let promise = this.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:2484  expect  let derived_h = derived.as_object().expect("just allocated");
+crates/v12-engine/src/builtins/promise.rs:2511  expect  let handler = on_finally.as_object().expect("checked above");
+crates/v12-engine/src/builtins/promise.rs:1074  unreachable  unreachable!("an abrupt read carries a value, not a getter")
+crates/v12-engine/src/builtins/reflect.rs:145  expect  let (get, set, e, c) = accessor.expect("descriptor half resolved");
+crates/v12-engine/src/builtins/reflect.rs:434  expect  None => JsValue::string(k.string().expect("non-symbol key is a string")),
+crates/v12-engine/src/builtins/reflect.rs:308  unreachable  _ => unreachable!(),
+crates/v12-engine/src/builtins/regexp.rs:116  expect  source.as_string().expect("source is a string"),
+crates/v12-engine/src/builtins/regexp.rs:117  expect  flags.as_string().expect("flags is a string"),
+crates/v12-engine/src/builtins/regexp.rs:124  expect  JsValue::from_i32_smi(0).expect("0 fits Smi"),
+crates/v12-engine/src/builtins/regexp.rs:577  expect  let obj = m.as_object().expect("non-null exec result is an object");
+crates/v12-engine/src/builtins/regexp.rs:606  expect  let obj = m.as_object().expect("non-null exec result is an object");
+crates/v12-engine/src/builtins/regexp.rs:721  expect  let obj = m.as_object().expect("non-null exec result is an object");
+crates/v12-engine/src/builtins/regexp.rs:1058  expect  .expect("RegExp source is a string");
+crates/v12-engine/src/builtins/regexp.rs:1061  expect  .expect("RegExp flags is a string");
+crates/v12-engine/src/builtins/regexp.rs:1202  expect  .expect("registry feeds the regex cache at dispatch");
+crates/v12-engine/src/builtins/registry.rs:685  unwrap  let ctor_obj = ctor.as_object().unwrap();
+crates/v12-engine/src/builtins/string.rs:289  unwrap  let idx = d.to_digit(10).unwrap() as usize;
+crates/v12-engine/src/builtins/string.rs:510  unwrap  let idx = d.to_digit(10).unwrap() as usize;
+crates/v12-engine/src/engine.rs:327  expect  let result = engine.eval("let x = 1;").expect("should run");
+crates/v12-engine/src/engine.rs:340  expect  let v = engine.eval_with_completion("let x = 1;").expect("ok");
+crates/v12-engine/src/engine.rs:469  expect  engine.eval_direct("var keep = 1;").expect("setup");
+crates/v12-engine/src/engine.rs:499  expect  let result = engine.eval_direct("var x = 1;").expect("still works");
+crates/v12-engine/src/engine.rs:507  expect  let func = engine.create_function("a", "return a+1;").expect("create");
+crates/v12-engine/src/engine.rs:560  expect  let desc = heap.lookup_property(shape, key).expect("accessor desc");
+crates/v12-engine/src/engine.rs:629  expect  std::fs::create_dir_all(&dir).expect("create temp module dir");
+crates/v12-engine/src/engine.rs:631  expect  std::fs::write(&dep, "export const x = 42; export default 7;").expect("write dep");
+crates/v12-engine/src/engine.rs:637  expect  .expect("write main");
+crates/v12-engine/src/engine.rs:696  expect  .expect("Object intrinsic must exist");
+crates/v12-engine/src/engine.rs:718  expect  .expect("getPrototypeOf should succeed");
+crates/v12-engine/src/engine.rs:354  panic  other => panic!("expected Thrown, got {other:?}"),
+crates/v12-engine/src/engine.rs:364  panic  other => panic!("expected Compile, got {other:?}"),
+crates/v12-engine/src/engine.rs:509  unwrap  let handle = func.as_object().unwrap();
+crates/v12-engine/src/engine.rs:571  unwrap  let data_desc = heap.lookup_property(data_shape, other_key).unwrap();
+crates/v12-engine/src/engine.rs:698  unwrap  let h = object_val.as_object().unwrap();
+crates/v12-engine/src/engine.rs:730  unwrap  .unwrap();
+crates/v12-engine/src/engine/host_fn.rs:89  expect  usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
+crates/v12-engine/src/jit_tier.rs:66  expect  .expect("baseline JIT construction cannot fail in the current build"),
+crates/v12-engine/src/jit_tier.rs:166  expect  [cfg-test] let v = engine.eval(HOT_SCRIPT).expect("run");
+crates/v12-engine/src/jit_tier.rs:173  expect  [cfg-test] v12_bccompiler::compile_source_with_strings(HOT_SCRIPT).expect("compile");
+crates/v12-engine/src/jit_tier.rs:185  expect  [cfg-test] interp.run().expect("run");
+crates/v12-engine/src/module_loader.rs:413  expect  .expect("deferred namespace"))
+crates/v12-engine/src/module_loader.rs:599  expect  .expect("linked module record")
+crates/v12-engine/src/module_loader.rs:655  expect  .expect("linked module record");
+crates/v12-engine/src/module_loader.rs:679  expect  .expect("linked module namespace object");
+crates/v12-engine/src/module_loader.rs:720  expect  .expect("linked module record");
+crates/v12-engine/src/module_loader.rs:739  expect  .expect("linked module namespace object");
+crates/v12-engine/src/module_loader.rs:771  expect  .expect("linked module record");
+crates/v12-engine/src/module_loader.rs:797  expect  .expect("linked module namespace object");
+crates/v12-engine/src/module_loader.rs:806  expect  .expect("linked module namespace"),
+crates/v12-engine/src/realm.rs:91  expect  .expect("intrinsic must have been inserted");
+crates/v12-engine/src/realm.rs:212  expect  JsValue::from_i32_smi(2).expect("2 fits Smi"),
+crates/v12-engine/src/realm.rs:266  expect  JsValue::from_i32_smi(2).expect("2 fits Smi"),
+crates/v12-engine/src/realm.rs:284  expect  .expect("eval intrinsic present");
+crates/v12-engine/src/realm.rs:373  expect  ("length", JsValue::from_i32_smi(0).expect("0 fits Smi")),
+crates/v12-engine/src/realm.rs:456  expect  ("length", JsValue::from_i32_smi(0).expect("0 fits Smi")),
+crates/v12-engine/src/realm.rs:492  expect  .expect("Symbol intrinsic");
+crates/v12-engine/src/realm.rs:529  expect  JsValue::from_i32_smi(1).expect("1 fits Smi"),
+crates/v12-engine/src/realm.rs:601  expect  .expect("collection iterator method installed");
+crates/v12-engine/src/realm.rs:637  expect  JsValue::from_i32_smi(7).expect("7 fits Smi"),
+crates/v12-engine/src/realm.rs:669  expect  .expect("toUTCString installed by the DateProto group");
+crates/v12-engine/src/realm.rs:706  expect  JsValue::from_i32_smi(1).expect("1 fits Smi"),
+crates/v12-heap/src/elements.rs:759  unwrap  arr.set(0, JsValue::from_i32_smi(5).unwrap());
+crates/v12-heap/src/elements.rs:760  unwrap  arr.set(1, JsValue::from_i32_smi(6).unwrap());
+crates/v12-heap/src/elements.rs:769  unwrap  arr.set(0, JsValue::from_i32_smi(5).unwrap());
+crates/v12-heap/src/elements.rs:770  unwrap  arr.set(1, JsValue::from_i32_smi(6).unwrap());
+crates/v12-heap/src/gc.rs:643  expect  Handle::new(u32::try_from(index).expect("slot count exceeds u32::MAX"))
+crates/v12-heap/src/gc.rs:988  expect  ValidityCellId(u32::try_from(id).expect("validity cell count exceeds u32::MAX"))
+crates/v12-heap/src/gc.rs:1271  expect  .expect("combined string exceeds u32 length");
+crates/v12-heap/src/gc.rs:2097  expect  let seen = heap.validity_serial(a).expect("real cell has a serial");
+crates/v12-heap/src/gc.rs:2140  expect  let before = heap.validity_serial(cell).expect("cell exists");
+crates/v12-heap/src/gc.rs:2142  expect  let after_seal = heap.validity_serial(cell).expect("cell exists");
+crates/v12-heap/src/gc.rs:2157  expect  let fresh = heap.validity_serial(cell).expect("cell exists");
+crates/v12-heap/src/gc.rs:2194  expect  .expect("present");
+crates/v12-heap/src/gc.rs:1756  unwrap  properties: smallvec::smallvec![JsValue::from_i32_smi(7).unwrap()],
+crates/v12-heap/src/gc.rs:1776  unwrap  .push(JsValue::from_i32_smi(42).unwrap());
+crates/v12-heap/src/gc.rs:1832  unwrap  smallvec::smallvec![JsValue::from_i32_smi(1).unwrap()],
+crates/v12-heap/src/gc.rs:1955  unwrap  properties: smallvec::smallvec![JsValue::from_i32_smi(1).unwrap()],
+crates/v12-heap/src/gc.rs:2018  unwrap  let head = prev.unwrap();
+crates/v12-heap/src/macros.rs:30  panic  panic!(
+crates/v12-heap/src/macros.rs:39  panic  panic!("engine invariant: {}", stringify!($cond));
+crates/v12-heap/src/object.rs:372  expect  crate::JsValue::from_i32_smi(len as i32).expect("array length fits Smi"),
+crates/v12-heap/src/object.rs:393  expect  crate::JsValue::from_i32_smi(len as i32).expect("len <= SMI_MAX fits Smi")
+crates/v12-heap/src/object.rs:586  expect  crate::JsValue::from_i32_smi(0).expect("0 fits"),
+crates/v12-heap/src/object.rs:602  expect  crate::JsValue::from_i32_smi(1).expect("1 fits"),
+crates/v12-heap/src/object.rs:618  expect  crate::JsValue::from_i32_smi(2).expect("2 fits"),
+crates/v12-heap/src/object.rs:775  expect  o.properties[0] = crate::JsValue::from_i32_smi(s).expect("fits");
+crates/v12-heap/src/object.rs:1044  unwrap  JsValue::from_i32_smi(10).unwrap(),
+crates/v12-heap/src/object.rs:1045  unwrap  JsValue::from_i32_smi(20).unwrap(),
+crates/v12-heap/src/object.rs:1046  unwrap  JsValue::from_i32_smi(30).unwrap(),
+crates/v12-heap/src/object.rs:1055  unwrap  let map = stored.arguments_mapped.as_ref().unwrap();
+crates/v12-heap/src/object.rs:1068  unwrap  elements: vec![JsValue::from_i32_smi(1).unwrap()],
+crates/v12-heap/src/shape.rs:754  expect  let d = heap.lookup_property(sxy, ky).expect("own key must resolve");
+crates/v12-heap/src/shape.rs:759  expect  .expect("inherited key must resolve");
+crates/v12-heap/src/shape.rs:925  expect  .expect("reconfigured key resolves");
+crates/v12-heap/src/shape.rs:941  expect  let d = heap.lookup_property(acc, fresh).expect("accessor resolves");
+crates/v12-heap/src/shape.rs:1026  expect  .expect("accessor must be found");
+crates/v12-heap/src/shape.rs:739  unwrap  assert!(!db.unwrap().attrs().writable());
+crates/v12-heap/src/shape.rs:1035  unwrap  let desc_data = heap.lookup_property(s_data, k2).unwrap();
+crates/v12-heap/src/shape.rs:1056  unwrap  let d = heap.lookup_property(s, k).unwrap();
+crates/v12-heap/src/shape.rs:1062  unwrap  assert_eq!(heap.lookup_property(s, k).unwrap().getter(), Some(getter));
+crates/v12-heap/src/shape.rs:1063  unwrap  assert_eq!(heap.lookup_property(s, k).unwrap().setter(), Some(setter));
+crates/v12-heap/src/string.rs:221  expect  u32::try_from(self.len()).expect("string exceeds u32::MAX code units")
+crates/v12-heap/src/string.rs:686  expect  let mid = heap.slice_string(rope, 65, 10).expect("in-bounds window");
+crates/v12-heap/src/string.rs:692  expect  let nested = heap.slice_string(mid, 3, 4).expect("in-bounds window");
+crates/v12-heap/src/string.rs:700  expect  .expect("in-bounds window");
+crates/v12-heap/src/string.rs:858  expect  let window = heap.slice_string(longer, 60, 40).expect("in-bounds");
+crates/v12-heap/src/string.rs:502  panic  panic!("canonical string instances are always flat")
+crates/v12-heap/src/string.rs:543  panic  other => panic!("expected flat Latin-1, got {other:?}"),
+crates/v12-heap/src/string.rs:551  panic  other => panic!("expected flat UTF-16, got {other:?}"),
+crates/v12-heap/src/value.rs:596  unwrap  assert_eq!(JsValue::from_i32_smi(0).unwrap().bits(), BOX_MASK);
+crates/v12-heap/src/value.rs:685  unwrap  let boxed = JsValue::from_i32_smi(v).unwrap();
+crates/v12-heap/src/value.rs:701  unwrap  JsValue::from_i32_smi(-1).unwrap().bits() & SMI_PAYLOAD_MASK,
+crates/v12-heap/src/value.rs:726  unwrap  assert_eq!(v.bits() & REF_PAYLOAD_MASK, v.as_slot().unwrap().1 as u64);
+crates/v12-heap/src/value.rs:791  unwrap  let smi = JsValue::from_i32_smi(42).unwrap();
+crates/v12-interp/src/call_setup.rs:153  expect  .expect("bound target is an object");
+crates/v12-interp/src/call_setup.rs:285  expect  .get(super::PROMISE_IDX.expect("intrinsic 'Promise' present"))
+crates/v12-interp/src/call_setup.rs:433  expect  .expect("bound target is an object"),
+crates/v12-interp/src/call_setup.rs:581  expect  .expect("bound target is an object"),
+crates/v12-interp/src/call_setup.rs:689  expect  let finished = self.frames.pop().expect("complete_frame requires a frame");
+crates/v12-interp/src/call_setup.rs:877  expect  usize::try_from(h.start).expect("handler pc fits usize") <= pc
+crates/v12-interp/src/call_setup.rs:878  expect  && pc < usize::try_from(h.end).expect("handler pc fits usize")
+crates/v12-interp/src/call_setup.rs:890  expect  let fr = self.frames.last_mut().expect("a frame was just inspected");
+crates/v12-interp/src/call_setup.rs:912  expect  let popped = self.frames.pop().expect("boundary frame exists");
+crates/v12-interp/src/call_setup.rs:1162  expect  .expect("bound target is an object"),
+crates/v12-interp/src/call_setup.rs:2471  expect  .expect("bound target is an object"),
+crates/v12-interp/src/call_setup.rs:2560  expect  u16::try_from(self.stack.len() - base).expect("arguments fit a frame window");
+crates/v12-interp/src/call_setup.rs:2561  expect  let argc = u16::try_from(args.len()).expect("argument count fits u16");
+crates/v12-interp/src/call_setup.rs:3942  expect  .get(state.as_object().expect("a state object"))
+crates/v12-interp/src/call_setup.rs:4415  expect  let idx = intrinsic_slot("Promise").expect("Promise intrinsic");
+crates/v12-interp/src/call_setup.rs:4571  expect  .expect("the fresh marker fits Smi");
+crates/v12-interp/src/call_setup.rs:4600  expect  let ctor_obj = ctor.as_object().expect("IsConstructor implies an object");
+crates/v12-interp/src/call_setup.rs:2522  unreachable  v12_heap::FunctionTarget::Bound(_) => unreachable!("handled above"),
+crates/v12-interp/src/call_setup.rs:2524  unreachable  unreachable!("handled above")
+crates/v12-interp/src/call_setup.rs:3223  unreachable  _ => unreachable!("only Map and Set constructors use this seam"),
+crates/v12-interp/src/call_setup.rs:4257  unreachable  unreachable!("callable_or_err rejects a non-object executor")
+crates/v12-interp/src/eval_context.rs:139  expect  env: owner_frame.env.expect("owner env binding has environment"),
+crates/v12-interp/src/eval_context.rs:178  expect  let mut binding_env = env.expect("eval-reachable env binding has environment");
+crates/v12-interp/src/eval_context.rs:190  expect  .expect("eval-reachable env binding has a parent environment");
+crates/v12-interp/src/eval_context.rs:277  expect  .expect("eval-local environment fits u16");
+crates/v12-interp/src/execute.rs:46  expect  let (wide, _) = WideOp::try_decode(&instrs[pc..]).expect("malformed wide opcode sequence
+crates/v12-interp/src/execute.rs:182  expect  let f = self.frames.last().expect("execute() requires a frame");
+crates/v12-interp/src/execute.rs:244  expect  WideOp::try_decode(words).expect("malformed wide opcode sequence");
+crates/v12-interp/src/execute.rs:291  expect  let env = self.frames.last().expect("frame").env;
+crates/v12-interp/src/execute.rs:292  expect  let owner_program = self.frames.last().expect("frame").program;
+crates/v12-interp/src/execute.rs:301  expect  let parent = self.frames.last().expect("frame").env;
+crates/v12-interp/src/execute.rs:319  expect  let frame = self.frames.last_mut().expect("frame");
+crates/v12-interp/src/execute.rs:662  expect  let new_target = self.frames.last().expect("frame").new_target;
+crates/v12-interp/src/execute.rs:769  expect  let env = self.frames.last().expect("frame").env;
+crates/v12-interp/src/execute.rs:770  expect  let owner_program = self.frames.last().expect("frame").program;
+crates/v12-interp/src/execute.rs:784  expect  let parent = self.frames.last().expect("frame").env;
+crates/v12-interp/src/execute.rs:797  expect  let frame = self.frames.last_mut().expect("frame");
+crates/v12-interp/src/execute.rs:827  expect  let frame = self.frames.last_mut().expect("frame");
+crates/v12-interp/src/execute.rs:887  expect  .expect("GenResumeMode requires a generator frame");
+crates/v12-interp/src/execute.rs:1178  expect  .expect("generator checked above");
+crates/v12-interp/src/execute.rs:1278  expect  .expect("dispatch requires a frame")
+crates/v12-interp/src/execute.rs:33  panic  panic!("corrupt bytecode: unassigned opcode byte at pc {pc}");
+crates/v12-interp/src/execute.rs:57  panic  panic!("corrupt bytecode: RegExt prefix at pc {pc} without its narrow instruction")
+crates/v12-interp/src/execute.rs:60  panic  panic!(
+crates/v12-interp/src/execute.rs:196  panic  panic!("corrupt bytecode: unassigned opcode byte at {fn_idx}:{pc}");
+crates/v12-interp/src/execute.rs:377  panic  panic!("corrupt bytecode: bare RegExt reached dispatch")
+crates/v12-interp/src/execute.rs:1300  panic  .unwrap_or_else(|| panic!("constant k{id} out of range in fn {fn_idx}"));
+crates/v12-interp/src/execute.rs:1315  panic  .unwrap_or_else(|| panic!("Str32({str_id}) missing from the string table"))
+crates/v12-interp/src/execute.rs:1413  panic  panic!("non-canonical value cannot be typed: {:#x}", v.bits())
+crates/v12-interp/src/execute.rs:54  unreachable  unreachable!("discriminant matched REG_EXT")
+crates/v12-interp/src/execute.rs:1337  unwrap  while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
+crates/v12-interp/src/execute.rs:1360  unwrap  while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
+crates/v12-interp/src/feedback.rs:617  expect  [cfg-test] Interp::from_source(&mut heap, "let x = 1; throw x + 1;").expect("compile");
+crates/v12-interp/src/feedback.rs:619  expect  [cfg-test] let fv = interp.feedback_vector(0).expect("feedback exists");
+crates/v12-interp/src/feedback.rs:441  unwrap  [cfg-test] Lattice::from_value(JsValue::from_i32_smi(42).unwrap(), None),
+crates/v12-interp/src/feedback.rs:539  unwrap  [cfg-test] let a = arb_lattice().new_tree(&mut runner).unwrap().current();
+crates/v12-interp/src/feedback.rs:540  unwrap  [cfg-test] let b = arb_lattice().new_tree(&mut runner).unwrap().current();
+crates/v12-interp/src/feedback.rs:541  unwrap  [cfg-test] let c = arb_lattice().new_tree(&mut runner).unwrap().current();
+crates/v12-interp/src/feedback.rs:589  unwrap  [cfg-test] let k = pool.insert(v12_bytecode::Const::F64(0.5)).unwrap();
+crates/v12-interp/src/generator_async.rs:233  expect  .get(super::PROMISE_IDX.expect("intrinsic 'Promise' present"))
+crates/v12-interp/src/generator_async.rs:271  expect  .push(JsValue::from_i32_smi(kind).expect("request kind is a small integer"));
+crates/v12-interp/src/generator_async.rs:286  expect  .expect("a request entry holds its promise")
+crates/v12-interp/src/generator_async.rs:901  expect  .push(JsValue::from_i32_smi(0).expect("0 fits Smi"));
+crates/v12-interp/src/generator_async.rs:960  unwrap  let obj = v.as_object().unwrap();
+crates/v12-interp/src/generator_async.rs:1013  unwrap  let state = p.properties[0].as_smi().unwrap();
+crates/v12-interp/src/generator.rs:28  expect  let frame = self.frames.last().expect("suspend requires a frame");
+crates/v12-interp/src/generator.rs:31  expect  let r#gen = frame.generator.expect("suspend requires generator");
+crates/v12-interp/src/generator.rs:58  expect  let finished_base = self.frames.pop().expect("pop").base;
+crates/v12-interp/src/globals.rs:262  expect  let new_slot = usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize
+crates/v12-interp/src/lib.rs:153  expect  "Object" => Some(OBJECT_IDX.expect("intrinsic 'Object' present")),
+crates/v12-interp/src/lib.rs:154  expect  "Array" => Some(ARRAY_IDX.expect("intrinsic 'Array' present")),
+crates/v12-interp/src/lib.rs:155  expect  "String" => Some(intrinsic_idx("String").expect("intrinsic 'String' present")),
+crates/v12-interp/src/lib.rs:156  expect  "Number" => Some(intrinsic_idx("Number").expect("intrinsic 'Number' present")),
+crates/v12-interp/src/lib.rs:157  expect  "Boolean" => Some(intrinsic_idx("Boolean").expect("intrinsic 'Boolean' present")),
+crates/v12-interp/src/lib.rs:158  expect  "Math" => Some(intrinsic_idx("Math").expect("intrinsic 'Math' present")),
+crates/v12-interp/src/lib.rs:159  expect  "JSON" => Some(intrinsic_idx("JSON").expect("intrinsic 'JSON' present")),
+crates/v12-interp/src/lib.rs:160  expect  "Error" => Some(intrinsic_idx("Error").expect("intrinsic 'Error' present")),
+crates/v12-interp/src/lib.rs:161  expect  "TypeError" => Some(intrinsic_idx("TypeError").expect("intrinsic 'TypeError' present")),
+crates/v12-interp/src/lib.rs:162  expect  "RangeError" => Some(intrinsic_idx("RangeError").expect("intrinsic 'RangeError' present"
+crates/v12-interp/src/lib.rs:164  expect  Some(intrinsic_idx("ReferenceError").expect("intrinsic 'ReferenceError' present"))
+crates/v12-interp/src/lib.rs:167  expect  Some(intrinsic_idx("SyntaxError").expect("intrinsic 'SyntaxError' present"))
+crates/v12-interp/src/lib.rs:169  expect  "Promise" => Some(PROMISE_IDX.expect("intrinsic 'Promise' present")),
+crates/v12-interp/src/lib.rs:170  expect  "Symbol" => Some(SYMBOL_IDX.expect("intrinsic 'Symbol' present")),
+crates/v12-interp/src/lib.rs:171  expect  "Map" => Some(intrinsic_idx("Map").expect("intrinsic 'Map' present")),
+crates/v12-interp/src/lib.rs:172  expect  "Set" => Some(intrinsic_idx("Set").expect("intrinsic 'Set' present")),
+crates/v12-interp/src/lib.rs:173  expect  "RegExp" => Some(REGEXP_IDX.expect("intrinsic 'RegExp' present")),
+crates/v12-interp/src/lib.rs:174  expect  "eval" => Some(intrinsic_idx("eval").expect("intrinsic 'eval' present")),
+crates/v12-interp/src/lib.rs:175  expect  "console" => Some(CONSOLE_IDX.expect("intrinsic 'console' present")),
+crates/v12-interp/src/lib.rs:176  expect  "globalThis" => Some(intrinsic_idx("globalThis").expect("intrinsic 'globalThis' present"
+crates/v12-interp/src/lib.rs:177  expect  "Proxy" => Some(intrinsic_idx("Proxy").expect("intrinsic 'Proxy' present")),
+crates/v12-interp/src/lib.rs:178  expect  "EvalError" => Some(intrinsic_idx("EvalError").expect("intrinsic 'EvalError' present")),
+crates/v12-interp/src/lib.rs:179  expect  "URIError" => Some(intrinsic_idx("URIError").expect("intrinsic 'URIError' present")),
+crates/v12-interp/src/lib.rs:181  expect  Some(intrinsic_idx("AggregateError").expect("intrinsic 'AggregateError' present"))
+crates/v12-interp/src/lib.rs:183  expect  "Iterator" => Some(intrinsic_idx("Iterator").expect("intrinsic 'Iterator' present")),
+crates/v12-interp/src/lib.rs:904  expect  .expect("closure prototype materialization cannot fail");
+crates/v12-interp/src/lib.rs:951  expect  let len_v = JsValue::from_i32_smi(i32::from(expected)).expect("param count fits Smi");
+crates/v12-interp/src/lib.rs:993  expect  JsValue::from_i32_smi(len as i32).expect("arguments length fits Smi"),
+crates/v12-interp/src/lib.rs:1228  expect  main_funcs[usize::try_from(self.main).expect("function index fits usize")].max_regs;
+crates/v12-interp/src/lib.rs:1239  expect  .get(usize::try_from(self.main).expect("function index fits usize"))
+crates/v12-interp/src/lib.rs:1254  expect  .get(PROMISE_IDX.expect("intrinsic 'Promise' present"))
+crates/v12-interp/src/lib.rs:1634  expect  .expect("binding cell payload");
+crates/v12-interp/src/lib.rs:1669  expect  .expect("binding cell payload");
+crates/v12-interp/src/lib.rs:2241  expect  let obj = val.as_object().expect("checked above");
+crates/v12-interp/src/lib.rs:220  panic  panic!("intrinsic_slot drifted from GLOBAL_INTRINSIC_NAMES");
+crates/v12-interp/src/lib.rs:2119  unreachable  _ => unreachable!("cached_native called with an unsynthesized id"),
+crates/v12-interp/src/lib.rs:2143  unreachable  _ => unreachable!("cached_native called with an unsynthesized id"),
+crates/v12-interp/src/object_ops.rs:517  expect  .get(super::intrinsic_slot("Symbol").expect("Symbol intrinsic"))
+crates/v12-interp/src/object_ops.rs:569  expect  .get(super::intrinsic_slot("Symbol").expect("Symbol intrinsic"))
+crates/v12-interp/src/ops.rs:40  expect  return !heap.get(v.as_string().expect("string tag")).is_empty();
+crates/v12-interp/src/ops.rs:61  expect  let h = v.as_string().expect("string tag");
+crates/v12-interp/src/ops.rs:143  expect  acc = acc * f64::from(radix) + f64::from(c.to_digit(radix).expect("validated above"));
+crates/v12-interp/src/ops.rs:210  expect  let (mantissa, exp_text) = sci.split_once('e').expect("scientific form");
+crates/v12-interp/src/ops.rs:211  expect  let exp: i32 = exp_text.parse().expect("decimal exponent");
+crates/v12-interp/src/ops.rs:279  expect  let o = v.as_object().expect("object tag");
+crates/v12-interp/src/ops.rs:422  expect  a.as_string().expect("string"),
+crates/v12-interp/src/ops.rs:423  expect  b.as_string().expect("string"),
+crates/v12-interp/src/ops.rs:451  unreachable  _ => unreachable!("flattened above"),
+crates/v12-interp/src/ops.rs:471  unreachable  _ => unreachable!("compare() only sees relational opcodes"),
+crates/v12-interp/src/ops.rs:483  unreachable  _ => unreachable!("compare() only sees relational opcodes"),
+crates/v12-interp/src/property.rs:294  expect  let h = obj_v.as_string().expect("string primitive has a handle");
+crates/v12-interp/src/property.rs:307  expect  let h = obj_v.as_string().expect("string primitive has a handle");
+crates/v12-interp/src/property.rs:1198  expect  .expect("module namespace property stores a binding cell");
+crates/v12-interp/src/property.rs:1785  expect  + usize::try_from(self.heap.get(child).num_own - 1).expect("slot fits usize");
+crates/v12-interp/src/property.rs:3721  expect  .expect("reconfigured data descriptor has a slot");
+crates/v12-interp/src/property.rs:3767  unwrap  Interp::from_source(heap, "0;").unwrap()
+crates/v12-interp/src/property.rs:3796  unwrap  define_data(&mut interp, target, "a", JsValue::from_i32_smi(1).unwrap());
+crates/v12-interp/src/property.rs:3812  unwrap  assert_eq!(interp.proxy_op_own_keys(proxy).unwrap(), vec![key_x]);
+crates/v12-interp/src/property.rs:3819  unwrap  assert_eq!(interp.proxy_op_own_keys(proxy).unwrap(), vec![key_a]);
+crates/v12-interp/src/property.rs:3826  unwrap  assert_eq!(interp.proxy_op_own_keys(proxy).unwrap(), vec![key_a]);
+crates/v12-interp/src/property.rs:3842  unwrap  let smi = JsValue::from_i32_smi(5).unwrap();
+crates/v12-interp/src/property.rs:3862  unwrap  Ok(JsValue::from_i32_smi(3).unwrap())
+crates/v12-interp/src/property.rs:3874  unwrap  let num = JsValue::from_i32_smi(7).unwrap();
+crates/v12-intl/src/collator.rs:27  unwrap  [cfg-test] assert_eq!(compare("a", "b", "en-US").unwrap(), Ordering::Less);
+crates/v12-intl/src/collator.rs:28  unwrap  [cfg-test] assert_eq!(compare("b", "a", "en-US").unwrap(), Ordering::Greater);
+crates/v12-intl/src/collator.rs:29  unwrap  [cfg-test] assert_eq!(compare("a", "a", "en-US").unwrap(), Ordering::Equal);
+crates/v12-intl/src/collator.rs:37  unwrap  [cfg-test] compare("Ärger", "Zebra", "de").unwrap(),
+crates/v12-intl/src/collator.rs:43  unwrap  [cfg-test] compare("öl", "zoo", "sv").unwrap(),
+crates/v12-intl/src/decimal.rs:61  unwrap  [cfg-test] format_decimal(1234567.891, "en-US").unwrap(),
+crates/v12-intl/src/decimal.rs:68  unwrap  [cfg-test] assert_eq!(format_decimal(f64::NAN, "en-US").unwrap(), "NaN");
+crates/v12-intl/src/decimal.rs:69  unwrap  [cfg-test] assert_eq!(format_decimal(f64::INFINITY, "en-US").unwrap(), "Infinity");
+crates/v12-intl/src/decimal.rs:71  unwrap  [cfg-test] format_decimal(f64::NEG_INFINITY, "en-US").unwrap(),
+crates/v12-intl/src/decimal.rs:74  unwrap  [cfg-test] assert_eq!(format_decimal(-0.0, "en-US").unwrap(), "-0");
+crates/v12-intl/src/decimal.rs:75  unwrap  [cfg-test] assert_eq!(format_decimal(0.0, "en-US").unwrap(), "0");
+crates/v12-intl/src/decimal.rs:80  unwrap  [cfg-test] assert_eq!(format_decimal(-9876.5, "en-US").unwrap(), "-9,876.5");
+crates/v12-intl/src/locale.rs:43  unwrap  [cfg-test] assert_eq!(parse_locale("EN-us").unwrap().to_string(), "en-US");
+crates/v12-intl/src/locale.rs:45  unwrap  [cfg-test] parse_locale("zh-hans-cn").unwrap().to_string(),
+crates/v12-intl/src/locale.rs:59  unwrap  [cfg-test] assert_eq!(canonicalize_locale("iw").unwrap(), "he");
+crates/v12-intl/src/locale.rs:60  unwrap  [cfg-test] assert_eq!(canonicalize_locale("en-US").unwrap(), "en-US");
+crates/v12-intl/src/plural.rs:131  unwrap  [cfg-test] assert_eq!(plural_cardinal(1.0, "en-US").unwrap(), Category::One);
+crates/v12-intl/src/plural.rs:132  unwrap  [cfg-test] assert_eq!(plural_cardinal(2.0, "en-US").unwrap(), Category::Other);
+crates/v12-intl/src/plural.rs:133  unwrap  [cfg-test] assert_eq!(plural_cardinal(0.0, "en-US").unwrap(), Category::Other);
+crates/v12-intl/src/plural.rs:138  unwrap  [cfg-test] assert_eq!(plural_cardinal(1.5, "en-US").unwrap(), Category::Other);
+crates/v12-intl/src/plural.rs:140  unwrap  [cfg-test] assert_eq!(plural_cardinal(1.0, "en-US").unwrap(), Category::One);
+crates/v12-intl/src/plural.rs:145  unwrap  [cfg-test] assert_eq!(plural_cardinal(f64::NAN, "en-US").unwrap(), Category::Other);
+crates/v12-intl/src/plural.rs:147  unwrap  [cfg-test] plural_cardinal(f64::INFINITY, "en-US").unwrap(),
+crates/v12-intl/src/plural.rs:155  unwrap  [cfg-test] let set = cardinal_categories("ru").unwrap();
+crates/v12-intl/src/plural.rs:161  unwrap  [cfg-test] assert_eq!(plural_cardinal(21.0, "ru").unwrap(), Category::One);
+crates/v12-intl/src/plural.rs:162  unwrap  [cfg-test] assert_eq!(plural_cardinal(3.0, "ru").unwrap(), Category::Few);
+crates/v12-intl/src/plural.rs:163  unwrap  [cfg-test] assert_eq!(plural_cardinal(5.0, "ru").unwrap(), Category::Many);
+crates/v12-intl/src/temporal.rs:236  unwrap  [cfg-test] let d = IsoDate::new(2026, 1, 31).unwrap();
+crates/v12-intl/src/temporal.rs:237  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 2, 1).unwrap());
+crates/v12-intl/src/temporal.rs:237  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 2, 1).unwrap());
+crates/v12-intl/src/temporal.rs:242  unwrap  [cfg-test] let d = IsoDate::new(2026, 12, 31).unwrap();
+crates/v12-intl/src/temporal.rs:243  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2027, 1, 1).unwrap());
+crates/v12-intl/src/temporal.rs:243  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2027, 1, 1).unwrap());
+crates/v12-intl/src/temporal.rs:245  unwrap  [cfg-test] d.sub_days(365).unwrap(),
+crates/v12-intl/src/temporal.rs:246  unwrap  [cfg-test] IsoDate::new(2025, 12, 31).unwrap()
+crates/v12-intl/src/temporal.rs:253  unwrap  [cfg-test] let d = IsoDate::new(2024, 2, 28).unwrap();
+crates/v12-intl/src/temporal.rs:254  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2024, 2, 29).unwrap());
+crates/v12-intl/src/temporal.rs:254  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2024, 2, 29).unwrap());
+crates/v12-intl/src/temporal.rs:255  unwrap  [cfg-test] assert_eq!(d.add_days(2).unwrap(), IsoDate::new(2024, 3, 1).unwrap());
+crates/v12-intl/src/temporal.rs:255  unwrap  [cfg-test] assert_eq!(d.add_days(2).unwrap(), IsoDate::new(2024, 3, 1).unwrap());
+crates/v12-intl/src/temporal.rs:257  unwrap  [cfg-test] let d = IsoDate::new(2026, 2, 28).unwrap();
+crates/v12-intl/src/temporal.rs:258  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 3, 1).unwrap());
+crates/v12-intl/src/temporal.rs:258  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 3, 1).unwrap());
+crates/v12-intl/src/temporal.rs:275  unwrap  [cfg-test] IsoDate::new(2026, 2, 1).unwrap().to_iso_string().unwrap(),
+crates/v12-intl/src/temporal.rs:275  unwrap  [cfg-test] IsoDate::new(2026, 2, 1).unwrap().to_iso_string().unwrap(),
+crates/v12-intl/src/temporal.rs:279  unwrap  [cfg-test] IsoDate::new(2026, 2, 1).unwrap(),
+crates/v12-intl/src/temporal.rs:280  unwrap  [cfg-test] IsoTime::new(13, 45, 30, 123, 0, 0).unwrap(),
+crates/v12-intl/src/temporal.rs:282  unwrap  [cfg-test] .unwrap();
+crates/v12-intl/src/temporal.rs:283  unwrap  [cfg-test] assert_eq!(dt.to_iso_string().unwrap(), "2026-02-01T13:45:30.123");
+crates/v12-intl/src/temporal.rs:292  unwrap  [cfg-test] assert!(IsoTime::MIDNIGHT == IsoTime::new(0, 0, 0, 0, 0, 0).unwrap());
+crates/v12-intl/src/temporal.rs:302  unwrap  [cfg-test] let max = IsoDate::new(275_760, 9, 13).unwrap();
+crates/v12-intl/src/temporal.rs:306  unwrap  [cfg-test] let min = IsoDate::new(-271_821, 4, 20).unwrap();
+crates/v12-jit-baseline/src/lib.rs:78  expect  [cfg-test] let mut baseline = JitBaseline::new().expect("new");
+crates/v12-jit-baseline/src/lib.rs:79  expect  [cfg-test] let compiled = baseline.compile(&fb).expect("compile supported");
+crates/v12-jit-baseline/src/lib.rs:92  expect  [cfg-test] let mut baseline = JitBaseline::new().expect("new");
+crates/v12-jit-baseline/src/lib.rs:102  expect  [cfg-test] let err = baseline.compile(&fb).expect_err("should be unsupported");
+crates/v12-jit-baseline/src/lib.rs:108  expect  [cfg-test] let mut baseline = JitBaseline::new().expect("new");
+crates/v12-jit-baseline/src/lib.rs:111  expect  [cfg-test] let err = baseline.compile(&fb).expect_err("should be too large");
+crates/v12-jit-baseline/src/lib.rs:133  expect  [cfg-test] let mut baseline = JitBaseline::new().expect("new");
+crates/v12-jit-baseline/src/lib.rs:134  expect  [cfg-test] let compiled = baseline.compile(&fb).expect("compile");
+crates/v12-jit-baseline/src/lib.rs:420  expect  [cfg-test] v12_interp::Interp::from_source(&mut heap, "throw typeof null;").expect("compiles");
+crates/v12-jit-baseline/src/lib.rs:444  expect  [cfg-test] let mut baseline = JitBaseline::new().expect("new even when disabled");
+crates/v12-jit-baseline/src/lib.rs:450  expect  [cfg-test] let err = baseline.compile(&fb).expect_err("disabled");
+crates/v12-jit-baseline/src/lib.rs:61  panic  [cfg-test] Ok(()) => panic!("interp did not throw"),
+crates/v12-jit-baseline/src/lib.rs:423  panic  [cfg-test] Ok(()) => panic!("expected throw"),
+crates/v12-jit-baseline/src/lib.rs:147  unwrap  [cfg-test] let k = pool.insert(Const::F64(10.5)).unwrap();
+crates/v12-jit-baseline/src/lib.rs:157  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:158  unwrap  [cfg-test] let compiled = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:178  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:179  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:204  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:205  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:240  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:241  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:267  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:268  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:289  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:290  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:312  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:313  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:332  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:333  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:362  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:363  unwrap  [cfg-test] let c = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:375  unwrap  [cfg-test] let k_null = pool.insert(Const::Null).unwrap();
+crates/v12-jit-baseline/src/lib.rs:382  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:383  unwrap  [cfg-test] let compiled = baseline.compile(&fb).unwrap();
+crates/v12-jit-baseline/src/lib.rs:395  unwrap  [cfg-test] let k_null = pool.insert(Const::Null).unwrap();
+crates/v12-jit-baseline/src/lib.rs:404  unwrap  [cfg-test] let mut baseline = JitBaseline::new().unwrap();
+crates/v12-jit-baseline/src/lib.rs:405  unwrap  [cfg-test] let compiled = baseline.compile(&fb).unwrap();
+crates/v12-jit-opt/src/compile.rs:576  expect  [cfg-test] .expect("compile");
+crates/v12-jit-opt/src/compile.rs:685  expect  [cfg-test] .expect("feedback exists")
+crates/v12-jit-opt/src/compile.rs:696  expect  [cfg-test] .expect("feedback exists")
+crates/v12-jit-opt/src/compile.rs:767  expect  [cfg-test] let inlined = inline_at(&caller, 0, &callee).expect("should inline");
+crates/v12-jit-opt/src/compile.rs:678  panic  [cfg-test] Ok(()) => panic!("expected Throw"),
+crates/v12-jit-opt/src/compile.rs:888  panic  [cfg-test] Ok(()) => panic!("expected Throw"),
+crates/v12-jit-opt/src/compile.rs:190  unwrap  let last_pc = *callee_pcs.last().unwrap() as usize;
+crates/v12-jit-opt/src/compile.rs:513  unwrap  [cfg-test] guard_for_lattice(Lattice::Smi, 1, 0).unwrap().guard,
+crates/v12-jit-opt/src/compile.rs:517  unwrap  [cfg-test] guard_for_lattice(Lattice::Double, 2, 5).unwrap().guard,
+crates/v12-jit-opt/src/compile.rs:521  unwrap  [cfg-test] guard_for_lattice(Lattice::Number, 0, 0).unwrap().guard,
+crates/v12-jit-opt/src/compile.rs:527  unwrap  [cfg-test] guard_for_lattice(Lattice::String, 0, 0).unwrap().guard,
+crates/v12-jit-opt/src/compile.rs:532  unwrap  [cfg-test] let g = guard_for_lattice(Lattice::Object(shape), 0, 7).unwrap();
+crates/v12-jit-opt/src/compile.rs:573  unwrap  [cfg-test] let mut pipeline = Pipeline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:583  unwrap  [cfg-test] let smi_input = JsValue::from_i32_smi(41).unwrap();
+crates/v12-jit-opt/src/compile.rs:593  unwrap  [cfg-test] smi_add_fast(smi_input, JsValue::from_i32_smi(1).unwrap()),
+crates/v12-jit-opt/src/compile.rs:594  unwrap  [cfg-test] Some(JsValue::from_i32_smi(42).unwrap())
+crates/v12-jit-opt/src/compile.rs:596  unwrap  [cfg-test] let big = JsValue::from_i32_smi(JsValue::SMI_MAX).unwrap();
+crates/v12-jit-opt/src/compile.rs:597  unwrap  [cfg-test] assert!(smi_add_fast(big, JsValue::from_i32_smi(1).unwrap()).is_none());
+crates/v12-jit-opt/src/compile.rs:599  unwrap  [cfg-test] let mut baseline = v12_jit_baseline::JitBaseline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:600  unwrap  [cfg-test] let baseline_compiled = baseline.compile(&fb).unwrap();
+crates/v12-jit-opt/src/compile.rs:635  unwrap  [cfg-test] let half_or_int = consts.insert(second).unwrap();
+crates/v12-jit-opt/src/compile.rs:700  unwrap  [cfg-test] let mut p = Pipeline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:703  unwrap  [cfg-test] .unwrap();
+crates/v12-jit-opt/src/compile.rs:722  unwrap  [cfg-test] let mut baseline = v12_jit_baseline::JitBaseline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:725  unwrap  [cfg-test] .unwrap();
+crates/v12-jit-opt/src/compile.rs:742  unwrap  [cfg-test] let mut p = Pipeline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:743  unwrap  [cfg-test] let (_c, deopt) = p.compile_with_feedback(&fb, Some(&fv)).unwrap();
+crates/v12-jit-opt/src/compile.rs:805  unwrap  [cfg-test] let inlined = inline_at(&caller, 1, &callee).unwrap();
+crates/v12-jit-opt/src/compile.rs:806  unwrap  [cfg-test] let mut baseline = v12_jit_baseline::JitBaseline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:807  unwrap  [cfg-test] let compiled = baseline.compile(&inlined).unwrap();
+crates/v12-jit-opt/src/compile.rs:869  unwrap  [cfg-test] let mut p = Pipeline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:870  unwrap  [cfg-test] let (_c, deopt) = p.compile_with_feedback(&fb, Some(&fv)).unwrap();
+crates/v12-jit-opt/src/compile.rs:873  unwrap  [cfg-test] let mut baseline = v12_jit_baseline::JitBaseline::new().unwrap();
+crates/v12-jit-opt/src/compile.rs:874  unwrap  [cfg-test] let compiled = baseline.compile(&fb).unwrap();
+crates/v12-jit-opt/src/deopt.rs:36  unwrap  /// let guard = cells.guard_for(3, 7).unwrap();
+crates/v12-jit-opt/src/deopt.rs:252  unwrap  [cfg-test] let g = reg.guard_for(10, 5).unwrap();
+crates/v12-jit-opt/src/guard.rs:299  unwrap  let smi = JsValue::from_i32_smi(42).unwrap();
+crates/v12-jit-opt/src/guard.rs:329  unwrap  let smi = JsValue::from_i32_smi(1).unwrap();

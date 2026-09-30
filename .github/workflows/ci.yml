@@ -28,6 +28,9 @@ jobs:
       # Phase 1 (Freeze) guard: no new property_keys.push /
       # properties.get(1) / error_value(" sites (builtins-arch-plan §5.1).
       - run: ./scripts/freeze-lint.sh
+      # unwrap/expect/panic/unreachable inventory: no new audited site, and
+      # no surplus entry (the allowlist is a ratchet — plan W0.3).
+      - run: ./scripts/unwrap-lint.sh
       # unsafe discipline + clippy, report-only. This script replaced a
       # reference to a script that never existed in any branch, which meant
       # this job died here and clippy never ran at all.

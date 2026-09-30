@@ -9,3 +9,6 @@ license.workspace = true
 # Compiled-data builds avoid baked/databake blob plumbing; see lib.rs coverage notes.
 icu = { workspace = true, features = ["compiled_data"] }
 temporal_rs.workspace = true
+
+[lints]
+workspace = true

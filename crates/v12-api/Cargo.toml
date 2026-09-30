@@ -9,3 +9,6 @@ description = "Convenient embedding API for the v12 JavaScript engine"
 [dependencies]
 v12-engine.workspace = true
 v12-heap.workspace = true
+
+[lints]
+workspace = true

@@ -9,3 +9,6 @@ license.workspace = true
 # `utf16` enables regress's `&[u16]` input path (`find_from_utf16`/`find_from_ucs2`),
 # the primary input encoding for this wrapper. Everything else stays default.
 regress = { workspace = true, features = ["utf16"] }
+
+[lints]
+workspace = true

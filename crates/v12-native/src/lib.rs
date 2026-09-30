@@ -17,6 +17,8 @@
 //!
 //! Dependency direction: `v12-heap ← v12-native ← {v12-interp, v12-engine}`.
 
+#![forbid(unsafe_code)]
+
 mod convert;
 mod id;
 mod methods;
