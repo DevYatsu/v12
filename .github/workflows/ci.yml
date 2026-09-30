@@ -44,10 +44,13 @@ jobs:
       - name: Run Test262
         run: |
           set +e
-          ./conformance/run.sh --filter language --jobs 4 --format tap --tap-out /tmp/t262.tap \
+          # --format tap,json is required together: `--format json --json-out F`
+          # alone silently writes nothing.
+          ./conformance/run.sh --filter language --jobs 4 \
+            --format tap,json --json-out /tmp/t262.json \
+            --tap-out /tmp/t262.tap \
             >/tmp/t262.stdout 2>/tmp/t262.stderr
-          status=$?
-          printf '%s\n' "$status" >/tmp/t262.status
+          printf '%s\n' "$?" >/tmp/t262.status
           exit 0
       - name: Upload Test262 evidence
         if: always()
@@ -55,6 +58,7 @@ jobs:
         with:
           name: test262-coverage
           path: |
+            /tmp/t262.json
             /tmp/t262.tap
             /tmp/t262.stdout
             /tmp/t262.stderr
@@ -64,11 +68,23 @@ jobs:
         if: always()
         run: |
           tail -n 40 /tmp/t262.tap || true
-      - name: Propagate Test262 status
-        if: always()
+      # THE REGRESSION GATE. Compares fail SETS, not pass rates: a net rise can
+      # hide new failures and a net zero can hide a one-for-one swap. Exit 1 on
+      # BROKE or REGRESSED; MARGINAL only warns (those are tests sitting near the
+      # kill window that flip with load alone).
+      #
+      # This replaces the old "Propagate Test262 status" step, which exited 1 if
+      # ANY test failed. At 77.6 % conformance that could never be green, so the
+      # job trained reviewers to ignore a permanently red result.
+      #
+      # Regenerate the baseline only via scripts/update-conformance-baseline.sh,
+      # and only with a faildiff justifying it (BROKE 0, REGRESSED 0).
+      - name: Gate on conformance regressions
         run: |
-          if [[ ! -s /tmp/t262.status ]]; then
-            echo "Test262 status was not recorded." >&2
+          if [[ ! -s /tmp/t262.json ]]; then
+            echo "::error::Test262 produced no JSON report; cannot gate." >&2
+            echo "Check conformance/run.sh and the submodule checkout." >&2
             exit 1
           fi
-          exit "$(cat /tmp/t262.status)"
+          ./conformance/faildiff.sh \
+            conformance/baseline/language.json /tmp/t262.json
