@@ -299,7 +299,7 @@ pub fn regexp_get_last_index(
 ) -> Result<JsValue, Throw> {
     match regexp_this(ctx, this, "get RegExp.prototype.lastIndex")? {
         RegExpThis::Prototype => Ok(JsValue::undefined()),
-        RegExpThis::Instance(re) => Ok(helpers::js_number(last_index(ctx.heap, re))),
+        RegExpThis::Instance(re) => Ok(helpers::js_number(last_index(ctx, re))),
     }
 }
 
@@ -505,7 +505,7 @@ pub fn regexp_symbol_search(
 ) -> Result<JsValue, Throw> {
     let (re, _source, _flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.search]")?;
     let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
-    let previous = last_index(ctx.heap, re);
+    let previous = last_index(ctx, re);
     let text_h = ctx.heap.intern_text(&s);
     set_last_index(ctx, re, 0.0)?;
     let m = regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)]);
@@ -974,30 +974,53 @@ fn compile_pattern(source: &str, flags: &str) -> Result<v12_regex::CompiledRegex
     v12_regex::compile(source, f).map_err(|e| e.message)
 }
 
-/// Current `lastIndex` as a number, read as `Get(R, "lastIndex")` and nothing
-/// else. Defaults to 0 when the property is absent (a receiver whose `lastIndex`
-/// was deleted), and to 0 for a non-numeric value, which is what the previous
-/// raw-slot read did.
-pub fn last_index(heap: &mut Heap, obj: Handle<JsObject>) -> f64 {
-    let key = last_index_key(heap);
-    let shape = heap.shape_of(obj);
-    let Some(desc) = heap.lookup_property(shape, key) else {
-        return 0.0;
+/// `ToLength(? Get(R, "lastIndex"))` (ES 22.2.5.2.2 step 4), reduced to an
+/// index the matcher can use.
+///
+/// `Get` goes through the own data property (see the module doc), so
+/// `lastIndex` is whatever a script last stored — and a script can store a
+/// *string*: `r.lastIndex = "12"` is legal and
+/// `exec/S15.10.6.2_A4_T8.js` depends on it, resuming at 12. Reading the slot
+/// and pattern-matching only Smi/f64 (what the old raw slot did) answered 0
+/// for every non-numeric `lastIndex`, silently re-matching from the start.
+///
+/// The steps, in order: `ToNumber` (so `""` is 0, `"1.9"` is 1.9, `null` is 0),
+/// then `ToIntegerOrInfinity` (truncate toward zero, `NaN` to 0), then clamp to
+/// `[0, 2^53 - 1]`. 0 for a missing property, since a deleted `lastIndex` reads
+/// as `undefined` → `NaN` → 0.
+pub fn last_index(ctx: &mut Ctx, obj: Handle<JsObject>) -> f64 {
+    let key = last_index_key(ctx.heap);
+    let value = {
+        let shape = ctx.heap.shape_of(obj);
+        let Some(desc) = ctx.heap.lookup_property(shape, key) else {
+            return 0.0;
+        };
+        let Some(slot) = desc.slot() else {
+            return 0.0;
+        };
+        ctx.heap
+            .get(obj)
+            .properties
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(JsValue::undefined())
     };
-    let Some(slot) = desc.slot() else {
+    let n = ctx.to_number(value);
+    to_length(n)
+}
+
+/// ES `ToLength(n)`: `ToIntegerOrInfinity` then clamp to `[0, 2^53 - 1]`. The
+/// 2^53 ceiling is what makes a `lastIndex` of `1e300` mean "past the end"
+/// rather than "an index no slice can express".
+fn to_length(n: f64) -> f64 {
+    if n.is_nan() {
         return 0.0;
-    };
-    let value = heap
-        .get(obj)
-        .properties
-        .get(slot as usize)
-        .copied()
-        .unwrap_or(JsValue::undefined());
-    value
-        .as_smi()
-        .map(f64::from)
-        .or_else(|| value.as_f64())
-        .unwrap_or(0.0)
+    }
+    let int = n.trunc();
+    if int <= 0.0 {
+        return 0.0;
+    }
+    int.min(9007199254740991.0)
 }
 
 /// `Set(R, "lastIndex", v, true)` (ES 10.4.1) — an ordinary `[[Set]]`, so it
@@ -1048,7 +1071,7 @@ pub fn regexp_exec(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
     let _ = source;
     let is_global = flags.contains('g');
     let is_sticky = flags.contains('y');
-    let mut start = last_index(ctx.heap, obj);
+    let mut start = last_index(ctx, obj);
     if !is_global && !is_sticky {
         start = 0.0;
     }

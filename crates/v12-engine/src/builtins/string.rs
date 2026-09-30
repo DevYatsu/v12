@@ -208,7 +208,7 @@ fn collect_match_spans(
         }
         spans.push((s, e, groups));
         // Zero-width guard (`lastIndex` counts UTF-16 units).
-        let li = regexp::last_index(ctx.heap, re);
+        let li = regexp::last_index(ctx, re);
         if li <= start {
             regexp::set_last_index(ctx, re, start + 1.0)?;
         }
@@ -1104,7 +1104,7 @@ pub fn string_match_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resul
             break;
         }
         matches.push(m);
-        let li = regexp::last_index(ctx.heap, re);
+        let li = regexp::last_index(ctx, re);
         if li <= start {
             regexp::set_last_index(ctx, re, start + 1.0)?;
         }
