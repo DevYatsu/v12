@@ -550,12 +550,18 @@ pub fn object_proto_to_string(
     this: JsValue,
     _args: &[JsValue],
 ) -> Result<JsValue, Throw> {
-    let text = if this.is_object()
-        && ctx.heap.get(this.as_object().unwrap()).kind == v12_heap::Kind::Array
-    {
-        "[object Array]"
-    } else {
-        "[object Object]"
+    // ES 20.1.3.6 step 6 brand table. `RegExp` is special-cased in the spec
+    // (a RegExp exotic object is branded by `[[RegExpMatcher]]`, *not* by a
+    // `@@toStringTag` property — `built-ins/RegExp/prototype/15.10.6.js`
+    // requires `Object.prototype.toString.call(RegExp.prototype)` to stay
+    // `"[object Object]"`, so nothing may be installed under `@@toStringTag`
+    // to fake it). `Map`/`Set`/`Date`/`Error` carry the brand through their
+    // own `@@toStringTag` installs and are out of this file's lane.
+    let kind = this.as_object().map(|o| ctx.heap.get(o).kind);
+    let text = match kind {
+        Some(v12_heap::Kind::Array) => "[object Array]",
+        Some(v12_heap::Kind::RegExp) => "[object RegExp]",
+        _ => "[object Object]",
     };
     Ok(JsValue::string(ctx.heap.intern_text(text)))
 }

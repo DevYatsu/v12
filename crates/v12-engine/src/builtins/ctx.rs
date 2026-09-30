@@ -597,7 +597,94 @@ impl<'a> Ctx<'a> {
             v12_heap::Attrs::new(false, false, true),
         );
         self.heap.bind_shape(obj, child);
+        self.heap.pad_properties_to_num_own(obj);
         getter
+    }
+
+    /// Allocates a native accessor function (a getter, a setter, or both) and
+    /// installs it as the property `name` on `obj` with spec accessor
+    /// attributes `{ writable: false, enumerable: false, configurable: true }`
+    /// — i.e. non-enumerable and configurable, which is what
+    /// `verifyProperty` asserts for every `RegExp.prototype` data accessor.
+    ///
+    /// One entry point for the whole read-only-getter shape
+    /// (`RegExp.prototype.source`, `…global`, …) and for the read/write
+    /// `lastIndex` accessor: `getter`/`setter` are `(NativeId, function name)`
+    /// pairs, and a `None` half is left undefined. Each allocated function
+    /// carries its own `length` (from [`super::builtin_length`]) and `name`
+    /// own props, so `get source` is reachable and named per spec.
+    pub fn define_named_accessor(
+        &mut self,
+        obj: Handle<JsObject>,
+        name: &str,
+        getter: Option<(v12_native::NativeId, String)>,
+        setter: Option<(v12_native::NativeId, String)>,
+    ) {
+        let getter_fn = getter.map(|(id, fname)| self.alloc_accessor_fn(id, &fname));
+        let setter_fn = setter.map(|(id, fname)| self.alloc_accessor_fn(id, &fname));
+        let key = v12_heap::PropKey::from_string(self.heap.intern_text(name));
+        let shape = self.heap.shape_of_mut(obj);
+        debug_assert!(
+            self.heap.lookup_property(shape, key).is_none(),
+            "duplicate accessor install for `{name}`"
+        );
+        let child = self.heap.define_accessor(
+            shape,
+            key,
+            getter_fn,
+            setter_fn,
+            v12_heap::Attrs::new(false, false, true),
+        );
+        self.heap.bind_shape(obj, child);
+        // `define_accessor` grows the shape's `num_own` without storing a
+        // value, so the object's property storage has to be padded before any
+        // later `add_property` hands out the next slot.
+        self.heap.pad_properties_to_num_own(obj);
+        let bound = self.heap.shape_of(obj);
+        let desc = self
+            .heap
+            .lookup_property(bound, key)
+            .copied()
+            .expect("freshly installed accessor key must resolve");
+        debug_assert!(
+            desc.is_accessor(),
+            "`{name}` must install as an accessor, not a data property"
+        );
+        debug_assert_eq!(
+            desc.attrs(),
+            v12_heap::Attrs::new(false, false, true),
+            "`{name}` must be non-enumerable and configurable"
+        );
+    }
+
+    /// One half of [`Self::define_named_accessor`]: a `Kind::Function` whose
+    /// callable routes to `id`, stamped with spec `length` and `name`.
+    fn alloc_accessor_fn(&mut self, id: v12_native::NativeId, fname: &str) -> Handle<JsObject> {
+        let func = self.alloc_obj(v12_heap::JsObject {
+            kind: v12_heap::Kind::Function,
+            callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+            ..Default::default()
+        });
+        // Both accessors are zero-argument per the spec getters; the arity
+        // table is the single source of truth for that claim.
+        let len = super::builtin_length(id).expect("accessor arity declared");
+        let len_v = JsValue::from_i32_smi(len as i32).expect("accessor arity fits Smi");
+        self.define_data_prop_with_attrs(
+            func,
+            "length",
+            len_v,
+            v12_heap::Attrs::new(false, false, true),
+        );
+        self.assert_own_data_value(func, "length", len_v);
+        let name_h = self.heap.intern_text(fname);
+        self.define_data_prop_with_attrs(
+            func,
+            "name",
+            JsValue::string(name_h),
+            v12_heap::Attrs::new(false, false, true),
+        );
+        self.assert_own_data_value(func, "name", JsValue::string(name_h));
+        func
     }
 
     /// Allocates a rooted native getter and installs it as a configurable,
@@ -660,6 +747,7 @@ impl<'a> Ctx<'a> {
             v12_heap::Attrs::new(false, false, true),
         );
         self.heap.bind_shape(obj, child);
+        self.heap.pad_properties_to_num_own(obj);
         // Enforcement (plan §3.4): the bound descriptor is an accessor with a
         // getter and no set accessor, carrying the declared attrs.
         let bound = self.heap.shape_of(obj);

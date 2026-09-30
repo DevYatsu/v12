@@ -347,6 +347,43 @@ pub enum NativeId {
     RegExpTest = 2302,
     RegExpToString = 2303,
     RegExpCompile = 2304,
+    // `%RegExp.prototype%` accessors and symbol-keyed protocol methods
+    // (ES 22.2.6 - 22.2.7). Deliberately NOT `define_builtins!` entries:
+    // like the regexp-backed `String.prototype` methods they reach the
+    // bodies through `NativeRegistry::call_native`'s step-2 arms, which
+    // are the only place the per-registry compiled-pattern cache
+    // (`Ctx::regex_cache`) is available. The getters need no cache, but
+    // they share the one dispatch path so the surface has a single home.
+    /// `get RegExp.prototype.source` — `"(?:)"` for `%RegExp.prototype%`.
+    RegExpProtoGetSource = 2305,
+    /// `get RegExp.prototype.flags` — `""` for `%RegExp.prototype%`.
+    RegExpProtoGetFlags = 2306,
+    RegExpProtoGetGlobal = 2307,
+    RegExpProtoGetIgnoreCase = 2308,
+    RegExpProtoGetMultiline = 2309,
+    RegExpProtoGetDotAll = 2310,
+    RegExpProtoGetUnicode = 2311,
+    RegExpProtoGetUnicodeSets = 2312,
+    RegExpProtoGetSticky = 2313,
+    RegExpProtoGetHasIndices = 2314,
+    /// `get RegExp.prototype.lastIndex` (ES 5 shape; modern ES gives every
+    /// RegExp *instance* an own `lastIndex` data property instead, which the
+    /// engine models as the object's internal slot).
+    RegExpProtoGetLastIndex = 2315,
+    /// `set RegExp.prototype.lastIndex`.
+    RegExpProtoSetLastIndex = 2316,
+    /// `%RegExp.prototype%[@@match]` (22.2.7.2).
+    RegExpSymbolMatch = 2317,
+    /// `%RegExp.prototype%[@@matchAll]` (22.2.7.3).
+    RegExpSymbolMatchAll = 2318,
+    /// `%RegExp.prototype%[@@replace]` (22.2.7.4).
+    RegExpSymbolReplace = 2319,
+    /// `%RegExp.prototype%[@@search]` (22.2.7.5).
+    RegExpSymbolSearch = 2320,
+    /// `%RegExp.prototype%[@@split]` (22.2.7.6).
+    RegExpSymbolSplit = 2321,
+    /// `get RegExp [ @@species ]` (22.2.6.4).
+    RegExpSymbolSpeciesGet = 2322,
     // Generator (interp-internal fallbacks, moved from the interp's NativeFn)
     GeneratorNext = 1910,
     GeneratorReturn = 1911,

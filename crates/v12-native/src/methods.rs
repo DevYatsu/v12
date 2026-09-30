@@ -13,6 +13,10 @@
 //!   a constant number of comparisons, not a linear scan over the table.
 //!
 //! Zero allocation, no runtime construction, no dependencies.
+//!
+//! One kind has no entry: `Kind::RegExp`. Its methods live on a real
+//! `%RegExp.prototype%` object, so a read must go through the ordinary
+//! prototype chain; see the comment at the `Array` arm.
 
 // The built-in method surface, declared at the kinds.
 //
@@ -102,12 +106,18 @@ crate::builtin_methods! {
         toString => SymbolProtoToString,
         valueOf => SymbolProtoValueOf,
     },
-    RegExp => {
-        exec => RegExpExec,
-        test => RegExpTest,
-        toString => RegExpToString,
-        compile => RegExpCompile,
-    },
+    // `Kind::RegExp` deliberately has NO surface. It used to carry
+    // `exec`/`test`/`toString`/`compile`, synthesized per read by
+    // `Interp::regexp_surface`, which meant (a) a RegExp instance's method was
+    // never the function object `RegExp.prototype.exec` holds — so
+    // `/a/.exec !== RegExp.prototype.exec` and every override of
+    // `RegExp.prototype.exec` was ignored — and (b) the surface was the *only*
+    // way those names resolved, because nothing installed them. Now that the
+    // 22.2.5 methods are real properties on `%RegExp.prototype%` (see
+    // `builtins::install_regexp_methods`), the read must travel the ordinary
+    // prototype chain. The `source`/`flags`/`lastIndex` *slot* reads are
+    // unaffected: `regexp_surface` handles those separately and does not
+    // consult this table.
     Array => {
         push => ArrayPush,
         pop => ArrayPop,

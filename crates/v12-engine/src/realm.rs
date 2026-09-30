@@ -577,6 +577,12 @@ impl Realm {
             if let Some(symbol_ctor) = intrinsics.get("Symbol").and_then(|v| v.as_object()) {
                 ctx.overwrite_data_prop(symbol_ctor, "species", JsValue::symbol(symbol_species));
             }
+            // `get RegExp [ @@species ]` (ES 22.2.6.4). Installed here for the
+            // same reason as the Promise line above: `@@species` is only
+            // canonical once this realm's well-known symbols exist, which is
+            // strictly after the main install pass that installs the rest of
+            // the `%RegExp.prototype%` surface.
+            crate::builtins::install_regexp_species(heap, symbol_species);
         }
         // `%Promise.prototype%`'s [[Prototype]] is `%Object.prototype%`; the
         // prototype was allocated before `object_proto` existed, so the link

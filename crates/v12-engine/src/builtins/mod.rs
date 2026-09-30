@@ -28,7 +28,7 @@ pub mod symbol;
 pub use ctx::{BuiltinFn, Ctx, call_ctx, call_legacy};
 pub use registry::{HostClosure, HostFn, NativeHandler, NativeRegistry};
 
-use v12_heap::{Heap, JsValue};
+use v12_heap::{Handle, Heap, JsValue};
 use v12_native::{NativeId, Throw};
 
 /// Handles needed to install built-ins. Constructed by `Realm::new` from its
@@ -417,6 +417,33 @@ pub fn builtin_length(id: NativeId) -> Option<u32> {
         // Keyed promise combinators (27.2.4).
         NativeId::PromiseAllKeyed => Some(1),
         NativeId::PromiseAllSettledKeyed => Some(1),
+        // RegExp: the 22.2.6 accessors and the `@@species` getter are all
+        // zero-argument; the 22.2.5 methods and 22.2.7 protocol methods carry
+        // their spec arity. These are the arities the `define_named_accessor`
+        // debug assertion and the `length` own props are checked against, so
+        // they must not drift.
+        NativeId::RegExpProtoGetSource
+        | NativeId::RegExpProtoGetFlags
+        | NativeId::RegExpProtoGetGlobal
+        | NativeId::RegExpProtoGetIgnoreCase
+        | NativeId::RegExpProtoGetMultiline
+        | NativeId::RegExpProtoGetDotAll
+        | NativeId::RegExpProtoGetUnicode
+        | NativeId::RegExpProtoGetUnicodeSets
+        | NativeId::RegExpProtoGetSticky
+        | NativeId::RegExpProtoGetHasIndices
+        | NativeId::RegExpProtoGetLastIndex
+        | NativeId::RegExpProtoSetLastIndex
+        | NativeId::RegExpSymbolSpeciesGet
+        | NativeId::RegExpToString => Some(0),
+        NativeId::RegExpExec
+        | NativeId::RegExpTest
+        | NativeId::RegExpSymbolMatch
+        | NativeId::RegExpSymbolMatchAll
+        | NativeId::RegExpSymbolSearch => Some(1),
+        NativeId::RegExpCompile | NativeId::RegExpSymbolReplace | NativeId::RegExpSymbolSplit => {
+            Some(2)
+        }
         _ => None,
     }
 }
@@ -453,6 +480,278 @@ pub(crate) fn install_native(
 ) -> Option<v12_heap::Handle<v12_heap::JsObject>> {
     let length = builtin_length(id);
     install_native_with_length(heap, target, name, id, length)
+}
+
+/// The `%RegExp.prototype%` handle, resolved through the realm `RegExp`
+/// constructor's `prototype` field (the same source `link_regexp_proto` uses).
+///
+/// Every `RegExp.prototype` install funnels here so the four install passes
+/// below share one resolution and one bail-out rule: a realm that has not
+/// linked the prototype (a bare-heap engine test) installs nothing rather than
+/// panicking. Requires `install_ctor` to have run, which is why all four are
+/// called from the tail of `install_builtins`.
+///
+/// `global` is passed explicitly rather than left to [`Ctx::intrinsic`]'s
+/// `realm_globals().first()` fallback: a *second* `Realm::new` on the same heap
+/// (what `$262.createRealm()` does) would otherwise resolve the primary
+/// realm's `RegExp`, and the duplicate-install assertion in
+/// [`Ctx::define_named_accessor`] would fire on the primary realm's prototype.
+fn regexp_proto(
+    heap: &mut Heap,
+    global: v12_heap::Handle<v12_heap::JsObject>,
+) -> Option<(
+    v12_heap::Handle<v12_heap::JsObject>,
+    v12_heap::Handle<v12_heap::JsObject>,
+)> {
+    let ctx = Ctx::new(heap, Some(global), None);
+    let ctor = ctx.intrinsic("RegExp").and_then(|v| v.as_object())?;
+    let proto = ctx.heap.get(ctor).prototype?;
+    Some((ctor, proto))
+}
+
+/// Group 1 — the `%RegExp.prototype%` data accessors (ES 22.2.6.1-22.2.6.6,
+/// 22.2.6.8-22.2.6.10): `source`, `flags`, and the eight single-flag getters.
+///
+/// Every one is an accessor `{ get f, set: undefined, enumerable: false,
+/// configurable: true }` whose getter is a zero-argument function named
+/// `get <name>`. `verifyProperty` on the prototype is a large share of the
+/// `built-ins/RegExp/prototype` suite, so the attributes are load-bearing, not
+/// incidental — hence [`Ctx::define_named_accessor`] asserting them.
+fn install_regexp_accessors(heap: &mut Heap, global: v12_heap::Handle<v12_heap::JsObject>) {
+    let Some((_ctor, proto)) = regexp_proto(heap, global) else {
+        return;
+    };
+    let mut ctx = Ctx::new(heap, None, None);
+    let flag_accessors: [(&str, NativeId); 8] = [
+        ("global", NativeId::RegExpProtoGetGlobal),
+        ("ignoreCase", NativeId::RegExpProtoGetIgnoreCase),
+        ("multiline", NativeId::RegExpProtoGetMultiline),
+        ("dotAll", NativeId::RegExpProtoGetDotAll),
+        ("unicode", NativeId::RegExpProtoGetUnicode),
+        ("unicodeSets", NativeId::RegExpProtoGetUnicodeSets),
+        ("sticky", NativeId::RegExpProtoGetSticky),
+        ("hasIndices", NativeId::RegExpProtoGetHasIndices),
+    ];
+    for (name, id) in flag_accessors {
+        ctx.define_named_accessor(proto, name, Some((id, format!("get {name}"))), None);
+    }
+    ctx.define_named_accessor(
+        proto,
+        "source",
+        Some((NativeId::RegExpProtoGetSource, "get source".to_string())),
+        None,
+    );
+    ctx.define_named_accessor(
+        proto,
+        "flags",
+        Some((NativeId::RegExpProtoGetFlags, "get flags".to_string())),
+        None,
+    );
+}
+
+/// Group 2 — the `%RegExp.prototype%` `lastIndex` accessor.
+///
+/// Modern ES gives each RegExp *instance* an own `lastIndex` data property
+/// (`RegExpAlloc` step 2), which this engine models as the object's internal
+/// slot: the interpreter's own-slot read serves it ahead of the shape lookup,
+/// so an instance's observable `lastIndex` is already right. The prototype
+/// accessor is the ES 5 shape, installed because it is the only way a
+/// `get`/`set lastIndex` *pair* is reachable on the surface at all, and because
+/// it gives the prototype itself the same brand check every other accessor has.
+fn install_regexp_last_index(heap: &mut Heap, global: v12_heap::Handle<v12_heap::JsObject>) {
+    let Some((_ctor, proto)) = regexp_proto(heap, global) else {
+        return;
+    };
+    let mut ctx = Ctx::new(heap, None, None);
+    ctx.define_named_accessor(
+        proto,
+        "lastIndex",
+        Some((
+            NativeId::RegExpProtoGetLastIndex,
+            "get lastIndex".to_string(),
+        )),
+        Some((
+            NativeId::RegExpProtoSetLastIndex,
+            "set lastIndex".to_string(),
+        )),
+    );
+}
+
+/// Group 3 — the `%RegExp.prototype%` methods (ES 22.2.5): `exec`, `test`,
+/// `toString`, `compile`.
+///
+/// All four already had `pub` bodies in `regexp.rs` and dispatch arms in the
+/// registry; none was ever *installed*, which is why `RegExp.prototype.exec`
+/// read `undefined` while the interpreter's `Kind::RegExp` surface kept
+/// `/a/.exec` working. Installing them retires that asymmetry: the prototype
+/// property and the instance read are now the same function object.
+fn install_regexp_methods(heap: &mut Heap, global: v12_heap::Handle<v12_heap::JsObject>) {
+    let Some((ctor, proto)) = regexp_proto(heap, global) else {
+        return;
+    };
+    let mut ctx = Ctx::new(heap, None, None);
+    for (name, id, len) in [
+        ("exec", NativeId::RegExpExec, 1u32),
+        ("test", NativeId::RegExpTest, 1),
+        ("toString", NativeId::RegExpToString, 0),
+        ("compile", NativeId::RegExpCompile, 2),
+    ] {
+        ctx.define_method(Some(proto), name, id, Some(len));
+    }
+    // `RegExp.length` is 2 and `RegExp.name` is `"RegExp"`
+    // (`CreateBuiltinFunction`). The intrinsic placeholder is wired to
+    // `RegExpConstruct` by the realm's `wire_callable` but, like every other
+    // intrinsic ctor here, carries neither property — and `install_ctor` stamps
+    // neither. Same two installs the realm hand-rolls for `Proxy`.
+    for (prop, value) in [
+        (
+            "length",
+            JsValue::from_i32_smi(2).expect("RegExp arity fits Smi"),
+        ),
+        ("name", JsValue::string(ctx.heap.intern_text("RegExp"))),
+    ] {
+        let key = v12_heap::PropKey::from_string(ctx.heap.intern_text(prop));
+        if ctx
+            .heap
+            .lookup_property(ctx.heap.shape_of(ctor), key)
+            .is_some()
+        {
+            continue;
+        }
+        ctx.define_data_prop_with_attrs(
+            ctor,
+            prop,
+            value,
+            v12_heap::Attrs::new(false, false, true),
+        );
+    }
+}
+
+/// Group 4 — the symbol-keyed protocol methods `%RegExp.prototype%[@@match]`,
+/// `[@@matchAll]`, `[@@replace]`, `[@@search]`, `[@@split]` (ES 22.2.7).
+///
+/// Kept out of the `define_builtins!` table for the same reason as
+/// [`install_string_regex_methods`]: a compile-time dispatch arm would pre-empt
+/// the registry's step-2 match, the only place the per-registry compiled-pattern
+/// cache is supplied. It is also the only part of the surface that needs a
+/// *symbol* key, which the string-keyed macro cannot express.
+///
+/// The `@@match` family of well-known symbols does not exist yet when
+/// `install_builtins` runs (the realm mints its canonical set strictly after the
+/// main pass), so each one is minted here and written into the `Symbol`
+/// constructor's slot, replacing the placeholder handler function the macro
+/// installed — the same `overwrite_data_prop` swap the realm performs for
+/// `toPrimitive` and `species`. Minting and keying must use the *same* handle or
+/// the JS read `re[Symbol.match]` would compute a key the method is not stored
+/// under. `@@species` is the exception: the realm's canonical handle must be
+/// reused, so `RegExp[@@species]` is installed by [`install_regexp_species`].
+fn install_regexp_protocol(heap: &mut Heap, targets: &BuiltinTargets) {
+    let Some(symbol_ctor) = targets.symbol else {
+        return;
+    };
+    let Some((_ctor, proto)) = regexp_proto(heap, targets.global) else {
+        return;
+    };
+    let mut ctx = Ctx::new(heap, None, None);
+    let protocol: [(&str, NativeId, u32); 5] = [
+        ("match", NativeId::RegExpSymbolMatch, 1),
+        ("matchAll", NativeId::RegExpSymbolMatchAll, 1),
+        ("replace", NativeId::RegExpSymbolReplace, 2),
+        ("search", NativeId::RegExpSymbolSearch, 1),
+        ("split", NativeId::RegExpSymbolSplit, 2),
+    ];
+    for (name, id, len) in protocol {
+        let sym = ctx.fresh_symbol();
+        install_well_known_symbol(&mut ctx, symbol_ctor, name, sym);
+        install_symbol_method(&mut ctx, proto, sym, id, &format!("[Symbol.{name}]"), len);
+    }
+}
+
+/// Publishes a well-known symbol on the `Symbol` constructor with the spec
+/// attributes `{ writable: false, enumerable: false, configurable: false }`.
+///
+/// The macro's `Symbol` group installed a *handler function* placeholder for
+/// each name it knew about, so most of these overwrite an existing slot (the
+/// same `overwrite_data_prop` swap the realm performs for `toPrimitive` and
+/// `species`). `matchAll` is the exception: the macro never declared it, so the
+/// slot has to be created here. Either way the value written is this function's
+/// own handle, which is what makes `re[Symbol.match]` compute a key the method
+/// is actually stored under.
+fn install_well_known_symbol(
+    ctx: &mut Ctx,
+    symbol_ctor: v12_heap::Handle<v12_heap::JsObject>,
+    name: &str,
+    sym: Handle<v12_heap::V12Symbol>,
+) {
+    let spec_attrs = v12_heap::Attrs::new(false, false, false);
+    if ctx.redefine_data_prop_with_attrs(symbol_ctor, name, JsValue::symbol(sym), spec_attrs) {
+        return;
+    }
+    ctx.define_data_prop_with_attrs(symbol_ctor, name, JsValue::symbol(sym), spec_attrs);
+}
+
+/// Allocates a symbol-keyed method (`CreateBuiltinFunction` + the symbol
+/// install) for the RegExp protocol surface. `length` and the `[Symbol.x]`
+/// function name are stamped with the spec attrs before the install.
+fn install_symbol_method(
+    ctx: &mut Ctx,
+    proto: v12_heap::Handle<v12_heap::JsObject>,
+    sym: Handle<v12_heap::V12Symbol>,
+    id: NativeId,
+    fname: &str,
+    len: u32,
+) {
+    let func = ctx.alloc_obj(v12_heap::JsObject {
+        kind: v12_heap::Kind::Function,
+        callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+        ..Default::default()
+    });
+    let len_v = JsValue::from_i32_smi(len as i32).expect("protocol arity fits Smi");
+    ctx.define_data_prop_with_attrs(
+        func,
+        "length",
+        len_v,
+        v12_heap::Attrs::new(false, false, true),
+    );
+    let name_h = ctx.heap.intern_text(fname);
+    ctx.define_data_prop_with_attrs(
+        func,
+        "name",
+        JsValue::string(name_h),
+        v12_heap::Attrs::new(false, false, true),
+    );
+    // `RegExp.prototype[@@x]` is `{ writable: true, enumerable: false,
+    // configurable: true }` — the same shape as every other prototype method.
+    ctx.define_symbol_data_prop_with_attrs(
+        proto,
+        sym,
+        JsValue::object(func),
+        v12_heap::Attrs::BUILTIN,
+    );
+}
+
+/// `get RegExp [ @@species ]` (ES 22.2.6.4).
+///
+/// Separate from [`install_regexp_surface`] because it must be keyed on the
+/// *realm's* canonical `Symbol.species`, which only exists once the realm has
+/// minted its well-known symbols — strictly after the main install pass, the
+/// same ordering that forces `install_reflect_builtins` out of
+/// `install_builtins`. The realm calls this where it installs
+/// `Promise [ @@species ]`.
+pub fn install_regexp_species(heap: &mut Heap, species: Handle<v12_heap::V12Symbol>) {
+    let global = heap.realm_globals().first().copied();
+    let Some(global) = global else { return };
+    let mut ctx = Ctx::new(heap, Some(global), None);
+    let Some(ctor) = ctx.intrinsic("RegExp").and_then(|v| v.as_object()) else {
+        return;
+    };
+    ctx.define_symbol_getter(
+        ctor,
+        species,
+        NativeId::RegExpSymbolSpeciesGet,
+        "get [Symbol.species]",
+        0,
+    );
 }
 
 /// Installs the regexp-backed `String.prototype` methods
@@ -907,6 +1206,14 @@ macro_rules! define_builtins {
             // Keyed promise combinators: the one install this pass makes that
             // the macro's target table cannot express (see the function's doc).
             install_keyed_promise_combinators(heap);
+            // The `%RegExp.prototype%` surface, one pass per spec group. Same
+            // reasoning as the string methods above: the bodies need the
+            // registry's step-2 arms (regex cache), and the symbol-keyed ones
+            // cannot ride the string-keyed macro at all.
+            install_regexp_accessors(heap, targets.global);
+            install_regexp_last_index(heap, targets.global);
+            install_regexp_methods(heap, targets.global);
+            install_regexp_protocol(heap, targets);
         }
     };
 }
