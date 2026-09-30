@@ -314,18 +314,12 @@ pub enum NativeId {
     SymbolProtoToString = 2503,
     SymbolProtoValueOf = 2504,
     SymbolProtoDescription = 2505,
-    SymbolWellKnownIterator = 2506,
-    SymbolWellKnownAsyncIterator = 2507,
-    SymbolWellKnownHasInstance = 2508,
-    SymbolWellKnownIsConcatSpreadable = 2509,
-    SymbolWellKnownMatch = 2510,
-    SymbolWellKnownReplace = 2511,
-    SymbolWellKnownSearch = 2512,
-    SymbolWellKnownSpecies = 2513,
-    SymbolWellKnownSplit = 2514,
-    SymbolWellKnownToPrimitive = 2515,
-    SymbolWellKnownToStringTag = 2516,
-    SymbolWellKnownUnscopables = 2517,
+    // The `25xx` band *had* twelve `SymbolWellKnown*` ids here. A well-known
+    // symbol is data, not behaviour, so they are gone: the values now come from
+    // `v12_heap::WellKnownSymbol` and `Heap::well_known_symbol`, and
+    // `builtins::symbol::install_well_known_singletons` publishes them. The band
+    // is left as a hole rather than renumbered, so the ids that survive keep
+    // their serialized values.
     // Iterator
     IteratorNext = 2200,
     IteratorSelf = 2204,
@@ -549,17 +543,9 @@ pub enum NativeId {
     // append-only: the discriminants above are stable and a future insertion
     // must never renumber them.
     //
-    // Well-known `Symbol` properties (ECMA-262 20.4.2). These differ from the
-    // `25xx` family above in *how they are installed*: the `25xx` entries
-    // install a handler function that the realm later overwrites with the
-    // realm's canonical symbol, because the well-known symbol has to be
-    // addressable as a key. These two have no engine-internal consumer yet, so
-    // they install the singleton itself as the property value — see
-    // `builtins::install_value_with_attrs`.
-    /// `Symbol.dispose`.
-    SymbolWellKnownDispose = 3500,
-    /// `Symbol.asyncDispose`.
-    SymbolWellKnownAsyncDispose = 3501,
+    // `SymbolWellKnownDispose = 3500` and `SymbolWellKnownAsyncDispose = 3501`
+    // used to live here, like the `25xx` family. They went the same way: the
+    // well-known symbols are data, so the `35xx` band starts at `SetUnion`.
     // Set methods (ECMA-262 24.2.3, the "new Set methods" proposal).
     /// `Set.prototype.union(other)`.
     SetUnion = 3502,
@@ -608,6 +594,72 @@ impl From<NativeId> for u32 {
     fn from(id: NativeId) -> u32 {
         id as u32
     }
+}
+
+/// Whether this native's function object has **no** `[[Construct]]` internal
+/// method, so `new` on it is a `TypeError` rather than a call to the handler.
+///
+/// Spec 10.4.1: *"Built-in function objects that are not identified as
+/// constructors do not implement the [[Construct]] internal method unless
+/// otherwise specified."* So the default for a built-in is *non*-constructible
+/// and a constructor has to opt in. The engine reaches the opposite default:
+/// `Interp::prepare_construct` routes every out-of-range native index to its
+/// handler with the function object as `this`, which is right for the handlers
+/// that brand-check (`Set.prototype.has` on a fresh instance throws) and wrong
+/// for the ones that ignore `this` entirely and would happily build a value.
+///
+/// This is that opt-out list, and it is a *deny* list on purpose: an allow-list
+/// of constructors would have to be exhaustive across ~200 ids, and a missing
+/// entry is a silently constructible method, whereas a missing entry here is at
+/// worst a redundant `TypeError` on a method that would have thrown anyway.
+///
+/// The three `Iterator` statics are the whole list today. Each has a
+/// `non-constructible.js` in the corpus, and each ignores `this`, so nothing
+/// else rejects `new` for them. `Iterator.from` is deliberately absent: its
+/// `non-constructible.js` passes today because `Iterator.from()` with no
+/// argument reaches the argument validation first, which is an accident of
+/// argument checking rather than the absence of `[[Construct]]`.
+///
+/// `PromiseCombinatorElement` is *not* here — it is a per-call
+/// `CreateBuiltinFunction`, never a registry index, and is special-cased at the
+/// two interp sites that can see it.
+pub fn is_non_constructible(id: NativeId) -> bool {
+    matches!(
+        id,
+        NativeId::IteratorConcat
+            | NativeId::IteratorZip
+            | NativeId::IteratorZipKeyed
+            | NativeId::PromiseAllKeyed
+            | NativeId::PromiseAllSettledKeyed
+    )
+}
+
+/// The mirror of [`is_non_constructible`]: the natives that *do* implement
+/// `[[Construct]]`, for the `IsConstructor` checks that live in engine code
+/// with no program table to consult.
+///
+/// This is a hand-maintained copy of `Interp::native_constructor_id`, and it has
+/// to stay equal to it: the interpreter answers `IsConstructor` exactly (it can
+/// see the `is_arrow` flag and the in-range function table), the engine answers
+/// it from this list, and a native in one and not the other is a receiver that
+/// is constructible in one context and not the other. The two are pinned
+/// against each other by `constructor_id_sets_agree` in this module's tests.
+pub fn native_is_constructor_id(id: NativeId) -> bool {
+    matches!(
+        id,
+        NativeId::ObjectConstruct
+            | NativeId::ArrayConstruct
+            | NativeId::BooleanConstruct
+            | NativeId::PromiseConstruct
+            | NativeId::ErrorCreate
+            | NativeId::TypeErrorCreate
+            | NativeId::RangeErrorCreate
+            | NativeId::ReferenceErrorCreate
+            | NativeId::SyntaxErrorCreate
+            | NativeId::EvalErrorCreate
+            | NativeId::UriErrorCreate
+            | NativeId::AggregateErrorCreate
+    )
 }
 
 /// A `u32` that does not name any [`NativeId`].

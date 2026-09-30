@@ -186,13 +186,16 @@ fn intrinsic_slot(text: &str) -> Option<usize> {
 }
 
 /// The internal-slot property reads on a RegExp object, in the order the
-/// realm materializes them in the object's `properties` vector (`source`,
-/// `flags`, `lastIndex`). Match on this enum, never on the raw slot numbers.
+/// realm materializes them in the object's `elements` vector (`source`,
+/// `flags`). Match on this enum, never on the raw slot numbers.
+///
+/// `lastIndex` used to be a third variant here, read out of `properties`. It is
+/// a real own data property now (ES 10.4.1), so it goes through the ordinary
+/// property path — see `Interp::regexp_slot`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegExpSlot {
     Source,
     Flags,
-    LastIndex,
 }
 
 /// Compile-time guard: every name in [`GLOBAL_INTRINSIC_NAMES`] must resolve
@@ -287,7 +290,10 @@ const WK_RETURN: usize = 16;
 const WK_THROW: usize = 17;
 const WK_SOURCE: usize = 18;
 const WK_FLAGS: usize = 19;
-const WK_LAST_INDEX: usize = 20;
+// Index 20 of `WELL_KNOWN_NAMES` is "lastIndex" and has no `WK_` constant: it
+// is a real own data property on a RegExp instance (ES 10.4.1), so no surface
+// probe needs an interned-key shortcut for it. The table entry stays so the
+// indices above and below keep their numbering.
 const WK_IS_ARRAY: usize = 21;
 const WK_CALL: usize = 22;
 const WK_APPLY: usize = 23;
@@ -2031,22 +2037,6 @@ impl<'a> Interp<'a> {
                 v12_native::lookup_method(kind, std::str::from_utf8(&bytes).ok()?)
             }
             _ => None,
-        }
-    }
-
-    /// Compares a key value's string text against `text` (flattening first).
-    /// The flatten is defensive — an O(1) no-op when the entry already ran
-    /// [`Self::flatten_key`] — so every surface probe stays correct whether
-    /// or not the caller pre-flattened.
-    fn key_is(&mut self, key_v: JsValue, text: &str) -> bool {
-        let Some(handle) = key_v.as_string() else {
-            return false;
-        };
-        self.heap.flatten(handle);
-        match &self.heap.get(handle).storage {
-            v12_heap::StrStorage::Latin1(bytes) => bytes == text.as_bytes(),
-            v12_heap::StrStorage::Utf16(units) => units.iter().copied().eq(text.encode_utf16()),
-            _ => false,
         }
     }
 

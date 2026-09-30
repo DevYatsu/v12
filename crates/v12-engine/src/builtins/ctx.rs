@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use v12_heap::{Handle, Heap, JsObject, JsValue};
-use v12_native::Throw;
+use v12_native::{NativeId, Throw};
 
 use super::helpers;
 use crate::job_queue::Job;
@@ -278,7 +278,68 @@ impl<'a> Ctx<'a> {
         Ok(obj)
     }
 
-    /// ES `ToNumber` subset: Smi/double pass through; `true`→1.0,
+    /// ES `IsConstructor(v)` as far as the heap alone can answer it.
+    ///
+    /// Needed by the two spec algorithms that gate on it from inside a
+    /// `&mut Ctx` body — `NewPromiseCapability` (27.2.3.1 step 1, so
+    /// `Promise.allKeyed.call(eval)` is a `TypeError`) and `SpeciesConstructor`
+    /// (7.3.24 step 8, so a `@@species` of `true` is a `TypeError`).
+    ///
+    /// **This over-approximates, in one direction only.** A `Kind::Function`
+    /// carries a `FunctionTarget::Bytecode(idx)`, and `idx` is an index into
+    /// *either* the owning program's function table (a real closure) *or* the
+    /// `NativeId` space (an engine native) — the two number spaces overlap, and
+    /// telling them apart needs the per-program table that only the interpreter
+    /// has (`Interp::is_constructor_object` makes the exact call by comparing
+    /// against `functions_for_program(len)`). So a bytecode target is reported
+    /// **constructible** unless it is on the explicit
+    /// [`v12_native::is_non_constructible`] deny-list. The error is always a
+    /// *missing* `TypeError` for a non-constructor static used as a receiver
+    /// (`Promise.allKeyed.call(Promise.all)`), never a spurious one for
+    /// something constructible — which is why `ctx-ctor-constructed.js`, whose
+    /// receiver is an ordinary function declaration, is answered correctly.
+    ///
+    /// The arms that *are* exact are the ones the corpus actually exercises: a
+    /// realm-bound `eval`, a `Host` closure and a bare `Native` function are all
+    /// reported non-constructible, and a `Bound` function forwards to its
+    /// target.
+    pub fn is_constructor(&self, v: JsValue) -> bool {
+        let Some(obj) = v.as_object() else {
+            return false;
+        };
+        let js = self.heap.get(obj);
+        match js.kind {
+            v12_heap::Kind::Function => match js.callable {
+                // A host closure and a bare `Native` function have no
+                // `[[Construct]]`; a realm-bound `eval` is spec-explicitly not
+                // a constructor.
+                v12_heap::FunctionTarget::Native(_)
+                | v12_heap::FunctionTarget::Host(_)
+                | v12_heap::FunctionTarget::RealmEval(_) => false,
+                // A bound function is constructible iff its target is.
+                v12_heap::FunctionTarget::Bound(state) => self
+                    .heap
+                    .get(state)
+                    .elements
+                    .first()
+                    .copied()
+                    .is_some_and(|target| self.is_constructor(target)),
+                // Constructible unless it is on the deny-list. See the doc
+                // comment: this arm cannot tell a closure from a native.
+                v12_heap::FunctionTarget::Bytecode(idx) => {
+                    !NativeId::try_from(idx).is_ok_and(v12_native::is_non_constructible)
+                }
+            },
+            v12_heap::Kind::Proxy => self
+                .heap
+                .get(obj)
+                .proxy_target
+                .is_some_and(|t| self.is_constructor(JsValue::object(t))),
+            _ => false,
+        }
+    }
+
+    /// ES ToNumber subset: Smi/double pass through; `true`→1.0,
     /// `false`/`null`→0.0, `undefined`→NaN; a string is trimmed
     /// (empty→0.0, else parsed as f64, failure→NaN); objects → NaN.
     pub fn to_number(&mut self, v: JsValue) -> f64 {
@@ -938,16 +999,6 @@ impl<'a> Ctx<'a> {
         }
         settings.properties[slot] = value;
         settings.property_keys[slot] = Some(key);
-    }
-
-    /// Mints a fresh, rooted symbol (identity is the handle) for a well-known
-    /// `Symbol` property value. Deliberately NOT registered with
-    /// `Heap::symbol_for_key`, so `Symbol.keyFor` returns `undefined` for it
-    /// per spec.
-    pub fn fresh_symbol(&mut self) -> Handle<v12_heap::V12Symbol> {
-        let h = self.heap.alloc(v12_heap::V12Symbol);
-        self.heap.add_root(JsValue::symbol(h));
-        h
     }
 }
 

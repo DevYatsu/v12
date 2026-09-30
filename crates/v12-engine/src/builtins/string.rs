@@ -208,9 +208,9 @@ fn collect_match_spans(
         }
         spans.push((s, e, groups));
         // Zero-width guard (`lastIndex` counts UTF-16 units).
-        let li = regexp::last_index(ctx.heap, re);
+        let li = regexp::last_index(ctx, re);
         if li <= start {
-            regexp::set_last_index(ctx.heap, re, start + 1.0);
+            regexp::set_last_index(ctx, re, start + 1.0)?;
         }
         start = li;
         if start > units_len as f64 || !global {
@@ -458,9 +458,7 @@ pub fn string_split(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     } else {
         let source_h = ctx.heap.intern_text(&source);
         let flags_h = ctx.heap.intern_text(&format!("{flags}g"));
-        let h = ctx.alloc_obj(v12_heap::JsObject::regexp(source_h, flags_h));
-        regexp::link_regexp_proto(ctx, h);
-        h
+        regexp::alloc_regexp_from_handles(ctx, source_h, flags_h)
     };
     let text_h = ctx.heap.intern_text(&text);
     let spans = collect_match_spans(ctx, splitter, text_h, &text, true)?;
@@ -979,7 +977,9 @@ pub fn string_from_code_point(
             units.push(0xDC00 + (rest & 0x3FF) as u16);
         }
     }
-    Ok(JsValue::string(ctx.heap.intern_string(V12Str::utf16(units))))
+    Ok(JsValue::string(
+        ctx.heap.intern_string(V12Str::utf16(units)),
+    ))
 }
 
 /// `String.prototype.trimLeft` – Annex B alias of `trimStart`.
@@ -1095,7 +1095,7 @@ pub fn string_match_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resul
     }
     let text_h = ctx.heap.intern_text(&text);
     let units_len: usize = text.chars().map(char::len_utf16).sum();
-    regexp::set_last_index(ctx.heap, re, 0.0);
+    regexp::set_last_index(ctx, re, 0.0)?;
     let mut matches = Vec::new();
     let mut start = 0.0;
     loop {
@@ -1104,9 +1104,9 @@ pub fn string_match_all(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resul
             break;
         }
         matches.push(m);
-        let li = regexp::last_index(ctx.heap, re);
+        let li = regexp::last_index(ctx, re);
         if li <= start {
-            regexp::set_last_index(ctx.heap, re, start + 1.0);
+            regexp::set_last_index(ctx, re, start + 1.0)?;
         }
         start = li;
         if start > units_len as f64 {

@@ -315,10 +315,16 @@ impl Realm {
         // realm needs (the macro's Symbol group installed a *handler
         // function* for it; the Promise surface below replaces that slot
         // with the real symbol, exactly as `toPrimitive` does for Date).
-        let (symbol_iterator, symbol_to_string_tag, symbol_species) = {
-            let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
-            (ctx.fresh_symbol(), ctx.fresh_symbol(), ctx.fresh_symbol())
-        };
+        // Taken from the heap's agent-wide well-known table, not minted per
+        // realm: ES 20.4.2.1 shares these across realms, which is what
+        // `Symbol/*/cross-realm.js` asserts. A per-realm mint made
+        // `otherRealm.Symbol.iterator` a different symbol from this realm's, so
+        // an object from one realm was not iterable in the other.
+        let (symbol_iterator, symbol_to_string_tag, symbol_species) = (
+            heap.well_known_symbol(v12_heap::WellKnownSymbol::Iterator),
+            heap.well_known_symbol(v12_heap::WellKnownSymbol::ToStringTag),
+            heap.well_known_symbol(v12_heap::WellKnownSymbol::Species),
+        );
         // `RegExp.prototype`: the spec's `%RegExp.prototype%` is an ordinary
         // object; the interpreter synthesizes the method surface from
         // `Kind::RegExp`, so no own props are stamped here. Linking it at
@@ -570,19 +576,12 @@ impl Realm {
                 JsValue::string(proto_tag),
                 v12_heap::Attrs::new(false, false, true),
             );
-            // `Symbol.species`: the macro installed a handler *function* in
-            // that slot, so overwrite it with this realm's canonical symbol
-            // (the `toPrimitive` fix below does the same for its own well-known
-            // symbol).
-            if let Some(symbol_ctor) = intrinsics.get("Symbol").and_then(|v| v.as_object()) {
-                ctx.overwrite_data_prop(symbol_ctor, "species", JsValue::symbol(symbol_species));
-            }
-            // `get RegExp [ @@species ]` (ES 22.2.6.4). Installed here for the
-            // same reason as the Promise line above: `@@species` is only
-            // canonical once this realm's well-known symbols exist, which is
-            // strictly after the main install pass that installs the rest of
-            // the `%RegExp.prototype%` surface.
-            crate::builtins::install_regexp_species(heap, symbol_species);
+            // `get RegExp [ @@species ]` (ES 22.2.6.4). Installed here because
+            // `RegExp [ @@species ]` is keyed on a symbol, which the
+            // string-keyed macro cannot express. No `Symbol.species` overwrite
+            // is needed: `install_well_known_singletons` already published the
+            // shared handle and `symbol_species` *is* that handle.
+            crate::builtins::install_regexp_species(heap, global, symbol_species);
         }
         // `%Promise.prototype%`'s [[Prototype]] is `%Object.prototype%`; the
         // prototype was allocated before `object_proto` existed, so the link
@@ -679,20 +678,17 @@ impl Realm {
                 Some(0),
             );
             // `Date.prototype[Symbol.toPrimitive]`: needs a symbol key, so it
-            // cannot ride the macro's string install. The realm's
-            // `Symbol.toPrimitive` value must itself be a symbol; the macro
-            // installed a handler *function* for it, so overwrite that slot
-            // with a fresh well-known symbol first.
+            // cannot ride the macro's string install. `Symbol.toPrimitive`'s
+            // value is read from the shared table rather than overwritten into
+            // the slot: the macro no longer installs a handler function there,
+            // so there is nothing to replace, and a replace would risk
+            // publishing a *second* symbol under the same name.
             {
-                let symbol_ctor = intrinsics.get("Symbol").and_then(|v| v.as_object());
-                if let Some(symbol_ctor) = symbol_ctor {
+                {
                     let mut ctx = crate::builtins::Ctx::new(heap, Some(global), None);
-                    let to_prim_sym = ctx.fresh_symbol();
-                    ctx.overwrite_data_prop(
-                        symbol_ctor,
-                        "toPrimitive",
-                        JsValue::symbol(to_prim_sym),
-                    );
+                    let to_prim_sym = ctx
+                        .heap
+                        .well_known_symbol(v12_heap::WellKnownSymbol::ToPrimitive);
                     // Allocate the method function and stamp spec `length` +
                     // `name` (the symbol spelling), then install it under the
                     // symbol key.

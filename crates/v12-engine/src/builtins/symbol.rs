@@ -10,29 +10,24 @@
 //! the reverse map. Well-known singletons keep their existing O(1) paths
 //! (interpreter surface + install layer) and never consult the registry.
 //!
-//! Well-known singleton contract: the JS-visible identity of a well-known
-//! symbol is the *value installed on the `Symbol` constructor*, and nothing
-//! else. There are two install routes and both end in a shape-bound data
-//! property, so a read is always an ordinary property lookup and never a
-//! dispatch:
+//! Well-known symbols are **shared by all realms** (ES 20.4.2.1): they belong
+//! to the agent, not to a realm, so `Symbol.matchAll` is the same value in two
+//! realms on the same heap. Every realm in v12 shares one heap, so the agent is
+//! [`v12_heap::Heap`]'s `well_known` table and
+//! [`install_well_known_singletons`] publishes its handles on each realm's
+//! `Symbol` constructor. Because the table is the only source, identity holds
+//! by construction — `Symbol.matchAll === Symbol.matchAll`,
+//! `Symbol.matchAll === otherRealm.Symbol.matchAll`, and the engine's protocol
+//! methods key on the same handles the script reads.
 //!
-//! 1. The realm allocates a canonical symbol per name and **overwrites** the
-//!    macro's handler-function placeholder with it (`realm.rs`,
-//!    `overwrite_data_prop`) — used for `@@iterator`, `@@toPrimitive`,
-//!    `@@toStringTag`, `@@species`, and `@@asyncIterator`, which the engine
-//!    addresses as keys and so must be the same handle everywhere.
-//! 2. [`symbol_well_known`] is evaluated **once, at install time**, and its
-//!    result is stored as the property value
-//!    ([`super::install_value_with_attrs`]) — used for `@@dispose` and
-//!    `@@asyncDispose`, which have no engine-internal consumer.
-//!
-//! Either way the property *is* the singleton, so `Symbol.dispose ===
-//! Symbol.dispose` holds by construction rather than by a cache. The handler
-//! is shared by every well-known id and cannot key a per-name cache itself;
-//! that is why it is free to mint a fresh symbol on each of the (at most
-//! one) evaluations it ever sees.
+//! Minting per realm instead (what this used to do, through a shared
+//! `symbol_well_known` handler that could not tell which name it was being
+//! called for and so minted a fresh symbol per install) is what the thirteen
+//! `Symbol/*/cross-realm.js` tests caught: an object built in one realm was not
+//! iterable in the other, because the two realms' `Symbol.iterator` were
+//! different symbols.
 
-use v12_heap::{Handle, JsValue};
+use v12_heap::{Handle, Heap, JsObject, JsValue};
 use v12_native::Throw;
 
 use super::ctx::Ctx;
@@ -154,7 +149,8 @@ fn well_known_description(ctx: &mut Ctx, sym: Handle<v12_heap::V12Symbol>) -> Op
             .lookup_property(shape, prop)
             .and_then(|d| d.slot())
             .and_then(|slot| ctx.heap.get(ctor).properties.get(slot as usize))
-            .and_then(|v| v.as_symbol()) == Some(sym);
+            .and_then(|v| v.as_symbol())
+            == Some(sym);
         if hit {
             return Some(format!("Symbol.{wk}"));
         }
@@ -189,22 +185,38 @@ const WELL_KNOWN_SYMBOL_NAMES: &[&str] = &[
     "asyncDispose",
 ];
 
-/// Well-known symbols: mints the symbol that becomes this realm's singleton.
+/// Publishes every well-known symbol on the `Symbol` constructor, from the
+/// heap's agent-wide table (ES 20.4.2.1: well-known symbols are *shared by all
+/// realms*).
 ///
-/// The handler is shared by every well-known id and cannot key a per-name
-/// cache itself — it is never *called* for a normal read. The install path
-/// (`builtins::install_value_with_attrs`) evaluates it exactly once, at
-/// install time, and stores the result as the property value, so the stored
-/// value *is* the singleton: every later read is an ordinary shape lookup and
-/// observes the same handle. That is why this can mint freely, and why
-/// `Symbol.dispose === Symbol.dispose` holds.
+/// The `define_builtins!` groups used to install a *handler function*
+/// placeholder in each of these slots, and `symbol_well_known`'s job was to be
+/// called once per name with its return value stored — but it could not tell
+/// which name it was being called for, so it minted freely and the result was
+/// per-realm and per-install. One loop over [`v12_heap::WellKnownSymbol::ALL`]
+/// replaces both the handler indirection and the per-realm mint: each slot is
+/// written with the one handle the table holds for that name, so
+/// `Symbol.matchAll === otherRealm.Symbol.matchAll` and
+/// `Symbol.dispose === Symbol.dispose` both hold by construction.
+///
+/// A `Symbol` property that is already absent is *created*; one that is present
+/// is overwritten, which is what `redefine_data_prop_with_attrs` is for. Either
+/// way the attributes are the spec's `{writable: false, enumerable: false,
+/// configurable: false}` — `Symbol/dispose/prop-desc.js` and its fourteen
+/// siblings `verifyProperty` exactly that, and the macro's `{true, false,
+/// true}` default is what had them failing.
 ///
 /// Nothing registers the result with `Heap::symbol_for_key`, so
 /// `Symbol.keyFor` answers `undefined` for it per 20.4.2.
-pub fn symbol_well_known(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    _args: &[JsValue],
-) -> Result<JsValue, Throw> {
-    Ok(fresh_symbol(ctx))
+pub fn install_well_known_singletons(heap: &mut Heap, symbol_ctor: Handle<JsObject>) {
+    let mut ctx = Ctx::new(heap, None, None);
+    for which in v12_heap::WellKnownSymbol::ALL {
+        let sym = ctx.heap.well_known_symbol(which);
+        let name = which.name();
+        let spec_attrs = v12_heap::Attrs::new(false, false, false);
+        let value = JsValue::symbol(sym);
+        if !ctx.redefine_data_prop_with_attrs(symbol_ctor, name, value, spec_attrs) {
+            ctx.define_data_prop_with_attrs(symbol_ctor, name, value, spec_attrs);
+        }
+    }
 }

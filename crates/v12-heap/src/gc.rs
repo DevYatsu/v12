@@ -324,6 +324,22 @@ pub struct Heap {
     /// Reverse map for `Symbol.keyFor`: symbol slot index → key string.
     symbol_registry_reverse: rustc_hash::FxHashMap<u32, String>,
 
+    /// The shared well-known symbols (ES 20.4.2 table 2), one slot per
+    /// [`WellKnownSymbol`], lazily minted.
+    ///
+    /// Spec 20.4.2.1: the well-known symbols are *"shared by all realms"* —
+    /// they belong to the **agent**, not to a realm, which is why
+    /// `Symbol.matchAll === otherRealm.Symbol.matchAll` is observable and
+    /// thirteen `Symbol/*/cross-realm.js` tests assert it. Every realm in v12
+    /// shares one heap, so "the agent" is exactly this table, and the same
+    /// lifetime argument as `symbol_registry` applies: the handles are marked
+    /// as roots at every collection because a well-known symbol's identity must
+    /// not depend on whether anything still references it.
+    ///
+    /// A plain `Vec<Option<Handle<..>>>` rather than an array of handles so a
+    /// realm that never asks for `@@unscopables` never allocates one.
+    well_known: Vec<Option<Handle<V12Symbol>>>,
+
     /// Shape-chain stub cache (own + validity-guarded proto entries). Plain
     /// metadata: handles inside are never traced — entries are harmless
     /// when stale (identity + verifies fail) and the table is
@@ -400,6 +416,7 @@ impl Heap {
             pinned_roots: Vec::new(),
             symbol_registry: rustc_hash::FxHashMap::default(),
             symbol_registry_reverse: rustc_hash::FxHashMap::default(),
+            well_known: Vec::new(),
             stub_cache: StubCache::new(),
             proto_generation: 0,
             policy,
@@ -514,6 +531,25 @@ impl Heap {
         if !self.pinned_roots.contains(&object) {
             self.pinned_roots.push(object);
         }
+    }
+
+    /// The shared well-known symbol for `which`, minting it on first use.
+    ///
+    /// Every realm on this heap gets the same handle, which is what
+    /// `Symbol.matchAll === otherRealm.Symbol.matchAll` requires (ES 20.4.2.1:
+    /// well-known symbols are shared by all realms). Mints are O(1) after the
+    /// first, and the result is a permanent GC root.
+    pub fn well_known_symbol(&mut self, which: WellKnownSymbol) -> Handle<V12Symbol> {
+        let idx = which as usize;
+        if idx >= self.well_known.len() {
+            self.well_known.resize(idx + 1, None);
+        }
+        if let Some(h) = self.well_known[idx] {
+            return h;
+        }
+        let h = self.alloc(V12Symbol);
+        self.well_known[idx] = Some(h);
+        h
     }
 
     /// `Symbol.for` shared symbol for `key`: the registered handle on a
@@ -1484,6 +1520,13 @@ impl Heap {
         for &handle in self.symbol_registry.values() {
             collector.mark(Space::Symbols, handle.index());
         }
+        // The well-known symbols are permanent roots for the same reason, and
+        // one more: their identity is agent-wide (ES 20.4.2.1), so a collection
+        // that dropped one would make a later `Symbol.match` a *different*
+        // symbol than the one the engine keys its protocol methods on.
+        for slot in self.well_known.iter().flatten() {
+            collector.mark(Space::Symbols, slot.index());
+        }
 
         while let Some((space, index)) = collector.work.pop() {
             let mut sink = MarkSink {
@@ -2153,5 +2196,86 @@ mod tests {
         // A second call with the same attrs returns the same cached child.
         let again = heap.update_data_attrs(with_x, key, Attrs::BUILTIN);
         assert_eq!(again, reconfigured);
+    }
+}
+
+/// One of the shared well-known symbols of ES 20.4.2 table 2.
+///
+/// The discriminants index [`Heap::well_known`] and nothing else, so inserting
+/// a variant must go at the end — the *order* is not the spec's and is not
+/// observable; only the identity is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum WellKnownSymbol {
+    AsyncIterator,
+    HasInstance,
+    IsConcatSpreadable,
+    Iterator,
+    Match,
+    MatchAll,
+    Replace,
+    Search,
+    Species,
+    Split,
+    ToPrimitive,
+    ToStringTag,
+    Unscopables,
+    Dispose,
+    AsyncDispose,
+}
+
+impl WellKnownSymbol {
+    /// The `Symbol` constructor property name, which is also the spec spelling
+    /// of the symbol's `[[Description]]` (20.4.2).
+    pub const fn name(self) -> &'static str {
+        match self {
+            WellKnownSymbol::AsyncIterator => "asyncIterator",
+            WellKnownSymbol::HasInstance => "hasInstance",
+            WellKnownSymbol::IsConcatSpreadable => "isConcatSpreadable",
+            WellKnownSymbol::Iterator => "iterator",
+            WellKnownSymbol::Match => "match",
+            WellKnownSymbol::MatchAll => "matchAll",
+            WellKnownSymbol::Replace => "replace",
+            WellKnownSymbol::Search => "search",
+            WellKnownSymbol::Species => "species",
+            WellKnownSymbol::Split => "split",
+            WellKnownSymbol::ToPrimitive => "toPrimitive",
+            WellKnownSymbol::ToStringTag => "toStringTag",
+            WellKnownSymbol::Unscopables => "unscopables",
+            WellKnownSymbol::Dispose => "dispose",
+            WellKnownSymbol::AsyncDispose => "asyncDispose",
+        }
+    }
+
+    /// Every well-known symbol, in spec table order.
+    pub const ALL: [WellKnownSymbol; 15] = [
+        WellKnownSymbol::AsyncIterator,
+        WellKnownSymbol::HasInstance,
+        WellKnownSymbol::IsConcatSpreadable,
+        WellKnownSymbol::Iterator,
+        WellKnownSymbol::Match,
+        WellKnownSymbol::MatchAll,
+        WellKnownSymbol::Replace,
+        WellKnownSymbol::Search,
+        WellKnownSymbol::Species,
+        WellKnownSymbol::Split,
+        WellKnownSymbol::ToPrimitive,
+        WellKnownSymbol::ToStringTag,
+        WellKnownSymbol::Unscopables,
+        WellKnownSymbol::Dispose,
+        WellKnownSymbol::AsyncDispose,
+    ];
+}
+
+impl WellKnownSymbol {
+    /// The variant for a `Symbol` constructor property name, or `None` for a
+    /// name that is not a well-known symbol.
+    ///
+    /// The engine reaches the table through names in two places — the RegExp
+    /// protocol install and the well-known-singleton install — and a name lookup
+    /// keeps the two from having to agree on an ordering. A name that is *not*
+    /// well-known is a caller bug, so it returns `None` rather than guessing.
+    pub fn from_name(name: &str) -> Option<Self> {
+        WellKnownSymbol::ALL.into_iter().find(|w| w.name() == name)
     }
 }

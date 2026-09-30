@@ -150,6 +150,25 @@ impl NativeRegistry {
         let global = heap.realm_globals().first().copied();
         Ctx::new(heap, global, Some(Rc::clone(&self.pending)))
     }
+
+    /// `Ctx` for the RegExp family: the per-registry compiled-pattern cache
+    /// plus the primary realm's global, for the same reason [`Self::promise_ctx`]
+    /// carries one.
+    ///
+    /// The global is not optional bookkeeping. `Ctx::type_error` reaches
+    /// `registry::error_object`, which links the error's `[[Prototype]]` (and so
+    /// its `constructor`) *from the global's intrinsic table*. With `None` the
+    /// error is still allocated with the right `name`/`message` own properties,
+    /// but it is a bare object: `e instanceof TypeError` is `false`,
+    /// `e.constructor` is `undefined`, and `assert.throws(TypeError, …)` — which
+    /// is how the whole corpus checks these paths — fails on the *assertion*
+    /// rather than on the engine's behaviour. That failure mode reads as
+    /// "no exception was thrown at all" and hides the fact that the right
+    /// exception was thrown.
+    fn regex_ctx<'h>(&self, heap: &'h mut Heap) -> Ctx<'h> {
+        let global = heap.realm_globals().first().copied();
+        Ctx::new(heap, global, None).with_regex_cache(self.regex_cache.clone())
+    }
 }
 
 impl v12_native::NativeRegistry for NativeRegistry {
@@ -218,35 +237,35 @@ impl v12_native::NativeRegistry for NativeRegistry {
                 promise::queue_microtask(&mut ctx, this, args)
             }
             NativeId::RegExpExec => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_exec(&mut ctx, this, args)
             }
             NativeId::RegExpTest => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_test(&mut ctx, this, args)
             }
             NativeId::RegExpCompile => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_compile(&mut ctx, this, args)
             }
             NativeId::StringMatch => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 string::string_match(&mut ctx, this, args)
             }
             NativeId::StringReplace => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 string::string_replace(&mut ctx, this, args)
             }
             NativeId::StringSearch => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 string::string_search(&mut ctx, this, args)
             }
             NativeId::StringSplit => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 string::string_split(&mut ctx, this, args)
             }
             NativeId::StringMatchAll => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 string::string_match_all(&mut ctx, this, args)
             }
             // The `%RegExp.prototype%` accessor surface (ES 22.2.6). These
@@ -316,23 +335,23 @@ impl v12_native::NativeRegistry for NativeRegistry {
             // string-replacement half, which is the fallback for an embedder
             // that drives the registry directly.
             NativeId::RegExpSymbolMatch => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_symbol_match(&mut ctx, this, args)
             }
             NativeId::RegExpSymbolMatchAll => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_symbol_match_all(&mut ctx, this, args)
             }
             NativeId::RegExpSymbolReplace => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_symbol_replace(&mut ctx, this, args)
             }
             NativeId::RegExpSymbolSearch => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_symbol_search(&mut ctx, this, args)
             }
             NativeId::RegExpSymbolSplit => {
-                let mut ctx = Ctx::new(heap, None, None).with_regex_cache(self.regex_cache.clone());
+                let mut ctx = self.regex_ctx(heap);
                 regexp::regexp_symbol_split(&mut ctx, this, args)
             }
             // Module import seam: loader-aware when installed (static imports

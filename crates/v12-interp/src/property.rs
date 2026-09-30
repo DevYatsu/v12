@@ -9,9 +9,9 @@ use super::{
     REGEXP_IDX, RegExpSlot, SYMBOL_IDX, WK_ADD, WK_APPLY, WK_ASYNC_ITERATOR, WK_BIND, WK_CALL,
     WK_CATCH, WK_CLEAR, WK_CONSTRUCTOR, WK_CREATE, WK_DEFINE_PROPERTY, WK_DELETE, WK_ENTRIES,
     WK_ENUMERABLE_OWN_KEYS, WK_FLAGS, WK_FOR_EACH, WK_GET, WK_GET_PROTOTYPE_OF, WK_HAS,
-    WK_HAS_OWN_PROPERTY, WK_IS_ARRAY, WK_ITERATOR, WK_KEYS, WK_LAST_INDEX, WK_LENGTH, WK_LOG,
-    WK_NEXT, WK_PROTOTYPE, WK_REJECT, WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN,
-    WK_THROW, WK_TO_STRING, WK_VALUE_OF, WK_VALUES, child_slot,
+    WK_HAS_OWN_PROPERTY, WK_IS_ARRAY, WK_ITERATOR, WK_KEYS, WK_LENGTH, WK_LOG, WK_NEXT,
+    WK_PROTOTYPE, WK_REJECT, WK_RESOLVE, WK_RETURN, WK_SET, WK_SIZE, WK_SOURCE, WK_THEN, WK_THROW,
+    WK_TO_STRING, WK_VALUE_OF, WK_VALUES, child_slot,
 };
 use crate::ops;
 use v12_native::NativeId;
@@ -687,20 +687,27 @@ impl Interp<'_> {
             return Some(Ok(self.map_set_method(id)));
         }
         let slot = self.regexp_slot(key)?;
-        let value = self.heap.get(obj).properties.get(slot as usize).copied()?;
+        let value = self.heap.get(obj).elements.get(slot as usize).copied()?;
         Some(Ok(value))
     }
 
-    /// Which internal-slot property a key names on a RegExp object. Slots
-    /// live at fixed positions in `properties` (see [`RegExpSlot`]).
-    /// Integer compares on the entry-interned key — no memcmp.
+    /// Which internal-slot property a key names on a RegExp object. The slots
+    /// live at fixed positions in the object's `elements` vector (see
+    /// [`RegExpSlot`]). Integer compares on the entry-interned key — no memcmp.
+    ///
+    /// `lastIndex` is deliberately **not** here. It used to be a third fixed
+    /// slot, and intercepting it here meant `r.lastIndex` bypassed the property
+    /// table entirely — no own property, no descriptor, no `[[Set]]` that can
+    /// fail. It is a real own data property now (ES 10.4.1), so a read of it
+    /// falls through to the ordinary `[[Get]]` and finds it there. Only
+    /// `source` and `flags` remain internal slots, which is what the spec
+    /// says: `RegExp.prototype.source` reads `[[OriginalSource]]`, not a
+    /// property.
     pub(crate) fn regexp_slot(&mut self, key: Option<PropKey>) -> Option<RegExpSlot> {
         if self.key_is_wk(key, WK_SOURCE) {
             Some(RegExpSlot::Source)
         } else if self.key_is_wk(key, WK_FLAGS) {
             Some(RegExpSlot::Flags)
-        } else if self.key_is_wk(key, WK_LAST_INDEX) {
-            Some(RegExpSlot::LastIndex)
         } else {
             None
         }
@@ -1472,21 +1479,14 @@ impl Interp<'_> {
                 return Ok(());
             }
         }
-        // RegExp `lastIndex` write: stores into the internal slot. Per spec
-        // the value is coerced via ToNumber.
-        if kind == Kind::RegExp && self.key_is(key_v, "lastIndex") {
-            let n = ops::to_number(self.heap, value);
-            if n.fract() == 0.0
-                && (-1e15..=1e15).contains(&n)
-                && let Some(smi) = JsValue::from_i32_smi(n as i32)
-            {
-                self.heap.get_mut(obj).properties[RegExpSlot::LastIndex as usize] = smi;
-                return Ok(());
-            }
-            self.heap.get_mut(obj).properties[RegExpSlot::LastIndex as usize] =
-                JsValue::from_f64(n);
-            return Ok(());
-        }
+        // `lastIndex` is NOT special-cased here any more. A RegExp instance
+        // carries it as a real own data property (ES 10.4.1), installed by
+        // `regexp::alloc_regexp`, so the ordinary `Descriptor::Data` arm below
+        // handles it: `ToNumber` on the value, the descriptor's `writable` in
+        // force, and a `false` return the strict-mode caller turns into a
+        // `TypeError`. The old arm wrote `properties[RegExpSlot::LastIndex]`
+        // directly, which is why a `writable: false` `lastIndex` silently kept
+        // accepting writes.
 
         let key = self.property_key(key_v)?;
         let shape = self.shape_of(obj);

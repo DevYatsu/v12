@@ -133,7 +133,7 @@ pub use elements::{
     MAX_FAST_ELEMENT_GAP,
 };
 pub use function::{FunctionTarget, HostClosure, Native};
-pub use gc::{GcPolicy, Heap, MarkSink, RootSet, Trace};
+pub use gc::{GcPolicy, Heap, MarkSink, RootSet, Trace, WellKnownSymbol};
 pub use handle::{Handle, HeapSpace, Space};
 pub use object::{
     BindingCellData, DictEntry, GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject,

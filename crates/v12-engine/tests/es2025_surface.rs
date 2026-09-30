@@ -11,11 +11,18 @@
 //! implementation, and the tests below are written to pin the consequences
 //! rather than the happy path alone:
 //!
-//! * An **iterable argument** is drained structurally — arrays, `Set`s, `Map`s,
-//!   strings, and the engine's own iterator objects. A user-defined
-//!   `@@iterator` (a generator, a hand-rolled iterator) is not reachable from a
-//!   `&mut Heap`; the tests below therefore exercise the engine-iterator path
-//!   and say so rather than implying full iterable coverage.
+//! * A **set-like argument** is read through `GetSetRecord` (24.2.3.1), not
+//!   iterated. That is a different and stricter contract than "anything
+//!   iterable": the argument must be an **Object** carrying callable `has` and
+//!   `keys` members, and a `Set`, a `Map` and a hand-built set-like all satisfy
+//!   it while a bare array and a bare string do **not** — an array has no `has`,
+//!   so `union([3])` is a `TypeError`, not a union with `[3]`. The tests below
+//!   use [`SET_LIKE_JS`] wherever they mean "an array of candidates" and pin the
+//!   rejection separately.
+//! * The *values* still come from a structural drain (`Ctx` cannot call
+//!   `keys()`), so a set-like whose `keys()` returns something other than its
+//!   own values is not modelled here. That limitation is a conformance gap, not
+//!   a licence for the weaker argument check the tests used to encode.
 //! * `ToString` on an **object** value needs the machine, so
 //!   `Iterator.prototype.join` renders objects through the Tier-0 display
 //!   subset.
@@ -36,12 +43,41 @@
 
 use v12_engine::Engine;
 
+/// The JS preamble that defines `setLike`, the spec-shaped argument the Set
+/// relational methods actually accept.
+///
+/// `GetSetRecord` (24.2.3.1) reads `size`, `has` and `keys` off the argument and
+/// requires the last two to be callable, so a bare array is *not* a valid
+/// argument even though it is iterable — an array has no `has`. Several tests
+/// below were originally written against a plain-array argument, which pinned
+/// the pre-ES2025 "any iterable" contract that the same lane's implementation
+/// had taken a shortcut against; conformance pinned it the other way
+/// (`Set/prototype/*/array-throws.js` and `called-with-object.js` are 14 tests
+/// of it). These tests are corrected to the spec's shape, not weakened: the
+/// ordering, dedupe, predicate and identity assertions they were written for are
+/// all preserved verbatim, only the argument is now one the spec admits.
+///
+/// `setLike` is a real `Set` rather than a hand-built `{size, has, keys}`
+/// object, and the reason is the documented deviation in
+/// `map::argument_set`: the *validation* is spec-exact, but the values still
+/// come from a structural drain of the argument, which only reaches the kinds
+/// `drain_iterable` knows. A plain object is not one of them, so a
+/// hand-built set-like would throw rather than union. One test does use a
+/// hand-built set-like to pin that boundary from the outside.
+const SET_LIKE_JS: &str = "function setLike(a) { return new Set(a); }";
+
 fn eval_display(src: &str) -> String {
     let mut engine = Engine::new();
     match engine.eval(src) {
         Ok(v) => engine.to_display_string(v),
         Err(thrown) => format!("threw: {}", engine.to_display_string(thrown)),
     }
+}
+
+/// [`eval_display`] with [`SET_LIKE_JS`] prepended, for the Set relational
+/// methods.
+fn eval_set(src: &str) -> String {
+    eval_display(&format!("{SET_LIKE_JS}\n{src}"))
 }
 
 /// Runs `setup`, drains the microtask queue, then evaluates `read`.
@@ -106,20 +142,64 @@ fn symbol_dispose_is_a_singleton() {
         "true"
     );
     // Two names, two symbols.
-    assert_eq!(eval_display("Symbol.dispose === Symbol.asyncDispose"), "false");
+    assert_eq!(
+        eval_display("Symbol.dispose === Symbol.asyncDispose"),
+        "false"
+    );
 }
 
-/// Spec 20.4.2 gives every `Symbol` static
-/// `{writable: false, enumerable: false, configurable: true}` — the one place
-/// in clauses 18-26 that departs from the `{true, false, true}` default, and
-/// the reason `install_value_with_attrs` exists next to `install_value`.
+/// Spec 20.4.2 gives every `Symbol` well-known property
+/// `{writable: false, enumerable: false, configurable: false}`.
+///
+/// This asserted `configurable: true`. The spec text and the corpus disagree
+/// with that in the same direction — `Symbol/dispose/prop-desc.js` and
+/// `Symbol/asyncDispose/prop-desc.js` both `verifyProperty(..., {writable:
+/// false, enumerable: false, configurable: false})` and both were *failing* at
+/// master, which is what a `{true, false, true}` default produces. The old
+/// `install_value_with_attrs` route is gone, replaced by
+/// `symbol::install_well_known_singletons`, which writes the spec triple for
+/// all fifteen names from the shared table.
 #[test]
-fn well_known_symbols_carry_the_non_writable_attribute_triple() {
-    assert_eq!(attr_triple_on("Symbol", "'dispose'"), "false,false,true");
-    assert_eq!(
-        attr_triple_on("Symbol", "'asyncDispose'"),
-        "false,false,true"
-    );
+fn well_known_symbols_carry_the_spec_attribute_triple() {
+    for name in ["'dispose'", "'asyncDispose'"] {
+        assert_eq!(
+            attr_triple_on("Symbol", name),
+            "false,false,false",
+            "{name}"
+        );
+    }
+    // Every well-known name, not just the two the merge lane added — the
+    // `25xx`-band handler placeholders used to leave these as
+    // `{true, false, true}` functions, which is how
+    // `Symbol/hasInstance/prop-desc.js` and its two siblings were failing with
+    // `typeof Symbol.hasInstance === "function"`.
+    for name in [
+        "'asyncIterator'",
+        "'hasInstance'",
+        "'isConcatSpreadable'",
+        "'iterator'",
+        "'match'",
+        "'matchAll'",
+        "'replace'",
+        "'search'",
+        "'species'",
+        "'split'",
+        "'toPrimitive'",
+        "'toStringTag'",
+        "'unscopables'",
+    ] {
+        assert_eq!(
+            eval_display(&format!("typeof Symbol[{}]", name)),
+            "symbol",
+            "{} must be a symbol",
+            name
+        );
+        assert_eq!(
+            attr_triple_on("Symbol", name),
+            "false,false,false",
+            "{name}"
+        );
+    }
 }
 
 /// A well-known symbol is never in the registry, so `Symbol.keyFor` answers
@@ -216,20 +296,83 @@ fn union_concatenates_in_spec_order_without_duplicates() {
         eval_display("new Set([3,1]).union(new Set([2,1])).values().toArray().join('-')"),
         "3-1-2"
     );
-    assert_eq!(eval_display("new Set([1,2]).union(new Set([2,3])).size"), "3");
+    assert_eq!(
+        eval_display("new Set([1,2]).union(new Set([2,3])).size"),
+        "3"
+    );
 }
 
-/// The argument goes through `GetSetFromIterable`, so an array is accepted and
-/// its duplicates collapse — the *set* of the argument is what every one of the
-/// seven algorithms measures.
+/// The argument goes through `GetSetRecord`, so its duplicates collapse — the
+/// *set* of the argument is what every one of the seven algorithms measures.
+/// SameValueZero: a duplicated `NaN` is still one element.
+///
+/// The argument is a set-like rather than a bare array, because an array has no
+/// `has` and is rejected; see `set_relational_rejects_a_non_object_argument`.
 #[test]
-fn union_accepts_an_array_argument_and_dedupes_it() {
+fn union_accepts_a_set_like_argument_and_dedupes_it() {
     assert_eq!(
-        eval_display("new Set([1,2]).union([2,3,3]).values().toArray().join('-')"),
+        eval_set("new Set([1,2]).union(setLike([2,3,3])).values().toArray().join('-')"),
         "1-2-3"
     );
     // SameValueZero: a duplicated `NaN` is still one element.
-    assert_eq!(eval_display("new Set([1]).union([NaN,NaN]).size"), "2");
+    assert_eq!(eval_set("new Set([1]).union(setLike([NaN,NaN])).size"), "2");
+}
+
+/// `GetSetRecord` step 1 is `If obj is not an Object, throw a TypeError`, and
+/// steps 6 and 8 require `has` and `keys` to be callable. Neither an iterable
+/// nor a set-like-without-`has` is enough — the distinction the conformance
+/// corpus draws in `array-throws.js` (a TypeError) against
+/// `set-like-array.js` (a union, because the array was given `has`/`keys`).
+#[test]
+fn set_relational_rejects_a_non_object_argument() {
+    for arg in ["1", "'x'", "null", "undefined", "Symbol()", "1n", "true"] {
+        assert!(
+            eval_set(&format!(
+                "(() => {{ try {{ new Set([1]).union({arg}); \
+                               return 'NO THROW'; }} \
+                               catch (e) {{ return e.constructor.name; }} }})()"
+            )) == "TypeError",
+            "union({arg}) must be a TypeError"
+        );
+    }
+    // An array has no `has`, so it fails step 6 rather than being consumed.
+    assert_eq!(
+        eval_set(
+            "(() => { try { new Set([1,2]).union([3]); return 'NO THROW'; } \
+                  catch (e) { return e.constructor.name; } })()"
+        ),
+        "TypeError"
+    );
+    // A `Map` is a perfectly good set-like: it has all three members.
+    assert_eq!(
+        eval_display("new Set([1]).union(new Map([[2, 'x']])).size"),
+        "2"
+    );
+}
+
+/// The documented deviation in `map::argument_set`, pinned from the outside so
+/// it cannot be mistaken for full `GetSetRecord` coverage: a hand-built set-like
+/// *validates* (its `size`, `has` and `keys` are all read and all callable) but
+/// its `keys()` is never called, because calling user code is what a `&mut Ctx`
+/// native cannot do. So the members it reports are accepted and the values come
+/// from a structural drain of the object instead, which a plain object cannot
+/// satisfy — the method rejects it at the drain.
+///
+/// The spec accepts this argument and unions `[2, 3]`. `Set/prototype/*/
+/// set-like-array.js` and `set-like-object.js` are the conformance half.
+#[test]
+fn a_hand_built_set_like_validates_but_is_not_iterated() {
+    let out = eval_display(
+        "(() => { var o = { size: 2, has: function (v) { return true; }, \
+                     keys: function () { return [2, 3].values(); } }; \
+           try { return 'size ' + new Set([1]).union(o).size; } \
+           catch (e) { return e.constructor.name; } })()",
+    );
+    assert_eq!(
+        out, "TypeError",
+        "a plain-object set-like passes validation and fails the structural \
+         drain — the deviation is in the values, not the argument check"
+    );
 }
 
 /// `intersection` builds its table from the argument and then walks the
@@ -244,8 +387,8 @@ fn intersection_iterates_the_receiver_in_spec_order() {
         "1-2"
     );
     // An empty operand short-circuits to the empty result (24.2.3.5 step 4).
-    assert_eq!(eval_display("new Set().intersection([1]).size"), "0");
-    assert_eq!(eval_display("new Set([1]).intersection([]).size"), "0");
+    assert_eq!(eval_set("new Set().intersection(setLike([1])).size"), "0");
+    assert_eq!(eval_set("new Set([1]).intersection(setLike([])).size"), "0");
 }
 
 /// `difference` yields the receiver's elements absent from the argument
@@ -253,10 +396,13 @@ fn intersection_iterates_the_receiver_in_spec_order() {
 #[test]
 fn difference_keeps_receiver_order_and_drops_argument_members() {
     assert_eq!(
-        eval_display("new Set([1,2,3]).difference([2]).values().toArray().join('-')"),
+        eval_set("new Set([1,2,3]).difference(setLike([2])).values().toArray().join('-')"),
         "1-3"
     );
-    assert_eq!(eval_display("new Set([1,2]).difference([1,2]).size"), "0");
+    assert_eq!(
+        eval_set("new Set([1,2]).difference(setLike([1,2])).size"),
+        "0"
+    );
 }
 
 /// `symmetricDifference` yields the receiver-only elements and then the
@@ -264,9 +410,7 @@ fn difference_keeps_receiver_order_and_drops_argument_members() {
 #[test]
 fn symmetric_difference_yields_this_then_argument() {
     assert_eq!(
-        eval_display(
-            "new Set([1,2]).symmetricDifference([2,3]).values().toArray().join('-')"
-        ),
+        eval_set("new Set([1,2]).symmetricDifference(setLike([2,3])).values().toArray().join('-')"),
         "1-3"
     );
 }
@@ -276,17 +420,17 @@ fn symmetric_difference_yields_this_then_argument() {
 #[test]
 fn set_predicates_return_primitive_booleans() {
     for (expr, want) in [
-        ("new Set([1]).isSubsetOf([1,2])", "true"),
-        ("new Set([1,9]).isSubsetOf([1,2])", "false"),
-        ("new Set([1,2]).isSupersetOf([1])", "true"),
-        ("new Set([1]).isSupersetOf([1,2])", "false"),
-        ("new Set([1]).isDisjointFrom([2])", "true"),
-        ("new Set([1]).isDisjointFrom([1])", "false"),
+        ("new Set([1]).isSubsetOf(setLike([1,2]))", "true"),
+        ("new Set([1,9]).isSubsetOf(setLike([1,2]))", "false"),
+        ("new Set([1,2]).isSupersetOf(setLike([1]))", "true"),
+        ("new Set([1]).isSupersetOf(setLike([1,2]))", "false"),
+        ("new Set([1]).isDisjointFrom(setLike([2]))", "true"),
+        ("new Set([1]).isDisjointFrom(setLike([1]))", "false"),
     ] {
-        assert_eq!(eval_display(expr), want, "{expr}");
+        assert_eq!(eval_set(expr), want, "{expr}");
     }
     assert_eq!(
-        eval_display("typeof new Set([1]).isSubsetOf([1])"),
+        eval_set("typeof new Set([1]).isSubsetOf(setLike([1]))"),
         "boolean"
     );
 }
@@ -296,20 +440,18 @@ fn set_predicates_return_primitive_booleans() {
 #[test]
 fn a_result_set_is_a_real_set() {
     assert_eq!(
-        eval_display(
-            "Object.getPrototypeOf(new Set([1]).union([2])) === Set.prototype"
-        ),
+        eval_set("Object.getPrototypeOf(new Set([1]).union(setLike([2]))) === Set.prototype"),
         "true"
     );
-    assert_eq!(eval_display("new Set([1,2]).union([]).size"), "2");
+    assert_eq!(eval_set("new Set([1,2]).union(setLike([])).size"), "2");
     assert_eq!(
-        eval_display("typeof new Set([1]).difference([1]).has"),
+        eval_set("typeof new Set([1]).difference(setLike([1])).has"),
         "function"
     );
     // The inherited method really is reachable through the linked prototype,
     // so the check above is not a detached method object.
-    assert_eq!(eval_display("new Set([1]).union([2]).has(2)"), "true");
-    assert_eq!(eval_display("new Set([1]).union([2]).size"), "2");
+    assert_eq!(eval_set("new Set([1]).union(setLike([2])).has(2)"), "true");
+    assert_eq!(eval_set("new Set([1]).union(setLike([2])).size"), "2");
 }
 
 /// Every method requires the `[[SetData]]` internal slot (24.2.3 step 1), so a
@@ -358,14 +500,42 @@ fn a_map_argument_iterates_entry_pairs() {
     );
 }
 
-/// A string argument iterates by code point, not by code unit.
+/// A string is not a valid set-relational argument at all.
+///
+/// This was originally `a_string_argument_iterates_by_code_point`, asserting
+/// that `Set.prototype.union('c')` unions the string's characters and that a
+/// surrogate pair counts as one. `GetSetRecord` step 1 requires an **Object**,
+/// so both halves of that are false: a string argument is a `TypeError`
+/// (`called-with-object.js`, seven method directories). The engine's *actual*
+/// string iteration — `for (const c of str)` and `new Set(str)` — is
+/// separately **not** code-point based; it yields code units, so a surrogate
+/// pair is two elements. That is a pre-existing gap, not something this change
+/// introduced (`StringIteratorPrototype` is 0/7 in conformance), and it is
+/// asserted here at its real value so the deviation is named rather than
+/// inherited silently from a test that was asserting the wrong thing about the
+/// wrong code path.
 #[test]
-fn a_string_argument_iterates_by_code_point() {
+fn a_string_is_not_a_set_relational_argument() {
+    for arg in ["'c'", "'\\u{1F600}'", "''"] {
+        assert_eq!(
+            eval_set(&format!(
+                "(() => {{ try {{ new Set(['ab']).union({arg}); return 'NO THROW'; }} \
+                   catch (e) {{ return e.constructor.name; }} }})()"
+            )),
+            "TypeError",
+            "union({arg}) must be a TypeError"
+        );
+    }
+    // The engine's real string iteration is by code unit, not code point. Named
+    // here as a known deviation; see `StringIteratorPrototype` conformance.
     assert_eq!(
-        eval_display("new Set(['ab']).union('c').values().toArray().join('-')"),
-        "ab-c"
+        eval_display(
+            "(() => { var n = 0; for (const c of '\\u{1F600}') n++; \
+                              return n; })()"
+        ),
+        "2",
+        "KNOWN DEVIATION: for-of over a string yields code units, not code points"
     );
-    assert_eq!(eval_display("new Set().union('\u{1F600}').size"), "1");
 }
 
 // ---------------------------------------------------------------------------
@@ -401,10 +571,7 @@ fn iterator_helpers_are_installed_on_the_right_objects() {
             "true,false,true",
             "Iterator.{name}"
         );
-        assert_eq!(
-            eval_display(&format!("typeof Iterator.{name}")),
-            "function"
-        );
+        assert_eq!(eval_display(&format!("typeof Iterator.{name}")), "function");
         assert_eq!(
             eval_display(&format!("typeof Iterator.prototype.{name}")),
             "undefined",
@@ -439,15 +606,10 @@ fn iterator_objects_inherit_the_iterator_prototype() {
         "true"
     );
     assert_eq!(
-        eval_display(
-            "Object.getPrototypeOf(new Set([1]).values()) === Iterator.prototype"
-        ),
+        eval_display("Object.getPrototypeOf(new Set([1]).values()) === Iterator.prototype"),
         "true"
     );
-    assert_eq!(
-        eval_display("typeof [1,2].values().includes"),
-        "function"
-    );
+    assert_eq!(eval_display("typeof [1,2].values().includes"), "function");
     assert_eq!(eval_display("[1,2,3].values().includes(2)"), "true");
 }
 
@@ -516,9 +678,7 @@ fn windows_overlaps_and_chunks_partitions() {
     );
     // …unless `"allow-partial"` asks for it.
     assert_eq!(
-        eval_display(
-            "JSON.stringify([1,2,3].values().windows(5, 'allow-partial').toArray())"
-        ),
+        eval_display("JSON.stringify([1,2,3].values().windows(5, 'allow-partial').toArray())"),
         "[[1,2,3]]"
     );
     // A group size of 1 makes `windows` the identity, one fresh array each.
@@ -549,7 +709,16 @@ fn window_results_are_distinct_arrays() {
 #[test]
 fn windows_and_chunks_validate_the_size_argument() {
     for name in ["windows", "chunks"] {
-        for arg in ["undefined", "'1'", "true", "null", "{}", "NaN", "1.5", "Infinity"] {
+        for arg in [
+            "undefined",
+            "'1'",
+            "true",
+            "null",
+            "{}",
+            "NaN",
+            "1.5",
+            "Infinity",
+        ] {
             assert_eq!(
                 eval_display(&format!(
                     "(() => {{ try {{ [1,2].values().{name}({arg}); return 'NO THROW'; }}
@@ -594,7 +763,9 @@ fn windows_rejects_an_invalid_undersized_option() {
     }
     for arg in ["undefined", "'only-full'", "'allow-partial'"] {
         assert_eq!(
-            eval_display(&format!("[1,2,3].values().windows(1, {arg}).toArray().length")),
+            eval_display(&format!(
+                "[1,2,3].values().windows(1, {arg}).toArray().length"
+            )),
             "3",
             "windows(1, {arg})"
         );
@@ -612,9 +783,18 @@ fn window_results_are_real_arrays() {
         ),
         "true"
     );
-    assert_eq!(eval_display("[1,2,3].values().windows(2).toArray()[0].length"), "2");
-    assert_eq!(eval_display("[1,2,3].values().chunks(2).toArray()[1].length"), "1");
-    assert_eq!(eval_display("[1,2,3,4,5].values().windows(3).toArray()[0].length"), "3");
+    assert_eq!(
+        eval_display("[1,2,3].values().windows(2).toArray()[0].length"),
+        "2"
+    );
+    assert_eq!(
+        eval_display("[1,2,3].values().chunks(2).toArray()[1].length"),
+        "1"
+    );
+    assert_eq!(
+        eval_display("[1,2,3,4,5].values().windows(3).toArray()[0].length"),
+        "3"
+    );
 }
 
 /// `toArray` (and therefore everything built on it) must return a real Array.
@@ -625,7 +805,10 @@ fn to_array_results_are_real_arrays() {
         "true"
     );
     assert_eq!(eval_display("[1,2].values().toArray().length"), "2");
-    assert_eq!(eval_display("typeof [1,2].values().toArray().map"), "function");
+    assert_eq!(
+        eval_display("typeof [1,2].values().toArray().map"),
+        "function"
+    );
 }
 
 /// `Iterator.zip` takes a *list* of iterables, yields one array per position,
@@ -647,8 +830,14 @@ fn zip_stops_at_the_shortest_input() {
         "[[1,10],[2,null]]"
     );
     // Each row is a fresh, packed, real Array.
-    assert_eq!(eval_display("Array.isArray(Iterator.zip([[1],[2]]).toArray()[0])"), "true");
-    assert_eq!(eval_display("Iterator.zip([[1],[2]]).toArray()[0].length"), "2");
+    assert_eq!(
+        eval_display("Array.isArray(Iterator.zip([[1],[2]]).toArray()[0])"),
+        "true"
+    );
+    assert_eq!(
+        eval_display("Iterator.zip([[1],[2]]).toArray()[0].length"),
+        "2"
+    );
 }
 
 /// `zipKeyed` takes an *object* of iterables and yields one null-prototype
@@ -660,9 +849,7 @@ fn zip_keyed_yields_null_prototype_objects_per_position() {
         "[{\"a\":1,\"b\":3},{\"a\":2,\"b\":4}]"
     );
     assert_eq!(
-        eval_display(
-            "Object.getPrototypeOf(Iterator.zipKeyed({a:[1]}).toArray()[0]) === null"
-        ),
+        eval_display("Object.getPrototypeOf(Iterator.zipKeyed({a:[1]}).toArray()[0]) === null"),
         "true"
     );
     // A non-enumerable own key is excluded (the spec's `[[GetOwnProperty]]`
@@ -692,11 +879,17 @@ fn iterator_statics_return_real_iterators() {
         "Iterator.concat([1],[2])",
     ] {
         assert_eq!(
-            eval_display(&format!("Object.getPrototypeOf({expr}) === Iterator.prototype")),
+            eval_display(&format!(
+                "Object.getPrototypeOf({expr}) === Iterator.prototype"
+            )),
             "true",
             "{expr}"
         );
-        assert_eq!(eval_display(&format!("typeof {expr}.next")), "function", "{expr}");
+        assert_eq!(
+            eval_display(&format!("typeof {expr}.next")),
+            "function",
+            "{expr}"
+        );
     }
 }
 

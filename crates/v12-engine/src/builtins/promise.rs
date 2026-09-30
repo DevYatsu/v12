@@ -2224,6 +2224,22 @@ fn keyed_combinator(
     args: &[JsValue],
     settled: bool,
 ) -> Result<JsValue, Throw> {
+    let name = if settled {
+        "allSettledKeyed"
+    } else {
+        "allKeyed"
+    };
+    // Step 1-2: `promiseCapability = NewPromiseCapability(C)`, whose step 1 is
+    // `If IsConstructor(C) is false, throw a TypeError exception`. This is a
+    // *throw*, not a rejection, and it precedes the argument check below. The
+    // four non-keyed combinators get the same gate from the interpreter's
+    // `new_promise_capability`; these two are pure engine handlers, so the
+    // check is made here against `Ctx::is_constructor`.
+    if !ctx.is_constructor(this) {
+        return Err(ctx.type_error(format!(
+            "TypeError: Promise.{name} invoked on a non-constructor value"
+        )));
+    }
     let prototype = this
         .as_object()
         .and_then(|ctor| ctx.heap.get(ctor).prototype);
@@ -2234,10 +2250,7 @@ fn keyed_combinator(
 
     let Some(input) = arg.as_object() else {
         let reason = ctx
-            .type_error(format!(
-                "TypeError: Promise.{} requires an object",
-                if settled { "allSettledKeyed" } else { "allKeyed" }
-            ))
+            .type_error(format!("TypeError: Promise.{name} requires an object"))
             .into_js(ctx.heap);
         settle_sync(ctx.heap, &sink, aggregate, STATE_REJECTED, reason);
         return Ok(aggregate_v);
@@ -2269,10 +2282,9 @@ fn keyed_combinator(
     // so a never-settling input costs nothing and cannot spin the drain. The
     // per-element payloads land in a scratch array; the keys are shared behind
     // an `Rc` because a `FnMut` job capture has to be `'static`.
-    let slots = ctx.heap.alloc(JsObject::array(vec![
-        JsValue::undefined();
-        values.len()
-    ]));
+    let slots = ctx
+        .heap
+        .alloc(JsObject::array(vec![JsValue::undefined(); values.len()]));
     ctx.heap.add_pinned_root(slots);
     let shared_keys = Rc::new(keys);
     let remaining = Rc::new(RefCell::new(values.len()));
@@ -2400,10 +2412,7 @@ fn build_keyed_result(
     heap.add_pinned_root(result);
     let payloads = heap.get(slots).elements_snapshot();
     for (index, key) in keys.iter().enumerate() {
-        let value = payloads
-            .get(index)
-            .copied()
-            .unwrap_or(JsValue::undefined());
+        let value = payloads.get(index).copied().unwrap_or(JsValue::undefined());
         add_keyed_data_prop(heap, result, *key, value);
     }
     JsValue::object(result)

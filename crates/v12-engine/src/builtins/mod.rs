@@ -661,7 +661,14 @@ fn install_regexp_protocol(heap: &mut Heap, targets: &BuiltinTargets) {
         ("split", NativeId::RegExpSymbolSplit, 2),
     ];
     for (name, id, len) in protocol {
-        let sym = ctx.fresh_symbol();
+        // Every name here is in `WellKnownSymbol::ALL`; the table is the same
+        // one `install_well_known_singletons` just published, so the method
+        // keyed under `Symbol.match` is keyed by the handle a script reads
+        // back as `Symbol.match`.
+        let Some(which) = v12_heap::WellKnownSymbol::from_name(name) else {
+            unreachable!("RegExp protocol name {name} is not a well-known symbol")
+        };
+        let sym = ctx.heap.well_known_symbol(which);
         install_well_known_symbol(&mut ctx, symbol_ctor, name, sym);
         install_symbol_method(&mut ctx, proto, sym, id, &format!("[Symbol.{name}]"), len);
     }
@@ -738,9 +745,17 @@ fn install_symbol_method(
 /// same ordering that forces `install_reflect_builtins` out of
 /// `install_builtins`. The realm calls this where it installs
 /// `Promise [ @@species ]`.
-pub fn install_regexp_species(heap: &mut Heap, species: Handle<v12_heap::V12Symbol>) {
-    let global = heap.realm_globals().first().copied();
-    let Some(global) = global else { return };
+/// `global` is passed explicitly for the reason [`regexp_proto`] documents:
+/// `Ctx::intrinsic`'s `realm_globals().first()` fallback would resolve the
+/// *primary* realm's `RegExp` for every realm, and because `@@species` is now
+/// one shared handle (ES 20.4.2.1) the second realm's install would collide
+/// with the first's rather than merely being redundant — tripping
+/// `Ctx::define_symbol_getter`'s duplicate-install assertion.
+pub fn install_regexp_species(
+    heap: &mut Heap,
+    global: Handle<v12_heap::JsObject>,
+    species: Handle<v12_heap::V12Symbol>,
+) {
     let mut ctx = Ctx::new(heap, Some(global), None);
     let Some(ctor) = ctx.intrinsic("RegExp").and_then(|v| v.as_object()) else {
         return;
@@ -806,33 +821,6 @@ pub(crate) fn install_value(
     if let Some(Ok(value)) = builtin_dispatch(id, heap, JsValue::undefined(), &[]) {
         builtin_install_prop(heap, obj, name, value);
     }
-}
-
-/// [`install_value`] with explicit attributes, for the well-known `Symbol`
-/// properties.
-///
-/// Why this exists rather than reusing [`builtin_install_prop`]'s `BUILTIN`
-/// attrs: spec 20.4.2 gives every `Symbol` static — unlike every other data
-/// property in clauses 18-26 — `{ [[Writable]]: false, [[Enumerable]]: false,
-/// [[Configurable]]: true }`. `BUILTIN` is writable, so `Symbol.dispose = 1`
-/// would silently succeed where the spec makes it a no-op (or a `TypeError` in
-/// strict mode).
-///
-/// The handler still runs exactly once, at install time, so the stored value
-/// is this realm's singleton symbol and `Symbol.dispose === Symbol.dispose`
-/// holds through a plain shape lookup on every later read.
-pub(crate) fn install_value_with_attrs(
-    heap: &mut Heap,
-    target: Option<v12_heap::Handle<v12_heap::JsObject>>,
-    name: &str,
-    id: NativeId,
-    attrs: v12_heap::Attrs,
-) {
-    let Some(obj) = target else { return };
-    let Some(Ok(value)) = builtin_dispatch(id, heap, JsValue::undefined(), &[]) else {
-        return;
-    };
-    Ctx::new(heap, None, None).define_data_prop_with_attrs(obj, name, value, attrs);
 }
 
 #[doc(hidden)]
@@ -1213,6 +1201,15 @@ macro_rules! define_builtins {
             install_regexp_accessors(heap, targets.global);
             install_regexp_last_index(heap, targets.global);
             install_regexp_methods(heap, targets.global);
+            // The shared well-known symbols, published on the `Symbol`
+            // constructor. Runs *before* the RegExp protocol install so the
+            // two agree by construction: `install_regexp_protocol` keys
+            // `RegExp.prototype[@@match]` and friends on the same table, and
+            // the realm's own `Symbol.species` / `toPrimitive` /
+            // `toStringTag` / `iterator` reads read the same table afterwards.
+            if let Some(symbol_ctor) = targets.symbol {
+                symbol::install_well_known_singletons(heap, symbol_ctor);
+            }
             install_regexp_protocol(heap, targets);
         }
     };
@@ -1531,32 +1528,11 @@ define_builtins! {
     Symbol {
         "for" (1) => SymbolFor => |heap, this, args| call_ctx(symbol::symbol_for, heap, this, args),
         "keyFor" (1) => SymbolKeyFor => |heap, this, args| call_ctx(symbol::symbol_key_for, heap, this, args),
-        "iterator" => SymbolWellKnownIterator => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "asyncIterator" => SymbolWellKnownAsyncIterator => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "hasInstance" => SymbolWellKnownHasInstance => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "isConcatSpreadable" => SymbolWellKnownIsConcatSpreadable => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "match" => SymbolWellKnownMatch => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "replace" => SymbolWellKnownReplace => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "search" => SymbolWellKnownSearch => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "species" => SymbolWellKnownSpecies => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "split" => SymbolWellKnownSplit => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "toPrimitive" => SymbolWellKnownToPrimitive => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "toStringTag" => SymbolWellKnownToStringTag => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "unscopables" => SymbolWellKnownUnscopables => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
     },
     SymbolProto {
         "toString" (0) => SymbolProtoToString => |heap, this, args| call_ctx(symbol::symbol_proto_to_string, heap, this, args),
         "valueOf" (0) => SymbolProtoValueOf => |heap, this, args| call_ctx(symbol::symbol_proto_value_of, heap, this, args),
         "description" => SymbolProtoDescription => |heap, this, args| call_ctx(symbol::symbol_proto_description, heap, this, args),
-    },
-    // Well-known symbols with no engine-internal consumer: the value installed
-    // is the singleton itself, so `Symbol.dispose === Symbol.dispose` holds
-    // through a shape lookup. Every name in the `Symbol` group above installs
-    // a *handler function* that the realm overwrites with its own canonical
-    // symbol (see `symbol.rs`'s module doc for why there are two routes).
-    SymbolValue {
-        "dispose" => SymbolWellKnownDispose => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
-        "asyncDispose" => SymbolWellKnownAsyncDispose => |heap, this, args| call_ctx(symbol::symbol_well_known, heap, this, args),
     },
     Proxy {
         "revocable" (2) => ProxyRevocable => |heap, this, args| call_ctx(proxy::proxy_revocable, heap, this, args),
@@ -1686,13 +1662,21 @@ define_builtins! {
 /// already carry the names, so a later move of the `Promise` statics into the
 /// macro cannot double-install.
 fn install_keyed_promise_combinators(heap: &mut Heap) {
-    let Some(idx) = v12_bytecode::GLOBAL_INTRINSICS.iter().position(|n| *n == "Promise") else {
+    let Some(idx) = v12_bytecode::GLOBAL_INTRINSICS
+        .iter()
+        .position(|n| *n == "Promise")
+    else {
         return;
     };
     let Some(global) = heap.realm_globals().first().copied() else {
         return;
     };
-    let Some(ctor) = heap.get(global).properties.get(idx).copied().and_then(|v| v.as_object())
+    let Some(ctor) = heap
+        .get(global)
+        .properties
+        .get(idx)
+        .copied()
+        .and_then(|v| v.as_object())
     else {
         return;
     };
@@ -1702,7 +1686,11 @@ fn install_keyed_promise_combinators(heap: &mut Heap) {
         ("allSettledKeyed", NativeId::PromiseAllSettledKeyed),
     ] {
         let key = v12_heap::PropKey::from_string(ctx.heap.intern_text(name));
-        if ctx.heap.lookup_property(ctx.heap.shape_of(ctor), key).is_some() {
+        if ctx
+            .heap
+            .lookup_property(ctx.heap.shape_of(ctor), key)
+            .is_some()
+        {
             continue;
         }
         ctx.define_method(Some(ctor), name, id, Some(1));

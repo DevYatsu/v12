@@ -5,14 +5,21 @@
 //! as a `Ctx` capability (`Ctx::with_regex_cache`, fed by the registry at
 //! dispatch); bodies clone the `Rc` out of the context.
 //!
-//! A RegExp object is a `Kind::RegExp` with `properties =
-//! [source, flags, lastIndex]`:
+//! A RegExp object is a `Kind::RegExp` whose `elements` vector holds the two
+//! internal slots, plus one real own data property in `properties`:
 //!
-//! - `properties[0]`: the source text (heap string; may be the canonical
+//! - `elements[0]`: `[[OriginalSource]]` (heap string; may be the canonical
 //!   `"(?:)"` for empty patterns).
-//! - `properties[1]`: the canonical flag string (heap string, `"dgimsuvy"`
-//!   order with only set flags).
-//! - `properties[2]`: `lastIndex` (Smi or double).
+//! - `elements[1]`: `[[OriginalFlags]]` (heap string, `"dgimsuvy"` order with
+//!   only set flags).
+//! - `lastIndex`: an **own shape-bound data property**, not a raw slot. ES
+//!   10.4.1 gives every RegExp instance one with `{writable: true, enumerable:
+//!   false, configurable: false}`, and the 22.2.7 algorithms reach it with
+//!   `Get`/`Set` rather than through the internal slots. That is load-bearing
+//!   in both directions: `RegExp/lastIndex.js` asserts the own property exists,
+//!   and the eight `*-lastindex-err` / `*-no-write` tests make a
+//!   `writable: false` `lastIndex` a `TypeError`, which a raw slot cannot
+//!   express because it has no descriptor to fail.
 //!
 //! The compiled `v12_regex::CompiledRegex` lives in a side table keyed by the
 //! object handle (`Rc<RefCell<HashMap<u32, CompiledRegex>>>`) so recompilation
@@ -34,10 +41,22 @@ use super::{ctx::Ctx, helpers};
 /// for collected objects are simply stale and get overwritten on reuse).
 pub type RegexCache = Rc<RefCell<HashMap<u32, v12_regex::CompiledRegex>>>;
 
-/// The `lastIndex` slot index in a RegExp object's `properties`.
+/// The `[[OriginalSource]]` / `[[OriginalFlags]]` internal-slot positions in a
+/// RegExp object's `elements` vector. They are slots, not properties — see
+/// [`v12_heap::JsObject::regexp`].
 const SLOT_SOURCE: usize = 0;
 const SLOT_FLAGS: usize = 1;
-const SLOT_LAST_INDEX: usize = 2;
+
+/// The spec attributes of a RegExp instance's own `lastIndex` data property
+/// (ES 10.4.1): writable, but neither enumerable nor configurable.
+const LAST_INDEX_ATTRS: v12_heap::Attrs = v12_heap::Attrs::new(true, false, false);
+
+/// Interns the `lastIndex` property key. Called on every read and write of the
+/// property, so it is a hash probe rather than a stored handle — the same
+/// trade `match_index` makes for `index`.
+fn last_index_key(heap: &mut Heap) -> v12_heap::PropKey {
+    v12_heap::PropKey::from_string(heap.intern_text("lastIndex"))
+}
 
 /// `RegExp(pattern, flags?)` — constructs a RegExp object.
 ///
@@ -52,8 +71,8 @@ pub fn regexp_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resu
             if let Some(obj) = first.as_object()
                 && ctx.heap.get(obj).kind == v12_heap::Kind::RegExp
             {
-                let source = ctx.heap.get(obj).properties[SLOT_SOURCE];
-                let flags = ctx.heap.get(obj).properties[SLOT_FLAGS];
+                let source = ctx.heap.get(obj).elements[SLOT_SOURCE];
+                let flags = ctx.heap.get(obj).elements[SLOT_FLAGS];
                 let handle = alloc_regexp(ctx, source, flags);
                 return Ok(JsValue::object(handle));
             }
@@ -75,11 +94,36 @@ pub fn regexp_construct(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resu
     Ok(JsValue::object(handle))
 }
 
+/// Allocates a RegExp object from already-interned `(source, flags)` strings.
+///
+/// Every RegExp allocation goes through here, and the reason is the
+/// `lastIndex` property: building the object by hand (as `String.prototype.split`
+/// used to, for its "Splitter" clone) produces one without it, and then the
+/// engine's own `Set(R, "lastIndex", v, true)` finds no own property, walks to
+/// the `RegExp.prototype.lastIndex` accessor, and recurses forever. The
+/// `#[must_use]`-shaped rule is simpler than a comment: there is exactly one
+/// constructor for this kind.
+pub fn alloc_regexp_from_handles(
+    ctx: &mut Ctx,
+    source: Handle<V12Str>,
+    flags: Handle<V12Str>,
+) -> Handle<JsObject> {
+    alloc_regexp(ctx, JsValue::string(source), JsValue::string(flags))
+}
+
 fn alloc_regexp(ctx: &mut Ctx, source: JsValue, flags: JsValue) -> Handle<JsObject> {
     let h = ctx.alloc_obj(JsObject::regexp(
         source.as_string().expect("source is a string"),
         flags.as_string().expect("flags is a string"),
     ));
+    // ES 10.4.1 step 2: `CreateNonEnumerableDataPropertyOrThrow(R,
+    // "lastIndex", 0)`. A *property*, not a slot — see the module doc.
+    ctx.define_data_prop_with_attrs(
+        h,
+        "lastIndex",
+        JsValue::from_i32_smi(0).expect("0 fits Smi"),
+        LAST_INDEX_ATTRS,
+    );
     link_regexp_proto(ctx, h);
     h
 }
@@ -143,8 +187,8 @@ fn regexp_this(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<RegExpThis,
 /// are already interned heap strings.
 fn regexp_slots(heap: &Heap, obj: Handle<JsObject>) -> (JsValue, JsValue) {
     (
-        heap.get(obj).properties[SLOT_SOURCE],
-        heap.get(obj).properties[SLOT_FLAGS],
+        heap.get(obj).elements[SLOT_SOURCE],
+        heap.get(obj).elements[SLOT_FLAGS],
     )
 }
 
@@ -255,7 +299,7 @@ pub fn regexp_get_last_index(
 ) -> Result<JsValue, Throw> {
     match regexp_this(ctx, this, "get RegExp.prototype.lastIndex")? {
         RegExpThis::Prototype => Ok(JsValue::undefined()),
-        RegExpThis::Instance(re) => Ok(helpers::js_number(last_index(ctx.heap, re))),
+        RegExpThis::Instance(re) => Ok(helpers::js_number(last_index(ctx, re))),
     }
 }
 
@@ -267,7 +311,7 @@ pub fn regexp_set_last_index(
 ) -> Result<JsValue, Throw> {
     if let RegExpThis::Instance(re) = regexp_this(ctx, this, "set RegExp.prototype.lastIndex")? {
         let v = ctx.to_number(args.first().copied().unwrap_or(JsValue::undefined()));
-        set_last_index(ctx.heap, re, v);
+        set_last_index(ctx, re, v)?;
     }
     Ok(JsValue::undefined())
 }
@@ -328,6 +372,84 @@ fn regexp_receiver(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<Handle<
     ctx.this_object(this, method, Some(v12_heap::Kind::RegExp))
 }
 
+/// `SpeciesConstructor(R, %RegExp%)` (ES 7.3.24), for its *validation*.
+///
+/// `@@matchAll` (step 4), `@@replace` (step 3) and `@@split` (step 3) all open
+/// with this call, and both of its failure modes are observable without ever
+/// using the value:
+///
+/// * step 3 — a `constructor` that is present and not a constructor is a
+///   `TypeError` (`Symbol.matchAll/species-constructor-is-not-object-throws.js`
+///   sets `regexp.constructor` to `null`, `true`, `""`, a symbol and `1`);
+/// * step 6 — a `@@species` that is neither `undefined`/`null` nor a
+///   constructor is a `TypeError`
+///   (`…/species-constructor-species-is-not-constructor.js`).
+///
+/// The value itself is discarded because none of the three methods can use it:
+/// `@@matchAll`'s spec result is a `RegExp String Iterator` this engine has no
+/// kind for (it drains eagerly — see [`regexp_symbol_match_all`]), and
+/// `@@replace`/`@@split` build their result without constructing `C`. So this
+/// performs the steps and drops the answer, which is the whole of the
+/// observable behaviour.
+fn validate_species_constructor(
+    ctx: &mut Ctx,
+    re: Handle<JsObject>,
+    method: &str,
+) -> Result<(), Throw> {
+    // Step 1-2: `C = ? Get(O, "constructor")`, and `undefined` selects the
+    // default. `null` does *not*: it falls through to step 3, which is the
+    // distinction the first test above is named for.
+    let c = super::iterator::own_or_inherited_read(ctx, JsValue::object(re), "constructor")?;
+    if c.is_undefined() {
+        return Ok(());
+    }
+    // Step 3.
+    if !ctx.is_constructor(c) {
+        return Err(ctx.type_error(format!(
+            "TypeError: {method} receiver's constructor is not a constructor"
+        )));
+    }
+    let Some(ctor_obj) = c.as_object() else {
+        // Unreachable given step 3 passed; the read below needs a handle.
+        return Ok(());
+    };
+    // Step 4: `S = ? Get(C, @@species)`, off the realm's `Symbol` constructor.
+    let Some(species_key) = (|| {
+        let sym = ctx.intrinsic("Symbol")?.as_object()?;
+        let key = v12_heap::PropKey::from_string(ctx.heap.intern_text("species"));
+        let shape = ctx.heap.shape_of(sym);
+        let slot = ctx
+            .heap
+            .lookup_property(shape, key)
+            .and_then(|d| d.slot())?;
+        Some(
+            ctx.heap
+                .get(sym)
+                .properties
+                .get(slot as usize)?
+                .as_symbol()?,
+        )
+    })() else {
+        // No `Symbol.species` in this realm: step 4 cannot produce a value, so
+        // there is nothing left to validate.
+        return Ok(());
+    };
+    let species_prop = v12_heap::PropKey::from_symbol(species_key);
+    let s = crate::internal_methods::dispatch_get(ctx.heap, ctor_obj, species_prop, c)
+        .map_err(Throw::Value)?;
+    // Step 5.
+    if s.is_undefined() || s.is_null() {
+        return Ok(());
+    }
+    // Step 6.
+    if !ctx.is_constructor(s) {
+        return Err(ctx.type_error(format!(
+            "TypeError: {method} receiver's constructor @@species is not a constructor"
+        )));
+    }
+    Ok(())
+}
+
 /// The `RegExp` receiver's own `(source, flags)` for the protocol methods,
 /// which all begin from the receiver's internal slots rather than a
 /// `Get`.
@@ -355,7 +477,7 @@ pub fn regexp_symbol_match(
     if !flags.contains('g') {
         return regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)]);
     }
-    set_last_index(ctx.heap, re, 0.0);
+    set_last_index(ctx, re, 0.0)?;
     let mut results: Vec<JsValue> = Vec::new();
     loop {
         let m = regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)])?;
@@ -383,12 +505,12 @@ pub fn regexp_symbol_search(
 ) -> Result<JsValue, Throw> {
     let (re, _source, _flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.search]")?;
     let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
-    let previous = last_index(ctx.heap, re);
+    let previous = last_index(ctx, re);
     let text_h = ctx.heap.intern_text(&s);
-    set_last_index(ctx.heap, re, 0.0);
+    set_last_index(ctx, re, 0.0)?;
     let m = regexp_exec(ctx, JsValue::object(re), &[JsValue::string(text_h)]);
     // Restore before propagating: the spec's step 6 is unconditional.
-    set_last_index(ctx.heap, re, previous);
+    set_last_index(ctx, re, previous)?;
     let m = m?;
     if m.is_null() {
         return Ok(helpers::js_number(-1.0));
@@ -413,10 +535,13 @@ pub fn regexp_symbol_match_all(
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let (re, _source, flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.matchAll]")?;
+    // Step 4: `C = ? SpeciesConstructor(R, %RegExp%)`. The value is unused here
+    // (see `validate_species_constructor`); its two failure modes are not.
+    validate_species_constructor(ctx, re, "RegExp.prototype[Symbol.matchAll]")?;
     let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
     let text_h = ctx.heap.intern_text(&s);
     if flags.contains('g') {
-        set_last_index(ctx.heap, re, 0.0);
+        set_last_index(ctx, re, 0.0)?;
     }
     let mut results: Vec<JsValue> = Vec::new();
     loop {
@@ -458,6 +583,8 @@ pub fn regexp_symbol_replace(
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let (re, _source, flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.replace]")?;
+    // Step 3: `C = ? SpeciesConstructor(rx, %RegExp%)` — validation only.
+    validate_species_constructor(ctx, re, "RegExp.prototype[Symbol.replace]")?;
     let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
     let replace_value = args.get(1).copied().unwrap_or(JsValue::undefined());
     if is_callable(ctx.heap, replace_value) {
@@ -469,7 +596,7 @@ pub fn regexp_symbol_replace(
     let template = ctx.to_string(replace_value);
     let global = flags.contains('g');
     if global {
-        set_last_index(ctx.heap, re, 0.0);
+        set_last_index(ctx, re, 0.0)?;
     }
     let text_h = ctx.heap.intern_text(&s);
     let mut out = String::new();
@@ -545,6 +672,8 @@ pub fn regexp_symbol_split(
     args: &[JsValue],
 ) -> Result<JsValue, Throw> {
     let (re, source, flags) = protocol_receiver(ctx, this, "RegExp.prototype[Symbol.split]")?;
+    // Step 3: `C = ? SpeciesConstructor(rx, %RegExp%)` — validation only.
+    validate_species_constructor(ctx, re, "RegExp.prototype[Symbol.split]")?;
     let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
     let units: Vec<u16> = s.encode_utf16().collect();
     let limit = match args.get(1) {
@@ -656,7 +785,7 @@ fn split_match(
     let Some(m) = compiled.exec(units, q) else {
         return Ok(None);
     };
-    set_last_index(ctx.heap, re, (m.end() as f64).max(q as f64 + 1.0));
+    set_last_index(ctx, re, (m.end() as f64).max(q as f64 + 1.0))?;
     let slice = |span: std::ops::Range<usize>| -> String {
         String::from_utf16_lossy(&units[span.start.min(units.len())..span.end.min(units.len())])
     };
@@ -809,10 +938,10 @@ pub fn compile_for(
 
 /// Reads `(source, flags)` off a RegExp object as Rust text.
 pub fn regexp_source_flags(heap: &mut Heap, obj: Handle<JsObject>) -> (String, String) {
-    let source_h = heap.get(obj).properties[SLOT_SOURCE]
+    let source_h = heap.get(obj).elements[SLOT_SOURCE]
         .as_string()
         .expect("RegExp source is a string");
-    let flags_h = heap.get(obj).properties[SLOT_FLAGS]
+    let flags_h = heap.get(obj).elements[SLOT_FLAGS]
         .as_string()
         .expect("RegExp flags is a string");
     (string_text(heap, source_h), string_text(heap, flags_h))
@@ -845,25 +974,85 @@ fn compile_pattern(source: &str, flags: &str) -> Result<v12_regex::CompiledRegex
     v12_regex::compile(source, f).map_err(|e| e.message)
 }
 
-/// Current `lastIndex` as a number (default 0).
-pub fn last_index(heap: &Heap, obj: Handle<JsObject>) -> f64 {
-    heap.get(obj).properties[SLOT_LAST_INDEX]
-        .as_smi()
-        .map(f64::from)
-        .or_else(|| heap.get(obj).properties[SLOT_LAST_INDEX].as_f64())
-        .unwrap_or(0.0)
+/// `ToLength(? Get(R, "lastIndex"))` (ES 22.2.5.2.2 step 4), reduced to an
+/// index the matcher can use.
+///
+/// `Get` goes through the own data property (see the module doc), so
+/// `lastIndex` is whatever a script last stored — and a script can store a
+/// *string*: `r.lastIndex = "12"` is legal and
+/// `exec/S15.10.6.2_A4_T8.js` depends on it, resuming at 12. Reading the slot
+/// and pattern-matching only Smi/f64 (what the old raw slot did) answered 0
+/// for every non-numeric `lastIndex`, silently re-matching from the start.
+///
+/// The steps, in order: `ToNumber` (so `""` is 0, `"1.9"` is 1.9, `null` is 0),
+/// then `ToIntegerOrInfinity` (truncate toward zero, `NaN` to 0), then clamp to
+/// `[0, 2^53 - 1]`. 0 for a missing property, since a deleted `lastIndex` reads
+/// as `undefined` → `NaN` → 0.
+pub fn last_index(ctx: &mut Ctx, obj: Handle<JsObject>) -> f64 {
+    let key = last_index_key(ctx.heap);
+    let value = {
+        let shape = ctx.heap.shape_of(obj);
+        let Some(desc) = ctx.heap.lookup_property(shape, key) else {
+            return 0.0;
+        };
+        let Some(slot) = desc.slot() else {
+            return 0.0;
+        };
+        ctx.heap
+            .get(obj)
+            .properties
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(JsValue::undefined())
+    };
+    let n = ctx.to_number(value);
+    to_length(n)
 }
 
-/// Sets `lastIndex`, canonicalizing to a Smi when integral and in range.
-pub fn set_last_index(heap: &mut Heap, obj: Handle<JsObject>, v: f64) {
-    if v.fract() == 0.0
+/// ES `ToLength(n)`: `ToIntegerOrInfinity` then clamp to `[0, 2^53 - 1]`. The
+/// 2^53 ceiling is what makes a `lastIndex` of `1e300` mean "past the end"
+/// rather than "an index no slice can express".
+fn to_length(n: f64) -> f64 {
+    if n.is_nan() {
+        return 0.0;
+    }
+    let int = n.trunc();
+    if int <= 0.0 {
+        return 0.0;
+    }
+    int.min(9007199254740991.0)
+}
+
+/// `Set(R, "lastIndex", v, true)` (ES 10.4.1) — an ordinary `[[Set]]`, so it
+/// honours the descriptor.
+///
+/// This is the whole of the `*-lastindex-err` / `*-no-write` cluster: the 22.2.7
+/// algorithms are strict-mode abstract operations, so a `[[Set]]` that returns
+/// `false` — which is exactly what a `writable: false` `lastIndex` produces — is
+/// a `TypeError`. A raw slot write cannot fail and therefore cannot throw, so
+/// before this the engine silently wrote past a frozen property and every one of
+/// those tests saw "no exception was thrown at all".
+///
+/// Returns `Result` because the failure is now real and must propagate: the
+/// spec's `ReturnIfAbrupt(setStatus)` appears in `RegExpBuiltinExec` steps 12.a.i
+/// and 15.b.c.i, in `@@match` step 8.c and in `@@replace`.
+pub fn set_last_index(ctx: &mut Ctx, obj: Handle<JsObject>, v: f64) -> Result<(), Throw> {
+    let value = if v.fract() == 0.0
         && (-1e15..=1e15).contains(&v)
         && let Some(smi) = JsValue::from_i32_smi(v as i32)
     {
-        heap.get_mut(obj).properties[SLOT_LAST_INDEX] = smi;
-        return;
+        smi
+    } else {
+        JsValue::from_f64(v)
+    };
+    let key = last_index_key(ctx.heap);
+    let stored =
+        crate::internal_methods::dispatch_set(ctx.heap, obj, key, value, JsValue::object(obj))
+            .map_err(Throw::Value)?;
+    if stored {
+        return Ok(());
     }
-    heap.get_mut(obj).properties[SLOT_LAST_INDEX] = JsValue::from_f64(v);
+    Err(ctx.type_error("TypeError: Cannot assign to read only property 'lastIndex'"))
 }
 
 /// `RegExp.prototype.exec(string)` — the core matching primitive.
@@ -882,14 +1071,14 @@ pub fn regexp_exec(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
     let _ = source;
     let is_global = flags.contains('g');
     let is_sticky = flags.contains('y');
-    let mut start = last_index(ctx.heap, obj);
+    let mut start = last_index(ctx, obj);
     if !is_global && !is_sticky {
         start = 0.0;
     }
     // Spec: lastIndex beyond the input length fails immediately.
     if start > input_units.len() as f64 {
         if is_global || is_sticky {
-            set_last_index(ctx.heap, obj, 0.0);
+            set_last_index(ctx, obj, 0.0)?;
         }
         return Ok(JsValue::null());
     }
@@ -904,14 +1093,14 @@ pub fn regexp_exec(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
     match m {
         None => {
             if is_global || is_sticky {
-                set_last_index(ctx.heap, obj, 0.0);
+                set_last_index(ctx, obj, 0.0)?;
             }
             Ok(JsValue::null())
         }
         Some(m) => {
             // Sticky: the match must start exactly at `lastIndex`.
             if is_sticky && m.start() != start as usize {
-                set_last_index(ctx.heap, obj, 0.0);
+                set_last_index(ctx, obj, 0.0)?;
                 return Ok(JsValue::null());
             }
             if is_global || is_sticky {
@@ -922,7 +1111,7 @@ pub fn regexp_exec(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
                 } else {
                     m.end() as f64
                 };
-                set_last_index(ctx.heap, obj, next);
+                set_last_index(ctx, obj, next)?;
             }
             Ok(match_result(ctx, &m, &input_units, &input_text))
         }
@@ -1029,10 +1218,13 @@ pub fn regexp_compile(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
     })?;
     let source_h = ctx.heap.intern_text(&source_text);
     let flags_h = ctx.heap.intern_text(&flags_text);
-    ctx.heap.get_mut(obj).properties[SLOT_SOURCE] = JsValue::string(source_h);
-    ctx.heap.get_mut(obj).properties[SLOT_FLAGS] = JsValue::string(flags_h);
-    ctx.heap.get_mut(obj).properties[SLOT_LAST_INDEX] =
-        JsValue::from_i32_smi(0).expect("0 fits Smi");
+    ctx.heap.get_mut(obj).elements[SLOT_SOURCE] = JsValue::string(source_h);
+    ctx.heap.get_mut(obj).elements[SLOT_FLAGS] = JsValue::string(flags_h);
+    // B.2.5.1 step 11: `Perform ? Set(O, "lastIndex", +0, true)`. An ordinary
+    // `Set`, so a receiver with a non-writable `lastIndex` makes `compile`
+    // throw rather than silently succeed — which is what
+    // `annexB/.../compile/lastindex-not-writable.js` asserts.
+    set_last_index(ctx, obj, 0.0)?;
     // Drop any cached compilation for this object.
     if let Some(cache) = ctx.regex_cache() {
         cache.borrow_mut().remove(&obj.index());
