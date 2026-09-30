@@ -17,6 +17,7 @@ use oxc_ast::ast::{
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{HandlerRange, Instr, Label, Opcode, WideOp};
 
+use crate::collect::binding_symbols;
 use crate::model::{CompileError, FinallyCtx, FnCtx, VarLoc};
 
 type Res<T> = Result<T, CompileError>;
@@ -129,6 +130,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Statement::EmptyStatement(_) | Statement::DebuggerStatement(_) => Ok(()),
             Statement::IfStatement(i) => {
+                // TDZ dominance: either branch may be skipped, so nothing
+                // declared inside one dominates code after the `if`.
+                self.enter_tdz_region();
                 let cond = self.expr(&i.test)?;
                 let else_l = self.label();
                 let end_l = self.label();
@@ -140,8 +144,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     self.stmt(alt)?;
                 }
                 self.bind(end_l);
+                self.exit_tdz_region();
                 Ok(())
             }
+            // Loop *heads* are deliberately not wrapped: a head declarator runs
+            // on every path into the body, so it dominates references there.
+            // The non-straight-line region is the body, opened by `with_loop` /
+            // `with_for_of_loop`.
             Statement::WhileStatement(w) => self.while_loop(&w.test, &w.body, None),
             Statement::DoWhileStatement(d) => self.do_while_loop(&d.body, &d.test, None),
             Statement::ForStatement(f) => self.for_loop(f, None),
@@ -174,7 +183,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 self.emit_reg3(Opcode::Throw, v, 0, 0, t.span);
                 Ok(())
             }
-            Statement::TryStatement(t) => self.try_stmt(t),
+            Statement::TryStatement(t) => self.tdz_region(|cx| cx.try_stmt(t)),
             Statement::FunctionDeclaration(f) => {
                 // Hoisted declarations were already initialized by the enclosing
                 // statement list's hoist pass; any declaration reaching here is
@@ -215,7 +224,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(())
             }
             Statement::VariableDeclaration(v) => self.var_decl(v),
-            Statement::SwitchStatement(s) => self.switch_stmt(s, None),
+            // A `switch` is the one construct whose case clauses share a block
+            // scope, so a binding declared under `case 1:` is genuinely visible
+            // (and genuinely uninitialized) under `case 2:`.
+            Statement::SwitchStatement(s) => self.tdz_region(|cx| cx.switch_stmt(s, None)),
             Statement::ClassDeclaration(c) => {
                 // Class declarations bind the constructor to the class name;
                 // `class_expression` performs that store when `is_statement`.
@@ -224,7 +236,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Statement::ForInStatement(f) => self.for_in_loop(f, None),
             Statement::ForOfStatement(f) => self.for_of_loop(f, None),
-            Statement::WithStatement(w) => self.with_stmt(w),
+            Statement::WithStatement(w) => self.tdz_region(|cx| cx.with_stmt(w)),
             Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => {
                 Err(self.err(
                     s.span(),
@@ -366,6 +378,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         self.err(ap.span, "default values in destructuring are not supported")
                     );
                 }
+            }
+            // End the TDZ for every binding this declarator introduced, once
+            // the whole declarator has run. Doing it per declarator rather
+            // than per store is what makes `let [a = a] = []` a read of a
+            // still-uninitialized `a`, and it covers the no-initializer form
+            // (`let x;`, initialized straight to `undefined`) plus every
+            // destructuring leaf without touching the pattern lowerings.
+            // `var` has no flag, so this is a no-op for it.
+            for sym in binding_symbols(&d.id) {
+                self.tdz_init(sym, d.span)?;
             }
         }
         Ok(())
@@ -987,12 +1009,20 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     per_iter_env = self.emit_per_iteration_env(span);
                 }
                 self.lower_binding_pattern(&v.declarations[0].id, value)?;
+                // `lower_binding_pattern` is shared with declaration lowering,
+                // which ends the TDZ in `var_decl`; a `for-of`/`for-in` head
+                // declarator has to do it here, or every read of the loop
+                // variable in the body would throw.
+                for sym in binding_symbols(&v.declarations[0].id) {
+                    self.tdz_init(sym, span)?;
+                }
             }
             oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
                 let src = value;
                 if let Some(sym) = self.comp.symbol_of(id.reference_id.get()) {
-                    let access = self.access_in_scope(sym);
-                    self.store_access(access, src, span);
+                    // `for (x of ...)` assigns to an existing binding, so the
+                    // TDZ guard applies here exactly as in `x = v`.
+                    self.store_binding_reassign(sym, src, span)?;
                 } else {
                     let gid = self.global_name_id(id.name.as_str());
                     self.emit_set_global(gid, src, span);
@@ -1360,11 +1390,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
         // `let`/`const` loop variables get a fresh per-iteration environment
         // when captured; `var` keeps the old single-slot behavior.
-        let per_iter_env =
-            is_lexical && self.per_iteration_env_needed(pattern) && self.emit_per_iteration_env(f.span);
+        let per_iter_env = is_lexical
+            && self.per_iteration_env_needed(pattern)
+            && self.emit_per_iteration_env(f.span);
         self.lower_binding_pattern(pattern, key_reg)?;
+        // See the `for-of` head above: the head declarator ends its own TDZ.
+        for sym in binding_symbols(pattern) {
+            self.tdz_init(sym, f.span)?;
+        }
 
-        self.with_loop(end, Some(cont), name, None, per_iter_env, |s| s.stmt(&f.body))?;
+        self.with_loop(end, Some(cont), name, None, per_iter_env, |s| {
+            s.stmt(&f.body)
+        })?;
         // Normal completion leaves the per-iteration environment before `cont`;
         // `break`/`continue` pop it inline in `jump_out`.
         if per_iter_env {
@@ -1428,7 +1465,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // copy. That is what makes the counter advance once per iteration
         // rather than once per body entry.
         let per_iter_env = per_iter_decl && self.emit_per_iteration_env(f.span);
-        self.with_loop(end, Some(cont), name, None, per_iter_env, |s| s.stmt(&f.body))?;
+        self.with_loop(end, Some(cont), name, None, per_iter_env, |s| {
+            s.stmt(&f.body)
+        })?;
         // Normal completion leaves the per-iteration environment before `cont`
         // (which `continue` targets) and before `end`; `break` and `continue`
         // pop it inline in `jump_out`.

@@ -111,7 +111,10 @@ impl FunctionBuilder {
     /// `cond_reg` and carry a 16-bit absolute target instead.
     pub fn emit_jump(&mut self, op: Opcode, cond_reg: u8, target: Label) {
         debug_assert!(
-            matches!(op, Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue),
+            matches!(
+                op,
+                Opcode::Jump | Opcode::JumpIfFalse | Opcode::JumpIfTrue | Opcode::JumpIfNullish
+            ),
             "emit_jump expects a branching opcode"
         );
         let wide_target = op == Opcode::Jump;

@@ -169,7 +169,12 @@ fn round(fb: &mut FunctionBytecode) -> bool {
                     let t = instr.imm24() as usize;
                     instr.set_imm24(map[t.min(n)]);
                 }
-                Some(Opcode::JumpIfFalse) | Some(Opcode::JumpIfTrue) => {
+                // `JumpIfNullish` is a 16-bit-target branch exactly like the
+                // two conditionals above and must be remapped with them —
+                // the TDZ guards in `FnCtx::tdz_test` are its only producers,
+                // and a stale target silently jumps into the middle of the
+                // `ReferenceError` construction instead of throwing it.
+                Some(Opcode::JumpIfFalse | Opcode::JumpIfTrue | Opcode::JumpIfNullish) => {
                     let t = instr.imm16() as usize;
                     instr.set_imm16(map[t.min(n)] as u16);
                 }
@@ -209,7 +214,7 @@ fn round(fb: &mut FunctionBytecode) -> bool {
                     changed = true;
                 }
             }
-            Some(Opcode::JumpIfFalse | Opcode::JumpIfTrue) => {
+            Some(Opcode::JumpIfFalse | Opcode::JumpIfTrue | Opcode::JumpIfNullish) => {
                 let mut t = fb.instrs[i].imm16() as usize;
                 let mut hops = 0usize;
                 while hops < 16 {

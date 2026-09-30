@@ -395,6 +395,33 @@ impl<'s> Collector<'s> {
         self.plans.units[unit].decl_order.push(sym);
     }
 
+    /// Walks a member expression's operands: the object (which carries the
+    /// *references*, including the base identifier of an optional chain) and,
+    /// for a computed key, the key expression.
+    ///
+    /// Shared by the `Expression` member arms and by the optional-chain arm so
+    /// both agree on what counts as a reference — they did not, and the chain
+    /// arm's blindness is what made TDZ checks read a mislaid flag.
+    ///
+    /// Takes the `Option` oxc's `as_member_expression` hands back so both
+    /// call sites (`Expression` arms and the chain's own element) share it.
+    fn member(&mut self, m: Option<&oxc_ast::ast::MemberExpression<'_>>) {
+        let Some(m) = m else {
+            return;
+        };
+        match m {
+            oxc_ast::ast::MemberExpression::ComputedMemberExpression(c) => {
+                self.expr(&c.object);
+                self.expr(&c.expression);
+            }
+            oxc_ast::ast::MemberExpression::StaticMemberExpression(s) => self.expr(&s.object),
+            oxc_ast::ast::MemberExpression::PrivateFieldExpression(p) => {
+                self.check_private_name_ref(&format!("#{}", p.field.name), p.span);
+                self.expr(&p.object);
+            }
+        }
+    }
+
     /// Validates a `#name` reference against the active lexical class scopes.
     /// `class Outer { #x; m() { this.#x } }` resolves; a reference to a name
     /// declared only by a nested class, or by no class at all, is an early
@@ -1728,8 +1755,44 @@ impl<'s> Collector<'s> {
                     }
                 }
             }
-            Expression::ChainExpression(_ch) => {
-                // chain contains nested functions only via arguments; ignore detailed walk
+            Expression::ChainExpression(ch) => {
+                // An optional chain is just a member/call spine, and the arms
+                // above already walk each link (object, computed key, call
+                // arguments), so recursing on the chain's own expression
+                // reaches the base identifier and any nested function.
+                //
+                // Skipping it — as this arm used to — left every reference
+                // inside `a?.b` invisible: an `a` that only a closure reads
+                // through a chain was never marked as escaping, so it was laid
+                // out as a plain register of the *declaring* unit and the
+                // closure read whatever happened to sit in that register of its
+                // own frame. That was silently wrong before, and became a
+                // spurious `ReferenceError` once TDZ checks read the same
+                // mislaid flag.
+                match &ch.expression {
+                    oxc_ast::ast::ChainElement::CallExpression(c) => {
+                        self.expr(&c.callee);
+                        for a in &c.arguments {
+                            match a {
+                                oxc_ast::ast::Argument::SpreadElement(sp) => {
+                                    self.expr(&sp.argument);
+                                }
+                                other => {
+                                    if let Some(e) = other.as_expression() {
+                                        self.expr(e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    oxc_ast::ast::ChainElement::TSNonNullExpression(_) => {}
+                    other => {
+                        // `ChainElement`'s member variants are exactly the
+                        // three `MemberExpression` ones; audited by the
+                        // `INHERIT(MemberExpression)` declaration.
+                        self.member(other.as_member_expression());
+                    }
+                }
             }
             Expression::PrivateInExpression(p) => {
                 self.check_private_name_ref(&format!("#{}", p.left.name), p.span);
@@ -1775,15 +1838,9 @@ impl<'s> Collector<'s> {
                 }
                 self.expr(&a.argument);
             }
-            Expression::ComputedMemberExpression(c) => {
-                self.expr(&c.object);
-                self.expr(&c.expression);
-            }
-            Expression::StaticMemberExpression(s) => self.expr(&s.object),
-            Expression::PrivateFieldExpression(p) => {
-                self.check_private_name_ref(&format!("#{}", p.field.name), p.span);
-                self.expr(&p.object);
-            }
+            Expression::ComputedMemberExpression(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::PrivateFieldExpression(_) => self.member(e.as_member_expression()),
             Expression::ObjectExpression(o) => {
                 // Annex B.3.1: two `PropertyDefinition : PropertyName :
                 // AssignmentExpression` entries for `__proto__` are an early
@@ -2108,7 +2165,7 @@ fn binding_symbol(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<SymbolId> {
     }
 }
 
-fn binding_symbols(pattern: &BindingPattern<'_>) -> Vec<SymbolId> {
+pub(crate) fn binding_symbols(pattern: &BindingPattern<'_>) -> Vec<SymbolId> {
     match pattern {
         BindingPattern::BindingIdentifier(id) => id.symbol_id.get().into_iter().collect(),
         BindingPattern::ObjectPattern(object) => object
@@ -2448,19 +2505,52 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
                 plans.units[ui].vars.insert(sym, VarLoc::Global);
                 continue;
             }
-            if plans.captured.contains(&sym) || plans.units[ui].eval_reachable {
+            // A `let`/`const` binding needs a parallel "initialized" cell so a
+            // reference made before its declaration runs can be rejected (see
+            // `UnitPlan::tdz_flags`). Only `lexical_symbols` qualifies:
+            // `var`/formals are initialized when the environment record is
+            // created and function declarations are initialized at scope
+            // entry, so neither can be observed uninitialized. The flag is
+            // allocated immediately after its value in the *same* storage
+            // class, so a captured binding's flag is reachable from inner
+            // functions through exactly the same environment chain.
+            let needs_tdz_flag = plans.units[ui].lexical_symbols.contains(&sym);
+            let flag = if plans.captured.contains(&sym) || plans.units[ui].eval_reachable {
                 plans.units[ui].env_slots.insert(sym, slot);
                 plans.units[ui].vars.insert(sym, VarLoc::Env(slot));
                 slot = slot.checked_add(1).ok_or_else(|| CompileError {
                     message: "too many functions/constants".into(),
                     span: Some((0, 0)),
                 })?;
+                if needs_tdz_flag {
+                    let flag = VarLoc::Env(slot);
+                    slot = slot.checked_add(1).ok_or_else(|| CompileError {
+                        message: "too many functions/constants".into(),
+                        span: Some((0, 0)),
+                    })?;
+                    Some(flag)
+                } else {
+                    None
+                }
             } else {
                 plans.units[ui].vars.insert(sym, VarLoc::Reg(reg));
                 reg = reg.checked_add(1).ok_or_else(|| CompileError {
                     message: "too many functions/constants".into(),
                     span: Some((0, 0)),
                 })?;
+                if needs_tdz_flag {
+                    let flag = VarLoc::Reg(reg);
+                    reg = reg.checked_add(1).ok_or_else(|| CompileError {
+                        message: "too many functions/constants".into(),
+                        span: Some((0, 0)),
+                    })?;
+                    Some(flag)
+                } else {
+                    None
+                }
+            };
+            if let Some(flag) = flag {
+                plans.units[ui].tdz_flags.insert(sym, flag);
             }
         }
         let eval_reachable = plans.units[ui].eval_reachable;

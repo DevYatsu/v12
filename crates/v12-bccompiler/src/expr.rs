@@ -9,6 +9,7 @@ use oxc_ast::ast::{
     Expression, LogicalOperator, MemberExpression, ObjectProperty, ObjectPropertyKind, PropertyKey,
     UnaryOperator, UpdateOperator,
 };
+use oxc_semantic::SymbolId;
 use oxc_span::{GetSpan, Span};
 use v12_bytecode::{Const, Label, Opcode};
 
@@ -544,7 +545,12 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         span: Span,
     ) -> Res<()> {
         if let Some(sym) = self.comp.symbol_of(rid) {
-            self.read_access(self.access_in_scope(sym), dst, span);
+            // `read_binding_into`, not `read_access`: a `let`/`const`
+            // reference is a `ReferenceError` until its declaration has run,
+            // and this is the single chokepoint every plain identifier read
+            // funnels through (`typeof` included — it is a read, not a safe
+            // probe).
+            self.read_binding_into(sym, dst, span)?;
             return Ok(());
         }
         // Spec-defined non-writable globals that need no runtime binding.
@@ -960,8 +966,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         self.emit_get_global_lenient(dst, gid, span);
                     }
                     Some(sym) => {
-                        let access = self.access_in_scope(sym);
-                        self.read_access(access, dst, span);
+                        self.read_binding_into(sym, dst, span)?;
                     }
                     None => match name {
                         "undefined" | "NaN" | "Infinity" => {
@@ -1177,7 +1182,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 }
                 let access = self.access_in_scope(sym);
                 let old = self.new_temp();
-                self.read_access(access, old, span);
+                // `x++` reads before it writes, so the read carries the TDZ
+                // guard and the store needs none of its own.
+                self.read_binding_into(sym, old, span)?;
                 let one = self.new_temp();
                 self.load_int(one, delta, span);
                 let new = self.new_temp();
@@ -1305,13 +1312,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     None => rhs,
                     Some(opcode) => {
                         let cur = self.new_temp();
-                        self.read_access(access, cur, span);
+                        // Compound assignment reads first, so its read carries
+                        // the TDZ guard.
+                        self.read_binding_into(sym, cur, span)?;
                         let out = self.new_temp();
                         self.emit_reg3(opcode, out, cur, rhs, span);
                         out
                     }
                 };
-                self.store_access(access, value, span);
+                if binop.is_some() {
+                    self.store_access(access, value, span);
+                } else {
+                    // Plain `x = v` never reads, so the store itself is the
+                    // reference that must be rejected while uninitialized.
+                    self.store_binding_reassign(sym, value, span)?;
+                }
                 Ok(value)
             }
             _ => {
@@ -1482,8 +1497,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                         }
                         continue;
                     };
-                    let access = self.access_in_scope(sym);
-                    self.store_access(access, val, span);
+                    // `AssignmentTargetProperty::AssignmentTargetPropertyIdentifier`
+                    // — a destructuring assignment target, same rule as
+                    // `assign_target`: guard the store.
+                    self.store_binding_reassign(sym, val, span)?;
                 }
                 oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
                     // `{y: z} = rhs`: property `y` → target `z`;
@@ -1543,8 +1560,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                     }
                     return Ok(());
                 };
-                let access = self.access_in_scope(sym);
-                self.store_access(access, val, span);
+                // `[x] = rhs` / `({x} = rhs)`: an assignment *target*, so the
+                // TDZ guard rides the store.
+                self.store_binding_reassign(sym, val, span)?;
                 Ok(())
             }
             _ => {
@@ -1907,8 +1925,14 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         };
         // Storage slot pair: (read register, writer closure context).
         enum Target {
-            Id(VarAccess),
-            Member { obj: u16, key: u16, is_super: bool },
+            /// `Id` carries the resolved storage plus the binding's symbol,
+            /// so the read below can still reach its TDZ guard.
+            Id(VarAccess, SymbolId),
+            Member {
+                obj: u16,
+                key: u16,
+                is_super: bool,
+            },
         }
         let target = match simple {
             oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
@@ -1923,7 +1947,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 {
                     return Err(self.err(id.span, "SyntaxError: Assignment to constant variable"));
                 }
-                Target::Id(self.access_in_scope(sym))
+                Target::Id(self.access_in_scope(sym), sym)
             }
             _ => {
                 let Some(m) = simple.as_member_expression() else {
@@ -1943,7 +1967,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // Read current value.
         let cur = self.new_temp();
         match &target {
-            Target::Id(access) => self.read_access(*access, cur, span),
+            Target::Id(_, sym) => self.read_binding_into(*sym, cur, span)?,
             Target::Member { obj, key, is_super } => {
                 if *is_super {
                     let receiver = self.read_this(span)?;
@@ -1982,7 +2006,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // Assign + yield the right-hand side.
         let rhs = self.expr(right)?;
         match &target {
-            Target::Id(access) => self.store_access(*access, rhs, span),
+            // Reached only when the guarded read above succeeded, so the
+            // binding is initialized and the store needs no guard.
+            Target::Id(access, _) => self.store_access(*access, rhs, span),
             Target::Member { obj, key, is_super } => {
                 if *is_super {
                     let receiver = self.read_this(span)?;
