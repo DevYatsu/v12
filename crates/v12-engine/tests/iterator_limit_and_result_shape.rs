@@ -284,3 +284,57 @@ fn zip_longest_pads_with_the_padding_option() {
 
 
 
+// -- JSON raw JSON: the stringify half ----------------------------------------
+//
+// `JSON.rawJSON` / `JSON.isRawJSON` themselves are NOT installed — both need a
+// `NativeId` in `v12-native/src/id.rs` and an entry in the `JSON` block of
+// `builtins/mod.rs`, both of which are outside this lane's file ownership. The
+// bodies (`json::json_raw_json`, `json::json_is_raw_json`) are written and
+// compile; only the wiring is missing.
+//
+// What IS live without any wiring is the *consuming* half: the
+// `SerializeJSONProperty` splice, because it is recognised structurally. These
+// tests therefore build a backdoor by hand — a lone `rawJSON` own property —
+// which is exactly the shape `JSON.rawJSON` produces and exactly the shape
+// `json::raw_json_of` looks for.
+
+#[test]
+fn a_lone_rawjson_property_is_spliced_verbatim() {
+    // Not quoted, not escaped: the text goes into the result as-is.
+    assert_eq!(
+        eval_display("var o = {}; o.rawJSON = '{\"x\":1}'; JSON.stringify(o)"),
+        "{\"x\":1}"
+    );
+    assert_eq!(
+        eval_display("JSON.stringify([{ rawJSON: '[1,2]' }, 3])"),
+        "[[1,2],3]"
+    );
+}
+
+#[test]
+fn an_ordinary_object_with_a_rawjson_key_is_not_treated_as_raw() {
+    // The safety property, and the reason the check is "exactly one own
+    // enumerable property" rather than "has a rawJSON property": a second key
+    // makes it an ordinary object that gets escaped like any other.
+    assert_eq!(
+        eval_display("JSON.stringify({ rawJSON: '{\"x\":1}', other: 2 })"),
+        "{\"rawJSON\":\"{\\\"x\\\":1}\",\"other\":2}"
+    );
+    // A `rawJSON` key whose value is not a String is likewise ordinary.
+    assert_eq!(
+        eval_display("JSON.stringify({ rawJSON: 1 })"),
+        "{\"rawJSON\":1}"
+    );
+}
+
+#[test]
+fn raw_json_text_is_not_validated_on_the_way_out() {
+    // `JSON.rawJSON` only rejects control characters; everything else is the
+    // caller's responsibility. Emitting `nope` verbatim and then failing to
+    // parse it is the documented round-trip behaviour, not a bug — and it is
+    // what shows the splice really is verbatim rather than a re-serialization.
+    assert_eq!(
+        eval_throw_kind("JSON.parse(JSON.stringify({ rawJSON: 'nope' }))"),
+        Ok("SyntaxError".into())
+    );
+}
