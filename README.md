@@ -13,9 +13,11 @@ start, small in memory, and correct enough to run real programs.
 > tested. Generators, async functions, and Promise microtasks are wired end to
 > end. Expect breaking changes.
 >
-> Measured on 2026-10-01 at `e925647d`:
-> - `cargo nextest run --workspace` → **1 295 tests, 1 295 passed, 2 skipped**
->   (~14 s). This is the canonical gate; see `CONTEXT.md`.
+> Measured on 2026-10-01 at `eaa495b5` (test count) / `e925647d` (conformance):
+> - `cargo nextest run --workspace` → **1 273 tests, 1 273 passed, 2 skipped**
+>   (~15 s). This is the canonical gate; see `CONTEXT.md`. The count drops when a
+>   crate's tests go with it — it was 1 295 until the unused `v12-intl` crate
+>   (22 tests) was deleted.
 > - Test262 `language` → **77.6 % pass** (19 080 / 24 590; 41 skipped) — the
 >   Phase 1 target is ≥60 %, so it is met. The committed baseline is
 >   `conformance/baseline/language.json`; CI gates on **fail sets** via
@@ -47,9 +49,9 @@ commit —
 
 Where a best-in-class crate exists, v12 uses it rather than rebuilding it:
 [oxc](https://oxc.rs) parses and analyzes all JavaScript, [regress][] implements
-ECMA-262 regular expressions, [malachite][malachite] powers `BigInt`,
-[ICU4X][icu] and [temporal_rs][temporal] back internationalization and dates,
-and [lasso][lasso] interns identifier strings.
+ECMA-262 regular expressions, and [lasso][lasso] interns identifier strings.
+`BigInt` and `Intl`/Temporal are hand-rolled or not yet implemented — the
+engine carries storage for them but no arithmetic or formatting.
 
 ## Embedding
 
@@ -100,7 +102,6 @@ See `crates/v12-api/README.md` for the full API surface and the runnable
 | `v12-jit-baseline` | Tier-1 template JIT backed by Cranelift (feature-gated, deopt map) |
 | `v12-jit-opt` | Tier-2 speculative optimizer — type lattice, guards, SSA, inlining, loop versioning *(driver wiring pending)* |
 | `v12-regex` | ES-semantics wrapper over `regress` |
-| `v12-intl` | `Intl`/Temporal primitives over ICU4X and `temporal_rs` |
 | `v12-engine` | Built-ins (Object/Array/String/Number/Math/Error/Promise/Map/Set/RegExp), single realm, microtask queue, `Engine::eval` API, ESM module compilation |
 | `v12-cli` | The `v12` binary: REPL (rustyline — history + arrows) and script runner |
 
@@ -181,13 +182,11 @@ optimizing-tier VMs on hot loops is explicitly out of scope for v1.
 
 v12's own code is dual-licensed under MIT or Apache-2.0, at your option.
 
-Bundled dependencies carry their own licenses, which v12 does not modify:
-most are MIT/Apache; the `BigInt` implementation ([malachite]) is
-LGPL-3.0-only — applications embedding v12 should review the dependency
-license list (`cargo deny check licenses`) before distributing binaries.
+Bundled dependencies carry their own licenses, which v12 does not modify —
+all of them are permissive (MIT/Apache/BSD/Unicode-3.0/Zlib family; no
+copyleft). Applications embedding v12 should still review the dependency
+license list (`cargo deny check licenses`, configured in `deny.toml`) before
+distributing binaries.
 
 [regress]: https://crates.io/crates/regress
-[malachite]: https://crates.io/crates/malachite
-[icu]: https://crates.io/crates/icu
-[temporal]: https://crates.io/crates/temporal_rs
 [lasso]: https://crates.io/crates/lasso

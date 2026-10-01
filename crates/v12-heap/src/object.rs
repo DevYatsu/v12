@@ -1,6 +1,6 @@
 //! Minimal heap-object types: `JsObject`, `V12Symbol`, `V12BigInt`. Strings
-//! live in their own module ([`crate::string`]); real BigInt semantics over
-//! malachite arrive with the built-ins.
+//! live in their own module ([`crate::string`]); real BigInt arithmetic lands
+//! with the built-ins — `V12BigInt` is the storage half only.
 
 use crate::gc::{MarkSink, Trace};
 use crate::handle::{Handle, HeapSpace, Space};
@@ -875,9 +875,9 @@ impl HeapExt for crate::Heap {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct V12Symbol;
 
-/// A heap BigInt placeholder: sign + little-endian base-256 magnitude. The
-/// malachite-backed implementation lands with built-ins; this carries the
-/// space and allocation accounting until then.
+/// A heap BigInt placeholder: sign + little-endian base-256 magnitude. Real
+/// arithmetic lands with the built-ins; this carries the space and allocation
+/// accounting until then.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct V12BigInt {
     /// `true` when negative. Zero is canonically positive (`sign == false`).

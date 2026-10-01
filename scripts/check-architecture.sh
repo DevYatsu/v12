@@ -66,9 +66,10 @@ if [ "$warnings" -gt 0 ]; then
     #   lints on for members that never opted in: test-support +16,
     #   v12-cli's `check` bin +5, conformance/harness's test262-runner +4.
     #   Those sites existed all along; nothing was linted there before, so
-    #   switching the lints on surfaced them. v12-api, v12-intl and v12-regex
-    #   gained 0 — every site in them is inside an inline `#[cfg(test)] mod
-    #   tests`, which a plain `cargo clippy` does not compile.
+    #   switching the lints on surfaced them. v12-api and v12-regex gained
+    #   0 — every site in them is inside an inline `#[cfg(test)] mod
+    #   tests`, which a plain `cargo clippy` does not compile. (v12-intl
+    #   was in that same group; the crate was deleted in W4.1.)
     #   -1 lint came out of v12-engine (123 -> 121 warnings): W0.3 deleted the
     #   two live `panic!`s in crates/v12-engine/src/builtins/ctx.rs.
     #   +3 summary lines, because three crates now warn at all.

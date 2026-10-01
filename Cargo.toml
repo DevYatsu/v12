@@ -48,18 +48,9 @@ cranelift-codegen = "0.135"
 # ECMA-262 RegExp engine.
 regress = "0.12"
 
-# BigInt.
-malachite = "0.11"
-
-# Intl / Temporal.
-icu = "2.3"
-temporal_rs = "0.2"
-
-# Identifier interning.
+# Identifier interning. Consumed by v12-bccompiler; the CLI used to pin it
+# without a single use site (removed in W4.1).
 lasso = "=0.7.3"
-
-# Arena allocation.
-bumpalo = "3.20"
 
 # Enum derive helpers (FromRepr for NativeId / Kind discriminants).
 strum = { version = "0.28", features = ["derive"] }
@@ -73,9 +64,6 @@ rustc-hash = "2"
 # small-object case, spills to the heap automatically past the inline cap.
 smallvec = "1"
 
-# Benchmarks (dev-only).
-criterion = "0.8"
-
 # Internal crates.
 v12-bytecode = { path = "crates/v12-bytecode" }
 v12-heap = { path = "crates/v12-heap" }
@@ -87,7 +75,6 @@ v12-api = { path = "crates/v12-api" }
 v12-jit-baseline = { path = "crates/v12-jit-baseline" }
 v12-jit-opt = { path = "crates/v12-jit-opt" }
 v12-regex = { path = "crates/v12-regex" }
-v12-intl = { path = "crates/v12-intl" }
 v12-engine = { path = "crates/v12-engine" }
 test-support = { path = "crates/test-support" }
 

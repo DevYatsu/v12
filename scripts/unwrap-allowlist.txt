@@ -20,7 +20,7 @@
 #   Counts only ever go DOWN. scripts/unwrap-lint.sh fails on surplus entries,
 #   so removing a site forces its line to be deleted here in the same commit.
 #
-# TOTALS: 566 sites
+# TOTALS: 514 sites
 #   conformance/harness      34
 #   test-support             17
 #   v12-api                  16
@@ -30,13 +30,12 @@
 #   v12-engine               111
 #   v12-heap                 53
 #   v12-interp               132
-#   v12-intl                 52
 #   v12-jit-baseline         38
 #   v12-jit-opt              38
 #   expect                   291
 #   panic                    32
 #   unreachable              25
-#   unwrap                   218
+#   unwrap                   166
 #
 # --- entries ---
 conformance/harness/src/frontmatter.rs:407  expect  [cfg-test] let neg = fm.negative.expect("should have negative");
@@ -477,58 +476,6 @@ crates/v12-interp/src/property.rs:3826  unwrap  assert_eq!(interp.proxy_op_own_k
 crates/v12-interp/src/property.rs:3842  unwrap  let smi = JsValue::from_i32_smi(5).unwrap();
 crates/v12-interp/src/property.rs:3862  unwrap  Ok(JsValue::from_i32_smi(3).unwrap())
 crates/v12-interp/src/property.rs:3874  unwrap  let num = JsValue::from_i32_smi(7).unwrap();
-crates/v12-intl/src/collator.rs:27  unwrap  [cfg-test] assert_eq!(compare("a", "b", "en-US").unwrap(), Ordering::Less);
-crates/v12-intl/src/collator.rs:28  unwrap  [cfg-test] assert_eq!(compare("b", "a", "en-US").unwrap(), Ordering::Greater);
-crates/v12-intl/src/collator.rs:29  unwrap  [cfg-test] assert_eq!(compare("a", "a", "en-US").unwrap(), Ordering::Equal);
-crates/v12-intl/src/collator.rs:37  unwrap  [cfg-test] compare("Ärger", "Zebra", "de").unwrap(),
-crates/v12-intl/src/collator.rs:43  unwrap  [cfg-test] compare("öl", "zoo", "sv").unwrap(),
-crates/v12-intl/src/decimal.rs:61  unwrap  [cfg-test] format_decimal(1234567.891, "en-US").unwrap(),
-crates/v12-intl/src/decimal.rs:68  unwrap  [cfg-test] assert_eq!(format_decimal(f64::NAN, "en-US").unwrap(), "NaN");
-crates/v12-intl/src/decimal.rs:69  unwrap  [cfg-test] assert_eq!(format_decimal(f64::INFINITY, "en-US").unwrap(), "Infinity");
-crates/v12-intl/src/decimal.rs:71  unwrap  [cfg-test] format_decimal(f64::NEG_INFINITY, "en-US").unwrap(),
-crates/v12-intl/src/decimal.rs:74  unwrap  [cfg-test] assert_eq!(format_decimal(-0.0, "en-US").unwrap(), "-0");
-crates/v12-intl/src/decimal.rs:75  unwrap  [cfg-test] assert_eq!(format_decimal(0.0, "en-US").unwrap(), "0");
-crates/v12-intl/src/decimal.rs:80  unwrap  [cfg-test] assert_eq!(format_decimal(-9876.5, "en-US").unwrap(), "-9,876.5");
-crates/v12-intl/src/locale.rs:43  unwrap  [cfg-test] assert_eq!(parse_locale("EN-us").unwrap().to_string(), "en-US");
-crates/v12-intl/src/locale.rs:45  unwrap  [cfg-test] parse_locale("zh-hans-cn").unwrap().to_string(),
-crates/v12-intl/src/locale.rs:59  unwrap  [cfg-test] assert_eq!(canonicalize_locale("iw").unwrap(), "he");
-crates/v12-intl/src/locale.rs:60  unwrap  [cfg-test] assert_eq!(canonicalize_locale("en-US").unwrap(), "en-US");
-crates/v12-intl/src/plural.rs:131  unwrap  [cfg-test] assert_eq!(plural_cardinal(1.0, "en-US").unwrap(), Category::One);
-crates/v12-intl/src/plural.rs:132  unwrap  [cfg-test] assert_eq!(plural_cardinal(2.0, "en-US").unwrap(), Category::Other);
-crates/v12-intl/src/plural.rs:133  unwrap  [cfg-test] assert_eq!(plural_cardinal(0.0, "en-US").unwrap(), Category::Other);
-crates/v12-intl/src/plural.rs:138  unwrap  [cfg-test] assert_eq!(plural_cardinal(1.5, "en-US").unwrap(), Category::Other);
-crates/v12-intl/src/plural.rs:140  unwrap  [cfg-test] assert_eq!(plural_cardinal(1.0, "en-US").unwrap(), Category::One);
-crates/v12-intl/src/plural.rs:145  unwrap  [cfg-test] assert_eq!(plural_cardinal(f64::NAN, "en-US").unwrap(), Category::Other);
-crates/v12-intl/src/plural.rs:147  unwrap  [cfg-test] plural_cardinal(f64::INFINITY, "en-US").unwrap(),
-crates/v12-intl/src/plural.rs:155  unwrap  [cfg-test] let set = cardinal_categories("ru").unwrap();
-crates/v12-intl/src/plural.rs:161  unwrap  [cfg-test] assert_eq!(plural_cardinal(21.0, "ru").unwrap(), Category::One);
-crates/v12-intl/src/plural.rs:162  unwrap  [cfg-test] assert_eq!(plural_cardinal(3.0, "ru").unwrap(), Category::Few);
-crates/v12-intl/src/plural.rs:163  unwrap  [cfg-test] assert_eq!(plural_cardinal(5.0, "ru").unwrap(), Category::Many);
-crates/v12-intl/src/temporal.rs:236  unwrap  [cfg-test] let d = IsoDate::new(2026, 1, 31).unwrap();
-crates/v12-intl/src/temporal.rs:237  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 2, 1).unwrap());
-crates/v12-intl/src/temporal.rs:237  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 2, 1).unwrap());
-crates/v12-intl/src/temporal.rs:242  unwrap  [cfg-test] let d = IsoDate::new(2026, 12, 31).unwrap();
-crates/v12-intl/src/temporal.rs:243  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2027, 1, 1).unwrap());
-crates/v12-intl/src/temporal.rs:243  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2027, 1, 1).unwrap());
-crates/v12-intl/src/temporal.rs:245  unwrap  [cfg-test] d.sub_days(365).unwrap(),
-crates/v12-intl/src/temporal.rs:246  unwrap  [cfg-test] IsoDate::new(2025, 12, 31).unwrap()
-crates/v12-intl/src/temporal.rs:253  unwrap  [cfg-test] let d = IsoDate::new(2024, 2, 28).unwrap();
-crates/v12-intl/src/temporal.rs:254  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2024, 2, 29).unwrap());
-crates/v12-intl/src/temporal.rs:254  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2024, 2, 29).unwrap());
-crates/v12-intl/src/temporal.rs:255  unwrap  [cfg-test] assert_eq!(d.add_days(2).unwrap(), IsoDate::new(2024, 3, 1).unwrap());
-crates/v12-intl/src/temporal.rs:255  unwrap  [cfg-test] assert_eq!(d.add_days(2).unwrap(), IsoDate::new(2024, 3, 1).unwrap());
-crates/v12-intl/src/temporal.rs:257  unwrap  [cfg-test] let d = IsoDate::new(2026, 2, 28).unwrap();
-crates/v12-intl/src/temporal.rs:258  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 3, 1).unwrap());
-crates/v12-intl/src/temporal.rs:258  unwrap  [cfg-test] assert_eq!(d.add_days(1).unwrap(), IsoDate::new(2026, 3, 1).unwrap());
-crates/v12-intl/src/temporal.rs:275  unwrap  [cfg-test] IsoDate::new(2026, 2, 1).unwrap().to_iso_string().unwrap(),
-crates/v12-intl/src/temporal.rs:275  unwrap  [cfg-test] IsoDate::new(2026, 2, 1).unwrap().to_iso_string().unwrap(),
-crates/v12-intl/src/temporal.rs:279  unwrap  [cfg-test] IsoDate::new(2026, 2, 1).unwrap(),
-crates/v12-intl/src/temporal.rs:280  unwrap  [cfg-test] IsoTime::new(13, 45, 30, 123, 0, 0).unwrap(),
-crates/v12-intl/src/temporal.rs:282  unwrap  [cfg-test] .unwrap();
-crates/v12-intl/src/temporal.rs:283  unwrap  [cfg-test] assert_eq!(dt.to_iso_string().unwrap(), "2026-02-01T13:45:30.123");
-crates/v12-intl/src/temporal.rs:292  unwrap  [cfg-test] assert!(IsoTime::MIDNIGHT == IsoTime::new(0, 0, 0, 0, 0, 0).unwrap());
-crates/v12-intl/src/temporal.rs:302  unwrap  [cfg-test] let max = IsoDate::new(275_760, 9, 13).unwrap();
-crates/v12-intl/src/temporal.rs:306  unwrap  [cfg-test] let min = IsoDate::new(-271_821, 4, 20).unwrap();
 crates/v12-jit-baseline/src/lib.rs:78  expect  [cfg-test] let mut baseline = JitBaseline::new().expect("new");
 crates/v12-jit-baseline/src/lib.rs:79  expect  [cfg-test] let compiled = baseline.compile(&fb).expect("compile supported");
 crates/v12-jit-baseline/src/lib.rs:92  expect  [cfg-test] let mut baseline = JitBaseline::new().expect("new");

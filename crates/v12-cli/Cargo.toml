@@ -18,7 +18,6 @@ v12-api.workspace = true
 v12-engine.workspace = true
 v12-bccompiler.workspace = true
 v12-bytecode.workspace = true
-lasso.workspace = true
 rustyline = "14"
 
 [lints]
