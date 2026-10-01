@@ -297,6 +297,31 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
             Expression::YieldExpression(y) => y.argument.as_ref().is_some_and(walk_expr),
             Expression::AwaitExpression(a) => walk_expr(&a.argument),
             Expression::PrivateInExpression(p) => walk_expr(&p.right),
+            // ES §15.7.1: `FieldDefinition : It is a Syntax Error if
+            // ContainsArguments of FieldDefinition is true`, and
+            // ContainsArguments is defined over the whole expression tree — an
+            // optional chain or a dynamic `import` does not stop it. Missing
+            // these two arms (they used to fall into `_ => false`) made
+            // `class C { x = (() => arguments)?.f }` and
+            // `class C { x = import(arguments) }` compile silently.
+            Expression::ChainExpression(ch) => match &ch.expression {
+                oxc_ast::ast::ChainElement::CallExpression(c) => {
+                    walk_expr(&c.callee)
+                        || c.arguments.iter().any(|a| match a {
+                            oxc_ast::ast::Argument::SpreadElement(s) => walk_expr(&s.argument),
+                            other => other.as_expression().is_some_and(walk_expr),
+                        })
+                }
+                oxc_ast::ast::ChainElement::ComputedMemberExpression(c) => {
+                    walk_expr(&c.object) || walk_expr(&c.expression)
+                }
+                oxc_ast::ast::ChainElement::StaticMemberExpression(s) => walk_expr(&s.object),
+                oxc_ast::ast::ChainElement::PrivateFieldExpression(p) => walk_expr(&p.object),
+                oxc_ast::ast::ChainElement::TSNonNullExpression(n) => walk_expr(&n.expression),
+            },
+            Expression::ImportExpression(i) => {
+                walk_expr(&i.source) || i.options.as_ref().is_some_and(walk_expr)
+            }
             _ => false,
         }
     }

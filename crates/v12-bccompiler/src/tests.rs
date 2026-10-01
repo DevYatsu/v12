@@ -2119,6 +2119,73 @@ fn class_field_initializer_arguments_is_syntax_error() {
         .expect("method arguments is legal");
 }
 
+/// ES §15.7.1: `ClassElement : FieldDefinition` is a Syntax Error if
+/// `ContainsArguments` of the FieldDefinition is true. `ContainsArguments` is
+/// defined over the whole expression tree, so an optional chain does not hide
+/// an `arguments` reference inside it.
+#[test]
+fn class_field_initializer_arguments_through_optional_chain_is_syntax_error() {
+    const MSG: &str = "'arguments' is not allowed in a class field initializer";
+    for src in [
+        // The chain: `arguments` sits inside an arrow the chain reaches.
+        "var C = class { x = (() => arguments)?.f };",
+        // An optional *call* whose callee is `arguments`. `contains_arguments`
+        // recurses into `CallExpression`'s callee (that is how it already
+        // handles the non-optional form), so the optional form agrees.
+        "var C = class { x = arguments?.() };",
+        "var C = class { x = arguments?.f };",
+        // A computed key inside a chain.
+        "var C = class { x = (() => 1)?.[arguments] };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("field initializer arguments should fail");
+        assert!(err.contains(MSG), "for {src}: got {err}");
+    }
+}
+
+/// Same ES §15.7.1 rule, reached through a dynamic `import`: neither the
+/// module specifier nor the options argument may reference `arguments`.
+#[test]
+fn class_field_initializer_arguments_in_dynamic_import_is_syntax_error() {
+    const MSG: &str = "'arguments' is not allowed in a class field initializer";
+    for src in [
+        "var C = class { x = import(arguments) };",
+        // The options argument is a full AssignmentExpression.
+        "var C = class { x = import('x', arguments) };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("field initializer arguments should fail");
+        assert!(err.contains(MSG), "for {src}: got {err}");
+    }
+}
+
+/// Negative control for the chain/import arms above: `contains_arguments` must
+/// not fire on a chain or an `import` that carries no `arguments`. Guards
+/// against a blanket recursion that would reject every chain-wrapped field.
+#[test]
+fn class_field_initializer_chain_and_import_without_arguments_compile() {
+    for src in [
+        // A chain whose base and call arguments are both clean.
+        "var C = class { x = (() => 1)?.f };",
+        "var C = class { x = (() => 1)()?.f(2)?.g };",
+        // Names that merely look like `arguments` (the check is textual, per
+        // spec: ContainsArguments is syntactic, not a scope lookup).
+        "var args = 1; var C = class { x = args + arg };",
+        "var arg = 1; var C = class { x = arg?.f };",
+        // `arguments` behind an ordinary function is a *different* binding, so
+        // the search stops there.
+        "var C = class { x = function () { return arguments; } };",
+        // A dynamic import with a literal source is fine, with or without
+        // import attributes.
+        "var C = class { x = import('x') };",
+        "var C = class { x = import('x', { with: { type: \"json\" } }) };",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
 /// ES §15.7.1: the `super()` *call* form is constructor-of-a-derived-class only.
 #[test]
 fn super_call_outside_derived_constructor_is_syntax_error() {
