@@ -322,7 +322,29 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
             Expression::ImportExpression(i) => {
                 walk_expr(&i.source) || i.options.as_ref().is_some_and(walk_expr)
             }
-            _ => false,
+            // Nothing to search: a literal has no subexpressions, and `this`/
+            // `super`/`import.meta`/`new.target` are keyword reads with no
+            // operands, so none of them can reach the `arguments` identifier.
+            // The `TS*`/`JSX*`/`V8Intrinsic` variants are never produced (the
+            // parser is never asked for TypeScript or JSX).
+            Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::ThisExpression(_)
+            | Expression::Super(_)
+            | Expression::ImportMeta(_)
+            | Expression::NewTarget(_)
+            | Expression::TSAsExpression(_)
+            | Expression::TSSatisfiesExpression(_)
+            | Expression::TSTypeAssertion(_)
+            | Expression::TSNonNullExpression(_)
+            | Expression::TSInstantiationExpression(_)
+            | Expression::V8IntrinsicExpression(_)
+            | Expression::JSXElement(_)
+            | Expression::JSXFragment(_) => false,
         }
     }
     fn simple_target_is_arguments(t: &SimpleAssignmentTarget<'_>) -> bool {
@@ -347,7 +369,58 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
                 .any(|d| d.init.as_ref().is_some_and(walk_expr)),
             Statement::ThrowStatement(t) => walk_expr(&t.argument),
             Statement::FunctionDeclaration(_) => false,
-            _ => false,
+            // Nothing to search, genuinely: `break`/`continue`/`empty`/
+            // `debugger` carry no expression and no binding (a label is not a
+            // symbol); the eight module declarations are top-level only, so they
+            // cannot appear in the arrow body being walked; the nine `TS*`
+            // variants are never produced (the parser is never asked for
+            // TypeScript).
+            Statement::BreakStatement(_)
+            | Statement::ContinueStatement(_)
+            | Statement::DebuggerStatement(_)
+            | Statement::EmptyStatement(_)
+            | Statement::ImportDeclaration(_)
+            | Statement::ExportAllDeclaration(_)
+            | Statement::ExportDefaultDeclaration(_)
+            | Statement::ExportDeclaration(_)
+            | Statement::ExportNamedDeclaration(_)
+            | Statement::ExportFromDeclaration(_)
+            | Statement::TSExportAssignment(_)
+            | Statement::TSNamespaceExportDeclaration(_)
+            | Statement::TSTypeAliasDeclaration(_)
+            | Statement::TSInterfaceDeclaration(_)
+            | Statement::TSEnumDeclaration(_)
+            | Statement::TSExternalModuleDeclaration(_)
+            | Statement::TSNamespaceDeclaration(_)
+            | Statement::TSGlobalDeclaration(_)
+            | Statement::TSImportEqualsDeclaration(_) => false,
+            // KNOWN WRONG — and deliberately left wrong, because W1.2 batch 1 is
+            // a behaviour-preserving exhaustiveness conversion. Each of these
+            // *does* reach expressions (and `ClassDeclaration` reaches its
+            // heritage), so ES §15.7.1 `ContainsArguments` should descend here
+            // and does not:
+            //
+            //     class C { x = (() => { while (arguments) {} })() }  // accepted
+            //     class C { x = (() => { try {} catch (e) { arguments } })() }
+            //     class C { x = (() => { class D extends arguments {} })() }
+            //
+            // V8 rejects all three. This is the same defect class as the
+            // `ChainExpression`/`ImportExpression` gap closed in 5a3a7aac, one
+            // level down: `walk_expr` only reaches a statement through an
+            // arrow's block body, and `walk_stmt` then drops it. Naming them
+            // here is what makes the hole visible; fixing them changes
+            // behaviour and needs its own conformance-verified batch (the
+            // immediate follow-up to this one).
+            Statement::WhileStatement(_)
+            | Statement::DoWhileStatement(_)
+            | Statement::ForStatement(_)
+            | Statement::ForInStatement(_)
+            | Statement::ForOfStatement(_)
+            | Statement::SwitchStatement(_)
+            | Statement::TryStatement(_)
+            | Statement::LabeledStatement(_)
+            | Statement::WithStatement(_)
+            | Statement::ClassDeclaration(_) => false,
         }
     }
     walk_expr(e)
@@ -912,8 +985,41 @@ impl<'s> Collector<'s> {
                 self.expr(&w.object);
                 self.stmt(&w.body);
             }
-            // break / continue / empty / debugger carry no references.
-            _ => {}
+            // Nothing to collect: no binding, no reference, no nested unit.
+            //   - `break`/`continue`/`empty`/`debugger` carry no expression. A
+            //     label is not a symbol; `LabeledStatement` above is the arm
+            //     that walks the labelled body.
+            //   - The eight module declarations never reach this match: the
+            //     `as_module_declaration()` prefilter above returns first. They
+            //     are named so this match is exhaustive in its own right rather
+            //     than by courtesy of a prefilter, and so the pre-existing
+            //     convention of writing out `TSExportAssignment` /
+            //     `TSNamespaceExportDeclaration` there continues below.
+            //     (`as_module_declaration()` is what makes that prefilter
+            //     exhaustive, which is why the two TS forms were already
+            //     listed in it.)
+            //   - The seven `TS*Declaration` variants are TypeScript. The
+            //     parser is only ever given `SourceType::script()`/`mjs()` and
+            //     neither sets `with_typescript`, so oxc cannot produce them.
+            Statement::BreakStatement(_)
+            | Statement::ContinueStatement(_)
+            | Statement::DebuggerStatement(_)
+            | Statement::EmptyStatement(_)
+            | Statement::ImportDeclaration(_)
+            | Statement::ExportAllDeclaration(_)
+            | Statement::ExportDefaultDeclaration(_)
+            | Statement::ExportDeclaration(_)
+            | Statement::ExportNamedDeclaration(_)
+            | Statement::ExportFromDeclaration(_)
+            | Statement::TSExportAssignment(_)
+            | Statement::TSNamespaceExportDeclaration(_)
+            | Statement::TSTypeAliasDeclaration(_)
+            | Statement::TSInterfaceDeclaration(_)
+            | Statement::TSEnumDeclaration(_)
+            | Statement::TSExternalModuleDeclaration(_)
+            | Statement::TSNamespaceDeclaration(_)
+            | Statement::TSGlobalDeclaration(_)
+            | Statement::TSImportEqualsDeclaration(_) => {}
         }
     }
 
@@ -1940,7 +2046,27 @@ impl<'s> Collector<'s> {
                     self.expr(opts);
                 }
             }
-            _ => {}
+            // Nothing to collect: a literal has no subexpressions, and
+            // `import.meta`/`new.target` are keyword reads with no operands.
+            // The `TS*`/`JSX*`/`V8Intrinsic` variants are never produced: the
+            // parser is only ever given `SourceType::script()`/`mjs()`, neither
+            // of which sets `with_typescript`/`with_jsx`.
+            Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::ImportMeta(_)
+            | Expression::NewTarget(_)
+            | Expression::TSAsExpression(_)
+            | Expression::TSSatisfiesExpression(_)
+            | Expression::TSTypeAssertion(_)
+            | Expression::TSNonNullExpression(_)
+            | Expression::TSInstantiationExpression(_)
+            | Expression::V8IntrinsicExpression(_)
+            | Expression::JSXElement(_)
+            | Expression::JSXFragment(_) => {}
         }
     }
 
