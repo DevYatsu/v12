@@ -1144,3 +1144,270 @@ fn error_value_leaves_no_scratch_root_behind() {
         );
     }
 }
+
+// ===========================================================================
+// W1.4 — `env_display` (the O(1) per-frame cache) vs `walk_env` (the
+// parent-link walk). `docs/architecture-maintainability-plan.md` §4 Track 1.
+//
+// `Interp::env_at` serves `depth < ENV_DISPLAY_CAP` out of `Frame.env_display`
+// and walks the chain for everything deeper. `ENV_DISPLAY_CAP` is 8; the
+// compiler's structural depth (`Plans::env_depth`) is an unbounded `u8` with no
+// cap at all. The two are only allowed to coexist because the walk is exact, so
+// the cache is a pure speed-up — a claim the in-source comments make and nothing
+// tested. The first divergence here would be a silent wrong value read, in the
+// same class as the `class … extends` leak this whole task is about.
+// ===========================================================================
+
+use v12_heap::{Handle, JsObject};
+
+/// A chain of `n` single-slot environments, head first, linked through
+/// `prototype` exactly as `Opcode::NewEnvironment` links them. Each new
+/// environment's parent is the previous one, so the *last* allocated is the
+/// head and the vector is reversed to match.
+fn env_chain(heap: &mut Heap, n: usize) -> Vec<Handle<JsObject>> {
+    let mut chain = Vec::with_capacity(n);
+    let mut parent = None;
+    for _ in 0..n {
+        let h = heap.alloc(JsObject::environment(1, parent));
+        chain.push(h);
+        parent = Some(h);
+    }
+    chain.reverse();
+    chain
+}
+
+/// The walk `Interp::walk_env` performs, written out independently here so the
+/// cache is checked against a second path rather than against itself.
+fn walk_chain(heap: &Heap, head: Handle<JsObject>, depth: u16) -> Option<Handle<JsObject>> {
+    let mut cur = head;
+    for _ in 0..depth {
+        cur = heap.get(cur).prototype?;
+    }
+    Some(cur)
+}
+
+/// The cache holds exactly the innermost `ENV_DISPLAY_CAP` environments, and
+/// every slot it holds equals what the walk would have produced — including
+/// the slots past the cap, which the cache leaves empty on purpose.
+#[test]
+fn env_display_caches_exactly_the_first_display_cap_environments() {
+    const DEPTH: u16 = 20;
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let chain = env_chain(&mut heap, usize::from(DEPTH));
+    // Ground truth from the walk, computed before the interpreter borrows the
+    // heap. `None` past the end of the chain.
+    let walked: Vec<Option<Handle<JsObject>>> = (0..=DEPTH)
+        .map(|d| walk_chain(&heap, chain[0], d))
+        .collect();
+    for (d, got) in walked.iter().enumerate() {
+        let want = chain.get(usize::from(d)).copied();
+        assert_eq!(
+            *got, want,
+            "walk at depth {d} should reach the {d}th environment"
+        );
+    }
+
+    let interp = program_of(&mut heap, fn_with_instrs(1, vec![], ConstantPool::new()));
+    let display = interp.env_display_for(Some(chain[0]));
+
+    // The cap is a bare constant with no compile-time counterpart: the
+    // compiler's depth is an unbounded `u8`. This assertion is the only thing
+    // in the tree that pins the number the interpreter and the compiler have to
+    // agree about, so it is stated explicitly rather than implied by a length.
+    assert_eq!(
+        crate::ENV_DISPLAY_CAP,
+        8,
+        "ENV_DISPLAY_CAP changed: the doc comments in lib.rs and model.rs that \
+         justify the two models coexisting are written against 8"
+    );
+
+    // Cached slots equal the walk, for every slot the cache actually holds.
+    for d in 0..crate::ENV_DISPLAY_CAP {
+        assert_eq!(
+            display[d],
+            walked[usize::from(d)],
+            "cached slot {d} must equal the walk"
+        );
+    }
+    // Past the cap the cache is empty, and the walk still answers. That split
+    // is the whole reason `env_at` can branch on `d < ENV_DISPLAY_CAP`.
+    assert!(
+        display[crate::ENV_DISPLAY_CAP..]
+            .iter()
+            .all(|s| s.is_none()),
+        "slots past the cap must stay empty: {:?}",
+        &display[crate::ENV_DISPLAY_CAP..]
+    );
+    assert_eq!(
+        walked[usize::from(crate::ENV_DISPLAY_CAP)],
+        Some(chain[crate::ENV_DISPLAY_CAP]),
+        "the walk must still resolve past the cap — this is the value the cache \
+         is not allowed to shadow"
+    );
+    assert_eq!(
+        walked[usize::from(DEPTH)],
+        None,
+        "and past the chain, nothing"
+    );
+}
+
+/// A chain shorter than the cap fills only the slots it has, so a depth inside
+/// the cap but past the end of the chain is `None` — an error the caller
+/// surfaces, not a wrong value.
+#[test]
+fn env_display_of_a_shallow_chain_fills_only_what_exists() {
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let chain = env_chain(&mut heap, 3);
+    let interp = program_of(&mut heap, fn_with_instrs(1, vec![], ConstantPool::new()));
+    let display = interp.env_display_for(Some(chain[0]));
+    let got: Vec<Option<Handle<JsObject>>> = display.to_vec();
+    let mut want: Vec<Option<Handle<JsObject>>> = chain.iter().copied().map(Some).collect();
+    want.resize(crate::ENV_DISPLAY_CAP, None);
+    assert_eq!(
+        got, want,
+        "a 3-deep chain fills 3 slots and leaves the rest empty"
+    );
+}
+
+/// `env_display_push` is a head-shift, not a rebuild: pushing the whole 20-deep
+/// chain must leave the cache holding the *newest* `ENV_DISPLAY_CAP`
+/// environments, with the tail dropped. If the shift were off by one, or kept
+/// the oldest entries instead of the newest, every `depth < CAP` access would
+/// read a stale environment — silently, since the slot is occupied.
+#[test]
+fn env_display_push_head_shifts_and_keeps_the_newest_environments() {
+    const DEPTH: usize = 20;
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let chain = env_chain(&mut heap, DEPTH);
+    let interp = program_of(&mut heap, fn_with_instrs(1, vec![], ConstantPool::new()));
+    let mut display = interp.env_display_for(Some(chain[0]));
+    for head in &chain[1..] {
+        crate::env_display_push(&mut display, *head);
+    }
+    let got: Vec<Option<Handle<JsObject>>> = display.to_vec();
+    // Head first: `display[0]` is the environment pushed last.
+    let want: Vec<Option<Handle<JsObject>>> = chain[DEPTH - crate::ENV_DISPLAY_CAP..]
+        .iter()
+        .rev()
+        .copied()
+        .map(Some)
+        .collect();
+    assert_eq!(
+        got,
+        want,
+        "after pushing the whole chain the cache must hold the newest {} environments",
+        crate::ENV_DISPLAY_CAP
+    );
+    // And those agree with the walk. The synthetic push sequence walks the
+    // chain in the opposite order to `env_chain`'s links, so the equivalent
+    // walk is from the other end at mirrored depth.
+    for d in 0..crate::ENV_DISPLAY_CAP {
+        assert_eq!(
+            display[d],
+            walk_chain(&heap, chain[0], (DEPTH - 1 - d) as u16),
+            "cached slot {d} must equal the walk"
+        );
+    }
+}
+
+/// A main function that pushes `depths` nested environments, writing
+/// `100 + i` into slot 0 of the i-th one *as it is pushed* (so always at
+/// `depth=0`, the current head), then reads slot 0 at `read_depth` and throws
+/// the result.
+///
+/// Reading `depth` from the final head therefore yields `100 + (depths - 1 -
+/// read_depth)`: every environment in the chain holds a distinct number, so a
+/// cache that disagreed with the walk anywhere would read a different
+/// environment and return a different number.
+///
+/// Operand roles differ between the two opcodes: `GetEnvSlot` is
+/// `(dst, depth, slot)` while `SetEnvSlot` is `(depth, slot, src)`, and
+/// `LoadInt` is `(dst, unused, i8 imm)`.
+fn chain_reader(depths: u16, read_depth: u16) -> FunctionBytecode {
+    let mut instrs = Vec::new();
+    for i in 0..depths {
+        instrs.push(Instr::new(Opcode::NewEnvironment, 0, 1, 0));
+        instrs.push(Instr::new(Opcode::LoadInt, 1, 0, (100 + i) as u8));
+        instrs.push(Instr::new(Opcode::SetEnvSlot, 0, 0, 1));
+    }
+    instrs.push(Instr::new(Opcode::GetEnvSlot, 2, read_depth as u8, 0));
+    instrs.push(Instr::new(Opcode::Throw, 2, 0, 0));
+    fn_with_instrs(3, instrs, ConstantPool::new())
+}
+
+/// **The agreement test.** Every environment in a 20-deep chain holds a
+/// distinct value, so a cache that disagreed with the walk anywhere — at the
+/// cap boundary, or far past it — would read a *different* environment and
+/// return a different number. Depths 0..=7 are served by `env_display`;
+/// 8..=19 by `walk_env`. All twenty must return their own environment's value,
+/// and the two halves must meet without a seam at depth 7/8.
+#[test]
+fn env_resolution_agrees_with_the_walk_at_and_beyond_the_display_cap() {
+    const DEPTH: u16 = 20;
+    for depth in 0..DEPTH {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let mut interp = program_of(&mut heap, chain_reader(DEPTH, depth));
+        let thrown = expect_throw(&mut interp);
+        let from_cache = depth < crate::ENV_DISPLAY_CAP as u16;
+        assert_eq!(
+            thrown.as_smi(),
+            Some(100 + (DEPTH - 1 - depth) as i32),
+            "depth {depth} ({}) must read the environment that received {}",
+            if from_cache { "cached" } else { "walked" },
+            100 + (DEPTH - 1 - depth)
+        );
+    }
+    // The cap boundary specifically, named: 7 is the last cached depth and 8
+    // the first walked one, and they are two links apart in a chain whose
+    // members are not interchangeable.
+    for (depth, want) in [
+        (7u16, 100 + (DEPTH - 1 - 7) as i32),
+        (8, 100 + (DEPTH - 1 - 8) as i32),
+    ] {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let mut interp = program_of(&mut heap, chain_reader(DEPTH, depth));
+        assert_eq!(
+            expect_throw(&mut interp).as_smi(),
+            Some(want),
+            "depth {depth} sits on the cached/walked seam"
+        );
+    }
+}
+
+/// A depth past the end of the chain must be an error, never a value borrowed
+/// from a shallower environment. Neither arm of `env_at` can produce one — a
+/// cache slot past a 3-deep chain is `None`, and the walk runs out of links —
+/// but the distinction is worth pinning: it is the difference between a loud
+/// `InternalError` and a silent wrong value.
+#[test]
+fn env_depth_past_the_end_of_the_chain_is_an_error_not_a_wrong_value() {
+    const DEPTH: u16 = 20;
+    for depth in [DEPTH, DEPTH + 1, u16::from(u8::MAX)] {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let mut interp = program_of(&mut heap, chain_reader(DEPTH, depth));
+        let thrown = expect_throw(&mut interp);
+        let msg = interp.to_display_string(thrown);
+        assert!(
+            msg.contains("environment depth exceeds live chain"),
+            "depth {depth} of a {DEPTH}-deep chain should report the depth error, got {msg}"
+        );
+    }
+}
+
+/// The same at a depth *inside* the cap but past a short chain: the cached slot
+/// is empty, so this must be the depth error rather than some other
+/// environment's value. This is the case a fixed-size cache is most likely to
+/// get wrong, because the slot exists and is merely `None`.
+#[test]
+fn env_depth_inside_the_cap_but_past_a_shallow_chain_is_an_error() {
+    for depth in 3..crate::ENV_DISPLAY_CAP as u16 {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let mut interp = program_of(&mut heap, chain_reader(3, depth));
+        let thrown = expect_throw(&mut interp);
+        let msg = interp.to_display_string(thrown);
+        assert!(
+            msg.contains("environment depth exceeds live chain"),
+            "depth {depth} of a 3-deep chain should report the depth error, got {msg}"
+        );
+    }
+}

@@ -426,7 +426,13 @@ type ProgramTable = (Rc<[FunctionBytecode]>, Rc<[String]>);
 /// real closures (functions nest far shallower); deeper walks fall back
 /// to the parent-link chain. Eight words per frame — accepted, speed-first
 /// (frames already hold register windows).
-const ENV_DISPLAY_CAP: usize = 8;
+///
+/// `pub(crate)` so the cache's shape can be asserted from `src/tests.rs`: this
+/// constant is the interpreter's half of a contract whose other half — the
+/// compiler's static `env_depth` — is an unbounded `u8` with no cap at all
+/// (`crates/v12-bccompiler/src/model.rs`). Nothing but a test ties the two
+/// together (task W1.4).
+pub(crate) const ENV_DISPLAY_CAP: usize = 8;
 
 /// One JavaScript activation: a function body, its register window on the
 /// shared stack, its pc, and the head of its environment chain.
@@ -477,7 +483,11 @@ struct Frame {
 /// O(1), allocation-free. Equivalent to re-walking — the new head's
 /// parent IS the previous head by construction — while the parent-link
 /// chain stays the source of truth.
-fn env_display_push(
+///
+/// `pub(crate)` for the same reason as [`ENV_DISPLAY_CAP`]: the head-shift's
+/// tail-drop is only correct relative to a cap the compiler does not share,
+/// and that pairing is asserted in `src/tests.rs` (task W1.4).
+pub(crate) fn env_display_push(
     display: &mut [Option<Handle<JsObject>>; ENV_DISPLAY_CAP],
     head: Handle<JsObject>,
 ) {
@@ -1691,7 +1701,10 @@ impl<'a> Interp<'a> {
     /// Display for a fresh frame whose environment head is `env`: the
     /// head plus up to `ENV_DISPLAY_CAP - 1` ancestors, walked once here
     /// (bounded O(8) per call — calls are cold, slot accesses hot).
-    fn env_display_for(
+    ///
+    /// `pub(crate)` so `src/tests.rs` can compare the cache against the
+    /// parent-link walk for a chain deeper than the cap (task W1.4).
+    pub(crate) fn env_display_for(
         &self,
         env: Option<Handle<JsObject>>,
     ) -> [Option<Handle<JsObject>>; ENV_DISPLAY_CAP] {

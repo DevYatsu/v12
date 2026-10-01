@@ -1737,8 +1737,19 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// The depth a statically resolved access must be emitted with: the
     /// structural hop count plus every scoped environment currently on the
     /// chain. Saturating because the structural count is already a `u8` budget.
-    fn biased_depth(&self, depth: u8) -> u8 {
+    pub(crate) fn biased_depth(&self, depth: u8) -> u8 {
         depth.saturating_add(self.env_bias)
+    }
+
+    /// The raw `env_bias` counter. `pub(crate)` and test-only: the field itself
+    /// is private because nothing outside emission may mutate it, but the
+    /// push/pop balance it encodes is the invariant that silently broke for
+    /// `class … extends` (a `NewEnvironment` with no matching `PopEnvironment`
+    /// left the runtime chain one level deeper than the static model), so it
+    /// needs a test that can read it (task W1.3).
+    #[cfg(test)]
+    pub(crate) fn env_bias(&self) -> u8 {
+        self.env_bias
     }
 
     /// `Closure dst, fn#idx` — escapes to `ClosureW` once the function

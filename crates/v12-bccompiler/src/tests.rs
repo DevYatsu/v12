@@ -2819,3 +2819,667 @@ fn base_class_instance_field_initializes_on_this() {
         f.validate().expect("valid bytecode");
     }
 }
+
+// ===========================================================================
+// W1.3 — the environment-depth model (`docs/architecture-maintainability-plan.md`
+// §4 Track 1). `Plans::env_depth` / `env_depth_between` / `this_home` and the
+// `env_bias` counter are the ONLY reconciliation between the compiler's static
+// unit-graph walk and the interpreter's runtime chain walk (`Interp::env_at`).
+// Nothing tested them.
+//
+// The silent-wrong-value failure they carry is documented and real: a
+// `class T extends Object` once made
+//     function h(){ let acc=0; function bump(){acc=acc+1;}
+//                   class T extends Object{m(){}} bump(); return acc; }
+// return `function` where the spec says `1`, because `NewEnvironment` had no
+// matching `PopEnvironment` and the runtime chain stayed one level deeper than
+// the static model. Silent, because the class scope holds exactly one slot, so
+// a misdirected `GetEnvSlot` at depth 0 reads the parent constructor back
+// instead of raising.
+//
+// How `Plans` became testable: it needed no production change at all. `Plans`
+// is a `pub struct` with `pub` fields and `Default`; `UnitPlan::new` is
+// `pub(crate)`; `collect::collect`, `model::Compiler` and `FnCtx::new` are all
+// `pub`/`pub(crate)` inside a private module, which is visible crate-wide. The
+// only production edit this file's tests needed is the `pub(crate)` widening of
+// `FnCtx::biased_depth` and a `#[cfg(test)]` `env_bias()` accessor, because
+// `env_bias` is a private field with no reader — see `model.rs`.
+// ===========================================================================
+
+use crate::collect;
+use crate::model::{Compiler, FnCtx, Plans, UnitPlan};
+use oxc_semantic::SymbolId;
+use std::collections::HashMap;
+
+/// A `Plans` whose unit graph is written by hand: `spec[i]` is
+/// `(parent, is_arrow, has_env)` for unit `i`. Unit 0 is the script body.
+/// The collector would never build some of these shapes (a sibling link, a
+/// home that is not an ancestor), and building them by hand is the point: the
+// fallbacks under test are only reachable on a graph the collector's scoping
+/// invariant otherwise rules out.
+fn plans_from_spec(spec: &[(Option<usize>, bool, bool)]) -> Plans {
+    let mut plans = Plans::default();
+    for &(parent, is_arrow, has_env) in spec {
+        let mut unit = UnitPlan::new(parent, is_arrow, String::new());
+        unit.has_env = has_env;
+        plans.units.push(unit);
+    }
+    plans
+}
+
+/// One real `SymbolId` to hang a hand-built `home_of` entry on. Minting a
+/// `SymbolId` directly means going through `oxc_index::Idx`; borrowing one from
+/// a parsed unit keeps the test independent of that.
+fn a_symbol_id() -> SymbolId {
+    let (_plans, names) = collected("let x = 1;");
+    *names.get("x").expect("`x` is declared")
+}
+
+/// `(Plans, name → SymbolId)` for `src`, built by the real collector, so the
+/// depth model is exercised against the unit graph `collect` actually produces
+/// and not only against hand-written ones. `SymbolId` is `Copy`, so nothing
+/// borrowed from the parse survives the call.
+fn collected(src: &str) -> (Plans, HashMap<String, SymbolId>) {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, src, SourceType::script()).parse();
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program);
+    let (scoping, _nodes) = semantic.semantic.into_scoping_and_nodes();
+    let plans = collect::collect(&parsed.program, &scoping, false)
+        .unwrap_or_else(|e| panic!("{src:?} should collect: {e}"));
+    let names: HashMap<String, SymbolId> = scoping
+        .symbol_ids()
+        .map(|id| (scoping.symbol_name(id).to_string(), id))
+        .collect();
+    (plans, names)
+}
+
+/// `levels` nested functions, level `i` declaring `let <prefix><i>`, with the
+/// innermost reading every outer binding. `collect` then gives
+/// `levels + 1` units (script body plus one per function), one distinctly-named
+/// binding per level, and an environment on every unit *except* the innermost —
+/// which is exactly the shape `env_depth` exists to measure.
+///
+/// Two details matter. Unique names: one identifier text has one `SymbolId` per
+/// *declaring scope*, so a reused name would collapse into a single map entry.
+/// And the innermost must *read* the outer bindings: a declared-but-never-read
+/// `let` is captured by nobody, so no unit gets `has_env` and every depth
+/// collapses to 0 — a test that passes for the wrong reason.
+fn nested_capture_fns(levels: usize, prefix: &str) -> String {
+    assert!(levels >= 2, "need at least one level to capture from");
+    let mut src = String::new();
+    for i in 0..levels {
+        src.push_str(&format!("function f{i}() {{ let {prefix}{i} = {i}; "));
+    }
+    let reads: Vec<String> = (0..levels - 1).map(|i| format!("{prefix}{i} ")).collect();
+    src.push_str(&format!("return {}; }}", reads.join("+ ")));
+    for _ in 1..levels {
+        src.push('}');
+    }
+    src
+}
+
+/// Runs `f` with a live `FnCtx` over unit 0 of `src`, then drops the parse,
+/// the scoping and the interner it borrows from. A closure rather than a
+/// returned context because `FnCtx` borrows the `Compiler` that borrows both.
+fn with_unit_ctx<R>(src: &str, f: impl FnOnce(&mut FnCtx<'_, '_, '_, '_>) -> R) -> R {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, src, SourceType::script()).parse();
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program);
+    let (scoping, _nodes) = semantic.semantic.into_scoping_and_nodes();
+    let plans = collect::collect(&parsed.program, &scoping, false)
+        .unwrap_or_else(|e| panic!("{src:?} should collect: {e}"));
+    let mut interner = Interner::default();
+    let mut comp = Compiler {
+        scoping: &scoping,
+        strings: &mut interner,
+        plans,
+        functions: Vec::new(),
+        emit_eval_metadata: false,
+        is_eval_payload: false,
+        eval_var_target: Default::default(),
+    };
+    let mut cx = FnCtx::new(&mut comp, 0);
+    f(&mut cx)
+}
+
+// -- env_depth --------------------------------------------------------------
+
+/// `env_depth` counts exactly one hop per *env-bearing* unit strictly between
+/// the accessing unit (inclusive) and the home unit (exclusive): a unit with
+/// no environment contributes a parent link but no hop. The home unit itself is
+/// never counted, and neither is anything below it. Both halves of that rule
+/// are load-bearing for every emitted depth, so the pattern below mixes
+/// env-bearing (1, 2, 4) and env-free (3, 5, 6) units.
+#[test]
+fn env_depth_counts_one_hop_per_env_bearing_unit_and_skips_the_rest() {
+    let sym = a_symbol_id();
+    let mut plans = plans_from_spec(&[
+        (None, false, true), // 0 — the home
+        (Some(0), false, true),
+        (Some(1), false, true),
+        (Some(2), false, false),
+        (Some(3), false, true),
+        (Some(4), false, false),
+        (Some(5), false, false),
+    ]);
+    plans.home_of.insert(sym, 0);
+    // Walking up from 6: 6 (no env), 5 (no env), 4 (env → 1), 3 (no env),
+    // 2 (env → 2), 1 (env → 3), then 0 == home → 3.
+    for (unit, want) in [
+        (0usize, 0u8),
+        (1, 1),
+        (2, 2),
+        (3, 2),
+        (4, 3),
+        (5, 3),
+        (6, 3),
+    ] {
+        assert_eq!(
+            plans.env_depth(unit, sym),
+            want,
+            "env_depth(unit {unit}) with home 0 should be {want}"
+        );
+    }
+}
+
+/// Zero is the right answer when the accessing unit *is* the home unit: the
+/// binding lives in that unit's own environment, at hop 0 from the frame head.
+#[test]
+fn env_depth_is_zero_when_the_accessing_unit_is_the_home() {
+    let sym = a_symbol_id();
+    let mut plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
+    plans.home_of.insert(sym, 1);
+    assert_eq!(plans.env_depth(1, sym), 0, "own binding is at hop 0");
+}
+
+/// An unbound symbol has no home unit at all; `env_depth` answers 0 rather
+/// than panicking. `FnCtx::access` never reaches it — it checks `home_of`
+/// first and returns a register instead.
+#[test]
+fn env_depth_is_zero_for_a_symbol_with_no_home_unit() {
+    let plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
+    let sym = a_symbol_id();
+    assert_eq!(plans.env_depth(1, sym), 0, "no home → 0, not a panic");
+}
+
+/// The second silent zero: a home that is *not* on the accessing unit's parent
+/// chain. Scoping says this cannot arise, so nothing would notice if it did —
+/// which is exactly why the fallback is pinned rather than left to inspection.
+#[test]
+fn env_depth_is_zero_when_the_home_is_not_an_ancestor() {
+    let sym = a_symbol_id();
+    // 0 main, with 1 and 2 as siblings.
+    let mut plans = plans_from_spec(&[
+        (None, false, true),
+        (Some(0), false, true),
+        (Some(0), false, true),
+    ]);
+    plans.home_of.insert(sym, 1);
+    assert_eq!(
+        plans.env_depth(2, sym),
+        0,
+        "a sibling's binding has no structural depth — the documented fallback"
+    );
+    // And the other direction: the parent cannot reach down into a child.
+    let mut plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
+    plans.home_of.insert(sym, 1);
+    assert_eq!(plans.env_depth(0, sym), 0, "main cannot reach into a child");
+}
+
+/// The model against the unit graph `collect` actually builds: a five-unit
+/// capture chain where the four outer units own an environment and the
+/// innermost does not. From the innermost, `x0` is three hops out, `x3` is at
+/// hop 0.
+#[test]
+fn env_depth_matches_the_capture_chain_collect_actually_builds() {
+    let (plans, names) = collected(&nested_capture_fns(5, "x"));
+    // 0 is the script body; 1..=5 are the nested functions, innermost last.
+    let inner = 5usize;
+    assert_eq!(
+        plans.units.len(),
+        6,
+        "expected 6 units, got {}",
+        plans.units.len()
+    );
+    for (level, want) in [(0usize, 3u8), (1, 2), (2, 1), (3, 0)] {
+        let sym = *names
+            .get(&format!("x{level}"))
+            .unwrap_or_else(|| panic!("x{level} is declared"));
+        assert_eq!(
+            plans.env_depth(inner, sym),
+            want,
+            "x{level} should be {want} hops out of unit {inner}"
+        );
+        // And 0 hops from its own declaring unit.
+        let home = plans.home_of[&sym];
+        assert_eq!(
+            plans.env_depth(home, sym),
+            0,
+            "x{level} is at hop 0 inside its own unit {home}"
+        );
+    }
+    // Assert the premise: every unit but the innermost owns an environment. If
+    // `collect`'s `has_env` policy changes, the depths above would silently
+    // become 0 and this test would pass while testing nothing.
+    for unit in 1..inner {
+        assert!(
+            plans.units[unit].has_env,
+            "unit {unit} owns an environment; if this stops being true the depth \
+             expectations above no longer test what they claim"
+        );
+    }
+    assert!(
+        !plans.units[inner].has_env,
+        "the innermost reads nothing from inside itself, so it needs no env"
+    );
+}
+
+// -- env_depth_between ------------------------------------------------------
+
+/// Distance 1: the home is the immediate parent and owns an environment.
+#[test]
+fn env_depth_between_an_ancestor_at_distance_one_is_one() {
+    let plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
+    assert_eq!(plans.env_depth_between(1, 0), 1);
+}
+
+/// Distance greater than one, counting only env-bearing units. Walk from 3:
+/// unit 3 holds an env (1), unit 2 does not (still 1), unit 1 does (2), then
+/// unit 0 is the target and is not counted.
+#[test]
+fn env_depth_between_counts_every_env_bearing_unit_on_the_way() {
+    let plans = plans_from_spec(&[
+        (None, false, true), // 0 — the target
+        (Some(0), false, true),
+        (Some(1), false, false),
+        (Some(2), false, true),
+    ]);
+    assert_eq!(plans.env_depth_between(3, 0), 2);
+    // From unit 2 the env-free unit 2 contributes nothing and unit 1
+    // contributes one.
+    assert_eq!(plans.env_depth_between(2, 0), 1);
+    assert_eq!(plans.env_depth_between(1, 0), 1);
+    // Skipping the env-free unit entirely must not shorten the walk: the hop
+    // count is a property of the chain, not of how many links separate them.
+    let no_env_middle = plans_from_spec(&[
+        (None, false, true),
+        (Some(0), false, false),
+        (Some(1), false, true),
+    ]);
+    assert_eq!(
+        no_env_middle.env_depth_between(2, 0),
+        1,
+        "an env-free unit between still costs a parent link but no hop"
+    );
+}
+
+/// Self is depth 0 — the base case every other answer is measured against.
+#[test]
+fn env_depth_between_a_unit_and_itself_is_zero() {
+    let plans = plans_from_spec(&[
+        (None, false, true),
+        (Some(0), false, true),
+        (Some(1), false, true),
+    ]);
+    for unit in 0..3 {
+        assert_eq!(
+            plans.env_depth_between(unit, unit),
+            0,
+            "unit {unit} vs itself"
+        );
+    }
+}
+
+/// **The dangerous fallback.** `env_depth_between` returns `0` when `to_unit`
+/// is not on `from_unit`'s parent chain. `0` is indistinguishable from a
+/// legitimate "the home is my own unit" answer, so a chain that is not linked
+/// where the model thinks it is resolves to the wrong environment *silently*
+/// instead of failing. Pinned explicitly; this is W1.3's reason to exist.
+#[test]
+fn env_depth_between_a_non_ancestor_falls_back_to_zero() {
+    let plans = plans_from_spec(&[
+        (None, false, true),
+        (Some(0), false, true),
+        (Some(0), false, true),
+    ]);
+    assert_eq!(
+        plans.env_depth_between(2, 1),
+        0,
+        "a sibling is not an ancestor: the documented 0 fallback"
+    );
+    assert_eq!(plans.env_depth_between(1, 2), 0, "and symmetrically");
+    // Walking off the top of the chain is the same fallback.
+    assert_eq!(plans.env_depth_between(1, 99), 0, "no such unit");
+}
+
+/// The `u8` budget. `env_depth_between` counts with `depth += 1` on a `u8`, so
+/// 255 env-bearing units is exact and the 256th overflows — see the next two
+/// tests.
+#[test]
+fn env_depth_between_is_exact_up_to_the_u8_budget() {
+    let mut spec: Vec<(Option<usize>, bool, bool)> = vec![(None, false, true)];
+    for i in 1..=255usize {
+        spec.push((Some(i - 1), false, true));
+    }
+    let plans = plans_from_spec(&spec);
+    assert_eq!(
+        plans.env_depth_between(255, 0),
+        255,
+        "255 envs fit the u8 budget"
+    );
+    assert_eq!(plans.env_depth_between(254, 0), 254);
+}
+
+/// **Pins a known defect, deliberately.** `env_depth_between` counts with
+/// `depth += 1` on a `u8` (`model.rs`), so a 256th env-bearing unit on one
+/// access path overflows: a debug build panics, and a release build — which
+/// leaves `overflow-checks` off — wraps to 0. The wrap is a *silent wrong
+/// depth*, and therefore a silent wrong value read: the same failure class as
+/// the `class … extends` bug this task exists to pin.
+///
+/// Repro (300 nested env-owning functions, through the `v12` CLI):
+///     function f0(){ let a0 = 0;function f1(){ let a1 = 1; …
+///       return function(){ return a0; };}…return a0;}
+///     → `panicked at crates/v12-bccompiler/src/model.rs:473:
+///       attempt to add with overflow`, exit 101 (debug).
+///
+/// When this is fixed (a saturating add, a `u16`, or a checked compile error),
+/// **invert this test**: it must then assert the 256-deep answer rather than a
+/// panic. Do not delete it — that would put the boundary back out of sight.
+#[test]
+#[should_panic(expected = "attempt to add with overflow")]
+fn env_depth_between_overflows_past_255_env_bearing_units() {
+    let mut spec: Vec<(Option<usize>, bool, bool)> = vec![(None, false, true)];
+    for i in 1..=256usize {
+        spec.push((Some(i - 1), false, true));
+    }
+    let plans = plans_from_spec(&spec);
+    let _ = plans.env_depth_between(256, 0);
+}
+
+// -- this_home --------------------------------------------------------------
+
+/// A plain function is its own `this` home: it owns the `this` register.
+#[test]
+fn this_home_of_a_plain_function_is_itself() {
+    let plans = plans_from_spec(&[
+        (None, false, true),
+        (Some(0), false, true),
+        (Some(1), false, true),
+    ]);
+    for unit in 1..3 {
+        assert_eq!(
+            plans.this_home(unit),
+            unit,
+            "unit {unit} is its own this-home"
+        );
+    }
+}
+
+/// A method is a non-arrow unit too, so `this` is its own. Built from real
+/// source so the arrow flag comes from `collect` rather than a literal.
+#[test]
+fn this_home_of_collected_methods_is_itself() {
+    let (plans, _names) = collected("class C { m(){} } let o = { p(){} };");
+    let non_arrow: Vec<usize> = plans
+        .units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| !u.is_arrow)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        non_arrow.len() >= 3,
+        "expected script + class + method units, got {non_arrow:?}"
+    );
+    for unit in non_arrow {
+        assert_eq!(
+            plans.this_home(unit),
+            unit,
+            "non-arrow unit {unit} is its own this-home"
+        );
+    }
+}
+
+/// An arrow observes the `this` of the nearest non-arrow ancestor — the unit
+/// whose frame actually holds the `this` register.
+#[test]
+fn this_home_of_an_arrow_is_the_nearest_non_arrow_ancestor() {
+    // 0 main → 1 function (non-arrow) → 2 arrow → 3 arrow
+    let plans = plans_from_spec(&[
+        (None, false, true),
+        (Some(0), false, true),
+        (Some(1), true, true),
+        (Some(2), true, true),
+    ]);
+    assert_eq!(plans.this_home(2), 1, "an arrow sees the function's this");
+    assert_eq!(plans.this_home(3), 1, "and so does an arrow inside it");
+}
+
+/// `this_home` must not walk *past* a non-arrow on the way up: a plain
+/// function nested inside an arrow rebinds `this` for itself and its own
+/// arrow descendants.
+#[test]
+fn this_home_stops_at_the_first_non_arrow_ancestor() {
+    // 0 main → 1 function → 2 arrow → 3 plain function → 4 arrow
+    let plans = plans_from_spec(&[
+        (None, false, true),
+        (Some(0), false, true),
+        (Some(1), true, true),
+        (Some(2), false, true),
+        (Some(3), true, true),
+    ]);
+    assert_eq!(plans.this_home(3), 3, "the inner function rebinds this");
+    assert_eq!(plans.this_home(4), 3, "and its arrow inherits that");
+    assert_ne!(plans.this_home(4), 1, "not the outer function's this");
+}
+
+// -- env_bias accounting ----------------------------------------------------
+
+/// `emit_scoped_env` (push) and `emit_pop_env` (pop) are the only mutators of
+/// `env_bias`, and they are the compiler's half of the `class … extends` fix:
+/// while a class scope is live, every statically resolved access in the unit is
+/// physically one hop deeper, and after the pop everything is back to the
+/// structural depths. Unbalanced push/pop *is* the silent bug.
+#[test]
+fn env_bias_increments_on_a_scoped_env_and_returns_on_the_matching_pop() {
+    with_unit_ctx("let a = 1;", |cx| {
+        let span = oxc_span::Span::new(0, 0);
+        assert_eq!(cx.env_bias(), 0, "a fresh unit has no scoped environments");
+        assert_eq!(cx.biased_depth(0), 0);
+
+        cx.emit_scoped_env(0, 1, span);
+        assert_eq!(cx.env_bias(), 1, "push increments the bias");
+        assert_eq!(
+            cx.biased_depth(0),
+            1,
+            "structural depth 0 is emitted one hop deeper"
+        );
+        assert_eq!(
+            cx.biased_depth(3),
+            4,
+            "the bias adds to the structural count"
+        );
+
+        cx.emit_scoped_env(0, 1, span);
+        assert_eq!(cx.env_bias(), 2, "scopes nest");
+        assert_eq!(cx.biased_depth(0), 2);
+        assert_eq!(cx.biased_depth(3), 5);
+
+        cx.emit_pop_env(span);
+        assert_eq!(cx.env_bias(), 1, "pop decrements");
+        assert_eq!(cx.biased_depth(0), 1);
+        cx.emit_pop_env(span);
+        assert_eq!(
+            cx.env_bias(),
+            0,
+            "balanced push/pop returns to the prior value"
+        );
+        assert_eq!(cx.biased_depth(0), 0, "and structural depths are restored");
+        assert_eq!(cx.biased_depth(3), 3);
+    });
+}
+
+/// An unmatched pop saturates at 0 rather than wrapping to 255. Nothing should
+/// ever emit one, but a wrap here would bias every later depth by 255 and read
+/// an unrelated environment — the same silent shape as the class bug.
+#[test]
+fn env_bias_saturates_at_zero_rather_than_wrapping_on_an_unmatched_pop() {
+    with_unit_ctx("let a = 1;", |cx| {
+        let span = oxc_span::Span::new(0, 0);
+        cx.emit_pop_env(span);
+        assert_eq!(cx.env_bias(), 0, "an unmatched pop cannot go negative");
+        assert_eq!(cx.biased_depth(0), 0);
+    });
+}
+
+/// `emit_env_pop` — the per-iteration environment's pop half — must *not* touch
+/// the bias: that environment replaces the unit's own rather than shadowing it,
+/// so both halves are bias-neutral. If it ever started decrementing, every
+/// `for (let i…)` body would drift one hop per iteration.
+#[test]
+fn per_iteration_env_push_and_pop_leave_env_bias_untouched() {
+    with_unit_ctx("let a = 1;", |cx| {
+        let span = oxc_span::Span::new(0, 0);
+        cx.emit_new_env(0, 1, span);
+        assert_eq!(cx.env_bias(), 0, "a per-iteration env is not a scoped env");
+        cx.emit_env_pop(span);
+        assert_eq!(cx.env_bias(), 0, "and its pop is not a scoped pop");
+        assert_eq!(cx.biased_depth(0), 0);
+
+        // Repeated, as a loop body would: no drift across iterations.
+        for _ in 0..1000 {
+            cx.emit_new_env(0, 1, span);
+            cx.emit_env_pop(span);
+        }
+        assert_eq!(cx.env_bias(), 0, "a thousand iterations, still no bias");
+    });
+}
+
+/// The same accounting as the interpreter sees it: in the emitted bytecode. A
+/// captured binding of the enclosing function is at *structural* depth 0 there.
+/// The `extends a` expression is evaluated after the class-scope push, so it
+/// must be emitted at depth 1; after the `PopEnvironment` every access must be
+/// back at 0. This is the observable form of the balance the test above
+/// asserts on the counter directly.
+#[test]
+fn class_scope_biases_depths_while_live_and_restores_them_after_the_pop() {
+    let src = "function h(){ let a = 0; function bump(){ a = a + 1; } \
+               class T extends a { m(){} } a = a + 1; return a; }";
+    let (prog, _strings) = compile_source_with_strings(src).expect("class-extends compiles");
+    let fb = &prog.functions[1];
+    assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+
+    let new_env = fb
+        .instrs
+        .iter()
+        .position(|i| i.op() == Some(Opcode::NewEnvironment))
+        .expect("the class scope pushes an environment");
+    let pop = fb
+        .instrs
+        .iter()
+        .position(|i| i.op() == Some(Opcode::PopEnvironment))
+        .expect("the class scope must be retired with PopEnvironment");
+    assert!(new_env < pop, "the push must precede the pop");
+
+    // Operand roles differ between the two opcodes: GetEnvSlot is
+    // (dst, depth, slot), SetEnvSlot is (depth, slot, src).
+    let depths: Vec<(usize, u8)> = fb
+        .instrs
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, i)| match i.op() {
+            Some(Opcode::GetEnvSlot) => Some((pc, i.b())),
+            Some(Opcode::SetEnvSlot) => Some((pc, i.a())),
+            _ => None,
+        })
+        .collect();
+    let inside: Vec<u8> = depths
+        .iter()
+        .filter(|(pc, _)| *pc > new_env && *pc < pop)
+        .map(|(_, d)| *d)
+        .collect();
+    let after: Vec<u8> = depths
+        .iter()
+        .filter(|(pc, _)| *pc > pop)
+        .map(|(_, d)| *d)
+        .collect();
+
+    assert!(
+        inside.contains(&1),
+        "an access evaluated while the class scope is pushed must be biased to \
+         depth 1; saw depths {inside:?} between the NewEnvironment at pc {new_env} \
+         and the PopEnvironment at pc {pop} in:\n{fb}"
+    );
+    assert!(
+        !after.is_empty(),
+        "expected accesses after the class statement in:\n{fb}"
+    );
+    assert!(
+        after.iter().all(|d| *d == 0),
+        "after PopEnvironment every access is back at the structural depth 0; \
+         saw {after:?} in:\n{fb}"
+    );
+}
+
+/// Negative control for the test above: a class with **no** `extends` allocates
+/// no class-scope environment, so there is nothing to bias and nothing to pop.
+#[test]
+fn a_class_without_extends_emits_no_scoped_env_and_no_pop() {
+    let (prog, _strings) = compile_source_with_strings("class T { m(){} }").expect("compiles");
+    let fb = &prog.functions[0];
+    assert!(
+        !fb.instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::PopEnvironment)),
+        "a class with no heritage must not pop an environment:\n{fb}"
+    );
+    assert!(
+        !fb.instrs
+            .iter()
+            .any(|i| i.op() == Some(Opcode::NewEnvironment)),
+        "and must not push one either:\n{fb}"
+    );
+}
+
+/// **The historical bug, pinned as a regression test.** Before
+/// `PopEnvironment` existed, the class scope shadowed the enclosing function's
+/// environment for the rest of the unit, so the `GetEnvSlot` at `depth=0` after
+/// the class read the parent constructor back and this returned `function`
+/// where the spec says `1`. The value is `1`; the *silence* was the defect.
+///
+/// This is the compiler half — the emitted depths. The end-to-end half, this
+/// exact source evaluated by the real interpreter, is pinned in
+/// `v12-interp/tests/env_scope_agreement.rs` and in `v12-engine`'s
+/// `class_env_scope::closure_write_after_extending_class_reads_back_written_value`.
+#[test]
+fn the_class_extends_env_leak_repro_emits_only_unbiased_depths() {
+    let src = "function h(){ let acc=0; function bump(){acc=acc+1;} \
+               class T extends Object{m(){}} bump(); return acc; }";
+    let (prog, _strings) = compile_source_with_strings(src).expect("repro compiles");
+    for fb in &prog.functions {
+        assert!(fb.validate().is_ok(), "validate failed:\n{fb}");
+    }
+    // Unit 1 is `h`. `acc` is captured by `bump`, so h owns an environment and
+    // `acc` is at structural depth 0. h pushes no scope of its own, so every
+    // env access it emits must be at depth 0.
+    let fb = &prog.functions[1];
+    let depths: Vec<u8> = fb
+        .instrs
+        .iter()
+        .filter_map(|i| match i.op() {
+            Some(Opcode::GetEnvSlot) => Some(i.b()),
+            Some(Opcode::SetEnvSlot) => Some(i.a()),
+            _ => None,
+        })
+        .collect();
+    assert!(!depths.is_empty(), "expected env accesses in h:\n{fb}");
+    assert!(
+        depths.iter().all(|d| *d == 0),
+        "h has no scoped environment, so every access is at depth 0; saw {depths:?} in:\n{fb}"
+    );
+}

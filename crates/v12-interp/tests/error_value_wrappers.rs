@@ -35,8 +35,14 @@ fn assert_name_and_message(interp: &mut Interp, err: JsValue, name: &str, messag
     interp.heap_mut().add_root(err);
     assert_eq!(interp.heap().get(handle).kind, Kind::Error);
     let obj = interp.heap().get(handle);
-    assert!(obj.properties[0].is_string(), "properties[0] must be the name");
-    assert!(obj.properties[1].is_string(), "properties[1] must be the message");
+    assert!(
+        obj.properties[0].is_string(),
+        "properties[0] must be the name"
+    );
+    assert!(
+        obj.properties[1].is_string(),
+        "properties[1] must be the message"
+    );
     assert_eq!(interp.to_display_string(err), format!("{name}: {message}"));
 }
 
