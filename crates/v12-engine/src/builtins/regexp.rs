@@ -1,9 +1,9 @@
 //! RegExp built-ins over the [`v12_regex`] wrapper (which wraps `regress`).
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3 + §8): all
-//! bodies take `&mut Ctx`. The per-registry compiled-pattern cache travels
-//! as a `Ctx` capability (`Ctx::with_regex_cache`, fed by the registry at
-//! dispatch); bodies clone the `Rc` out of the context.
+//! Native bodies take `&mut Ctx` (`ctx::BuiltinFn`). The per-registry
+//! compiled-pattern cache travels as a `Ctx` capability
+//! (`Ctx::with_regex_cache`, fed by the registry at dispatch); bodies clone
+//! the `Rc` out of the context. Target state: `ROADMAP.md` §2.
 //!
 //! A RegExp object is a `Kind::RegExp` whose `elements` vector holds the two
 //! internal slots, plus one real own data property in `properties`:

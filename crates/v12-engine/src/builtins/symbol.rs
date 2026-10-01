@@ -1,8 +1,8 @@
 //! Symbol built-in.
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
-//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
-//! `ctx::call_ctx`, so dispatch IDs and install paths are unchanged.
+//! Native bodies take `&mut Ctx` (`ctx::BuiltinFn`); the `&mut Heap` dispatch
+//! site reaches them through `ctx::call_ctx`, so dispatch IDs and install paths
+//! are unchanged. Target state and remaining steps: `ROADMAP.md` §2.
 //!
 //! v1: symbols are fresh heap handles (`V12Symbol` is an opaque unit —
 //! identity is the handle). `Symbol.for` shares per-key symbols through

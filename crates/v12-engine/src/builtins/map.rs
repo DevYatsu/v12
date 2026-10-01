@@ -11,10 +11,10 @@
 //! the per-op implementations are the stride-generic helpers below; the
 //! `pub` natives are thin `Kind`-specialized wrappers.
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
-//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
-//! `ctx::call_ctx`. Callback-taking methods (`forEach`) stay at the
-//! interpreter seam (`Interp::run_callback_builtin`) and are untouched here.
+//! Native bodies take `&mut Ctx` (`ctx::BuiltinFn`); the `&mut Heap` dispatch
+//! site reaches them through `ctx::call_ctx`. Callback-taking methods
+//! (`forEach`) stay at the interpreter seam (`Interp::run_callback_builtin`).
+//! Target state: `ROADMAP.md` §2.
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, Kind};
 use v12_native::Throw;

@@ -1,9 +1,11 @@
 //! Shared conversions and validation helpers for the built-in natives.
 //!
-//! Thin shims over [`super::ctx::Ctx`] conversions: the canonical logic
-//! lives on `Ctx` (per `docs/builtins-arch-plan.md` §4.1) and these free
-//! functions delegate through an ephemeral `Ctx` so existing
-//! `fn(&mut Heap, …)` bodies keep compiling until their file migrates.
+//! Thin shims over [`super::ctx::Ctx`] conversions: the canonical logic lives
+//! on `Ctx` and these free functions delegate through an ephemeral
+//! `Ctx::new(heap, None, None)`. Those `None`s mean a shim cannot reach realm
+//! intrinsics, `pending`, or the regex cache — prefer `&mut Ctx` bodies.
+//! Target state: `ROADMAP.md` §2.
+//!
 //! Leaf string-flatten utilities (`string_text_cow`, `value_text_cow`)
 //! stay here because they borrow heap storage via `Cow`.
 

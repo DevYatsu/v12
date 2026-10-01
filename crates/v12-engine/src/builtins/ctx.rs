@@ -1,9 +1,11 @@
-//! Phase 3 step 1: canonical `Ctx` conversions (see `docs/builtins-arch-plan.md` §4.1+§5 step 3).
+//! The canonical builtin context: an exclusive `&mut Heap` borrow plus
+//! optional realm/intrinsic readers and sinks (`global`, `pending`,
+//! `regex_cache`). It owns the conversion logic (`require_object_coercible`,
+//! `this_object`, `to_number`, `to_string`, `string_text`); the free functions
+//! in `helpers` are thin shims delegating here.
 //!
-//! `Ctx` owns the conversion logic (`require_object_coercible`,
-//! `this_object`, `to_number`, `to_string`, `string_text`); the free
-//! functions in `helpers` are thin shims delegating here so existing
-//! `fn(&mut Heap, …)` bodies keep compiling until their file migrates.
+//! Target state — and how far this is from it, since most bodies still touch
+//! no field but `heap` — is `ROADMAP.md` §2.
 
 use std::cell::RefCell;
 use std::rc::Rc;

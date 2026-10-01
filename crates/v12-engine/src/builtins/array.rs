@@ -1,9 +1,9 @@
 //! Array built-ins: push, pop, and length handling.
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): non-callback
-//! bodies take `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them
-//! through `ctx::call_ctx`. Callback-taking methods stay at the interpreter
-//! seam (`Interp::run_callback_builtin`) and are untouched here.
+//! Non-callback native bodies take `&mut Ctx` (`ctx::BuiltinFn`); the `&mut
+//! Heap` dispatch site reaches them through `ctx::call_ctx`. Callback-taking
+//! methods stay at the interpreter seam (`Interp::run_callback_builtin`) and
+//! are untouched here. Target state: `ROADMAP.md` §2.
 
 use v12_heap::{Handle, Heap, JsObject, JsValue, PropKey, V12Str};
 use v12_native::Throw;

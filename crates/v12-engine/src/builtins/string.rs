@@ -1,9 +1,9 @@
 //! String built-ins.
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3 + §8): all
-//! bodies take `&mut Ctx`. The regexp-backed methods (`match`, `replace`,
-//! `search`, `split`) read the per-registry compiled-pattern cache out of the
-//! `Ctx` capability fed by the registry at dispatch.
+//! Native bodies take `&mut Ctx` (`ctx::BuiltinFn`). The regexp-backed methods
+//! (`match`, `replace`, `search`, `split`) read the per-registry
+//! compiled-pattern cache out of the `Ctx` capability fed by the registry at
+//! dispatch. Target state: `ROADMAP.md` §2.
 
 use v12_heap::{Handle, Heap, JsValue, V12Str};
 use v12_native::Throw;

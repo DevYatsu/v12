@@ -1,8 +1,8 @@
 //! Global URI built-ins: `encodeURI`/`decodeURI` and the Component variants.
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
-//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
-//! `ctx::call_ctx`, so dispatch IDs and install paths are unchanged.
+//! Native bodies take `&mut Ctx` (`ctx::BuiltinFn`); the `&mut Heap` dispatch
+//! site reaches them through `ctx::call_ctx`, so dispatch IDs and install paths
+//! are unchanged. Target state and remaining steps: `ROADMAP.md` §2.
 
 use v12_heap::JsValue;
 use v12_native::Throw;

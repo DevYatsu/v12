@@ -31,10 +31,10 @@
 //! relational methods) goes through it, so the recognised set of iterable kinds
 //! is written down once, here, instead of per method.
 //!
-//! Phase 3 step 3 migration (`docs/builtins-arch-plan.md` §5.3): bodies take
-//! `&mut Ctx`; the legacy `&mut Heap` dispatch site reaches them through
-//! `ctx::call_ctx`. Callback-taking methods stay at the interpreter seam
-//! (`Interp::run_callback_builtin`) and are untouched here.
+//! Native bodies take `&mut Ctx` (`ctx::BuiltinFn`); the `&mut Heap` dispatch
+//! site reaches them through `ctx::call_ctx`. Callback-taking methods stay at
+//! the interpreter seam (`Interp::run_callback_builtin`) and are untouched
+//! here. Target state: `ROADMAP.md` §2.
 
 use v12_heap::{Handle, Heap, JsObject, JsValue};
 use v12_native::Throw;

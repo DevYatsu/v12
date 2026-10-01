@@ -1,9 +1,8 @@
 //! Math built-ins.
 //!
-//! Phase 3 step 2 migration (`docs/builtins-arch-plan.md` §5.3): pure
-//! builtins that ignore `this`. Bodies take `&mut Ctx`; the legacy
-//! `&mut Heap` dispatch site reaches them through `ctx::call_ctx`, so
-//! dispatch IDs and install paths are unchanged.
+//! Native bodies take `&mut Ctx` (`ctx::BuiltinFn`) and ignore `this`; the
+//! `&mut Heap` dispatch site reaches them through `ctx::call_ctx`, so dispatch
+//! IDs and install paths are unchanged. Target state: `ROADMAP.md` §2.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
