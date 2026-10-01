@@ -144,9 +144,14 @@ impl Interp<'_> {
             // declared variables, hoisted names, and intrinsics, so an
             // unresolved read here is a genuine undeclared reference.
             let text = self.global_name_text(str_id, program);
-            return Err(JSException(
-                self.error_value(&format!("ReferenceError: {text} is not defined")),
-            ));
+            // The `"ReferenceError: "` head is redundant with `reference_error`'s
+            // default kind, but kept: `parse_error_text` re-splits on the
+            // first `": "`, and `{text}` is a source-supplied identifier that
+            // may contain one.  Pinning the head is what keeps this port
+            // exactly equivalent to `error_value`'s single split.
+            return Err(JSException(self.reference_error(&format!(
+                "ReferenceError: {text} is not defined"
+            ))));
         };
         Ok(v)
     }

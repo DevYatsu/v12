@@ -433,8 +433,7 @@ fn ensure_deferred(interp: &mut Interp<'_>, state: &Loader, path: &Path) -> Resu
         return Ok(());
     }
     if loading || pending_tla {
-        return Err(interp
-            .error_value("TypeError: Cannot evaluate a module while it is already evaluating"));
+        return Err(interp.type_error("Cannot evaluate a module while it is already evaluating"));
     }
     match load_and_evaluate(interp, state, path) {
         Ok(_) => Ok(()),
@@ -744,8 +743,13 @@ pub(crate) fn validate_export_stars(
             if let Some(previous) = owners.get(&name)
                 && previous != &child_path
             {
+                // The `"SyntaxError: "` head is redundant with `syntax_error`'s
+                // default kind, but kept: `parse_error_text` re-splits on the
+                // first `": "`, and `{name}` is an export name read out of the
+                // module source, so it may contain one.  Pinning the head is
+                // what keeps this exactly equivalent to `error_value`'s split.
                 return Err(
-                    interp.error_value(&format!("SyntaxError: ambiguous export name '{name}'"))
+                    interp.syntax_error(&format!("SyntaxError: ambiguous export name '{name}'"))
                 );
             }
             owners.insert(name, child_path.clone());

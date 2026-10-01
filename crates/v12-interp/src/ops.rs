@@ -597,9 +597,9 @@ impl Interp<'_> {
                 }
             }
         }
-        Err(JSException(self.error_value(
-            "TypeError: Cannot convert object to primitive value",
-        )))
+        Err(JSException(
+            self.type_error("Cannot convert object to primitive value"),
+        ))
     }
 
     /// ES ToNumber, routing objects through [`Self::to_primitive_default`]
@@ -631,7 +631,7 @@ impl Interp<'_> {
 
     /// The ES TypeError for `ToString(symbol)`.
     pub(crate) fn symbol_to_string_type_error(&mut self) -> JSException {
-        JSException(self.error_value("TypeError: Cannot convert a Symbol value to a string"))
+        JSException(self.type_error("Cannot convert a Symbol value to a string"))
     }
 
     /// ES ToPropertyKey (7.1.19): strings and symbols pass through; any other

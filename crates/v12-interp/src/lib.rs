@@ -1425,11 +1425,15 @@ impl<'a> Interp<'a> {
         name_id: u32,
     ) -> Result<crate::JsValue, JSException> {
         let Some(h) = obj_v.as_object() else {
-            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+            return Err(JSException(self.type_error(
+                "Cannot read private member from an object whose class did not declare it",
+            )));
         };
         let o = self.heap.get(h);
         if o.private_brand != Some(class_id) {
-            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+            return Err(JSException(self.type_error(
+                "Cannot read private member from an object whose class did not declare it",
+            )));
         }
         if let Some(m) = &o.private_fields
             && let Some(v) = m.get(&name_id)
@@ -1458,16 +1462,18 @@ impl<'a> Interp<'a> {
         val: crate::JsValue,
     ) -> Result<(), JSException> {
         let Some(h) = obj_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: Cannot define private field on non-object",
-            )));
+            return Err(JSException(
+                self.type_error("Cannot define private field on non-object"),
+            ));
         };
         let o = self.heap.get_mut(h);
         if o.private_brand.is_none() {
             o.private_brand = Some(class_id);
         }
         if o.private_brand != Some(class_id) {
-            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+            return Err(JSException(self.type_error(
+                "Cannot read private member from an object whose class did not declare it",
+            )));
         }
         let m = o
             .private_fields
@@ -1484,12 +1490,14 @@ impl<'a> Interp<'a> {
     ) -> Result<(), JSException> {
         let Some(h) = obj_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: Cannot set private member on non-object"),
+                self.type_error("Cannot set private member on non-object"),
             ));
         };
         let o = self.heap.get_mut(h);
         if o.private_brand != Some(class_id) {
-            return Err(JSException(self.error_value("TypeError: Cannot read private member from an object whose class did not declare it")));
+            return Err(JSException(self.type_error(
+                "Cannot read private member from an object whose class did not declare it",
+            )));
         }
         let m = o
             .private_fields
@@ -1621,7 +1629,7 @@ impl<'a> Interp<'a> {
             .get(idx)
             .copied()
             .ok_or_else(|| {
-                JSException(self.error_value("InternalError: environment slot out of range"))
+                JSException(self.error_value_kind("InternalError", "environment slot out of range"))
             })?;
         if let Some(cell) = value.as_object()
             && self.heap.get(cell).kind == v12_heap::Kind::BindingCell
@@ -1633,9 +1641,9 @@ impl<'a> Interp<'a> {
                 .as_ref()
                 .expect("binding cell payload");
             if !binding.initialized {
-                return Err(JSException(self.error_value(
-                    "ReferenceError: Cannot access binding before initialization",
-                )));
+                return Err(JSException(
+                    self.reference_error("Cannot access binding before initialization"),
+                ));
             }
             return Ok(binding.value);
         }
@@ -1656,7 +1664,7 @@ impl<'a> Interp<'a> {
             .get(idx)
             .copied()
             .ok_or_else(|| {
-                JSException(self.error_value("InternalError: environment slot out of range"))
+                JSException(self.error_value_kind("InternalError", "environment slot out of range"))
             })?;
         if let Some(cell) = stored.as_object()
             && self.heap.get(cell).kind == v12_heap::Kind::BindingCell
@@ -1716,8 +1724,9 @@ impl<'a> Interp<'a> {
 
     fn env_at_expect(&mut self, depth: u16) -> Result<Handle<JsObject>, JSException> {
         self.env_at(depth).ok_or_else(|| {
-            JSException(self.error_value(
-                "InternalError: environment depth exceeds live chain or missing environment",
+            JSException(self.error_value_kind(
+                "InternalError",
+                "environment depth exceeds live chain or missing environment",
             ))
         })
     }
@@ -2029,9 +2038,13 @@ impl<'a> Interp<'a> {
             // intrinsics — surface as "not a function" so the bucket
             // "native function #4294967295 is not registered" clears.
             if unknown.0 == 0xFFFF_FFFF {
-                return JSException(self.error_value("TypeError: not a function"));
+                return JSException(self.type_error("not a function"));
             }
-            JSException(self.error_value(&format!(
+            // Head kept for the reason documented on `globals.rs`'s
+            // undeclared-global site: `parse_error_text` re-splits on the
+            // first ": ", so a pinned head is the only thing keeping this
+            // equivalent to `error_value`'s single split.
+            JSException(self.type_error(&format!(
                 "TypeError: native function #{} is not registered",
                 unknown.0
             )))

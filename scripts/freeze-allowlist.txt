@@ -24,13 +24,14 @@
 #     explicit cap raise with a reason here.
 #   * Each migration commit DELETES the entries it retired; the cap follows
 #     automatically because the script counts entries.
-#   * This file must therefore shrink monotonically from here.  The stages were
-#     call_setup.rs 53 -> 0 (DONE, W0.2c batch 1), then object_ops.rs 20 -> 0
-#     and property.rs 16 -> 0 (DONE, W0.2c batch 2).  What is left is
-#     lib.rs 8, generator_async.rs 7, execute.rs 5, call_capability.rs 5,
-#     eval_context.rs 3, and ops.rs / module_loader.rs 1 each — batch 3.
-#     ERR_VAL is 30 now (was 119); the other 14 are PK_PUSH/PROP_GET1 and
-#     never move again.
+#   * This file must therefore shrink monotonically from here.  ALL THREE
+#     stages are DONE: call_setup.rs 53 -> 0 (batch 1), object_ops.rs 20 -> 0
+#     and property.rs 16 -> 0 (batch 2), then the last eight files in batch 3.
+#     ERR_VAL is 1 now (was 119).  That 1 is execute.rs:174
+#     "ScriptRuntimeError", a non-KNOWN_KINDS prefix whose value is
+#     observable from JS as `e.name` — it is a documented exception, NOT
+#     zero debt, and its entry is deliberately still here.  The other 14
+#     entries are PK_PUSH/PROP_GET1 and never move again.
 #
 # ===================== MIGRATION TARGETS =====================
 # ERR_VAL -> real error objects with a kind and a realm link.
@@ -46,9 +47,8 @@
 #     (crates/v12-native/src/throw.rs:44,57), wrapped once as
 #     Interp::{type_error,range_error,syntax_error,reference_error} beside
 #     Interp::error_value (crates/v12-interp/src/call_setup.rs:968).  That
-#     wrapper batch gated 118 of the 119 sites; batches 1 and 2 have since
-#     retired call_setup.rs (53), object_ops.rs (20) and property.rs (16),
-#     leaving 30.
+#     wrapper batch gated 118 of the 119 sites; batches 1-3 have since retired
+#     every one of them except execute.rs:174, leaving 1.
 # PK_PUSH -> ctx.define_data_prop_with_attrs (ctx.rs:482) is the sole legal
 #   push.  Sites that write an internal slot or a fixed record layout, and the
 #   interpreter's dictionary/sparse storage core, are structurally exempt and
@@ -113,12 +113,23 @@ PROP_GET1 crates/v12-heap/src/object.rs:758 # properties.get(1)
 PROP_GET1 crates/v12-engine/src/builtins/string.rs:416 # properties.get(1)
 #
 # --- ERR_VAL: stringly `error_value("` construction (target: the Ctx / v12-native error wrappers) ---
-# 30 sites remain, listed below per file with the migration rationale for that file.
-# (119 at the 2026-10-01 re-baseline; call_setup.rs retired in W0.2c batch 1,
-# object_ops.rs + property.rs in batch 2.  ALL of batch 2's counts above are
-# lower bounds: the lint pattern `error_value("` misses every multi-line and
-# trailing-comma call form, so property.rs alone held 75 real sites behind a
-# cap of 16.  Count with a paren-matching scan, not the grep.)
+# 1 site remains — see its block below for why it cannot be retired.
+# (119 at the 2026-10-01 re-baseline; retired across W0.2c batches 1-3: 53 in
+# call_setup.rs, 20 + 16 in object_ops.rs + property.rs, 29 in batch 3.)
+#
+# A WARNING ABOUT THE CAP NUMBERS, learned the hard way: every count in this
+# section was a LOWER BOUND.  The lint pattern `error_value("` misses every
+# multi-line and trailing-comma call form, so property.rs held 75 real sites
+# behind a cap of 16, and lib.rs 12 behind a cap of 8.  It also cannot see
+# `error_value(&format!(`, which is why globals.rs:148 was never listed here
+# at all despite being a live site.  Count with a paren-matching scan.
+#
+# TWO FILES THAT A NAIVE `grep error_value(` MISCOUNTS:
+#   * crates/v12-engine/src/builtins/registry.rs — 3 substring hits, all of
+#     them `syntax_error_value(`.  Zero real sites, never in this list.
+#   * a receiver split across a line break (`self\n  .error_value(`) is
+#     invisible to both the lint and a naive same-line grep; 3 sites in
+#     execute.rs / module_loader.rs had that shape.
 #
 # crates/v12-interp/src/call_setup.rs — 0 sites remaining (RETIRED)
 # Call/construct ABI guards (arity, stack depth, corrupt call header,
@@ -132,9 +143,11 @@ PROP_GET1 crates/v12-engine/src/builtins/string.rs:416 # properties.get(1)
 #     re-splits on the FIRST ": ", so a pinned head is what makes those ports
 #     exactly equivalent to `error_value`'s single split even if the
 #     interpolated `{name}`/`{message}` ever grows a ": " of its own.
-#   * `Interp::error_value` itself stays (it is permissive by contract and
-#     still has 30 callers in the other interpreter/engine files).  Do not
-#     delete it as part of this retirement.
+#   * `Interp::error_value` itself STAYS.  After batch 3 it has exactly one
+#     production caller left — execute.rs:174, the ScriptRuntimeError site
+#     that cannot be ported — plus the wrapper tests.  Deleting it would
+#     force that site onto a wrapper and change a JS-observable `e.name`, so
+#     it is deliberately kept, and keeping it is what makes that entry honest.
 #
 #
 # crates/v12-interp/src/object_ops.rs — 0 sites remaining (RETIRED)
@@ -165,54 +178,69 @@ PROP_GET1 crates/v12-engine/src/builtins/string.rs:416 # properties.get(1)
 # typed wrapper) and are deliberately untouched.
 #
 #
-# crates/v12-interp/src/lib.rs — 8 sites remaining
-# private-member brand checks and call-completed-without-result guard. 8 sites.
-ERR_VAL crates/v12-interp/src/lib.rs:1428 # "TypeError: Cannot read private member from an object whose class did not declare it"
-ERR_VAL crates/v12-interp/src/lib.rs:1432 # "TypeError: Cannot read private member from an object whose class did not declare it"
-ERR_VAL crates/v12-interp/src/lib.rs:1470 # "TypeError: Cannot read private member from an object whose class did not declare it"
-ERR_VAL crates/v12-interp/src/lib.rs:1487 # "TypeError: Cannot set private member on non-object"
-ERR_VAL crates/v12-interp/src/lib.rs:1492 # "TypeError: Cannot read private member from an object whose class did not declare it"
-ERR_VAL crates/v12-interp/src/lib.rs:1624 # "InternalError: environment slot out of range"
-ERR_VAL crates/v12-interp/src/lib.rs:1659 # "InternalError: environment slot out of range"
-ERR_VAL crates/v12-interp/src/lib.rs:2032 # "TypeError: not a function"
+# crates/v12-interp/src/lib.rs — 0 sites remaining (RETIRED)
+# Private-member brand checks, environment-slot/depth guards and the
+# call-completed-without-result guard.  Was 8 lint-visible but 12 true call
+# sites.  Retired in W0.2c batch 3, the last batch.
 #
-# crates/v12-interp/src/generator_async.rs — 7 sites remaining
-# generator/async receiver guards. 7 sites.
-ERR_VAL crates/v12-interp/src/generator_async.rs:626 # "TypeError: generator next called on non-object"
-ERR_VAL crates/v12-interp/src/generator_async.rs:630 # "TypeError: not a generator"
-ERR_VAL crates/v12-interp/src/generator_async.rs:711 # "TypeError: generator return called on non-object"
-ERR_VAL crates/v12-interp/src/generator_async.rs:715 # "TypeError: not a generator"
-ERR_VAL crates/v12-interp/src/generator_async.rs:780 # "TypeError: generator throw called on non-object"
-ERR_VAL crates/v12-interp/src/generator_async.rs:784 # "TypeError: not a generator"
-ERR_VAL crates/v12-interp/src/generator_async.rs:1067 # "RangeError: maximum call stack size exceeded"
+# 3 of the 12 were "InternalError: …", and there is NO `internal_error`
+# wrapper — only type/range/syntax/reference exist.  They went to
+# `error_value_kind("InternalError", msg)`, the validating sibling added in
+# W0.2b: same (name, message) pair, and no stringly "Kind: " prefix left, so
+# the `error_value("` lint hit retires too.  If a real `internal_error`
+# wrapper is ever wanted that is a W0.2d follow-up, not a reason to leave
+# these on the permissive path.
 #
-# crates/v12-interp/src/execute.rs — 5 sites remaining
-# execution-deadline, yield-outside-generator and await-outside-async guards.
-# 5 sites.
+# crates/v12-interp/src/generator_async.rs — 0 sites remaining (RETIRED)
+# Generator/async receiver guards (ES 27.4) plus the resume-depth RangeError.
+# All 7 were plain literals (6 TypeError, 1 RangeError), so this file was
+# mechanical.  Retired in W0.2c batch 3.
+#
+# crates/v12-interp/src/execute.rs — 1 site remaining, DELIBERATE EXCEPTION
+# Was 5 lint-visible / 6 true sites.  Four retired in W0.2c batch 3
+# (yield-outside-generator and await-outside-async SyntaxErrors,
+# null/undefined property set, delete-of-non-object).  The FIFTH IS NOT
+# PORTABLE AND MUST NOT BE:
+#
+#   "ScriptRuntimeError: execution deadline exceeded"
+#
+# `ScriptRuntimeError` is NOT in v12_native::KNOWN_KINDS (throw.rs:28-36).
+# error_value splits PERMISSIVELY, so today this throws an error whose `name`
+# is literally "ScriptRuntimeError".  Every typed wrapper routes through
+# parse_error_text, which falls back to the wrapper's default kind — so
+# porting it would silently make `e.name === "TypeError"` instead.  That is
+# observable from JS and is a real conformance-visible change, so this site
+# stays on error_value and this entry stays in the allowlist.
+#
+# This is why workspace ERR_VAL is 1 and not 0.  Zero would be a false claim.
+# Retiring it needs either a real `error_value_kind`-style path that accepts an
+# unvalidated name, or a decision to rename the thrown value to a spec error
+# type — both of which are behaviour changes and belong in their own batch.
 ERR_VAL crates/v12-interp/src/execute.rs:174 # "ScriptRuntimeError: execution deadline exceeded"
-ERR_VAL crates/v12-interp/src/execute.rs:704 # "TypeError: cannot set properties of null or undefined"
-ERR_VAL crates/v12-interp/src/execute.rs:732 # "TypeError: Cannot delete property of an object"
-ERR_VAL crates/v12-interp/src/execute.rs:1136 # "SyntaxError: yield outside generator"
-ERR_VAL crates/v12-interp/src/execute.rs:1171 # "SyntaxError: await outside async"
 #
-# crates/v12-interp/src/call_capability.rs — 5 sites remaining
-# call-depth limit and call-arity guards. 5 sites.
-ERR_VAL crates/v12-interp/src/call_capability.rs:31 # "RangeError: maximum call stack size exceeded"
-ERR_VAL crates/v12-interp/src/call_capability.rs:44 # "RangeError: maximum call stack size exceeded"
-ERR_VAL crates/v12-interp/src/call_capability.rs:60 # "RangeError: too many call arguments"
-ERR_VAL crates/v12-interp/src/call_capability.rs:66 # "RangeError: too many call arguments"
-ERR_VAL crates/v12-interp/src/call_capability.rs:84 # "InternalError: call completed without a result"
+# crates/v12-interp/src/call_capability.rs — 0 sites remaining (RETIRED)
+# Call-depth limit and call-arity guards.  4 RangeErrors went to
+# `range_error`; the fifth was an "InternalError: …" and took the same
+# `error_value_kind("InternalError", …)` route as lib.rs's three (no
+# `internal_error` wrapper exists).  Retired in W0.2c batch 3.
 #
-# crates/v12-interp/src/eval_context.rs — 3 sites remaining
-# direct-eval program-compile and eval-local binding guards. 3 sites.
-ERR_VAL crates/v12-interp/src/eval_context.rs:241 # "TypeError: invalid eval program"
-ERR_VAL crates/v12-interp/src/eval_context.rs:411 # "ReferenceError: invalid eval-local binding"
-ERR_VAL crates/v12-interp/src/eval_context.rs:430 # "ReferenceError: arguments owner is unavailable"
+# crates/v12-interp/src/eval_context.rs — 0 sites remaining (RETIRED)
+# Direct-eval program-compile and eval-local binding guards (2 ReferenceError,
+# 1 TypeError).  Retired in W0.2c batch 3.
 #
-# crates/v12-interp/src/ops.rs — 1 site remaining
-# Symbol-to-string conversion guard. 1 site.
-ERR_VAL crates/v12-interp/src/ops.rs:634 # "TypeError: Cannot convert a Symbol value to a string"
+# crates/v12-interp/src/ops.rs — 0 sites remaining (RETIRED)
+# Symbol-to-string conversion guard.  Was 1 lint-visible but 2 true sites;
+# both TypeError literals.  Retired in W0.2c batch 3.
 #
-# crates/v12-engine/src/module_loader.rs — 1 site remaining
-# re-entrant module evaluation guard. 1 site.
-ERR_VAL crates/v12-engine/src/module_loader.rs:437 # "TypeError: Cannot evaluate a module while it is already evaluating"
+# crates/v12-engine/src/module_loader.rs — 0 sites remaining (RETIRED)
+# Re-entrant module evaluation guard plus the ambiguous-export-name guard.
+# Retired in W0.2c batch 3.
+#
+# NOTE ON THE MIGRATION TARGET: these two sites are NOT Ctx-based.  They call
+# `interp.error_value(...)` and sit in `ensure_deferred(interp, …)` and
+# `validate_export_stars(interp, …)`, neither of which has a `Ctx` parameter
+# in scope — so `ctx.type_error` was not reachable and was not used.  The
+# reachable target is the `Interp` wrapper set (v12-engine depends on
+# v12-interp), exactly as in the interpreter batches.  This same file DOES use
+# `ctx.type_error` at lines 185/206, inside `handle_import(ctx: &mut Ctx, …)`
+# — which is why the distinction has to be made per site, not per file.

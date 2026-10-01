@@ -238,7 +238,7 @@ impl Interp<'_> {
         let funcs = self.functions_for_program(program_id);
         let function = funcs
             .get(compiled.main as usize)
-            .ok_or_else(|| JSException(self.error_value("TypeError: invalid eval program")))?;
+            .ok_or_else(|| JSException(self.type_error("invalid eval program")))?;
         let max_regs = function.max_regs;
         let var_names = function
             .eval_metadata
@@ -408,7 +408,7 @@ impl Interp<'_> {
                 let idx = usize::from(slot);
                 if idx >= self.heap.get(env).properties.len() {
                     return Err(JSException(
-                        self.error_value("ReferenceError: invalid eval-local binding"),
+                        self.reference_error("invalid eval-local binding"),
                     ));
                 }
                 self.heap.get_mut(env).properties[idx] = value;
@@ -427,7 +427,7 @@ impl Interp<'_> {
         }
         let Some(frame) = self.frames.get(frame_idx) else {
             return Err(JSException(
-                self.error_value("ReferenceError: arguments owner is unavailable"),
+                self.reference_error("arguments owner is unavailable"),
             ));
         };
         let base = frame.base;

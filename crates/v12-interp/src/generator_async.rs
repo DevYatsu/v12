@@ -623,11 +623,11 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: generator next called on non-object"),
+                self.type_error("generator next called on non-object"),
             ));
         };
         if self.heap.get(r#gen).kind != Kind::Generator {
-            return Err(JSException(self.error_value("TypeError: not a generator")));
+            return Err(JSException(self.type_error("not a generator")));
         }
         let async_gen = self.is_async_generator_for(r#gen);
         let request = if async_gen {
@@ -708,11 +708,11 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: generator return called on non-object"),
+                self.type_error("generator return called on non-object"),
             ));
         };
         if self.heap.get(r#gen).kind != Kind::Generator {
-            return Err(JSException(self.error_value("TypeError: not a generator")));
+            return Err(JSException(self.type_error("not a generator")));
         }
         let done = self
             .heap
@@ -777,11 +777,11 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let Some(r#gen) = this_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: generator throw called on non-object"),
+                self.type_error("generator throw called on non-object"),
             ));
         };
         if self.heap.get(r#gen).kind != Kind::Generator {
-            return Err(JSException(self.error_value("TypeError: not a generator")));
+            return Err(JSException(self.type_error("not a generator")));
         }
         let done = self
             .heap
@@ -1064,7 +1064,7 @@ impl Interp<'_> {
     ) -> Result<Option<JsValue>, JSException> {
         if self.resume_depth >= MAX_RESUME_DEPTH {
             return Err(JSException(
-                self.error_value("RangeError: maximum call stack size exceeded"),
+                self.range_error("maximum call stack size exceeded"),
             ));
         }
         self.resume_depth += 1;

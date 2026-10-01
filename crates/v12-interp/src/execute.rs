@@ -700,8 +700,7 @@ impl Interp<'_> {
                     // and callers that truncate the stack afterwards then
                     // corrupt the machine (the register-window OOB class).
                     if obj_v.is_null() || obj_v.is_undefined() {
-                        let exc = self
-                            .error_value("TypeError: cannot set properties of null or undefined");
+                        let exc = self.type_error("cannot set properties of null or undefined");
                         throw_js!(exc);
                     }
                     // Strictness comes from the running function itself
@@ -728,8 +727,7 @@ impl Interp<'_> {
                     // ES 13.5.1.2: a strict-mode `delete` of a member whose
                     // [[Delete]] returns false throws a TypeError.
                     if !deleted && funcs[fn_idx as usize].is_strict {
-                        let exc =
-                            self.error_value("TypeError: Cannot delete property of an object");
+                        let exc = self.type_error("Cannot delete property of an object");
                         throw_js!(exc);
                     }
                     self.write_bool(base, ra, deleted);
@@ -1050,9 +1048,7 @@ impl Interp<'_> {
                     if let Some(global) = self.global {
                         let global_v = JsValue::object(global);
                         if global_v.is_null() || global_v.is_undefined() {
-                            let exc = self.error_value(
-                                "TypeError: cannot set properties of null or undefined",
-                            );
+                            let exc = self.type_error("cannot set properties of null or undefined");
                             throw_js!(exc);
                         }
                     }
@@ -1133,7 +1129,7 @@ impl Interp<'_> {
                         .copied()
                         .unwrap_or(JsValue::undefined());
                     if self.frames.last().and_then(|f| f.generator).is_none() {
-                        let exc = self.error_value("SyntaxError: yield outside generator");
+                        let exc = self.syntax_error("yield outside generator");
                         throw_js!(exc);
                     }
                     let resume_pc = pc + op_width;
@@ -1168,7 +1164,7 @@ impl Interp<'_> {
                     // main hits the second guard until module mains compile
                     // as async functions.
                     if self.frames.last().and_then(|f| f.generator).is_none() {
-                        let exc = self.error_value("SyntaxError: await outside async");
+                        let exc = self.syntax_error("await outside async");
                         throw_js!(exc);
                     };
                     let r#gen = self

@@ -28,7 +28,7 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(JSException(
-                self.error_value("RangeError: maximum call stack size exceeded"),
+                self.range_error("maximum call stack size exceeded"),
             ));
         }
         // `prepare_call` + `execute` below nest a Rust call per value-call
@@ -41,7 +41,7 @@ impl Interp<'_> {
         // reached.
         if self.resume_depth >= MAX_RESUME_DEPTH {
             return Err(JSException(
-                self.error_value("RangeError: maximum call stack size exceeded"),
+                self.range_error("maximum call stack size exceeded"),
             ));
         }
 
@@ -56,15 +56,11 @@ impl Interp<'_> {
 
         let Ok(caller_max_regs) = u16::try_from(self.stack.len() - base) else {
             self.stack.truncate(base);
-            return Err(JSException(
-                self.error_value("RangeError: too many call arguments"),
-            ));
+            return Err(JSException(self.range_error("too many call arguments")));
         };
         let Ok(argc) = u16::try_from(args.len()) else {
             self.stack.truncate(base);
-            return Err(JSException(
-                self.error_value("RangeError: too many call arguments"),
-            ));
+            return Err(JSException(self.range_error("too many call arguments")));
         };
 
         let saved_stop = self.stop_at_frames;
@@ -72,23 +68,25 @@ impl Interp<'_> {
         self.stop_at_frames = Some(boundary);
         self.top_result = None;
 
-        let result = match self.prepare_call(base, caller_max_regs, 0, argc, false, 0) {
-            Ok(CallOutcome::Pushed) => {
-                self.resume_depth += 1;
-                let execution = self.execute();
-                self.resume_depth -= 1;
-                self.cleanup_nested_call_frames(boundary, base);
-                execution.and_then(|()| {
-                    self.top_result.take().ok_or_else(|| {
-                        JSException(
-                            self.error_value("InternalError: call completed without a result"),
-                        )
+        let result =
+            match self.prepare_call(base, caller_max_regs, 0, argc, false, 0) {
+                Ok(CallOutcome::Pushed) => {
+                    self.resume_depth += 1;
+                    let execution = self.execute();
+                    self.resume_depth -= 1;
+                    self.cleanup_nested_call_frames(boundary, base);
+                    execution.and_then(|()| {
+                        self.top_result.take().ok_or_else(|| {
+                            JSException(self.error_value_kind(
+                                "InternalError",
+                                "call completed without a result",
+                            ))
+                        })
                     })
-                })
-            }
-            Ok(CallOutcome::Value(value)) => Ok(value),
-            Err(error) => Err(error),
-        };
+                }
+                Ok(CallOutcome::Value(value)) => Ok(value),
+                Err(error) => Err(error),
+            };
 
         self.stop_at_frames = saved_stop;
         self.stack.truncate(base);
