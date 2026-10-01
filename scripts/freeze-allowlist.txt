@@ -24,10 +24,13 @@
 #     explicit cap raise with a reason here.
 #   * Each migration commit DELETES the entries it retired; the cap follows
 #     automatically because the script counts entries.
-#   * This file must therefore shrink monotonically from here.  The three
-#     stages were call_setup.rs 53 -> 0 (DONE, W0.2c batch 1), then
-#     object_ops.rs 20 -> 0, then the 10-site files.  ERR_VAL is 66 now
-#     (was 119); the other 63 are PK_PUSH/PROP_GET1 and never move again.
+#   * This file must therefore shrink monotonically from here.  The stages were
+#     call_setup.rs 53 -> 0 (DONE, W0.2c batch 1), then object_ops.rs 20 -> 0
+#     and property.rs 16 -> 0 (DONE, W0.2c batch 2).  What is left is
+#     lib.rs 8, generator_async.rs 7, execute.rs 5, call_capability.rs 5,
+#     eval_context.rs 3, and ops.rs / module_loader.rs 1 each — batch 3.
+#     ERR_VAL is 30 now (was 119); the other 14 are PK_PUSH/PROP_GET1 and
+#     never move again.
 #
 # ===================== MIGRATION TARGETS =====================
 # ERR_VAL -> real error objects with a kind and a realm link.
@@ -43,8 +46,9 @@
 #     (crates/v12-native/src/throw.rs:44,57), wrapped once as
 #     Interp::{type_error,range_error,syntax_error,reference_error} beside
 #     Interp::error_value (crates/v12-interp/src/call_setup.rs:968).  That
-#     wrapper batch gated 118 of the 119 sites; batch 1 has since retired
-#     call_setup.rs's 53, leaving 66.
+#     wrapper batch gated 118 of the 119 sites; batches 1 and 2 have since
+#     retired call_setup.rs (53), object_ops.rs (20) and property.rs (16),
+#     leaving 30.
 # PK_PUSH -> ctx.define_data_prop_with_attrs (ctx.rs:482) is the sole legal
 #   push.  Sites that write an internal slot or a fixed record layout, and the
 #   interpreter's dictionary/sparse storage core, are structurally exempt and
@@ -109,8 +113,12 @@ PROP_GET1 crates/v12-heap/src/object.rs:758 # properties.get(1)
 PROP_GET1 crates/v12-engine/src/builtins/string.rs:416 # properties.get(1)
 #
 # --- ERR_VAL: stringly `error_value("` construction (target: the Ctx / v12-native error wrappers) ---
-# 66 sites remain, listed below per file with the migration rationale for that file.
-# (119 at the 2026-10-01 re-baseline; call_setup.rs retired in W0.2c batch 1.)
+# 30 sites remain, listed below per file with the migration rationale for that file.
+# (119 at the 2026-10-01 re-baseline; call_setup.rs retired in W0.2c batch 1,
+# object_ops.rs + property.rs in batch 2.  ALL of batch 2's counts above are
+# lower bounds: the lint pattern `error_value("` misses every multi-line and
+# trailing-comma call form, so property.rs alone held 75 real sites behind a
+# cap of 16.  Count with a paren-matching scan, not the grep.)
 #
 # crates/v12-interp/src/call_setup.rs — 0 sites remaining (RETIRED)
 # Call/construct ABI guards (arity, stack depth, corrupt call header,
@@ -125,53 +133,37 @@ PROP_GET1 crates/v12-engine/src/builtins/string.rs:416 # properties.get(1)
 #     exactly equivalent to `error_value`'s single split even if the
 #     interpolated `{name}`/`{message}` ever grows a ": " of its own.
 #   * `Interp::error_value` itself stays (it is permissive by contract and
-#     still has 66 callers in the other interpreter/engine files).  Do not
+#     still has 30 callers in the other interpreter/engine files).  Do not
 #     delete it as part of this retirement.
 #
 #
-# crates/v12-interp/src/object_ops.rs — 20 sites remaining
-# destructure/spread, prototype-chain and accessor-prototype guards. 20
-# sites; second-largest batch.
-ERR_VAL crates/v12-interp/src/object_ops.rs:17 # "TypeError: cannot destructure non-iterable"
-ERR_VAL crates/v12-interp/src/object_ops.rs:23 # "TypeError: spread/rest source is not an array"
-ERR_VAL crates/v12-interp/src/object_ops.rs:216 # "TypeError: cannot define accessor on non-object"
-ERR_VAL crates/v12-interp/src/object_ops.rs:249 # "TypeError: cannot define method on non-object"
-ERR_VAL crates/v12-interp/src/object_ops.rs:272 # "TypeError: cannot redefine accessor as method"
-ERR_VAL crates/v12-interp/src/object_ops.rs:296 # "TypeError: cannot set prototype of a primitive"
-ERR_VAL crates/v12-interp/src/object_ops.rs:310 # "TypeError: prototype must be an object or null"
-ERR_VAL crates/v12-interp/src/object_ops.rs:321 # "TypeError: cyclic [[Prototype]] value"
-ERR_VAL crates/v12-interp/src/object_ops.rs:606 # "TypeError: IteratorNext called on non-object"
-ERR_VAL crates/v12-interp/src/object_ops.rs:616 # "TypeError: iterator.next is not a function"
-ERR_VAL crates/v12-interp/src/object_ops.rs:631 # "TypeError: iterator.next() returned a non-object"
-ERR_VAL crates/v12-interp/src/object_ops.rs:690 # "TypeError: iterator.return is not a function"
-ERR_VAL crates/v12-interp/src/object_ops.rs:700 # "TypeError: iterator.return() returned a non-object"
-ERR_VAL crates/v12-interp/src/object_ops.rs:716 # "TypeError: spread source is not an array"
-ERR_VAL crates/v12-interp/src/object_ops.rs:721 # "TypeError: spread source is not an array"
-ERR_VAL crates/v12-interp/src/object_ops.rs:734 # "TypeError: destination is not an object"
-ERR_VAL crates/v12-interp/src/object_ops.rs:739 # "TypeError: destination is not an array"
-ERR_VAL crates/v12-interp/src/object_ops.rs:744 # "TypeError: spread source is not an array"
-ERR_VAL crates/v12-interp/src/object_ops.rs:749 # "TypeError: spread source is not an array"
-ERR_VAL crates/v12-interp/src/object_ops.rs:793 # "TypeError: Array.prototype.join requires an array"
+# crates/v12-interp/src/object_ops.rs — 0 sites remaining (RETIRED)
+# destructure/spread, prototype-chain and accessor-prototype guards.  Was 20,
+# all TypeError, all plain string literals — no `format!`, so this batch was
+# mechanical.  Retired in W0.2c batch 2.  This file's ONE PK_PUSH site
+# (object_ops.rs:280) is a different idiom and is deliberately untouched.
 #
-# crates/v12-interp/src/property.rs — 16 sites remaining
-# proxy trap type guards plus [[Set]]/[[DefineOwnProperty]] failure paths.
-# 16 sites.
-ERR_VAL crates/v12-interp/src/property.rs:1415 # "TypeError: 'set' on proxy returned false"
-ERR_VAL crates/v12-interp/src/property.rs:1435 # "TypeError: cannot assign to read-only property"
-ERR_VAL crates/v12-interp/src/property.rs:1565 # "TypeError: 'set' on proxy returned false"
-ERR_VAL crates/v12-interp/src/property.rs:1626 # "TypeError: cannot assign to read-only property"
-ERR_VAL crates/v12-interp/src/property.rs:1675 # "TypeError: cannot assign to read-only property"
-ERR_VAL crates/v12-interp/src/property.rs:1694 # "TypeError: 'set' on proxy returned false"
-ERR_VAL crates/v12-interp/src/property.rs:1717 # "TypeError: cannot assign to read-only property"
-ERR_VAL crates/v12-interp/src/property.rs:1816 # "TypeError: cannot define property on non-object"
-ERR_VAL crates/v12-interp/src/property.rs:2406 # "TypeError: 'isExtensible' trap result mismatch"
-ERR_VAL crates/v12-interp/src/property.rs:2941 # "TypeError: 'set' trap must be a function"
-ERR_VAL crates/v12-interp/src/property.rs:2946 # "TypeError: 'set' trap must be a function"
-ERR_VAL crates/v12-interp/src/property.rs:3151 # "TypeError: 'has' trap must be a function"
-ERR_VAL crates/v12-interp/src/property.rs:3156 # "TypeError: 'has' trap must be a function"
-ERR_VAL crates/v12-interp/src/property.rs:3228 # "TypeError: 'get' trap must be a function"
-ERR_VAL crates/v12-interp/src/property.rs:3233 # "TypeError: 'get' trap must be a function"
-ERR_VAL crates/v12-interp/src/property.rs:3336 # "TypeError: 'ownKeys' trap result must be an object"
+#
+# crates/v12-interp/src/property.rs — 0 sites remaining (RETIRED)
+# Proxy trap type guards plus [[Set]]/[[DefineOwnProperty]] failure paths.
+# 16 single-line sites plus 59 multi-line/trailing-comma ones the lint's
+# `error_value("` pattern never counted (16 -> 75 true call sites).  Retired
+# in W0.2c batch 2.  All 75 were TypeError bar one ReferenceError, and 4 of
+# them were `format!` sites that interpolate a value into the message.
+#
+# The 4 `format!` sites KEEP their literal `"TypeError: "` head, which is now
+# redundant with `type_error`'s default kind.  It is load-bearing, not
+# decorative: `parse_error_text` re-splits on the FIRST ": ", so a pinned head
+# is the only thing making these equivalent to `error_value`'s single split
+# when the interpolated value contains ": ".  That is reachable, not
+# hypothetical — the `Cannot read properties of {base} (reading '{key_text}')`
+# site interpolates an arbitrary JS property key.  Rationale is in-code at
+# each site (the `proxy_trap` pair shares one comment).
+#
+# This file's THREE PK_PUSH sites (property.rs:1761/1798/1859) are a
+# different idiom (the `define_data_prop_with_attrs` migration, which has no
+# typed wrapper) and are deliberately untouched.
+#
 #
 # crates/v12-interp/src/lib.rs — 8 sites remaining
 # private-member brand checks and call-completed-without-result guard. 8 sites.

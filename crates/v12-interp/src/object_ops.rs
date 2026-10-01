@@ -14,13 +14,13 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let Some(src_obj) = src_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: cannot destructure non-iterable"),
+                self.type_error("cannot destructure non-iterable"),
             ));
         };
         if self.heap.get(src_obj).kind != Kind::Array {
             // For destructuring, non-array iterable is still an error in our subset (only arrays).
             return Err(JSException(
-                self.error_value("TypeError: spread/rest source is not an array"),
+                self.type_error("spread/rest source is not an array"),
             ));
         }
         let start_usize = start as usize;
@@ -50,9 +50,9 @@ impl Interp<'_> {
         excl_vals: &[JsValue],
     ) -> Result<JsValue, JSException> {
         if src_v.is_null() || src_v.is_undefined() {
-            return Err(JSException(self.error_value(
-                "TypeError: cannot destructure 'undefined' or 'null'",
-            )));
+            return Err(JSException(
+                self.type_error("cannot destructure 'undefined' or 'null'"),
+            ));
         }
         let Some(src_obj) = src_v.as_object() else {
             // Primitives in object rest: spec coerces to object, but our subset treats as empty.
@@ -213,7 +213,7 @@ impl Interp<'_> {
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: cannot define accessor on non-object"),
+                self.type_error("cannot define accessor on non-object"),
             ));
         };
         let key = self.property_key(key_v)?;
@@ -246,7 +246,7 @@ impl Interp<'_> {
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: cannot define method on non-object"),
+                self.type_error("cannot define method on non-object"),
             ));
         };
         let key = self.property_key(key_v)?;
@@ -269,7 +269,7 @@ impl Interp<'_> {
                 // A duplicate accessor/method name in one class body is a
                 // SyntaxError, so this is unreachable from compiled classes.
                 return Err(JSException(
-                    self.error_value("TypeError: cannot redefine accessor as method"),
+                    self.type_error("cannot redefine accessor as method"),
                 ));
             }
             None => {
@@ -293,7 +293,7 @@ impl Interp<'_> {
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: cannot set prototype of a primitive"),
+                self.type_error("cannot set prototype of a primitive"),
             ));
         };
         match proto_v {
@@ -307,7 +307,7 @@ impl Interp<'_> {
             v => {
                 let Some(proto) = v.as_object() else {
                     return Err(JSException(
-                        self.error_value("TypeError: prototype must be an object or null"),
+                        self.type_error("prototype must be an object or null"),
                     ));
                 };
                 if self.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
@@ -317,9 +317,7 @@ impl Interp<'_> {
                 let mut cur = Some(proto);
                 while let Some(c) = cur {
                     if c == obj {
-                        return Err(JSException(
-                            self.error_value("TypeError: cyclic [[Prototype]] value"),
-                        ));
+                        return Err(JSException(self.type_error("cyclic [[Prototype]] value")));
                     }
                     cur = self.heap.get(c).prototype;
                 }
@@ -335,9 +333,9 @@ impl Interp<'_> {
     /// observable bound on the `super.x` object-literal lowering.
     pub(crate) fn op_get_prototype(&mut self, obj_v: JsValue) -> Result<JsValue, JSException> {
         let Some(obj) = obj_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: cannot read the prototype of a primitive",
-            )));
+            return Err(JSException(
+                self.type_error("cannot read the prototype of a primitive"),
+            ));
         };
         self.gc_protect();
         self.object_proto_of(obj)
@@ -447,8 +445,8 @@ impl Interp<'_> {
             .as_object()
             .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
             .ok_or_else(|| {
-                JSException(self.error_value(
-                    "TypeError: value is not iterable (its Symbol.iterator property is not a function)",
+                JSException(self.type_error(
+                    "value is not iterable (its Symbol.iterator property is not a function)",
                 ))
             })?;
         self.stack.push(JsValue::object(method_obj));
@@ -457,9 +455,9 @@ impl Interp<'_> {
         self.stack.pop();
         match result {
             Ok(v) if v.as_object().is_some() => Ok((v, from_sync)),
-            Ok(_) => Err(JSException(self.error_value(
-                "TypeError: result of Symbol.iterator call is not an object",
-            ))),
+            Ok(_) => Err(JSException(
+                self.type_error("result of Symbol.iterator call is not an object"),
+            )),
             Err(e) => Err(e),
         }
     }
@@ -603,7 +601,7 @@ impl Interp<'_> {
     pub(crate) fn op_iterator_next(&mut self, iter_v: JsValue) -> Result<JsValue, JSException> {
         let Some(_iter_obj) = iter_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: IteratorNext called on non-object"),
+                self.type_error("IteratorNext called on non-object"),
             ));
         };
         let next_key = self.new_temp_key("next");
@@ -613,7 +611,7 @@ impl Interp<'_> {
             .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
         else {
             return Err(JSException(
-                self.error_value("TypeError: iterator.next is not a function"),
+                self.type_error("iterator.next is not a function"),
             ));
         };
         // Park the resolved function on the value stack: `gc_protect`
@@ -628,7 +626,7 @@ impl Interp<'_> {
         match result {
             Ok(v) if v.as_object().is_some() => Ok(v),
             Ok(_) => Err(JSException(
-                self.error_value("TypeError: iterator.next() returned a non-object"),
+                self.type_error("iterator.next() returned a non-object"),
             )),
             Err(e) => Err(e),
         }
@@ -687,7 +685,7 @@ impl Interp<'_> {
             .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
         else {
             return Err(JSException(
-                self.error_value("TypeError: iterator.return is not a function"),
+                self.type_error("iterator.return is not a function"),
             ));
         };
         self.stack.push(JsValue::object(return_obj));
@@ -697,7 +695,7 @@ impl Interp<'_> {
         match inner {
             Err(e) => Err(e),
             Ok(v) if check_result && v.as_object().is_none() => Err(JSException(
-                self.error_value("TypeError: iterator.return() returned a non-object"),
+                self.type_error("iterator.return() returned a non-object"),
             )),
             Ok(_) => Ok(()),
         }
@@ -713,12 +711,12 @@ impl Interp<'_> {
     pub(crate) fn op_check_is_array(&mut self, v: JsValue) -> Result<(), JSException> {
         let Some(obj) = v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: spread source is not an array"),
+                self.type_error("spread source is not an array"),
             ));
         };
         if self.heap.get(obj).kind != Kind::Array {
             return Err(JSException(
-                self.error_value("TypeError: spread source is not an array"),
+                self.type_error("spread source is not an array"),
             ));
         }
         Ok(())
@@ -730,23 +728,19 @@ impl Interp<'_> {
         src_v: JsValue,
     ) -> Result<(), JSException> {
         let Some(dst_obj) = dst_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: destination is not an object"),
-            ));
+            return Err(JSException(self.type_error("destination is not an object")));
         };
         if self.heap.get(dst_obj).kind != Kind::Array {
-            return Err(JSException(
-                self.error_value("TypeError: destination is not an array"),
-            ));
+            return Err(JSException(self.type_error("destination is not an array")));
         }
         let Some(src_obj) = src_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: spread source is not an array"),
+                self.type_error("spread source is not an array"),
             ));
         };
         if self.heap.get(src_obj).kind != Kind::Array {
             return Err(JSException(
-                self.error_value("TypeError: spread source is not an array"),
+                self.type_error("spread source is not an array"),
             ));
         }
         let src_elements: Vec<JsValue> = self.heap.get(src_obj).elements_snapshot();
@@ -790,7 +784,7 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let Some(arr) = this_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: Array.prototype.join requires an array"),
+                self.type_error("Array.prototype.join requires an array"),
             ));
         };
         let sep = if let Some(&v) = args.first() {
@@ -821,9 +815,9 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
         let Some(obj) = this_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: Array.prototype.push called on non-object",
-            )));
+            return Err(JSException(
+                self.type_error("Array.prototype.push called on non-object"),
+            ));
         };
         // Spec: appended items land at `length`-based indices. For a sparse
         // array (`new Array(len)`) the element store is shorter than the

@@ -135,7 +135,12 @@ impl Interp<'_> {
                 .map(|h| self.string_text(h))
                 .unwrap_or_default();
             let base = if obj_v.is_null() { "null" } else { "undefined" };
-            return Err(JSException(self.error_value(&format!(
+            // The `"TypeError: "` prefix is redundant with `type_error`'s
+            // default kind, but kept: `parse_error_text` re-splits on the
+            // first `": "`, and `{key_text}` is an arbitrary JS property key
+            // that may contain one.  Pinning the head is what keeps this
+            // exactly equivalent to `error_value`'s single split.
+            return Err(JSException(self.type_error(&format!(
                 "TypeError: Cannot read properties of {base} (reading '{key_text}')"
             ))));
         }
@@ -187,9 +192,9 @@ impl Interp<'_> {
             })
         {
             if self.heap.get(obj).arguments_strict {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'caller' may not be accessed in strict mode",
-                )));
+                return Err(JSException(
+                    self.type_error("'caller' may not be accessed in strict mode"),
+                ));
             }
             let shape = self.shape_of(obj);
             let value = key
@@ -1197,9 +1202,9 @@ impl Interp<'_> {
             .as_ref()
             .expect("module namespace property stores a binding cell");
         if !binding.initialized {
-            return Err(JSException(self.error_value(
-                "ReferenceError: Cannot access binding before initialization",
-            )));
+            return Err(JSException(
+                self.reference_error("Cannot access binding before initialization"),
+            ));
         }
         Ok(binding.value)
     }
@@ -1389,14 +1394,14 @@ impl Interp<'_> {
         // throw, whatever the mode. A primitive *base* has no internal method,
         // so it takes `set_property`'s primitive rules.
         if base_v.is_null() || base_v.is_undefined() {
-            return Err(JSException(self.error_value(
-                "TypeError: cannot set properties of null or undefined",
-            )));
+            return Err(JSException(
+                self.type_error("cannot set properties of null or undefined"),
+            ));
         }
         if receiver_v.as_object().is_none() {
-            return Err(JSException(self.error_value(
-                "TypeError: super assignment receiver is not an object",
-            )));
+            return Err(JSException(
+                self.type_error("super assignment receiver is not an object"),
+            ));
         }
         let Some(mut cur) = base_v.as_object() else {
             return self.set_property(base_v, key_v, value, strict);
@@ -1412,7 +1417,7 @@ impl Interp<'_> {
                 let ok = self.proxy_op_set(cur, receiver_v, key_v, value)?;
                 if !ok && strict {
                     return Err(JSException(
-                        self.error_value("TypeError: 'set' on proxy returned false"),
+                        self.type_error("'set' on proxy returned false"),
                     ));
                 }
                 return Ok(());
@@ -1421,9 +1426,9 @@ impl Interp<'_> {
                 if d.is_accessor() {
                     if d.set.is_undefined() {
                         if strict {
-                            return Err(JSException(self.error_value(
-                                "TypeError: cannot assign to accessor without setter",
-                            )));
+                            return Err(JSException(
+                                self.type_error("cannot assign to accessor without setter"),
+                            ));
                         }
                         return Ok(());
                     }
@@ -1432,7 +1437,7 @@ impl Interp<'_> {
                 if d.has_writable && !d.writable {
                     if strict {
                         return Err(JSException(
-                            self.error_value("TypeError: cannot assign to read-only property"),
+                            self.type_error("cannot assign to read-only property"),
                         ));
                     }
                     return Ok(());
@@ -1479,9 +1484,9 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         // Spec step 1: `Get` on a nullish base throws.
         if base_v.is_null() || base_v.is_undefined() {
-            return Err(JSException(self.error_value(
-                "TypeError: cannot read properties of null or undefined",
-            )));
+            return Err(JSException(
+                self.type_error("cannot read properties of null or undefined"),
+            ));
         }
         // A primitive base has no internal method. The object-literal `super`
         // lowering never produces one (`[[GetPrototypeOf]]` already threw),
@@ -1540,16 +1545,16 @@ impl Interp<'_> {
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             if obj_v.is_null() || obj_v.is_undefined() {
-                return Err(JSException(self.error_value(
-                    "TypeError: cannot set properties of null or undefined",
-                )));
+                return Err(JSException(
+                    self.type_error("cannot set properties of null or undefined"),
+                ));
             }
             // Primitive targets accept and drop writes in sloppy mode (no
             // wrapper objects); strict mode throws per ES SetValue.
             if strict {
-                return Err(JSException(self.error_value(
-                    "TypeError: cannot set property on a primitive value",
-                )));
+                return Err(JSException(
+                    self.type_error("cannot set property on a primitive value"),
+                ));
             }
             return Ok(());
         };
@@ -1562,7 +1567,7 @@ impl Interp<'_> {
             let ok = self.proxy_op_set(obj, obj_v, key_v, value)?;
             if !ok && strict {
                 return Err(JSException(
-                    self.error_value("TypeError: 'set' on proxy returned false"),
+                    self.type_error("'set' on proxy returned false"),
                 ));
             }
             return Ok(());
@@ -1570,9 +1575,9 @@ impl Interp<'_> {
 
         if self.heap.get(obj).kind == Kind::ModuleNamespace {
             if strict {
-                return Err(JSException(self.error_value(
-                    "TypeError: Cannot assign to module namespace property",
-                )));
+                return Err(JSException(
+                    self.type_error("Cannot assign to module namespace property"),
+                ));
             }
             return Ok(());
         }
@@ -1623,7 +1628,7 @@ impl Interp<'_> {
                         self.heap.get_mut(obj).properties[idx] = value;
                     } else if strict {
                         return Err(JSException(
-                            self.error_value("TypeError: cannot assign to read-only property"),
+                            self.type_error("cannot assign to read-only property"),
                         ));
                     }
                     return Ok(());
@@ -1637,9 +1642,9 @@ impl Interp<'_> {
                         let args = [value];
                         self.call_accessor_with(setter, JsValue::object(obj), &args)?;
                     } else if strict {
-                        return Err(JSException(self.error_value(
-                            "TypeError: cannot assign to accessor without setter",
-                        )));
+                        return Err(JSException(
+                            self.type_error("cannot assign to accessor without setter"),
+                        ));
                     }
                     return Ok(());
                 }
@@ -1661,9 +1666,9 @@ impl Interp<'_> {
                     let args = [value];
                     self.call_accessor_with(setter, JsValue::object(obj), &args)?;
                 } else if strict {
-                    return Err(JSException(self.error_value(
-                        "TypeError: cannot assign to accessor without setter",
-                    )));
+                    return Err(JSException(
+                        self.type_error("cannot assign to accessor without setter"),
+                    ));
                 }
                 return Ok(());
             }
@@ -1672,7 +1677,7 @@ impl Interp<'_> {
                 self.heap.get_mut(obj).properties[idx] = value;
             } else if strict {
                 return Err(JSException(
-                    self.error_value("TypeError: cannot assign to read-only property"),
+                    self.type_error("cannot assign to read-only property"),
                 ));
             }
             return Ok(());
@@ -1691,7 +1696,7 @@ impl Interp<'_> {
                     let ok = self.proxy_op_set(p, JsValue::object(obj), key_v, value)?;
                     if !ok && strict {
                         return Err(JSException(
-                            self.error_value("TypeError: 'set' on proxy returned false"),
+                            self.type_error("'set' on proxy returned false"),
                         ));
                     }
                     return Ok(());
@@ -1700,9 +1705,9 @@ impl Interp<'_> {
                     if d.is_accessor() {
                         if !d.has_set || d.set.is_undefined() {
                             if strict {
-                                return Err(JSException(self.error_value(
-                                    "TypeError: cannot assign to accessor without setter",
-                                )));
+                                return Err(JSException(
+                                    self.type_error("cannot assign to accessor without setter"),
+                                ));
                             }
                             return Ok(());
                         }
@@ -1714,7 +1719,7 @@ impl Interp<'_> {
                     if d.has_writable && !d.writable {
                         if strict {
                             return Err(JSException(
-                                self.error_value("TypeError: cannot assign to read-only property"),
+                                self.type_error("cannot assign to read-only property"),
                             ));
                         }
                         return Ok(());
@@ -1729,9 +1734,9 @@ impl Interp<'_> {
 
         if self.heap.get(obj).flags & JsObject::FLAG_NOT_EXTENSIBLE != 0 {
             if strict {
-                return Err(JSException(self.error_value(
-                    "TypeError: cannot add property to non-extensible object",
-                )));
+                return Err(JSException(
+                    self.type_error("cannot add property to non-extensible object"),
+                ));
             }
             return Ok(());
         }
@@ -1813,7 +1818,7 @@ impl Interp<'_> {
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: cannot define property on non-object"),
+                self.type_error("cannot define property on non-object"),
             ));
         };
         // Flatten-once so the single intern below reads flat storage.
@@ -1908,9 +1913,9 @@ impl Interp<'_> {
     /// exists anywhere on `obj`'s prototype chain, including array indices.
     pub(crate) fn op_in(&mut self, key_v: JsValue, obj_v: JsValue) -> Result<bool, JSException> {
         let Some(obj) = obj_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: right-hand side of 'in' should be an object",
-            )));
+            return Err(JSException(
+                self.type_error("right-hand side of 'in' should be an object"),
+            ));
         };
         // Proxy exotic: `HasProperty` is the `has` trap (ES 10.5.6). Checked
         // before the element fast path so a proxy is never treated as an
@@ -1994,13 +1999,18 @@ impl Interp<'_> {
         if trap_v.is_undefined() || trap_v.is_null() {
             return Ok(None);
         }
+        // Both traps below keep the literal `"TypeError: "` head even though
+        // `type_error`'s default kind makes it redundant: `parse_error_text`
+        // re-splits on the first `": "`, and `{name}` is a trap name that may
+        // contain one.  The pinned head is what keeps these ports exactly
+        // equivalent to `error_value`'s single split.
         let Some(trap) = trap_v.as_object() else {
-            return Err(JSException(self.error_value(&format!(
+            return Err(JSException(self.type_error(&format!(
                 "TypeError: '{name}' trap must be a function"
             ))));
         };
         if self.heap.get(trap).kind != Kind::Function {
-            return Err(JSException(self.error_value(&format!(
+            return Err(JSException(self.type_error(&format!(
                 "TypeError: '{name}' trap must be a function"
             ))));
         }
@@ -2020,7 +2030,8 @@ impl Interp<'_> {
         };
         match (target, handler) {
             (Some(t), Some(h)) => Ok((t, h)),
-            _ => Err(JSException(self.error_value(&format!(
+            // Head kept for the reason documented on `proxy_trap` above.
+            _ => Err(JSException(self.type_error(&format!(
                 "TypeError: Cannot perform '{op}' on a proxy that has been revoked"
             )))),
         }
@@ -2403,7 +2414,7 @@ impl Interp<'_> {
         // ES step 5: the target is read *after* the trap.
         if boolean != self.object_is_extensible(target)? {
             return Err(JSException(
-                self.error_value("TypeError: 'isExtensible' trap result mismatch"),
+                self.type_error("'isExtensible' trap result mismatch"),
             ));
         }
         Ok(boolean)
@@ -2427,8 +2438,8 @@ impl Interp<'_> {
         // ES step 9: the target is re-read *after* the trap (a trap that calls
         // `preventExtensions(target)` must be observed).
         if self.object_is_extensible(target)? {
-            return Err(JSException(self.error_value(
-                "TypeError: 'preventExtensions' trap returned true for an extensible target",
+            return Err(JSException(self.type_error(
+                "'preventExtensions' trap returned true for an extensible target",
             )));
         }
         Ok(true)
@@ -2448,16 +2459,16 @@ impl Interp<'_> {
             self.call_inline(trap, JsValue::object(handler), &[JsValue::object(target)])?;
         // ES step 9: the trap result must be an object or null.
         if !result.is_null() && result.as_object().is_none() {
-            return Err(JSException(self.error_value(
-                "TypeError: 'getPrototypeOf' trap result must be an object or null",
+            return Err(JSException(self.type_error(
+                "'getPrototypeOf' trap result must be an object or null",
             )));
         }
         // ES steps 10-13: read the target state *after* the trap.
         if !self.object_is_extensible(target)? {
             let target_proto_v = self.object_proto_of(target)?;
             if result.as_object() != target_proto_v.as_object() {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'getPrototypeOf' trap result differs from the target's prototype",
+                return Err(JSException(self.type_error(
+                    "'getPrototypeOf' trap result differs from the target's prototype",
                 )));
             }
         }
@@ -2491,8 +2502,8 @@ impl Interp<'_> {
         if !self.object_is_extensible(target)? {
             let target_proto_v = self.object_proto_of(target)?;
             if proto != target_proto_v.as_object() {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'setPrototypeOf' trap result differs from the target's prototype",
+                return Err(JSException(self.type_error(
+                    "'setPrototypeOf' trap result differs from the target's prototype",
                 )));
             }
         }
@@ -2527,13 +2538,13 @@ impl Interp<'_> {
         let target_desc = self.object_get_own_property(target, key)?;
         if let Some(desc) = target_desc {
             if desc.has_configurable && !desc.configurable {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'deleteProperty' trap cannot delete a non-configurable property",
+                return Err(JSException(self.type_error(
+                    "'deleteProperty' trap cannot delete a non-configurable property",
                 )));
             }
             if !self.object_is_extensible(target)? {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'deleteProperty' trap cannot delete from a non-extensible target",
+                return Err(JSException(self.type_error(
+                    "'deleteProperty' trap cannot delete from a non-extensible target",
                 )));
             }
         }
@@ -2568,49 +2579,39 @@ impl Interp<'_> {
                 && td.has_configurable
                 && !td.configurable
             {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'getOwnPropertyDescriptor' trap reported a non-configurable property as absent",
-                )));
+                return Err(JSException(self.type_error("'getOwnPropertyDescriptor' trap reported a non-configurable property as absent")));
             }
             if !target_extensible {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'getOwnPropertyDescriptor' trap reported a property of a non-extensible target as absent",
-                )));
+                return Err(JSException(self.type_error("'getOwnPropertyDescriptor' trap reported a property of a non-extensible target as absent")));
             }
             return Ok(None);
         }
         let Some(obj) = result.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: 'getOwnPropertyDescriptor' trap result must be an object or undefined",
+            return Err(JSException(self.type_error(
+                "'getOwnPropertyDescriptor' trap result must be an object or undefined",
             )));
         };
         let trap_desc = self.read_trap_descriptor(obj)?;
         // ES 10.5.5 step 17: a reported property of a non-extensible target
         // with no matching own target descriptor is a TypeError.
         if target_desc.is_none() && !target_extensible {
-            return Err(JSException(self.error_value(
-                "TypeError: 'getOwnPropertyDescriptor' trap reported a property for a non-extensible target",
+            return Err(JSException(self.type_error(
+                "'getOwnPropertyDescriptor' trap reported a property for a non-extensible target",
             )));
         }
         // ES 10.5.5 step 16: a non-configurable trap result demands an
         // existing, non-configurable, compatible target descriptor.
         if trap_desc.has_configurable && !trap_desc.configurable {
             let Some(td) = target_desc.filter(|td| td.has_configurable && !td.configurable) else {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'getOwnPropertyDescriptor' trap reported a non-configurable property that is absent or configurable on the target",
-                )));
+                return Err(JSException(self.type_error("'getOwnPropertyDescriptor' trap reported a non-configurable property that is absent or configurable on the target")));
             };
             // Step 16.c.ii.2: a non-configurable, writable target data
             // property may not be reported as non-writable.
             if td.is_data() && td.writable && trap_desc.has_writable && !trap_desc.writable {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
-                )));
+                return Err(JSException(self.type_error("'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor")));
             }
             if !desc_compatible(target_extensible, trap_desc, td) {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor",
-                )));
+                return Err(JSException(self.type_error("'getOwnPropertyDescriptor' trap result is not compatible with the target descriptor")));
             }
         }
         Ok(Some(trap_desc))
@@ -2647,22 +2648,18 @@ impl Interp<'_> {
             None => {
                 // ES step 19.
                 if !target_extensible {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'defineProperty' trap added a property to a non-extensible target",
+                    return Err(JSException(self.type_error(
+                        "'defineProperty' trap added a property to a non-extensible target",
                     )));
                 }
                 if setting_config_false {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'defineProperty' trap reported a non-configurable property that does not exist",
-                    )));
+                    return Err(JSException(self.type_error("'defineProperty' trap reported a non-configurable property that does not exist")));
                 }
             }
             Some(td) => {
                 // ES step 20.
                 if setting_config_false && td.has_configurable && td.configurable {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'defineProperty' trap reported a non-configurable property for a configurable target property",
-                    )));
+                    return Err(JSException(self.type_error("'defineProperty' trap reported a non-configurable property for a configurable target property")));
                 }
                 if td.is_data()
                     && td.has_configurable
@@ -2671,16 +2668,14 @@ impl Interp<'_> {
                     && desc.has_writable
                     && !desc.writable
                 {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'defineProperty' trap reported non-writable for a non-configurable writable target property",
-                    )));
+                    return Err(JSException(self.type_error("'defineProperty' trap reported non-writable for a non-configurable writable target property")));
                 }
                 if td.has_configurable
                     && !td.configurable
                     && !desc_compatible(target_extensible, desc, td)
                 {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'defineProperty' trap result is not compatible with the target descriptor",
+                    return Err(JSException(self.type_error(
+                        "'defineProperty' trap result is not compatible with the target descriptor",
                     )));
                 }
             }
@@ -2732,9 +2727,9 @@ impl Interp<'_> {
                             .as_object()
                             .is_some_and(|h| self.heap.get(h).kind == Kind::Function)
                     {
-                        return Err(JSException(self.error_value(
-                            "TypeError: Accessor must be a function or undefined",
-                        )));
+                        return Err(JSException(
+                            self.type_error("Accessor must be a function or undefined"),
+                        ));
                     }
                     out.has_get = true;
                     out.get = got;
@@ -2745,9 +2740,9 @@ impl Interp<'_> {
                             .as_object()
                             .is_some_and(|h| self.heap.get(h).kind == Kind::Function)
                     {
-                        return Err(JSException(self.error_value(
-                            "TypeError: Accessor must be a function or undefined",
-                        )));
+                        return Err(JSException(
+                            self.type_error("Accessor must be a function or undefined"),
+                        ));
                     }
                     out.has_set = true;
                     out.set = got;
@@ -2756,8 +2751,8 @@ impl Interp<'_> {
             }
         }
         if out.is_data() && out.is_accessor() {
-            return Err(JSException(self.error_value(
-                "TypeError: Invalid property descriptor: cannot specify both value and accessor fields",
+            return Err(JSException(self.type_error(
+                "Invalid property descriptor: cannot specify both value and accessor fields",
             )));
         }
         Ok(out)
@@ -2922,8 +2917,8 @@ impl Interp<'_> {
         };
         // Revoked proxy (both slots cleared by revocation): TypeError.
         let (Some(target), Some(handler)) = (target, handler) else {
-            return Err(JSException(self.error_value(
-                "TypeError: Cannot perform 'set' on a proxy that has been revoked",
+            return Err(JSException(self.type_error(
+                "Cannot perform 'set' on a proxy that has been revoked",
             )));
         };
         // ToPropertyKey before the trap sees the key (spec step order).
@@ -2938,12 +2933,12 @@ impl Interp<'_> {
                 return self.ordinary_set_with_receiver(target, key, value, receiver);
             }
             return Err(JSException(
-                self.error_value("TypeError: 'set' trap must be a function"),
+                self.type_error("'set' trap must be a function"),
             ));
         };
         if self.heap.get(trap).kind != Kind::Function {
             return Err(JSException(
-                self.error_value("TypeError: 'set' trap must be a function"),
+                self.type_error("'set' trap must be a function"),
             ));
         }
         self.gc_protect();
@@ -2969,13 +2964,11 @@ impl Interp<'_> {
                     && !desc.writable
                     && !ops::strict_equals(self.heap, desc.value, value)
                 {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'set' trap returned true for a non-configurable non-writable target property with a different value",
-                    )));
+                    return Err(JSException(self.type_error("'set' trap returned true for a non-configurable non-writable target property with a different value")));
                 }
             } else if !desc.has_set || desc.set.is_undefined() {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'set' trap returned true for a non-configurable accessor without a setter",
+                return Err(JSException(self.type_error(
+                    "'set' trap returned true for a non-configurable accessor without a setter",
                 )));
             }
         }
@@ -3122,8 +3115,8 @@ impl Interp<'_> {
         };
         // Revoked proxy (both slots cleared by revocation): TypeError.
         let (Some(target), Some(handler)) = (target, handler) else {
-            return Err(JSException(self.error_value(
-                "TypeError: Cannot perform 'has' on a proxy that has been revoked",
+            return Err(JSException(self.type_error(
+                "Cannot perform 'has' on a proxy that has been revoked",
             )));
         };
         // ToPropertyKey before the trap sees the key (spec step order: the
@@ -3148,12 +3141,12 @@ impl Interp<'_> {
                 return self.op_in(key_v, JsValue::object(target));
             }
             return Err(JSException(
-                self.error_value("TypeError: 'has' trap must be a function"),
+                self.type_error("'has' trap must be a function"),
             ));
         };
         if self.heap.get(trap).kind != Kind::Function {
             return Err(JSException(
-                self.error_value("TypeError: 'has' trap must be a function"),
+                self.type_error("'has' trap must be a function"),
             ));
         }
         self.gc_protect();
@@ -3171,13 +3164,13 @@ impl Interp<'_> {
                 && desc.has_configurable
                 && !desc.configurable
             {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'has' trap returned false for a non-configurable target property",
+                return Err(JSException(self.type_error(
+                    "'has' trap returned false for a non-configurable target property",
                 )));
             }
             if !self.object_is_extensible(target)? {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'has' trap returned false for a non-extensible target",
+                return Err(JSException(self.type_error(
+                    "'has' trap returned false for a non-extensible target",
                 )));
             }
         }
@@ -3203,8 +3196,8 @@ impl Interp<'_> {
         };
         // Revoked proxy (both slots cleared by revocation): TypeError.
         let (Some(target), Some(handler)) = (target, handler) else {
-            return Err(JSException(self.error_value(
-                "TypeError: Cannot perform 'get' on a proxy that has been revoked",
+            return Err(JSException(self.type_error(
+                "Cannot perform 'get' on a proxy that has been revoked",
             )));
         };
         // ToPropertyKey before the trap sees the key (spec step order: the
@@ -3225,12 +3218,12 @@ impl Interp<'_> {
                 return self.ordinary_get_with_receiver(target, receiver, key, key_v);
             }
             return Err(JSException(
-                self.error_value("TypeError: 'get' trap must be a function"),
+                self.type_error("'get' trap must be a function"),
             ));
         };
         if self.heap.get(trap).kind != Kind::Function {
             return Err(JSException(
-                self.error_value("TypeError: 'get' trap must be a function"),
+                self.type_error("'get' trap must be a function"),
             ));
         }
         self.gc_protect();
@@ -3251,17 +3244,13 @@ impl Interp<'_> {
                 && !desc.writable
                 && !ops::strict_equals(self.heap, desc.value, result)
             {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'get' trap result differs from a non-configurable non-writable target property",
-                )));
+                return Err(JSException(self.type_error("'get' trap result differs from a non-configurable non-writable target property")));
             }
             if desc.is_accessor()
                 && (!desc.has_get || desc.get.is_undefined())
                 && !result.is_undefined()
             {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'get' trap result differs from a non-configurable accessor with an undefined getter",
-                )));
+                return Err(JSException(self.type_error("'get' trap result differs from a non-configurable accessor with an undefined getter")));
             }
         }
         Ok(result)
@@ -3333,7 +3322,7 @@ impl Interp<'_> {
         // `CreateListFromArrayLike` (ES 7.4.4): result must be an object.
         let Some(list_obj) = result.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: 'ownKeys' trap result must be an object"),
+                self.type_error("'ownKeys' trap result must be an object"),
             ));
         };
         let len_key = self.new_temp_key("length");
@@ -3342,9 +3331,9 @@ impl Interp<'_> {
         // `ToLength` floors and clamps the low end to 0; the high end is
         // capped at `u32::MAX` (see the doc comment above).
         if len_f.is_nan() || len_f > f64::from(u32::MAX) {
-            return Err(JSException(self.error_value(
-                "TypeError: 'ownKeys' trap result length out of range",
-            )));
+            return Err(JSException(
+                self.type_error("'ownKeys' trap result length out of range"),
+            ));
         }
         let len = len_f.max(0.0).floor() as u32;
         let mut keys: Vec<PropKey> = Vec::with_capacity(len.min(1024) as usize);
@@ -3359,15 +3348,15 @@ impl Interp<'_> {
             } else if let Some(y) = entry.as_symbol() {
                 PropKey::from_symbol(y)
             } else {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'ownKeys' trap result entries must be strings or symbols",
+                return Err(JSException(self.type_error(
+                    "'ownKeys' trap result entries must be strings or symbols",
                 )));
             };
             // Duplicate entries are a `TypeError` (ES 10.5.11 step 8).
             if keys.contains(&key) {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'ownKeys' trap result contains duplicate entries",
-                )));
+                return Err(JSException(
+                    self.type_error("'ownKeys' trap result contains duplicate entries"),
+                ));
             }
             keys.push(key);
         }
@@ -3399,22 +3388,22 @@ impl Interp<'_> {
         };
         for &k in &target_nonconfigurable {
             if !remove(&mut unchecked, k) {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'ownKeys' trap result is missing a non-configurable target key",
+                return Err(JSException(self.type_error(
+                    "'ownKeys' trap result is missing a non-configurable target key",
                 )));
             }
         }
         if !extensible_target {
             for &k in &target_configurable {
                 if !remove(&mut unchecked, k) {
-                    return Err(JSException(self.error_value(
-                        "TypeError: 'ownKeys' trap result is missing a target key",
-                    )));
+                    return Err(JSException(
+                        self.type_error("'ownKeys' trap result is missing a target key"),
+                    ));
                 }
             }
             if !unchecked.is_empty() {
-                return Err(JSException(self.error_value(
-                    "TypeError: 'ownKeys' trap result contains new keys for a non-extensible target",
+                return Err(JSException(self.type_error(
+                    "'ownKeys' trap result contains new keys for a non-extensible target",
                 )));
             }
         }
@@ -3518,15 +3507,15 @@ impl Interp<'_> {
         rhs_v: JsValue,
     ) -> Result<bool, JSException> {
         let Some(rhs_obj) = rhs_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: right-hand side of 'instanceof' is not an object",
-            )));
+            return Err(JSException(
+                self.type_error("right-hand side of 'instanceof' is not an object"),
+            ));
         };
         // Per ES OrdinaryHasInstance, RHS must be callable.
         if self.heap.get(rhs_obj).kind != Kind::Function {
-            return Err(JSException(self.error_value(
-                "TypeError: right-hand side of 'instanceof' is not callable",
-            )));
+            return Err(JSException(
+                self.type_error("right-hand side of 'instanceof' is not callable"),
+            ));
         }
         // Fast path for built-in constructors whose prototype has not been
         // wired via `Heap::add_property` (Realm creates them as empty objects).
@@ -3600,15 +3589,15 @@ impl Interp<'_> {
             }
         }
         let Some(proto_val) = rhs_proto_val else {
-            return Err(JSException(self.error_value(
-                "TypeError: function has non-object prototype 'prototype' in instanceof check",
+            return Err(JSException(self.type_error(
+                "function has non-object prototype 'prototype' in instanceof check",
             )));
         };
         // Per spec, null prototype is also an error for instanceof (throws).
         // Non-object primitive also throws the same TypeError.
         let Some(proto_obj) = proto_val.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: function has non-object prototype 'prototype' in instanceof check",
+            return Err(JSException(self.type_error(
+                "function has non-object prototype 'prototype' in instanceof check",
             )));
         };
         let Some(mut cur) = lhs_v.as_object() else {
@@ -3638,9 +3627,9 @@ impl Interp<'_> {
     ) -> Result<bool, JSException> {
         let Some(obj) = obj_v.as_object() else {
             if obj_v.is_null() || obj_v.is_undefined() {
-                return Err(JSException(self.error_value(
-                    "TypeError: cannot delete properties of null or undefined",
-                )));
+                return Err(JSException(
+                    self.type_error("cannot delete properties of null or undefined"),
+                ));
             }
             // Primitives have no own properties: nothing to remove.
             return Ok(true);
