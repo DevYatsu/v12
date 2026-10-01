@@ -61,9 +61,7 @@ impl Interp<'_> {
         let this_v = self.stack[callee_slot + 1];
 
         let Some(callee_obj) = callee_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: callee is not a function"),
-            ));
+            return Err(JSException(self.type_error("callee is not a function")));
         };
         // Proxy exotic: `[[Call]]` is the `apply` trap (ES 10.5.12).
         if self.heap.get(callee_obj).kind == Kind::Proxy {
@@ -75,9 +73,7 @@ impl Interp<'_> {
                 .map(CallOutcome::Value);
         }
         if self.heap.get(callee_obj).kind != Kind::Function {
-            return Err(JSException(
-                self.error_value("TypeError: callee is not a function"),
-            ));
+            return Err(JSException(self.type_error("callee is not a function")));
         }
         // Read the callable target, captured environment, and program id
         // from the object. The program id lets a closure created in another
@@ -254,7 +250,7 @@ impl Interp<'_> {
 
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(JSException(
-                self.error_value("RangeError: maximum call stack size exceeded"),
+                self.range_error("maximum call stack size exceeded"),
             ));
         }
 
@@ -462,7 +458,7 @@ impl Interp<'_> {
                 // precisely for nested `execute()` re-entries.
                 if self.resume_depth >= MAX_RESUME_DEPTH {
                     return Err(JSException(
-                        self.error_value("RangeError: maximum call stack size exceeded"),
+                        self.range_error("maximum call stack size exceeded"),
                     ));
                 }
                 let funcs = self.functions_for_program(func_program);
@@ -549,7 +545,7 @@ impl Interp<'_> {
         // arr.map(f))`) otherwise recurses until the process aborts.
         if self.resume_depth >= MAX_RESUME_DEPTH {
             return Err(JSException(
-                self.error_value("RangeError: maximum call stack size exceeded"),
+                self.range_error("maximum call stack size exceeded"),
             ));
         }
         let (target, captured_env, func_program) = {
@@ -811,17 +807,13 @@ impl Interp<'_> {
         let caller_funcs = self.functions_for_program(caller_program);
         let Some(caller_fn) = caller_funcs.get(caller_fn_idx as usize) else {
             self.stack.truncate(finished.base);
-            return Err(JSException(
-                self.error_value("TypeError: corrupt call header"),
-            ));
+            return Err(JSException(self.type_error("corrupt call header")));
         };
         let instrs = caller_fn.instrs.clone();
         let Ok((is_construct, dst, width)) = decode_parked_call(&instrs, caller_pc) else {
             // Corrupt call header: treat as JS TypeError rather than native panic
             self.stack.truncate(finished.base);
-            return Err(JSException(
-                self.error_value("TypeError: corrupt call header"),
-            ));
+            return Err(JSException(self.type_error("corrupt call header")));
         };
         let idx = caller_base + usize::from(dst);
         // The caller was parked on its `Call`/`Construct` and the destination
@@ -1080,17 +1072,13 @@ impl Interp<'_> {
         args_arr_v: JsValue,
     ) -> Result<CallOutcome, JSException> {
         let Some(callee_obj) = callee_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: callee is not a function"),
-            ));
+            return Err(JSException(self.type_error("callee is not a function")));
         };
         // Proxy exotic: `[[Call]]` is the `apply` trap (ES 10.5.12).
         if self.heap.get(callee_obj).kind == Kind::Proxy {
             // Materialize the spread args first: `proxy_call` takes a slice.
             let Some(args_obj) = args_arr_v.as_object() else {
-                return Err(JSException(
-                    self.error_value("TypeError: args is not an array"),
-                ));
+                return Err(JSException(self.type_error("args is not an array")));
             };
             let args_vec: Vec<JsValue> = self
                 .heap
@@ -1104,9 +1092,7 @@ impl Interp<'_> {
                 .map(CallOutcome::Value);
         }
         if self.heap.get(callee_obj).kind != Kind::Function {
-            return Err(JSException(
-                self.error_value("TypeError: callee is not a function"),
-            ));
+            return Err(JSException(self.type_error("callee is not a function")));
         }
         // Read the callable target, captured environment, and program id
         // from the object. The program id lets a closure created in another
@@ -1119,9 +1105,7 @@ impl Interp<'_> {
         // Materialize the spread args from the args array (shared by both the
         // native and bytecode paths below).
         let Some(args_obj) = args_arr_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: args is not an array"),
-            ));
+            return Err(JSException(self.type_error("args is not an array")));
         };
         let args_slice: Vec<JsValue> = self.heap.get(args_obj).elements_array.iter().collect();
         // Holes become undefined for call.
@@ -1182,7 +1166,7 @@ impl Interp<'_> {
         }
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(JSException(
-                self.error_value("RangeError: maximum call stack size exceeded"),
+                self.range_error("maximum call stack size exceeded"),
             ));
         }
         let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
@@ -1279,9 +1263,7 @@ impl Interp<'_> {
         let callee_v = self.stack[callee_slot];
 
         let Some(callee_obj) = callee_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: value is not a constructor"),
-            ));
+            return Err(JSException(self.type_error("value is not a constructor")));
         };
         // Proxy exotic: `[[Construct]]` is the `construct` trap (ES 10.5.13).
         if self.heap.get(callee_obj).kind == Kind::Proxy {
@@ -1293,9 +1275,7 @@ impl Interp<'_> {
                 .map(CallOutcome::Value);
         }
         if self.heap.get(callee_obj).kind != Kind::Function {
-            return Err(JSException(
-                self.error_value("TypeError: value is not a constructor"),
-            ));
+            return Err(JSException(self.type_error("value is not a constructor")));
         }
         // Read the callable target, captured environment, and program id
         // from the object. The program id lets a closure created in another
@@ -1318,9 +1298,7 @@ impl Interp<'_> {
                     // the registry's "not registered", which is neither a
                     // `TypeError` object nor the right message.
                     if idx == u32::from(NativeId::PromiseCombinatorElement) {
-                        return Err(JSException(
-                            self.error_value("TypeError: not a constructor"),
-                        ));
+                        return Err(JSException(self.type_error("not a constructor")));
                     }
                     let args_start = callee_slot + 2;
                     let args_end = args_start + usize::from(argc);
@@ -1330,9 +1308,7 @@ impl Interp<'_> {
                     // ignore `this` and would otherwise build a value under
                     // `new` instead of throwing (spec 10.4.1).
                     if v12_native::is_non_constructible(id) {
-                        return Err(JSException(
-                            self.error_value("TypeError: not a constructor"),
-                        ));
+                        return Err(JSException(self.type_error("not a constructor")));
                     }
                     // One router: `new Function(params…, body)` compiles via
                     // the Function arm; constructor-shaped natives ignore the
@@ -1353,9 +1329,7 @@ impl Interp<'_> {
                 // materialization below is what papered it over: an arrow has
                 // no `prototype`, so the fallback allocated one.
                 if !self.bytecode_is_constructor(idx, callee_program) {
-                    return Err(JSException(
-                        self.error_value("TypeError: value is not a constructor"),
-                    ));
+                    return Err(JSException(self.type_error("value is not a constructor")));
                 }
                 idx
             }
@@ -1370,15 +1344,11 @@ impl Interp<'_> {
                 return result.map(CallOutcome::Value).map_err(JSException);
             }
             v12_heap::FunctionTarget::Host(_) => {
-                return Err(JSException(
-                    self.error_value("TypeError: value is not a constructor"),
-                ));
+                return Err(JSException(self.type_error("value is not a constructor")));
             }
             v12_heap::FunctionTarget::RealmEval(_) => {
                 // Realm-bound eval functions are not constructors.
-                return Err(JSException(
-                    self.error_value("TypeError: value is not a constructor"),
-                ));
+                return Err(JSException(self.type_error("value is not a constructor")));
             }
             v12_heap::FunctionTarget::Bound(_) => {
                 // `new bf(...)` is `Construct(bf, args, bf)` (ES 10.2.2
@@ -1434,14 +1404,12 @@ impl Interp<'_> {
         };
         let Some(proto) = proto_v.as_object() else {
             // Guarded above by `v.as_object().is_some()`; kept exhaustive.
-            return Err(JSException(
-                self.error_value("TypeError: value is not a constructor"),
-            ));
+            return Err(JSException(self.type_error("value is not a constructor")));
         };
 
         if self.frames.len() >= MAX_CALL_DEPTH {
             return Err(JSException(
-                self.error_value("RangeError: maximum call stack size exceeded"),
+                self.range_error("maximum call stack size exceeded"),
             ));
         }
 
@@ -1630,9 +1598,9 @@ impl Interp<'_> {
             }
             NativeId::FunctionCall => {
                 let Some(target) = this_v.as_object() else {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.call called on non-function",
-                    )));
+                    return Err(JSException(
+                        self.type_error("Function.prototype.call called on non-function"),
+                    ));
                 };
                 let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
                 let fwd = if args.len() > 1 {
@@ -1643,17 +1611,17 @@ impl Interp<'_> {
                 if self.heap.get(target).kind != Kind::Function
                     && self.heap.get(target).kind != Kind::Proxy
                 {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.call called on non-function",
-                    )));
+                    return Err(JSException(
+                        self.type_error("Function.prototype.call called on non-function"),
+                    ));
                 }
                 self.call_value(JsValue::object(target), this_arg, fwd)
             }
             NativeId::FunctionApply => {
                 let Some(target) = this_v.as_object() else {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.apply called on non-function",
-                    )));
+                    return Err(JSException(
+                        self.type_error("Function.prototype.apply called on non-function"),
+                    ));
                 };
                 let this_arg = args.first().copied().unwrap_or(JsValue::undefined());
                 let fwd: Vec<JsValue> = if let Some(arr_v) = args.get(1) {
@@ -1681,22 +1649,22 @@ impl Interp<'_> {
                 if self.heap.get(target).kind != Kind::Function
                     && self.heap.get(target).kind != Kind::Proxy
                 {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.apply called on non-function",
-                    )));
+                    return Err(JSException(
+                        self.type_error("Function.prototype.apply called on non-function"),
+                    ));
                 }
                 self.call_value(JsValue::object(target), this_arg, &fwd)
             }
             NativeId::FunctionBind => {
                 let Some(target) = this_v.as_object() else {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.bind called on non-function",
-                    )));
+                    return Err(JSException(
+                        self.type_error("Function.prototype.bind called on non-function"),
+                    ));
                 };
                 if self.heap.get(target).kind != Kind::Function {
-                    return Err(JSException(self.error_value(
-                        "TypeError: Function.prototype.bind called on non-function",
-                    )));
+                    return Err(JSException(
+                        self.type_error("Function.prototype.bind called on non-function"),
+                    ));
                 }
                 // `args[0]` is the bound `this`; `args[1..]` are the bound
                 // prefix arguments. Both are captured in a state object the
@@ -2129,7 +2097,12 @@ impl Interp<'_> {
             .as_object()
             .is_some_and(|o| self.heap.get(o).kind == Kind::Function)
         {
-            return Err(JSException(self.error_value(&format!(
+            // The `"TypeError: "` prefix is redundant with `type_error`'s
+            // default kind, but kept: `parse_error_text` re-splits on the first
+            // `": "`, so pinning the head here is what makes the port exactly
+            // equivalent to `error_value`'s single split even if `{name}` ever
+            // grew a `": "` of its own.
+            return Err(JSException(self.type_error(&format!(
                 "TypeError: Reflect.{name} is not a constructor"
             ))));
         }
@@ -2141,9 +2114,9 @@ impl Interp<'_> {
     /// when the caller passes `undefined`; a non-object throws.
     fn create_list_from_array_like(&mut self, v: JsValue) -> Result<Vec<JsValue>, JSException> {
         let Some(obj) = v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: CreateListFromArrayLike called on non-object",
-            )));
+            return Err(JSException(
+                self.type_error("CreateListFromArrayLike called on non-object"),
+            ));
         };
         let len_key = self.new_temp_key("length");
         let len_v = self.get_property(0, 0, JsValue::object(obj), len_key)?;
@@ -2174,14 +2147,14 @@ impl Interp<'_> {
         let target_v = args.first().copied().unwrap_or(JsValue::undefined());
         let Some(target) = target_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: Reflect.apply target is not a function"),
+                self.type_error("Reflect.apply target is not a function"),
             ));
         };
         // `IsCallable` includes a proxy whose target is callable; a revoked
         // proxy is not callable (ES 10.5.12 step 1 uses the resolved target).
         if !self.is_callable_object(target) {
             return Err(JSException(
-                self.error_value("TypeError: Reflect.apply target is not a function"),
+                self.type_error("Reflect.apply target is not a function"),
             ));
         }
         let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
@@ -2202,27 +2175,27 @@ impl Interp<'_> {
         self.reject_reflect_construct(this_v, "construct")?;
         let target_v = args.first().copied().unwrap_or(JsValue::undefined());
         let Some(target) = target_v.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: Reflect.construct target is not a constructor",
-            )));
+            return Err(JSException(
+                self.type_error("Reflect.construct target is not a constructor"),
+            ));
         };
         if !self.is_constructor_object(target) {
-            return Err(JSException(self.error_value(
-                "TypeError: Reflect.construct target is not a constructor",
-            )));
+            return Err(JSException(
+                self.type_error("Reflect.construct target is not a constructor"),
+            ));
         }
         let list =
             self.create_list_from_array_like(args.get(1).copied().unwrap_or(JsValue::undefined()))?;
         let new_target = args.get(2).copied().unwrap_or(target_v);
         let Some(nt) = new_target.as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: Reflect.construct newTarget is not a constructor",
-            )));
+            return Err(JSException(
+                self.type_error("Reflect.construct newTarget is not a constructor"),
+            ));
         };
         if !self.is_constructor_object(nt) {
-            return Err(JSException(self.error_value(
-                "TypeError: Reflect.construct newTarget is not a constructor",
-            )));
+            return Err(JSException(
+                self.type_error("Reflect.construct newTarget is not a constructor"),
+            ));
         }
         self.construct_object(target, &list, new_target)
     }
@@ -2238,9 +2211,7 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "call")?;
         if !self.is_callable_object(target) {
-            return Err(JSException(
-                self.error_value("TypeError: target is not a function"),
-            ));
+            return Err(JSException(self.type_error("target is not a function")));
         }
         let apply_key = self.new_temp_key("apply");
         let trap_v = self.get_property(0, 0, JsValue::object(handler), apply_key)?;
@@ -2249,12 +2220,12 @@ impl Interp<'_> {
         }
         let Some(trap) = trap_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: 'apply' trap must be a function"),
+                self.type_error("'apply' trap must be a function"),
             ));
         };
         if self.heap.get(trap).kind != Kind::Function {
             return Err(JSException(
-                self.error_value("TypeError: 'apply' trap must be a function"),
+                self.type_error("'apply' trap must be a function"),
             ));
         }
         // `CreateArrayFromList` for the trap's third argument.
@@ -2278,9 +2249,7 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let (target, handler) = self.proxy_parts(proxy, "construct")?;
         if !self.is_constructor_object(target) {
-            return Err(JSException(
-                self.error_value("TypeError: target is not a constructor"),
-            ));
+            return Err(JSException(self.type_error("target is not a constructor")));
         }
         let construct_key = self.new_temp_key("construct");
         let trap_v = self.get_property(0, 0, JsValue::object(handler), construct_key)?;
@@ -2289,12 +2258,12 @@ impl Interp<'_> {
         }
         let Some(trap) = trap_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: 'construct' trap must be a function"),
+                self.type_error("'construct' trap must be a function"),
             ));
         };
         if self.heap.get(trap).kind != Kind::Function {
             return Err(JSException(
-                self.error_value("TypeError: 'construct' trap must be a function"),
+                self.type_error("'construct' trap must be a function"),
             ));
         }
         self.gc_protect();
@@ -2307,9 +2276,9 @@ impl Interp<'_> {
         )?;
         // ES step 12: the trap result must be an object.
         if result.as_object().is_none() {
-            return Err(JSException(self.error_value(
-                "TypeError: 'construct' trap result must be an object",
-            )));
+            return Err(JSException(
+                self.type_error("'construct' trap result must be an object"),
+            ));
         }
         Ok(result)
     }
@@ -2476,9 +2445,7 @@ impl Interp<'_> {
             // Step 2: `IsConstructor(target)` false ⇒ TypeError (ES 10.1.14).
             // Covers an arrow target and a native target with no `[[Construct]]`.
             if !self.is_constructor_object(inner) {
-                return Err(JSException(
-                    self.error_value("TypeError: target is not a constructor"),
-                ));
+                return Err(JSException(self.type_error("target is not a constructor")));
             }
             // Step 3.
             let inner_v = JsValue::object(inner);
@@ -2492,9 +2459,7 @@ impl Interp<'_> {
             return self.construct_object(inner, &call_args, effective_new_target);
         }
         if self.heap.get(target).kind != Kind::Function {
-            return Err(JSException(
-                self.error_value("TypeError: target is not a constructor"),
-            ));
+            return Err(JSException(self.type_error("target is not a constructor")));
         }
         // A native/host constructor invoked without a parked `Construct`
         // opcode: call its handler directly and take its object result (the
@@ -2515,9 +2480,7 @@ impl Interp<'_> {
         let idx = match self.heap.get(target).callable {
             v12_heap::FunctionTarget::Bytecode(i) => i,
             v12_heap::FunctionTarget::RealmEval(_) => {
-                return Err(JSException(
-                    self.error_value("TypeError: target is not a constructor"),
-                ));
+                return Err(JSException(self.type_error("target is not a constructor")));
             }
             v12_heap::FunctionTarget::Bound(_) => unreachable!("handled above"),
             v12_heap::FunctionTarget::Native(_) | v12_heap::FunctionTarget::Host(_) => {
@@ -2530,15 +2493,11 @@ impl Interp<'_> {
             // `onFulfilledElement` is the one native here with no
             // `[[Construct]]` at all (see `prepare_construct`).
             if idx == u32::from(NativeId::PromiseCombinatorElement) {
-                return Err(JSException(
-                    self.error_value("TypeError: not a constructor"),
-                ));
+                return Err(JSException(self.type_error("not a constructor")));
             }
             let id = self.native_id_for(idx)?;
             if v12_native::is_non_constructible(id) {
-                return Err(JSException(
-                    self.error_value("TypeError: not a constructor"),
-                ));
+                return Err(JSException(self.type_error("not a constructor")));
             }
             return self.dispatch_native(id, target_v, args);
         }
@@ -2699,9 +2658,7 @@ impl Interp<'_> {
                 if defined {
                     Ok(JsValue::object(proxy))
                 } else {
-                    Err(JSException(
-                        self.error_value("TypeError: Cannot redefine property"),
-                    ))
+                    Err(JSException(self.type_error("Cannot redefine property")))
                 }
             }
             NativeId::ObjectDefineProperties => {
@@ -2721,8 +2678,8 @@ impl Interp<'_> {
                 if ok {
                     Ok(JsValue::object(proxy))
                 } else {
-                    Err(JSException(self.error_value(
-                        "TypeError: cannot set prototype of a non-extensible object",
+                    Err(JSException(self.type_error(
+                        "cannot set prototype of a non-extensible object",
                     )))
                 }
             }
@@ -2838,7 +2795,7 @@ impl Interp<'_> {
     fn to_property_descriptor(&mut self, v: JsValue) -> Result<OwnDesc, JSException> {
         let Some(obj) = v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: Property description must be an object"),
+                self.type_error("Property description must be an object"),
             ));
         };
         self.read_trap_descriptor(obj)
@@ -2854,9 +2811,9 @@ impl Interp<'_> {
         if v.is_null() {
             return Ok(None);
         }
-        v.as_object().map(Some).ok_or_else(|| {
-            JSException(self.error_value("TypeError: prototype must be an object or null"))
-        })
+        v.as_object()
+            .map(Some)
+            .ok_or_else(|| JSException(self.type_error("prototype must be an object or null")))
     }
 
     /// ES `DefineProperties` over a proxy target.
@@ -2866,9 +2823,7 @@ impl Interp<'_> {
         props_v: JsValue,
     ) -> Result<(), JSException> {
         let Some(props) = props_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: properties must be an object"),
-            ));
+            return Err(JSException(self.type_error("properties must be an object")));
         };
         let keys = self.ordinary_own_keys(props);
         for k in keys {
@@ -3045,7 +3000,7 @@ impl Interp<'_> {
     ) -> Result<JsValue, JSException> {
         let Some(obj) = this_v.as_object() else {
             return Err(JSException(
-                self.error_value("TypeError: Array method called on non-object"),
+                self.type_error("Array method called on non-object"),
             ));
         };
         if id == NativeId::ArraySort {
@@ -3056,9 +3011,7 @@ impl Interp<'_> {
             .copied()
             .and_then(|v| self.callback_is_callable(v))
         else {
-            return Err(JSException(
-                self.error_value("TypeError: callback is not a function"),
-            ));
+            return Err(JSException(self.type_error("callback is not a function")));
         };
         // The callback outlives the argument window across nested executions;
         // root it so a collection during a nested call cannot free it.
@@ -3178,9 +3131,9 @@ impl Interp<'_> {
             }),
             NativeId::ArrayReduce | NativeId::ArrayReduceRight => match accumulator {
                 Some(v) => Ok(v),
-                None => Err(JSException(self.error_value(
-                    "TypeError: Reduce of empty array with no initial value",
-                ))),
+                None => Err(JSException(
+                    self.type_error("Reduce of empty array with no initial value"),
+                )),
             },
             NativeId::ArrayFlatMap => {
                 // flatMap: flatten one level of array results into the output.
@@ -3260,7 +3213,7 @@ impl Interp<'_> {
             .filter(|obj| matches!(self.heap.get(*obj).kind, Kind::Function | Kind::Proxy))
         else {
             return Err(JSException(
-                self.error_value("TypeError: collection adder is not callable"),
+                self.type_error("collection adder is not callable"),
             ));
         };
         let iterator = self.get_iterator(iterable, false)?;
@@ -3295,7 +3248,7 @@ impl Interp<'_> {
             let call_args = if kind == Kind::Map {
                 let Some(entry) = value.as_object() else {
                     return Err(JSException(
-                        self.error_value("TypeError: Map iterator entry is not an object"),
+                        self.type_error("Map iterator entry is not an object"),
                     ));
                 };
                 let key_key = self.new_temp_key("0");
@@ -3788,7 +3741,7 @@ impl Interp<'_> {
         let Some(ctor) = ctor else {
             self.stack.truncate(base);
             return Err(JSException(
-                self.error_value("TypeError: AggregateError is not available"),
+                self.type_error("AggregateError is not available"),
             ));
         };
         self.stack.push(JsValue::object(ctor));
@@ -3835,18 +3788,19 @@ impl Interp<'_> {
         let element_record = self.heap.get(callee).elements.clone();
         if element_record.len() < record::SLOTS {
             return Err(JSException(
-                self.error_value("TypeError: combinator element has no record"),
+                self.type_error("combinator element has no record"),
             ));
         }
         let state = element_record[record::STATE];
-        let index = element_record[record::INDEX].as_smi().ok_or_else(|| {
-            JSException(self.error_value("TypeError: combinator index is not Smi"))
-        })? as u32;
+        let index = element_record[record::INDEX]
+            .as_smi()
+            .ok_or_else(|| JSException(self.type_error("combinator index is not Smi")))?
+            as u32;
         let resolve_v = element_record[record::RESOLVE];
         let Some(already) = element_record[record::ALREADY].as_object() else {
-            return Err(JSException(self.error_value(
-                "TypeError: combinator element has no alreadyResolved",
-            )));
+            return Err(JSException(
+                self.type_error("combinator element has no alreadyResolved"),
+            ));
         };
         let fulfilled = ops::to_boolean(self.heap, element_record[record::FULFILLED]);
         // Steps 4-a-1/2 (and 5-a-1/2): the per-element first-wins guard, so a
@@ -4010,8 +3964,11 @@ impl Interp<'_> {
             .as_object()
             .is_some_and(|o| matches!(self.heap.get(o).kind, Kind::Function | Kind::Proxy));
         if !callable {
+            // Prefix retained deliberately — see `reject_reflect_construct`:
+            // `message` is caller-supplied, so only a pinned head makes this
+            // identical to `error_value`'s single split.
             return Err(JSException(
-                self.error_value(&format!("TypeError: {message}")),
+                self.type_error(&format!("TypeError: {message}")),
             ));
         }
         Ok(v)
@@ -4185,7 +4142,7 @@ impl Interp<'_> {
         // Step 1: `If ctor is not an Object, throw a TypeError exception`.
         if this_v.as_object().is_none() {
             return Err(JSException(
-                self.error_value("TypeError: Promise.try requires an object receiver"),
+                self.type_error("Promise.try requires an object receiver"),
             ));
         }
         let callback = args.first().copied().unwrap_or_else(JsValue::undefined);
@@ -4249,7 +4206,7 @@ impl Interp<'_> {
         // allocating a second one, so this arm returns the receiver itself.
         if !self.promise_instance_receiver(this_v) && !self.is_capability_constructor(this_v) {
             return Err(JSException(
-                self.error_value("TypeError: Promise constructor requires 'new'"),
+                self.type_error("Promise constructor requires 'new'"),
             ));
         }
         let (promise, resolve, reject) = self.promise_capability(this_v)?;
@@ -4373,7 +4330,7 @@ impl Interp<'_> {
         // Step 3.
         if c.as_object().is_none() {
             return Err(JSException(
-                self.error_value("TypeError: species constructor is not an object"),
+                self.type_error("species constructor is not an object"),
             ));
         }
         // Step 4.
@@ -4394,9 +4351,7 @@ impl Interp<'_> {
         };
         // Step 6.
         if !self.is_capability_constructor(s) {
-            return Err(JSException(
-                self.error_value("TypeError: species is not a constructor"),
-            ));
+            return Err(JSException(self.type_error("species is not a constructor")));
         }
         Ok(s)
     }
@@ -4444,9 +4399,9 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
         if !self.is_promise(this_v) {
-            return Err(JSException(self.error_value(
-                "TypeError: Promise.prototype.then requires a promise",
-            )));
+            return Err(JSException(
+                self.type_error("Promise.prototype.then requires a promise"),
+            ));
         }
         let on_fulfilled = args.first().copied().unwrap_or_else(JsValue::undefined);
         let on_rejected = args.get(1).copied().unwrap_or_else(JsValue::undefined);
@@ -4510,9 +4465,9 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
         if !self.is_promise(this_v) {
-            return Err(JSException(self.error_value(
-                "TypeError: Promise.prototype.finally requires a promise",
-            )));
+            return Err(JSException(
+                self.type_error("Promise.prototype.finally requires a promise"),
+            ));
         }
         let on_finally = args.first().copied().unwrap_or_else(JsValue::undefined);
         let default_ctor = self.promise_ctor_value();
@@ -4558,9 +4513,9 @@ impl Interp<'_> {
         // Ahead of everything else, so a non-constructor never reaches the
         // `Construct` below.
         if !self.is_capability_constructor(ctor) {
-            return Err(JSException(self.error_value(
-                "TypeError: promise constructor is not a constructor",
-            )));
+            return Err(JSException(
+                self.type_error("promise constructor is not a constructor"),
+            ));
         }
         // Step 2: the `PromiseCapability Record` — a plain three-slot object
         // (`[[Resolve]]`, `[[Reject]]`, `[[AlreadyResolved]]`; slot names in
@@ -4653,15 +4608,13 @@ impl Interp<'_> {
         args: &[JsValue],
     ) -> Result<JsValue, JSException> {
         let Some(obj) = this_v.as_object() else {
-            return Err(JSException(
-                self.error_value("TypeError: forEach called on non-object"),
-            ));
+            return Err(JSException(self.type_error("forEach called on non-object")));
         };
         let want_map = id == NativeId::MapForEach;
         let kind = self.heap.get(obj).kind;
         if (want_map && kind != Kind::Map) || (!want_map && kind != Kind::Set) {
             return Err(JSException(
-                self.error_value("TypeError: forEach called on incompatible receiver"),
+                self.type_error("forEach called on incompatible receiver"),
             ));
         }
         let Some(cb) = args
@@ -4669,9 +4622,7 @@ impl Interp<'_> {
             .copied()
             .and_then(|v| self.callback_is_callable(v))
         else {
-            return Err(JSException(
-                self.error_value("TypeError: callback is not a function"),
-            ));
+            return Err(JSException(self.type_error("callback is not a function")));
         };
         self.heap.add_root(JsValue::object(cb));
         let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
@@ -4726,9 +4677,9 @@ impl Interp<'_> {
         // (`argument-effect-order`), and it closes the receiver on the way out
         // (`argument-validation-failure-closes-underlying`).
         if this_v.as_object().is_none() {
-            return Err(JSException(self.error_value(
-                "TypeError: Iterator.prototype method called on a non-object",
-            )));
+            return Err(JSException(
+                self.type_error("Iterator.prototype method called on a non-object"),
+            ));
         }
         let callback = match args.first().copied().filter(|v| {
             v.as_object()
@@ -4739,9 +4690,9 @@ impl Interp<'_> {
                 // Step 4.b: `IteratorClose(O, ThrowCompletion(TypeError))` —
                 // the original abrupt wins, so close errors are swallowed.
                 let _ = self.op_iterator_close(this_v, true);
-                return Err(JSException(self.error_value(
-                    "TypeError: Iterator.prototype callback is not a function",
-                )));
+                return Err(JSException(
+                    self.type_error("Iterator.prototype callback is not a function"),
+                ));
             }
         };
         // Step 5: `GetIteratorDirect(O, sync)`.
@@ -5096,9 +5047,9 @@ impl Interp<'_> {
             // TypeError. A supplied `undefined` initial value is NOT that case,
             // which is what `acc_is_unset` (not the slot) decides.
             _ if acc_is_unset => {
-                return Err(JSException(self.error_value(
-                    "TypeError: Reduce of empty iterator with no initial value",
-                )));
+                return Err(JSException(
+                    self.type_error("Reduce of empty iterator with no initial value"),
+                ));
             }
             _ => self.stack[acc_slot],
         };
@@ -5117,9 +5068,9 @@ impl Interp<'_> {
             self.heap.add_root(value);
             out.push(value);
             if out.len() > MAX_DRAIN {
-                return Err(JSException(self.error_value(
-                    "RangeError: iterator drain exceeds 1,000,000 values",
-                )));
+                return Err(JSException(
+                    self.range_error("iterator drain exceeds 1,000,000 values"),
+                ));
             }
         }
         Ok(crate::call::alloc_array(self, out))
@@ -5132,21 +5083,18 @@ impl Interp<'_> {
     /// pin) and later mutations of the property are not observed.
     fn helper_source_open(&mut self, this_v: JsValue) -> Result<HelperSource, JSException> {
         if this_v.as_object().is_none() {
-            return Err(JSException(self.error_value(
-                "TypeError: Iterator.prototype method called on a non-object",
-            )));
+            return Err(JSException(
+                self.type_error("Iterator.prototype method called on a non-object"),
+            ));
         }
         let next_key = self.new_temp_key("next");
         let next_v = self.get_property(0, 0, this_v, next_key)?;
-        let next =
-            next_v
-                .as_object()
-                .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
-                .ok_or_else(|| {
-                    JSException(self.error_value(
-                        "TypeError: Iterator.prototype method requires a callable next",
-                    ))
-                })?;
+        let next = next_v
+            .as_object()
+            .filter(|h| matches!(self.heap.get(*h).kind, Kind::Function | Kind::Proxy))
+            .ok_or_else(|| {
+                JSException(self.type_error("Iterator.prototype method requires a callable next"))
+            })?;
         self.heap.add_root(JsValue::object(next));
         self.heap.add_root(this_v);
         Ok(HelperSource {
@@ -5171,7 +5119,7 @@ impl Interp<'_> {
             let result = self.call_value(source.next, source.iter, &[])?;
             if result.as_object().is_none() {
                 return Err(JSException(
-                    self.error_value("TypeError: iterator next() returned a non-object"),
+                    self.type_error("iterator next() returned a non-object"),
                 ));
             }
             self.heap.add_root(result);

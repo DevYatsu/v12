@@ -25,8 +25,9 @@
 #   * Each migration commit DELETES the entries it retired; the cap follows
 #     automatically because the script counts entries.
 #   * This file must therefore shrink monotonically from here.  The three
-#     stages to aim for, in order of size: call_setup.rs 53 -> 0, then
-#     object_ops.rs 20 -> 0, then the 10-site files.
+#     stages were call_setup.rs 53 -> 0 (DONE, W0.2c batch 1), then
+#     object_ops.rs 20 -> 0, then the 10-site files.  ERR_VAL is 66 now
+#     (was 119); the other 63 are PK_PUSH/PROP_GET1 and never move again.
 #
 # ===================== MIGRATION TARGETS =====================
 # ERR_VAL -> real error objects with a kind and a realm link.
@@ -41,8 +42,9 @@
 #     the same pair Ctx uses: v12_native::{parse_error_text,error_object}
 #     (crates/v12-native/src/throw.rs:44,57), wrapped once as
 #     Interp::{type_error,range_error,syntax_error,reference_error} beside
-#     Interp::error_value (crates/v12-interp/src/call_setup.rs:963).  That
-#     wrapper batch is a prerequisite for retiring 118 of the 119 sites.
+#     Interp::error_value (crates/v12-interp/src/call_setup.rs:968).  That
+#     wrapper batch gated 118 of the 119 sites; batch 1 has since retired
+#     call_setup.rs's 53, leaving 66.
 # PK_PUSH -> ctx.define_data_prop_with_attrs (ctx.rs:482) is the sole legal
 #   push.  Sites that write an internal slot or a fixed record layout, and the
 #   interpreter's dictionary/sparse storage core, are structurally exempt and
@@ -107,65 +109,25 @@ PROP_GET1 crates/v12-heap/src/object.rs:758 # properties.get(1)
 PROP_GET1 crates/v12-engine/src/builtins/string.rs:416 # properties.get(1)
 #
 # --- ERR_VAL: stringly `error_value("` construction (target: the Ctx / v12-native error wrappers) ---
-# 119 sites remain, listed below per file with the migration rationale for that file.
+# 66 sites remain, listed below per file with the migration rationale for that file.
+# (119 at the 2026-10-01 re-baseline; call_setup.rs retired in W0.2c batch 1.)
 #
-# crates/v12-interp/src/call_setup.rs — 53 sites remaining
-# call/construct ABI guards (arity, stack depth, corrupt call
-# header, callee/args) plus every Proxy/Reflect trap dispatch. Largest batch in
-# the list at 45% of all ERR_VAL sites, so it goes first.
-ERR_VAL crates/v12-interp/src/call_setup.rs:65 # "TypeError: callee is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:79 # "TypeError: callee is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:257 # "RangeError: maximum call stack size exceeded"
-ERR_VAL crates/v12-interp/src/call_setup.rs:465 # "RangeError: maximum call stack size exceeded"
-ERR_VAL crates/v12-interp/src/call_setup.rs:552 # "RangeError: maximum call stack size exceeded"
-ERR_VAL crates/v12-interp/src/call_setup.rs:815 # "TypeError: corrupt call header"
-ERR_VAL crates/v12-interp/src/call_setup.rs:823 # "TypeError: corrupt call header"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1039 # "TypeError: callee is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1047 # "TypeError: args is not an array"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1063 # "TypeError: callee is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1078 # "TypeError: args is not an array"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1140 # "RangeError: maximum call stack size exceeded"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1238 # "TypeError: value is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1252 # "TypeError: value is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1277 # "TypeError: not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1289 # "TypeError: not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1312 # "TypeError: value is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1329 # "TypeError: value is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1335 # "TypeError: value is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1393 # "TypeError: value is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:1399 # "RangeError: maximum call stack size exceeded"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2132 # "TypeError: Reflect.apply target is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2139 # "TypeError: Reflect.apply target is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2197 # "TypeError: target is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2207 # "TypeError: 'apply' trap must be a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2212 # "TypeError: 'apply' trap must be a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2237 # "TypeError: target is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2247 # "TypeError: 'construct' trap must be a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2252 # "TypeError: 'construct' trap must be a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2435 # "TypeError: target is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2451 # "TypeError: target is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2474 # "TypeError: target is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2489 # "TypeError: not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2495 # "TypeError: not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2658 # "TypeError: Cannot redefine property"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2796 # "TypeError: Property description must be an object"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2813 # "TypeError: prototype must be an object or null"
-ERR_VAL crates/v12-interp/src/call_setup.rs:2825 # "TypeError: properties must be an object"
-ERR_VAL crates/v12-interp/src/call_setup.rs:3003 # "TypeError: Array method called on non-object"
-ERR_VAL crates/v12-interp/src/call_setup.rs:3015 # "TypeError: callback is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:3218 # "TypeError: collection adder is not callable"
-ERR_VAL crates/v12-interp/src/call_setup.rs:3253 # "TypeError: Map iterator entry is not an object"
-ERR_VAL crates/v12-interp/src/call_setup.rs:3746 # "TypeError: AggregateError is not available"
-ERR_VAL crates/v12-interp/src/call_setup.rs:3793 # "TypeError: combinator element has no record"
-ERR_VAL crates/v12-interp/src/call_setup.rs:3798 # "TypeError: combinator index is not Smi"
-ERR_VAL crates/v12-interp/src/call_setup.rs:4143 # "TypeError: Promise.try requires an object receiver"
-ERR_VAL crates/v12-interp/src/call_setup.rs:4207 # "TypeError: Promise constructor requires 'new'"
-ERR_VAL crates/v12-interp/src/call_setup.rs:4331 # "TypeError: species constructor is not an object"
-ERR_VAL crates/v12-interp/src/call_setup.rs:4353 # "TypeError: species is not a constructor"
-ERR_VAL crates/v12-interp/src/call_setup.rs:4612 # "TypeError: forEach called on non-object"
-ERR_VAL crates/v12-interp/src/call_setup.rs:4619 # "TypeError: forEach called on incompatible receiver"
-ERR_VAL crates/v12-interp/src/call_setup.rs:4628 # "TypeError: callback is not a function"
-ERR_VAL crates/v12-interp/src/call_setup.rs:5129 # "TypeError: iterator next() returned a non-object"
+# crates/v12-interp/src/call_setup.rs — 0 sites remaining (RETIRED)
+# Call/construct ABI guards (arity, stack depth, corrupt call header,
+# callee/args) plus every Proxy/Reflect trap dispatch.  Was 53, the largest
+# batch at 45% of all ERR_VAL sites, so it went first.  All 53 retired in
+# W0.2c batch 1 to Interp::{type,range,syntax,reference}_error
+# (call_setup.rs:991-1008).  Two notes for whoever reads the diff:
+#   * the two `format!` sites (reject_reflect_construct, callable_or_err)
+#     kept their literal `"TypeError: "` head on purpose.  The head is
+#     redundant with the wrapper's default kind, but `parse_error_text`
+#     re-splits on the FIRST ": ", so a pinned head is what makes those ports
+#     exactly equivalent to `error_value`'s single split even if the
+#     interpolated `{name}`/`{message}` ever grows a ": " of its own.
+#   * `Interp::error_value` itself stays (it is permissive by contract and
+#     still has 66 callers in the other interpreter/engine files).  Do not
+#     delete it as part of this retirement.
+#
 #
 # crates/v12-interp/src/object_ops.rs — 20 sites remaining
 # destructure/spread, prototype-chain and accessor-prototype guards. 20
