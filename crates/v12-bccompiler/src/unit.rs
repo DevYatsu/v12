@@ -73,24 +73,10 @@ fn emit_default_derived_super(
     c: &Class<'_>,
 ) -> Result<(), CompileError> {
     // Env depth from this frame to the class scope captured by the nearest
-    // non-arrow unit that uses `super` (this constructor). Mirrors
-    // `expr::FnCtx::super_env_depth`; each env-bearing unit on the path
-    // contributes one parent link.
-    let depth = {
-        let units = &cx.comp.plans.units;
-        let mut depth = 0u8;
-        let mut cur = Some(cx.unit);
-        while let Some(u) = cur {
-            if units[u].has_env {
-                depth += 1;
-            }
-            if !units[u].is_arrow && units[u].uses_super {
-                break;
-            }
-            cur = units[u].parent;
-        }
-        depth
-    };
+    // non-arrow unit that uses `super` (this constructor). Shares the walk with
+    // `expr::FnCtx::super_env_depth` — one home, so the two cannot drift apart
+    // the way two hand-copied `u8` accumulators did.
+    let depth = cx.comp.plans.super_env_depth_between(cx.unit);
     // Layout: [callee][this]; `CallApply` reads the args array from its third
     // operand. `collect` set `has_rest`, so `r{arity+1}` holds the forwarded
     // argument list (arity is 0 for the synthesised constructor).
@@ -539,7 +525,7 @@ fn emit_prologue(
         let ancestor_envs = if cx.unit == 0 {
             0
         } else {
-            cx.comp.plans.env_depth_between(cx.unit, 0)
+            cx.comp.plans.env_depth_between(cx.unit, 0)?
         };
         cx.emit_new_env(ancestor_envs, env_slots, oxc_span::Span::default());
     }

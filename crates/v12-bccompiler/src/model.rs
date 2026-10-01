@@ -46,6 +46,17 @@ pub const MAX_REGS: u16 = 65_535;
 /// `WideOp::GetEnvSlotW`/`SetEnvSlotW`/`NewEnvironmentW` (16-bit operands).
 pub const MAX_ENV_SLOTS: u16 = 65_535;
 
+/// Deepest environment chain a `GetEnvSlot`/`SetEnvSlot` depth operand can
+/// name, and so the ceiling [`Plans::env_depth_between`] enforces.
+///
+/// Unlike [`MAX_REGS`]/[`MAX_ENV_SLOTS`] this is *not* a limit the ISA imposes
+/// on ordinary programs: the wide ops already carry a 16-bit depth, so a
+/// 300-deep capture chain compiles and runs. The bound exists only because the
+/// depth is counted in a `u16`; crossing it is rejected as a `CompileError`
+/// rather than allowed to wrap into a wrong depth. It is far beyond any
+/// hand-written or generated nesting depth.
+pub const MAX_ENV_DEPTH: u16 = u16::MAX;
+
 /// Native index reserved for the synchronous module import helper.
 ///
 /// See [`crate::unit::NATIVE_IMPORT_INDEX`] and the crate-level docs for
@@ -450,32 +461,93 @@ impl Plans {
     /// structural: every env-bearing unit strictly between the accessing unit
     /// (inclusive) and the home unit (exclusive) contributes one parent-link
     /// step. This is what makes `GetEnvSlot` depths static per unit pair.
-    pub fn env_depth(&self, from_unit: usize, sym: SymbolId) -> u8 {
+    pub fn env_depth(&self, from_unit: usize, sym: SymbolId) -> Result<u16, CompileError> {
         let Some(&home) = self.home_of.get(&sym) else {
-            return 0;
+            return Ok(0);
         };
         if !self.is_descendant_or_self(from_unit, home) {
-            return 0;
+            return Ok(0);
         }
         self.env_depth_between(from_unit, home)
     }
 
     /// Hop count from `from_unit`'s innermost environment up to (excluding)
     /// `to_unit`'s environment.
-    pub fn env_depth_between(&self, from_unit: usize, to_unit: usize) -> u8 {
-        let mut depth = 0u8;
+    ///
+    /// `u16`, not `u8`: the depth is an operand of `GetEnvSlot`/`SetEnvSlot`
+    /// and reaches the interpreter through `WideOp::GetEnvSlotW`/`SetEnvSlotW`,
+    /// whose `depth` field is `u16` (`v12-bytecode/src/wide.rs`), and
+    /// `Interp::env_read` takes a `u16`. The narrow opcodes carry 8 bits; the
+    /// wide ones carry 16, so 256 env-bearing units is an ordinary depth that
+    /// `emit_get_env`/`emit_set_env` route wide. Counting on a `u8` here made
+    /// the 256th hop wrap — a panic in debug, and in release (where
+    /// `overflow-checks` is off) a wrap to `0`, i.e. a `GetEnvSlot` at depth 0
+    /// reading an unrelated environment. Silent, and it produced a
+    /// *plausible* number rather than an obvious one.
+    ///
+    /// The accumulator is `checked_add`, so the count cannot wrap in any build
+    /// profile. A chain longer than `u16::MAX` is not representable by the
+    /// bytecode at all and is rejected as a [`CompileError`] — the honest
+    /// outcome, since the alternative would be a wrong depth.
+    pub fn env_depth_between(&self, from_unit: usize, to_unit: usize) -> Result<u16, CompileError> {
+        let mut depth: u16 = 0;
         let mut cur = Some(from_unit);
         while let Some(u) = cur {
             if u == to_unit {
-                return depth;
+                return Ok(depth);
             }
             if self.units[u].has_env {
-                depth += 1;
+                depth = depth.checked_add(1).ok_or_else(Self::env_depth_err)?;
             }
             cur = self.units[u].parent;
         }
         // Not on ancestor chain — return 0 to avoid panic; the access will be treated as global.
-        0
+        Ok(0)
+    }
+
+    /// Env depth from `from_unit`'s frame up to the class-scope environment
+    /// captured by the nearest non-arrow unit that uses `super`.
+    ///
+    /// Each env-bearing unit on the path (including the method's own prologue
+    /// env) contributes one parent link; the class env is that link's target,
+    /// so depth 0 when the frame env *is* the class env. Arrows inherit the
+    /// `super` binding, so the owner is not always `from_unit`.
+    ///
+    /// This is the single home of that walk. `expr::FnCtx::super_env_depth` and
+    /// the constructor prologue in `unit.rs` were verbatim copies; two copies of
+    /// a depth accumulator is exactly how the `u8` overflow was able to hide in
+    /// one of them.
+    pub fn super_env_depth_between(&self, from_unit: usize) -> u16 {
+        let mut depth: u16 = 0;
+        let mut cur = Some(from_unit);
+        while let Some(u) = cur {
+            if self.units[u].has_env {
+                // Saturating, not wrapping: this walk has no error channel, and
+                // an unreachable `u16::MAX` is the only value a saturated depth
+                // can produce — which the interpreter rejects as "depth exceeds
+                // live chain" rather than resolving to another environment's
+                // slot. Every *reachable* depth is exact.
+                depth = depth.saturating_add(1);
+            }
+            if !self.units[u].is_arrow && self.units[u].uses_super {
+                break;
+            }
+            cur = self.units[u].parent;
+        }
+        depth
+    }
+
+    /// The capacity error for an env chain too deep to name. Reached only past
+    /// [`MAX_ENV_DEPTH`], which no reachable program hits; named explicitly
+    /// rather than folded into the generic "too many functions/constants" so a
+    /// future reader can tell *which* budget was exceeded.
+    fn env_depth_err() -> CompileError {
+        CompileError {
+            message: format!(
+                "environment nesting exceeds the maximum env depth of {MAX_ENV_DEPTH}"
+            ),
+            span: Some((0, 0)),
+        }
     }
 
     fn is_descendant_or_self(&self, from: usize, of: usize) -> bool {
@@ -680,9 +752,21 @@ pub struct FnCtx<'c, 's, 'i, 'a> {
     /// per-iteration copy-forward) are relative to the current head and stay
     /// unbiased, which is why they call the raw `emit_get_env`/`emit_set_env`
     /// rather than going through `access`.
-    env_bias: u8,
+    ///
+    /// `u16` to match the depth operand it shifts, and `saturating` on *both*
+    /// sides: the push cannot wrap into a small bias (which would bias every
+    /// later access in the unit the wrong way), and the pop cannot underflow.
+    env_bias: u16,
     scope_stack: Vec<ScopeId>,
-    overflow: Option<CompileError>,
+    /// Deferred capacity error, taken by [`FnCtx::finish`].
+    ///
+    /// `RefCell` rather than a plain field because the infallible accessors
+    /// ([`FnCtx::access`], [`FnCtx::access_location`]) resolve an env depth
+    /// and have no `Result` to return it through. Their callers are all
+    /// mid-emission, so stashing the error and surfacing it at `finish` keeps
+    /// the depth resolution total *and* keeps the failure a compile error
+    /// rather than a wrong depth.
+    overflow: std::cell::RefCell<Option<CompileError>>,
 }
 
 impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
@@ -703,7 +787,30 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             scope_stack: Vec::new(),
             tdz_region_depth: 0,
             tdz_initialized: HashSet::new(),
-            overflow: None,
+            overflow: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Records a deferred capacity error, keeping the first one. Emission
+    /// continues so the surrounding borrow structure stays intact; `finish`
+    /// reports it.
+    fn defer_overflow(&self, err: CompileError) {
+        if self.overflow.borrow().is_none() {
+            *self.overflow.borrow_mut() = Some(err);
+        }
+    }
+
+    /// [`Self::env_depth`] as a depth for emission, deferring the
+    /// unrepresentable-depth error instead of returning one. Returns 0 in that
+    /// case, which is never emitted: the stashed error fails the unit at
+    /// `finish` before the bytecode is assembled.
+    fn env_depth_or_defer(&self, from_unit: usize, sym: SymbolId) -> u16 {
+        match self.comp.plans.env_depth(from_unit, sym) {
+            Ok(d) => d,
+            Err(e) => {
+                self.defer_overflow(e);
+                0
+            }
         }
     }
 
@@ -718,17 +825,17 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     // -- registers ----------------------------------------------------------
 
     pub fn new_temp(&mut self) -> u16 {
-        if self.overflow.is_some() {
+        if self.overflow.borrow().is_some() {
             return 0;
         }
         let r = self.temp_top;
         let Some(next) = self.temp_top.checked_add(1) else {
-            self.overflow = Some(self.overflow_err());
+            self.defer_overflow(self.overflow_err());
             return 0;
         };
         self.temp_top = next;
         if let Err(e) = self.track(r) {
-            self.overflow = Some(e);
+            self.defer_overflow(e);
             return 0;
         }
         r
@@ -736,18 +843,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// Contiguous block for call layouts and array elements.
     pub fn new_temps(&mut self, n: u16) -> u16 {
-        if self.overflow.is_some() {
+        if self.overflow.borrow().is_some() {
             return 0;
         }
         let base = self.temp_top;
         let Some(next) = self.temp_top.checked_add(n) else {
-            self.overflow = Some(self.overflow_err());
+            self.defer_overflow(self.overflow_err());
             return 0;
         };
         self.temp_top = next;
         let top = base.checked_add(n.saturating_sub(1)).unwrap_or(base);
         if let Err(e) = self.track(top) {
-            self.overflow = Some(e);
+            self.defer_overflow(e);
             return 0;
         }
         base
@@ -800,7 +907,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         match loc {
             VarLoc::Reg(r) => VarAccess::Reg(r),
             VarLoc::Env(slot) => VarAccess::Env {
-                depth: self.biased_depth(plans.env_depth(self.unit, sym)),
+                depth: self.biased_depth(self.env_depth_or_defer(self.unit, sym)),
                 slot,
             },
             VarLoc::Global => VarAccess::Global { sym },
@@ -903,7 +1010,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         Some(match loc {
             VarLoc::Reg(r) => VarAccess::Reg(r),
             VarLoc::Env(slot) => VarAccess::Env {
-                depth: self.biased_depth(plans.env_depth(self.unit, sym)),
+                depth: self.biased_depth(self.env_depth_or_defer(self.unit, sym)),
                 slot,
             },
             // No `let`/`const` binding aliases the global object: top-level
@@ -1460,38 +1567,36 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_reg2(Opcode::Move, dst, src, span);
     }
 
-    /// `GetEnvSlot` with wide fallback once the slot (or destination)
+    /// `GetEnvSlot` with wide fallback once the depth, slot, or destination
     /// exceeds the narrow 8-bit operand.
-    pub fn emit_get_env(&mut self, dst: u16, depth: u8, slot: u16, span: oxc_span::Span) {
-        if dst <= u16::from(u8::MAX) && slot <= u16::from(u8::MAX) {
+    ///
+    /// Selection follows the same idiom as every other wide escape in this
+    /// module (`MAX_REGS`/`MAX_ENV_SLOTS` for `emit_regs`, `emit_closure`,
+    /// `emit_new_env`): all operands narrow-checked against `u8::MAX`, and the
+    /// whole instruction goes wide if *any* of them does. `depth` participates
+    /// because `WideOp::GetEnvSlotW` carries it as a `u16` — a 256-deep access
+    /// is a valid depth, so it must not be truncated into the narrow opcode.
+    pub fn emit_get_env(&mut self, dst: u16, depth: u16, slot: u16, span: oxc_span::Span) {
+        if dst <= u16::from(u8::MAX) && slot <= u16::from(u8::MAX) && depth <= u16::from(u8::MAX) {
             self.emit_spanned(
-                Instr::new(Opcode::GetEnvSlot, dst as u8, depth, slot as u8),
+                Instr::new(Opcode::GetEnvSlot, dst as u8, depth as u8, slot as u8),
                 span,
             );
         } else {
-            let words = WideOp::GetEnvSlotW {
-                dst,
-                depth: u16::from(depth),
-                slot,
-            }
-            .encode();
+            let words = WideOp::GetEnvSlotW { dst, depth, slot }.encode();
             self.emit_words(words, span);
         }
     }
 
-    pub fn emit_set_env(&mut self, depth: u8, slot: u16, src: u16, span: oxc_span::Span) {
-        if src <= u16::from(u8::MAX) && slot <= u16::from(u8::MAX) {
+    /// `SetEnvSlot` with the same wide fallback as [`Self::emit_get_env`].
+    pub fn emit_set_env(&mut self, depth: u16, slot: u16, src: u16, span: oxc_span::Span) {
+        if src <= u16::from(u8::MAX) && slot <= u16::from(u8::MAX) && depth <= u16::from(u8::MAX) {
             self.emit_spanned(
-                Instr::new(Opcode::SetEnvSlot, depth, slot as u8, src as u8),
+                Instr::new(Opcode::SetEnvSlot, depth as u8, slot as u8, src as u8),
                 span,
             );
         } else {
-            let words = WideOp::SetEnvSlotW {
-                src,
-                depth: u16::from(depth),
-                slot,
-            }
-            .encode();
+            let words = WideOp::SetEnvSlotW { src, depth, slot }.encode();
             self.emit_words(words, span);
         }
     }
@@ -1685,20 +1790,16 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         self.emit_regs(Opcode::NewArray, dst, base, u16::from(len), 0b0011, span);
     }
 
-    /// `NewEnvironment depth, slots` with a `NewEnvironmentW` escape once
-    /// the slot count exceeds the narrow 8-bit operand.
-    pub fn emit_new_env(&mut self, depth: u8, slots: u16, span: oxc_span::Span) {
-        if slots <= u16::from(u8::MAX) {
+    /// `NewEnvironment depth, slots` with a `NewEnvironmentW` escape once the
+    /// slot count or the depth exceeds the narrow 8-bit operand.
+    pub fn emit_new_env(&mut self, depth: u16, slots: u16, span: oxc_span::Span) {
+        if slots <= u16::from(u8::MAX) && depth <= u16::from(u8::MAX) {
             self.emit_spanned(
-                Instr::new(Opcode::NewEnvironment, depth, slots as u8, 0),
+                Instr::new(Opcode::NewEnvironment, depth as u8, slots as u8, 0),
                 span,
             );
         } else {
-            let words = WideOp::NewEnvironmentW {
-                depth: u16::from(depth),
-                slots,
-            }
-            .encode();
+            let words = WideOp::NewEnvironmentW { depth, slots }.encode();
             self.emit_words(words, span);
         }
     }
@@ -1709,9 +1810,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     ///
     /// The unit's base environment (the prologue) is not scoped and does not go
     /// through here — it *is* the origin every structural depth counts from.
-    pub fn emit_scoped_env(&mut self, depth: u8, slots: u16, span: oxc_span::Span) {
+    pub fn emit_scoped_env(&mut self, depth: u16, slots: u16, span: oxc_span::Span) {
         self.emit_new_env(depth, slots, span);
-        self.env_bias += 1;
+        self.env_bias = self.env_bias.saturating_add(1);
     }
 
     /// Retires the environment [`Self::emit_scoped_env`] pushed, so the unit is
@@ -1736,9 +1837,21 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 
     /// The depth a statically resolved access must be emitted with: the
     /// structural hop count plus every scoped environment currently on the
-    /// chain. Saturating because the structural count is already a `u8` budget.
-    pub(crate) fn biased_depth(&self, depth: u8) -> u8 {
-        depth.saturating_add(self.env_bias)
+    /// chain.
+    ///
+    /// Exact, not saturating. A saturating add here produced a *plausible*
+    /// wrong depth — a bias that pushed the total past the old `u8` range
+    /// clamped to a real-looking depth, and the access then read some other
+    /// environment's slot. That is the same silent-wrong-value failure class
+    /// as the counting overflow this replaced, one step earlier and with no
+    /// panic to announce it, so the sum is computed in `u32` and only the
+    /// (unreachable, given [`MAX_ENV_DEPTH`]) over-`u16` case saturates.
+    pub(crate) fn biased_depth(&self, depth: u16) -> u16 {
+        let total = u32::from(depth) + u32::from(self.env_bias);
+        if total > u32::from(MAX_ENV_DEPTH) {
+            return MAX_ENV_DEPTH;
+        }
+        total as u16
     }
 
     /// The raw `env_bias` counter. `pub(crate)` and test-only: the field itself
@@ -1748,7 +1861,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// left the runtime chain one level deeper than the static model), so it
     /// needs a test that can read it (task W1.3).
     #[cfg(test)]
-    pub(crate) fn env_bias(&self) -> u8 {
+    pub(crate) fn env_bias(&self) -> u16 {
         self.env_bias
     }
 
@@ -1808,7 +1921,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
 pub enum VarAccess {
     Reg(u16),
     Env {
-        depth: u8,
+        depth: u16,
         slot: u16,
     },
     /// A global property (`GetGlobal`/`SetGlobal`) — the symbol's name is

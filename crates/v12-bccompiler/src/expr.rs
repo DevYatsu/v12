@@ -2243,24 +2243,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     }
 
     /// Env depth from the current frame to the class scope env captured by the
-    /// nearest method/constructor unit. Each env-bearing unit on the path
-    /// (including the method's own prologue env) contributes one parent link;
-    /// the class env itself is that link's target (depth 0 when the frame env
-    /// is the class env directly).
-    fn super_env_depth(&self) -> u8 {
-        let units = &self.comp.plans.units;
-        let mut depth = 0u8;
-        let mut cur = Some(self.unit);
-        while let Some(u) = cur {
-            if units[u].has_env {
-                depth += 1;
-            }
-            if !units[u].is_arrow && units[u].uses_super {
-                break;
-            }
-            cur = units[u].parent;
-        }
-        depth
+    /// nearest method/constructor unit. See [`Plans::super_env_depth_between`],
+    /// which owns the walk; this is the `FnCtx`-level accessor for it.
+    fn super_env_depth(&self) -> u16 {
+        self.comp.plans.super_env_depth_between(self.unit)
     }
 
     /// Emits the load half of a member read whose base (`obj`) and key
@@ -2343,7 +2329,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         }
         let plan = &self.comp.plans.units[home];
         if let Some(slot) = plan.this_slot {
-            let depth = self.comp.plans.env_depth_between(self.unit, home);
+            let depth = self.comp.plans.env_depth_between(self.unit, home)?;
             self.emit_get_env(dst, depth, slot, span);
         } else {
             // Home did not allocate a `this` env slot (e.g. class field

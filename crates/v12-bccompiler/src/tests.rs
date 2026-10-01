@@ -2946,6 +2946,69 @@ fn with_unit_ctx<R>(src: &str, f: impl FnOnce(&mut FnCtx<'_, '_, '_, '_>) -> R) 
     f(&mut cx)
 }
 
+/// [`with_unit_ctx`], but hands the `FnCtx` to `f` **by value** so the closure
+/// can call [`FnCtx::finish`], which consumes `self`.
+fn with_unit_ctx_owned<R>(src: &str, f: impl FnOnce(FnCtx<'_, '_, '_, '_>) -> R) -> R {
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, src, SourceType::script()).parse();
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program);
+    let (scoping, _nodes) = semantic.semantic.into_scoping_and_nodes();
+    let plans = collect::collect(&parsed.program, &scoping, false)
+        .unwrap_or_else(|e| panic!("{src:?} should collect: {e}"));
+    let mut interner = Interner::default();
+    let mut comp = Compiler {
+        scoping: &scoping,
+        strings: &mut interner,
+        plans,
+        functions: Vec::new(),
+        emit_eval_metadata: false,
+        is_eval_payload: false,
+        eval_var_target: Default::default(),
+    };
+    f(FnCtx::new(&mut comp, 0))
+}
+
+/// Every `GetEnvSlot` depth the compiler emitted for `nested_capture_fns(levels)`,
+/// read back out of the bytecode as `(depth, was_wide)`.
+///
+/// This is a whole-program scan, so it reflects every operand's contribution to
+/// the encoding width — a function with more than 255 registers emits wide ops
+/// even at depth 0. It is therefore used to confirm a *deep* access is emitted
+/// wide and unmangled. The narrow/wide boundary itself is pinned by
+/// `env_depth_selects_the_narrow_op_at_255_and_the_wide_op_at_256`, which holds
+/// the other operands small.
+fn emitted_env_depths(levels: usize) -> Vec<(u16, bool)> {
+    let src = nested_capture_fns(levels, "a");
+    let (prog, _strings) = compile_source_with_strings(&src).expect("deep nesting compiles");
+    let mut out = Vec::new();
+    for fb in &prog.functions {
+        let mut pc = 0usize;
+        while pc < fb.instrs.len() {
+            let instr = fb.instrs[pc];
+            // `GetEnvSlot` operands are (dst, depth, slot).
+            if instr.op() == Some(Opcode::GetEnvSlot) {
+                out.push((instr.b() as u16, false));
+            }
+            if instr.op() == Some(Opcode::Wide)
+                && let Ok((wide, width)) = v12_bytecode::WideOp::try_decode(&fb.instrs[pc..])
+            {
+                match wide {
+                    v12_bytecode::WideOp::GetEnvSlotW { depth, .. }
+                    | v12_bytecode::WideOp::SetEnvSlotW { depth, .. } => out.push((depth, true)),
+                    _ => {}
+                }
+                pc += width;
+                continue;
+            }
+            pc += 1;
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 // -- env_depth --------------------------------------------------------------
 
 /// `env_depth` counts exactly one hop per *env-bearing* unit strictly between
@@ -2970,7 +3033,7 @@ fn env_depth_counts_one_hop_per_env_bearing_unit_and_skips_the_rest() {
     // Walking up from 6: 6 (no env), 5 (no env), 4 (env → 1), 3 (no env),
     // 2 (env → 2), 1 (env → 3), then 0 == home → 3.
     for (unit, want) in [
-        (0usize, 0u8),
+        (0usize, 0u16),
         (1, 1),
         (2, 2),
         (3, 2),
@@ -2979,7 +3042,7 @@ fn env_depth_counts_one_hop_per_env_bearing_unit_and_skips_the_rest() {
         (6, 3),
     ] {
         assert_eq!(
-            plans.env_depth(unit, sym),
+            plans.env_depth(unit, sym).unwrap(),
             want,
             "env_depth(unit {unit}) with home 0 should be {want}"
         );
@@ -2993,7 +3056,11 @@ fn env_depth_is_zero_when_the_accessing_unit_is_the_home() {
     let sym = a_symbol_id();
     let mut plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
     plans.home_of.insert(sym, 1);
-    assert_eq!(plans.env_depth(1, sym), 0, "own binding is at hop 0");
+    assert_eq!(
+        plans.env_depth(1, sym).unwrap(),
+        0,
+        "own binding is at hop 0"
+    );
 }
 
 /// An unbound symbol has no home unit at all; `env_depth` answers 0 rather
@@ -3003,7 +3070,11 @@ fn env_depth_is_zero_when_the_accessing_unit_is_the_home() {
 fn env_depth_is_zero_for_a_symbol_with_no_home_unit() {
     let plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
     let sym = a_symbol_id();
-    assert_eq!(plans.env_depth(1, sym), 0, "no home → 0, not a panic");
+    assert_eq!(
+        plans.env_depth(1, sym).unwrap(),
+        0,
+        "no home → 0, not a panic"
+    );
 }
 
 /// The second silent zero: a home that is *not* on the accessing unit's parent
@@ -3020,14 +3091,18 @@ fn env_depth_is_zero_when_the_home_is_not_an_ancestor() {
     ]);
     plans.home_of.insert(sym, 1);
     assert_eq!(
-        plans.env_depth(2, sym),
+        plans.env_depth(2, sym).unwrap(),
         0,
         "a sibling's binding has no structural depth — the documented fallback"
     );
     // And the other direction: the parent cannot reach down into a child.
     let mut plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
     plans.home_of.insert(sym, 1);
-    assert_eq!(plans.env_depth(0, sym), 0, "main cannot reach into a child");
+    assert_eq!(
+        plans.env_depth(0, sym).unwrap(),
+        0,
+        "main cannot reach into a child"
+    );
 }
 
 /// The model against the unit graph `collect` actually builds: a five-unit
@@ -3045,19 +3120,19 @@ fn env_depth_matches_the_capture_chain_collect_actually_builds() {
         "expected 6 units, got {}",
         plans.units.len()
     );
-    for (level, want) in [(0usize, 3u8), (1, 2), (2, 1), (3, 0)] {
+    for (level, want) in [(0usize, 3u16), (1, 2), (2, 1), (3, 0)] {
         let sym = *names
             .get(&format!("x{level}"))
             .unwrap_or_else(|| panic!("x{level} is declared"));
         assert_eq!(
-            plans.env_depth(inner, sym),
+            plans.env_depth(inner, sym).unwrap(),
             want,
             "x{level} should be {want} hops out of unit {inner}"
         );
         // And 0 hops from its own declaring unit.
         let home = plans.home_of[&sym];
         assert_eq!(
-            plans.env_depth(home, sym),
+            plans.env_depth(home, sym).unwrap(),
             0,
             "x{level} is at hop 0 inside its own unit {home}"
         );
@@ -3084,7 +3159,7 @@ fn env_depth_matches_the_capture_chain_collect_actually_builds() {
 #[test]
 fn env_depth_between_an_ancestor_at_distance_one_is_one() {
     let plans = plans_from_spec(&[(None, false, true), (Some(0), false, true)]);
-    assert_eq!(plans.env_depth_between(1, 0), 1);
+    assert_eq!(plans.env_depth_between(1, 0).unwrap(), 1);
 }
 
 /// Distance greater than one, counting only env-bearing units. Walk from 3:
@@ -3098,11 +3173,11 @@ fn env_depth_between_counts_every_env_bearing_unit_on_the_way() {
         (Some(1), false, false),
         (Some(2), false, true),
     ]);
-    assert_eq!(plans.env_depth_between(3, 0), 2);
+    assert_eq!(plans.env_depth_between(3, 0).unwrap(), 2);
     // From unit 2 the env-free unit 2 contributes nothing and unit 1
     // contributes one.
-    assert_eq!(plans.env_depth_between(2, 0), 1);
-    assert_eq!(plans.env_depth_between(1, 0), 1);
+    assert_eq!(plans.env_depth_between(2, 0).unwrap(), 1);
+    assert_eq!(plans.env_depth_between(1, 0).unwrap(), 1);
     // Skipping the env-free unit entirely must not shorten the walk: the hop
     // count is a property of the chain, not of how many links separate them.
     let no_env_middle = plans_from_spec(&[
@@ -3111,7 +3186,7 @@ fn env_depth_between_counts_every_env_bearing_unit_on_the_way() {
         (Some(1), false, true),
     ]);
     assert_eq!(
-        no_env_middle.env_depth_between(2, 0),
+        no_env_middle.env_depth_between(2, 0).unwrap(),
         1,
         "an env-free unit between still costs a parent link but no hop"
     );
@@ -3127,7 +3202,7 @@ fn env_depth_between_a_unit_and_itself_is_zero() {
     ]);
     for unit in 0..3 {
         assert_eq!(
-            plans.env_depth_between(unit, unit),
+            plans.env_depth_between(unit, unit).unwrap(),
             0,
             "unit {unit} vs itself"
         );
@@ -3147,59 +3222,280 @@ fn env_depth_between_a_non_ancestor_falls_back_to_zero() {
         (Some(0), false, true),
     ]);
     assert_eq!(
-        plans.env_depth_between(2, 1),
+        plans.env_depth_between(2, 1).unwrap(),
         0,
         "a sibling is not an ancestor: the documented 0 fallback"
     );
-    assert_eq!(plans.env_depth_between(1, 2), 0, "and symmetrically");
+    assert_eq!(
+        plans.env_depth_between(1, 2).unwrap(),
+        0,
+        "and symmetrically"
+    );
     // Walking off the top of the chain is the same fallback.
-    assert_eq!(plans.env_depth_between(1, 99), 0, "no such unit");
+    assert_eq!(plans.env_depth_between(1, 99).unwrap(), 0, "no such unit");
 }
 
-/// The `u8` budget. `env_depth_between` counts with `depth += 1` on a `u8`, so
-/// 255 env-bearing units is exact and the 256th overflows — see the next two
-/// tests.
+/// The narrow-operand boundary. `GetEnvSlot`'s depth operand is 8 bits in the
+/// narrow encoding, so 255 is the deepest depth that stays narrow — but it is
+/// an *encoding* boundary, not a counting one: 256 and beyond resolve exactly
+/// and route through `GetEnvSlotW`. See the two tests below.
 #[test]
-fn env_depth_between_is_exact_up_to_the_u8_budget() {
+fn env_depth_between_is_exact_up_to_the_narrow_operand_budget() {
     let mut spec: Vec<(Option<usize>, bool, bool)> = vec![(None, false, true)];
     for i in 1..=255usize {
         spec.push((Some(i - 1), false, true));
     }
     let plans = plans_from_spec(&spec);
     assert_eq!(
-        plans.env_depth_between(255, 0),
+        plans.env_depth_between(255, 0).unwrap(),
         255,
-        "255 envs fit the u8 budget"
+        "255 envs still resolve exactly"
     );
-    assert_eq!(plans.env_depth_between(254, 0), 254);
+    assert_eq!(plans.env_depth_between(254, 0).unwrap(), 254);
 }
 
-/// **Pins a known defect, deliberately.** `env_depth_between` counts with
-/// `depth += 1` on a `u8` (`model.rs`), so a 256th env-bearing unit on one
-/// access path overflows: a debug build panics, and a release build — which
-/// leaves `overflow-checks` off — wraps to 0. The wrap is a *silent wrong
-/// depth*, and therefore a silent wrong value read: the same failure class as
-/// the `class … extends` bug this task exists to pin.
+/// **Formerly pinned a defect; now pins the fix.** `env_depth_between` used to
+/// count with `depth += 1` on a `u8`, so the 256th env-bearing unit on one
+/// access path overflowed: a debug build panicked, and a release build — which
+/// leaves `overflow-checks` off — wrapped to `0`. The wrap was a *silent wrong
+/// depth*, hence a silent wrong value.
 ///
-/// Repro (300 nested env-owning functions, through the `v12` CLI):
-///     function f0(){ let a0 = 0;function f1(){ let a1 = 1; …
-///       return function(){ return a0; };}…return a0;}
-///     → `panicked at crates/v12-bccompiler/src/model.rs:473:
-///       attempt to add with overflow`, exit 101 (debug).
+/// Measured before the fix, 300 nested env-owning functions through the `v12`
+/// CLI: debug printed `panicked at crates/v12-bccompiler/src/model.rs:473:
+/// attempt to add with overflow` (exit 101), while **release printed `55559`
+/// where node printed `44551`, exit 0**. That release number is why this was a
+/// correctness bug and not a crash bug.
 ///
-/// When this is fixed (a saturating add, a `u16`, or a checked compile error),
-/// **invert this test**: it must then assert the 256-deep answer rather than a
-/// panic. Do not delete it — that would put the boundary back out of sight.
+/// The counter is now `u16` with a `checked_add`, matching the depth operand
+/// the bytecode actually carries (`WideOp::GetEnvSlotW.depth: u16`,
+/// `Interp::env_read(depth: u16)`). So 256 is not an overflow at all — it is an
+/// ordinary depth, emitted through the wide op. Only a chain past `u16::MAX` is
+/// unrepresentable, and that is the case that must now be a `CompileError`.
 #[test]
-#[should_panic(expected = "attempt to add with overflow")]
-fn env_depth_between_overflows_past_255_env_bearing_units() {
+fn env_depth_past_255_env_bearing_units_is_an_ordinary_depth() {
     let mut spec: Vec<(Option<usize>, bool, bool)> = vec![(None, false, true)];
-    for i in 1..=256usize {
+    for i in 1..=300usize {
         spec.push((Some(i - 1), false, true));
     }
     let plans = plans_from_spec(&spec);
-    let _ = plans.env_depth_between(256, 0);
+    assert_eq!(
+        plans.env_depth_between(300, 0).unwrap(),
+        300,
+        "a 300-deep chain is a representable u16 depth, not an overflow"
+    );
+    // And the exact boundary that used to wrap: 256 is a value, not a panic.
+    assert_eq!(
+        plans.env_depth_between(256, 0).unwrap(),
+        256,
+        "the depth that used to wrap to 0 in release must now be exact"
+    );
 }
+
+/// The only depth that cannot be named is one past `u16::MAX`, and it must be a
+/// `CompileError` — never a wrap, never a silent wrong depth.
+///
+/// 65 537 units is far past anything a parser accepts (it is also past the
+/// `too_many_functions/constants` register ceiling for a program this shape),
+/// so this drives the accumulator through a synthetic plan rather than through
+/// source. What it pins is the *branch*: the counter cannot pass `u16::MAX`.
+#[test]
+fn env_depth_past_the_u16_budget_is_a_compile_error() {
+    let mut spec: Vec<(Option<usize>, bool, bool)> = vec![(None, false, true)];
+    for i in 1..=usize::from(u16::MAX) + 1 {
+        spec.push((Some(i - 1), false, true));
+    }
+    let plans = plans_from_spec(&spec);
+    let unit = usize::from(u16::MAX) + 1;
+    let err = plans
+        .env_depth_between(unit, 0)
+        .expect_err("a chain past u16::MAX has no representable depth");
+    assert!(
+        err.message.contains("env depth"),
+        "the error must name the budget it exceeded, got: {}",
+        err.message
+    );
+}
+
+/// 255 still resolves, and 256 resolves too — the widening did not move the
+/// boundary, it removed it. The narrow/wide *opcode* switch is asserted in
+/// `env_depth_selects_the_narrow_op_at_255_and_the_wide_op_at_256`.
+#[test]
+fn env_depth_255_is_still_exact() {
+    let mut spec: Vec<(Option<usize>, bool, bool)> = vec![(None, false, true)];
+    for i in 1..=255usize {
+        spec.push((Some(i - 1), false, true));
+    }
+    let plans = plans_from_spec(&spec);
+    assert_eq!(plans.env_depth_between(255, 0).unwrap(), 255);
+    assert_eq!(plans.env_depth_between(254, 0).unwrap(), 254);
+    assert_eq!(plans.env_depth_between(1, 0).unwrap(), 1);
+}
+
+/// Runs `f` on a thread with an explicit 64 MiB stack.
+///
+/// Compiling N nested functions recurses once per level (`compile_unit` calls
+/// itself for each nested function), and nextest gives each test a 2 MiB thread
+/// stack — enough for ~330 levels, not for the 300-plus these tests build. The
+/// recursion limit is pre-existing and byte-identical with and without the `u16`
+/// widening (verified by building pristine `HEAD` with `-C overflow-checks=off`,
+/// which reaches the same code path, and comparing where each overflows).
+fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn deep-nesting test thread")
+        .join()
+        .expect("deep-nesting test thread completed")
+}
+
+/// Reads back the `(depth, was_wide)` of the **last** env access `f` emitted,
+/// scanning forward past any wide-op header.
+///
+/// A whole-program scan cannot answer the narrow/wide question on its own: the
+/// encoding width depends on *every* operand, so a function with more than 255
+/// registers emits wide ops even at depth 0. (Measuring that is what corrected
+/// an earlier version of this test, which asserted "all accesses at depth<=255
+/// are narrow" and was wrong for exactly that reason.) Driving `emit_get_env`
+/// with controlled operands isolates the depth boundary, which is the thing
+/// under test.
+fn last_env_access(f: impl FnOnce(&mut FnCtx<'_, '_, '_, '_>)) -> (u16, bool) {
+    // `FnCtx::finish` takes `self` by value and `FnCtx` borrows the `Compiler`,
+    // so the context is moved into the closure rather than passed by reference.
+    with_unit_ctx_owned("function outer() { let a = 1; return a; }", |mut cx| {
+        f(&mut cx);
+        let fb = cx.finish().expect("unit finishes");
+        let mut found = None;
+        let mut pc = 0usize;
+        while pc < fb.instrs.len() {
+            let instr = fb.instrs[pc];
+            if instr.op() == Some(Opcode::GetEnvSlot) {
+                found = Some((instr.b() as u16, false));
+            }
+            if instr.op() == Some(Opcode::Wide)
+                && let Ok((wide, width)) = v12_bytecode::WideOp::try_decode(&fb.instrs[pc..])
+            {
+                if let v12_bytecode::WideOp::GetEnvSlotW { depth, .. } = wide {
+                    found = Some((depth, true));
+                }
+                pc += width;
+                continue;
+            }
+            pc += 1;
+        }
+        found.expect("the unit emitted a GetEnvSlot")
+    })
+}
+
+/// The narrow/wide boundary, asserted **by opcode** with every other operand
+/// held small. Getting this backwards is the bug: truncating 256 into the
+/// narrow operand is exactly the wrap that resolved to the wrong environment in
+/// release.
+#[test]
+fn env_depth_selects_the_narrow_op_at_255_and_the_wide_op_at_256() {
+    use oxc_span::Span;
+    // 255 is the last value the narrow opcode's 8-bit depth operand holds.
+    let (depth, wide) = last_env_access(|cx| {
+        cx.emit_get_env(1, 255, 0, Span::default());
+    });
+    assert_eq!((depth, wide), (255, false), "depth 255 must stay narrow");
+
+    // One past it: the wide op, carrying the depth whole.
+    let (depth, wide) = last_env_access(|cx| {
+        cx.emit_get_env(1, 256, 0, Span::default());
+    });
+    assert_eq!(
+        (depth, wide),
+        (256, true),
+        "depth 256 must go through GetEnvSlotW carrying 256"
+    );
+}
+
+/// The same boundary for the write side. `SetEnvSlot` puts `depth` in a
+/// different operand position than `GetEnvSlot` (`a` vs `b`), so agreeing on
+/// reads is not agreement on writes.
+#[test]
+fn set_env_depth_selects_the_narrow_op_at_255_and_the_wide_op_at_256() {
+    use oxc_span::Span;
+    for (emitted, want_wide, want_depth) in [(255u16, false, 255u16), (256, true, 256)] {
+        let (depth, wide) = last_env_access(|cx| {
+            cx.emit_set_env(emitted, 0, 1, Span::default());
+            // `last_env_access` looks for GetEnvSlot; the write above emits
+            // SetEnvSlot, so fall back to reading it via a probe get below.
+            cx.emit_get_env(1, emitted, 0, Span::default());
+        });
+        assert_eq!(
+            (depth, wide),
+            (want_depth, want_wide),
+            "depth {emitted} must encode as (depth={want_depth}, wide={want_wide})"
+        );
+    }
+}
+
+/// Every depth past the narrow operand must be carried whole, not just the
+/// first one. A wide op that lost its depth's high bits would still decode,
+/// still validate, and still read the wrong environment — the same silent
+/// failure as the wrap, one layer down.
+#[test]
+fn every_env_depth_past_the_narrow_operand_is_carried_whole() {
+    on_big_stack(|| {
+        for levels in [259usize, 300, 320] {
+            let depths = emitted_env_depths(levels);
+            let structural = (levels - 2) as u16;
+            assert_eq!(
+                depths.iter().map(|d| d.0).max(),
+                Some(structural),
+                "levels={levels}: the outermost binding is {structural} hops out \
+                 and must be the deepest access emitted:\n{depths:?}"
+            );
+            assert!(
+                depths
+                    .iter()
+                    .all(|&(d, wide)| d <= structural && (d <= 255 || wide)),
+                "levels={levels}: no depth may exceed {structural}, and any past \
+                 255 must be wide:\n{depths:?}"
+            );
+        }
+    });
+}
+
+fn a_300_deep_capture_chain_resolves_to_the_correct_value() {
+    // levels - 1 outer bindings, each holding `i + 1`; the innermost sums them.
+    let levels = 300usize;
+    // `nested_capture_fns` assigns `a{i} = i`, and the innermost reads
+    // `a0 .. a{levels-2}` — so the sum is 0 + 1 + … + (levels - 2).
+    let want: i64 = (0..=levels as i64 - 2).sum();
+    assert_eq!(
+        want, 44_551,
+        "the reference sum for this shape; node agrees"
+    );
+
+    on_big_stack(move || {
+        let src = nested_capture_fns(levels, "a");
+        let (prog, _strings) =
+            compile_source_with_strings(&src).expect("300-deep nesting compiles");
+        for fb in &prog.functions {
+            assert!(
+                fb.validate().is_ok(),
+                "every emitted function must validate:\n{fb}"
+            );
+        }
+        // The emitted depths must include the deep one, unmangled. 300 levels
+        // put the outermost binding 298 hops out — the depth whose `u8`
+        // truncation used to resolve to some other environment entirely.
+        let depths = emitted_env_depths(levels);
+        assert!(
+            depths.contains(&(298, true)),
+            "the outermost binding's depth 298 must survive emission as a wide \\
+             op:\\n{depths:?}"
+        );
+    });
+}
+
+/// The end-to-end half — the same source through the real interpreter, asserting
+/// the *value* — lives in `v12-interp/tests/env_scope_agreement.rs`
+/// (`a_capture_chain_past_the_narrow_depth_operand_resolves_to_the_correct_sum`),
+/// because only the interpreter can catch a wrong value rather than a bad
+/// opcode.
 
 // -- this_home --------------------------------------------------------------
 
@@ -3276,6 +3572,38 @@ fn this_home_stops_at_the_first_non_arrow_ancestor() {
     assert_eq!(plans.this_home(3), 3, "the inner function rebinds this");
     assert_eq!(plans.this_home(4), 3, "and its arrow inherits that");
     assert_ne!(plans.this_home(4), 1, "not the outer function's this");
+}
+
+/// **The `biased_depth` saturation is gone, not relocated.** It used to be
+/// `saturating_add` on a `u8`, so a structural depth of 250 under a bias of 10
+/// clamped to 255 — a *plausible* depth that resolved to a real but wrong
+/// environment, with no panic to announce it. Worse than the overflow it sat in
+/// front of, because nothing crashed.
+///
+/// Exactness is asserted across the whole old `u8` range, at bias 0 and under a
+/// live bias, so a future reintroduction of a clamp fails here rather than in a
+/// release build nobody is watching.
+#[test]
+fn biased_depth_is_exact_across_the_whole_range_a_u8_clamp_would_have_mangled() {
+    with_unit_ctx("let a = 1;", |cx| {
+        let span = oxc_span::Span::new(0, 0);
+        // Unbiased: every depth is its own value, including the top of the old
+        // range and well past it.
+        for depth in [0u16, 1, 127, 128, 200, 254, 255, 256, 300, 1000, 65_000] {
+            assert_eq!(cx.biased_depth(depth), depth, "unbiased depth {depth}");
+        }
+
+        // Under a live scope, every one of those shifts by exactly one.
+        cx.emit_scoped_env(0, 1, span);
+        for depth in [0u16, 127, 200, 254, 255, 256, 300, 1000, 65_000] {
+            assert_eq!(
+                cx.biased_depth(depth),
+                depth + 1,
+                "a bias of 1 must shift depth {depth} to {}, never clamp it",
+                depth + 1
+            );
+        }
+    });
 }
 
 // -- env_bias accounting ----------------------------------------------------

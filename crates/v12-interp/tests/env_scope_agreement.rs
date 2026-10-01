@@ -188,3 +188,55 @@ fn writes_at_a_depth_past_the_env_display_cap_land_in_the_right_environment() {
     // 1 + 2 + 4 + ... + 512 = 1023.
     assert_eq!(run_real(&src), "1023");
 }
+
+/// **The `u8` env-depth overflow, pinned as a value.** `Plans::env_depth_between`
+/// used to count hops on a `u8`, so a capture chain deeper than 255 env-bearing
+/// units overflowed: a debug build panicked, and a release build — with
+/// `overflow-checks` off — wrapped the depth to `0`. The wrap emitted a
+/// `GetEnvSlot` at depth 0, which resolves successfully against whatever
+/// environment happens to be innermost, so it produced a **plausible wrong
+/// number** rather than an error. Measured on 300 levels before the fix: debug
+/// `attempt to add with overflow` (exit 101), release `55559` where node prints
+/// `44551` (exit 0).
+///
+/// The depth counter is now `u16`, matching the depth operand the bytecode
+/// carries (`WideOp::GetEnvSlotW.depth` is a `u16`, and `env_read` takes one), so
+/// this depth is emitted through the wide op and resolves exactly.
+///
+/// Asserting the *value* is the point: every level holds a distinct number, so a
+/// depth resolved even slightly wrong changes the sum, and a panic-free
+/// assertion would have passed while release printed the wrong answer.
+#[test]
+fn a_capture_chain_past_the_narrow_depth_operand_resolves_to_the_correct_sum() {
+    // On a 64 MiB stack: compiling N nested functions recurses once per level and
+    // nextest gives each test a 2 MiB thread stack. That recursion limit is
+    // pre-existing and byte-identical with and without the `u16` widening.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(a_capture_chain_past_the_narrow_depth_operand_body)
+        .expect("spawn deep-nesting test thread")
+        .join()
+        .expect("deep-nesting test thread completed");
+}
+
+fn a_capture_chain_past_the_narrow_depth_operand_body() {
+    // `levels - 2` is the depth of `a0` from the innermost unit. 300 puts that
+    // at 298 — past the old `u8` budget, and past `ENV_DISPLAY_CAP` too, so the
+    // read is served by the parent-link walk at a depth only the wide op can
+    // name.
+    for levels in [2usize, 254, 256, 257, 300, 600] {
+        let (src, want) = nested_capture_source(levels);
+        assert_eq!(
+            run_real(&src),
+            want.to_string(),
+            "{levels} nested env-owning functions: `a0` is {} hops out, which {} \
+             the narrow depth operand",
+            levels - 2,
+            if levels - 2 > u8::MAX as usize {
+                "exceeds"
+            } else {
+                "fits within"
+            }
+        );
+    }
+}
