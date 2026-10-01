@@ -22,9 +22,9 @@
 
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
-    ArrayExpressionElement, ArrowFunctionExpression, AssignmentTarget, BindingPattern, Expression,
-    ForStatementInit, FormalParameters, Function, ImportPhase, ModuleDeclaration, ModuleExportName,
-    Program, PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
+    ArrayExpressionElement, ArrowFunctionExpression, BindingPattern, Expression, ForStatementInit,
+    FormalParameters, Function, ImportPhase, ModuleDeclaration, ModuleExportName, Program,
+    PropertyKey, SimpleAssignmentTarget, Statement, VariableDeclaration,
 };
 use oxc_semantic::{AstNodes, ScopeId, Scoping, SymbolId};
 use oxc_span::GetSpan;
@@ -237,25 +237,12 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
                 _ => false,
             },
             Expression::AssignmentExpression(a) => {
-                let lhs = match &a.left {
-                    AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                        id.name.as_str() == "arguments"
-                    }
-                    AssignmentTarget::ArrayAssignmentTarget(arr) => arr
-                        .elements
-                        .iter()
-                        .flatten()
-                        .any(|el| match el {
-                            oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
-                                target_is_arguments(&d.binding) || walk_expr(&d.init)
-                            }
-                            other => other
-                                .as_simple_assignment_target()
-                                .is_some_and(simple_target_is_arguments),
-                        }),
-                    _ => false,
-                };
-                lhs || walk_expr(&a.right)
+                // The whole left side, not just an identifier: `({a: b =
+                // arguments} = o)` and `([a = arguments] = o)` both put the
+                // reference in a destructuring default. `walk_assignment_target`
+                // is exhaustive over `AssignmentTarget` and subsumes the
+                // identifier and array cases this used to spell out inline.
+                walk_assignment_target(&a.left) || walk_expr(&a.right)
             }
             Expression::ConditionalExpression(c) => {
                 walk_expr(&c.test) || walk_expr(&c.consequent) || walk_expr(&c.alternate)
@@ -347,42 +334,134 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
             | Expression::JSXFragment(_) => false,
         }
     }
-    fn simple_target_is_arguments(t: &SimpleAssignmentTarget<'_>) -> bool {
-        matches!(
-            t,
-            SimpleAssignmentTarget::AssignmentTargetIdentifier(id) if id.name.as_str() == "arguments"
-        )
+    /// ES §15.7.1: a binding pattern is not just a shape — `AssignmentPattern`
+    /// and `BindingProperty` both carry a *default*, and a computed
+    /// `BindingProperty` key is a full `Expression`. All three are
+    /// `CanContainArguments`, so a pattern that only names identifiers is
+    /// invisible to `ContainsArguments` unless it is descended into.
+    ///
+    /// Exhaustive over `BindingPattern` (4 variants) and `BindingProperty` is a
+    /// struct, so there is nothing to match on its key beyond `computed`.
+    fn walk_binding_pattern(p: &BindingPattern<'_>) -> bool {
+        match p {
+            // A bare binding *name* is not a reference: `let arguments = 1` is
+            // rejected by the strict-mode binding rule in `Collect`, not here.
+            // (`ContainsArguments` is about reading the binding.)
+            BindingPattern::BindingIdentifier(_) => false,
+            BindingPattern::ObjectPattern(o) => {
+                o.properties.iter().any(walk_binding_property)
+                    || o.rest
+                        .as_ref()
+                        .is_some_and(|r| walk_binding_pattern(&r.argument))
+            }
+            BindingPattern::ArrayPattern(a) => {
+                a.elements.iter().flatten().any(walk_binding_pattern)
+                    || a.rest
+                        .as_ref()
+                        .is_some_and(|r| walk_binding_pattern(&r.argument))
+            }
+            // `{a = arguments}` / `[a = arguments]`: the default is an
+            // `AssignmentExpression` that runs when the element is undefined.
+            BindingPattern::AssignmentPattern(a) => {
+                walk_expr(&a.right) || walk_binding_pattern(&a.left)
+            }
+        }
     }
-    fn target_is_arguments(t: &oxc_ast::ast::AssignmentTarget<'_>) -> bool {
-        t.as_simple_assignment_target()
-            .is_some_and(simple_target_is_arguments)
+    fn walk_binding_property(p: &oxc_ast::ast::BindingProperty<'_>) -> bool {
+        // `{[arguments]: a}`: a computed key is evaluated like any other
+        // expression. A static/private key is a name, not a reference.
+        (p.computed && p.key.as_expression().is_some_and(walk_expr))
+            || walk_binding_pattern(&p.value)
     }
-    /// A declarator's *initializer* is the only part of a `VariableDeclaration`
-    /// that evaluates an expression; the binding id is a pattern. Shared by the
-    /// `VariableDeclaration` arm above and the three loop heads below, which is
-    /// why `for (let a = arguments;;) {}` is caught like `let a = arguments;`.
+    /// The assignment-target twin of `walk_binding_pattern`: used for a for-in/
+    /// of head that is an assignment rather than a declaration, and for the
+    /// left of an `AssignmentExpression`. Exhaustive over `AssignmentTarget`'s
+    /// flattened 13 (`SimpleAssignmentTarget` 9 + `AssignmentTargetPattern` 2 +
+    /// ... resolved through `INHERIT`), matching `walk_expr`'s member arms.
+    fn walk_assignment_target(t: &oxc_ast::ast::AssignmentTarget<'_>) -> bool {
+        match t {
+            // `for (arguments of o)`: the head reads the binding.
+            oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                id.name.as_str() == "arguments"
+            }
+            oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(c) => {
+                walk_expr(&c.object) || walk_expr(&c.expression)
+            }
+            oxc_ast::ast::AssignmentTarget::StaticMemberExpression(s) => walk_expr(&s.object),
+            oxc_ast::ast::AssignmentTarget::PrivateFieldExpression(p) => walk_expr(&p.object),
+            oxc_ast::ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
+                arr.elements.iter().flatten().any(walk_maybe_default)
+                    || arr
+                        .rest
+                        .as_ref()
+                        .is_some_and(|r| walk_assignment_target(&r.target))
+            }
+            oxc_ast::ast::AssignmentTarget::ObjectAssignmentTarget(obj) => {
+                obj.properties.iter().any(walk_assignment_property)
+                    || obj
+                        .rest
+                        .as_ref()
+                        .is_some_and(|r| walk_assignment_target(&r.target))
+            }
+            oxc_ast::ast::AssignmentTarget::TSAsExpression(_)
+            | oxc_ast::ast::AssignmentTarget::TSSatisfiesExpression(_)
+            | oxc_ast::ast::AssignmentTarget::TSNonNullExpression(_)
+            | oxc_ast::ast::AssignmentTarget::TSTypeAssertion(_) => false,
+        }
+    }
+    /// `[a = arguments]` / `({a: b = arguments} = o)`: the default runs at the
+    /// assignment, so it is searched. `AssignmentTargetMaybeDefault` is
+    /// `AssignmentTargetWithDefault` plus `INHERIT(AssignmentTarget)`.
+    fn walk_maybe_default(t: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>) -> bool {
+        match t {
+            oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+                walk_expr(&d.init) || walk_assignment_target(&d.binding)
+            }
+            other => other
+                .as_assignment_target()
+                .is_some_and(walk_assignment_target),
+        }
+    }
+    fn walk_assignment_property(p: &oxc_ast::ast::AssignmentTargetProperty<'_>) -> bool {
+        match p {
+            // `{a} = o` shorthand: the key *is* the reference. `{a = init}` (the
+            // `init` field) is the default form.
+            oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
+                id.binding.name.as_str() == "arguments" || id.init.as_ref().is_some_and(walk_expr)
+            }
+            oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(pp) => {
+                (pp.computed && pp.name.as_expression().is_some_and(walk_expr))
+                    || walk_maybe_default(&pp.binding)
+            }
+        }
+    }
+    /// A declarator's *initializer* is one of two places an expression can hide
+    /// in a declaration; the other is the binding pattern, which is why this
+    /// descends into `d.id` as well. Shared by the `VariableDeclaration` arm
+    /// above and the three loop heads below.
     fn walk_var_decl(v: &oxc_ast::ast::VariableDeclaration<'_>) -> bool {
         v.declarations
             .iter()
-            .any(|d| d.init.as_ref().is_some_and(walk_expr))
+            .any(|d| d.init.as_ref().is_some_and(walk_expr) || walk_binding_pattern(&d.id))
     }
-    /// The `left` of a for-in/of head, split the same two ways `Collect::stmt`
-    /// splits it (`:857-900`): a declaration contributes its declarator
-    /// initializers, an assignment target contributes the reference itself.
+    /// The `left` of a for-in/of head. `Collect::stmt` splits this the same way
+    /// (`:857-900`): a declaration, or an assignment target.
+    ///
+    /// Enumerated rather than wildcarded: `ForStatementLeft` flattens to 15, but
+    /// 14 of them are `AssignmentTarget`'s variants verbatim (`INHERIT`), so
+    /// converting through `as_assignment_target()` and delegating is both
+    /// exhaustive and short. A new `AssignmentTarget` variant is a compile error
+    /// in `walk_assignment_target` above, which is the guarantee that matters.
     fn walk_for_left(l: &oxc_ast::ast::ForStatementLeft<'_>) -> bool {
         match l {
             oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => walk_var_decl(v),
-            oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
-                id.name.as_str() == "arguments"
-            }
-            // The six `INHERIT(AssignmentTarget)` variants (array/object
-            // patterns, member targets, rest). A pattern *default* can evaluate
-            // an expression, so `for (const [a = arguments] of o)` is still
-            // missed — the same class of hole, one enum deeper. Enumerating them
-            // is ADR-0002 batch 3, which owns `ForStatementLeft` and its two
-            // wildcards in `Collect::stmt`; recorded here rather than dropped
-            // silently.
-            _ => false,
+            oxc_ast::ast::ForStatementLeft::TSAsExpression(_)
+            | oxc_ast::ast::ForStatementLeft::TSSatisfiesExpression(_)
+            | oxc_ast::ast::ForStatementLeft::TSNonNullExpression(_)
+            | oxc_ast::ast::ForStatementLeft::TSTypeAssertion(_) => false,
+            other => other
+                .as_assignment_target()
+                .is_some_and(walk_assignment_target),
         }
     }
     fn walk_stmt(s: &Statement<'_>) -> bool {
@@ -454,16 +533,22 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
                             || case.consequent.iter().any(walk_stmt)
                     })
             }
-            // The catch-clause `param` is a binding pattern, so for an identifier
-            // it is not a source of `arguments` and only the body is walked — but
-            // a *destructuring* default is (`try {} catch ({a = arguments}) {}`),
-            // the same pattern-default gap as `walk_for_left`, i.e. ADR-0002
-            // batch 2/3.
             Statement::TryStatement(t) => {
                 t.block.body.iter().any(walk_stmt)
-                    || t.handler
-                        .as_ref()
-                        .is_some_and(|h| h.body.body.iter().any(walk_stmt))
+                    || t.handler.as_ref().is_some_and(|h| {
+                        // The catch parameter is a `CatchParameter`, whose
+                        // `pattern` is a `BindingPattern`. For an identifier it
+                        // is not a source of `arguments` (that is the strict
+                        // binding rule in `Collect`, not `ContainsArguments`),
+                        // but a destructuring default is:
+                        // `try {} catch ({a = arguments}) {}`. Fixed together
+                        // with the rest of the pattern-default gap — this arm
+                        // used to walk the clause body only.
+                        h.param
+                            .as_ref()
+                            .is_some_and(|p| walk_binding_pattern(&p.pattern))
+                            || h.body.body.iter().any(walk_stmt)
+                    })
                     || t.finalizer
                         .as_ref()
                         .is_some_and(|f| f.body.iter().any(walk_stmt))

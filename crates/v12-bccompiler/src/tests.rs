@@ -2275,7 +2275,104 @@ fn class_field_initializer_arrow_body_statements_without_arguments_compile() {
     }
 }
 
-/// ES §15.7.1: the `super()` *call* form is constructor-of-a-derived-class only.
+/// ES §15.7.1: a *binding pattern* carries expressions of its own — a default
+/// (`AssignmentPattern.right` / `AssignmentTargetWithDefault.init`) and a
+/// computed key — and `ContainsArguments` must descend into all of them. Every
+/// source below was accepted where the spec requires `SyntaxError`; each one is
+/// a distinct site: the catch parameter, a for-head declaration, a for-head
+/// assignment target, a plain declarator, or a computed key.
+#[test]
+fn class_field_initializer_arguments_in_binding_pattern_default_is_syntax_error() {
+    const MSG: &str = "'arguments' is not allowed in a class field initializer";
+    for src in [
+        // The catch parameter, reached from the `TryStatement` arm. The pattern
+        // is walked, not just the clause body.
+        "var C = class { x = (() => { try {} catch ({a = arguments}) {} })() };",
+        // Nested: the default is inside a nested object pattern.
+        "var C = class { x = (() => { try {} catch ({a: {b = arguments}}) {} })() };",
+        "var C = class { x = (() => { try {} catch ([a = arguments]) {} })() };",
+        // A for-of head, declaration form (`walk_var_decl` -> pattern).
+        "var C = class { x = (() => { for (const [a = arguments] of o) {} })() };",
+        "var C = class { x = (() => { for (const {a = arguments} of o) {} })() };",
+        // A for-of head, assignment-target form (no declaration).
+        "var C = class { x = (() => { for ([a = arguments] of o) {} })() };",
+        "var C = class { x = (() => { for ({a = arguments} of o) {} })() };",
+        // The same two for a for-in head.
+        "var C = class { x = (() => { for (const [a = arguments] in o) {} })() };",
+        "var C = class { x = (() => { for ([a = arguments] in o) {} })() };",
+        // A plain `let`/`const` declarator: the pattern, not the initializer.
+        "var C = class { x = (() => { let [a = arguments] = o; })() };",
+        "var C = class { x = (() => { let {a = arguments} = o; })() };",
+        "var C = class { x = (() => { let {a: {b = arguments}} = o; })() };",
+        // A `for` head, where the declarator has both a pattern and an init.
+        "var C = class { x = (() => { for (let [a = arguments] = o;;) {} })() };",
+        // A computed key is an `Expression`, not a name.
+        "var C = class { x = (() => { let {[arguments]: a} = o; })() };",
+        "var C = class { x = (() => { for (const {[arguments]: b} of o) {} })() };",
+        // A member target in a for-head: `o[arguments]` reads the computed key.
+        "var C = class { x = (() => { for (o[arguments] of o) {} })() };",
+        // A destructuring *assignment* — the `AssignmentExpression` left side.
+        "var C = class { x = ({a: b = arguments} = o); };",
+        "var C = class { x = ({a = arguments} = o); };",
+        "var C = class { x = ([[a = arguments]] = o); };",
+        "var C = class { x = ({[arguments]: b} = o); };",
+        // A rest element carrying a pattern with a default.
+        "var C = class { x = (() => { let [...[a = arguments]] = o; })() };",
+        // The pattern default must compose with the statement arms, not just
+        // fire one level deep.
+        "var C = class { x = (() => { for (const v of o) { if (v) { let {a = arguments} = o; } } })() };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("field initializer arguments should fail");
+        assert!(err.contains(MSG), "for {src}: got {err}");
+    }
+}
+
+/// Negative control for the pattern arms above: every pattern shape walked —
+/// catch parameter, for-head declaration, for-head assignment target, plain
+/// declarator, computed key, destructuring assignment, rest — with no
+/// `arguments`, must still compile. Guards against a descent that rejects every
+/// destructuring pattern in a field initializer.
+#[test]
+fn class_field_initializer_binding_patterns_without_arguments_compile() {
+    for src in [
+        // Plain identifier bindings, both head forms.
+        "var C = class { x = (() => { for (const k of o) {} })() };",
+        "var C = class { x = (() => { for (var k in o) {} })() };",
+        "var C = class { x = (() => { for ([a] of o) {} })() };",
+        "var C = class { x = (() => { for ({a} of o) {} })() };",
+        // Defaults that are not `arguments`.
+        "var C = class { x = (() => { for (const [a = 1] of o) {} })() };",
+        "var C = class { x = (() => { for (const {a = 1} of o) {} })() };",
+        "var C = class { x = (() => { for ([a = 1] of o) {} })() };",
+        "var C = class { x = (() => { try {} catch ({a = 1}) {} })() };",
+        "var C = class { x = (() => { try {} catch ([a = 1]) {} })() };",
+        "var C = class { x = (() => { let [a = 1] = o; })() };",
+        "var C = class { x = (() => { let {a = 1} = o; })() };",
+        // Patterns with no default at all, including rest and deep nesting.
+        "var C = class { x = (() => { try {} catch (e) {} })() };",
+        "var C = class { x = (() => { let {a} = o; })() };",
+        "var C = class { x = (() => { let [a, ...rest] = o; })() };",
+        "var C = class { x = (() => { let {a: {b: [c]}} = o; })() };",
+        "var C = class { x = ({...rest} = o); };",
+        "var C = class { x = (args = 1); };",
+        "var C = class { x = (a.b = 1); };",
+        "var C = class { x = (() => { for (o[k] of o) {} })() };",
+        "var C = class { x = (() => { for (o.a of o) {} })() };",
+        // A nested ordinary function has its own `arguments`, so the search
+        // stops at its parameter list — but only there: a pattern default in
+        // the *enclosing* scope is still a source, even when the pattern sits
+        // in the same statement as a function (`for (const [a = arguments] of
+        // function () {})` is a SyntaxError, confirmed against V8).
+        "var C = class { x = function ([a = arguments]) {} };",
+        "var C = class { x = (() => { (function ([a = arguments]) {})() })() };",
+        "var C = class { x = (() => { while (n) { (function (p = arguments) {})() } })() };",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
 #[test]
 fn super_call_outside_derived_constructor_is_syntax_error() {
     for src in [
