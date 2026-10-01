@@ -66,6 +66,50 @@ fn wide_operands_execute_with_documented_layouts() {
     assert_eq!(thrown.as_smi(), Some(1300));
 }
 
+/// **Probe (task W1.5): can the wide op carry a `depth` past 255?** The
+/// compiler's `env_depth_between` counts on a `u8`, but `WideOp::GetEnvSlotW`
+/// carries `depth: u16` and `env_read` takes `u16`. If a 300-deep chain reads
+/// correctly at depth 300 through the wide encoding, then the `u8` budget is a
+/// *compiler-side* narrowing, not a representational limit — which decides
+/// whether the fix is a `CompileError` or a widened operand.
+///
+/// Pushes `DEPTH` environments, writing `100 + i` into slot 0 of the i-th as it
+/// is pushed, then reads slot 0 at `DEPTH - 1 - 300` through `GetEnvSlotW`. The
+/// wide path must land on the same environment the narrow path would.
+#[test]
+fn wide_env_depth_past_255_resolves_the_same_environment() {
+    const DEPTH: u16 = 400;
+    // Read the environment that received value(i), i.e. i = DEPTH-1-read_depth.
+    // `LoadInt`'s immediate is a `u8`, so values are kept distinct mod 251 —
+    // ample for the 99-index separation used below.
+    let read_depth: u16 = 300;
+    let mut instrs = Vec::new();
+    for i in 0..DEPTH {
+        instrs.push(Instr::new(Opcode::NewEnvironment, 0, 1, 0));
+        instrs.push(Instr::new(Opcode::LoadInt, 1, 0, (i % 251) as u8));
+        instrs.push(Instr::new(Opcode::SetEnvSlot, 0, 0, 1));
+    }
+    instrs.extend(
+        WideOp::GetEnvSlotW {
+            dst: 2,
+            depth: read_depth,
+            slot: 0,
+        }
+        .encode(),
+    );
+    instrs.push(Instr::new(Opcode::Throw, 2, 0, 0));
+
+    let mut heap = Heap::new(GcPolicy::NoGC);
+    let mut interp = program_of(&mut heap, fn_with_instrs(3, instrs, ConstantPool::new()));
+    let thrown = expect_throw(&mut interp);
+    assert_eq!(
+        thrown.as_smi(),
+        Some(((DEPTH - 1 - read_depth) % 251) as i32),
+        "a wide depth of {read_depth} must resolve the same environment the \
+         narrow path would; if this fails the u8 budget really is a hard limit"
+    );
+}
+
 #[test]
 fn handler_delivery_lands_in_register_stack_depth() {
     // Range [0,1) guarded with target pc 1 and depth 0: the exception value
