@@ -357,16 +357,41 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
         t.as_simple_assignment_target()
             .is_some_and(simple_target_is_arguments)
     }
+    /// A declarator's *initializer* is the only part of a `VariableDeclaration`
+    /// that evaluates an expression; the binding id is a pattern. Shared by the
+    /// `VariableDeclaration` arm above and the three loop heads below, which is
+    /// why `for (let a = arguments;;) {}` is caught like `let a = arguments;`.
+    fn walk_var_decl(v: &oxc_ast::ast::VariableDeclaration<'_>) -> bool {
+        v.declarations
+            .iter()
+            .any(|d| d.init.as_ref().is_some_and(walk_expr))
+    }
+    /// The `left` of a for-in/of head, split the same two ways `Collect::stmt`
+    /// splits it (`:857-900`): a declaration contributes its declarator
+    /// initializers, an assignment target contributes the reference itself.
+    fn walk_for_left(l: &oxc_ast::ast::ForStatementLeft<'_>) -> bool {
+        match l {
+            oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => walk_var_decl(v),
+            oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
+                id.name.as_str() == "arguments"
+            }
+            // The six `INHERIT(AssignmentTarget)` variants (array/object
+            // patterns, member targets, rest). A pattern *default* can evaluate
+            // an expression, so `for (const [a = arguments] of o)` is still
+            // missed — the same class of hole, one enum deeper. Enumerating them
+            // is ADR-0002 batch 3, which owns `ForStatementLeft` and its two
+            // wildcards in `Collect::stmt`; recorded here rather than dropped
+            // silently.
+            _ => false,
+        }
+    }
     fn walk_stmt(s: &Statement<'_>) -> bool {
         match s {
             Statement::ExpressionStatement(e) => walk_expr(&e.expression),
             Statement::ReturnStatement(r) => r.argument.as_ref().is_some_and(walk_expr),
             Statement::IfStatement(i) => walk_expr(&i.test) || walk_stmt(&i.consequent),
             Statement::BlockStatement(b) => b.body.iter().any(walk_stmt),
-            Statement::VariableDeclaration(v) => v
-                .declarations
-                .iter()
-                .any(|d| d.init.as_ref().is_some_and(walk_expr)),
+            Statement::VariableDeclaration(v) => walk_var_decl(v),
             Statement::ThrowStatement(t) => walk_expr(&t.argument),
             Statement::FunctionDeclaration(_) => false,
             // Nothing to search, genuinely: `break`/`continue`/`empty`/
@@ -394,33 +419,70 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
             | Statement::TSNamespaceDeclaration(_)
             | Statement::TSGlobalDeclaration(_)
             | Statement::TSImportEqualsDeclaration(_) => false,
-            // KNOWN WRONG — and deliberately left wrong, because W1.2 batch 1 is
-            // a behaviour-preserving exhaustiveness conversion. Each of these
-            // *does* reach expressions (and `ClassDeclaration` reaches its
-            // heritage), so ES §15.7.1 `ContainsArguments` should descend here
-            // and does not:
-            //
-            //     class C { x = (() => { while (arguments) {} })() }  // accepted
-            //     class C { x = (() => { try {} catch (e) { arguments } })() }
-            //     class C { x = (() => { class D extends arguments {} })() }
-            //
-            // V8 rejects all three. This is the same defect class as the
-            // `ChainExpression`/`ImportExpression` gap closed in 5a3a7aac, one
-            // level down: `walk_expr` only reaches a statement through an
-            // arrow's block body, and `walk_stmt` then drops it. Naming them
-            // here is what makes the hole visible; fixing them changes
-            // behaviour and needs its own conformance-verified batch (the
-            // immediate follow-up to this one).
-            Statement::WhileStatement(_)
-            | Statement::DoWhileStatement(_)
-            | Statement::ForStatement(_)
-            | Statement::ForInStatement(_)
-            | Statement::ForOfStatement(_)
-            | Statement::SwitchStatement(_)
-            | Statement::TryStatement(_)
-            | Statement::LabeledStatement(_)
-            | Statement::WithStatement(_)
-            | Statement::ClassDeclaration(_) => false,
+            // These ten all reach expressions, so ES §15.7.1
+            // `ContainsArguments` descends into them. They were `=> false` in
+            // 3dce22fa (W1.2 batch 1), which named them `KNOWN WRONG`:
+            // ADR-0002's "only the 2 `contains_arguments` gaps are genuine" was
+            // wrong — it is 12, these ten plus `ChainExpression` /
+            // `ImportExpression`. `walk_stmt` is reached only through an
+            // arrow's block body, which is why a field initializer could carry
+            // a loop and still miss the `arguments` inside it.
+            Statement::WhileStatement(w) => walk_expr(&w.test) || walk_stmt(&w.body),
+            Statement::DoWhileStatement(d) => walk_expr(&d.test) || walk_stmt(&d.body),
+            Statement::ForStatement(f) => {
+                // `init` is optional and is a declaration *or* an expression,
+                // split exactly as `Collect::stmt` splits it (`:857-862`); the
+                // declaration side is not covered by the expression path.
+                (match &f.init {
+                    Some(ForStatementInit::VariableDeclaration(v)) => walk_var_decl(v),
+                    Some(other) => other.as_expression().is_some_and(walk_expr),
+                    None => false,
+                }) || f.test.as_ref().is_some_and(walk_expr)
+                    || f.update.as_ref().is_some_and(walk_expr)
+                    || walk_stmt(&f.body)
+            }
+            Statement::ForInStatement(f) => {
+                walk_for_left(&f.left) || walk_expr(&f.right) || walk_stmt(&f.body)
+            }
+            Statement::ForOfStatement(f) => {
+                walk_for_left(&f.left) || walk_expr(&f.right) || walk_stmt(&f.body)
+            }
+            Statement::SwitchStatement(s) => {
+                walk_expr(&s.discriminant)
+                    || s.cases.iter().any(|case| {
+                        case.test.as_ref().is_some_and(walk_expr)
+                            || case.consequent.iter().any(walk_stmt)
+                    })
+            }
+            // The catch-clause `param` is a binding pattern, so for an identifier
+            // it is not a source of `arguments` and only the body is walked — but
+            // a *destructuring* default is (`try {} catch ({a = arguments}) {}`),
+            // the same pattern-default gap as `walk_for_left`, i.e. ADR-0002
+            // batch 2/3.
+            Statement::TryStatement(t) => {
+                t.block.body.iter().any(walk_stmt)
+                    || t.handler
+                        .as_ref()
+                        .is_some_and(|h| h.body.body.iter().any(walk_stmt))
+                    || t.finalizer
+                        .as_ref()
+                        .is_some_and(|f| f.body.iter().any(walk_stmt))
+            }
+            Statement::LabeledStatement(l) => walk_stmt(&l.body),
+            // Unreachable in practice: a field initializer is strict-mode code,
+            // so `with` is already a SyntaxError there (`stmt.rs:776`). Kept
+            // correct anyway — `contains_arguments` has exactly one call site
+            // and that strictness is an accident of *this* caller, not a
+            // property of the walker.
+            Statement::WithStatement(w) => walk_expr(&w.object) || walk_stmt(&w.body),
+            // Heritage only, mirroring the `ClassExpression` arm in `walk_expr`:
+            // a nested class's methods and field initializers are their own
+            // `FunctionExpression` / `FieldDefinition` early errors, not this
+            // one's, so the search must not descend past the heritage.
+            Statement::ClassDeclaration(c) => c
+                .heritage
+                .as_ref()
+                .is_some_and(|h| walk_expr(&h.expression)),
         }
     }
     walk_expr(e)

@@ -2186,6 +2186,95 @@ fn class_field_initializer_chain_and_import_without_arguments_compile() {
     }
 }
 
+/// ES §15.7.1: `ContainsArguments` reaches a statement only through an arrow's
+/// block body, but once there it must descend into every statement form that
+/// holds an expression. These ten were `=> false` in `3dce22fa`, which named them
+/// `KNOWN WRONG` — a class field initializer could carry a loop and still miss
+/// the `arguments` inside it. Each source below exercises one of those arms.
+#[test]
+fn class_field_initializer_arguments_in_arrow_body_statement_is_syntax_error() {
+    const MSG: &str = "'arguments' is not allowed in a class field initializer";
+    for src in [
+        // WhileStatement: test.
+        "var C = class { x = (() => { while (arguments) {} })() };",
+        // DoWhileStatement: body (its test sits after the body).
+        "var C = class { x = (() => { do { arguments } while (0) })() };",
+        "var C = class { x = (() => { do {} while (arguments) })() };",
+        // ForStatement: the init is a *declaration*, so it is only reachable via
+        // the declarator initializer, not the expression path — then test,
+        // update, body.
+        "var C = class { x = (() => { for (let a = arguments; ;) {} })() };",
+        "var C = class { x = (() => { for (let i = arguments; ;) {} })() };",
+        "var C = class { x = (() => { for (;; arguments) {} })() };",
+        "var C = class { x = (() => { for (;;) { arguments } })() };",
+        // ForInStatement: left (both forms) and right.
+        "var C = class { x = (() => { for (arguments in o) {} })() };",
+        "var C = class { x = (() => { for (let k = arguments; ;) {} })() };",
+        "var C = class { x = (() => { for (const k in arguments) {} })() };",
+        // ForOfStatement: the same three positions.
+        "var C = class { x = (() => { for (arguments of o) {} })() };",
+        "var C = class { x = (() => { for (const v of arguments) {} })() };",
+        // SwitchStatement: discriminant, a case test, a case body.
+        "var C = class { x = (() => { switch (arguments) {} })() };",
+        "var C = class { x = (() => { switch (1) { case arguments: } })() };",
+        "var C = class { x = (() => { switch (1) { case 1: arguments } })() };",
+        // TryStatement: block, catch body, finalizer. The catch *param* is a
+        // binding pattern, so `catch (e)` alone is not a source — the body is.
+        "var C = class { x = (() => { try { arguments } catch (e) {} })() };",
+        "var C = class { x = (() => { try { g() } catch (e) { arguments } })() };",
+        "var C = class { x = (() => { try {} catch (e) {} finally { arguments } })() };",
+        // LabeledStatement: body.
+        "var C = class { x = (() => { l: { arguments } })() };",
+        "var C = class { x = (() => { l: while (arguments) {} })() };",
+        // WithStatement: object and body. A field initializer is strict-mode
+        // code, so `with` is *already* a SyntaxError there (Pass B, `stmt.rs:776`).
+        // These two therefore pin precedence — ContainsArguments is reported
+        // first — not reachability: no legal field initializer can contain a
+        // `with` for the arm to matter to.
+        "var C = class { x = (() => { with (arguments) {} })() };",
+        "var C = class { x = (() => { with (o) { arguments } })() };",
+        // ClassDeclaration: heritage, mirroring the `ClassExpression` arm.
+        "var C = class { x = (() => { class D extends arguments {} })() };",
+        // The arms must compose, not merely fire one level deep.
+        "var C = class { x = (() => { for (const v of o) { if (v) { arguments } } })() };",
+    ] {
+        let err = compile_source_with_strings(src)
+            .map_err(|e| e.message)
+            .expect_err("field initializer arguments should fail");
+        assert!(err.contains(MSG), "for {src}: got {err}");
+    }
+}
+
+/// Negative control for the ten statement arms above: each of those statement
+/// forms, in a field initializer, with no `arguments` anywhere, must still
+/// compile. Guards against an over-eager descent that rejects every loop.
+#[test]
+fn class_field_initializer_arrow_body_statements_without_arguments_compile() {
+    for src in [
+        "var C = class { x = (() => { while (n) {} })() };",
+        "var C = class { x = (() => { do { n } while (n) })() };",
+        "var C = class { x = (() => { for (let i = n; i < n; i = i) {} })() };",
+        "var C = class { x = (() => { for (let i = n; ;) {} })() };",
+        // `for (k in o)` is rejected by the emitter (a pre-existing
+        // Pass B limitation, unrelated to ContainsArguments), so use `var`.
+        "var C = class { x = (() => { for (var k in o) {} })() };",
+        "var C = class { x = (() => { for (const v of o) {} })() };",
+        "var C = class { x = (() => { switch (n) { case 1: break; default: } })() };",
+        "var C = class { x = (() => { try { g() } catch (e) { n } finally { n } })() };",
+        "var C = class { x = (() => { l: { n } })() };",
+        // No `with` control: a field initializer is strict-mode code, so `with`
+        // is rejected by Pass B before ContainsArguments could be consulted.
+        "var C = class { x = (() => { class D extends Object {} })() };",
+        // An `arguments` that merely looks like one, in a newly-walked spot.
+        "var args = 1; var C = class { x = (() => { while (args) {} })() };",
+        // A nested ordinary function brings its own `arguments`, so the search
+        // stops there even inside a loop.
+        "var C = class { x = (() => { while (n) { (function () { return arguments })() } })() };",
+    ] {
+        compile_source_with_strings(src).unwrap_or_else(|e| panic!("{src}: {}", e.message));
+    }
+}
+
 /// ES §15.7.1: the `super()` *call* form is constructor-of-a-derived-class only.
 #[test]
 fn super_call_outside_derived_constructor_is_syntax_error() {
