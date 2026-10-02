@@ -46,9 +46,27 @@
 //! Nothing here changes the emitted bytecode. Task W2.1 phase A is the table
 //! plus the cross-check test in `tests.rs`; W2.2 (phase B) wires `Width` into
 //! `v12-bccompiler`'s `word_width` and derives the byte decoder from the
-//! assigned-discriminant list. Normalising the divergences listed below, and
-//! making any dispatcher *enforce* the roles rather than merely record them,
-//! is later work — see W2.3.
+//! assigned-discriminant list.
+//!
+//! # W2.3: the table is enforced, and what that does *not* mean
+//!
+//! [`crate::FunctionBytecode::validate`] now walks every instruction against
+//! this table (see the `validate` module), so the roles are load-bearing rather
+//! than descriptive: an operand the table calls a register must be inside the
+//! frame, an environment slot must fit the environment the function allocated,
+//! a branch must land in the stream, and so on. Six of the eight
+//! [`KNOWN_INCONSISTENT_OPERAND_ORDER`] entries are *checked in their current
+//! order* rather than exempted, because the checks read roles per slot: a gate
+//! keyed on the opcode list would have had to exempt the very opcodes whose
+//! operands are most worth checking.
+//!
+//! What the enforcement does **not** reach is the role *kind* — nothing here
+//! can tell a `Key` from an `Obj` in a slot both call a register, for the
+//! reason the phase-A test `role_kinds_are_citation_backed_for_unlabelled_register_operands`
+//! already states. So normalising the divergences (W2.4) is *not* made safe by
+//! this gate alone: a forgotten transposition still validates. W2.4 keeps the
+//! label cross-check in `tests.rs` as its real gate, and the emit-site
+//! citations as its checklist.
 
 use crate::{Instr, Opcode, WideOp};
 #[cfg(test)]
@@ -141,6 +159,46 @@ pub enum Role {
     Mask,
     /// [`WideOp`] variant discriminant, in the header's low immediate byte.
     Disc,
+}
+
+impl Role {
+    /// The role's name, for diagnostics.
+    ///
+    /// A validation failure has to say *which* operand was wrong, and the
+    /// alternatives — the slot letter, or the disassembler's own rendering —
+    /// are both less precise: `b` does not distinguish a key from an object,
+    /// and `fmt_operands` is the third statement of the contract rather than
+    /// the one being enforced.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unused => "unused",
+            Self::Dst => "dst",
+            Self::Src => "src",
+            Self::InOut => "in/out",
+            Self::Cond => "condition",
+            Self::Obj => "object",
+            Self::Key => "key",
+            Self::Val => "value",
+            Self::Callee => "callee",
+            Self::Count => "count",
+            Self::ArgsArr => "argument array",
+            Self::ElemBase => "element base",
+            Self::Excl => "excluded key",
+            Self::Pair => "accessor pair base",
+            Self::Depth => "environment depth",
+            Self::Slot => "environment slot",
+            Self::FnIndex => "function index",
+            Self::Start => "start index",
+            Self::Flag => "flag",
+            Self::ConstId => "constant id",
+            Self::NameId => "name id",
+            Self::Imm8 => "immediate",
+            Self::Imm16 => "jump target (high)",
+            Self::Imm24 => "jump target",
+            Self::Mask => "register-extension mask",
+            Self::Disc => "wide discriminant",
+        }
+    }
 }
 
 /// How many [`Instr`] words one instruction occupies.

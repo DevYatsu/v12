@@ -68,11 +68,18 @@ impl Rng {
 
 /// A `FunctionBytecode` with `len` filler instructions and room for
 /// handlers whose targets stay in bounds (`len` words of code).
+///
+/// The frame is sized to the filler: word `i` is `Move r{i}, r0, #1`, so
+/// `max_regs` is one more than the highest register written. That is not
+/// cosmetic — `validate` now rejects a register operand at or past `max_regs`
+/// (it used to check only `max_regs != 0`), so a helper that under-declares
+/// the frame makes every caller that expects a clean `validate()` fail on an
+/// operand the helper itself wrote.
 pub fn fn_with(len: u32, handlers: Vec<HandlerRange>) -> FunctionBytecode {
     let instrs: Vec<Instr> = (0..len)
         .map(|i| Instr::new(Opcode::Move, i as u8, 0, 1))
         .collect();
-    let mut fb = FunctionBytecode::with_instructions(instrs, 2);
+    let mut fb = FunctionBytecode::with_instructions(instrs, len.saturating_add(1) as u16);
     fb.handlers = handlers;
     fb
 }

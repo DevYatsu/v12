@@ -161,7 +161,6 @@ pub enum WideOp {
 fn pack_hi_lo(hi: u16, lo: u16) -> u32 {
     (u32::from(hi) << 16) | u32::from(lo)
 }
-
 fn unpack_hi_lo(word: u32) -> (u16, u16) {
     ((word >> 16) as u16, word as u16)
 }
@@ -521,6 +520,103 @@ impl WideOp {
             other => Err(BytecodeError::UnknownWideDiscriminant {
                 discriminant: other,
             }),
+        }
+    }
+
+    /// Calls `f(name, value)` for every field of this variant that is a
+    /// **register index**, in slot order.
+    ///
+    /// The wide escape of the narrow ISA, and the same role vocabulary: this
+    /// says a field *is* a register, never what it is for, so it inherits both
+    /// the [`crate::OpSpec`] table's blind spot (role *kind*) and its
+    /// enforcement (the range check in `validate.rs`). A `u16` field absent
+    /// from this list is an immediate — `argc`, `slots`, `depth`, `start`,
+    /// `const_id`, `function_index`, the private `class_id`/`name_id` pair, and
+    /// `excl_count`, which is a count of excluded keys rather than a register.
+    ///
+    /// Written as a callback rather than a returned `Vec` so a validation pass
+    /// can run it per instruction without allocating; the trait-object-free
+    /// `impl FnMut` keeps it monomorphic at every call site.
+    pub fn each_register(self, mut f: impl FnMut(&'static str, u16)) {
+        match self {
+            Self::LoadConstW { dst, .. } | Self::LoadIntW { dst, .. } => f("dst", dst),
+            Self::GetEnvSlotW { dst, .. } => f("dst", dst),
+            Self::SetEnvSlotW { src, .. } => f("src", src),
+            Self::CallW { dst, func, .. } | Self::ConstructW { dst, func, .. } => {
+                f("dst", dst);
+                f("callee", func);
+            }
+            Self::CopyObjectRestW {
+                dst,
+                src,
+                excl_base,
+                ..
+            } => {
+                f("dst", dst);
+                f("src", src);
+                f("excl base", excl_base);
+            }
+            Self::CopyArrayRestW { dst, src, .. } => {
+                f("dst", dst);
+                f("src", src);
+            }
+            Self::RegExt { .. } | Self::NewEnvironmentW { .. } => {}
+            Self::ClosureW { dst, .. } => f("dst", dst),
+            Self::GetPrivateW { dst, obj, .. } | Self::HasPrivateW { dst, obj, .. } => {
+                f("dst", dst);
+                f("obj", obj);
+            }
+            Self::SetPrivateW { obj, value, .. } | Self::DefinePrivateW { obj, value, .. } => {
+                f("obj", obj);
+                f("value", value);
+            }
+            Self::SetPropertyR {
+                base,
+                key,
+                value,
+                receiver,
+            } => {
+                f("base", base);
+                f("key", key);
+                f("value", value);
+                f("receiver", receiver);
+            }
+            Self::GetSuperW {
+                dst,
+                base,
+                key,
+                receiver,
+            } => {
+                f("dst", dst);
+                f("base", base);
+                f("key", key);
+                f("receiver", receiver);
+            }
+        }
+    }
+
+    /// The slot count of the environment this variant allocates, if it
+    /// allocates one.
+    ///
+    /// The wide counterpart of the narrow `NewEnvironment`'s `b` slot. The
+    /// `depth` field is deliberately absent: the interpreter discards it
+    /// (`opspec::Role::Unused` on the narrow form), so counting it as an
+    /// operand of the allocation would be counting something nothing reads.
+    pub fn env_allocation(self) -> Option<u32> {
+        match self {
+            Self::NewEnvironmentW { slots, .. } => Some(u32::from(slots)),
+            _ => None,
+        }
+    }
+
+    /// The `(depth, slot)` an environment access names, if this variant is
+    /// one. The wide counterpart of the narrow `GetEnvSlot`/`SetEnvSlot`.
+    pub fn env_access(self) -> Option<(u32, u32)> {
+        match self {
+            Self::GetEnvSlotW { depth, slot, .. } | Self::SetEnvSlotW { depth, slot, .. } => {
+                Some((u32::from(depth), u32::from(slot)))
+            }
+            _ => None,
         }
     }
 }

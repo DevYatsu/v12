@@ -13,7 +13,7 @@
 mod common;
 
 use common::render;
-use v12_bytecode::{FunctionBuilder, HandlerRange, Instr, Opcode, WideOp};
+use v12_bytecode::{Const, FunctionBuilder, HandlerRange, Instr, Opcode, WideOp};
 
 #[test]
 fn deeply_nested_handler_ranges_validate() {
@@ -31,8 +31,10 @@ fn deeply_nested_handler_ranges_validate() {
         })
         .collect();
 
-    let mut fb = common::fn_with(CODE_LEN, handlers);
-    fb.max_regs = LEVELS as u16;
+    // `fn_with` sizes the frame to the registers its filler writes; an
+    // override here would under-declare it and `validate` would reject the
+    // control for a reason that has nothing to do with handler nesting.
+    let fb = common::fn_with(CODE_LEN, handlers);
     fb.validate().expect("50-level nesting must validate");
 
     // The disassembler prints every row of a deep table unchanged.
@@ -89,6 +91,13 @@ fn build_and_disassemble_65k_instruction_function() {
 
     let mut b = FunctionBuilder::new(Some("big"));
     b.reserve_regs(8);
+    // `validate` checks a `LoadConst` id against the function's pool, because
+    // `Interp::const_value` panics on an id it does not have. The loop below
+    // reuses const 7 on every iteration, so eight entries make the fixture
+    // real bytecode rather than a stream that only the disassembler tolerates.
+    for i in 0..8u64 {
+        b.add_const(Const::BigU64(i)).expect("pool has room");
+    }
 
     // Loop skeleton with one wide sequence per iteration plus occasional
     // forward skips, so backpatching interacts with multi-word ops at scale.
@@ -170,10 +179,13 @@ fn build_and_disassemble_65k_instruction_function() {
         );
     }
 
-    // Disassembly line accounting: header + one line per decode unit.
+    // Disassembly line accounting: header + one line per constant-pool entry
+    // + one line per decode unit. (The pool rows are part of the listing;
+    // counting them is why this fixture interns the constants its
+    // `LoadConstW` names rather than pointing at an empty pool.)
     let text = render(&fb);
     let lines = text.lines().count();
-    let expected_units = 1 + expected_decode_units(&fb.instrs);
+    let expected_units = 1 + fb.consts.len() + expected_decode_units(&fb.instrs);
     assert_eq!(lines, expected_units, "line accounting drifted");
 }
 
@@ -217,6 +229,9 @@ fn finish_panics_when_any_label_is_unbound() {
 #[test]
 fn jump_to_already_bound_label_is_backward_branch() {
     let mut b = FunctionBuilder::new(None);
+    // The loop tests on r2 (`JumpIfTrue 2`), so the frame must contain it:
+    // `validate` rejects a condition register at or past `max_regs`.
+    b.reserve_regs(3);
     let loop_head = b.label();
     b.bind(loop_head); // binds to pc 0 (next emitted instruction)
     assert_eq!(b.pc(), 0);
@@ -243,6 +258,12 @@ fn jump_to_already_bound_label_is_backward_branch() {
 #[test]
 fn jumps_across_wide_sequences_patch_to_word_accurate_pcs() {
     let mut b = FunctionBuilder::new(Some("wide-hops"));
+    // The opening branch tests r9, so the frame must contain it.
+    b.reserve_regs(10);
+    // The `LoadConstW` below names pool entry 0, so the pool must have one:
+    // `Interp::const_value` panics on an id the function does not have, and
+    // `validate` now rejects it before any interpreter sees the stream.
+    b.add_const(Const::Null).expect("pool has room");
 
     // Backward target before any wide ops.
     let head = b.label();
@@ -252,9 +273,13 @@ fn jumps_across_wide_sequences_patch_to_word_accurate_pcs() {
     let exit = b.label();
     b.emit_jump(Opcode::JumpIfFalse, 9, exit); // pc 0
 
+    // Const id 0, not a 32-bit one: a real pool entry, so the fixture is
+    // bytecode `validate` accepts. The 32-bit const-id *encoding* is covered
+    // by `wide_ops_roundtrip_through_encode_decode` in `wide.rs`; what this
+    // test is about is pc accounting across a three-word sequence.
     let load_const_w = WideOp::LoadConstW {
         dst: 1,
-        const_id: 0xDEAD_BEEF,
+        const_id: 0,
     }
     .encode();
     let load_int_w = WideOp::LoadIntW {

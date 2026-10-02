@@ -24,6 +24,7 @@ mod analysis;
 mod builder;
 mod opcode;
 mod opspec;
+mod validate;
 mod wide;
 
 #[cfg(test)]
@@ -313,7 +314,18 @@ impl FunctionBytecode {
     /// - ranges may nest but never partially overlap, and a nested handler
     ///   runs at a strictly greater `stack_depth` so unwinding pops frames
     ///   in a well-defined order,
-    /// - every handler target is a valid pc.
+    /// - every handler target is a valid pc,
+    /// - every instruction's operands agree with its [`OpSpec`] entry: a
+    ///   register operand inside the frame, an environment slot inside the
+    ///   environment the function allocated, a branch target inside the
+    ///   stream, a constant id inside the pool, a `Flag` operand that is `0`
+    ///   or `1`, and an instruction stream that decodes.
+    ///
+    /// The operand half is [`validate::check_operand_contract`], and its module
+    /// docs state exactly what it does *not* check — the role *kind* of an
+    /// unlabelled register operand, the environment-depth bound (an inherited
+    /// chain is not in a `FunctionBytecode`), and the call-header window (whose
+    /// size constant belongs to `v12-bccompiler`).
     pub fn validate(&self) -> Result<(), BytecodeError> {
         if self.max_regs == 0 {
             return Err(BytecodeError::ZeroMaxRegs);
@@ -365,7 +377,7 @@ impl FunctionBytecode {
             prev_start = h.start;
             open.push(h);
         }
-        Ok(())
+        validate::check_operand_contract(self)
     }
 }
 

@@ -43,9 +43,11 @@ fn base() -> [HandlerRange; 3] {
 }
 
 fn fb(handlers: Vec<HandlerRange>) -> FunctionBytecode {
-    let mut fb = fn_with(CODE_LEN, handlers);
-    fb.max_regs = 1;
-    fb
+    // No `max_regs` override: `fn_with` sizes the frame to the registers its
+    // filler writes, which is what the operand half of `validate` requires.
+    // These cases are about handler invariants, and a frame declared too small
+    // would reject all of them — including the control — for the wrong reason.
+    fn_with(CODE_LEN, handlers)
 }
 
 #[track_caller]
