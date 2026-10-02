@@ -23,7 +23,11 @@ pub type SpanPair = (u32, u32);
 mod analysis;
 mod builder;
 mod opcode;
+mod opspec;
 mod wide;
+
+#[cfg(test)]
+mod tests;
 
 pub use analysis::{
     CountedLoop, MAX_INLINE_SIZE, find_counted_loop, is_inline_candidate, is_loop_header,
@@ -31,6 +35,11 @@ pub use analysis::{
 };
 pub use builder::{FunctionBuilder, Label};
 pub use opcode::{Instr, MAX_IMM24, Opcode};
+pub use opspec::{
+    CREATE_GENERATOR_B_FALLBACK, KNOWN_DISASSEMBLER_LABEL_DIVERGENCE,
+    KNOWN_DISASSEMBLER_SLOT_DIVERGENCE, KNOWN_INCONSISTENT_OPERAND_ORDER, OpSpec, Role, Slot,
+    Width, all_opcodes, spec, spec_at_byte,
+};
 pub use wide::WideOp;
 
 // ---------------------------------------------------------------------------
@@ -552,7 +561,11 @@ pub fn mnemonic(op: Opcode) -> &'static str {
 
 /// Formats one instruction's operands after the mnemonic; `Wide` is handled
 /// by the caller because it consumes trailing words.
-fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result {
+///
+/// `pub(crate)` so `opspec.rs`'s cross-check test can compare this
+/// independent statement of the operand contract against the [`opspec`] table
+/// instead of re-deriving the rendering rules a second time.
+pub(crate) fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> fmt::Result {
     let (a, b, c) = (i.a(), i.b(), i.c());
     match op {
         Opcode::Move => write!(f, " r{a}, r{b}"),
