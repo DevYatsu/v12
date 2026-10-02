@@ -578,6 +578,11 @@ fn utf16(text: &str) -> Vec<u16> {
 }
 
 /// Finds `needle` in `haystack` at or after `from` (unit indices).
+///
+/// Returns an index into `haystack`, not into the suffix. `skip(from)` leaves a
+/// sequence whose first window starts AT `from`, so `position` is relative to
+/// that and must be offset back: without the `+ from`, `"abcdef".indexOf("f",4)`
+/// returned 1 instead of 5, and the same error hit `includes`.
 fn utf16_find(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from.min(haystack.len()));
@@ -589,6 +594,7 @@ fn utf16_find(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
         .windows(needle.len())
         .skip(from)
         .position(|w| w == needle)
+        .map(|rel| rel + from)
 }
 
 fn arg_text(ctx: &mut Ctx, v: JsValue) -> String {
