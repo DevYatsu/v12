@@ -717,6 +717,26 @@ const fn build_specs() -> [Option<OpSpec>; 256] {
 /// with its own migration, not a refactor. The point of listing them is that
 /// the table has to say something about each, and "inconsistent on purpose
 /// (today)" is the honest answer.
+/// Registers reserved before a call's arguments: `[callee][this][args...]`.
+///
+/// The callee's register window starts at `callee_reg + 1`, so callee `r0` is
+/// the caller's `this`, and callee `r{i}` is argument `i - 1`. Arguments
+/// therefore occupy `callee_reg + CALL_HEADER_REGS ..
+/// callee_reg + CALL_HEADER_REGS + argc` on the caller side, and no copying is
+/// needed at either boundary.
+///
+/// **Why this lives here rather than in the compiler.** The emitter
+/// (`v12-bccompiler`) sizes call windows from it, and the interpreter
+/// (`v12-interp`) reads them back at six `args_start` sites. `v12-bccompiler` is
+/// an OPTIONAL dependency of `v12-interp` — deliberately, so the front-end is
+/// not a runtime dependency of the interpreter — so the interpreter could not
+/// name the compiler's copy without reintroducing that edge. `v12-bytecode` is
+/// the one crate both already depend on, and it already owns the calling
+/// convention's operand table (`OpSpec`), so the layout constant belongs beside
+/// it. `v12-bccompiler::model::CALL_HEADER_REGS` re-exports this for its own
+/// callers.
+pub const CALL_HEADER_REGS: u16 = 2;
+
 pub const KNOWN_INCONSISTENT_OPERAND_ORDER: &[(&str, &str)] = &[
     (
         "GetEnvSlot / SetEnvSlot",

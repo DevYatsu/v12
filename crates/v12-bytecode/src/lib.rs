@@ -37,7 +37,7 @@ pub use analysis::{
 pub use builder::{FunctionBuilder, Label};
 pub use opcode::{ALL_OPCODES, Instr, MAX_IMM24, OPCODE_COUNT, Opcode};
 pub use opspec::{
-    CREATE_GENERATOR_B_FALLBACK, KNOWN_DISASSEMBLER_LABEL_DIVERGENCE,
+    CALL_HEADER_REGS, CREATE_GENERATOR_B_FALLBACK, KNOWN_DISASSEMBLER_LABEL_DIVERGENCE,
     KNOWN_DISASSEMBLER_SLOT_DIVERGENCE, KNOWN_INCONSISTENT_OPERAND_ORDER, OpSpec, Role, Slot,
     Width, all_opcodes, spec, spec_at_byte,
 };

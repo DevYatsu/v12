@@ -27,7 +27,14 @@ pub const REG_THIS: u16 = 0;
 /// `this` value, and callee `r{i}` == argument `i - 1`. Arguments therefore
 /// occupy `callee_reg + 2 .. callee_reg + 2 + argc` on the caller side and no
 /// copying is needed at either boundary.
-pub const CALL_HEADER_REGS: u16 = 2;
+///
+/// The constant itself now lives in `v12-bytecode`, beside the `OpSpec` table
+/// that describes the calling convention's operands. The interpreter reads the
+/// same layout back and `v12-bccompiler` is only an optional dependency of
+/// `v12-interp`, so a single statement in the shared crate is the only place
+/// both can name without reintroducing that edge. Re-exported here so the ~16
+/// existing users in this crate are unchanged.
+pub use v12_bytecode::CALL_HEADER_REGS;
 
 /// Hard cap on registers per function.
 ///

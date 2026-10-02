@@ -1396,3 +1396,35 @@ fn every_role_has_a_distinct_name() {
     );
     assert!(!names.iter().any(|n| n.is_empty()));
 }
+
+/// W2.4: the call ABI layout has exactly one statement, in this crate.
+///
+/// Before this, `CALL_HEADER_REGS` lived in `v12-bccompiler::model` and the
+/// interpreter open-coded `callee_slot + 2` at 16 sites. That was not a
+/// cosmetic duplication: `v12-bccompiler` is an OPTIONAL dependency of
+/// `v12-interp`, so the interpreter could not name the compiler's copy without
+/// reintroducing the front-end as a runtime edge. Moving the constant here,
+/// beside the `OpSpec` table that describes the same calling convention, is what
+/// makes one statement possible at all.
+///
+/// Pin the value and pin why the header is NOT part of the operand count:
+/// `Call`'s third operand is a `Count`, not a register, so the header window
+/// `CALL_HEADER_REGS + argc` is not derivable from the opcode's operand roles —
+/// which is exactly why `validate()` cannot check it from the table alone.
+#[test]
+fn call_header_regs_is_the_single_statement_of_the_call_window_layout() {
+    assert_eq!(CALL_HEADER_REGS, 2, "call layout is [callee][this][args...]");
+
+    let call = spec(Opcode::Call).expect("Call has a table row");
+    assert_eq!(
+        call.c,
+        Role::Count,
+        "Call's c operand is the argument count, not a register — so the \\
+         CALL_HEADER_REGS + argc window cannot be checked from operand roles alone"
+    );
+
+    // The header is a property of the CONVENTION, not of any operand: the
+    // callee's r0 is `this` and its r{i} is argument i-1, so arguments begin at
+    // callee_reg + CALL_HEADER_REGS on the caller side with no copying.
+    assert!(CALL_HEADER_REGS >= 2, "callee and this both precede the arguments");
+}

@@ -65,7 +65,7 @@ impl Interp<'_> {
         };
         // Proxy exotic: `[[Call]]` is the `apply` trap (ES 10.5.12).
         if self.heap.get(callee_obj).kind == Kind::Proxy {
-            let args_start = callee_slot + 2;
+            let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
             let args_end = args_start + usize::from(argc);
             let args_vec = self.stack[args_start..args_end].to_vec();
             return self
@@ -84,7 +84,7 @@ impl Interp<'_> {
         };
 
         if direct_eval && matches!(target, v12_heap::FunctionTarget::RealmEval(_)) {
-            let args_start = callee_slot + 2;
+            let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
             let source = self
                 .stack
                 .get(args_start)
@@ -107,7 +107,7 @@ impl Interp<'_> {
         let target_idx = match target {
             v12_heap::FunctionTarget::Bytecode(idx) => idx,
             v12_heap::FunctionTarget::Native(f) => {
-                let args_start = callee_slot + 2;
+                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                 let args_end = args_start + usize::from(argc);
                 self.gc_protect();
                 let result = {
@@ -117,7 +117,7 @@ impl Interp<'_> {
                 return result.map(CallOutcome::Value).map_err(JSException);
             }
             v12_heap::FunctionTarget::Host(closure) => {
-                let args_start = callee_slot + 2;
+                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                 let args_end = args_start + usize::from(argc);
                 self.gc_protect();
                 let result = {
@@ -132,7 +132,7 @@ impl Interp<'_> {
                 // the same eval seam the interpreter uses for direct eval, so
                 // the nested program registers into this interpreter's
                 // cross-program table and its closures stay callable here.
-                let args_start = callee_slot + 2;
+                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                 let source = self.realm_eval_source(self.stack.get(args_start).copied());
                 let result = self.run_realm_eval(&source, this_v, target_global);
                 return result.map(CallOutcome::Value);
@@ -151,7 +151,7 @@ impl Interp<'_> {
                     let prefix: Vec<JsValue> = st.elements[2..].to_vec();
                     (target_fn, this_arg, prefix)
                 };
-                let args_start = callee_slot + 2;
+                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                 let args_end = args_start + usize::from(argc);
                 let mut call_args = prefix;
                 call_args.extend_from_slice(&self.stack[args_start..args_end]);
@@ -162,7 +162,7 @@ impl Interp<'_> {
         };
 
         if direct_eval && target_idx == u32::from(NativeId::Eval) {
-            let args_start = callee_slot + 2;
+            let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
             let source = self
                 .stack
                 .get(args_start)
@@ -188,14 +188,14 @@ impl Interp<'_> {
         let callee_funcs = self.functions_for_program(callee_program);
         if (target_idx as usize) >= callee_funcs.len() {
             if let Ok(native_fn) = NativeId::try_from(target_idx) {
-                let args_start = callee_slot + 2;
+                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                 let args_end = args_start + usize::from(argc);
                 let args_slice = self.stack[args_start..args_end].to_vec();
                 return self
                     .dispatch_call_native(callee_obj, native_fn, this_v, &args_slice)
                     .map(CallOutcome::Value);
             }
-            let args_start = callee_slot + 2;
+            let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
             let args_end = args_start + usize::from(argc);
             self.gc_protect();
             if target_idx == u32::from(NativeId::Eval) {
@@ -293,7 +293,7 @@ impl Interp<'_> {
             };
             let mut window = vec![JsValue::undefined(); usize::from(callee_max_regs)];
             window[0] = self.bind_this(target_idx, callee_program, this_v);
-            let arg_src = callee_slot + 2;
+            let arg_src = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
             let actuals = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
             let arguments =
                 self.frame_arguments_for(target_idx, callee_program, &actuals, callee_v);
@@ -339,7 +339,7 @@ impl Interp<'_> {
 
         // Extending the stack never moves existing slots, so the caller-tail
         // arguments stay valid while being copied into r1..
-        let arg_src = callee_slot + 2;
+        let arg_src = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
         let passed: Vec<JsValue> = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
         self.stack.resize(window_end, JsValue::undefined());
         // ES OrdinaryCallBindThis: resolve the frame's `this` binding for the
@@ -1267,7 +1267,7 @@ impl Interp<'_> {
         };
         // Proxy exotic: `[[Construct]]` is the `construct` trap (ES 10.5.13).
         if self.heap.get(callee_obj).kind == Kind::Proxy {
-            let args_start = callee_slot + 2;
+            let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
             let args_end = args_start + usize::from(argc);
             let args_vec = self.stack[args_start..args_end].to_vec();
             return self
@@ -1300,7 +1300,7 @@ impl Interp<'_> {
                     if idx == u32::from(NativeId::PromiseCombinatorElement) {
                         return Err(JSException(self.type_error("not a constructor")));
                     }
-                    let args_start = callee_slot + 2;
+                    let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                     let args_end = args_start + usize::from(argc);
                     self.gc_protect();
                     let id = self.native_id_for(idx)?;
@@ -1334,7 +1334,7 @@ impl Interp<'_> {
                 idx
             }
             v12_heap::FunctionTarget::Native(f) => {
-                let args_start = callee_slot + 2;
+                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                 let args_end = args_start + usize::from(argc);
                 self.gc_protect();
                 let result = {
@@ -1366,7 +1366,7 @@ impl Interp<'_> {
                 // above already does exactly this, and `construct_object`
                 // brackets itself with `stop_at_frames` + a stack truncate back
                 // to the window it pushed, so the caller's frame is untouched.
-                let args_start = callee_slot + 2;
+                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
                 let args_end = args_start + usize::from(argc);
                 let args_vec = self.stack[args_start..args_end].to_vec();
                 return self
@@ -1443,7 +1443,7 @@ impl Interp<'_> {
         let new_base = base + usize::from(caller_max_regs);
         let window_end = new_base + usize::from(callee_max_regs);
 
-        let arg_src = callee_slot + 2;
+        let arg_src = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
         let passed: Vec<JsValue> = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
         self.stack.resize(window_end, JsValue::undefined());
         self.stack[new_base] = instance_v;
