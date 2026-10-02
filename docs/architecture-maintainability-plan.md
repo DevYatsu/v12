@@ -282,6 +282,8 @@ Every task reports all four, or it is not done:
 3. `./scripts/check-architecture.sh` → exit 0 (W0.1 onward).
 4. For any conformance-affecting change: `conformance/faildiff.sh BEFORE.json AFTER.json`, pasted into the commit message. **Any pass regression blocks the commit.** No pass-rate comparison.
 
+**Lanes do not run the faildiff; the orchestrator does, centrally.** Two concurrent ~20-minute `runner`-profile builds contending for the target lock is what killed a pair of lanes on transport timeouts, so `faildiff` was moved out of every lane and run once, serially, over the batch. A lane that changes reachable behaviour therefore commits with the gate **pending** and says so — the orchestrator discharges it before the batch is called done. The discharge must be recorded here or the plan is stale the moment it is written.
+
 ## 7. Exit criteria
 
 - **Track 0 done:** a fresh clone on a clean branch is fully green, and clippy's warning count is *visible in CI* rather than absent. `-D warnings` remains off until the 275 reach 0.
