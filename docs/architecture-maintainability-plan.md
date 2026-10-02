@@ -305,6 +305,15 @@ Every task reports all four, or it is not done:
 
 **Lanes do not run the faildiff; the orchestrator does, centrally.** Two concurrent ~20-minute `runner`-profile builds contending for the target lock is what killed a pair of lanes on transport timeouts, so `faildiff` was moved out of every lane and run once, serially, over the batch. A lane that changes reachable behaviour therefore commits with the gate **pending** and says so — the orchestrator discharges it before the batch is called done. The discharge must be recorded here or the plan is stale the moment it is written.
 
+**Gate ledger** — every batch that committed with the gate pending, and what the central run found:
+
+| Batch | Commits | `faildiff` result |
+|---|---|---|
+| W3.1 + W2.1a | `0736effa`, `cbd49537` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
+| W2.2 + W3.3 | `a7183ab1`, `9e682fe6` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
+
+**A `net +0` on a batch that fixed real bugs is not a null result.** W3.3 fixed three confirmed spec violations (`parseInt("0x10",16)`, `toPrecision(3)`, `toFixed(undefined)`), and the `language` slice still moved zero. The same held for the whole `ContainsArguments` sequence — 28 violations closed, `FIXED 0` every time, because test262 has no coverage for that rule's statement or pattern halves. Conformance is a *regression* gate here, not a progress one; progress is measured by the direct-call and unit tests.
+
 ## 7. Exit criteria
 
 - **Track 0 done:** a fresh clone on a clean branch is fully green, and clippy's warning count is *visible in CI* rather than absent. `-D warnings` remains off until the 275 reach 0.
