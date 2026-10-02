@@ -33,7 +33,15 @@
 # uses, deliberately reused rather than reinvented:
 #   * any path component named `tests`  -> crates/*/tests/*.rs (integration)
 #   * any basename named `tests.rs`     -> the `#[cfg(test)] mod tests;` file
-# Implemented as `--exclude-dir=tests --exclude=tests.rs`.
+#   * any basename matching `*_tests.rs` -> a sibling split-out test module,
+#     e.g. `src/opspec_tests.rs`. Narrower than the two above, and included only
+#     because it bit in practice: a lane wrote a correctly `#[cfg(test)]`-gated
+#     module under that name and this gate flagged its 39 test assertions as
+#     production panic sites. A gate that cries wolf on test code trains people
+#     to route around it, which is worse. The rule stays name-shaped rather than
+#     cfg-detection-shaped, so a PRODUCTION file named `foo_tests.rs` would be
+#     excluded; accepted and documented rather than hidden.
+# Implemented as `--exclude-dir=tests --exclude=tests.rs --exclude=*_tests.rs`.
 # Deliberate consequences (identical to freeze-lint.sh):
 #   * `#[cfg(test)] mod tests { … }` INLINE inside a production file stays IN
 #     scope: it is not a path, and excluding it by line range would be fragile
@@ -83,6 +91,7 @@ fi
 # class this repo keeps paying for — use a character class.
 scan() {
     grep -rnE --include='*.rs' --exclude-dir=tests --exclude='tests.rs' \
+        --exclude='*_tests.rs' \
         -o -e "$2" crates/ conformance/ 2>/dev/null || true
 }
 
