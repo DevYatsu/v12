@@ -105,17 +105,20 @@ pub fn global_parse_int(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Resu
         }
     }
 
-    // NaN radix → 0; 0/absent → default 10, honoring a `0x`/`0X` hex prefix
-    // (→ 16).
+    // NaN radix → 0. Spec 19.2.5 steps 11-12: a leading `0x`/`0X` is a radix
+    // prefix whenever the *effective* radix is 16 — which includes an explicit
+    // `parseInt(s, 16)`, not only the `radix == 0` default, where the prefix
+    // instead *decides* that the effective radix is 16.
+    let hex_prefixed = s.starts_with("0x") || s.starts_with("0X");
     if radix == 0 {
-        if s.len() >= 2 && s.as_bytes().starts_with(b"0x") {
-            return Ok(helpers::js_number(scan_int_digits(&s[2..], 16, sign)));
-        }
-        if s.len() >= 2 && s.as_bytes().starts_with(b"0X") {
-            return Ok(helpers::js_number(scan_int_digits(&s[2..], 16, sign)));
-        }
-        radix = 10;
-    } else if !(2..=36).contains(&radix) {
+        radix = if hex_prefixed { 16 } else { 10 };
+    }
+    // Without this, an explicit `parseInt("0x10", 16)` scanned the `0` as a
+    // hex digit, stopped at `x`, and read 0.
+    if radix == 16 && hex_prefixed {
+        return Ok(helpers::js_number(scan_int_digits(&s[2..], 16, sign)));
+    }
+    if !(2..=36).contains(&radix) {
         return Ok(JsValue::from_f64(f64::NAN));
     }
     Ok(helpers::js_number(scan_int_digits(s, radix as u32, sign)))
@@ -315,6 +318,16 @@ pub fn number_proto_to_string(
         out.push('0');
     } else {
         let mut chunks = Vec::new();
+        // The `2.0..=36.0` window above is the *only* thing keeping this loop
+        // finite: it divides by `radix`, so `radix == 1` would leave
+        // `int_part` unchanged forever. Widening that window turns a `RangeError`
+        // into a hang instead of a failing test, so pin the precondition —
+        // `debug_assert!` fires in test builds, which is where a mutation
+        // experiment lands.
+        debug_assert!(
+            radix >= 2,
+            "radix window must exclude 1; radix 1 cannot terminate"
+        );
         while int_part >= 1.0 {
             chunks.push(DIGITS[(int_part % radix as f64) as usize]);
             int_part = (int_part / radix as f64).trunc();
@@ -344,8 +357,14 @@ pub fn number_proto_to_string(
 /// digits; |x| ≥ 1e21 falls back to normal `ToString`.
 pub fn number_to_fixed(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let n = this_number(ctx, this, "toFixed")?;
+    // Spec 21.1.3.3: an absent `fractionDigits` and an explicit `undefined` are
+    // the same thing — the argument is only consulted via
+    // `ToIntegerOrInfinity`, which `undefined` never reaches. Coercing it
+    // first turned `x.toFixed(undefined)` into `ToNumber(undefined)` = NaN and
+    // a spurious `RangeError`.
     let digits = match args.first() {
         None => 0usize,
+        Some(&v) if v.is_undefined() => 0usize,
         Some(&v) => {
             let d = ctx.to_number(v);
             if !(0.0..=100.0).contains(&d) {
@@ -403,7 +422,10 @@ pub fn number_to_precision(
             let sign = if exp >= 0 { '+' } else { '-' };
             format!("{mantissa}e{sign}{}", exp.abs())
         } else if exp + 1 == p as i32 {
-            mantissa.to_string()
+            // `e == p - 1` returns the `p` digits with **no** decimal point.
+            // `mantissa` still carries Rust's `{:e}` point (`(123).toPrecision(3)`
+            // formats as `1.23e2`), so drop it — the spec answer is `123`.
+            mantissa.replace('.', "")
         } else {
             // Fixed with (p - 1 - exp) fraction digits.
             let frac = (p as i32 - 1 - exp).max(0) as usize;

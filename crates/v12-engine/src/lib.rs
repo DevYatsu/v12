@@ -13,6 +13,8 @@ pub mod job_queue;
 pub(crate) mod module_loader;
 pub(crate) mod module_namespace;
 pub mod realm;
+#[doc(hidden)]
+pub mod test_harness;
 pub mod value;
 
 pub use builtins::HostClosure;
