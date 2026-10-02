@@ -225,13 +225,12 @@ pub fn array_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
 
 pub fn array_sort(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.sort", None)?;
-    let heap = &mut *ctx.heap;
-    let mut elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
+    let mut elems: Vec<JsValue> = ctx.heap.get(obj).elements_snapshot();
     // Filter holes (undefined) to end per spec simplified: keep order for undefined.
     elems.retain(|v| !v.is_undefined() && !v.is_hole());
-    // `value_text` allocates per call; sort_by_cached_key computes each key once.
-    elems.sort_by_cached_key(|a| helpers::value_text(heap, *a));
-    heap.get_mut(obj).replace_elements(elems);
+    // `to_string` allocates per call; sort_by_cached_key computes each key once.
+    elems.sort_by_cached_key(|a| ctx.to_string(*a));
+    ctx.heap.get_mut(obj).replace_elements(elems);
     Ok(this)
 }
 
@@ -314,7 +313,7 @@ fn dense_bound(heap: &mut Heap, obj: Handle<JsObject>, len: i64) -> i64 {
             .filter_map(|d| d.key().string())
             .collect();
         for key in keys {
-            let text = helpers::string_text(heap, key);
+            let text = helpers::heap_string_text(heap, key);
             if text.len() <= 10 && !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
                 if let Ok(n) = text.parse::<i64>() {
                     bound = bound.max(n.saturating_add(1));
@@ -792,18 +791,19 @@ pub fn array_of(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsVal
 /// strings (per code point). Iterable objects need the interpreter's
 /// iterator protocol and are not supported by this native path.
 pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let heap = &mut *ctx.heap;
     let Some(&source) = args.first() else {
         return Ok(new_array(ctx, Vec::new()));
     };
     if let Some(h) = source.as_string() {
-        let text = helpers::string_text(heap, h);
+        // Flatten/intern through `ctx`, before `heap` is borrowed below.
+        let text = ctx.string_text(h);
         let chars: Vec<JsValue> = text
             .chars()
-            .map(|c| JsValue::string(heap.intern_text(&c.to_string())))
+            .map(|c| JsValue::string(ctx.heap.intern_text(&c.to_string())))
             .collect();
         return Ok(new_array(ctx, chars));
     }
+    let heap = &mut *ctx.heap;
     let Some(obj) = source.as_object() else {
         return Ok(new_array(ctx, Vec::new()));
     };

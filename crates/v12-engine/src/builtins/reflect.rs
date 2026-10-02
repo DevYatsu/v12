@@ -14,7 +14,6 @@ use v12_heap::{Attrs, Handle, Heap, JsObject, JsValue, PropKey, V12Str};
 use v12_native::Throw;
 
 use super::ctx::Ctx;
-use super::helpers;
 
 /// ES `ToPropertyKey` (interpreter-reentry-free subset): symbols pass through,
 /// strings are canonicalized, everything else is coerced with `ToString`.
@@ -24,11 +23,7 @@ pub fn property_key(ctx: &mut Ctx, v: JsValue) -> Result<PropKey, Throw> {
         let owned = match &ctx.heap.get(h).storage {
             v12_heap::StrStorage::Latin1(bytes) => V12Str::latin1(bytes.clone()),
             v12_heap::StrStorage::Utf16(units) => V12Str::utf16(units.clone()),
-            _ => V12Str::utf16(
-                helpers::string_text(&mut *ctx.heap, h)
-                    .encode_utf16()
-                    .collect(),
-            ),
+            _ => V12Str::utf16(ctx.string_text(h).encode_utf16().collect()),
         };
         return Ok(PropKey::from_string(ctx.heap.intern_string(owned)));
     }

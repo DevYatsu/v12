@@ -590,13 +590,13 @@ impl v12_native::NativeRegistry for NativeRegistry {
         let mut param_parts = Vec::new();
         for &arg in args[..args.len().saturating_sub(1)].iter() {
             if let Some(h) = arg.as_string() {
-                param_parts.push(super::helpers::string_text(heap, h));
+                param_parts.push(super::helpers::heap_string_text(heap, h));
             }
         }
         let body = args
             .last()
             .and_then(|v| v.as_string())
-            .map(|h| super::helpers::string_text(heap, h))
+            .map(|h| super::helpers::heap_string_text(heap, h))
             .unwrap_or_default();
         let src = format!("function __f({}){{{}}}", param_parts.join(","), body);
         let (program, strings) =

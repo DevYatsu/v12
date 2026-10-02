@@ -18,6 +18,95 @@ mod realm_tests {
 }
 
 #[cfg(test)]
+mod ctx_realm_tests {
+    use v12_heap::{GcPolicy, Heap, JsValue, PropKey};
+    use v12_native::Throw;
+
+    use crate::builtins::Ctx;
+    use crate::realm::Realm;
+
+    /// Reads an own data property through the object's bound shape (no
+    /// prototype walk) — the same lookup production uses, so a missing
+    /// `constructor` install reads `None` instead of silently resolving
+    /// somewhere up the chain.
+    fn own_data(
+        heap: &mut Heap,
+        obj: v12_heap::Handle<v12_heap::JsObject>,
+        name: &str,
+    ) -> Option<JsValue> {
+        let key = PropKey::from_string(heap.intern_text(name));
+        let slot = heap
+            .lookup_property(heap.shape_of(obj), key)
+            .and_then(|d| d.slot())? as usize;
+        heap.get(obj).properties.get(slot).copied()
+    }
+
+    /// W3.1 regression. `helpers.rs` used to expose shims that built a
+    /// throwaway `Ctx::new(heap, None, None)` and delegated to it. Three of
+    /// the four shims were pure heap coercions and needed nothing — but
+    /// `as_object` → `Ctx::this_object` builds a `TypeError`, and with `global:
+    /// None` the `TypeError` it built was **detached from the realm**: no own
+    /// `constructor` link and no `[[Prototype]]` pointing at
+    /// `%TypeError.prototype%`. In a realm that had everything it needed,
+    /// `err instanceof TypeError` and `err.constructor === TypeError` both
+    /// read false, which is exactly what test262's `assert.throws` compares.
+    ///
+    /// The shim is gone, so this pins the invariant at the method its callers
+    /// now reach directly: a realm-bearing `Ctx` links what it throws to the
+    /// realm's own error class. Mutation check: setting `global = None` in
+    /// `Ctx::make_error` (restoring the shim's behaviour) fails both asserts.
+    #[test]
+    fn thrown_type_error_is_linked_to_the_realm_type_error() {
+        let mut heap = Heap::new(GcPolicy::NoGC);
+        let realm = Realm::new(&mut heap);
+
+        // Ground truth, read from the realm directly — deliberately *not*
+        // through `Ctx::intrinsic`, so the test does not depend on the same
+        // reader whose fallback it is checking.
+        let type_error_ctor = realm
+            .get_intrinsic("TypeError")
+            .and_then(|v| v.as_object())
+            .expect("realm must define the TypeError intrinsic");
+        let type_error_proto = heap.get(type_error_ctor).prototype;
+        assert!(
+            type_error_proto.is_some(),
+            "realm must define %TypeError.prototype%"
+        );
+
+        let mut ctx = Ctx::new(&mut heap, Some(realm.global()), None);
+        let thrown = ctx
+            .this_object(JsValue::undefined(), "Array.prototype.sort", None)
+            .err()
+            .expect("a non-object receiver must throw");
+        let Throw::Value(value) = thrown else {
+            panic!("`this_object` must throw a ready value, not a bare message");
+        };
+        let err = value
+            .as_object()
+            .expect("the thrown value must be an object");
+
+        // [[Prototype]]: this is what makes `err instanceof TypeError` true.
+        assert_eq!(
+            heap.get(err).prototype,
+            type_error_proto,
+            "thrown error's [[Prototype]] must be the realm's %TypeError.prototype%"
+        );
+        // Own `constructor`: the identity test262's `assert.throws(TypeError, …)`
+        // compares.
+        assert_eq!(
+            own_data(&mut heap, err, "constructor"),
+            Some(JsValue::object(type_error_ctor)),
+            "thrown error must carry an own `constructor` link to the realm TypeError"
+        );
+        assert_eq!(
+            own_data(&mut heap, err, "name"),
+            Some(JsValue::string(heap.intern_text("TypeError"))),
+            "thrown error must be named TypeError"
+        );
+    }
+}
+
+#[cfg(test)]
 mod job_queue_tests {
     use std::cell::RefCell;
     use std::rc::Rc;

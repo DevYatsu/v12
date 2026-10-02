@@ -378,103 +378,20 @@ impl<'a> Ctx<'a> {
     /// String text of a value: strings render their text, real arrays
     /// render comma-joined elements, everything else renders the way
     /// `console.log` observes it (Tier-0 display subset).
+    ///
+    /// Delegates to [`helpers::heap_value_text`] — a `Ctx` adds nothing here,
+    /// because the coercion reads no realm state (see the invariant at the top
+    /// of `helpers`). One implementation, so the two paths cannot drift.
     pub fn to_string(&mut self, v: JsValue) -> String {
-        if let Some(obj) = v.as_object()
-            && self.heap.get(obj).kind == v12_heap::Kind::Array
-        {
-            return Self::array_join_text(self.heap, obj, 0);
-        }
-        if let Some(h) = v.as_string() {
-            return self.string_text(h);
-        }
-        // ES `ToString` on a Number is `Number::toString` — notably `-0`
-        // renders `"0"`, unlike the console `display_text` form (`"-0"`).
-        // Property keys and `String(-0)` both flow through here.
-        if let Some(number) = v.as_smi().map(f64::from).or(v.as_f64()) {
-            return super::number::number_to_string(number);
-        }
-        Self::display_text(v)
+        helpers::heap_value_text(self.heap, v)
     }
 
     /// String text of a heap string, flattened and lossy-converted.
+    ///
+    /// Delegates to [`helpers::heap_string_text`] (same one-implementation
+    /// reason as [`Self::to_string`]).
     pub fn string_text(&mut self, h: Handle<v12_heap::V12Str>) -> String {
-        self.heap.flatten(h);
-        match &self.heap.get(h).storage {
-            v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
-            _ => String::new(),
-        }
-    }
-
-    /// Comma-joined element text of a real array (`undefined`/`null`/holes
-    /// render empty, matching `Array.prototype.join`). Nested arrays
-    /// recurse; `depth` caps the recursion so cyclic arrays terminate.
-    fn array_join_text(heap: &mut Heap, obj: Handle<JsObject>, depth: usize) -> String {
-        if depth > 8 {
-            return String::new();
-        }
-        // Snapshot before formatting: rendering an element may allocate (and
-        // thus collect), invalidating a live borrow of the element store.
-        let elements: Vec<JsValue> = heap.get(obj).elements_snapshot();
-        let mut parts = Vec::with_capacity(elements.len());
-        for v in elements {
-            if v.is_undefined() || v.is_null() || v.is_hole() {
-                parts.push(String::new());
-            } else if let Some(nested) = v
-                .as_object()
-                .filter(|h| heap.get(*h).kind == v12_heap::Kind::Array)
-            {
-                parts.push(Self::array_join_text(heap, nested, depth + 1));
-            } else if let Some(h) = v.as_string() {
-                Self::string_text_of(heap, h, &mut parts);
-            } else {
-                parts.push(Self::display_text(v));
-            }
-        }
-        parts.join(",")
-    }
-
-    /// Pushes the flattened text of `h` onto `parts` (array-join helper).
-    fn string_text_of(heap: &mut Heap, h: Handle<v12_heap::V12Str>, parts: &mut Vec<String>) {
-        heap.flatten(h);
-        let text = match &heap.get(h).storage {
-            v12_heap::StrStorage::Latin1(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-            v12_heap::StrStorage::Utf16(units) => String::from_utf16_lossy(units),
-            _ => String::new(),
-        };
-        parts.push(text);
-    }
-
-    /// `console.log`-style display text for a non-string value (Tier-0 subset).
-    fn display_text(v: JsValue) -> String {
-        if let Some(number) = v.as_smi().map(f64::from).or(v.as_f64()) {
-            if number.is_nan() {
-                return "NaN".to_string();
-            }
-            if number == f64::INFINITY {
-                return "Infinity".to_string();
-            }
-            if number == f64::NEG_INFINITY {
-                return "-Infinity".to_string();
-            }
-            return format!("{number}");
-        }
-        if v.is_true() {
-            return "true".to_string();
-        }
-        if v.is_false() {
-            return "false".to_string();
-        }
-        if v.is_undefined() {
-            return "undefined".to_string();
-        }
-        if v.is_null() {
-            return "null".to_string();
-        }
-        if v.is_object() {
-            return "[object Object]".to_string();
-        }
-        "<unprintable>".to_string()
+        helpers::heap_string_text(self.heap, h)
     }
 
     // -- props (unified install family, plan §3) ---------------------------

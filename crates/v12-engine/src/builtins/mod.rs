@@ -1780,18 +1780,17 @@ fn array_join(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue,
     };
     // Snapshot before formatting: the display helpers may allocate (and thus
     // collect), invalidating a live borrow of the element store.
-    let heap = &mut *ctx.heap;
-    let elements: Vec<JsValue> = heap.get(arr).elements_snapshot();
+    let elements: Vec<JsValue> = ctx.heap.get(arr).elements_snapshot();
     let mut parts = Vec::with_capacity(elements.len());
     for &v in &elements {
         if v.is_undefined() || v.is_null() {
             parts.push(String::new());
         } else {
-            parts.push(helpers::value_text(heap, v));
+            parts.push(ctx.to_string(v));
         }
     }
     let text = parts.join(&sep);
-    Ok(JsValue::string(heap.intern_text(&text)))
+    Ok(JsValue::string(ctx.heap.intern_text(&text)))
 }
 
 /// Placeholder handler for the callback-taking built-ins (`map`, `forEach`,

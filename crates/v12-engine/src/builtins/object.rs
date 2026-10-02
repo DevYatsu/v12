@@ -892,11 +892,7 @@ fn property_key(ctx: &mut Ctx, v: JsValue) -> Result<PropKey, JsValue> {
             v12_heap::StrStorage::Utf16(units) => v12_heap::V12Str::utf16(units.clone()),
             // Unreachable post-flatten (flatten materializes in place), but
             // degrade gracefully instead of assuming it: re-read lossy text.
-            _ => v12_heap::V12Str::utf16(
-                helpers::string_text(&mut *ctx.heap, h)
-                    .encode_utf16()
-                    .collect(),
-            ),
+            _ => v12_heap::V12Str::utf16(ctx.string_text(h).encode_utf16().collect()),
         };
         return Ok(PropKey::from_string(ctx.heap.intern_string(owned)));
     }
