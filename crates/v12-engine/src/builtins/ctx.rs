@@ -1,8 +1,10 @@
 //! The canonical builtin context: an exclusive `&mut Heap` borrow plus
 //! optional realm/intrinsic readers and sinks (`global`, `pending`,
 //! `regex_cache`). It owns the conversion logic (`require_object_coercible`,
-//! `this_object`, `to_number`, `to_string`, `string_text`); the free functions
-//! in `helpers` are thin shims delegating here.
+//! `this_object`, `to_number`, `to_integer_or_infinity`, `to_string`,
+//! `string_text`) and the spec algorithms that need realm state but no
+//! capability (`species_constructor`); the free functions in `helpers` are
+//! thin shims delegating here.
 //!
 //! Target state — and how far this is from it, since most bodies still touch
 //! no field but `heap` — is `ROADMAP.md` §2.
@@ -344,35 +346,25 @@ impl<'a> Ctx<'a> {
     /// ES ToNumber subset: Smi/double pass through; `true`→1.0,
     /// `false`/`null`→0.0, `undefined`→NaN; a string is trimmed
     /// (empty→0.0, else parsed as f64, failure→NaN); objects → NaN.
+    ///
+    /// Delegates to [`heap_to_number`] — a `Ctx` adds nothing here, because
+    /// the coercion reads no realm state (the `heap_` convention in
+    /// [`helpers`]). One implementation, so the `&mut Ctx` caller and the
+    /// bare-`&mut Heap` caller cannot drift.
     pub fn to_number(&mut self, v: JsValue) -> f64 {
-        if let Some(n) = v.as_smi().map(f64::from) {
-            return n;
-        }
-        if let Some(n) = v.as_f64() {
-            return n;
-        }
-        if v.is_true() {
-            return 1.0;
-        }
-        if v.is_false() || v.is_null() {
-            return 0.0;
-        }
-        if let Some(h) = v.as_string() {
-            let text = self.string_text(h);
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return 0.0;
-            }
-            // Non-decimal integer literals (`0x`/`0b`/`0o`): Rust's
-            // `f64` parser accepts neither, but `Number("0x000A")` is
-            // 10 per `StringNumericLiteral` (no sign allowed — the
-            // prefix check below rejects `+0x1`, which stays NaN).
-            if let Some(n) = parse_non_decimal_integer(trimmed) {
-                return n;
-            }
-            return trimmed.parse::<f64>().unwrap_or(f64::NAN);
-        }
-        f64::NAN
+        heap_to_number(self.heap, v)
+    }
+
+    /// ES `ToIntegerOrInfinity` (7.1.5): `ToNumber`, then NaN and both zeros
+    /// to `+0`, then truncate. `±Infinity` pass through (Rust's `trunc` is the
+    /// identity there).
+    ///
+    /// Delegates to [`heap_to_integer_or_infinity`] so the coercion exists
+    /// once: array lengths, relative indices and `Date` components all reduce
+    /// to these four rules, and a `f64`-only copy of them cannot honour a
+    /// string or boolean argument (the bug this replaced).
+    pub fn to_integer_or_infinity(&mut self, v: JsValue) -> f64 {
+        heap_to_integer_or_infinity(self.heap, v)
     }
 
     /// String text of a value: strings render their text, real arrays
@@ -392,6 +384,121 @@ impl<'a> Ctx<'a> {
     /// reason as [`Self::to_string`]).
     pub fn string_text(&mut self, h: Handle<v12_heap::V12Str>) -> String {
         helpers::heap_string_text(self.heap, h)
+    }
+
+    /// The realm's canonical `%Symbol.species%` key, or `None` in a bare heap
+    /// with no `Symbol` constructor.
+    ///
+    /// Read off `Symbol.species` rather than assumed: symbols are per-agent, so
+    /// interning the string `"species"` would key the wrong `@@species` in a
+    /// realm whose `Symbol` has been replaced (see `builtin::symbol`).
+    fn species_key(&mut self) -> Option<v12_heap::PropKey> {
+        let sym = self.intrinsic("Symbol")?.as_object()?;
+        let key = v12_heap::PropKey::from_string(self.heap.intern_text("species"));
+        let shape = self.heap.shape_of(sym);
+        let slot = self
+            .heap
+            .lookup_property(shape, key)
+            .and_then(|d| d.slot())?;
+        let sym = self
+            .heap
+            .get(sym)
+            .properties
+            .get(slot as usize)?
+            .as_symbol()?;
+        Some(v12_heap::PropKey::from_symbol(sym))
+    }
+
+    /// `SpeciesConstructor(O, default)` (ES 7.3.22 — 7.3.24 in the ES2026
+    /// numbering), returning the selected constructor, *not* merely validating
+    /// it. `default` is the caller's `%RegExp%` / `%Promise%` / `%ArrayBuffer%`
+    /// / `%TypedArray%`, so the default is never hardcoded here.
+    ///
+    /// `@@matchAll` (MatchAllIterator step 3), `@@replace` (step 3) and
+    /// `@@split` (step 3) all open with this call, and every step below is
+    /// observable.
+    ///
+    /// ## Step 3 tests `Type(C)`; step 6 tests `IsConstructor(S)`
+    ///
+    /// These are **different predicates on different values at different
+    /// steps**, and collapsing them into one "must be a constructor" check is
+    /// the bug this function is the fix for:
+    ///
+    /// * Step 3 asks only whether `C` is an **Object**. A plain
+    ///   `r.constructor = { [Symbol.species]: f }` is a perfectly good `C`; it
+    ///   is almost never itself a constructor, and requiring one threw a
+    ///   `TypeError` for a receiver every engine accepts. That single wrong
+    ///   predicate made `species-regexp-get-global-throws.js` and
+    ///   `species-regexp-get-unicode-throws.js` fail, because their `C` is an
+    ///   object literal.
+    /// * Step 6 asks whether `S` — a *different* value, the `@@species`
+    ///   property of `C` — is a constructor, and step 7 **throws** when it is
+    ///   not. It does not fall back to the default. Do not "fix" that into a
+    ///   default: step 5's `undefined`/`null` case is what selects the
+    ///   default, and the corpus requires the throw for `@@species` values
+    ///   like `{}`, `0`, `""` and `Date.now`
+    ///   (`Symbol.split/species-ctor-species-non-ctor.js`,
+    ///   `Symbol.matchAll/species-constructor-species-is-not-constructor.js`).
+    ///
+    /// So the two steps disagree in *both* directions: `{}` passes step 3 and
+    /// can still fail at step 7, while a real constructor that is not
+    /// callable-by-`new` (a method definition, an arrow) fails step 6 with a
+    /// `TypeError` that a naive `Type`-only reading of step 3 would not have
+    /// predicted.
+    ///
+    /// `IsConstructor` is [`Self::is_constructor`], which over-approximates in
+    /// the *missing-`TypeError`* direction only — see its doc comment.
+    ///
+    /// W3.2: moved here from a private `regexp.rs` copy so `Promise` (27.5.4.10,
+    /// whose callers are still behind an interpreter-seam capability) states the
+    /// same seven steps against one implementation instead of two copies in
+    /// prose.
+    pub fn species_constructor(
+        &mut self,
+        receiver: Handle<JsObject>,
+        default: JsValue,
+        method: &str,
+    ) -> Result<JsValue, Throw> {
+        // Step 1: `Let ctor be ? Get(O, "constructor")`. A throwing `constructor`
+        // getter propagates — the `?` is load-bearing
+        // (`Symbol.matchAll/species-constructor-get-constructor-throws.js`).
+        let ctor =
+            super::iterator::own_or_inherited_read(self, JsValue::object(receiver), "constructor")?;
+        // Step 2: `undefined` selects the default. `null` does *not*: it falls
+        // through to step 3, which is what
+        // `species-constructor-is-not-object-throws.js` asserts for `null`.
+        if ctor.is_undefined() {
+            return Ok(default);
+        }
+        // Step 3: `If ctor is not an Object, throw a TypeError exception.` — an
+        // Object test, *not* `IsConstructor`. See the section note above.
+        let Some(ctor_obj) = ctor.as_object() else {
+            return Err(self.type_error(format!(
+                "TypeError: {method} receiver's constructor is not an object"
+            )));
+        };
+        // Step 4: `Let species be ? Get(ctor, %Symbol.species%)`. A throwing
+        // getter propagates (`species-constructor-get-species-throws.js`), and a
+        // bare heap with no `Symbol` constructor has no key to read, so there is
+        // nothing left to select and the default stands in.
+        let Some(species_key) = self.species_key() else {
+            return Ok(default);
+        };
+        let species = crate::internal_methods::dispatch_get(self.heap, ctor_obj, species_key, ctor)
+            .map_err(Throw::Value)?;
+        // Step 5: `undefined`/`null` select the default.
+        if species.is_undefined() || species.is_null() {
+            return Ok(default);
+        }
+        // Step 6: `If IsConstructor(species) is true, return species.`
+        if self.is_constructor(species) {
+            return Ok(species);
+        }
+        // Step 7: `Throw a TypeError exception.` — no fallback to the default;
+        // step 5 is the only path that selects it.
+        Err(self.type_error(format!(
+            "TypeError: {method} receiver's constructor @@species is not a constructor"
+        )))
     }
 
     // -- props (unified install family, plan §3) ---------------------------
@@ -975,6 +1082,82 @@ pub fn realm_function_proto(heap: &mut Heap) -> Option<Handle<JsObject>> {
     let global = heap.realm_globals().first().copied()?;
     let ctor = own_data_prop(heap, global, "Function")?.as_object()?;
     heap.get(ctor).prototype
+}
+
+/// ES ToNumber (7.1.4), heap-only — the canonical implementation
+/// [`Ctx::to_number`] delegates to, for callers that hold a bare `&mut Heap`
+/// (see the `heap_` convention in [`helpers`]).
+///
+/// Smi/double pass through; `true`→1.0, `false`/`null`→0.0, `undefined`→NaN;
+/// a string is trimmed (empty→0.0, else parsed as f64, failure→NaN); objects →
+/// NaN (`valueOf`/`toString` user code is not part of v12's `ToNumber`
+/// subset — the same documented gap `Ctx::to_number` has).
+pub(crate) fn heap_to_number(heap: &mut Heap, v: JsValue) -> f64 {
+    if let Some(n) = v.as_smi().map(f64::from) {
+        return n;
+    }
+    if let Some(n) = v.as_f64() {
+        return n;
+    }
+    if v.is_true() {
+        return 1.0;
+    }
+    if v.is_false() || v.is_null() {
+        return 0.0;
+    }
+    if let Some(h) = v.as_string() {
+        let text = helpers::heap_string_text(heap, h);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return 0.0;
+        }
+        // Non-decimal integer literals (`0x`/`0b`/`0o`): Rust's `f64`
+        // parser accepts neither, but `Number("0x000A")` is 10 per
+        // `StringNumericLiteral` (no sign allowed — the prefix check in
+        // `parse_non_decimal_integer` rejects `+0x1`, which stays NaN).
+        if let Some(n) = parse_non_decimal_integer(trimmed) {
+            return n;
+        }
+        return trimmed.parse::<f64>().unwrap_or(f64::NAN);
+    }
+    f64::NAN
+}
+
+/// ES `ToIntegerOrInfinity` over a number that is already `ToNumber`ed.
+///
+/// The rules, and why a bare `.trunc()` does not give them:
+///
+/// * **NaN → `+0`** (step 2). `x.toFixed(undefined)` consults its argument
+///   only through `ToIntegerOrInfinity`, so absent and explicit `undefined`
+///   must agree — truncating the NaN `ToNumber(undefined)` produced made them
+///   differ, throwing a spurious `RangeError` (W3.3, bug 3).
+/// * **`-0` → `+0`** (step 2, which names `-0` explicitly). The test must run
+///   after `ToNumber` but before `trunc`, because `trunc(-0.5)` *is* `-0` and
+///   that case must stay `-0` (step 4). `n == 0.0` is what catches `-0`
+///   (`-0.0 == 0.0`); it also matches `+0`, which is already the answer, so
+///   the over-match is free. `is_nan` is a separate test because `NaN == 0.0`
+///   is false and `NaN.trunc()` is `NaN`, not `0`.
+/// * **`±Infinity` → itself** (step 3). `trunc` is already the identity, so no
+///   guard is needed — but a caller that must not accept a sentinel has to
+///   clamp afterwards (`ToLength`, array lengths). This function does not.
+pub(crate) fn integer_or_infinity(n: f64) -> f64 {
+    if n.is_nan() || n == 0.0 {
+        0.0
+    } else {
+        n.trunc()
+    }
+}
+
+/// ES `ToIntegerOrInfinity` (7.1.5), heap-only: [`heap_to_number`], then
+/// [`integer_or_infinity`].
+///
+/// The single implementation of this coercion in the crate — W3.2, which
+/// deleted `array.rs`'s private `to_length` and its three
+/// `as_smi().map(i64::from).or_else(as_f64).map(trunc).unwrap_or(0)` copies,
+/// none of which coerced a string or a boolean at all. `Ctx` delegates here so
+/// a `&mut Ctx` caller and a bare-`&mut Heap` caller cannot drift.
+pub(crate) fn heap_to_integer_or_infinity(heap: &mut Heap, v: JsValue) -> f64 {
+    integer_or_infinity(heap_to_number(heap, v))
 }
 
 /// Parses a trimmed `0x`/`0b`/`0o` integer literal per

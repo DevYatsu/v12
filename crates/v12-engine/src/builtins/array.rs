@@ -19,25 +19,19 @@ fn length_prop(heap: &mut Heap) -> v12_heap::PropKey {
     v12_heap::PropKey::from_string(h)
 }
 
-/// ES ToLength on a length-property value: NaN → 0, truncate, clamp to
-/// [0, 2^53-1]. The receiver's length is *not* a u32 quantity — array-like
-/// objects legally carry `length` up to 2^53-1, and a saturating u32 cast
-/// (`4294967296 as u32` → 4294967295) sent pop/push writing at index
-/// 2^32-2, which a flat element store answered with a multi-GB resize.
-fn to_length(v: JsValue) -> f64 {
-    let n = v
-        .as_smi()
-        .map(f64::from)
-        .or_else(|| v.as_f64())
-        .unwrap_or(f64::NAN);
-    if n.is_nan() {
-        return 0.0;
-    }
-    n.trunc().clamp(0.0, 9007199254740991.0)
-}
-
 /// The receiver's `length` (array-layout slot for arrays, shape property for
 /// generic receivers), through ToLength; falls back to the element store.
+///
+/// ToLength is [`Ctx::to_integer_or_infinity`] (the `heap_` twin, because
+/// this helper holds a borrowed heap) clamped to `[0, 2^53-1]`. W3.2 deleted
+/// the private `to_length` that stood here: it computed the same clamp but read
+/// the value with `as_smi().or(as_f64)`, so a **string or boolean `length`
+/// coerced to `NaN` and therefore to 0** — `push` on `{length: "5"}` wrote
+/// index 0 instead of 5. The clamp is still load-bearing, for the reason its
+/// old doc gave: the receiver's length is *not* a u32 quantity — array-like
+/// objects legally carry `length` up to 2^53-1, and a saturating u32 cast
+/// (`4294967296 as u32` → 4294967295) sent pop/push writing at index 2^32-2,
+/// which a flat element store answered with a multi-GB resize.
 fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> f64 {
     let key = length_prop(heap);
     // Look up through the object's own shape: a shape-bound array (literal,
@@ -57,7 +51,7 @@ fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> f64 {
             .copied()
             .unwrap_or(JsValue::undefined());
         if !v.is_undefined() {
-            return to_length(v);
+            return super::ctx::heap_to_integer_or_infinity(heap, v).clamp(0.0, 9007199254740991.0);
         }
     }
     // Fallback to elements length.
@@ -193,26 +187,25 @@ pub fn array_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
     let heap = &mut *ctx.heap;
     let elems: Vec<JsValue> = heap.get(obj).elements_snapshot();
     let len = elems.len() as i64;
-    let to_idx = |v: JsValue| -> i64 {
+    // W3.2: the third copy of the hand-rolled
+    // `as_smi().or(as_f64).map(trunc).unwrap_or(0)` coercion, replaced by
+    // `Ctx::to_integer_or_infinity` — `slice("1")` used to start at index 0.
+    let to_idx = |heap: &mut Heap, v: JsValue| -> i64 {
         if v.is_undefined() {
             return 0;
         }
-
-        v.as_smi()
-            .map(i64::from)
-            .or_else(|| v.as_f64().map(|f| f.trunc() as i64))
-            .unwrap_or(0)
+        super::ctx::heap_to_integer_or_infinity(heap, v) as i64
     };
     let start = if args.is_empty() {
         0
     } else {
-        let n = to_idx(args[0]);
+        let n = to_idx(heap, args[0]);
         if n < 0 { (len + n).max(0) } else { n.min(len) }
     };
     let end = if args.len() < 2 || args[1].is_undefined() {
         len
     } else {
-        let n = to_idx(args[1]);
+        let n = to_idx(heap, args[1]);
         if n < 0 { (len + n).max(0) } else { n.min(len) }
     };
     let slice = if start >= end {
@@ -391,16 +384,21 @@ fn set_array_len(heap: &mut Heap, obj: Handle<JsObject>, len: u32) {
 
 /// Relative-index normalization shared by `at`/`slice`-style methods:
 /// negative values count from `len`, the result is clamped to `[0, len]`.
-fn relative_index(v: Option<JsValue>, len: i64, default: i64) -> i64 {
+///
+/// The coercion is [`Ctx::to_integer_or_infinity`] (its `heap_` twin). W3.2
+/// replaced the private
+/// `as_smi().map(i64::from).or_else(|| as_f64().map(trunc)).unwrap_or(0)`
+/// that stood here — and two more copies of it in `slice` and `splice`. That
+/// shape coerced **no** string or boolean at all: `at("1")` read index 0 where
+/// the spec says 1. `as i64` still does the saturating cast (Infinity → `i64::MAX`,
+/// which the `(len + n).max(0)`/`n.min(len)` arms below reduce to `len`/`0`
+/// exactly as before).
+fn relative_index(heap: &mut Heap, v: Option<JsValue>, len: i64, default: i64) -> i64 {
     let Some(v) = v else { return default };
     if v.is_undefined() {
         return default;
     }
-    let n = v
-        .as_smi()
-        .map(i64::from)
-        .or_else(|| v.as_f64().map(|f| f.trunc() as i64))
-        .unwrap_or(0);
+    let n = super::ctx::heap_to_integer_or_infinity(heap, v) as i64;
     if n < 0 { (len + n).max(0) } else { n.min(len) }
 }
 
@@ -423,7 +421,7 @@ pub fn array_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
     // `0..len` would visit billions of holes. Holes never match, so entries
     // outside `[from, len)` cannot contribute either.
     if heap.get(obj).kind == v12_heap::Kind::Array {
-        let from = relative_index(args.get(1).copied(), len, 0).max(0);
+        let from = relative_index(heap, args.get(1).copied(), len, 0).max(0);
         for (i, v) in heap.get(obj).elements_array.dense_entries() {
             let i = i64::from(i);
             if i < from {
@@ -441,7 +439,7 @@ pub fn array_index_of(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
     // Holes never match, so scanning past the last stored element (or
     // shape-bound integer key) cannot find anything — bound the loop.
     let dense = dense_bound(heap, obj, len);
-    let from = relative_index(args.get(1).copied(), len, 0)
+    let from = relative_index(heap, args.get(1).copied(), len, 0)
         .max(0)
         .min(dense);
     for i in from..dense {
@@ -467,7 +465,7 @@ pub fn array_last_index_of(
     // Entry scan like `indexOf`: only present elements can match, so a
     // huge length view never widens the walk.
     if heap.get(obj).kind == v12_heap::Kind::Array {
-        let from = relative_index(args.get(1).copied(), len, len - 1);
+        let from = relative_index(heap, args.get(1).copied(), len, len - 1);
         for (i, v) in heap
             .get(obj)
             .elements_array
@@ -489,7 +487,7 @@ pub fn array_last_index_of(
     if len <= 0 || dense <= 0 {
         return Ok(JsValue::from_i32_smi(-1).unwrap_or_else(|| JsValue::from_f64(-1.0)));
     }
-    let mut from = relative_index(args.get(1).copied(), len, len - 1).min(dense - 1);
+    let mut from = relative_index(heap, args.get(1).copied(), len, len - 1).min(dense - 1);
     if from >= dense {
         from = dense - 1;
     }
@@ -516,7 +514,7 @@ pub fn array_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
     // `[from, len)` reads as `undefined`, so an `undefined` search hits when
     // the range holds fewer present entries than indices.
     if heap.get(obj).kind == v12_heap::Kind::Array {
-        let from = relative_index(args.get(1).copied(), len, 0).max(0);
+        let from = relative_index(heap, args.get(1).copied(), len, 0).max(0);
         let mut present: i64 = 0;
         for (i, v) in heap.get(obj).elements_array.dense_entries() {
             let i = i64::from(i);
@@ -537,7 +535,7 @@ pub fn array_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
         return Ok(JsValue::from_bool(false));
     }
     let dense = dense_bound(heap, obj, len);
-    let from = relative_index(args.get(1).copied(), len, 0)
+    let from = relative_index(heap, args.get(1).copied(), len, 0)
         .max(0)
         .min(dense);
     for i in from..dense {
@@ -586,7 +584,7 @@ pub fn array_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValu
     let obj = ctx.this_object(this, "Array.prototype.at", None)?;
     let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
-    let idx = relative_index(args.first().copied(), len, 0);
+    let idx = relative_index(heap, args.first().copied(), len, 0);
     if idx < 0 || idx >= len {
         return Ok(JsValue::undefined());
     }
@@ -643,16 +641,13 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     let obj = ctx.this_object(this, "Array.prototype.splice", None)?;
     let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
-    let start = relative_index(args.first().copied(), len, 0).max(0);
+    let start = relative_index(heap, args.first().copied(), len, 0).max(0);
     let delete_count = match args.get(1).copied() {
         None => len - start,
         Some(v) if v.is_undefined() => len - start,
         Some(v) => {
-            let d = v
-                .as_smi()
-                .map(i64::from)
-                .or_else(|| v.as_f64().map(|f| f.trunc() as i64))
-                .unwrap_or(0);
+            // W3.2: fourth copy of the same coercion, same replacement.
+            let d = super::ctx::heap_to_integer_or_infinity(heap, v) as i64;
             d.max(0).min(len - start)
         }
     };
@@ -684,8 +679,8 @@ pub fn array_fill(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVa
     let obj = ctx.this_object(this, "Array.prototype.fill", None)?;
     let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
-    let start = relative_index(args.get(1).copied(), len, 0).max(0);
-    let end = relative_index(args.get(2).copied(), len, len).max(0);
+    let start = relative_index(heap, args.get(1).copied(), len, 0).max(0);
+    let end = relative_index(heap, args.get(2).copied(), len, len).max(0);
     let value = args.first().copied().unwrap_or(JsValue::undefined());
     // A huge `length` on a sparse receiver would materialize billions of
     // entries: write the stored region plus bounded growth. Full arrays
@@ -710,9 +705,9 @@ pub fn array_copy_within(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resu
     let obj = ctx.this_object(this, "Array.prototype.copyWithin", None)?;
     let heap = &mut *ctx.heap;
     let len = i64::from(array_len(heap, obj));
-    let target = relative_index(args.first().copied(), len, 0).max(0);
-    let start = relative_index(args.get(1).copied(), len, 0).max(0);
-    let end = relative_index(args.get(2).copied(), len, len).max(0);
+    let target = relative_index(heap, args.first().copied(), len, 0).max(0);
+    let start = relative_index(heap, args.get(1).copied(), len, 0).max(0);
+    let end = relative_index(heap, args.get(2).copied(), len, len).max(0);
     if target >= len || start >= end {
         return Ok(this);
     }

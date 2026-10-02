@@ -61,8 +61,16 @@ pub fn time_clip(time: f64) -> f64 {
     if !time.is_finite() || time.abs() > MAX_TIME_VALUE {
         return f64::NAN;
     }
-    // `trunc` is ES ToIntegerOrInfinity for finite values; `+ 0.0` folds -0.
-    time.trunc() + 0.0
+    // W3.2: this was `time.trunc() + 0.0`, a hand-rolled copy of
+    // `ToIntegerOrInfinity` + the `+ 0` fold. It is a **pure refactor, not a
+    // fix** — `trunc` already handles every finite input, and `+ 0.0` already
+    // folds the `-0` that `truncate` returns for `-1 < x < 0`
+    // (`(-0.5).trunc() + 0.0` is `+0`, so `1/new Date(-0.5).getTime()` was
+    // already `Infinity`, as `node` reports). Verified by reverting this one
+    // line and diffing the `G` probe section: 0 changed values. The gain is
+    // that the rule now lives in one place, so a caller that needs the
+    // *unfolded* truncation (`MakeTime`/`MakeDay` below) can say so.
+    super::ctx::integer_or_infinity(time) + 0.0
 }
 
 /// ES `Day(t)`: the day number of the time value (floor division, so
@@ -215,8 +223,16 @@ fn ms_from_time(t: f64) -> f64 {
 /// ES `MakeTime(hour, min, sec, ms)`: NaN when any input is non-finite,
 /// otherwise the combined milliseconds (may exceed one day's range).
 ///
-/// Each component is `ToIntegerOrInfinity`ed first (ES step 2), so
+/// Each component is truncated (ES step 2), so
 /// `Date.UTC(2016, 0, 1, 0.9)` truncates rather than keeping the fraction.
+///
+/// The truncation is a plain `trunc`, **not**
+/// [`super::ctx::integer_or_infinity`], and that is deliberate: ES step 1
+/// tests *finiteness of the raw component* and returns NaN, so no `NaN → +0`
+/// rule applies here; and step 2's `-0 → +0` fold must not fire either,
+/// because step 4's `truncate(-0.5) = -0` is the answer the spec gives —
+/// `make_time` then *multiplies* the component, so folding `-0` to `+0` would
+/// change a `-0` millisecond total into `+0`.
 fn make_time(hour: f64, min: f64, sec: f64, ms: f64) -> f64 {
     if !hour.is_finite() || !min.is_finite() || !sec.is_finite() || !ms.is_finite() {
         return f64::NAN;

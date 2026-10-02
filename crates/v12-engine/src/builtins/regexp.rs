@@ -372,108 +372,6 @@ fn regexp_receiver(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<Handle<
     ctx.this_object(this, method, Some(v12_heap::Kind::RegExp))
 }
 
-/// The realm's canonical `%Symbol.species%`, or `None` in a bare heap with no
-/// `Symbol` constructor.
-///
-/// Read off `Symbol.species` rather than assumed: symbols are per-agent, so
-/// interning the string `"species"` would key the wrong `@@species` in a realm
-/// whose `Symbol` has been replaced (see `builtin::symbol`).
-fn realm_species_key(ctx: &mut Ctx) -> Option<v12_heap::PropKey> {
-    let sym = ctx.intrinsic("Symbol")?.as_object()?;
-    let key = v12_heap::PropKey::from_string(ctx.heap.intern_text("species"));
-    let shape = ctx.heap.shape_of(sym);
-    let slot = ctx
-        .heap
-        .lookup_property(shape, key)
-        .and_then(|d| d.slot())?;
-    let sym = ctx
-        .heap
-        .get(sym)
-        .properties
-        .get(slot as usize)?
-        .as_symbol()?;
-    Some(v12_heap::PropKey::from_symbol(sym))
-}
-
-/// `SpeciesConstructor(O, %RegExp%)` (ES 7.3.22), returning the selected
-/// constructor — not merely validating it.
-///
-/// `@@matchAll` (MatchAllIterator step 3), `@@replace` (step 3) and `@@split`
-/// (step 3) all open with this call, and every step below is observable.
-///
-/// ## Step 3 tests `Type(C)`; step 6 tests `IsConstructor(S)`
-///
-/// These are **different predicates on different values at different steps**,
-/// and collapsing them into one "must be a constructor" check is the bug this
-/// function is the fix for:
-///
-/// * Step 3 asks only whether `C` is an **Object**. A plain
-///   `r.constructor = { [Symbol.species]: f }` is a perfectly good `C`; it is
-///   almost never itself a constructor, and requiring one threw a `TypeError`
-///   for a receiver every engine accepts. That single wrong predicate made
-///   `species-regexp-get-global-throws.js` and
-///   `species-regexp-get-unicode-throws.js` fail, because their `C` is an
-///   object literal.
-/// * Step 6 asks whether `S` — a *different* value, the `@@species` property of
-///   `C` — is a constructor, and step 7 **throws** when it is not. It does not
-///   fall back to the default. Do not "fix" that into a default: step 5's
-///   `undefined`/`null` case is what selects the default, and the corpus
-///   requires the throw for `@@species` values like `{}`, `0`, `""` and
-///   `Date.now` (`Symbol.split/species-ctor-species-non-ctor.js`,
-///   `Symbol.matchAll/species-constructor-species-is-not-constructor.js`).
-///
-/// So the two steps disagree in *both* directions: `{}` passes step 3 and can
-/// still fail at step 7, while a real constructor that is not callable-by-`new`
-/// (a method definition, an arrow) fails step 6 with a `TypeError` that a
-/// naive `Type`-only reading of step 3 would not have predicted.
-fn species_constructor(
-    ctx: &mut Ctx,
-    re: Handle<JsObject>,
-    method: &str,
-) -> Result<JsValue, Throw> {
-    let default_ctor = ctx.intrinsic("RegExp").unwrap_or(JsValue::undefined());
-
-    // Step 1: `Let ctor be ? Get(O, "constructor")`. A throwing `constructor`
-    // getter propagates — the `?` is load-bearing
-    // (`Symbol.matchAll/species-constructor-get-constructor-throws.js`).
-    let ctor = super::iterator::own_or_inherited_read(ctx, JsValue::object(re), "constructor")?;
-    // Step 2: `undefined` selects the default. `null` does *not*: it falls
-    // through to step 3, which is what
-    // `species-constructor-is-not-object-throws.js` asserts for `null`.
-    if ctor.is_undefined() {
-        return Ok(default_ctor);
-    }
-    // Step 3: `If ctor is not an Object, throw a TypeError exception.` — an
-    // Object test, *not* `IsConstructor`. See the section note above.
-    let Some(ctor_obj) = ctor.as_object() else {
-        return Err(ctx.type_error(format!(
-            "TypeError: {method} receiver's constructor is not an object"
-        )));
-    };
-    // Step 4: `Let species be ? Get(ctor, %Symbol.species%)`. A throwing
-    // getter propagates (`species-constructor-get-species-throws.js`), and a
-    // bare heap with no `Symbol` constructor has no key to read, so there is
-    // nothing left to select and the default stands in.
-    let Some(species_key) = realm_species_key(ctx) else {
-        return Ok(default_ctor);
-    };
-    let species = crate::internal_methods::dispatch_get(ctx.heap, ctor_obj, species_key, ctor)
-        .map_err(Throw::Value)?;
-    // Step 5: `undefined`/`null` select the default.
-    if species.is_undefined() || species.is_null() {
-        return Ok(default_ctor);
-    }
-    // Step 6: `If IsConstructor(species) is true, return species.`
-    if ctx.is_constructor(species) {
-        return Ok(species);
-    }
-    // Step 7: `Throw a TypeError exception.` — no fallback to the default;
-    // step 5 is the only path that selects it.
-    Err(ctx.type_error(format!(
-        "TypeError: {method} receiver's constructor @@species is not a constructor"
-    )))
-}
-
 /// MatchAllIterator step 6: `Let matcher be ? Construct(C, « R, flags »)`.
 ///
 /// ## Why this only handles `C = %RegExp%`
@@ -627,9 +525,13 @@ pub fn regexp_symbol_match_all(
     // *before* the species selection, so a `@@replace`-style coercion failure
     // is observed even when the receiver's species is also malformed.
     let s = ctx.to_string(args.first().copied().unwrap_or(JsValue::undefined()));
-    let species_ctor = species_constructor(ctx, re, "RegExp.prototype[Symbol.matchAll]")?;
-    let matcher = construct_species_matcher(ctx, species_ctor, re, &flags)?;
-    // MatchAllIterator step 6 (continued):
+    // `SpeciesConstructor(R, %RegExp%)` — W3.2 moved the seven steps onto
+    // `Ctx`, so `Promise` (whose callers need a capability) states them
+    // against one implementation instead of a second copy in prose.
+    let default_ctor = ctx.intrinsic("RegExp").unwrap_or(JsValue::undefined());
+    let species_ctor =
+        ctx.species_constructor(re, default_ctor, "RegExp.prototype[Symbol.matchAll]")?;
+    let matcher = construct_species_matcher(ctx, species_ctor, re, &flags)?; // MatchAllIterator step 6 (continued):
     //   `Let lastIndex be ? ToLength(? Get(R, "lastIndex")).`
     //   `Perform ? Set(matcher, "lastIndex", lastIndex, true).`
     // The receiver's own `lastIndex` is copied onto the matcher and left
@@ -789,7 +691,9 @@ pub fn regexp_symbol_split(
     // « regexp, newFlags »)`, so only its `TypeError`s are observable here:
     // this engine's cursor rewrite (see the fn doc) matches against the
     // receiver `re`, never against a constructed `splitter`.
-    let _species_ctor = species_constructor(ctx, re, "RegExp.prototype[Symbol.split]")?;
+    let default_ctor = ctx.intrinsic("RegExp").unwrap_or(JsValue::undefined());
+    let _species_ctor =
+        ctx.species_constructor(re, default_ctor, "RegExp.prototype[Symbol.split]")?;
     let units: Vec<u16> = s.encode_utf16().collect();
     let limit = match args.get(1) {
         Some(&v) if !v.is_undefined() => ctx.to_number(v),
