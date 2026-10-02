@@ -1006,7 +1006,9 @@ fn compile_pattern(source: &str, flags: &str) -> Result<v12_regex::CompiledRegex
 /// The steps, in order: `ToNumber` (so `""` is 0, `"1.9"` is 1.9, `null` is 0),
 /// then `ToIntegerOrInfinity` (truncate toward zero, `NaN` to 0), then clamp to
 /// `[0, 2^53 - 1]`. 0 for a missing property, since a deleted `lastIndex` reads
-/// as `undefined` → `NaN` → 0.
+/// as `undefined` → `NaN` → 0. W3.2 routed the last two steps through
+/// [`Ctx::to_length`], deleting the private `to_length(n: f64)` that stood
+/// here — same four rules, one implementation shared with `array.rs`.
 pub fn last_index(ctx: &mut Ctx, obj: Handle<JsObject>) -> f64 {
     let key = last_index_key(ctx.heap);
     let value = {
@@ -1024,22 +1026,7 @@ pub fn last_index(ctx: &mut Ctx, obj: Handle<JsObject>) -> f64 {
             .copied()
             .unwrap_or(JsValue::undefined())
     };
-    let n = ctx.to_number(value);
-    to_length(n)
-}
-
-/// ES `ToLength(n)`: `ToIntegerOrInfinity` then clamp to `[0, 2^53 - 1]`. The
-/// 2^53 ceiling is what makes a `lastIndex` of `1e300` mean "past the end"
-/// rather than "an index no slice can express".
-fn to_length(n: f64) -> f64 {
-    if n.is_nan() {
-        return 0.0;
-    }
-    let int = n.trunc();
-    if int <= 0.0 {
-        return 0.0;
-    }
-    int.min(9007199254740991.0)
+    ctx.to_length(value)
 }
 
 /// `Set(R, "lastIndex", v, true)` (ES 10.4.1) — an ordinary `[[Set]]`, so it

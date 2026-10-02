@@ -70,7 +70,10 @@ fn as_regexp(heap: &Heap, v: Option<&JsValue>) -> Option<Handle<v12_heap::JsObje
 /// `String.prototype.charAt(index)` – returns a single-character string.
 pub fn string_char_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let handle = this_string(ctx, this, "String.prototype.charAt")?;
-    let index = args.first().and_then(to_index).unwrap_or(0);
+    let index = match args.first().copied() {
+        None => 0,
+        Some(v) => to_index(ctx, v),
+    };
     let units = string_units(&mut *ctx.heap, handle);
     let unit = match units.get(index as usize) {
         Some(&unit) => vec![unit],
@@ -84,8 +87,14 @@ pub fn string_char_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
 pub fn string_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let handle = this_string(ctx, this, "String.prototype.slice")?;
     let len = ctx.heap.get(handle).len() as i64;
-    let start = args.first().and_then(to_integer).unwrap_or(0);
-    let end = args.get(1).and_then(to_integer).unwrap_or(len);
+    let start = match args.first().copied() {
+        None => 0,
+        Some(v) => to_index(ctx, v),
+    };
+    let end = match args.get(1).copied() {
+        None => len,
+        Some(v) => to_index(ctx, v),
+    };
     let from = clamp_index(start, len) as u32;
     let to = clamp_index(end, len) as u32;
     let (from, to) = if from > to { (to, to) } else { (from, to) };
@@ -100,20 +109,26 @@ pub fn string_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     Ok(JsValue::string(sliced))
 }
 
-fn to_index(v: &JsValue) -> Option<i64> {
-    if let Some(n) = v.as_smi() {
-        return Some(i64::from(n));
-    }
-    if let Some(n) = v.as_f64()
-        && n.is_finite()
-    {
-        return Some(n.trunc() as i64);
-    }
-    None
-}
-
-fn to_integer(v: &JsValue) -> Option<i64> {
-    to_index(v)
+/// ES `ToIntegerOrInfinity` reduced to an `i64` — the shared coercion for every
+/// index-shaped argument in this file (`charAt`/`slice`, `charCodeAt`,
+/// `codePointAt`, `indexOf`/`includes`/`startsWith`/`endsWith` `position`,
+/// `substring`/`substr`/`split`/`padStart`/`padEnd`/`repeat`).
+///
+/// W3.2 replaced a `&JsValue`-only pair — `to_index` and `to_integer`, the
+/// latter a pure alias of the former — that read only Smi/f64 and returned
+/// `None` for **everything else**. `charAt("1")` answered `'a'` (index 0)
+/// where the spec says `'b'`, and `"abcdef".slice("1","3")` returned the whole
+/// string because both arguments fell back to the defaults 0 and `len`.
+/// `Ctx::to_integer_or_infinity` performs the real `ToNumber` first, so a
+/// string, a boolean, `null` and `[]` now coerce the way `ToIntegerOrInfinity`
+/// says: `""` → 0, `"1.9"` → 1, `true` → 1, `null` → 0, `[]` → 0.
+///
+/// `as i64` keeps the saturating cast, so `±Infinity` becomes `i64::MAX`/
+/// `i64::MIN`; every caller's clamp (`.clamp(0, len)`, `units.get(i)`, a
+/// `usize` cast through `.max(0)`) turns that into "past the end" exactly as
+/// it already did for an f64 `Infinity` argument.
+fn to_index(ctx: &mut Ctx, v: JsValue) -> i64 {
+    ctx.to_integer_or_infinity(v) as i64
 }
 
 fn clamp_index(index: i64, len: i64) -> i64 {
@@ -546,13 +561,15 @@ fn this_text(ctx: &mut Ctx, this: JsValue, method: &str) -> Result<String, Throw
 }
 
 /// Integer coercion shared by the index arguments (NaN → 0, truncation).
+/// `Option`-shaped so an absent argument and an explicit `undefined` share
+/// the default; both are `NaN` under `ToIntegerOrInfinity` anyway. W3.2
+/// reduced this to [`to_index`] — the old body was the same
+/// `to_number` + NaN-to-0 + `trunc as i64` sequence written out again.
 fn to_int(ctx: &mut Ctx, v: Option<JsValue>) -> i64 {
-    let Some(v) = v else { return 0 };
-    if v.is_undefined() {
-        return 0;
+    match v {
+        None => 0,
+        Some(v) => to_index(ctx, v),
     }
-    let n = ctx.to_number(v);
-    if n.is_nan() { 0 } else { n.trunc() as i64 }
 }
 
 /// UTF-16 code units of the text — JS string indices are UTF-16 offsets.
@@ -623,7 +640,7 @@ pub fn string_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVal
         None => 0,
         Some(v) if v.is_undefined() => 0,
         Some(v) => {
-            let n = ctx.to_number(v).trunc() as i64;
+            let n = to_index(ctx, v);
             if n < 0 { len + n } else { n }
         }
     };
@@ -729,7 +746,7 @@ pub fn string_ends_with(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resul
     let end = match args.get(1).copied() {
         None => units.len(),
         Some(v) if v.is_undefined() => units.len(),
-        Some(v) => (ctx.to_number(v).trunc().max(0.0) as usize).min(units.len()),
+        Some(v) => (to_index(ctx, v).max(0) as usize).min(units.len()),
     };
     Ok(JsValue::from_bool(
         end >= needle.len() && units[end - needle.len()..end] == needle[..],

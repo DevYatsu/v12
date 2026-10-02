@@ -22,16 +22,17 @@ fn length_prop(heap: &mut Heap) -> v12_heap::PropKey {
 /// The receiver's `length` (array-layout slot for arrays, shape property for
 /// generic receivers), through ToLength; falls back to the element store.
 ///
-/// ToLength is [`Ctx::to_integer_or_infinity`] (the `heap_` twin, because
-/// this helper holds a borrowed heap) clamped to `[0, 2^53-1]`. W3.2 deleted
-/// the private `to_length` that stood here: it computed the same clamp but read
-/// the value with `as_smi().or(as_f64)`, so a **string or boolean `length`
-/// coerced to `NaN` and therefore to 0** — `push` on `{length: "5"}` wrote
-/// index 0 instead of 5. The clamp is still load-bearing, for the reason its
-/// old doc gave: the receiver's length is *not* a u32 quantity — array-like
-/// objects legally carry `length` up to 2^53-1, and a saturating u32 cast
-/// (`4294967296 as u32` → 4294967295) sent pop/push writing at index 2^32-2,
-/// which a flat element store answered with a multi-GB resize.
+/// ToLength is [`Ctx::to_length`] — its `heap_` twin plus the shared
+/// [`super::ctx::length_from`] clamp, because this helper holds a borrowed
+/// heap. W3.2 deleted the private `to_length` that stood here: it computed the
+/// same clamp but read the value with `as_smi().or(as_f64)`, so a **string or
+/// boolean `length` coerced to `NaN` and therefore to 0** — `push` on
+/// `{length: "5"}` wrote index 0 instead of 5. The clamp is still load-bearing,
+/// for the reason its old doc gave: the receiver's length is *not* a u32
+/// quantity — array-like objects legally carry `length` up to 2^53-1, and a
+/// saturating u32 cast (`4294967296 as u32` → 4294967295) sent pop/push writing
+/// at index 2^32-2, which a flat element store answered with a multi-GB
+/// resize.
 fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> f64 {
     let key = length_prop(heap);
     // Look up through the object's own shape: a shape-bound array (literal,
@@ -51,7 +52,7 @@ fn array_length(heap: &mut Heap, obj: Handle<JsObject>) -> f64 {
             .copied()
             .unwrap_or(JsValue::undefined());
         if !v.is_undefined() {
-            return super::ctx::heap_to_integer_or_infinity(heap, v).clamp(0.0, 9007199254740991.0);
+            return super::ctx::length_from(super::ctx::heap_to_integer_or_infinity(heap, v));
         }
     }
     // Fallback to elements length.

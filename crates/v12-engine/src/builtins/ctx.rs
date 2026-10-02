@@ -367,6 +367,17 @@ impl<'a> Ctx<'a> {
         heap_to_integer_or_infinity(self.heap, v)
     }
 
+    /// ES `ToLength` (7.1.20) over a *value*, not a number: [`Self::to_number`]
+    /// then [`length_from`].
+    ///
+    /// The `&mut Heap` twin is `length_from(integer_or_infinity(
+    /// heap_to_number(heap, v)))` — one clamp, two entry points, because a
+    /// `f64`-only copy is exactly what let `regexp.rs`'s private `to_length`
+    /// and `array.rs`'s inline `.clamp(…)` drift apart from each other.
+    pub fn to_length(&mut self, v: JsValue) -> f64 {
+        length_from(self.to_number(v))
+    }
+
     /// String text of a value: strings render their text, real arrays
     /// render comma-joined elements, everything else renders the way
     /// `console.log` observes it (Tier-0 display subset).
@@ -1146,6 +1157,18 @@ pub(crate) fn integer_or_infinity(n: f64) -> f64 {
     } else {
         n.trunc()
     }
+}
+
+/// ES `ToLength` (7.1.20) step 2, given an **already `ToNumber`-converted**
+/// value: [`integer_or_infinity`] then clamp to `[0, 2^53 - 1]`. W3.2 lifted
+/// this out of `regexp.rs`, where it stood as a private `to_length(n: f64)`
+/// — the numeric twin of `array.rs`'s inline
+/// `heap_to_integer_or_infinity(…).clamp(0.0, 9007199254740991.0)`. The 2^53
+/// ceiling is what makes a `lastIndex` of `1e300` mean "past the end" rather
+/// than "an index no slice can express"; the `ToNumber` step is *not* part of
+/// it, which is why this takes an `f64` and [`Ctx::to_length`] wraps it.
+pub(crate) fn length_from(n: f64) -> f64 {
+    integer_or_infinity(n).clamp(0.0, 9007199254740991.0)
 }
 
 /// ES `ToIntegerOrInfinity` (7.1.5), heap-only: [`heap_to_number`], then

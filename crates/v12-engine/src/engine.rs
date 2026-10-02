@@ -810,6 +810,30 @@ mod tests {
     }
 
     #[test]
+    fn string_index_arguments_coerce_through_to_number() {
+        let mut engine = Engine::new();
+        // W3.2: `String.prototype`'s index arguments went through a
+        // `&JsValue`-only `to_index` that pattern-matched Smi/f64 and returned
+        // `None` for everything else, so every caller fell back to its
+        // default: `charAt("1")` was `'a'`, and `slice("1","3")` was the whole
+        // string. Spec order is ToNumber -> ToIntegerOrInfinity.
+        let thrown = engine
+            .eval("let s = 'abcdef'; throw s.charAt('1') + s.charAt(true) + s.charAt(1.9) + s.charAt(-1);")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "bbb");
+        let thrown = engine
+            .eval("let s = 'abcdef'; throw [s.slice('1'), s.slice('1','3'), s.slice(true,true), s.slice()].join('|');")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "bcdef|bc||abcdef");
+        // ToNumber corners that reach the same coercion: "" and null are 0,
+        // [] is 0, "1.9" truncates, and an explicit NaN argument is 0.
+        let thrown = engine
+            .eval("let s = 'abc'; throw [s.charAt(''), s.charAt(null), s.charAt([]), s.charAt(NaN), s.charAt('x')].join(',');")
+            .unwrap_err();
+        assert_eq!(engine.to_display_string(thrown), "a,a,a,a,a");
+    }
+
+    #[test]
     fn regexp_last_index_global() {
         let mut engine = Engine::new();
         // Global exec advances lastIndex across calls.
