@@ -16,7 +16,7 @@
 //!
 //! Rounds repeat until convergence (bounded).
 
-use v12_bytecode::{FunctionBytecode, Instr, Opcode, WideOp};
+use v12_bytecode::{FunctionBytecode, Instr, Opcode, spec};
 
 const MAX_ROUNDS: usize = 8;
 
@@ -243,10 +243,70 @@ fn imm8(instr: Instr) -> i32 {
     i8::from_be_bytes([instr.c()]) as i32
 }
 
-/// Wide sequences count as one logical word.
+/// Words the sequence starting at `words[0]` occupies.
+///
+/// Derived from `v12_bytecode::OpSpec`'s `width` rather than a private
+/// `match Opcode::Wide`, so the "is this opcode one word or a header plus
+/// payload?" question has exactly one answer in the workspace. `Width` says
+/// *which* opcodes may carry a payload; the count itself still comes from
+/// `WideOp::try_decode`, which is the only place that knows a variant's
+/// payload shape — and which `OpSpec::logical_width` calls, in `v12-bytecode`.
+///
+/// An unassigned byte decodes to no `Opcode` and no `OpSpec`, so it reports
+/// one word, as it did when this function matched on `Opcode::Wide` directly.
 fn word_width(words: &[Instr]) -> usize {
-    match words.first().and_then(|w| w.op()) {
-        Some(Opcode::Wide) => WideOp::try_decode(words).map(|(_, w)| w).unwrap_or(1),
-        _ => 1,
+    words
+        .first()
+        .and_then(|w| w.op())
+        .and_then(spec)
+        .map_or(1, |s| s.logical_width(words))
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+    use v12_bytecode::{ALL_OPCODES, WideOp};
+
+    /// The peephole layout walk is only sound if "one word" and "header plus
+    /// payload" agree with the `OpSpec` table — it deletes and remaps by word
+    /// index, so a table that called a wide opcode `Width::One` would silently
+    /// fold a payload word into an instruction boundary.
+    #[test]
+    fn a_lone_instruction_costs_one_word() {
+        for &op in ALL_OPCODES {
+            assert_eq!(word_width(&[Instr::new(op, 1, 2, 3)]), 1, "{op:?}");
+        }
+    }
+
+    /// A real `Wide` sequence is reported as its full span, header included.
+    #[test]
+    fn wide_sequences_span_their_payload() {
+        for words in [
+            WideOp::RegExt {
+                mask: 0b0011,
+                a_hi: 0,
+                b_hi: 0,
+                c_hi: 0,
+            }
+            .encode(),
+            WideOp::LoadConstW {
+                dst: 1,
+                const_id: 2,
+            }
+            .encode(),
+            WideOp::LoadIntW { dst: 1, value: 2 }.encode(),
+        ] {
+            assert_eq!(words.first().and_then(|w| w.op()), Some(Opcode::Wide));
+            assert_eq!(word_width(&words), words.len(), "{words:?}");
+        }
+    }
+
+    /// An unassigned opcode byte — reachable through `Instr`'s public tuple
+    /// field, and by any corrupt or future-format input — costs one word, not a
+    /// panic and not a zero.
+    #[test]
+    fn an_unassigned_byte_costs_one_word() {
+        assert_eq!(word_width(&[Instr(0x0500_0000)]), 1);
+        assert_eq!(word_width(&[]), 1);
     }
 }

@@ -43,9 +43,12 @@
 //! bytecode, and therefore the wire format and every dispatcher at once. That
 //! is a separate decision, not a cleanup.
 //!
-//! Nothing reads this table at runtime yet. Task W2.1 phase A is the table
-//! plus the cross-check test in `tests.rs`; wiring it into a dispatcher is
-//! phase B.
+//! Nothing here changes the emitted bytecode. Task W2.1 phase A is the table
+//! plus the cross-check test in `tests.rs`; W2.2 (phase B) wires `Width` into
+//! `v12-bccompiler`'s `word_width` and derives the byte decoder from the
+//! assigned-discriminant list. Normalising the divergences listed below, and
+//! making any dispatcher *enforce* the roles rather than merely record them,
+//! is later work — see W2.3.
 
 use crate::{Instr, Opcode, WideOp};
 #[cfg(test)]
@@ -306,20 +309,18 @@ static OP_SPECS: [Option<OpSpec>; 256] = build_specs();
 
 /// Every assigned [`Opcode`], in discriminant order.
 ///
-/// Derived by scanning the byte range against [`Opcode`]'s hand-written
-/// `TryFrom<u8>`, not maintained by hand — so it cannot silently omit a
-/// variant the way the `ALL_OPS` list in `opcode.rs` does (that list is stale:
-/// it stops at `ToPropertyKey` = 75 and never gained `GetAsyncIterator` = 76,
-/// `GetPrototype` = 77 or `PopEnvironment` = 78).
+/// A `Vec` view of [`crate::ALL_OPCODES`] — the same list the byte decoder inverts, so
+/// a variant cannot be decoded but absent here, or present here but not
+/// decodable. The list it replaced (`ALL_OPS` in `opcode.rs`) was hand-written
+/// and went stale: it stopped at `ToPropertyKey` = 75 and never gained
+/// `GetAsyncIterator` = 76, `GetPrototype` = 77 or `PopEnvironment` = 78, and
+/// the tests in `opcode.rs` iterated it, so those three variants had no
+/// encoding coverage at all.
 ///
-/// A function rather than a `const` because `TryFrom<u8>` is not a `const fn`
-/// (see [`Opcode`]'s hand-written impl), and adding a second, `const`-callable
-/// decoder here would reintroduce exactly the two-decoders problem this module
-/// exists to remove. The scan is 256 iterations of a jump table.
+/// Returns `Vec` rather than the slice itself because callers clone per sweep
+/// and the crate exposes the const list directly for the cases that do not.
 pub fn all_opcodes() -> Vec<Opcode> {
-    (0u16..=255)
-        .filter_map(|byte| Opcode::try_from(byte as u8).ok())
-        .collect()
+    crate::ALL_OPCODES.to_vec()
 }
 
 /// The operand contract for this opcode.

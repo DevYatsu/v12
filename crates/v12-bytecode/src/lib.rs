@@ -34,7 +34,7 @@ pub use analysis::{
     logical_pcs, loop_headers, next_logical_pc,
 };
 pub use builder::{FunctionBuilder, Label};
-pub use opcode::{Instr, MAX_IMM24, Opcode};
+pub use opcode::{ALL_OPCODES, Instr, MAX_IMM24, OPCODE_COUNT, Opcode};
 pub use opspec::{
     CREATE_GENERATOR_B_FALLBACK, KNOWN_DISASSEMBLER_LABEL_DIVERGENCE,
     KNOWN_DISASSEMBLER_SLOT_DIVERGENCE, KNOWN_INCONSISTENT_OPERAND_ORDER, OpSpec, Role, Slot,

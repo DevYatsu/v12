@@ -178,87 +178,132 @@ pub enum Opcode {
     PopEnvironment = 78,
 }
 
+/// Every assigned [`Opcode`], in ascending discriminant order.
+///
+/// The single statement of *which bytes decode and to what*: [`TryFrom<u8>`]
+/// inverts this list into a byte-indexed lookup at compile time, so a new
+/// variant is added in exactly one place and the decoder cannot drift from it.
+/// A duplicate discriminant here would collapse two variants onto one byte and
+/// make one unreachable, so `discriminants_are_frozen` pins the whole list
+/// against a frozen copy of the wire format.
+///
+/// Ordering is part of the contract, not a style choice: [`crate::all_opcodes`]
+/// returns this list verbatim.
+pub const ALL_OPCODES: &[Opcode] = &[
+    Opcode::Move,
+    Opcode::LoadConst,
+    Opcode::LoadInt,
+    Opcode::Wide,
+    Opcode::Add,
+    Opcode::Sub,
+    Opcode::Mul,
+    Opcode::Div,
+    Opcode::Mod,
+    Opcode::Pow,
+    Opcode::Neg,
+    Opcode::BitAnd,
+    Opcode::BitOr,
+    Opcode::BitXor,
+    Opcode::Shl,
+    Opcode::Shr,
+    Opcode::UShr,
+    Opcode::BitNot,
+    Opcode::Eq,
+    Opcode::Ne,
+    Opcode::Lt,
+    Opcode::Le,
+    Opcode::Gt,
+    Opcode::Ge,
+    Opcode::StrictEq,
+    Opcode::StrictNe,
+    Opcode::Not,
+    Opcode::TypeOf,
+    Opcode::Jump,
+    Opcode::JumpIfFalse,
+    Opcode::JumpIfTrue,
+    Opcode::LoopHeader,
+    Opcode::Call,
+    Opcode::Return,
+    Opcode::Throw,
+    Opcode::GetProperty,
+    Opcode::SetProperty,
+    Opcode::DeleteProperty,
+    Opcode::NewObject,
+    Opcode::NewArray,
+    Opcode::Closure,
+    Opcode::NewEnvironment,
+    Opcode::GetEnvSlot,
+    Opcode::SetEnvSlot,
+    Opcode::CreateGenerator,
+    Opcode::SuspendYield,
+    Opcode::Await,
+    Opcode::In,
+    Opcode::InstanceOf,
+    Opcode::CopyArrayRest,
+    Opcode::CheckIsArray,
+    Opcode::CallApply,
+    Opcode::CopyObjectRest,
+    Opcode::ArrayAppend,
+    Opcode::GetGlobal,
+    Opcode::SetGlobal,
+    Opcode::Construct,
+    Opcode::GetNewTarget,
+    Opcode::ToNumber,
+    Opcode::MergeObject,
+    Opcode::DefineAccessor,
+    Opcode::JumpIfNullish,
+    Opcode::SetPrototype,
+    Opcode::GetIterator,
+    Opcode::IteratorNext,
+    Opcode::IteratorClose,
+    Opcode::DefineMethod,
+    Opcode::GetGlobalLenient,
+    Opcode::GenResumeMode,
+    Opcode::ToPropertyKey,
+    Opcode::GetAsyncIterator,
+    Opcode::GetPrototype,
+    Opcode::PopEnvironment,
+];
+
+/// Number of assigned [`Opcode`] variants.
+pub const OPCODE_COUNT: usize = ALL_OPCODES.len();
+
+/// [`ALL_OPCODES`] inverted into a byte-indexed lookup; `None` at every
+/// unassigned discriminant.
+///
+/// Built at compile time, so the decoder and the list it decodes are one
+/// artefact. A `static` rather than a `const` would make this unreadable from
+/// a `const fn` — and [`Opcode::from_byte`] is deliberately `const` so
+/// compile-time consumers are not forced through `TryFrom` (which cannot be).
+const OPCODE_BY_BYTE: [Option<Opcode>; 256] = invert_all_opcodes();
+
+const fn invert_all_opcodes() -> [Option<Opcode>; 256] {
+    let mut table = [None; 256];
+    let mut i = 0;
+    while i < ALL_OPCODES.len() {
+        table[ALL_OPCODES[i] as usize] = Some(ALL_OPCODES[i]);
+        i += 1;
+    }
+    table
+}
+
+impl Opcode {
+    /// Decodes an opcode byte; `None` for an unassigned discriminant.
+    ///
+    /// `const`-callable, which [`TryFrom<u8>`] is not (a trait method cannot
+    /// be). Every other decoder in the workspace should reach for this rather
+    /// than rebuilding its own `match`.
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        OPCODE_BY_BYTE[byte as usize]
+    }
+}
+
 impl TryFrom<u8> for Opcode {
     type Error = u8;
 
     /// Inverse of the discriminant mapping; `Err` carries the unassigned byte.
     fn try_from(byte: u8) -> Result<Self, Self::Error> {
-        match byte {
-            1 => Ok(Self::Move),
-            2 => Ok(Self::LoadConst),
-            3 => Ok(Self::LoadInt),
-            4 => Ok(Self::Wide),
-            10 => Ok(Self::Add),
-            11 => Ok(Self::Sub),
-            12 => Ok(Self::Mul),
-            13 => Ok(Self::Div),
-            14 => Ok(Self::Mod),
-            15 => Ok(Self::Pow),
-            16 => Ok(Self::Neg),
-            17 => Ok(Self::BitAnd),
-            18 => Ok(Self::BitOr),
-            19 => Ok(Self::BitXor),
-            20 => Ok(Self::Shl),
-            21 => Ok(Self::Shr),
-            22 => Ok(Self::UShr),
-            23 => Ok(Self::BitNot),
-            24 => Ok(Self::Eq),
-            25 => Ok(Self::Ne),
-            26 => Ok(Self::Lt),
-            27 => Ok(Self::Le),
-            28 => Ok(Self::Gt),
-            29 => Ok(Self::Ge),
-            30 => Ok(Self::StrictEq),
-            31 => Ok(Self::StrictNe),
-            32 => Ok(Self::Not),
-            33 => Ok(Self::TypeOf),
-            34 => Ok(Self::Jump),
-            35 => Ok(Self::JumpIfFalse),
-            36 => Ok(Self::JumpIfTrue),
-            37 => Ok(Self::LoopHeader),
-            38 => Ok(Self::Call),
-            39 => Ok(Self::Return),
-            40 => Ok(Self::Throw),
-            41 => Ok(Self::GetProperty),
-            42 => Ok(Self::SetProperty),
-            43 => Ok(Self::DeleteProperty),
-            44 => Ok(Self::NewObject),
-            45 => Ok(Self::NewArray),
-            46 => Ok(Self::Closure),
-            47 => Ok(Self::NewEnvironment),
-            48 => Ok(Self::GetEnvSlot),
-            49 => Ok(Self::SetEnvSlot),
-            50 => Ok(Self::CreateGenerator),
-            51 => Ok(Self::SuspendYield),
-            52 => Ok(Self::Await),
-            53 => Ok(Self::In),
-            54 => Ok(Self::InstanceOf),
-            55 => Ok(Self::CopyArrayRest),
-            56 => Ok(Self::CheckIsArray),
-            57 => Ok(Self::CallApply),
-            58 => Ok(Self::CopyObjectRest),
-            59 => Ok(Self::ArrayAppend),
-            60 => Ok(Self::GetGlobal),
-            61 => Ok(Self::SetGlobal),
-            62 => Ok(Self::Construct),
-            63 => Ok(Self::GetNewTarget),
-            64 => Ok(Self::ToNumber),
-            65 => Ok(Self::MergeObject),
-            66 => Ok(Self::DefineAccessor),
-            67 => Ok(Self::JumpIfNullish),
-            68 => Ok(Self::SetPrototype),
-            69 => Ok(Self::GetIterator),
-            70 => Ok(Self::IteratorNext),
-            71 => Ok(Self::IteratorClose),
-            72 => Ok(Self::DefineMethod),
-            73 => Ok(Self::GetGlobalLenient),
-            74 => Ok(Self::GenResumeMode),
-            75 => Ok(Self::ToPropertyKey),
-            76 => Ok(Self::GetAsyncIterator),
-            77 => Ok(Self::GetPrototype),
-            78 => Ok(Self::PopEnvironment),
-            other => Err(other),
-        }
+        Self::from_byte(byte).ok_or(byte)
     }
 }
 
@@ -364,104 +409,170 @@ impl Instr {
 mod encoding_tests {
     use super::*;
 
-    /// Every opcode, so encoding tests cannot silently skip new variants.
-    const ALL_OPS: &[Opcode] = &[
-        Opcode::Move,
-        Opcode::LoadConst,
-        Opcode::LoadInt,
-        Opcode::Wide,
-        Opcode::Add,
-        Opcode::Sub,
-        Opcode::Mul,
-        Opcode::Div,
-        Opcode::Mod,
-        Opcode::Pow,
-        Opcode::Neg,
-        Opcode::BitAnd,
-        Opcode::BitOr,
-        Opcode::BitXor,
-        Opcode::Shl,
-        Opcode::Shr,
-        Opcode::UShr,
-        Opcode::BitNot,
-        Opcode::Eq,
-        Opcode::Ne,
-        Opcode::Lt,
-        Opcode::Le,
-        Opcode::Gt,
-        Opcode::Ge,
-        Opcode::StrictEq,
-        Opcode::StrictNe,
-        Opcode::Not,
-        Opcode::TypeOf,
-        Opcode::Jump,
-        Opcode::JumpIfFalse,
-        Opcode::JumpIfTrue,
-        Opcode::LoopHeader,
-        Opcode::Call,
-        Opcode::Return,
-        Opcode::Throw,
-        Opcode::GetProperty,
-        Opcode::SetProperty,
-        Opcode::DeleteProperty,
-        Opcode::NewObject,
-        Opcode::NewArray,
-        Opcode::Closure,
-        Opcode::NewEnvironment,
-        Opcode::GetEnvSlot,
-        Opcode::SetEnvSlot,
-        Opcode::CreateGenerator,
-        Opcode::SuspendYield,
-        Opcode::Await,
-        Opcode::In,
-        Opcode::InstanceOf,
-        Opcode::CopyArrayRest,
-        Opcode::CheckIsArray,
-        Opcode::CallApply,
-        Opcode::CopyObjectRest,
-        Opcode::ArrayAppend,
-        Opcode::GetGlobal,
-        Opcode::SetGlobal,
-        Opcode::Construct,
-        Opcode::GetNewTarget,
-        Opcode::ToNumber,
-        Opcode::MergeObject,
-        Opcode::DefineAccessor,
-        Opcode::JumpIfNullish,
-        Opcode::SetPrototype,
-        Opcode::GetIterator,
-        Opcode::IteratorNext,
-        Opcode::IteratorClose,
-        Opcode::DefineMethod,
-        Opcode::GetGlobalLenient,
-        Opcode::GenResumeMode,
-        Opcode::ToPropertyKey,
+    /// The wire format, frozen: every assigned opcode with its discriminant.
+    ///
+    /// A deliberate second copy of [`ALL_OPCODES`], because a stability test
+    /// that read the live list would prove nothing — renumbering a variant
+    /// updates the very list the decoder is built from. This one is a
+    /// transcript of the *pre-W2.2* hand-written decoder's output, captured
+    /// byte for byte over the whole `0..=255` range, so it detects a
+    /// renumbering, a dropped arm, a newly-assigned gap, and a stale entry
+    /// alike. It replaces the old `ALL_OPS` list, which was neither complete
+    /// (it stopped at `ToPropertyKey` = 75) nor pinned to any byte.
+    ///
+    /// Adding an opcode means adding a row here, which is the point: the
+    /// discriminants are the serialized format.
+    const FROZEN_DISCRIMINANTS: &[(u8, Opcode)] = &[
+        (1, Opcode::Move),
+        (2, Opcode::LoadConst),
+        (3, Opcode::LoadInt),
+        (4, Opcode::Wide),
+        (10, Opcode::Add),
+        (11, Opcode::Sub),
+        (12, Opcode::Mul),
+        (13, Opcode::Div),
+        (14, Opcode::Mod),
+        (15, Opcode::Pow),
+        (16, Opcode::Neg),
+        (17, Opcode::BitAnd),
+        (18, Opcode::BitOr),
+        (19, Opcode::BitXor),
+        (20, Opcode::Shl),
+        (21, Opcode::Shr),
+        (22, Opcode::UShr),
+        (23, Opcode::BitNot),
+        (24, Opcode::Eq),
+        (25, Opcode::Ne),
+        (26, Opcode::Lt),
+        (27, Opcode::Le),
+        (28, Opcode::Gt),
+        (29, Opcode::Ge),
+        (30, Opcode::StrictEq),
+        (31, Opcode::StrictNe),
+        (32, Opcode::Not),
+        (33, Opcode::TypeOf),
+        (34, Opcode::Jump),
+        (35, Opcode::JumpIfFalse),
+        (36, Opcode::JumpIfTrue),
+        (37, Opcode::LoopHeader),
+        (38, Opcode::Call),
+        (39, Opcode::Return),
+        (40, Opcode::Throw),
+        (41, Opcode::GetProperty),
+        (42, Opcode::SetProperty),
+        (43, Opcode::DeleteProperty),
+        (44, Opcode::NewObject),
+        (45, Opcode::NewArray),
+        (46, Opcode::Closure),
+        (47, Opcode::NewEnvironment),
+        (48, Opcode::GetEnvSlot),
+        (49, Opcode::SetEnvSlot),
+        (50, Opcode::CreateGenerator),
+        (51, Opcode::SuspendYield),
+        (52, Opcode::Await),
+        (53, Opcode::In),
+        (54, Opcode::InstanceOf),
+        (55, Opcode::CopyArrayRest),
+        (56, Opcode::CheckIsArray),
+        (57, Opcode::CallApply),
+        (58, Opcode::CopyObjectRest),
+        (59, Opcode::ArrayAppend),
+        (60, Opcode::GetGlobal),
+        (61, Opcode::SetGlobal),
+        (62, Opcode::Construct),
+        (63, Opcode::GetNewTarget),
+        (64, Opcode::ToNumber),
+        (65, Opcode::MergeObject),
+        (66, Opcode::DefineAccessor),
+        (67, Opcode::JumpIfNullish),
+        (68, Opcode::SetPrototype),
+        (69, Opcode::GetIterator),
+        (70, Opcode::IteratorNext),
+        (71, Opcode::IteratorClose),
+        (72, Opcode::DefineMethod),
+        (73, Opcode::GetGlobalLenient),
+        (74, Opcode::GenResumeMode),
+        (75, Opcode::ToPropertyKey),
+        (76, Opcode::GetAsyncIterator),
+        (77, Opcode::GetPrototype),
+        (78, Opcode::PopEnvironment),
     ];
 
+    /// Every one of the 73 discriminants is pinned, not 13 of them.
+    ///
+    /// Three things at once, and each catches a different failure the old
+    /// 13-assert test could not:
+    ///
+    /// * `op as u8 == byte` — a frozen row that no longer matches its own
+    ///   variant means the *enum* was renumbered;
+    /// * frozen list == [`ALL_OPCODES`] — the live list gained, lost or
+    ///   reordered a variant (or moved one to a different byte);
+    /// * strict ascent + equal length — a duplicate discriminant in
+    ///   `ALL_OPCODES`, which `invert_all_opcodes` would silently collapse,
+    ///   making one of the two variants undecodable.
     #[test]
-    fn discriminants_are_stable_and_unique() {
-        assert_eq!(Opcode::Move as u8, 1);
-        assert_eq!(Opcode::Wide as u8, 4);
-        assert_eq!(Opcode::Await as u8, 52);
-        assert_eq!(Opcode::In as u8, 53);
-        assert_eq!(Opcode::InstanceOf as u8, 54);
-        assert_eq!(Opcode::CopyArrayRest as u8, 55);
-        assert_eq!(Opcode::CheckIsArray as u8, 56);
-        assert_eq!(Opcode::CallApply as u8, 57);
-        assert_eq!(Opcode::CopyObjectRest as u8, 58);
-        assert_eq!(Opcode::ArrayAppend as u8, 59);
-        assert_eq!(Opcode::GetGlobal as u8, 60);
-        assert_eq!(Opcode::SetGlobal as u8, 61);
-        assert_eq!(Opcode::Construct as u8, 62);
-        assert_eq!(Opcode::GetNewTarget as u8, 63);
-        assert_eq!(Opcode::ToPropertyKey as u8, 75);
-        let unique: std::collections::HashSet<u8> = ALL_OPS.iter().map(|&op| op as u8).collect();
-        assert_eq!(unique.len(), ALL_OPS.len());
+    fn discriminants_are_frozen() {
+        let mut previous: Option<u8> = None;
+        for &(byte, op) in FROZEN_DISCRIMINANTS {
+            assert_eq!(
+                op as u8, byte,
+                "frozen row ({byte}, {op:?}) contradicts the enum"
+            );
+            if let Some(prev) = previous {
+                assert!(
+                    prev < byte,
+                    "frozen discriminants not ascending: {prev} then {byte}"
+                );
+            }
+            previous = Some(byte);
+        }
+        assert_eq!(FROZEN_DISCRIMINANTS.len(), OPCODE_COUNT);
+
+        let live: Vec<(u8, Opcode)> = ALL_OPCODES.iter().map(|&op| (op as u8, op)).collect();
+        assert_eq!(
+            live, FROZEN_DISCRIMINANTS,
+            "the assigned-discriminant list moved; if that is intended, this is a \
+             wire-format change and the frozen copy must be updated deliberately"
+        );
+    }
+
+    /// Byte-for-byte decode equivalence with the pre-W2.2 hand-written decoder.
+    ///
+    /// The decoder used to be a 73-arm `match`; it is now a compile-time
+    /// inversion of [`ALL_OPCODES`]. This walks the *entire* `0..=255` byte
+    /// range and asserts the resulting `(byte, opcode)` sequence is exactly
+    /// the frozen transcript of the old `match` — every assigned byte and,
+    /// just as importantly, every byte still rejected.
+    #[test]
+    fn every_byte_decodes_exactly_as_the_frozen_decoder_did() {
+        let decoded: Vec<(u8, Opcode)> = (0u16..=255)
+            .filter_map(|byte| Opcode::try_from(byte as u8).ok().map(|op| (byte as u8, op)))
+            .collect();
+        assert_eq!(decoded, FROZEN_DISCRIMINANTS);
+
+        // The complement matters as much as the mapping: 183 of 256 bytes must
+        // still be rejected, so a decoder that accepted everything, or an
+        // `Opcode::from_byte` that returned a default for a gap, fails here.
+        let rejected = (0u16..=255)
+            .filter(|byte| Opcode::try_from(*byte as u8).is_err())
+            .count();
+        assert_eq!(rejected, 256 - OPCODE_COUNT);
+
+        // `from_byte` is what `TryFrom` delegates to; pin that they agree,
+        // since only one of them is `const` and a future edit could split them.
+        for byte in 0u16..=255 {
+            let byte = byte as u8;
+            assert_eq!(
+                Opcode::from_byte(byte).ok_or(byte),
+                Opcode::try_from(byte),
+                "{byte}"
+            );
+        }
     }
 
     #[test]
     fn all_opcodes_roundtrip_through_new() {
-        for (idx, &op) in ALL_OPS.iter().enumerate() {
+        for (idx, &op) in ALL_OPCODES.iter().enumerate() {
             let i = Instr::new(op, idx as u8, 0xAB, 0xCD);
             assert_eq!(i.op(), Some(op), "{op:?}");
             assert_eq!(i.a(), idx as u8);
@@ -472,7 +583,7 @@ mod encoding_tests {
 
     #[test]
     fn all_opcodes_roundtrip_through_imm16_big_endian() {
-        for &op in ALL_OPS {
+        for &op in ALL_OPCODES {
             let i = Instr::new_imm16(op, 7, 0xBEEF);
             assert_eq!(i.op(), Some(op));
             assert_eq!(i.a(), 7);
@@ -485,7 +596,7 @@ mod encoding_tests {
 
     #[test]
     fn all_opcodes_roundtrip_through_imm24() {
-        for &op in ALL_OPS {
+        for &op in ALL_OPCODES {
             let i = Instr::new_imm24(op, 0x00AB_CDEF);
             assert_eq!(i.op(), Some(op));
             assert_eq!(i.imm24(), 0x00AB_CDEF);

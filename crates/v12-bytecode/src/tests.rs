@@ -22,17 +22,21 @@
 //! # Why the coverage is not self-reported
 //!
 //! The opcode list is derived by scanning the full `0..=255` byte range
-//! against `Opcode`'s hand-written `TryFrom<u8>`, so a new variant cannot be
-//! absent from the sweep. The hand-maintained `ALL_OPS` list in `opcode.rs`
-//! *is* stale (it stops at `ToPropertyKey` = 75), which is precisely why this
-//! file does not reuse it.
+//! against `Opcode`'s decoder, so a new variant cannot be absent from the
+//! sweep. The hand-maintained `ALL_OPS` list this file used to contrast itself
+//! against is gone (W2.2): it stopped at `ToPropertyKey` = 75, so it was both
+//! incomplete and — as the tests in `opcode.rs` iterated it — evidence of
+//! nothing. The frozen transcript that replaced it lives in `opcode.rs` and
+//! covers the discriminants; this file covers the roles.
 
 use super::*;
 use crate::opspec::{render_operands, spec, spec_at_byte};
 use crate::{Instr, Opcode, WideOp, all_opcodes};
 
 /// Number of assigned `Opcode` variants. A new variant must bump this, which
-/// makes adding one a deliberate act rather than an accident.
+/// makes adding one a deliberate act rather than an accident — and, since
+/// `opcode.rs` also pins every discriminant against a frozen transcript, a
+/// variant cannot land here without someone updating two counts on purpose.
 const OPCODE_COUNT: usize = 73;
 
 /// Distinct byte values stamped into `a`, `b`, `c`.
