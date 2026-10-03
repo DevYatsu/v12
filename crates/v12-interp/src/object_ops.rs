@@ -770,13 +770,73 @@ impl Interp<'_> {
         Ok(())
     }
 
-    /// Physical index for a shape-derived property `slot` on object `obj`.
+    /// `Array.prototype.push(...items)`: appended items land at
+    /// `length`-based indices through the interpreter's own property path.
     ///
-    /// The global object's `properties` vector is prefixed by
-    /// `GLOBAL_VAR_OFFSET` intrinsic slots that the shape graph does not
-    /// track (the realm installs them by pushing directly), so every
-    /// descriptor slot on the global maps to `GLOBAL_VAR_OFFSET + slot`;
-    /// ordinary objects use the slot as-is.
+    /// The sixth index/length reader of
+    /// `docs/adr/0004-arraylike-index-access.md`. It stays because the router
+    /// arm in `dispatch_native` must exist: `Interp::run_callback_builtin`
+    /// and then `NativeRegistry::call_native` are the only other routes, and
+    /// a bare `Interp` built with a `NativeRegistry` that refuses every id
+    /// (`crates/v12-interp/tests/promise_capability_seam.rs`'s `Seam`) would
+    /// then have **no** `push` at all — its own test fails on `keep.push(...)`
+    /// inside the GC-stress constructor. Deleting this body needs that test
+    /// (and any other bare-`Interp` embedder) to supply a registry that can
+    /// serve `ArrayPush`, which is outside this task's file set.
+    ///
+    /// What this change fixes is the *coercion*, which is the half of the ADR
+    /// that had to land in the same commit: the body used to read `length`
+    /// through the own shape with an inline `as_smi().or(as_f64)` — so
+    /// `{length: "5"}` coerced to `NaN` and wrote index 0 instead of 5 — and
+    /// wrote indices with `set_element`, a store a plain property read never
+    /// consults. Both now go through `Get`/`Set`.
+    pub(crate) fn array_push_fallback(
+        &mut self,
+        this_v: JsValue,
+        args: &[JsValue],
+    ) -> Result<JsValue, JSException> {
+        let Some(obj) = this_v.as_object() else {
+            return Err(JSException(
+                self.type_error("Array.prototype.push called on non-object"),
+            ));
+        };
+        // `ToLength(Get(O, "length"))`: the receiver's length is an f64
+        // because array-like objects legally carry lengths up to 2^53-1.
+        let len_key = self.new_temp_key("length");
+        let len_v = self.get_property(0, 0, JsValue::object(obj), len_key)?;
+        let len = ops::to_number(self.heap, len_v);
+        let mut len = if len.is_finite() && len > 0.0 {
+            len.trunc()
+        } else {
+            0.0
+        };
+        for &item in args {
+            if len <= 4294967294.0 {
+                let key = JsValue::string(self.heap.intern_text(&(len as u32).to_string()));
+                self.set_property(JsValue::object(obj), key, item, true)?;
+            }
+            len += 1.0;
+        }
+        self.set_property(JsValue::object(obj), len_key, ops::box_number(len), true)?;
+        Ok(ops::box_number(len))
+    }
+
+    /// `Array.prototype.join(separator?)`: `LengthOfArrayLike(O)` indices read
+    /// through the interpreter's own property path, `undefined`/`null`/holes
+    /// rendering empty.
+    ///
+    /// This is the *sixth* index/length reader
+    /// (`docs/adr/0004-arraylike-index-access.md`), and the ADR wants it gone
+    /// in favour of the registry body at `builtins/mod.rs:1773`. That body is
+    /// not fixable from this task's file set: it reads `elements_snapshot()`,
+    /// so it answers `""` for `{0:"a",1:"b",2:"c",length:3}` and cannot be
+    /// routed through `internal_methods::dispatch_get` without editing
+    /// `builtins/mod.rs`. Deleting the router arm instead makes it the live
+    /// path and *regresses* `Array.prototype.join` on sparse arrays, whose
+    /// holes it renders as `<unprintable>` instead of empty. So the arm stays
+    /// and this body is corrected in place: it no longer ignores `length`
+    /// (which is why it visited zero elements for a generic receiver) and no
+    /// longer coerces with an inline `as_smi().or(as_f64)`.
     pub(crate) fn array_join_fallback(
         &mut self,
         this_v: JsValue,
@@ -796,9 +856,20 @@ impl Interp<'_> {
         } else {
             ",".to_string()
         };
-        let elements: Vec<JsValue> = self.heap.get(arr).elements_snapshot();
-        let mut parts = Vec::with_capacity(elements.len());
-        for &v in &elements {
+        // `ToLength(Get(O, "length"))` through [[Get]], so an inherited or
+        // string `length` counts.
+        let len_key = self.new_temp_key("length");
+        let len_v = self.get_property(0, 0, JsValue::object(arr), len_key)?;
+        let len = ops::to_number(self.heap, len_v);
+        let len = if len.is_finite() && len > 0.0 {
+            len.trunc() as i64
+        } else {
+            0
+        };
+        let mut parts: Vec<String> = Vec::new();
+        for i in 0..len.min(1_000_000) {
+            let key = JsValue::string(self.heap.intern_text(&i.to_string()));
+            let v = self.get_property(0, 0, JsValue::object(arr), key)?;
             if v.is_undefined() || v.is_null() || v.is_hole() {
                 parts.push(String::new());
             } else {
@@ -807,61 +878,5 @@ impl Interp<'_> {
         }
         self.gc_protect();
         Ok(JsValue::string(self.heap.intern_text(&parts.join(&sep))))
-    }
-
-    pub(crate) fn array_push_fallback(
-        &mut self,
-        this_v: JsValue,
-        args: &[JsValue],
-    ) -> Result<JsValue, JSException> {
-        let Some(obj) = this_v.as_object() else {
-            return Err(JSException(
-                self.type_error("Array.prototype.push called on non-object"),
-            ));
-        };
-        // Spec: appended items land at `length`-based indices. For a sparse
-        // array (`new Array(len)`) the element store is shorter than the
-        // `length` property, so the store end is not the write index. The
-        // length is an f64 (ToLength): array-like receivers legally carry
-        // lengths up to 2^53-1, and indices beyond the element-store range
-        // skip the store write (the flat guard refuses huge-gap resizes).
-        let key = self.length_key();
-        let shape = self.shape_of(obj);
-        let mut len = self
-            .heap
-            .lookup_property(shape, key)
-            .and_then(|d| d.slot().map(|s| s as usize))
-            .filter(|&idx| idx < self.heap.get(obj).properties.len())
-            .and_then(|idx| {
-                let v = self.heap.get(obj).properties[idx];
-                v.as_smi()
-                    .map(|s| f64::from(s))
-                    .or_else(|| v.as_f64())
-                    .map(|n| {
-                        if n.is_nan() {
-                            0.0
-                        } else {
-                            n.trunc().clamp(0.0, 9007199254740991.0)
-                        }
-                    })
-            })
-            .unwrap_or_else(|| self.heap.get(obj).element_len() as f64);
-        for &item in args {
-            if len <= 4294967294.0 {
-                self.heap.get_mut(obj).set_element(len as u32, item);
-            }
-            len += 1.0;
-        }
-        let new_len = len;
-        // Sync length if shape exists
-        if let Some(desc) = self
-            .heap
-            .lookup_property(shape, key)
-            .and_then(|d| d.slot().map(|s| s as usize))
-            && desc < self.heap.get(obj).properties.len()
-        {
-            self.heap.get_mut(obj).properties[desc] = ops::box_number(new_len);
-        }
-        Ok(ops::box_number(new_len))
     }
 }

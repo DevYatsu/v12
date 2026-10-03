@@ -1559,11 +1559,25 @@ impl Interp<'_> {
     }
 
     /// Single normalization point for every `NativeId` call. Explicit router
-    /// arms (generator control, `ArrayJoin`/`ArrayPush` fallbacks,
-    /// `ConsoleLog`, `Function.prototype.call/apply/bind`, direct `eval`,
+    /// arms (generator control, `ConsoleLog`,
+    /// `Function.prototype.call/apply/bind`, direct `eval`,
     /// `Function` construction) run first — they need stack/program tables
     /// and are NOT builtins. Everything else tries `run_callback_builtin`
     /// (re-entrant, needs the machine) before `NativeRegistry::call_native`.
+    ///
+    /// `ArrayJoin`/`ArrayPush` keep their arms, and both fallbacks now read
+    /// `length` and the indices through the interpreter's property path.
+    ///
+    /// `docs/adr/0004-arraylike-index-access.md` wants both arms deleted so the
+    /// `builtins/mod.rs` registry bodies become the live path. Deleting
+    /// `ArrayPush`'s breaks a bare `Interp` whose `NativeRegistry` refuses
+    /// every id (`crates/v12-interp/tests/promise_capability_seam.rs`'s `Seam`
+    /// — its own `keep.push(...)` throws), and deleting `ArrayJoin`'s promotes
+    /// `builtins/mod.rs:1773`, which is `elements_snapshot()`-based and
+    /// regresses holes to `<unprintable>`. Both registry bodies are outside this
+    /// task's file set, so the arms stay and the coercion lands where the live
+    /// code is. Consequence to carry forward: `array::array_push` and
+    /// `array::array_sort` are still unreachable from JavaScript.
     ///
     /// `RealmEval` never reaches here: it is a `FunctionTarget` variant
     /// matched at each call site before id decoding.
