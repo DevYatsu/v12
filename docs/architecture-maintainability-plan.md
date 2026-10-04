@@ -369,6 +369,7 @@ Every task reports all four, or it is not done:
 | W3.2 slice 2 | `bb8cd58b` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 | ADR-0004 batch 1 | `1cb599a6` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 | ADR-0004 batch 2 | `3495ed55` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
+| ADR-0004 batch 3 | `629ee762` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 | ADR-0004 batch 3 | *(pending — central run required)* | expected `net +0`, BROKE 0; `ArraySetLength` has no test262 coverage for the sparse partial-write case, exactly as the W3.3 `parseInt` precedent above |
 
 **A `net +0` on a batch that fixed real bugs is not a null result.** W3.3 fixed three confirmed spec violations (`parseInt("0x10",16)`, `toPrecision(3)`, `toFixed(undefined)`), and the `language` slice still moved zero. The same held for the whole `ContainsArguments` sequence — 28 violations closed, `FIXED 0` every time, because test262 has no coverage for that rule's statement or pattern halves. Conformance is a *regression* gate here, not a progress one; progress is measured by the direct-call and unit tests.
