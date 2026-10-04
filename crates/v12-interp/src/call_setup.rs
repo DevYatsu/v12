@@ -3048,7 +3048,24 @@ impl Interp<'_> {
             None
         };
 
-        let indices: Box<dyn Iterator<Item = u32>> = if id == NativeId::ArrayReduceRight {
+        // Walk direction is a per-method spec property, not a detail:
+        // `reduceRight`, `findLast` and `findLastIndex` iterate `k` DOWNWARD
+        // from `len-1`, everything else upward from `0`.
+        //
+        // `findLast`/`findLastIndex` used to walk `0..len` here while their
+        // match arm (below) deliberately did NOT break out of the loop — the
+        // two halves were wrong in a way that cancelled: keeping the last
+        // FORWARD match is the highest index, which is what a backward search
+        // would have returned first. The consequence was that on any receiver
+        // where the predicate matched at most one index the *value* was right
+        // and only the recorded visitation order revealed the defect, which is
+        // why the generated table's `findLast` rows needed an always-true
+        // predicate to catch it at all. Direction and early-exit are one
+        // invariant and are now changed together.
+        let indices: Box<dyn Iterator<Item = u32>> = if matches!(
+            id,
+            NativeId::ArrayReduceRight | NativeId::ArrayFindLast | NativeId::ArrayFindLastIndex
+        ) {
             Box::new((0..len).rev())
         } else {
             Box::new(0..len)
@@ -3074,9 +3091,38 @@ impl Interp<'_> {
             Vec::new()
         };
         let mut found: Option<(JsValue, u32)> = None;
+        // `find`/`findIndex`/`findLast`/`findLastIndex` are the ONLY callback
+        // methods whose spec step has no `HasProperty` guard: all four run the
+        // predicate once per index in `[0, len)` and pass `undefined` where the
+        // index is a hole. `forEach`/`map`/`filter`/`every`/`some`/`reduce`/
+        // `reduceRight` are all "if `k` is present, …" and must keep skipping —
+        // `map` in particular writes an own property only at an index it
+        // visited, so visiting holes there would create properties the spec
+        // never creates. So this is a property of the four methods, not of the
+        // seam.
+        //
+        // test262 pins it from the outside: `find/predicate-called-for-each-
+        // array-property` requires four predicate calls for
+        // `[undefined, , , 'foo']`. `node` v24.21.0 agrees:
+        // `findLastIndex` over `[a,_,_,d,_]` is `4`, with the predicate seeing
+        // `undefined` at index 4.
+        let visits_holes = matches!(
+            id,
+            NativeId::ArrayFind
+                | NativeId::ArrayFindIndex
+                | NativeId::ArrayFindLast
+                | NativeId::ArrayFindLastIndex
+        );
         for i in indices {
-            let Some(elem) = self.callback_index(obj, i)? else {
-                continue;
+            // A hole is `undefined` to the predicate, but presence is still
+            // what decides: a PRESENT `undefined` and a hole take the same
+            // branch here and are told apart only by the index list the
+            // callback records, which is why `callback_index` answers `Option`
+            // rather than a bare value.
+            let elem = match self.callback_index(obj, i)? {
+                Some(v) => v,
+                None if visits_holes => JsValue::undefined(),
+                None => continue,
             };
             // `forEach`/`map`/`filter`/`every`/`some`/`find`/`findIndex` call
             // back with `(element, index, array)`. `reduce`/`reduceRight` call
@@ -3125,20 +3171,21 @@ impl Interp<'_> {
                         return Ok(JsValue::from_bool(false));
                     }
                 }
+                // All four `find*` methods return at the FIRST match in their
+                // own traversal direction, so one `break` serves all of them
+                // once the direction above is right. `findLast`/`findLastIndex`
+                // used to fall through and keep overwriting `found`, which is
+                // only correct while walking forward.
                 NativeId::ArrayFind | NativeId::ArrayFindLast => {
                     if result.is_true() {
                         found = Some((elem, i));
-                        if id == NativeId::ArrayFind {
-                            break;
-                        }
+                        break;
                     }
                 }
                 NativeId::ArrayFindIndex | NativeId::ArrayFindLastIndex => {
                     if result.is_true() {
                         found = Some((JsValue::from_f64(f64::from(i)), i));
-                        if id == NativeId::ArrayFindIndex {
-                            break;
-                        }
+                        break;
                     }
                 }
                 _ => {}

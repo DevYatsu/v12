@@ -73,11 +73,15 @@
 //! observation must actually contain `threw:TypeError`, so a row cannot be
 //! excused as "not implemented" while v12 quietly returns a wrong value.
 //!
-//! Measured at this commit: **80 of 351 rows diverge, across 14 methods**
+//! Measured at this commit: **54 of 351 rows diverge, across 10 methods**
 //! (9 receivers × 39 rows). 45 of those are five unimplemented methods on all
-//! nine receivers. The last committed claim, ADR-0004's "24", was measured on
-//! 306 rows with a single receiver and one observation per row; it is not
-//! comparable and is superseded by [`KNOWN_DIVERGENCES`].
+//! nine receivers, so the index/length model itself disagrees with `node` on
+//! only 9 rows, in three clusters: the `Object.keys`-after-delete defect
+//! (`pop`/`shift`/`splice`, 6 rows), `length_lower` (2 rows), and
+//! `index_assign_past` on the arguments exotic (1 row). The last committed
+//! claim, ADR-0004's "24", was measured on 306 rows with a single receiver and
+//! one observation per row; it is not comparable and is superseded by
+//! [`KNOWN_DIVERGENCES`].
 //!
 //! # "Holes materialised as present `undefined`" — FIXED, and it was one cause
 //!
@@ -152,11 +156,47 @@
 //!   store probe. (Verified at this commit: `callback_len` survives at
 //!   `v12-interp/src/call_setup.rs:2962` — the *name* was kept, its body was
 //!   rewritten — so "all three were deleted" would be the wrong claim to leave
-//!   behind.) What remains at that seam is a *different* defect, listed here:
-//!   `find`/`findIndex` skip holes where ES (and test262's
-//!   `predicate-called-for-each-array-property`) require the predicate to run
-//!   on every index, and `findLast`/`findLastIndex` walk forward instead of
-//!   backward.
+//!   behind.) What remained at that seam was a *different* defect, and it is
+//!   **now FIXED** — see the find-family section below.
+//!
+//! # The find family: direction and holes — FIXED, and it was TWO causes
+//!
+//! `findLast`/`findLastIndex` walked `0..len` like their forward twins, and all
+//! four of `find`/`findIndex`/`findLast`/`findLastIndex` *skipped holes* where
+//! their spec step has no `HasProperty` guard. That is why all four were
+//! tracked as one cluster and why the batch could not take them one at a time:
+//! the two causes are separable per method but not per cluster, and on 5 of the
+//! 9 receivers a `findLast` row needed **both** fixed before it could agree —
+//! so fixing only the direction would have left 10 of the 18 rows still
+//! diverging and the cause still unidentified.
+//!
+//! Three details were wrong *together*, which is what made this look like one
+//! small bug for so long:
+//!
+//! 1. **Direction.** Only `reduceRight` got `.rev()`.
+//! 2. **Early exit.** Only `find`/`findIndex` broke out of the loop;
+//!    `findLast`/`findLastIndex` fell through and kept the LAST match. Those two
+//!    mistakes *cancelled*: keeping the last FORWARD match is the highest
+//!    index, which is what a backward search returns first. So on any receiver
+//!    where the predicate matched at most one index the **return value was
+//!    already correct** and only the recorded visitation order revealed it —
+//!    which is why the generated table needed an always-true predicate to catch
+//!    `findLast` at all, and why the old ledger entry had to confess that in
+//!    prose.
+//! 3. **Hole visiting**, scoped to these four methods and NOT to the seam:
+//!    `forEach`/`map`/`filter`/`every`/`some`/`reduce`/`reduceRight` are all
+//!    "if `k` is present" in the spec, `map` in particular writes an own
+//!    property only at an index it visited, and the seven are pinned as still
+//!    skipping holes.
+//!
+//! Pinned from the outside by
+//! [`find_last_walks_backward_and_stops_at_the_first_match`],
+//! [`the_find_family_visits_holes_and_nothing_else_does`] and
+//! [`a_present_undefined_is_not_a_hole_for_the_find_family`]. The last of those
+//! exists because a hole and a present `undefined` are indistinguishable from
+//! inside the callback by any test on the *value* — `node` answers the same for
+//! both receivers under `typeof x === "undefined"`, verified by running it — so
+//! the predicate has to ask `!(i in o)` of the receiver it was handed.
 use std::collections::{BTreeMap, BTreeSet};
 
 use v12_engine::Engine;
@@ -168,6 +208,60 @@ fn eval_json(src: &str) -> String {
     match engine.eval(src) {
         Ok(v) => engine.to_display_string(v),
         Err(thrown) => format!("threw: {}", engine.to_display_string(thrown)),
+    }
+}
+
+/// Runs `Array.prototype.<method>.call(o, pred)` on a receiver declared by
+/// `decl`, and reports BOTH the return value and the predicate's visit order as
+/// `["<String(result)>", "i:i:i"]`.
+///
+/// The two halves are reported separately on purpose: on a dense receiver a
+/// forward `findLast` walk returns the right *value* (the ledger's
+/// `walks FORWARD` entry says exactly this) and only the visit order exposes
+/// it, so a test written on the return value alone would pass against the bug.
+///
+/// The result goes through `String`, so it is always a JSON string and `nil`
+/// never appears — `JSON.stringify([undefined])` is `[null]` in `node` and this
+/// harness must not depend on that.
+fn probe(decl: &str, method: &str, pred: &str) -> String {
+    eval_json(&format!(
+        r#"
+        {decl}
+        var vis = [];
+        var ret = Array.prototype.{method}.call(o, function (x, i) {{
+            vis.push(i);
+            return ({pred});
+        }});
+        JSON.stringify([String(ret), vis.join(":")]);
+        "#
+    ))
+}
+
+/// `0..len` in the order the method is specified to walk it, comma-joined.
+///
+/// Computed from the spec's direction, never copied from an oracle: `findLast`
+/// and `findLastIndex` are specified to iterate `k` from `len-1` **down to**
+/// `0`, and the other two from `0` up to `len-1`.
+fn walk_order(method: &str, len: u32) -> String {
+    let idx = walk(method, len);
+    idx.iter().map(u32::to_string).collect::<Vec<_>>().join(":")
+}
+
+/// The one index a backward walk visits first, and the only one a forward walk
+/// visits first. Split out because "which index does the walk START at" is the
+/// half of the direction invariant an always-true predicate can see.
+fn first_index(method: &str, len: u32) -> String {
+    walk(method, len)
+        .first()
+        .expect("a non-empty walk")
+        .to_string()
+}
+
+fn walk(method: &str, len: u32) -> Vec<u32> {
+    if method.starts_with("findLast") {
+        (0..len).rev().collect()
+    } else {
+        (0..len).collect()
     }
 }
 
@@ -240,12 +334,14 @@ struct Known<'a> {
     why: &'a str,
 }
 
-/// The complete, current divergence set: **80 of 351 rows, 14 methods**.
+/// The complete, current divergence set: **54 of 351 rows, 10 methods**.
 ///
 /// Each entry is one *defect*, not one symptom, so the count is the number of
 /// things to fix rather than the number of places they show. Read with the
-/// caveat in the module header: 45 of the 80 rows are the five `absent`
-/// entries and say nothing about the index/length model.
+/// caveat in the module header: 45 of the 54 rows are the five `absent`
+/// entries and say nothing about the index/length model, so only **9 rows in
+/// three clusters** remain — and none of the three is in the callback seam,
+/// which is now clean on all 39 rows it runs.
 const KNOWN_DIVERGENCES: &[Known] = &[
     // -- unimplemented: five rows below cover all nine receivers each --------
     Known {
@@ -312,45 +408,6 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         receivers: &["array_dense", "array_holey"],
         absent: false,
         why: "`o.length = 1` on a real array drops the element but not its own key",
-    },
-    // -- the callback seam's hole handling and direction --------------------
-    Known {
-        method: "find",
-        receivers: &[
-            "inherited_length",
-            "array_holey",
-            "sparse_ctor",
-            "length_assigned",
-        ],
-        absent: false,
-        why: "the seam SKIPS holes; ES requires the predicate to run once per index \
-              (test262 find/predicate-called-for-each-array-property asserts the \
-              predicate is called 4 times for [undefined, , , 'foo'])",
-    },
-    Known {
-        method: "findIndex",
-        receivers: &[
-            "inherited_length",
-            "array_holey",
-            "sparse_ctor",
-            "length_assigned",
-        ],
-        absent: false,
-        why: "same seam hole-skip as find",
-    },
-    Known {
-        method: "findLast",
-        receivers: ALL_RECEIVERS,
-        absent: false,
-        why: "walks FORWARD: the visitation order is 0,1,2 rather than 2,1,0. The \
-              return value happens to agree on a dense receiver, so only the \
-              recorded invocations expose it",
-    },
-    Known {
-        method: "findLastIndex",
-        receivers: ALL_RECEIVERS,
-        absent: false,
-        why: "same forward-walking seam as findLast",
     },
     // -- arguments exotic ----------------------------------------------------
     Known {
@@ -452,7 +509,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 80,
+        total, 54,
         "the divergence count moved without the ledger's shape changing"
     );
 }
@@ -820,7 +877,242 @@ fn array_from_still_materialises_where_slice_does_not() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. The declared deviations, pinned by name.
+// 6. The find family: direction, and holes as ordinary `undefined`.
+// ---------------------------------------------------------------------------
+
+/// ES 22.1.3.15 `Array.prototype.findLast` and 22.1.3.14 `findLastIndex`
+/// iterate `k` **downward** from `len-1` to `0` and return at the *first*
+/// match; `find`/`findIndex` iterate upward. Both halves were wrong together at
+/// the callback seam: the loop walked `0..len` for all four, and only
+/// `find`/`findIndex` broke out of it — so `findLast` kept the LAST FORWARD
+/// match, which is the highest index, and therefore returned the right answer on
+/// a dense receiver by accident.
+///
+/// That accident is why this test exists in two halves. The return value alone
+/// cannot see the defect (`x === "c"` matches one index, so forward and backward
+/// agree), so the always-true predicate is used to force the whole range to be
+/// walked, and the **visit order** is asserted alongside the result.
+#[test]
+fn find_last_walks_backward_and_stops_at_the_first_match() {
+    const DENSE: &str = r#"var o = {0:"a",1:"b",2:"c",length:3};"#;
+    let len = 3;
+
+    // Two predicates, because they observe different halves of the invariant:
+    // an ALWAYS-TRUE predicate stops at the first index visited, so it reports
+    // only WHICH index the walk starts at — which is the direction, and is the
+    // half that is invisible in the return value on a dense receiver. An
+    // ALWAYS-FALSE predicate never returns early, so it reports the WHOLE walk
+    // in order. Neither alone can see a walk that starts at the right index and
+    // then gets the direction of the remainder wrong.
+
+    for method in ["findLast", "findLastIndex"] {
+        let is_index = method.ends_with("Index");
+        // Always true ⇒ the first index visited is `len-1` and the answer is it.
+        // A forward walk visits `0` and answers `0` / `"a"`.
+        assert_is(
+            &probe(DENSE, method, "true"),
+            &format!(
+                r#"["{want}","{first}"]"#,
+                want = if is_index { "2" } else { "c" },
+                first = first_index(method, len)
+            ),
+            &format!("{method} starts at the LAST index"),
+        );
+        // Always false ⇒ the whole range, in the method's direction.
+        assert_is(
+            &probe(DENSE, method, "false"),
+            &format!(
+                r#"["{want}","{order}"]"#,
+                want = if is_index { "-1" } else { "undefined" },
+                order = walk_order(method, len)
+            ),
+            &format!("{method} visits all {len} indices in its own direction"),
+        );
+    }
+
+    // Only the LAST index matches: backward and forward agree on the value, so
+    // this half is the guard that the fix did not change *which* match wins —
+    // only the direction of the search for it.
+    assert_is(
+        &probe(DENSE, "findLast", r#"x === "c""#),
+        r#"["c","2"]"#,
+        "findLast returns the last match when only the last index matches",
+    );
+
+    // Only the FIRST index matches. The result is `"a"` either way — a forward
+    // walk with the old fall-through overwrite also returned `"a"` — so the
+    // visit order is the entire difference, and it is descending.
+    assert_is(
+        &probe(DENSE, "findLast", r#"x === "a""#),
+        r#"["a","2:1:0"]"#,
+        "findLast visits 2,1,0 when only index 0 matches",
+    );
+    // The forward half, unchanged by this batch: `find` stops at index 0 and
+    // never looks at 1 or 2.
+    assert_is(
+        &probe(DENSE, "find", r#"x === "a""#),
+        r#"["a","0"]"#,
+        "find still stops at the first forward match",
+    );
+}
+
+/// The find family is the ONLY callback method with no `HasProperty` step in its
+/// spec step: all four run the predicate once per index in `[0, len)` and pass
+/// `undefined` where the index is a hole. `forEach`/`map`/`filter`/`every`/
+/// `some`/`reduce`/`reduceRight` are all guarded by "if `k` is present" and skip
+/// it — so this is a per-method property, not a property of the seam, and the
+/// fix that adds it must not leak to the seven.
+///
+/// `node` v24.21.0, verified by running it, on the two holey receivers below:
+/// `findLastIndex` over `[a,_,_,d,_]` is `4` with the predicate seeing
+/// `undefined` at index 4, and over `Object.create({length:3})` it is `2`.
+#[test]
+fn the_find_family_visits_holes_and_nothing_else_does() {
+    // A hole at the TOP of the range is the case that cannot pass by accident:
+    // a hole-skipping walk finds the next PRESENT element instead, and a
+    // hole-VISITING walk that also assumed "holes are absent" reports the same
+    // thing — only "a hole is `undefined`" returns the hole's own index.
+    //
+    // `top` is `String(Get(o, len-1))`: what the predicate sees at the index the
+    // backward walk starts on. Stated per receiver because it IS the property
+    // under test.
+    const HOLEY_ARRAY: &str =
+        r#"var o = (function () { var x = ["a"]; x[3] = "d"; x.length = 5; return x; })();"#;
+    // The smallest receiver reaching a hole strictly below its visible extent:
+    // `{0:"a", 2:"c", length:3}` has extent 2 and a hole at 1. The generated
+    // table has no such receiver (see the header's NAMED GAP), which is why
+    // this is a focused test rather than a row.
+    const HOLEY_OBJECT: &str = r#"var o = {0:"a",2:"c",length:3};"#;
+    const ALL_HOLES: &str = r#"var o = Object.create({length:3});"#;
+
+    for (label, decl, len, top) in [
+        ("holey array, hole at 4", HOLEY_ARRAY, 5, "undefined"),
+        ("holey object, hole at 1", HOLEY_OBJECT, 3, "c"),
+        ("all holes", ALL_HOLES, 3, "undefined"),
+    ] {
+        for method in ["findLast", "findLastIndex"] {
+            let is_index = method.ends_with("Index");
+            assert_is(
+                &probe(decl, method, "true"),
+                &format!(
+                    r#"["{want}","{first}"]"#,
+                    want = if is_index {
+                        (len - 1).to_string()
+                    } else {
+                        top.to_string()
+                    },
+                    first = first_index(method, len)
+                ),
+                &format!(
+                    "{method} on {label} starts at index {}, hole or not",
+                    len - 1
+                ),
+            );
+            // Always false is the only way to see the FULL range, and so the
+            // only way to prove EVERY hole was visited rather than just the one
+            // that happened to be visited first.
+            assert_is(
+                &probe(decl, method, "false"),
+                &format!(
+                    r#"["{want}","{order}"]"#,
+                    want = if is_index { "-1" } else { "undefined" },
+                    order = walk_order(method, len)
+                ),
+                &format!("{method} on {label} visits all {len} indices"),
+            );
+        }
+        // `find`/`findIndex` upward: index 0 is the first visited, so the hole
+        // at the top is never reached — this asserts the *forward* half of the
+        // invariant and that the two directions really are different code.
+        assert_is(
+            &probe(decl, "findIndex", "true"),
+            r#"["0","0"]"#,
+            &format!("findIndex on {label} stops at index 0"),
+        );
+        // …and the full forward range, so the hole-visiting invariant is
+        // asserted in the forward direction too rather than only backward.
+        assert_is(
+            &probe(decl, "find", "false"),
+            &format!(
+                r#"["undefined","{order}"]"#,
+                order = walk_order("find", len)
+            ),
+            &format!("find on {label} visits all {len} indices"),
+        );
+    }
+
+    // The guard: the seven methods that DO skip holes must still skip them. If
+    // the hole-visit ever becomes a property of the seam rather than of the
+    // find family, this is what fails.
+    //
+    // The index is the THIRD argument for `reduce`/`reduceRight`
+    // (`accumulator, value, index`) and the SECOND for the rest
+    // (`value, index, array`) — the same arity split
+    // `the_reduce_callback_receives_the_index` pins, and getting it wrong here
+    // would silently record the receiver instead of the index.
+    for (method, is_reduce, want) in [
+        ("forEach", false, "0:3"),
+        ("map", false, "0:3"),
+        ("filter", false, "0:3"),
+        ("every", false, "0:3"),
+        // `some` returns at the first match, so it visits only index 0 — the
+        // hole at 4 is never reached either way, which is the point.
+        ("some", false, "0"),
+        ("reduce", true, "0:3"),
+        ("reduceRight", true, "3:0"),
+    ] {
+        let extra = if is_reduce { r#","seed""# } else { "" };
+        let idx = if is_reduce { "p2" } else { "p1" };
+        let got = eval_json(&format!(
+            r#"
+            var o = (function () {{ var x = ["a"]; x[3] = "d"; x.length = 5; return x; }})();
+            var vis = [];
+            var f = function (p0, p1, p2) {{ vis.push({idx}); return true; }};
+            Array.prototype.{method}.call(o, f{extra});
+            vis.join(":");
+            "#
+        ));
+        assert_is(&got, want, &format!("{method} still skips holes"));
+    }
+}
+
+/// A hole is `undefined` to the predicate, but a **present** `undefined` is a
+/// different thing, and the find family is the only place the difference is
+/// observable at all: it is the only callback method that visits holes, so only
+/// it can be handed an index the receiver does not have.
+///
+/// The predicate here closes over the receiver and asks `!(i in o)` — "is this
+/// index a hole?" — which is the only way to tell the two apart from inside the
+/// callback. `typeof x === "undefined"` cannot: `node` answers the same for both
+/// receivers with that predicate (verified by running it), because a hole is
+/// *passed* as `undefined` and the callee never learns it was absent. An
+/// implementation that visited holes by testing `x === undefined` would pass
+/// that weaker predicate and fail this one.
+#[test]
+fn a_present_undefined_is_not_a_hole_for_the_find_family() {
+    // A hole at 1: the predicate matches at index 1 and the walk stops.
+    const HOLEY: &str = r#"var o = {0:"a",2:"c",length:3};"#;
+    // A PRESENT `undefined` at 1: no index is a hole, so the predicate never
+    // matches and the whole range is walked.
+    const DENSE: &str = r#"var o = {0:"a",1:undefined,2:"c",length:3};"#;
+    let is_hole = "!(i in o)";
+
+    for (method, stop_at_hole) in [("find", "0:1"), ("findLast", "2:1")] {
+        assert_is(
+            &probe(HOLEY, method, is_hole),
+            &format!(r#"["undefined","{stop_at_hole}"]"#),
+            &format!("{method} visits the hole at 1, so a hole-detecting predicate stops there"),
+        );
+        assert_is(
+            &probe(DENSE, method, is_hole),
+            &format!(r#"["undefined","{order}"]"#, order = walk_order(method, 3)),
+            &format!("{method} finds no hole in {{0:a,1:undefined,2:c}}, so it walks all 3"),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. The declared deviations, pinned by name.
 // ---------------------------------------------------------------------------
 
 /// `MAX_WRITE_SPAN` is a permanent deviation: `fill`/`copyWithin` will not
