@@ -84,24 +84,41 @@ pub fn array_slice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsV
         let n = to_idx(&mut *ctx.heap, args[1]);
         if n < 0 { (len + n).max(0) } else { n.min(len) }
     };
-    let slice = read_range(&mut *ctx.heap, obj, start, end)?;
-    Ok(new_array(ctx, slice))
+    let slice = read_slots(&mut *ctx.heap, obj, start, end)?;
+    Ok(new_array_slots(ctx, slice))
 }
 
 pub fn array_sort(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.sort", None)?;
     let len = array_like_len(&mut *ctx.heap, obj)? as i64;
-    let mut elems = read_range(&mut *ctx.heap, obj, 0, len)?;
-    // Filter holes (undefined) to end per spec simplified: keep order for undefined.
-    elems.retain(|v| !v.is_undefined() && !v.is_hole());
+    // Only the indices the receiver HAS take part: `SortIndexedProperties` step
+    // 3 collects `Get(O, k)` for every *present* k, so a hole is not a value
+    // here — reading it would manufacture an `undefined` element.
+    let slots = read_slots(&mut *ctx.heap, obj, 0, len)?;
+    let mut present: Vec<JsValue> = slots.iter().filter_map(|s| *s).collect();
+    // Undefined sorts after every defined element, and the undefined elements
+    // keep their relative order — that is what `sort` has always done here and
+    // it is what `node` does. Sorting them *by their string key* would put
+    // `undefined` between `"n"` and `"z"`, which is wrong: `sort([undefined,
+    // "z"])` is `[z, undefined]`.
+    let (defined, undefined): (Vec<JsValue>, Vec<JsValue>) =
+        present.iter().partition(|v| !v.is_undefined());
+    let mut defined = defined;
     // `to_string` allocates per call; sort_by_cached_key computes each key once.
-    elems.sort_by_cached_key(|a| ctx.to_string(*a));
-    // `SortIndexedProperties` writes the whole `0..len` view, so an inherited
-    // index becomes an own one: `sort.call(Object.create({0:"inh",length:3}))`
-    // leaves `{"0":"inh"}`, not an empty object.
-    elems.resize((len.clamp(0, MAX_SCAN_SPAN)) as usize, JsValue::undefined());
-    for (i, &v) in elems.iter().enumerate() {
-        index_set(&mut *ctx.heap, obj, i as i64, v)?;
+    defined.sort_by_cached_key(|a| ctx.to_string(*a));
+    present = defined;
+    present.extend(undefined);
+    // Write back: the sorted values land at `0..present.len()`, and every index
+    // from there to `len` is DELETED if the receiver owns it. Writing
+    // `undefined` across the tail instead is what made a holey receiver gain
+    // own keys `node` never creates — and deleting unconditionally would
+    // delete an index the receiver owns that sorting left below `len`.
+    let n = present.len() as i64;
+    for i in 0..n.min(len) {
+        index_set(&mut *ctx.heap, obj, i, present[i as usize])?;
+    }
+    for i in n..len.min(MAX_SCAN_SPAN) {
+        index_delete(&mut *ctx.heap, obj, i);
     }
     Ok(this)
 }
@@ -308,7 +325,7 @@ fn visible_extent(heap: &mut Heap, obj: Handle<JsObject>) -> i64 {
         // high-water mark to this crate (`ElementsArray::len` counts *present*
         // entries, which is not an extent — that conflation is what hid a
         // sparse array's tail from the deleted readers). Both `index_get` and
-        // `read_range` take the array fast path instead, so nothing is
+        // `read_slots` take the array fast path instead, so nothing is
         // narrowed here.
         return i64::MAX;
     }
@@ -366,57 +383,87 @@ fn read_limit(len: i64, extent: i64) -> i64 {
     }
 }
 
+/// One index of a whole-array read: `None` is a hole (the receiver does not
+/// have the index), `Some(undefined)` is a *present* `undefined`.
+///
+/// This is the type the shared reader returns, and it is the whole point: a
+/// `Vec<JsValue>` cannot tell the two apart, because a hole reads as
+/// `undefined`. Every method whose spec output is built with
+/// `CreateDataProperty`-per-present-index (`slice`, `concat`, `sort`,
+/// `reverse`, `splice`'s removed array, `map`) materialises a hole into an own
+/// `undefined` the moment that distinction is dropped — which is exactly what
+/// the deleted `Vec<JsValue>` reader did. `Array.from` is the deliberate
+/// exception: its spec step is an unconditional `CreateDataProperty` per index,
+/// so it *wants* the flattened form and takes it explicitly.
+type Slot = Option<JsValue>;
+
+/// `index_get`'s answer as a [`Slot`], so a caller that has the `(value,
+/// present)` pair can hand it straight to [`write_slot`] without restating the
+/// `if present { set } else { delete }` shape at every site. (A `From` impl
+/// would read better but trips the orphan rule: both `Option` and the tuple
+/// are foreign to this crate.)
+fn slot_of(answer: (JsValue, bool)) -> Slot {
+    answer.1.then_some(answer.0)
+}
+
 /// `Kind::Array` read: the lattice iterator already yields every index up to
 /// its own high-water mark with holes intact. That is both the cheapest read
 /// for a real array and the only one that can see an index no shape key names,
 /// so it stays as the fast path. Trailing holes are padded out to the
 /// requested span — capped by `MAX_SCAN_SPAN` — because `slice(new Array(3))`
-/// is three `undefined`s in the spec and `[]` here.
-fn array_range(heap: &Heap, obj: Handle<JsObject>, start: i64, end: i64) -> Vec<JsValue> {
+/// is a length-3 holey array in the spec and `[]` here.
+fn array_slots(heap: &Heap, obj: Handle<JsObject>, start: i64, end: i64) -> Vec<Slot> {
     let all = heap.get(obj).elements_snapshot();
     let lo = start.max(0) as usize;
     let hi = (end.max(start).max(0) as usize).min(all.len());
-    let mut out: Vec<JsValue> = all[lo.min(hi)..hi]
+    let mut out: Vec<Slot> = all[lo.min(hi)..hi]
         .iter()
-        .map(|v| {
-            if v.is_hole() {
-                JsValue::undefined()
-            } else {
-                *v
-            }
-        })
+        .map(|v| (!v.is_hole()).then_some(*v))
         .collect();
-    out.resize(
-        (end - start).clamp(0, MAX_SCAN_SPAN) as usize,
-        JsValue::undefined(),
-    );
+    out.resize((end - start).clamp(0, MAX_SCAN_SPAN) as usize, None);
     out
 }
 
-/// Reads `start..end` through `index_get`, holes reading as `undefined` —
-/// which is exactly what `slice`/`join`/`flat`/`concat`/`Array.from` put in
-/// their result. Indices at or past the visible extent skip the dispatcher:
-/// they are provably holes, and skipping is what keeps a huge `length` cheap.
-fn read_range(
+/// Reads `start..end` through `index_get`, keeping each index's presence.
+///
+/// Indices at or past the visible extent skip the dispatcher: they are provably
+/// holes, and skipping is what keeps a huge `length` cheap.
+fn read_slots(
     heap: &mut Heap,
     obj: Handle<JsObject>,
     start: i64,
     end: i64,
-) -> Result<Vec<JsValue>, Throw> {
+) -> Result<Vec<Slot>, Throw> {
     if heap.get(obj).kind == v12_heap::Kind::Array {
-        return Ok(array_range(heap, obj, start, end));
+        return Ok(array_slots(heap, obj, start, end));
     }
     let extent = visible_extent(heap, obj);
     let end = end.min(read_limit(end, extent));
-    let mut out: Vec<JsValue> = Vec::new();
+    let mut out: Vec<Slot> = Vec::new();
     for i in start..end.max(start) {
         if i >= extent {
-            out.push(JsValue::undefined());
+            out.push(None);
             continue;
         }
-        out.push(index_get(heap, obj, i)?.0);
+        let (value, present) = index_get(heap, obj, i)?;
+        out.push(present.then_some(value));
     }
     Ok(out)
+}
+
+/// `Set(O, ToString(i), v)` for a present slot and `Delete(O, ToString(i))` for
+/// a hole — the spec's own "absent source deletes the destination" rule, which
+/// `shift`/`unshift`/`copyWithin` and now `sort`/`reverse` all need. Writing
+/// `undefined` at a hole is the bug this helper exists to make impossible: it
+/// leaves an own property the receiver never had.
+fn write_slot(heap: &mut Heap, obj: Handle<JsObject>, i: i64, slot: Slot) -> Result<(), Throw> {
+    match slot {
+        Some(v) => index_set(heap, obj, i, v),
+        None => {
+            index_delete(heap, obj, i);
+            Ok(())
+        }
+    }
 }
 
 /// `Set(O, "length", len, O)` — the one length writer.
@@ -481,6 +528,19 @@ fn relative_index(heap: &mut Heap, v: Option<JsValue>, len: i64, default: i64) -
 /// interpreter's `NewArray` arm). Roots it too.
 fn new_array(ctx: &mut Ctx, elements: Vec<JsValue>) -> JsValue {
     JsValue::object(ctx.alloc_array(elements))
+}
+
+/// [`new_array`] for a read that kept each index's presence: `None` becomes a
+/// real hole in the new array's element lattice, so `i in result` is false
+/// exactly where the source had no index.
+fn new_array_slots(ctx: &mut Ctx, slots: Vec<Slot>) -> JsValue {
+    new_array(
+        ctx,
+        slots
+            .into_iter()
+            .map(|s| s.unwrap_or_else(JsValue::hole))
+            .collect(),
+    )
 }
 
 /// `Array.prototype.indexOf(search, fromIndex?)` – strict-equality scan;
@@ -636,15 +696,15 @@ pub fn array_includes(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<
 /// turned `concat.call(arguments(1,2,3))` into `[1,2,3]` where the spec says
 /// `[argumentsObj]`.
 pub fn array_concat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
-    let mut out: Vec<JsValue> = Vec::new();
+    let mut out: Vec<Slot> = Vec::new();
     let this_obj = this.as_object();
     if let Some(obj) = this_obj
         && ctx.heap.get(obj).kind == v12_heap::Kind::Array
     {
         let len = array_like_len(&mut *ctx.heap, obj)? as i64;
-        out.extend(read_range(&mut *ctx.heap, obj, 0, len)?);
+        out.extend(read_slots(&mut *ctx.heap, obj, 0, len)?);
     } else {
-        out.push(this);
+        out.push(Some(this));
     }
     for &item in args {
         let is_spread = item
@@ -653,12 +713,12 @@ pub fn array_concat(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
         if is_spread {
             let h = item.as_object().expect("checked spread");
             let len = array_like_len(&mut *ctx.heap, h)? as i64;
-            out.extend(read_range(&mut *ctx.heap, h, 0, len)?);
+            out.extend(read_slots(&mut *ctx.heap, h, 0, len)?);
         } else {
-            out.push(item);
+            out.push(Some(item));
         }
     }
-    Ok(new_array(ctx, out))
+    Ok(new_array_slots(ctx, out))
 }
 
 /// `Array.prototype.at(index)` – relative indexing, out-of-range → undefined.
@@ -677,13 +737,14 @@ pub fn array_at(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValu
 pub fn array_reverse(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.reverse", None)?;
     let len = array_like_len(&mut *ctx.heap, obj)? as i64;
-    let mut elems = read_range(&mut *ctx.heap, obj, 0, len)?;
-    elems.reverse();
-    // Write the whole range back: a hole that moved must become an explicit
-    // `undefined` (and vice versa), which `replace_elements` on a flat vec
-    // could not express for a generic receiver at all.
-    for (i, &v) in elems.iter().enumerate() {
-        index_set(&mut *ctx.heap, obj, i as i64, v)?;
+    let mut slots = read_slots(&mut *ctx.heap, obj, 0, len)?;
+    slots.reverse();
+    // Permute presence along with the value: a hole has to travel to its
+    // mirrored index and stay a hole. Writing the whole range back — which is
+    // all a `Vec<JsValue>` could do — left three present `undefined`s where
+    // `reverse(new Array(3))` leaves none.
+    for (i, slot) in slots.iter().enumerate() {
+        write_slot(&mut *ctx.heap, obj, i as i64, *slot)?;
     }
     Ok(this)
 }
@@ -701,12 +762,8 @@ pub fn array_shift(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<Js
     // writing `undefined` — which is why shifting `Object.create({0:"inh",
     // length:3})` leaves no own index behind instead of two `undefined`s.
     for k in 1..len {
-        let (v, present) = index_get(heap, obj, k)?;
-        if present {
-            index_set(heap, obj, k - 1, v)?;
-        } else {
-            index_delete(heap, obj, k - 1);
-        }
+        let slot = slot_of(index_get(heap, obj, k)?);
+        write_slot(heap, obj, k - 1, slot)?;
     }
     index_delete(heap, obj, len - 1);
     set_array_len(heap, obj, (len - 1) as f64)?;
@@ -721,12 +778,8 @@ pub fn array_unshift(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<J
     let n = args.len() as i64;
     // Back to front, so no read is clobbered by an earlier write.
     for k in (0..len).rev() {
-        let (v, present) = index_get(heap, obj, k)?;
-        if present {
-            index_set(heap, obj, k + n, v)?;
-        } else {
-            index_delete(heap, obj, k + n);
-        }
+        let slot = slot_of(index_get(heap, obj, k)?);
+        write_slot(heap, obj, k + n, slot)?;
     }
     for (i, &item) in args.iter().enumerate() {
         index_set(heap, obj, i as i64, item)?;
@@ -765,20 +818,21 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     let items: Vec<JsValue> = args.iter().skip(2).copied().collect();
     let insert_count = items.len() as i64;
 
-    let mut removed: Vec<JsValue> = Vec::new();
+    // Spec steps 5-6: the removed array gets one entry per index in
+    // `[start, start + deleteCount)`, and an index the receiver does not *have*
+    // leaves a HOLE in it — `splice.call(new Array(3), 0, 3)` returns
+    // `[<3 empty items>]`, not three `undefined`s.
+    let mut removed: Vec<Slot> = Vec::new();
     for j in 0..delete_count.min(MAX_SCAN_SPAN) {
-        removed.push(index_get(heap, obj, start + j)?.0);
+        let (value, present) = index_get(heap, obj, start + j)?;
+        removed.push(present.then_some(value));
     }
 
     if insert_count < delete_count {
         // Step 7: close the gap down, then delete the tail that fell out of it.
         for k in start..len - delete_count {
-            let (v, present) = index_get(heap, obj, k + delete_count)?;
-            if present {
-                index_set(heap, obj, k, v)?;
-            } else {
-                index_delete(heap, obj, k);
-            }
+            let slot = slot_of(index_get(heap, obj, k + delete_count)?);
+            write_slot(heap, obj, k, slot)?;
         }
         for k in (len - delete_count)..(len - insert_count) {
             index_delete(heap, obj, k);
@@ -788,12 +842,8 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
         // tail up into it, back to front so no read is clobbered.
         let mut k = len - delete_count;
         while k > start {
-            let (v, present) = index_get(heap, obj, k + delete_count - 1)?;
-            if present {
-                index_set(heap, obj, k + insert_count - 1, v)?;
-            } else {
-                index_delete(heap, obj, k + insert_count - 1);
-            }
+            let slot = slot_of(index_get(heap, obj, k + delete_count - 1)?);
+            write_slot(heap, obj, k + insert_count - 1, slot)?;
             k -= 1;
         }
     }
@@ -802,7 +852,7 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
         index_set(heap, obj, start + i as i64, item)?;
     }
     set_array_len(heap, obj, (len - delete_count + insert_count).max(0) as f64)?;
-    Ok(new_array(ctx, removed))
+    Ok(new_array_slots(ctx, removed))
 }
 
 /// Upper bound on entries a single `fill`/`copyWithin` call materializes in
@@ -856,19 +906,14 @@ pub fn array_copy_within(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resu
     // Snapshot the source before writing: the spec picks its copy direction
     // from whether the ranges overlap, and on a generic receiver there is no
     // cheaper way to be right than reading the window once.
-    let mut src: Vec<(JsValue, bool)> = Vec::with_capacity(count.max(0) as usize);
+    let mut src: Vec<Slot> = Vec::with_capacity(count.max(0) as usize);
     for k in 0..count {
-        src.push(index_get(heap, obj, start + k)?);
+        src.push(slot_of(index_get(heap, obj, start + k)?));
     }
-    for (k, (v, present)) in src.into_iter().enumerate() {
-        let d = target + k as i64;
-        if present {
-            index_set(heap, obj, d, v)?;
-        } else {
-            // An absent source deletes the destination; writing `undefined`
-            // there would leave an own property the spec never creates.
-            index_delete(heap, obj, d);
-        }
+    for (k, slot) in src.into_iter().enumerate() {
+        // An absent source deletes the destination; writing `undefined` there
+        // would leave an own property the spec never creates.
+        write_slot(heap, obj, target + k as i64, slot)?;
     }
     Ok(this)
 }
@@ -998,12 +1043,20 @@ pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsV
     };
     let len = array_like_len(heap, obj)? as i64;
     // A huge `length` property on a sparse receiver describes mostly holes;
-    // `read_range` fills them as `undefined` without dispatching, and the
-    // length property is fixed afterwards so the result still reads
-    // `length === len`. The visible extent includes the prototype chain, so
+    // `read_slots` fills them as `None` without dispatching, and the length
+    // property is fixed afterwards so the result still reads `length === len`.
+    // The visible extent includes the prototype chain, so
     // `Array.from(Object.create({0:"inh", length:3}))` sees the inherited
     // index — the deleted `dense_bound` saw own shape keys only.
-    let items = read_range(heap, obj, 0, len)?;
+    //
+    // `Array.from` is the one caller that FLATTENS the slots: its spec step is
+    // an unconditional `CreateDataProperty(O, k, Get(next, k))` for every
+    // `k < len`, so `Array.from(new Array(3))` has three own `undefined`s where
+    // `slice` produces three holes.
+    let items = read_slots(heap, obj, 0, len)?
+        .into_iter()
+        .map(|s| s.unwrap_or_else(JsValue::undefined))
+        .collect();
     let arr_v = new_array(ctx, items);
     if let Some(arr) = arr_v.as_object() {
         set_array_len(&mut *ctx.heap, arr, len as f64)?;

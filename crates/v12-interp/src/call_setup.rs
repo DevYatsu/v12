@@ -2963,7 +2963,11 @@ impl Interp<'_> {
         let key = self.new_temp_key("length");
         let v = self.get_property(0, 0, JsValue::object(obj), key)?;
         let n = self.to_number_value(v)?;
-        let n = if n.is_finite() && n > 0.0 { n.trunc() } else { 0.0 };
+        let n = if n.is_finite() && n > 0.0 {
+            n.trunc()
+        } else {
+            0.0
+        };
         Ok(n.clamp(0.0, f64::from(Self::MAX_CALLBACK_SCAN)) as u32)
     }
 
@@ -2986,9 +2990,7 @@ impl Interp<'_> {
         if !self.op_in(key, JsValue::object(obj))? {
             return Ok(None);
         }
-        Ok(Some(
-            self.get_property(0, 0, JsValue::object(obj), key)?,
-        ))
+        Ok(Some(self.get_property(0, 0, JsValue::object(obj), key)?))
     }
 
     fn callback_is_callable(&self, v: JsValue) -> Option<Handle<JsObject>> {
@@ -3052,14 +3054,22 @@ impl Interp<'_> {
             Box::new(0..len)
         };
 
-        // `map`'s result array is `ArraySpeciesCreate(O, len)` and step 8b
-        // writes an own `undefined` for every index it skipped, so the result
-        // has the receiver's length with holes filled in. `filter`/`flatMap`
-        // create with `0` and only append, which is why they need no padding —
-        // `map.call(Object.create({length:3}), f)` is `[undefined, undefined,
-        // undefined]` in `node` and `[]` when the pushes are the only writer.
+        // `map`'s result array is `ArraySpeciesCreate(O, len)` and its step 7.b
+        // writes an own property ONLY at an index the receiver has, so the
+        // pre-sized result is a hole and every visited index overwrites one of
+        // its holes. It must be pre-sized with HOLES, not `undefined`:
+        // `map.call(Object.create({length:3}), f)` is a length-3 array of holes
+        // in `node`, and a materialised `undefined` there is a present own
+        // property the spec never creates. (`filter`/`flatMap` create with `0`
+        // and only append, which is why they need no padding.)
+        //
+        // An earlier version of this comment claimed `node` answered
+        // `[undefined, undefined, undefined]` here. It does not: the generated
+        // node-differential table's `inherited_length` row reads `map|[3]-,-,-`,
+        // and `-` is the harness's marker for `!(i in v)`. The claim was a
+        // console transcription of the very array this bug produced.
         let mut mapped: Vec<JsValue> = if id == NativeId::ArrayMap {
-            vec![JsValue::undefined(); len as usize]
+            vec![JsValue::hole(); len as usize]
         } else {
             Vec::new()
         };
@@ -5270,21 +5280,29 @@ impl Interp<'_> {
         // object untouched — `sort.call(Object.create({0:"inh",length:3}))`
         // stayed `{}` where `node` leaves `{"0":"inh"}`.
         let len = self.callback_len(obj)?;
-        let mut elems: Vec<JsValue> = Vec::with_capacity(len as usize);
+        // Only the indices the receiver HAS take part. `SortIndexedProperties`
+        // step 3 reads `Get(O, k)` for every *present* `k`, so a hole is not a
+        // value here — flattening it to `undefined` (the deleted body) is what
+        // made the write-back below create an own property for an index the
+        // receiver never had.
+        let mut present: Vec<JsValue> = Vec::with_capacity(len as usize);
         for i in 0..len {
-            elems.push(self.callback_index(obj, i)?.unwrap_or(JsValue::undefined()));
+            if let Some(value) = self.callback_index(obj, i)? {
+                present.push(value);
+            }
         }
-        // Undefined sorts last; holes after undefined. Sort the defined part.
-        let undefined_count = elems.iter().filter(|v| v.is_undefined()).count();
-        elems.retain(|v| !v.is_undefined() && !v.is_hole());
+        // Undefined sorts last; the undefined elements keep their relative
+        // order. Sort the defined part.
+        let undefined_count = present.iter().filter(|v| v.is_undefined()).count();
+        present.retain(|v| !v.is_undefined() && !v.is_hole());
         // Pre-transduce through strings? No — comparators are user code or
         // default ToString ordering. Rust's sort is stable (spec requires it).
         if let Some(cb) = comparator {
             // Insertion into a comparator-ordered vec via sort_by with a
             // stateful closure is unsound under re-entry; collect and
             // insertion-sort instead (arrays here are small).
-            let mut sorted: Vec<JsValue> = Vec::with_capacity(elems.len());
-            for v in elems {
+            let mut sorted: Vec<JsValue> = Vec::with_capacity(present.len());
+            for v in present {
                 let mut lo = 0usize;
                 let mut hi = sorted.len();
                 while lo < hi {
@@ -5305,28 +5323,35 @@ impl Interp<'_> {
                 }
                 sorted.insert(lo, v);
             }
-            elems = sorted;
+            present = sorted;
         } else {
-            elems.sort_by_cached_key(|v| self.to_display_string(*v));
+            present.sort_by_cached_key(|v| self.to_display_string(*v));
         }
         let undefineds = vec![JsValue::undefined(); undefined_count];
-        elems.extend(undefineds);
-        // `SortIndexedProperties` step 5: `Set(O, ToString(k), v, true)` for
-        // *every* `k` in `0..len`, holes included — which is why node's
-        // inherited-index receiver comes back owning index 0.
+        present.extend(undefineds);
+        // Write the sorted values to `0..present.len()` and DELETE every index
+        // from there to `len`. Writing `undefined` across the tail instead is
+        // what made a holey receiver gain own keys `node` never creates, and
+        // deleting unconditionally would delete an own index sorting left
+        // below `len`.
         //
-        // `Kind::Array` keeps the lattice write. `Set` on an array index is
-        // `set_element` (`internal_methods.rs:1043`), so replacing the whole
-        // store with the `0..len` view is the same observable state at one
+        // The `Kind::Array` no-hole case keeps the lattice write: `Set` on an
+        // array index is `set_element` (`internal_methods.rs:1043`), so
+        // replacing the whole store is the same observable state at one
         // allocation instead of `len` of them.
-        if self.heap.get(obj).kind == Kind::Array {
-            self.heap.get_mut(obj).replace_elements(elems);
+        let n = present.len() as u32;
+        if n == len && self.heap.get(obj).kind == Kind::Array {
+            self.heap.get_mut(obj).replace_elements(present);
             return Ok(JsValue::object(obj));
         }
         let receiver = JsValue::object(obj);
-        for (i, &v) in elems.iter().enumerate() {
+        for (i, &v) in present.iter().enumerate() {
             let key = JsValue::string(self.heap.intern_text(&i.to_string()));
             self.set_property(receiver, key, v, true)?;
+        }
+        for i in n..len {
+            let key = JsValue::string(self.heap.intern_text(&i.to_string()));
+            self.delete_property(receiver, key)?;
         }
         // No `length` write: `Array.prototype.sort` (23.1.3.34) has no such
         // step. Re-asserting it turned a string `length` into a number and

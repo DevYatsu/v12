@@ -73,11 +73,64 @@
 //! observation must actually contain `threw:TypeError`, so a row cannot be
 //! excused as "not implemented" while v12 quietly returns a wrong value.
 //!
-//! Measured at this commit: **108 of 351 rows diverge, across 19 methods**
+//! Measured at this commit: **80 of 351 rows diverge, across 14 methods**
 //! (9 receivers × 39 rows). 45 of those are five unimplemented methods on all
 //! nine receivers. The last committed claim, ADR-0004's "24", was measured on
 //! 306 rows with a single receiver and one observation per row; it is not
 //! comparable and is superseded by [`KNOWN_DIVERGENCES`].
+//!
+//! # "Holes materialised as present `undefined`" — FIXED, and it was one cause
+//!
+//! Six methods (`slice`, `map`, `concat`, `splice`, `sort`, `reverse`) used to
+//! report a hole as a present own `undefined`, in the array they return or in
+//! the receiver they write back. The shared hypothesis was that this was one
+//! root cause, and it holds — with the interesting part being *how many sites
+//! it needed*, which was not one:
+//!
+//! 1. `builtins/array.rs`'s range reader returned `Vec<JsValue>`, in which a
+//!    hole and a present `undefined` are the same value, and the write-back
+//!    helpers had no way to say "delete this index" instead of "set it to
+//!    `undefined`".
+//! 2. `map` does not run there at all — it is a callback method and runs at
+//!    the interpreter seam, which had its own copy of the mistake
+//!    (`vec![undefined; len]` as the pre-sized result).
+//! 3. `sort` does not run there either. `NativeId::ArraySort` is always
+//!    intercepted by `Interp::run_array_callback`, so
+//!    `builtins/array::array_sort` never sees a JS call and the seam's
+//!    `array_sort_callback` was the live copy.
+//!
+//! Three sites, one invariant, and the invariant is now expressed as a type in
+//! `builtins/array.rs` (`type Slot = Option<JsValue>`) rather than as a comment
+//! at each of them. `Array.from` is the deliberate exception — its spec step is
+//! an unconditional `CreateDataProperty` per index — and says so where it
+//! flattens.
+//!
+//! The invariant is pinned from the outside by
+//! [`a_hole_is_never_materialised_as_an_own_undefined`], which is also the
+//! place that records which of the six can *observe* the difference at all:
+//! `slice`, `concat`, `map` and `splice`'s removed array can, because `i in
+//! result` is false; `sort` and `reverse` cannot in their return value (both
+//! return the receiver) and are observable only through `hasOwnProperty` on the
+//! receiver afterwards.
+//!
+//! # A NAMED GAP this batch found in the table itself
+//!
+//! Mutation: flatten the generic-receiver branch of the range reader (drop the
+//! `present` bit on the `index_get` answer). The 351-row table does **not**
+//! notice — it stays at 80/14 — and only the focused test fails.
+//!
+//! The reason is structural, and it is worth stating because it bounds what the
+//! table can ever claim: `visible_extent` short-circuits every index at or past
+//! the receiver's highest visible index to "hole" without dispatching, so the
+//! `index_get`-presence branch only runs for indices BELOW the extent. Of the
+//! table's four generic receivers, `inherited_indices` has extent 1 (its only
+//! index, `0`, is *present*) and `inherited_length`/`own_*` have extent 0 or 3
+//! with every index present. **A hole strictly below the visible extent of a
+//! non-`Array` receiver is therefore exercised at no index at all in 351 rows.**
+//! `{0:"a", 2:"c", length:3}` — extent 2, hole at 1 — is the smallest receiver
+//! that reaches it, and it is the focused test's, not a table row's. Adding it
+//! is one `receiver` stanza in the row source; it is not added here because it
+//! would change the 351-row denominator the batch accounting is stated in.
 //!
 //! # Deliberately NOT covered here
 //!
@@ -187,11 +240,11 @@ struct Known<'a> {
     why: &'a str,
 }
 
-/// The complete, current divergence set: **108 of 351 rows, 19 methods**.
+/// The complete, current divergence set: **80 of 351 rows, 14 methods**.
 ///
 /// Each entry is one *defect*, not one symptom, so the count is the number of
 /// things to fix rather than the number of places they show. Read with the
-/// caveat in the module header: 45 of the 108 rows are the five `absent`
+/// caveat in the module header: 45 of the 80 rows are the five `absent`
 /// entries and say nothing about the index/length model.
 const KNOWN_DIVERGENCES: &[Known] = &[
     // -- unimplemented: five rows below cover all nine receivers each --------
@@ -225,80 +278,13 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         absent: true,
         why: "Array.prototype.toSpliced is not registered (ES2023 change-array-by-copy)",
     },
-    // -- holes materialised as present `undefined` ---------------------------
-    Known {
-        method: "slice",
-        receivers: &[
-            "inherited_indices",
-            "inherited_length",
-            "array_holey",
-            "sparse_ctor",
-            "length_assigned",
-        ],
-        absent: false,
-        why: "the RESULT array carries present `undefined` where the receiver had a \
-              hole; `i in result` is true at an index the source never had",
-    },
-    Known {
-        method: "map",
-        receivers: &[
-            "inherited_indices",
-            "inherited_length",
-            "array_holey",
-            "sparse_ctor",
-            "length_assigned",
-        ],
-        absent: false,
-        why: "same hole materialisation as slice, on the seam's result array",
-    },
-    Known {
-        method: "concat",
-        receivers: &["array_holey", "sparse_ctor", "length_assigned"],
-        absent: false,
-        why: "same hole materialisation as slice",
-    },
-    Known {
-        method: "splice",
-        receivers: &[
-            "own_numeric_length",
-            "own_string_length",
-            "inherited_indices",
-            "inherited_length",
-            "array_holey",
-            "sparse_ctor",
-            "length_assigned",
-        ],
-        absent: false,
-        why: "two defects in one row: the removed-element array materialises its \
-              hole, AND the deleted index stays in Object.keys on the two \
-              own-index receivers (see pop/shift)",
-    },
-    Known {
-        method: "sort",
-        receivers: &[
-            "inherited_indices",
-            "inherited_length",
-            "array_holey",
-            "sparse_ctor",
-            "length_assigned",
-        ],
-        absent: false,
-        why: "writes EVERY index 0..len-1, so a holey receiver gains present \
-              `undefined`s and own keys node never creates",
-    },
-    Known {
-        method: "reverse",
-        receivers: &[
-            "inherited_indices",
-            "inherited_length",
-            "array_holey",
-            "sparse_ctor",
-            "length_assigned",
-        ],
-        absent: false,
-        why: "same as sort: full-range rewrite instead of a hole-aware permutation",
-    },
     // -- deleted keys stay visible to Object.keys ---------------------------
+    //
+    // ONE defect behind four entries, which the generated table separates for
+    // us: `hasOwnProperty(o, i)` says false but `Object.keys(o)` still counts
+    // the index, because `index_delete`/`delete_property` hole the storage
+    // cell and leave the shape descriptor behind. Every entry below is a case
+    // where that makes the `Object.keys` column differ from node's.
     Known {
         method: "pop",
         receivers: &["own_numeric_length", "own_string_length"],
@@ -311,6 +297,15 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         receivers: &["own_numeric_length", "own_string_length"],
         absent: false,
         why: "same as pop: a deleted own index stays in Object.keys",
+    },
+    Known {
+        method: "splice",
+        receivers: &["own_numeric_length", "own_string_length"],
+        absent: false,
+        why: "same as pop/shift, and it is the ONLY remaining defect on these two \
+              receivers: the hole materialisation in the removed-element array \
+              this entry used to also carry is fixed (see `a_hole_is_never_\
+              materialised_as_an_own_undefined`)",
     },
     Known {
         method: "length_lower",
@@ -457,7 +452,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 108,
+        total, 80,
         "the divergence count moved without the ledger's shape changing"
     );
 }
@@ -667,7 +662,165 @@ fn an_index_write_never_lowers_a_declared_length() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The declared deviations, pinned by name.
+// 5. The hole invariant, stated so reading it does not need `node`.
+// ---------------------------------------------------------------------------
+
+/// The receiver used by every case below: a hole at index 1, present elements
+/// at 0 and 2. `{0:"a", 2:"c", length:3}` is the smallest object on which a
+/// hole and a present `undefined` are both expressible, so a method that
+/// confuses them cannot pass by accident.
+const HOLEY_DECL: &str = r#"var r = {0:"a", 2:"c", length:3};"#;
+
+/// Every own index of `r`, as a `-`-for-hole string, read through the spec's
+/// `HasProperty` (`i in r`) rather than through a value comparison. `in` is
+/// the only thing that can tell a hole from a present `undefined`.
+const OWN_INDEXES: &str = r#"
+    var s = [];
+    for (var i = 0; i < r.length; i++) {
+        s.push(Object.prototype.hasOwnProperty.call(r, i) ? String(r[i]) : "-");
+    }
+    s.join(",");
+"#;
+
+/// The same read on an arbitrary array, for the methods whose *return value* is
+/// the thing under test.
+const INDEXES_OF: &str = r#"
+    (function (a) {
+        var s = [];
+        for (var i = 0; i < a.length; i++) {
+            s.push(i in a ? String(a[i]) : "-");
+        }
+        return s.join(",");
+    })(RESULT)
+"#;
+
+/// Six methods used to report a hole as a present own `undefined`. Which of
+/// them can *observe* the difference, and how:
+///
+/// * `slice`, `concat`, `map` and `splice`'s removed array RETURN a fresh
+///   array, and `i in result` is false at every index the source did not have.
+///   That is the whole assertion: a materialised `undefined` reads `"undefined"`
+///   where a hole reads `"-"`.
+/// * `sort` and `reverse` RETURN THE RECEIVER, so their return value cannot
+///   distinguish anything — the observable is `Object.keys(receiver)`, i.e.
+///   whether the method created own properties at indices that were holes.
+///   A test written on their return value could not fail, so none is.
+///
+/// The expected strings are derived from the spec's own rule (a hole in, a hole
+/// out) rather than copied from `node`; `node` agrees with all of them
+/// (verified in the batch's own `node` diff, which also showed the only
+/// remaining disagreement on these receivers is the separate
+/// `Object.keys`-after-delete defect listed under `pop`).
+#[test]
+fn a_hole_is_never_materialised_as_an_own_undefined() {
+    // `slice`: one hole in the receiver, one hole in the result.
+    assert_is(
+        &eval_json(&format!(
+            r#"{HOLEY_DECL}
+               Array.prototype.slice.call(r);
+               {INDEXES_OF}"#,
+            INDEXES_OF = INDEXES_OF.replace("RESULT", "Array.prototype.slice.call(r)"),
+        )),
+        "a,-,c",
+        "slice leaves the receiver's hole absent in the result",
+    );
+    // `concat`: the receiver is an Array, so it IS spread — and its hole must
+    // survive the spread into the same relative position.
+    assert_is(
+        &eval_json(&format!(
+            r#"var r = (function () {{ var x = ["a"]; x[2] = "c"; x.length = 3; return x; }})();
+               {INDEXES_OF}"#,
+            INDEXES_OF = INDEXES_OF.replace("RESULT", "Array.prototype.concat.call(r)"),
+        )),
+        "a,-,c",
+        "concat spreads a hole as a hole",
+    );
+    // `map`: the seam's result is pre-sized to the receiver's length, so the
+    // pre-size is the only thing that can go wrong here.
+    assert_is(
+        &eval_json(&format!(
+            r#"{HOLEY_DECL}
+               var m = Array.prototype.map.call(r, function (v) {{ return v; }});
+               var s = [];
+               for (var i = 0; i < m.length; i++) {{ s.push(i in m ? String(m[i]) : "-"); }}
+               s.join(",");"#
+        )),
+        "a,-,c",
+        "map's pre-sized result is holey, not filled with `undefined`",
+    );
+    // `splice`: the REMOVED array is the result under test. Deleting all three
+    // indices of a 3-element receiver returns a length-3 array whose entries
+    // are the receiver's own — `a`, hole, `c`.
+    assert_is(
+        &eval_json(&format!(
+            r#"{HOLEY_DECL}
+               var out = Array.prototype.splice.call(r, 0, 3);
+               var s = [];
+               for (var i = 0; i < out.length; i++) {{ s.push(i in out ? String(out[i]) : "-"); }}
+               s.join(",");"#
+        )),
+        "a,-,c",
+        "splice's removed array keeps the hole it removed",
+    );
+    // `sort` and `reverse` return the receiver, so their return value cannot
+    // distinguish a hole from a present `undefined` — the observable is
+    // `hasOwnProperty` on the receiver afterwards. Neither may leave an own
+    // property holding `undefined` at an index it did not have to write.
+    //
+    // `Object.keys` would be the natural next check and is deliberately NOT
+    // used here: on these two receivers it still counts a deleted own index,
+    // which is the separate `pop`/`shift` defect in `KNOWN_DIVERGENCES`.
+    for (what, call, want) in [
+        // `sort` packs the two present values into `0,1` and deletes the tail,
+        // so index 2 ends up a hole rather than a present `undefined`.
+        ("sort", r#"Array.prototype.sort.call(r)"#, "a,c,-"),
+        // `reverse` permutes presence: `"a"` lands at 2, `"c"` at 0, and the
+        // hole at 1 stays a hole.
+        ("reverse", r#"Array.prototype.reverse.call(r)"#, "c,-,a"),
+    ] {
+        assert_is(
+            &eval_json(&format!(
+                r#"{HOLEY_DECL}
+                   {call};
+                   {OWN_INDEXES}"#
+            )),
+            want,
+            &format!("{what} must not leave a present `undefined` where the receiver had a hole"),
+        );
+    }
+}
+
+/// The flip side, and the reason this fix could not have been a blanket
+/// "never write `undefined`": `Array.from` has NO hole semantics. Its spec step
+/// is an unconditional `CreateDataProperty(O, k, Get(next, k))` for every
+/// `k < len`, so it must MATERIALISE. `slice(new Array(3))` is three holes and
+/// `Array.from(new Array(3))` is three own `undefined`s — and this test fails if
+/// a reader that is shared between them stops flattening.
+#[test]
+fn array_from_still_materialises_where_slice_does_not() {
+    assert_is(
+        &eval_json(
+            r#"
+            function own(a) {
+                var s = [];
+                for (var i = 0; i < a.length; i++) { s.push(i in a ? String(a[i]) : "-"); }
+                return s.join(",");
+            }
+            JSON.stringify([
+                own(Array.prototype.slice.call(new Array(3))),
+                own(Array.from(new Array(3))),
+                Object.keys(Array.from(new Array(3))).length,
+                Object.keys(Array.prototype.slice.call(new Array(3))).length,
+            ]);
+            "#,
+        ),
+        r#"["-,-,-","undefined,undefined,undefined",3,0]"#,
+        "Array.from materialises holes; slice does not",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. The declared deviations, pinned by name.
 // ---------------------------------------------------------------------------
 
 /// `MAX_WRITE_SPAN` is a permanent deviation: `fill`/`copyWithin` will not
