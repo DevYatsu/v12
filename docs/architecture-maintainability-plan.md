@@ -379,8 +379,7 @@ Every task reports all four, or it is not done:
 | ADR-0004 batch 1 | `1cb599a6` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 | ADR-0004 batch 2 | `3495ed55` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 | ADR-0004 batch 3 | `629ee762` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
-| ADR-0004 batch 3 | *(pending — central run required)* | expected `net +0`, BROKE 0; `ArraySetLength` has no test262 coverage for the sparse partial-write case, exactly as the W3.3 `parseInt` precedent above |
-| ADR-0004 batch 4 | *(pending — central run required)* | expected `net +0`, BROKE 0. **Higher risk than batch 3, stated up front:** batch 4 makes `sort`/`reverse`/`shift`/`unshift`/`splice`/`copyWithin` **delete** indices where they previously wrote `undefined`, so a test262 case asserting a trailing own `undefined` after one of those on a sparse receiver would newly fail. `test262` has no sparse-receiver coverage for `Array.prototype` on generic receivers (that is why this table exists), so the expectation is `net +0` — but it is the one batch in this series whose mechanism touches five methods at once, and it should be run rather than assumed. |
+| ADR-0004 batch 4 | `fbc49842` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 
 **A `net +0` on a batch that fixed real bugs is not a null result.** W3.3 fixed three confirmed spec violations (`parseInt("0x10",16)`, `toPrecision(3)`, `toFixed(undefined)`), and the `language` slice still moved zero. The same held for the whole `ContainsArguments` sequence — 28 violations closed, `FIXED 0` every time, because test262 has no coverage for that rule's statement or pattern halves. Conformance is a *regression* gate here, not a progress one; progress is measured by the direct-call and unit tests.
 
