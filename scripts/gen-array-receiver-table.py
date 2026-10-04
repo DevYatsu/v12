@@ -32,6 +32,13 @@ USAGE
   ./scripts/gen-array-receiver-table.py --check    # exit 1 if stale (CI use)
   ./scripts/gen-array-receiver-table.py --node PATH  # node binary (default: node)
 
+EXIT CODES for `--check`
+  0  the committed table is byte-identical to a fresh generation
+  1  it is stale (or the row source and the generated file cannot be linked)
+  2  `node` is absent, so the oracle could not be recomputed and the check is
+     INCOMPLETE. The digest linkage is verified and reported first; a missing
+     oracle must never read as a pass.
+
 CI DOES NOT RUN THIS. The committed test must pass under plain
 `cargo nextest` with no `node` installed, so the generated literals are
 committed artifacts; this script is a dev-time tool. `--check` is available
@@ -280,6 +287,52 @@ def generate(node_bin):
     return "\n".join(out)
 
 
+def declared_digest(text):
+    """The (bytes, fnv1a) pair the generated file claims for the row source."""
+    m = re.search(r"const TABLE_SOURCE_BYTES: usize = (\d+);", text)
+    n = re.search(r"const TABLE_SOURCE_FNV1A: u64 = 0x([0-9a-f]{16});", text)
+    if not m or not n:
+        return None
+    return int(m.group(1)), int(n.group(1), 16)
+
+
+def check_without_node():
+    """The part of `--check` that needs no oracle.
+
+    A `--check` that cannot run `node` has NOT verified the oracle, and the one
+    thing it must never do is pass anyway — a green `--check` on a machine
+    without node would mean "the table is in sync", which is exactly the claim
+    it cannot make. So this reports the digest linkage (which is checkable from
+    the two files alone) and the caller still exits NON-ZERO, with a distinct
+    code so a caller can tell "stale" (1) from "could not verify" (2).
+    """
+    with open(TABLE, "rb") as fh:
+        raw = fh.read()
+    if not os.path.exists(OUT):
+        print("gen-array-receiver-table: FAIL — %s does not exist" % OUT)
+        return False
+    with open(OUT, encoding="utf-8") as fh:
+        current = fh.read()
+    declared = declared_digest(current)
+    if declared is None:
+        print("gen-array-receiver-table: FAIL — %s carries no digest constants" % OUT)
+        return False
+    want = (len(raw), fnv1a(raw))
+    if declared != want:
+        print(
+            "gen-array-receiver-table: FAIL — %s is stale (it declares %d bytes / "
+            "0x%016x for the row source, which is now %d bytes / 0x%016x)"
+            % (os.path.relpath(OUT, ROOT), declared[0], declared[1], want[0], want[1])
+        )
+        return False
+    print(
+        "gen-array-receiver-table: digest linkage OK (%d bytes / 0x%016x) — but "
+        "the ORACLE was not re-run, so this is NOT a staleness check"
+        % want
+    )
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--check", action="store_true", help="exit 1 if the committed file is stale")
@@ -287,6 +340,25 @@ def main():
     args = ap.parse_args()
 
     if not shutil.which(args.node):
+        if args.check:
+            # Never a pass: report what could be checked without the oracle, and
+            # exit non-zero either way. 1 = stale, 2 = in sync but unverified.
+            if check_without_node():
+                print(
+                    "gen-array-receiver-table: %r not found on PATH, so --check could NOT "
+                    "compare the committed table against the oracle. The digest linkage "
+                    "verified. Exit 2 = INCOMPLETE, not pass.\n"
+                    "  Set V12_NODE or pass --node PATH." % args.node,
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            print(
+                "gen-array-receiver-table: %r not found on PATH and the committed table "
+                "is already stale against the row source.\n"
+                "  Set V12_NODE or pass --node PATH." % args.node,
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         sys.exit(
             "gen-array-receiver-table: %r not found on PATH. This is a DEV-TIME tool:\n"
             "  the committed test runs under plain `cargo nextest` with no node.\n"

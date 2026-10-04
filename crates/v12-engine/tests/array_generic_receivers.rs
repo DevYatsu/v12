@@ -73,15 +73,92 @@
 //! observation must actually contain `threw:TypeError`, so a row cannot be
 //! excused as "not implemented" while v12 quietly returns a wrong value.
 //!
-//! Measured at this commit: **54 of 351 rows diverge, across 10 methods**
-//! (9 receivers × 39 rows). 45 of those are five unimplemented methods on all
-//! nine receivers, so the index/length model itself disagrees with `node` on
-//! only 9 rows, in three clusters: the `Object.keys`-after-delete defect
-//! (`pop`/`shift`/`splice`, 6 rows), `length_lower` (2 rows), and
-//! `index_assign_past` on the arguments exotic (1 row). The last committed
-//! claim, ADR-0004's "24", was measured on 306 rows with a single receiver and
-//! one observation per row; it is not comparable and is superseded by
-//! [`KNOWN_DIVERGENCES`].
+//! Measured at this commit: **165 of 624 rows diverge, across all 39 methods**
+//! (16 receivers × 39 rows). 80 of those are five unimplemented methods on all
+//! sixteen receivers and say nothing about the index/length model. The rest is
+//! four clusters, itemised at [`KNOWN_DIVERGENCES`]: the pre-existing
+//! `Object.keys`-after-delete defect (17 rows), two NEW accessor defects that
+//! no pre-Batch-6 receiver could reach (E1 and E2 below, 21 rows with a
+//! behavioural difference plus 47 rows that differ only in the harness's key
+//! count), and the arguments-exotic `index_assign_past` row.
+//!
+//! # Every number in this file's history was stated against 351 rows
+//!
+//! The receiver set went 9 → 16 in Batch 6, so **the denominator moved and the
+//! series is not comparable across that boundary**. Restated:
+//!
+//! | batch | receivers × rows | divergences | methods |
+//! |---|---|---|---|
+//! | ADR-0004 as filed | 1 × 306 | 24 | 19 |
+//! | batch 3 (generated) | 9 × 351 | 108 | — |
+//! | batch 4 | 9 × 351 | 80 | 14 |
+//! | batch 5 | 9 × 351 | 54 | 10 |
+//! | **batch 6 (this one)** | **16 × 624** | **165** | **39** |
+//!
+//! The 24 → 108 step is the one that matters: it is what a stronger instrument
+//! found when a transcribed table was replaced by a generated one. The
+//! 108 → 165 step is the same thing one level further out — seven more spec
+//! decision points, and **no row an earlier batch claimed fixed has come back**
+//! (`slice`/`map`/`concat`/`sort`/`reverse`/`splice` are still clean on every
+//! receiver without an accessor, and the six "hole materialised as an own
+//! `undefined`" rows stay fixed on `holey_object`, which is a holey receiver no
+//! earlier batch had).
+//!
+//! What did change is *coverage*: on the six new receivers that carry no
+//! accessor, 5 of 39 rows diverge (`holey_object`, `length_float`,
+//! `shadowed_index`, `proto_chain_two_deep`, `length_negative` — the last three
+//! diverge only through the five unimplemented methods). `shadowed_index`,
+//! `proto_chain_two_deep` and `length_negative` are **clean**: a receiver that
+//! makes a method decide between own and inherited, or walk two hops, or clamp
+//! a negative length, is answered correctly by all 34 implemented methods.
+//!
+//! # The NAMED GAP of batch 4 is CLOSED, and it was load-bearing
+//!
+//! Batch 4 recorded a gap in this table rather than fixing it: "`visible_extent`
+//! short-circuits every index at or past the receiver's highest visible index
+//! to 'hole' without dispatching, so the `index_get` presence branch only runs
+//! BELOW the extent. **A hole strictly below the visible extent of a non-`Array`
+//! receiver is exercised at NO index in 351 rows.**"
+//!
+//! `holey_object` (`{0:"a", 2:"c", length:3}`) closes it, and the claim is now
+//! measured rather than argued:
+//!
+//! * Instrumenting `read_slots` shows that across all 39 rows of all NINE
+//!   pre-Batch-6 receivers there are **30 dispatched index reads and 0 of them
+//!   answer `present == false`** — the branch's false arm was genuinely
+//!   unreachable.
+//! * On `holey_object`, `visible_extent` returns 3 (one past the highest
+//!   integer key, 2), index 1 is inside the dispatch range, and the instrumented
+//!   read reports `index 1 -> present=false`.
+//! * Mutation: drop the `present` bit at `read_slots`'s `index_get` call. The
+//!   nine old receivers stay at **exactly 54** divergent rows — the mutation is
+//!   invisible, as batch 4 said. `holey_object` goes 11 → 13 divergent rows,
+//!   the two new ones being `slice` and `reverse`, and six rows that already
+//!   diverged for the delete-count reason change content as well.
+//!
+//! Two new receivers then found two defects no earlier receiver could see, and
+//! they are unrelated to the index/length model, so they are named apart:
+//! **E1** an object-literal accessor is created non-enumerable (so `Object.keys`
+//! omits it — a key-count difference charged to 47 rows) and **E2**
+//! `invoke_accessor_getter` answers `undefined` for a bytecode getter, so
+//! `array_like_len`/`index_get` read 0/`undefined` where the interpreter's own
+//! `[[Get]]` on the same object reads the accessor. E2 is visible as a split
+//! *inside one receiver*: on `length_getter` the callback-seam methods read
+//! `length` 3 and agree with node, and the native-path methods read 0. Both
+//! texts are on [`KNOWN_DIVERGENCES`].
+//!
+//! Adding `holey_object` to the **oracle-free** half of this file
+//! ([`self_consistency_over_the_whole_corpus`]) then found a third, **E3**: a
+//! `delete`d own shape-backed property keeps its descriptor with a hole in the
+//! cell, and reading it hands JS the hole tag instead of `undefined` — so
+//! `String(o[k])` raises an internal error and `o[k] === undefined` is `false`,
+//! where node answers cleanly. It is the same delete as the
+//! `Object.keys`-after-delete cluster (one cause, two symptoms) and it was
+//! invisible to both halves until a receiver had an own index that a mutator
+//! deletes *and* that stays inside the post-mutation `length`. The four affected
+//! pairs are listed, and ratcheted, in [`KNOWN_HOLE_READ_ERRORS`].
+//!
+//! None of the three is fixed here: this batch measures, the next one fixes.
 //!
 //! # "Holes materialised as present `undefined`" — FIXED, and it was one cause
 //!
@@ -117,24 +194,27 @@
 //! return the receiver) and are observable only through `hasOwnProperty` on the
 //! receiver afterwards.
 //!
-//! # A NAMED GAP this batch found in the table itself
+//! # The NAMED GAP batch 4 found in the table — CLOSED, see the header
 //!
-//! Mutation: flatten the generic-receiver branch of the range reader (drop the
-//! `present` bit on the `index_get` answer). The 351-row table does **not**
-//! notice — it stays at 80/14 — and only the focused test fails.
+//! Kept as the record of what was true when it was written, because the header
+//! section that closes it cites these numbers. Mutation: flatten the
+//! generic-receiver branch of the range reader (drop the `present` bit on the
+//! `index_get` answer). On the 351-row / 9-receiver table this did **not**
+//! move the divergence count at all — 80/14 at batch 4, 54/10 at batch 5 — and
+//! only the focused test failed.
 //!
-//! The reason is structural, and it is worth stating because it bounds what the
-//! table can ever claim: `visible_extent` short-circuits every index at or past
-//! the receiver's highest visible index to "hole" without dispatching, so the
-//! `index_get`-presence branch only runs for indices BELOW the extent. Of the
-//! table's four generic receivers, `inherited_indices` has extent 1 (its only
-//! index, `0`, is *present*) and `inherited_length`/`own_*` have extent 0 or 3
-//! with every index present. **A hole strictly below the visible extent of a
-//! non-`Array` receiver is therefore exercised at no index at all in 351 rows.**
-//! `{0:"a", 2:"c", length:3}` — extent 2, hole at 1 — is the smallest receiver
-//! that reaches it, and it is the focused test's, not a table row's. Adding it
-//! is one `receiver` stanza in the row source; it is not added here because it
-//! would change the 351-row denominator the batch accounting is stated in.
+//! The reason was structural: `visible_extent` short-circuits every index at or
+//! past the receiver's highest visible index to "hole" without dispatching, so
+//! the `index_get`-presence branch only ran for indices BELOW the extent, and
+//! every one of those was present. **A hole strictly below the visible extent of
+//! a non-`Array` receiver was exercised at no index at all in 351 rows.** (One
+//! correction to the note batch 4 left: `{0:"a", 2:"c", length:3}` has extent
+//! **3**, not 2 — `visible_extent` returns one *past* the highest integer key.
+//! The conclusion is unaffected, and index 1 is below 3, which is the whole
+//! reason the receiver works.)
+//!
+//! `holey_object` is that receiver, added in batch 6; the measured proof is in
+//! the header.
 //!
 //! # Deliberately NOT covered here
 //!
@@ -308,7 +388,13 @@ fn the_generated_table_matches_its_row_source() {
 // 2. The node-differential table, with its divergences named.
 // ---------------------------------------------------------------------------
 
-/// Every receiver, in row-source order.
+/// Every receiver, in row-source order. **Sixteen**, not nine: the seven added
+/// in Batch 6 are the seven spec decision points the first nine could not
+/// reach — a hole strictly below the visible extent, a getter at an index, a
+/// getter as the length, an own index shadowing an inherited one, a prototype
+/// chain two hops deep, a fractional `length`, and a negative `length`. The
+/// justification for each is in `scripts/array-receiver-table.txt`; the
+/// measured consequence is in the header.
 const ALL_RECEIVERS: &[&str] = &[
     "own_numeric_length",
     "own_string_length",
@@ -319,7 +405,55 @@ const ALL_RECEIVERS: &[&str] = &[
     "array_holey",
     "sparse_ctor",
     "length_assigned",
+    "holey_object",
+    "accessor_index",
+    "length_getter",
+    "shadowed_index",
+    "proto_chain_two_deep",
+    "length_float",
+    "length_negative",
 ];
+
+/// The two receivers that carry an accessor property. Both diverge on almost
+/// every row, for two reasons that have nothing to do with each other and are
+/// therefore almost always named separately in the ledger below.
+const ACCESSOR_RECEIVERS: &[&str] = &["accessor_index", "length_getter"];
+
+/// Cause **E1**: an accessor written in an object literal is registered
+/// **non-enumerable**, so `Object.keys` omits it while node reports it.
+///
+/// This is NOT an index/length defect and it is charged to every row of both
+/// accessor receivers through the harness's `Object.keys(o).length` column —
+/// the same conflation the harness docstring avoids for `JSON.stringify`. It
+/// is reported rather than hidden, because suppressing it would mean the table
+/// quietly stopped being a differential table on two of sixteen receivers.
+/// Verified at this commit: `Object.getOwnPropertyNames({0:"a", get length(){…}})`
+/// answers `0,length` in v12 (the key IS in the shape) while
+/// `getOwnPropertyDescriptor(…).enumerable` answers `false` where node answers
+/// `true`, which is what makes `Object.keys` drop it.
+const E1_ACCESSOR_NON_ENUMERABLE: &str = "E1: an object-literal accessor is created non-enumerable, so `Object.keys` omits it \
+     (v12 `getOwnPropertyDescriptor(o, k).enumerable` is false where node's is true) and the \
+     harness's key count is one low. An `Object.keys` defect, not an index/length one.";
+
+/// Cause **E2**: `internal_methods::invoke_accessor_getter` cannot run a
+/// **bytecode** getter — it matches `FunctionTarget::Native`/`Host` and returns
+/// `undefined` for `Bytecode`, with a comment saying the interpreter's
+/// `get_property` path provides it. So the engine's own `[[Get]]` and the
+/// interpreter's `[[Get]]` disagree on the same object at the same key.
+///
+/// That is observable as a split INSIDE one receiver: on `length_getter`, the
+/// seven callback-seam methods (`map`, `forEach`, `filter`, `every`, `some`,
+/// `find*`, `flatMap`, `reduce*`) read `length` 3 and agree with node on both
+/// the visit list and the returned array, while the native-path methods
+/// (`slice`, `fill`, `indexOf`, `at`, `reverse`, `pop`, `shift`, `splice`,
+/// `unshift`, `copyWithin`) read `length` 0 — because `array_like_len` and
+/// `index_get` reach the getter through `dispatch_get`. Same receiver, same
+/// property, two answers; no receiver before Batch 6 could show it.
+const E2_ACCESSOR_GETTER_UNREADABLE: &str = "E2: `invoke_accessor_getter` answers `undefined` for a bytecode getter, so \
+     `array_like_len`/`index_get` (which reach [[Get]] via `dispatch_get`) read 0/undefined where \
+     the interpreter's own [[Get]] on the same object reads the accessor. The callback seam, which \
+     reads through `Interp::get_property`, agrees with node on these receivers and the native path \
+     does not.";
 
 /// One row of the divergence ledger.
 struct Known<'a> {
@@ -334,16 +468,35 @@ struct Known<'a> {
     why: &'a str,
 }
 
-/// The complete, current divergence set: **54 of 351 rows, 10 methods**.
+/// The complete, current divergence set: **165 of 624 rows, 39 methods**
+/// (16 receivers × 39 rows).
 ///
-/// Each entry is one *defect*, not one symptom, so the count is the number of
-/// things to fix rather than the number of places they show. Read with the
-/// caveat in the module header: 45 of the 54 rows are the five `absent`
-/// entries and say nothing about the index/length model, so only **9 rows in
-/// three clusters** remain — and none of the three is in the callback seam,
-/// which is now clean on all 39 rows it runs.
+/// A `Known` entry is one (method, receivers, cause) triple, and **a method may
+/// appear more than once** when it diverges on different receivers for
+/// different reasons — [`declared_divergences`] unions the receiver sets
+/// instead of letting a later entry overwrite an earlier one, which is what
+/// makes per-cause attribution possible without a second table.
+///
+/// How the 165 rows divide, because the raw total is close to meaningless on
+/// its own:
+///
+/// * **80 rows** are the five `absent` methods on all sixteen receivers. They
+///   say nothing about the index/length model; they were 45 of 351 before this
+///   batch and are still the same five methods.
+/// * **17 rows** are the pre-existing "a deleted own index stays in
+///   `Object.keys`" cluster, now on six receivers instead of four (the six
+///   `holey_object` rows and the three `length_float` rows are new; the eight
+///   `own_*`/`array_*` rows are the ones earlier batches recorded).
+/// * **21 rows** are genuinely new behavioural divergences, on the two accessor
+///   receivers, from E1 and E2 above.
+/// * The remaining rows on the accessor receivers (47 of the 64 that differ
+///   ONLY in the harness's key count) are E1 alone.
+///
+/// Pre-Batch-6, the same table said 54 of 351 across 10 methods, of which 9
+/// rows were real. **Every batch number recorded against 351 is stated against
+/// a denominator this table no longer has**; see the header.
 const KNOWN_DIVERGENCES: &[Known] = &[
-    // -- unimplemented: five rows below cover all nine receivers each --------
+    // -- unimplemented: five rows below cover all sixteen receivers each ------
     Known {
         method: "toLocaleString",
         receivers: ALL_RECEIVERS,
@@ -376,32 +529,71 @@ const KNOWN_DIVERGENCES: &[Known] = &[
     },
     // -- deleted keys stay visible to Object.keys ---------------------------
     //
-    // ONE defect behind four entries, which the generated table separates for
+    // ONE defect behind these entries, which the generated table separates for
     // us: `hasOwnProperty(o, i)` says false but `Object.keys(o)` still counts
-    // the index, because `index_delete`/`delete_property` hole the storage
-    // cell and leave the shape descriptor behind. Every entry below is a case
-    // where that makes the `Object.keys` column differ from node's.
+    // the index, because `index_delete`/`delete_property` hole the storage cell
+    // and leave the shape descriptor behind. Every entry below is a case where
+    // that makes the `Object.keys` column differ from node's — and it is the
+    // ONLY field that differs on all of them.
     Known {
         method: "pop",
-        receivers: &["own_numeric_length", "own_string_length"],
+        receivers: &[
+            "own_numeric_length",
+            "own_string_length",
+            "holey_object",
+            "length_float",
+        ],
         absent: false,
         why: "`hasOwnProperty(o, i)` is false but `Object.keys(o)` still counts the \
               deleted index: the shape descriptor survives the delete",
     },
     Known {
         method: "shift",
-        receivers: &["own_numeric_length", "own_string_length"],
+        receivers: &[
+            "own_numeric_length",
+            "own_string_length",
+            "holey_object",
+            "length_float",
+        ],
         absent: false,
         why: "same as pop: a deleted own index stays in Object.keys",
     },
     Known {
         method: "splice",
-        receivers: &["own_numeric_length", "own_string_length"],
+        receivers: &[
+            "own_numeric_length",
+            "own_string_length",
+            "holey_object",
+            "length_float",
+        ],
         absent: false,
-        why: "same as pop/shift, and it is the ONLY remaining defect on these two \
+        why: "same as pop/shift, and it is the ONLY remaining defect on these four \
               receivers: the hole materialisation in the removed-element array \
               this entry used to also carry is fixed (see `a_hole_is_never_\
               materialised_as_an_own_undefined`)",
+    },
+    // `holey_object` extends the same cluster to three more methods, because
+    // deleting its index 1 is the case the deleted-key defect is worst at: the
+    // index is a hole, so every reader agrees it is absent and only the key
+    // count can still be wrong.
+    Known {
+        method: "copyWithin",
+        receivers: &["holey_object"],
+        absent: false,
+        why: "holey_object: same deleted-key-counts defect — copyWithin deletes index 1 and \
+              the shape descriptor survives",
+    },
+    Known {
+        method: "sort",
+        receivers: &["holey_object"],
+        absent: false,
+        why: "holey_object: same deleted-key-counts defect — sort deletes the hole at index 1",
+    },
+    Known {
+        method: "unshift",
+        receivers: &["holey_object"],
+        absent: false,
+        why: "holey_object: same deleted-key-counts defect — unshift deletes the hole at index 1",
     },
     Known {
         method: "length_lower",
@@ -417,15 +609,246 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         why: "`arguments[7] = x` grows `arguments.length` to 8; the exotic's length \
               is fixed at creation and an index write must not touch it",
     },
+    // -- E2: the accessor receivers, one entry per method --------------------
+    //
+    // `accessor_index` and `length_getter` are the two receivers with an
+    // accessor property, and between them they diverge on 38 and 39 of their 39
+    // rows. Every entry below is `ACCESSOR_RECEIVERS`; the two `why` texts say
+    // which of E1/E2 the row carries, because they are separable and only one
+    // of them is an index/length defect.
+    //
+    // E2 BEYOND THE KEY COUNT — the native path really does misread the receiver.
+    Known {
+        method: "fill",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "copyWithin",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "slice",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "reverse",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "shift",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "unshift",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "splice",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "pop",
+        receivers: &["length_getter"],
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "indexOf",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "lastIndexOf",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "includes",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "at",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    Known {
+        method: "flat",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E2_ACCESSOR_GETTER_UNREADABLE,
+    },
+    // E1 ALONE — the method's own answer agrees with node on both receivers and
+    // only the harness's `Object.keys` column differs. Twenty-six rows' worth,
+    // and NOT one index/length defect: this is the cost of putting an accessor
+    // in a receiver and is stated here so nobody reads these as 26 method bugs.
+    //
+    // The seam methods (`map`, `forEach`, `filter`, `some`, `every`, `find*`,
+    // `flatMap`, `reduce`, `reduceRight`) are in this group and that is the
+    // point: they read `length` through `Interp::get_property`, so they get the
+    // getter right and would have been the only rows in the table that could
+    // have shown the split between the two readers.
+    Known {
+        method: "join",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "sort",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "concat",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "toString",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "push",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "flatMap",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "map",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "forEach",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "filter",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "reduce",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "reduceRight",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "some",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "every",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "find",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "findIndex",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "findLast",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "findLastIndex",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "index_assign_low",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "index_assign_mid",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "index_assign_past",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
+    Known {
+        method: "length_lower",
+        receivers: ACCESSOR_RECEIVERS,
+        absent: false,
+        why: E1_ACCESSOR_NON_ENUMERABLE,
+    },
 ];
 
 /// Divergences this file knows about, folded into the same shape the test
 /// builds from the table, so one `assert_eq!` compares them.
+///
+/// **Unions** receiver sets across entries naming the same method: a method
+/// that diverges on `own_numeric_length` for one reason and on
+/// `length_getter` for another needs two ledger entries, and a map that let
+/// the second overwrite the first would silently drop the first.
 fn declared_divergences() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
-    KNOWN_DIVERGENCES
-        .iter()
-        .map(|k| (k.method, k.receivers.iter().copied().collect()))
-        .collect()
+    let mut out: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
+    for k in KNOWN_DIVERGENCES {
+        out.entry(k.method)
+            .or_default()
+            .extend(k.receivers.iter().copied());
+    }
+    out
 }
 
 /// Runs every generated program once and returns, per receiver, the rows v12
@@ -509,7 +932,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 54,
+        total, 165,
         "the divergence count moved without the ledger's shape changing"
     );
 }
@@ -595,6 +1018,14 @@ fn self_consistency_over_the_whole_corpus() {
             "var r = Object.create({0:'inh', length:3});",
         ),
         ("inherited length", "var r = Object.create({length:3});"),
+        // A hole strictly below the visible extent. Added with the
+        // `holey_object` row: the oracle-free half of this test should cover
+        // every receiver shape the differential half does, or a receiver can be
+        // differentially pinned and self-consistency-unpinned at the same time.
+        (
+            "hole below the extent",
+            r#"var r = {0:"a",2:"c",length:3};"#,
+        ),
     ];
     let mutators = [
         r#"Array.prototype.fill.call(r, "q", 0, 3)"#,
@@ -630,10 +1061,19 @@ fn self_consistency_over_the_whole_corpus() {
                 "#
             );
             let got = eval_json(&src);
-            assert!(
-                !got.contains("threw:"),
-                "{label} + {m} must not throw: {got}"
-            );
+            let known = KNOWN_HOLE_READ_ERRORS
+                .iter()
+                .any(|(l, mm)| *l == label && *mm == m);
+            if got.contains("threw:") || got.contains("ReferenceError") {
+                assert!(
+                    known,
+                    "{label} + {m} must not throw: {got}\n\
+                     If this is the E3 hole-read defect, add the pair to \
+                     KNOWN_HOLE_READ_ERRORS with its reason — do not widen the \
+                     corpus's mutator list to avoid it."
+                );
+                continue;
+            }
             assert!(
                 !got.contains('!'),
                 "{label} + {m}: an index reads differently twice in a row, so \
@@ -646,7 +1086,69 @@ fn self_consistency_over_the_whole_corpus() {
             );
         }
     }
+
+    // The ratchet's other direction: a listed pair that has become clean is as
+    // much a failure as an unlisted pair that has become broken, because the
+    // list is the only place E3 is written down.
+    for (label, m) in KNOWN_HOLE_READ_ERRORS {
+        let decl = corpus
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, d)| *d)
+            .expect("a listed pair names a receiver in the corpus above");
+        let src = format!(
+            r#"{decl}
+               try {{ {m}; }} catch (e) {{}}
+               var L = r.length;
+               if (typeof L !== "number" || L < 0 || L > 8) {{ L = 0; }}
+               var out = "";
+               for (var n = 0; n < L; n++) {{ out += String(r[n]) + ";"; }}
+               out;
+               "#
+        );
+        let got = eval_json(&src);
+        assert!(
+            got.contains("threw:") || got.contains("ReferenceError"),
+            "{label} + {m} is listed in KNOWN_HOLE_READ_ERRORS but reads cleanly now \
+             ({got}) — E3 is fixed for this pair, so DELETE the entry"
+        );
+    }
 }
+
+/// **E3**: a `delete`d own shape-backed property keeps its descriptor with a
+/// hole in the storage cell, and reading that descriptor hands the **hole tag**
+/// to JS instead of `undefined`.
+///
+/// This is the same root cause as the `Object.keys`-after-delete entry in
+/// [`KNOWN_DIVERGENCES`] — one delete, two symptoms — and it is invisible to
+/// both halves of this file until a receiver has an own index that a mutator
+/// deletes and that stays *inside* the post-mutation `length`, because
+/// `snap`'s `hasOwnProperty` arm prints `-` for a deleted index without reading
+/// it, and the dense receivers shorten `length` past the deleted index. The
+/// `holey_object` corpus entry above is the first shape that does.
+///
+/// Verified against `node` at this commit (v24.21.0): for all four pairs node
+/// reads every index back as `undefined`/its value and v12 raises an internal
+/// `ReferenceError` out of the property read — `String(hole)` falls through to
+/// the unimplemented BigInt arm. `typeof r[k]` and `r[k] === undefined` also
+/// disagree (`undefined`/`false` against `undefined`/`true`), so the hole tag is
+/// observably not `undefined` and not merely un-printable.
+///
+/// The pairs below are measured, not guessed: each one is a (receiver, mutator)
+/// combination in the corpus whose post-state read hits this. Nothing else in
+/// the 6 × 9 corpus does — the other 50 combinations read back cleanly.
+const KNOWN_HOLE_READ_ERRORS: &[(&str, &str)] = &[
+    (
+        "hole below the extent",
+        r#"Array.prototype.copyWithin.call(r, 0, 1, 3)"#,
+    ),
+    ("hole below the extent", r#"Array.prototype.shift.call(r)"#),
+    (
+        "hole below the extent",
+        r#"Array.prototype.unshift.call(r, "z")"#,
+    ),
+    ("hole below the extent", r#"Array.prototype.sort.call(r)"#),
+];
 
 // ---------------------------------------------------------------------------
 // 4. `ArraySetLength`: the defect this batch fixed, pinned directly.

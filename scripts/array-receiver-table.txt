@@ -31,6 +31,44 @@
 # declared length. `ArraySetLength` is reachable only by writing one index.
 # A table that cannot see the bug it is cited for is the same failure as a
 # transcribed one, one level up.
+#
+# WHY THERE ARE NOW SIXTEEN (Batch 6). Nine of these receivers were selected
+# before anyone wrote down which decision points the 39 methods actually branch
+# on, and the list has three gaps a reader can see from the code:
+#
+#   1. **No hole strictly below the visible extent on a non-`Array`.**
+#      `visible_extent` (`builtins/array.rs`) returns ONE PAST the highest
+#      integer key reachable on the receiver or its prototype chain, and
+#      `read_slots` short-circuits every index `>= extent` to "hole" without
+#      dispatching. Every pre-Batch-6 receiver either has a contiguous index
+#      range (`own_*`, `array_dense`) or a visible extent of 0/1
+#      (`inherited_*`), so `index_get`'s presence branch only ever ran where
+#      the answer was `present == true`. `holey_object` below is the smallest
+#      receiver that reaches it with `present == false`.
+#   2. **No receiver where a `[[Get]]` must invoke an accessor.** Both the
+#      length read (`array_like_len`) and the index read (`index_get`) route
+#      through `dispatch_get`, which is the only thing that makes a getter a
+#      getter; a shape-slot read would answer a plain value and no row would
+#      notice. `accessor_index` (getter AT an index) and `length_getter`
+#      (getter AS the length) pin the two call sites separately, because they
+#      are two call sites.
+#   3. **No receiver where an own index SHADOWS an inherited one, and none
+#      where the chain is deeper than one hop.** `inherited_indices` has no own
+#      properties at all, so "own wins over inherited" is never decided by a
+#      row; and a reader that walked exactly one prototype hop would score
+#      identically on every pre-Batch-6 receiver, because all of them are at
+#      most one hop deep. `shadowed_index` and `proto_chain_two_deep` are those
+#      two rungs.
+#
+# `length_float` and `length_negative` are the two `ToLength` outcomes no
+# earlier receiver reached: truncation (`3.7` → 3) and the clamp of a negative
+# to zero. `own_string_length` covers coercion, not either of these.
+#
+# NOT COVERED, DELIBERATELY: a **Proxy** receiver. `index_get`/`index_set` reach
+# `proxy_get`/`proxy_set`, which are the unimplemented-trap stubs and throw
+# `TypeError`; a Proxy row would measure the stub, not the index/length model,
+# and would belong in the `absent` ledger as a separate entry rather than
+# inflating this table's denominator with rows whose expectation is "it threw".
 
 
 receiver own_numeric_length
@@ -402,6 +440,335 @@ method   find            Array.prototype.find.call(o,rec(function(){return true;
 method   findIndex       Array.prototype.findIndex.call(o,rec(function(){return true;}))
 method   findLast        Array.prototype.findLast.call(o,rec(function(){return true;}))
 method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(){return true;}))
+method   with            Array.prototype.with.call(o,1,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[1] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)
+
+# ---------------------------------------------------------------------------
+# Batch 6 receivers — one per spec decision point the 39 methods branch on and
+# no pre-Batch-6 receiver reached. See the header for the three gaps.
+# ---------------------------------------------------------------------------
+
+# A hole strictly BELOW the visible extent on a non-`Array`. `visible_extent`
+# returns one past the highest integer key (2), so index 1 is inside the
+# dispatch range and `index_get` has to answer `present == false` there. Every
+# other generic receiver has either a contiguous range or an extent of 0/1.
+receiver holey_object
+decl     {0:"a",2:"c",length:3}
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"c")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"c")
+method   includes        Array.prototype.includes.call(o,"c")
+method   at              Array.prototype.at.call(o,2)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="c";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="c";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="c";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="c";}))
+method   with            Array.prototype.with.call(o,2,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[2] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)
+
+# A getter AT an index: `index_get` must reach `dispatch_get` for the value, so
+# this row is the only thing that distinguishes "reads the property" from
+# "reads the shape slot". `snap` reads through `o[i]` too, so it agrees with
+# whatever `[[Get]]` does rather than papering over it.
+receiver accessor_index
+decl     {0:"a", get 1(){return "acc";}, 2:"c", length:3}
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"c")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"c")
+method   includes        Array.prototype.includes.call(o,"c")
+method   at              Array.prototype.at.call(o,2)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="c";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="c";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="c";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="c";}))
+method   with            Array.prototype.with.call(o,2,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[1] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)
+
+# A getter AS the length: `LengthOfArrayLike` is `ToLength(Get(O,"length"))`, and
+# `Get` invokes an accessor. `inherited_length` and `own_string_length` pin the
+# chain walk and the coercion; nothing pinned that the read is a `[[Get]]`.
+# `length_lower` is the interesting row: assigning to a getter-only property is
+# a silent no-op in sloppy mode, and node reports the receiver UNCHANGED.
+receiver length_getter
+decl     {0:"a",1:"b",2:"c", get length(){return 3;}}
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"c")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"c")
+method   includes        Array.prototype.includes.call(o,"c")
+method   at              Array.prototype.at.call(o,2)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="c";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="c";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="c";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="c";}))
+method   with            Array.prototype.with.call(o,2,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[1] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)
+
+# An OWN index that shadows an INHERITED one. `inherited_indices` has no own
+# indices, so no pre-Batch-6 row ever made a reader decide between the two
+# rungs; `index_assign_low` here writes over an inherited index and must create
+# an OWN one (node's `snap` answers `2/3/h:z,...` — the key count rises).
+receiver shadowed_index
+decl     Object.assign(Object.create({0:"inh0",1:"inh1",2:"inh2",length:3}),{1:"own1"})
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"inh2")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"inh2")
+method   includes        Array.prototype.includes.call(o,"inh2")
+method   at              Array.prototype.at.call(o,2)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="inh2";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="inh2";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="inh2";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="inh2";}))
+method   with            Array.prototype.with.call(o,2,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[1] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)
+
+# `length` AND the only index two hops up the chain. Every other receiver is at
+# most one hop deep, so a reader that walked exactly one prototype hop scores
+# identically on all of them; here such a reader sees nothing at all
+# (`visible_extent` is 1 and `Object.keys(o)` is 0 either way, but `slice`
+# returns `[deep]` where a one-hop reader returns `[]`).
+receiver proto_chain_two_deep
+decl     Object.create(Object.create({0:"deep",length:3}))
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"deep")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"deep")
+method   includes        Array.prototype.includes.call(o,"deep")
+method   at              Array.prototype.at.call(o,0)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="deep";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="deep";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="deep";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="deep";}))
+method   with            Array.prototype.with.call(o,0,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[2] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)
+
+# `ToLength` TRUNCATION. `own_string_length` pins `ToNumber` on a string; no
+# receiver had a fractional length, so `ToIntegerOrInfinity`'s truncation was
+# never decided by a row. `3.7` is length 3.
+receiver length_float
+decl     {0:"a",1:"b",2:"c",length:3.7}
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"b")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"b")
+method   includes        Array.prototype.includes.call(o,"b")
+method   at              Array.prototype.at.call(o,1)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="c";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="c";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="c";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="c";}))
+method   with            Array.prototype.with.call(o,1,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[1] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)
+
+# `ToLength` CLAMP: a negative length is 0, not -1. No receiver had one, so a
+# reader that passed the raw value through would answer every method with an
+# empty range and could not be told apart from a correct one on any other
+# receiver. Every mutating row must therefore leave the receiver untouched —
+# except `index_assign_*`, which reaches `ArraySetLength` through the index.
+receiver length_negative
+decl     {0:"a",1:"b",2:"c",length:-1}
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"a")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"a")
+method   includes        Array.prototype.includes.call(o,"a")
+method   at              Array.prototype.at.call(o,0)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="c";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="c";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="c";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="c";}))
 method   with            Array.prototype.with.call(o,1,"q")
 method   toReversed      Array.prototype.toReversed.call(o)
 method   toSorted        Array.prototype.toSorted.call(o)
