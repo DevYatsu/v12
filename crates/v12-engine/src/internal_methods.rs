@@ -986,10 +986,28 @@ fn ordinary_has_property(
     let shape = shape_of(heap, obj);
     // Guarded stub fast path: a recorded `Data` location answers `true`
     // in O(1); anything else (including accessor-held keys, which stubs
-    // never record) falls through to the walk below.
-    if heap.stub_lookup_proto(obj, shape, key).is_some() {
+    // never record) falls through to the walk below. A recorded cell holding a
+    // `hole` falls through with it — see the note on the walk below.
+    if let Some((holder, hsl)) = heap.stub_lookup_proto(obj, shape, key)
+        && let Some(&v) = heap.get(holder).properties.get(hsl as usize)
+        && !v.is_hole()
+    {
         return Ok(true);
     }
+    //
+    // THE RULE, once, for this whole function and its `ordinary_get` twin: a
+    // `hole` cell means the property is ABSENT. `delete` leaves the shared
+    // shape descriptor in place and holes the cell, so "descriptor present" and
+    // "property present" are no longer the same question — and ES 10.1.8
+    // answers the absent case by CONTINUING to the prototype
+    // (`OrdinaryHasProperty` step 3), not by answering `false`. Getting that
+    // wrong is not a cosmetic hole: returning the cell's contents handed the
+    // internal `Hole` tag to JavaScript, where `String(hole)` fell through to
+    // the unimplemented BigInt arm and raised an `InternalError` naming a
+    // subsystem with nothing to do with the defect. This is the rung
+    // `Array.prototype`'s `index_get` asks for presence through, so it has to
+    // agree with `ordinary_get` or every deleted own index would come back as a
+    // present `undefined`.
     let mut cur = Some(obj);
     while let Some(o) = cur {
         let o_shape = shape_of(heap, o);
@@ -1004,6 +1022,16 @@ fn ordinary_has_property(
             .copied()
         {
             if !entry.is_accessor {
+                if heap
+                    .get(o)
+                    .properties
+                    .get(entry.slot as usize)
+                    .is_none_or(|v| v.is_hole())
+                {
+                    // Deleted own key: step 3 continues to the prototype.
+                    cur = heap.get(o).prototype;
+                    continue;
+                }
                 heap.stub_record_proto(obj, shape, key, o, o_shape, entry.slot);
             }
             return Ok(true);
@@ -1012,6 +1040,15 @@ fn ordinary_has_property(
             // Record `Data` locations for future O(1) probes (accessors
             // have no servable slot and always re-walk).
             if let v12_heap::Descriptor::Data { slot, .. } = d {
+                if heap
+                    .get(o)
+                    .properties
+                    .get(slot as usize)
+                    .is_none_or(|v| v.is_hole())
+                {
+                    cur = heap.get(o).prototype;
+                    continue;
+                }
                 heap.stub_record_proto(obj, shape, key, o, o_shape, slot);
             }
             return Ok(true);
@@ -1037,11 +1074,19 @@ fn ordinary_get(
     let recv_shape = shape_of(heap, obj);
     // Guarded stub fast path (O(1)): serves recorded `Data` locations —
     // own and proto alike. OOB storage falls through to the walk, which
-    // resolves exactly as before (including continuing past holes).
+    // resolves exactly as before.
+    //
+    // A recorded cell can hold a `hole`: `delete` holes the storage cell and
+    // leaves the shared shape descriptor in place, and the stub cache is keyed
+    // by shape, which a delete does not change. `CONTEXT.md` requires the hole
+    // to be "never observable from conforming JavaScript", and this is one of
+    // the seven rungs that let it out — see the note on `ordinary_has_property`
+    // below for the whole rule.
     if let Some((holder, hsl)) = heap.stub_lookup_proto(obj, recv_shape, key)
-        && let Some(v) = heap.get(holder).properties.get(hsl as usize)
+        && let Some(&v) = heap.get(holder).properties.get(hsl as usize)
+        && !v.is_hole()
     {
-        return Ok(*v);
+        return Ok(v);
     }
     let mut cur = Some(obj);
     while let Some(o) = cur {
@@ -1060,11 +1105,16 @@ fn ordinary_get(
                 return invoke_accessor_getter(heap, o, entry.getter);
             }
             heap.stub_record_proto(obj, recv_shape, key, o, o_shape, entry.slot);
-            if let Some(v) = heap.get(o).properties.get(entry.slot as usize) {
-                return Ok(*v);
+            if let Some(&v) = heap.get(o).properties.get(entry.slot as usize)
+                && !v.is_hole()
+            {
+                return Ok(v);
             }
-            // OOB storage (embedder-short object): fall through to the
-            // shape walk, mirroring the Data arm below.
+            // OOB storage (embedder-short object) or a deleted own key: fall
+            // through to the shape walk, mirroring the Data arm below. The two
+            // stores are disjoint, so the shape walk finds nothing here and
+            // continues to the prototype — which is what ES 10.1.8 step 3 says
+            // when `[[GetOwnProperty]]` answered `undefined`.
         }
         if let Some(d) = heap.get(o_shape).descriptors.find(key).copied() {
             match d {
@@ -1072,9 +1122,12 @@ fn ordinary_get(
                     // Record the location (own or proto, depth ≤ 2) for
                     // future O(1) probes, then serve exactly as before.
                     heap.stub_record_proto(obj, recv_shape, key, o, o_shape, slot);
-                    if let Some(v) = heap.get(o).properties.get(slot as usize) {
-                        return Ok(*v);
+                    if let Some(&v) = heap.get(o).properties.get(slot as usize)
+                        && !v.is_hole()
+                    {
+                        return Ok(v);
                     }
+                    // Deleted own key: continue to the prototype (step 3).
                 }
                 v12_heap::Descriptor::Accessor { getter, .. } => {
                     return invoke_accessor_getter(heap, o, getter);

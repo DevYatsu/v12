@@ -777,3 +777,58 @@ method   index_assign_low   (o[0] = "z")
 method   index_assign_mid   (o[1] = "z")
 method   index_assign_past  (o[7] = "z")
 method   length_lower       (o.length = 1)
+
+# `frozen_object` (Batch 7). The one uncovered rung that has a LIVE code path
+# behind it: `set_array_len` and `index_set` route through `[[Set]]`
+# specifically so that a non-writable receiver gets the spec's refusal
+# (ES 22.1.5.2 `Set(O, "length", …, true)` → `[[Set]]` on a frozen receiver
+# returns `false`, and a mutating method that requires the write to succeed
+# throws `TypeError`). `length_assigned` exercises a *writable* length and
+# `index_assign_*` a writable index; nothing in the table so far has an
+# integrity level that makes the write FAIL, so every mutating row on every
+# other receiver answers "the write happened". This receiver answers "the write
+# was refused", which is a different branch of the same `[[Set]]` path.
+#
+# `decl` is the frozen receiver itself, so `snap`'s `Object.keys` column and
+# `hasOwnProperty` see exactly what a frozen object is.
+receiver frozen_object
+decl     Object.freeze({0:"a",length:3})
+method   fill            Array.prototype.fill.call(o,"q",0,3)
+method   copyWithin      Array.prototype.copyWithin.call(o,0,1,3)
+method   slice           Array.prototype.slice.call(o)
+method   join            Array.prototype.join.call(o,"-")
+method   sort            Array.prototype.sort.call(o)
+method   reverse         Array.prototype.reverse.call(o)
+method   shift           Array.prototype.shift.call(o)
+method   unshift         Array.prototype.unshift.call(o,"z")
+method   splice          Array.prototype.splice.call(o,1,1)
+method   concat          Array.prototype.concat.call(o,[1])
+method   toString        Array.prototype.toString.call(o)
+method   toLocaleString  Array.prototype.toLocaleString.call(o)
+method   push            Array.prototype.push.call(o,"d")
+method   pop             Array.prototype.pop.call(o)
+method   indexOf         Array.prototype.indexOf.call(o,"a")
+method   lastIndexOf     Array.prototype.lastIndexOf.call(o,"a")
+method   includes        Array.prototype.includes.call(o,"a")
+method   at              Array.prototype.at.call(o,0)
+method   flat            Array.prototype.flat.call(o)
+method   flatMap         Array.prototype.flatMap.call(o,rec(function(x){return [x];}))
+method   map             Array.prototype.map.call(o,rec(function(x){return x;}))
+method   forEach         Array.prototype.forEach.call(o,rec(function(){}))
+method   filter          Array.prototype.filter.call(o,rec(function(){return true;}))
+method   reduce          Array.prototype.reduce.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   reduceRight     Array.prototype.reduceRight.call(o,rec(function(p,c){return p+"|"+c;},"R"))
+method   some            Array.prototype.some.call(o,rec(function(){return true;}))
+method   every           Array.prototype.every.call(o,rec(function(){return true;}))
+method   find            Array.prototype.find.call(o,rec(function(x){return x==="c";}))
+method   findIndex       Array.prototype.findIndex.call(o,rec(function(x){return x==="c";}))
+method   findLast        Array.prototype.findLast.call(o,rec(function(x){return x==="c";}))
+method   findLastIndex   Array.prototype.findLastIndex.call(o,rec(function(x){return x==="c";}))
+method   with            Array.prototype.with.call(o,1,"q")
+method   toReversed      Array.prototype.toReversed.call(o)
+method   toSorted        Array.prototype.toSorted.call(o)
+method   toSpliced       Array.prototype.toSpliced.call(o,1,1)
+method   index_assign_low   (o[0] = "z")
+method   index_assign_mid   (o[1] = "z")
+method   index_assign_past  (o[7] = "z")
+method   length_lower       (o.length = 1)

@@ -73,14 +73,49 @@
 //! observation must actually contain `threw:TypeError`, so a row cannot be
 //! excused as "not implemented" while v12 quietly returns a wrong value.
 //!
-//! Measured at this commit: **165 of 624 rows diverge, across all 39 methods**
-//! (16 receivers × 39 rows). 80 of those are five unimplemented methods on all
-//! sixteen receivers and say nothing about the index/length model. The rest is
-//! four clusters, itemised at [`KNOWN_DIVERGENCES`]: the pre-existing
-//! `Object.keys`-after-delete defect (17 rows), two NEW accessor defects that
-//! no pre-Batch-6 receiver could reach (E1 and E2 below, 21 rows with a
+//! Measured at this commit: **177 of 663 rows diverge, across all 39 methods**
+//! (17 receivers × 39 rows). 85 of those are five unimplemented methods on all
+//! seventeen receivers and say nothing about the index/length model. The rest is
+//! five clusters, itemised at [`KNOWN_DIVERGENCES`]: the pre-existing
+//! `Object.keys`-after-delete defect (17 rows), two accessor defects that no
+//! pre-Batch-6 receiver could reach (E1 and E2 below, 21 rows with a
 //! behavioural difference plus 47 rows that differ only in the harness's key
-//! count), and the arguments-exotic `index_assign_past` row.
+//! count), the arguments-exotic `index_assign_past` row, and the seven
+//! `frozen_object` rows Batch 7 added.
+//!
+//! **Batch 7 fixed one of the three defects it set out to fix, and could not
+//! fix the other two — both because their fix lives outside this batch's file
+//! set.** What was settled here, per defect:
+//!
+//! * **E3 is FIXED.** A `delete`d property handed the internal `Hole` tag to
+//!   JavaScript. Seven rungs disagreed about what a `hole` cell means; they now
+//!   all say "absent", which is what ES 10.1.8 `OrdinaryGet` step 2 says. See
+//!   [`KNOWN_HOLE_READ_ERRORS`] and
+//!   [`a_deleted_property_never_hands_javascript_the_hole_sentinel`].
+//! * **E2 is OPEN and is not patch-shaped.** `FunctionTarget::Bytecode` is a
+//!   bare index into a program table that `Ctx`'s single `&mut Heap` cannot
+//!   reach, so the two `invoke_accessor_getter` call sites cannot be repaired
+//!   in place — it needs seam interception (25 methods) or a `NativeHandler`
+//!   signature change.
+//! * **E1 is OPEN and the fix is in `v12-bytecode` + `v12-bccompiler`**, which
+//!   this batch may not modify: `DefineAccessor` carries no attribute operand,
+//!   so the interpreter cannot tell a class accessor from a literal one.
+//!
+//! # `frozen_object` — the integrity-level rung (Batch 7)
+//!
+//! Every one of the previous sixteen receivers has a WRITABLE `length` and
+//! writable indices, so no row had ever reached the branch where a required
+//! `[[Set]]`/`[[Delete]]` must be **refused**. That branch is reached by
+//! `Object.freeze`, and it found the worst defect in this file's history:
+//! `Array.prototype.reverse.call(Object.freeze({0:"a",length:3}))` **deleted the
+//! non-configurable own property `0`** — `o[0]` became `undefined`,
+//! `Object.keys(o)` dropped it — while `Object.isFrozen(o)` still answered
+//! `true`. That is state corruption plus a false integrity report, not merely a
+//! missing `TypeError`. `copyWithin` and `shift` do the same delete; `fill`,
+//! `unshift`, `splice` and `pop` complete silently after a refused write.
+//! `push` is correct, so the refusal machinery is reachable and it is the
+//! observation of it that is missing. Recorded, **not fixed** — see
+//! [`FROZEN_REFUSAL_UNOBSERVED`].
 //!
 //! # Every number in this file's history was stated against 351 rows
 //!
@@ -93,12 +128,17 @@
 //! | batch 3 (generated) | 9 × 351 | 108 | — |
 //! | batch 4 | 9 × 351 | 80 | 14 |
 //! | batch 5 | 9 × 351 | 54 | 10 |
-//! | **batch 6 (this one)** | **16 × 624** | **165** | **39** |
+//! | batch 6 | 16 × 624 | 165 | 39 |
+//! | **batch 7 (this one)** | **17 × 663** | **177** | **39** |
 //!
 //! The 24 → 108 step is the one that matters: it is what a stronger instrument
 //! found when a transcribed table was replaced by a generated one. The
 //! 108 → 165 step is the same thing one level further out — seven more spec
-//! decision points, and **no row an earlier batch claimed fixed has come back**
+//! decision points — and 165 → 177 is the same thing again: ONE receiver
+//! (`frozen_object`) added twelve rows, five of them the unimplemented methods
+//! re-counted on the new receiver and seven of them a defect no earlier
+//! receiver could reach. In both steps **no row an earlier batch claimed fixed
+//! has come back**
 //! (`slice`/`map`/`concat`/`sort`/`reverse`/`splice` are still clean on every
 //! receiver without an accessor, and the six "hole materialised as an own
 //! `undefined`" rows stay fixed on `holey_object`, which is a holey receiver no
@@ -388,12 +428,15 @@ fn the_generated_table_matches_its_row_source() {
 // 2. The node-differential table, with its divergences named.
 // ---------------------------------------------------------------------------
 
-/// Every receiver, in row-source order. **Sixteen**, not nine: the seven added
+/// Every receiver, in row-source order. **Seventeen**, not nine: the seven added
 /// in Batch 6 are the seven spec decision points the first nine could not
 /// reach — a hole strictly below the visible extent, a getter at an index, a
 /// getter as the length, an own index shadowing an inherited one, a prototype
-/// chain two hops deep, a fractional `length`, and a negative `length`. The
-/// justification for each is in `scripts/array-receiver-table.txt`; the
+/// chain two hops deep, a fractional `length`, and a negative `length` — and
+/// `frozen_object` (Batch 7) is the one *integrity level*: every other receiver
+/// has a **writable** `length` and **writable** indices, so no row had ever
+/// reached the branch where a required `[[Set]]`/`[[Delete]]` must be REFUSED.
+/// The justification for each is in `scripts/array-receiver-table.txt`; the
 /// measured consequence is in the header.
 const ALL_RECEIVERS: &[&str] = &[
     "own_numeric_length",
@@ -412,7 +455,39 @@ const ALL_RECEIVERS: &[&str] = &[
     "proto_chain_two_deep",
     "length_float",
     "length_negative",
+    "frozen_object",
 ];
+
+/// The seven mutating rows `frozen_object` diverges on, and what it found.
+///
+/// **Not fixed in this batch, by instruction** — the receiver was added to
+/// *measure* the integrity-level rung, and the answer is worse than "a missing
+/// `TypeError`":
+///
+/// * `Array.prototype.reverse.call(Object.freeze({0:"a",length:3}))` **deleted
+///   the non-configurable own property `0`** — `o[0]` became `undefined` and
+///   `Object.keys(o)` dropped it — while `Object.isFrozen(o)` still answered
+///   `true`. That is a state-corrupting violation, not just an unthrown one:
+///   the object is left reporting an integrity level it no longer has.
+///   `copyWithin` and `shift` do the same delete. `index_delete`
+///   (`builtins/array.rs`) holes the cell with no descriptor check at all.
+/// * `fill` refuses to write (the read-only index keeps its value) but returns
+///   the receiver instead of throwing, because `index_set` discards
+///   `dispatch_set`'s `false`.
+/// * `unshift` computed `length` 4, **wrote** nothing, and **returned 4**.
+/// * `splice`/`pop` computed a new `length`, could not write it, and returned
+///   normally.
+///
+/// `push` is the one mutator that agrees: it throws, because adding index 3 hits
+/// the non-extensible check. So the refusal machinery exists and is reachable —
+/// it is the two steps that must *observe* it (`DeletePropertyOrThrow`,
+/// `Set(O, k, v, true)`) that are missing.
+const FROZEN_REFUSAL_UNOBSERVED: &str = "FROZEN: on an integrity-level receiver every mutating method whose spec step \
+     requires a write to succeed proceeds as if it had. reverse/copyWithin/shift additionally DELETE the \
+     non-configurable own index (Object.isFrozen still answers true afterwards), fill returns the receiver \
+     after a refused index write, unshift returns a length it could not write, and splice/pop return normally \
+     after a refused length write. push is correct (it throws), so the refusal is reachable — it is the \
+     DeletePropertyOrThrow / Set(...,true) observation of it that is missing.";
 
 /// The two receivers that carry an accessor property. Both diverge on almost
 /// every row, for two reasons that have nothing to do with each other and are
@@ -422,24 +497,79 @@ const ACCESSOR_RECEIVERS: &[&str] = &["accessor_index", "length_getter"];
 /// Cause **E1**: an accessor written in an object literal is registered
 /// **non-enumerable**, so `Object.keys` omits it while node reports it.
 ///
+/// **STILL OPEN after Batch 7 — the fix is in a crate this batch may not
+/// touch.** `Interp::op_define_accessor` hardcodes `Attrs::BUILTIN`, and
+/// `Attrs::BUILTIN` is `WRITABLE | CONFIGURABLE`, i.e. `enumerable == false`.
+/// That is *correct* for a class accessor (`class C { get g(){} }` must be
+/// non-enumerable — verified against node) and wrong for an object-literal one
+/// (`{ get g(){} }` must be enumerable). Both reach the same opcode
+/// (`DefineAccessor = 66`), from `v12-bccompiler`'s `expr.rs:771` (literal) and
+/// `class.rs:173`/`:180` (class), and `Opcode::DefineAccessor`'s three operands
+/// are `Obj`, `Key`, `Pair` — there is **no attribute operand**, so the
+/// interpreter cannot tell the two spellings apart. The fix is one attribute
+/// carried from the compiler: an attribute operand on `DefineAccessor`, or a
+/// sibling opcode for the literal spelling. Either needs
+/// `crates/v12-bytecode/**` and `crates/v12-bccompiler/**`.
+///
+/// Nothing depends on the old value. The *only* consumer of the literal's
+/// enumerability in this table is `Object.keys`, and the class accessor stays
+/// non-enumerable either way because it takes the same code path with a
+/// different attribute. Measured at this commit: `{ m(){} }` (a method
+/// shorthand) IS enumerable, because `expr.rs`'s `object_prop` routes `Init`
+/// through `SetProperty` and never reaches `op_define_accessor` — so this is
+/// the accessor spelling only.
+///
 /// This is NOT an index/length defect and it is charged to every row of both
 /// accessor receivers through the harness's `Object.keys(o).length` column —
 /// the same conflation the harness docstring avoids for `JSON.stringify`. It
 /// is reported rather than hidden, because suppressing it would mean the table
-/// quietly stopped being a differential table on two of sixteen receivers.
+/// quietly stopped being a differential table on two of seventeen receivers.
 /// Verified at this commit: `Object.getOwnPropertyNames({0:"a", get length(){…}})`
 /// answers `0,length` in v12 (the key IS in the shape) while
 /// `getOwnPropertyDescriptor(…).enumerable` answers `false` where node answers
 /// `true`, which is what makes `Object.keys` drop it.
 const E1_ACCESSOR_NON_ENUMERABLE: &str = "E1: an object-literal accessor is created non-enumerable, so `Object.keys` omits it \
      (v12 `getOwnPropertyDescriptor(o, k).enumerable` is false where node's is true) and the \
-     harness's key count is one low. An `Object.keys` defect, not an index/length one.";
+     harness's key count is one low. An `Object.keys` defect, not an index/length one. OPEN: \
+     `DefineAccessor` carries no attribute operand, so the fix is in v12-bytecode + v12-bccompiler.";
 
 /// Cause **E2**: `internal_methods::invoke_accessor_getter` cannot run a
 /// **bytecode** getter — it matches `FunctionTarget::Native`/`Host` and returns
 /// `undefined` for `Bytecode`, with a comment saying the interpreter's
 /// `get_property` path provides it. So the engine's own `[[Get]]` and the
 /// interpreter's `[[Get]]` disagree on the same object at the same key.
+///
+/// **STILL OPEN after Batch 7, and this batch established that it is NOT a
+/// patch-shaped defect — it is the `NativeHandler` signature.** There are
+/// exactly **two** call sites of `invoke_accessor_getter` and both are inside
+/// `ordinary_get` (its dictionary rung and its shape rung); `ordinary_set` has
+/// the mirror-image hole for a *setter*, recorded there as "v1: setter
+/// invocation is a no-op beyond acknowledgement". Neither site is repairable in
+/// place. `FunctionTarget::Bytecode(u32)` is a bare index into a
+/// `Program.functions` table that lives in `Interp` / `NativeRegistry` and
+/// **not in the heap**, while every native reaches `[[Get]]` through
+/// `Ctx { heap: &'a mut Heap, .. }` — one exclusive borrow, no machine.
+/// `CONTEXT.md` already states the constraint ("natives cannot re-enter the
+/// interpreter"); `Ctx` makes it structural, because a re-entrant call
+/// capability would need a second `&mut Heap`.
+///
+/// The two fixes the architecture does sanction are both large and neither is
+/// this batch's:
+///
+/// 1. **Route the read through the seam.** `Interp::dispatch_native` already
+///    intercepts every built-in that must re-enter the machine, and
+///    `ArrayJoin`/`ArrayPush` carry hand-written `*_fallback` bodies in
+///    `v12-interp/src/object_ops.rs` for exactly this reason. Twenty-five array
+///    methods would need one.
+/// 2. **Change the handler type.** `NativeHandler` is
+///    `fn(&mut Heap, JsValue, &[JsValue])` across every registration; giving it
+///    machine access is a signature change plus a re-entrancy audit.
+///
+/// A third possibility — rebuilding a nested `Interp` from the registry, the way
+/// `NativeRegistry::eval` does — is *not* a fix and was rejected: a getter body
+/// would run with no job-queue checkpoint and no access to the caller's frame
+/// chain, so a `Promise.then` inside a getter would deadlock the drain rather
+/// than run it.
 ///
 /// That is observable as a split INSIDE one receiver: on `length_getter`, the
 /// seven callback-seam methods (`map`, `forEach`, `filter`, `every`, `some`,
@@ -453,7 +583,8 @@ const E2_ACCESSOR_GETTER_UNREADABLE: &str = "E2: `invoke_accessor_getter` answer
      `array_like_len`/`index_get` (which reach [[Get]] via `dispatch_get`) read 0/undefined where \
      the interpreter's own [[Get]] on the same object reads the accessor. The callback seam, which \
      reads through `Interp::get_property`, agrees with node on these receivers and the native path \
-     does not.";
+     does not. OPEN: not patch-shaped — `FunctionTarget::Bytecode` indexes a program table that \
+     `Ctx`'s bare `&mut Heap` cannot reach; it needs seam interception or a handler-signature change.";
 
 /// One row of the divergence ledger.
 struct Known<'a> {
@@ -468,8 +599,8 @@ struct Known<'a> {
     why: &'a str,
 }
 
-/// The complete, current divergence set: **165 of 624 rows, 39 methods**
-/// (16 receivers × 39 rows).
+/// The complete, current divergence set: **177 of 663 rows, 39 methods**
+/// (17 receivers × 39 rows).
 ///
 /// A `Known` entry is one (method, receivers, cause) triple, and **a method may
 /// appear more than once** when it diverges on different receivers for
@@ -477,26 +608,33 @@ struct Known<'a> {
 /// instead of letting a later entry overwrite an earlier one, which is what
 /// makes per-cause attribution possible without a second table.
 ///
-/// How the 165 rows divide, because the raw total is close to meaningless on
+/// How the 177 rows divide, because the raw total is close to meaningless on
 /// its own:
 ///
-/// * **80 rows** are the five `absent` methods on all sixteen receivers. They
-///   say nothing about the index/length model; they were 45 of 351 before this
-///   batch and are still the same five methods.
+/// * **85 rows** are the five `absent` methods on all seventeen receivers. They
+///   say nothing about the index/length model; they were 45 of 351 before
+///   Batch 6 and are still the same five methods.
 /// * **17 rows** are the pre-existing "a deleted own index stays in
 ///   `Object.keys`" cluster, now on six receivers instead of four (the six
 ///   `holey_object` rows and the three `length_float` rows are new; the eight
-///   `own_*`/`array_*` rows are the ones earlier batches recorded).
+///   `own_*`/`array_*` rows are the ones earlier batches recorded). **Batch 7
+///   did not move this cluster**, deliberately: `Object.keys`,
+///   `Object.getOwnPropertyNames` and `for-in` read the *descriptor list*
+///   through `collect_own_string_keys`, which consults liveness nowhere, so
+///   they are untouched by a fix to the `[[Get]]`/`[[HasProperty]]` cells.
 /// * **21 rows** are genuinely new behavioural divergences, on the two accessor
 ///   receivers, from E1 and E2 above.
 /// * The remaining rows on the accessor receivers (47 of the 64 that differ
 ///   ONLY in the harness's key count) are E1 alone.
+/// * **12 rows** are the `frozen_object` receiver: five `absent` methods
+///   re-counted on the new receiver, and seven mutating methods that proceed
+///   after a refused write (`FROZEN_REFUSAL_UNOBSERVED`).
 ///
 /// Pre-Batch-6, the same table said 54 of 351 across 10 methods, of which 9
 /// rows were real. **Every batch number recorded against 351 is stated against
 /// a denominator this table no longer has**; see the header.
 const KNOWN_DIVERGENCES: &[Known] = &[
-    // -- unimplemented: five rows below cover all sixteen receivers each ------
+    // -- unimplemented: five rows below cover all seventeen receivers each -----
     Known {
         method: "toLocaleString",
         receivers: ALL_RECEIVERS,
@@ -832,6 +970,56 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         absent: false,
         why: E1_ACCESSOR_NON_ENUMERABLE,
     },
+    // -- FROZEN: the integrity-level receiver, seven mutating rows ------------
+    //
+    // One cause behind all seven, and the worst finding of this batch: a
+    // mutating method whose spec step requires a write to SUCCEED proceeds as if
+    // it had. `push` is correct and is therefore NOT listed — it throws,
+    // because adding index 3 hits the non-extensible check — so the refusal
+    // machinery is reachable and it is the two steps that must *observe* it
+    // (`DeletePropertyOrThrow`, `Set(O, k, v, true)`) that are missing.
+    Known {
+        method: "reverse",
+        receivers: &["frozen_object"],
+        absent: false,
+        why: FROZEN_REFUSAL_UNOBSERVED,
+    },
+    Known {
+        method: "copyWithin",
+        receivers: &["frozen_object"],
+        absent: false,
+        why: FROZEN_REFUSAL_UNOBSERVED,
+    },
+    Known {
+        method: "shift",
+        receivers: &["frozen_object"],
+        absent: false,
+        why: FROZEN_REFUSAL_UNOBSERVED,
+    },
+    Known {
+        method: "fill",
+        receivers: &["frozen_object"],
+        absent: false,
+        why: FROZEN_REFUSAL_UNOBSERVED,
+    },
+    Known {
+        method: "unshift",
+        receivers: &["frozen_object"],
+        absent: false,
+        why: FROZEN_REFUSAL_UNOBSERVED,
+    },
+    Known {
+        method: "splice",
+        receivers: &["frozen_object"],
+        absent: false,
+        why: FROZEN_REFUSAL_UNOBSERVED,
+    },
+    Known {
+        method: "pop",
+        receivers: &["frozen_object"],
+        absent: false,
+        why: FROZEN_REFUSAL_UNOBSERVED,
+    },
 ];
 
 /// Divergences this file knows about, folded into the same shape the test
@@ -852,7 +1040,7 @@ fn declared_divergences() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
 }
 
 /// Runs every generated program once and returns, per receiver, the rows v12
-/// produced. Nine evals total — one per receiver, not one per row.
+/// produced. One eval per receiver, not one per row.
 fn observe() -> Vec<(&'static ReceiverTable, Vec<String>)> {
     RECEIVERS
         .iter()
@@ -932,7 +1120,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 165,
+        total, 177,
         "the divergence count moved without the ledger's shape changing"
     );
 }
@@ -1115,40 +1303,227 @@ fn self_consistency_over_the_whole_corpus() {
     }
 }
 
-/// **E3**: a `delete`d own shape-backed property keeps its descriptor with a
-/// hole in the storage cell, and reading that descriptor hands the **hole tag**
-/// to JS instead of `undefined`.
+/// **E3 — FIXED.** A `delete`d own shape-backed property keeps its descriptor
+/// with a `hole` in the storage cell, and every `[[Get]]`/`[[HasProperty]]`
+/// rung that read the cell straight out of `properties` handed the **hole tag**
+/// to JavaScript instead of `undefined`.
 ///
-/// This is the same root cause as the `Object.keys`-after-delete entry in
-/// [`KNOWN_DIVERGENCES`] — one delete, two symptoms — and it is invisible to
-/// both halves of this file until a receiver has an own index that a mutator
-/// deletes and that stays *inside* the post-mutation `length`, because
-/// `snap`'s `hasOwnProperty` arm prints `-` for a deleted index without reading
-/// it, and the dense receivers shorten `length` past the deleted index. The
-/// `holey_object` corpus entry above is the first shape that does.
+/// `CONTEXT.md` calls this a breach of a documented invariant: "`Hole` — the
+/// internal marker for an absent array element; **never observable from
+/// conforming JavaScript**." The observable failure was worse than a wrong
+/// value: `String(hole)` fell through to the unimplemented BigInt arm and
+/// raised `InternalError: BigInt ToString is not supported yet`, naming a
+/// subsystem that has nothing to do with the defect.
 ///
-/// Verified against `node` at this commit (v24.21.0): for all four pairs node
-/// reads every index back as `undefined`/its value and v12 raises an internal
-/// `ReferenceError` out of the property read — `String(hole)` falls through to
-/// the unimplemented BigInt arm. `typeof r[k]` and `r[k] === undefined` also
-/// disagree (`undefined`/`false` against `undefined`/`true`), so the hole tag is
-/// observably not `undefined` and not merely un-printable.
+/// The cause is one rule the readers did not all implement: **a `hole` cell
+/// means the property is ABSENT**, which is what ES 10.1.8 `OrdinaryGet` step 2
+/// says when it consults `[[GetOwnProperty]]`. Seven rungs disagreed about it
+/// — the interpreter's `get_property` read the cell raw at four of them (the
+/// StubCache arm, the IC arm, the dictionary rung and the shape rung) and
+/// `internal_methods`' `ordinary_get`/`ordinary_has_property` at three more.
+/// `object_get_own_property` and `ordinary_own_keys` already collapsed it,
+/// which is why `Reflect.ownKeys` and `JSON.stringify` were right while
+/// `Object.keys`, `in` and every plain read were not.
 ///
-/// The pairs below are measured, not guessed: each one is a (receiver, mutator)
-/// combination in the corpus whose post-state read hits this. Nothing else in
-/// the 6 × 9 corpus does — the other 50 combinations read back cleanly.
-const KNOWN_HOLE_READ_ERRORS: &[(&str, &str)] = &[
-    (
-        "hole below the extent",
-        r#"Array.prototype.copyWithin.call(r, 0, 1, 3)"#,
-    ),
-    ("hole below the extent", r#"Array.prototype.shift.call(r)"#),
-    (
-        "hole below the extent",
-        r#"Array.prototype.unshift.call(r, "z")"#,
-    ),
-    ("hole below the extent", r#"Array.prototype.sort.call(r)"#),
-];
+/// **The list is now empty and must stay empty.** It is kept rather than
+/// deleted because `self_consistency_over_the_whole_corpus` uses it in BOTH
+/// directions: an unlisted pair that throws fails, and a listed pair that has
+/// become clean also fails. The four pairs it used to name — every one of them
+/// `(hole below the extent, <mutator>)` — are covered again by
+/// [`a_deleted_property_never_hands_javascript_the_hole_sentinel`], which
+/// asserts the invariant directly instead of inferring it from "did it throw".
+///
+/// **What is deliberately NOT fixed here:** `Object.keys`,
+/// `Object.getOwnPropertyNames`, `for-in` and `in` still report a deleted own
+/// index, because they read the *descriptor list* (`collect_own_string_keys`
+/// and `op_in` consult liveness nowhere) rather than a cell. That is the
+/// separate `Object.keys`-after-delete cluster in [`KNOWN_DIVERGENCES`] and it
+/// is the next batch's work; nothing in this fix touches it.
+const KNOWN_HOLE_READ_ERRORS: &[(&str, &str)] = &[];
+
+/// The E3 invariant, stated so that reading it does not need `node`.
+///
+/// Every observable of "this property is absent" has to agree, and the two that
+/// matter are independent: `typeof` already classified the hole as
+/// `undefined` (`Interp::type_tag` has a defensive arm for it) while
+/// `=== undefined` did **not**, so a test on `typeof` alone passes with the
+/// sentinel still in place. `String(...)` is the arm that raised. All four
+/// observables are asserted on both sides of a `delete` — before, where the
+/// index is present, and after, where it is absent — so the assertions cannot
+/// pass vacuously on a receiver that never had the property.
+#[test]
+fn a_deleted_property_never_hands_javascript_the_hole_sentinel() {
+    // `key` is a JS *expression* (a quoted string), not a bare name, so the
+    // same template works for `"a"` and for `"0"`.
+    //
+    // `before` is the CONTROL read: the same expressions against the same
+    // receiver BEFORE the `delete`. A harness that cannot read the key at all
+    // fails here instead of passing the absent case vacuously.
+    for (label, decl, key, before) in [
+        (
+            "own index, then deleted",
+            r#"var o = {0:"a",1:"b",length:2};"#,
+            r#""0""#,
+            r#"["string",true,true,"a"]"#,
+        ),
+        (
+            "own string key, then deleted",
+            r#"var o = {a:"x",b:"y"};"#,
+            r#""a""#,
+            r#"["string",true,true,"x"]"#,
+        ),
+        (
+            // Never had a descriptor at all — a hole by construction. `before`
+            // is already the absent answer, so this case controls the control.
+            "index that was never present",
+            r#"var o = {0:"a",2:"c",length:3};"#,
+            r#""1""#,
+            r#"["undefined",false,false,"undefined"]"#,
+        ),
+    ] {
+        let absent = r#"["undefined",false,false,"undefined"]"#;
+        assert_is(
+            &eval_json(&format!(
+                r#"{decl}
+                   JSON.stringify([typeof o[{key}], {key} in o,
+                                   Object.prototype.hasOwnProperty.call(o, {key}),
+                                   String(o[{key}])]);"#
+            )),
+            before,
+            &format!("{label}: the control read, before the delete"),
+        );
+        // `delete` must make it absent on EVERY observable.
+        assert_is(
+            &eval_json(&format!(
+                r#"{decl}
+                   delete o[{key}];
+                   JSON.stringify([typeof o[{key}], {key} in o,
+                                   Object.prototype.hasOwnProperty.call(o, {key}),
+                                   String(o[{key}])]);"#
+            )),
+            absent,
+            &format!("{label}: a deleted property reads as absent, not as an internal tag"),
+        );
+    }
+
+    // The other half of the same rule, and the one a "collapse to `undefined`"
+    // fix gets WRONG: ES 10.1.8 step 3 says a deleted own property is answered
+    // by the PROTOTYPE, not by `undefined`. So the fix cannot be "return
+    // `undefined` when the cell is a hole" — that is what a first attempt did,
+    // and it turned `{a:"inh"}`-backed receivers that had an own `a` deleted
+    // into objects reporting `undefined` where node reports the inherited
+    // value. This is the observable that distinguishes the two.
+    assert_is(
+        &eval_json(
+            r#"var p = {a:"inh", 0:"inh0"};
+               var o = Object.create(p);
+               o.a = "own"; o[0] = "own0";
+               delete o.a; delete o[0];
+               JSON.stringify(["a" in o, 0 in o, o.a, o[0]]);"#,
+        ),
+        r#"[true,true,"inh","inh0"]"#,
+        "a deleted own property is answered by the prototype, not by `undefined`",
+    );
+
+    // The same continue-the-walk rule on the path that decides PRESENCE, which
+    // is a different reader again (`dispatch_has`, not `dispatch_get`) and was
+    // a second survivor until this case existed: with no receiver in the
+    // generated table having a *deleted own* index that the prototype
+    // re-supplies, answering `false` instead of continuing produced no
+    // divergence anywhere. `indexOf` needs the presence answer before the value
+    // answer, so it is the probe that sees `ordinary_has_property`.
+    assert_is(
+        &eval_json(
+            r#"var p = {0:"inh0", length:1};
+               var o = Object.create(p);
+               o[0] = "own0";
+               delete o[0];
+               JSON.stringify([o[0], Array.prototype.indexOf.call(o, "own0"),
+                               Array.prototype.indexOf.call(o, "inh0"),
+                               Array.prototype.at.call(o, 0)]);"#,
+        ),
+        r#"["inh0",-1,0,"inh0"]"#,
+        "`dispatch_has` continues to the prototype for a deleted own index too",
+    );
+
+    // …and the same rule through a **cold** key, which is the only shape that
+    // reaches `ordinary_has_property`'s walk rungs at all. The StubCache rung is
+    // consulted first and a key that was read while it was still own is already
+    // recorded there, so the walk is skipped and mutating it is invisible — a
+    // third survivor, found by measuring rather than by reasoning. Here the
+    // index is written and deleted without ever being read, so nothing is
+    // recorded, and the walk has to answer for itself.
+    //
+    // It also shows the StubCache being *poisoned* by the mutation: with the
+    // walk answering `false`, the second call is served from the stub instead,
+    // so the two rows disagree with each other rather than both being uniformly
+    // wrong. A single-row assertion would not have shown that.
+    assert_is(
+        &eval_json(
+            r#"var p = {length:1};
+               var o = Object.create(p);
+               o[0] = "own0";
+               delete o[0];
+               p[0] = "inh0";
+               JSON.stringify([Array.prototype.indexOf.call(o, "own0"),
+                               Array.prototype.indexOf.call(o, "inh0"),
+                               Array.prototype.at.call(o, 0)]);"#,
+        ),
+        r#"[-1,0,"inh0"]"#,
+        "`dispatch_has`'s walk continues to the prototype on a cold deleted key",
+    );
+
+    // The reader that raised the internal error, on its own: `String(o[0])`
+    // after `delete o[0]`. Named separately because it is the observable that
+    // produced an `InternalError` naming BigInt, and a fix that special-cased
+    // `to_string` instead of collapsing the cell at the storage boundary would
+    // pass the four observables above and fail this.
+    assert_is(
+        &eval_json(
+            r#"var o = {0:"a",1:"b",length:2};
+               delete o[0];
+               String(o[0]);"#,
+        ),
+        "undefined",
+        "String() of a deleted property is `undefined`, not an internal error",
+    );
+
+    // …and the SEAM/NATIVE SPLIT: the *same* key read through the
+    // interpreter's own `[[Get]]` and through `internal_methods::dispatch_get`
+    // — two separate implementations of the same internal method, in two
+    // crates. A fix applied to only one of them passes everything above.
+    //
+    // `Reflect.get` is the probe, and choosing it is the whole content of this
+    // assertion — three plausible probes were measured to be BLIND to
+    // `internal_methods::ordinary_get`, and the reasons generalise:
+    //
+    //   * `indexOf`/`includes`/`at`/`slice` ask `dispatch_has` first, so for an
+    //     index already decided absent they never reach the cell read at all;
+    //     and `at` cannot tell a hole from `undefined` in its return value.
+    //   * `Object.values`/`Object.entries` DO call `dispatch_get` per key, but
+    //     the result lands in an **element store**, whose reader filters holes
+    //     (`ElementsStorage::get` → `.filter(|v| !v.is_hole())`). The sentinel
+    //     is swallowed one step later.
+    //   * `JSON.stringify` collapses holes explicitly (`json.rs`).
+    //
+    // `Reflect.get` hands the `[[Get]]` result straight back to JavaScript, so
+    // it is the only one of the four that can see the cell read at all. With
+    // `ordinary_get` mutated back to serving `properties` raw, this line is the
+    // assertion that fails.
+    assert_is(
+        &eval_json(
+            r#"var o = {0:"a",1:"b",length:2};
+               delete o[0];
+               JSON.stringify([o[0], Reflect.get(o, "0"),
+                               Reflect.get(o, "0") === undefined,
+                               Array.prototype.indexOf.call(o, "a"),
+                               Array.prototype.includes.call(o, "a"),
+                               Array.prototype.join.call(o, "-")]);"#,
+        ),
+        r#"[null,null,true,-1,false,"-b"]"#,
+        "the interpreter's [[Get]] and the engine's `dispatch_get` agree on a deleted index",
+    );
+}
 
 // ---------------------------------------------------------------------------
 // 4. `ArraySetLength`: the defect this batch fixed, pinned directly.

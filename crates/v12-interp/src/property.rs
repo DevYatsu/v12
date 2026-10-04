@@ -1246,9 +1246,14 @@ impl Interp<'_> {
                 return self.module_namespace_get(holder, Some(key), key_v);
             }
             let idx = self.global_slot_index(holder, hsl as usize);
-            if let Some(v) = self.heap.get(holder).properties.get(idx) {
-                return Ok(*v);
+            if let Some(&v) = self.heap.get(holder).properties.get(idx)
+                && !v.is_hole()
+            {
+                return Ok(v);
             }
+            // A recorded `Data` location can hold a `hole`: `delete` leaves the
+            // shared shape descriptor in place and the stub cache is keyed by
+            // shape, which a delete does not change. Fall through to the walk.
         }
 
         let cached_slot = if is_proxy {
@@ -1260,13 +1265,16 @@ impl Interp<'_> {
                 .and_then(|ic| ic.get(shape, key))
         };
         if let Some(slot) = cached_slot
-            && let Some(v) = self
+            && let Some(&v) = self
                 .heap
                 .get(obj)
                 .properties
                 .get(self.global_slot_index(obj, slot as usize))
+            && !v.is_hole()
         {
-            return Ok(*v);
+            // Same hole fall-through as the StubCache arm above: an IC records a
+            // shape and a slot, and neither changes when the cell is deleted.
+            return Ok(v);
         }
 
         // Slow path: own dictionary rung and shape first, then the
@@ -1289,6 +1297,21 @@ impl Interp<'_> {
             if self.heap.get(o).kind == Kind::Proxy {
                 return self.proxy_op_get(o, JsValue::object(obj), key_v);
             }
+            //
+            // THE RULE, applied where the hit is CHOSEN so the walk itself
+            // skips an absent level: a `hole` cell means the property is
+            // ABSENT. `delete` holes the storage cell and leaves the shared
+            // shape/dictionary descriptor in place, so "descriptor present" and
+            // "property present" are no longer the same question, and
+            // `CONTEXT.md` requires the `Hole` tag to be "never observable from
+            // conforming JavaScript". ES 10.1.8 step 3 answers the absent case
+            // by continuing to the prototype — so a holed level must not
+            // `break`, and serving its cell would put the internal tag into
+            // JavaScript, where `String(hole)` fell through to the unimplemented
+            // BigInt arm and raised an `InternalError` naming a subsystem with
+            // nothing to do with the defect. `op_in` states the same rule for
+            // `[[HasProperty]]`, and `internal_methods`' `ordinary_get` /
+            // `ordinary_has_property` are its engine-side twins.
             if let Some(entry) = self
                 .heap
                 .get(o)
@@ -1297,13 +1320,34 @@ impl Interp<'_> {
                 .and_then(|m| m.get(&key))
                 .copied()
             {
-                dict_hit = Some((o, entry));
-                break;
+                let absent = !entry.is_accessor
+                    && self
+                        .heap
+                        .get(o)
+                        .properties
+                        .get(self.global_slot_index(o, entry.slot as usize))
+                        .is_some_and(|v| v.is_hole());
+                if !absent {
+                    dict_hit = Some((o, entry));
+                    break;
+                }
             }
             let sh = self.shape_of(o);
             if let Some(d) = self.heap.lookup_property(sh, key) {
-                hit = Some((o, *d));
-                break;
+                let absent = matches!(
+                    d,
+                    Descriptor::Data { slot, .. }
+                        if self
+                            .heap
+                            .get(o)
+                            .properties
+                            .get(self.global_slot_index(o, *slot as usize))
+                            .is_some_and(|v| v.is_hole())
+                );
+                if !absent {
+                    hit = Some((o, *d));
+                    break;
+                }
             }
             cur = self.heap.get(o).prototype;
         }
@@ -1322,9 +1366,10 @@ impl Interp<'_> {
                 self.heap
                     .stub_record_proto(obj, shape, key, owner, owner_shape, entry.slot);
             }
-            let value =
-                self.heap.get(owner).properties[self.global_slot_index(owner, entry.slot as usize)];
-            return Ok(value);
+            // A holed cell never reaches here — the walk above skips the level
+            // (see THE RULE), so this cell is live.
+            let idx = self.global_slot_index(owner, entry.slot as usize);
+            return Ok(self.heap.get(owner).properties[idx]);
         }
         match hit {
             Some((owner, desc)) => match desc {
@@ -1349,6 +1394,8 @@ impl Interp<'_> {
                             .or_default()
                             .record(shape, key, slot);
                     }
+                    // A holed cell never reaches here — see THE RULE in the
+                    // walk above.
                     Ok(value)
                 }
                 Descriptor::Accessor { getter, .. } => {
@@ -1952,18 +1999,50 @@ impl Interp<'_> {
             if self.heap.get(o).kind == Kind::Proxy {
                 return self.proxy_op_has(prop_key_value(key), o);
             }
-            // Dictionary rung: overflow keys live only here.
-            if self
+            // THE RULE: a `hole` cell means the property is ABSENT — `delete`
+            // leaves the shared shape descriptor in place and holes the cell, so
+            // "descriptor present" and "property present" are no longer the same
+            // question. ES 10.1.8 `OrdinaryHasProperty` step 3 then says to
+            // CONTINUE to the prototype, so a deleted own key is answered by an
+            // inherited one if there is one. Answering `false` here (or serving
+            // the cell) is what made `0 in o` disagree with
+            // `hasOwnProperty(o, 0)`.
+            if let Some(entry) = self
                 .heap
                 .get(o)
                 .dictionary
                 .as_ref()
-                .is_some_and(|m| m.contains_key(&key))
+                .and_then(|m| m.get(&key))
+                .copied()
             {
+                if !entry.is_accessor
+                    && self
+                        .heap
+                        .get(o)
+                        .properties
+                        .get(entry.slot as usize)
+                        .is_some_and(|v| v.is_hole())
+                {
+                    cur = self.heap.get(o).prototype;
+                    continue;
+                }
                 return Ok(true);
             }
             let sh = self.shape_of(o);
-            if self.heap.lookup_property(sh, key).is_some() {
+            if let Some(d) = self.heap.lookup_property(sh, key).copied() {
+                // Same on the shape rung; `Descriptor::Accessor` has no storage
+                // cell, so it is always present.
+                if let v12_heap::Descriptor::Data { slot, .. } = d
+                    && self
+                        .heap
+                        .get(o)
+                        .properties
+                        .get(self.global_slot_index(o, slot as usize))
+                        .is_some_and(|v| v.is_hole())
+                {
+                    cur = self.heap.get(o).prototype;
+                    continue;
+                }
                 return Ok(true);
             }
             // For arrays, the prototype chain check after the element fast
