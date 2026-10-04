@@ -345,8 +345,58 @@ pub(crate) fn ordinary_define_own_property(
     // Extend shape: allocate new shape and publish it onto the object.
     let next_shape = heap.add_property(shape, key, attrs);
     bind_shape(heap, obj, next_shape);
-    heap.get_mut(obj).properties.push(value);
+    store_shape_extension(heap, obj, next_shape, value);
     Ok(true)
+}
+
+/// Stores `value` for a shape extension that just bound `next_shape` onto
+/// `obj`, addressing the descriptor's slot rather than assuming `push` hits it.
+///
+/// `Heap::add_property` hands out `slot = parent.num_own`, which assumes the
+/// invariant **`properties.len() == shape.num_own`** — every own descriptor's
+/// slot is a dense prefix of `properties`. `JsObject::array` and
+/// `JsObject::array_sparse` (v12-heap) break it at birth: they pre-seed
+/// `properties[0]` with the length and a *placeholder* `property_keys[0]`, and
+/// they cannot bind a shape because they have no `&mut Heap`. `num_own` is
+/// therefore 0 while `properties.len()` is 1, and `push` stores at index 1
+/// while the descriptor names slot 0 — a `[[Set]]` that **nothing ever reads
+/// back**. That is why `Array.prototype.push` on such an array returned 2,
+/// `length` stayed 0 and `pop` returned `undefined`.
+///
+/// 23 of the 25 `JsObject::array`/`array_sparse` call sites in the workspace go
+/// through `heap.alloc(..)` directly and never bind the canonical length shape
+/// that `Ctx::alloc_array` installs, so this is not one array — it is every
+/// array the promise module, the generators, `object_ops::alloc_array` and
+/// `call::alloc_array` build.
+///
+/// The repair is deliberately kind-guarded. Only `Kind::Array` and
+/// `Kind::Arguments` can be born violating the invariant (they are the kinds
+/// whose constructors pre-seed a slot), and the realm global is neither — it
+/// carries a `GLOBAL_VAR_OFFSET` intrinsic prefix that the shape graph does not
+/// track, so a slot-addressed write there would be *worse* than `push`. Every
+/// other kind keeps the exact `push` it has today.
+///
+/// Writing at slot 0 is also self-healing: `properties[0]` **is** the array's
+/// length, so the pre-seeded value becomes the shape's slot-0 property and
+/// `num_own` catches up with `properties.len()`. From then on the length is an
+/// ordinary `[[Get]]`/`[[Set]]` and no layout special case is needed anywhere.
+fn store_shape_extension(
+    heap: &mut Heap,
+    obj: Handle<JsObject>,
+    next_shape: v12_heap::ShapeHandle,
+    value: JsValue,
+) {
+    let kind = heap.get(obj).kind;
+    if !matches!(kind, v12_heap::Kind::Array | v12_heap::Kind::Arguments) {
+        heap.get_mut(obj).properties.push(value);
+        return;
+    }
+    let slot = heap.get(next_shape).num_own as usize - 1;
+    let obj_mut = heap.get_mut(obj);
+    if obj_mut.properties.len() <= slot {
+        obj_mut.properties.resize(slot + 1, JsValue::hole());
+    }
+    obj_mut.properties[slot] = value;
 }
 
 /// Canonical array-index interpretation of a property key: a non-symbol key
@@ -563,7 +613,7 @@ pub(crate) fn apply_property_descriptor(
     }
     let next_shape = heap.add_property(shape, key, attrs);
     bind_shape(heap, obj, next_shape);
-    heap.get_mut(obj).properties.push(value);
+    store_shape_extension(heap, obj, next_shape, value);
     Ok(true)
 }
 
@@ -1122,7 +1172,7 @@ fn ordinary_set(
     }
     let child = heap.add_property(shape, key, v12_heap::Attrs::DEFAULT);
     bind_shape(heap, obj, child);
-    heap.get_mut(obj).properties.push(value);
+    store_shape_extension(heap, obj, child, value);
     Ok(true)
 }
 

@@ -132,19 +132,14 @@ fn index_prop(heap: &mut Heap, i: i64) -> PropKey {
 /// quantity (array-likes legally carry up to 2^53-1).
 fn array_like_len(heap: &mut Heap, obj: Handle<JsObject>) -> Result<f64, Throw> {
     let key = length_prop(heap);
-    if heap.get(obj).kind == v12_heap::Kind::Array {
-        // `Array` has a real array-length exotic in the spec, which v12 models
-        // as a layout slot rather than a property walk, so `[[Get]]` is not
-        // the authority here. Read the slot directly. Also the cheap path:
-        // `push` runs this once per call inside the interpreter's dispatch, and
-        // routing it through `dispatch_get` adds a shape bind plus a stub-cache
-        // probe per push — allocation the GC-stress tests collect on, which is
-        // what lost the capability record in `promise_capability_seam`.
-        if let Some(v) = array_layout_len(heap, obj, key) {
-            return Ok(super::ctx::length_from(
-                super::ctx::heap_to_integer_or_infinity(heap, v),
-            ));
-        }
+    // MUTATION 6: an elements-first probe ahead of the property path.
+    if heap.get(obj).kind == v12_heap::Kind::Array
+        && let Some(&flat) = heap.get(obj).elements.first()
+        && !flat.is_undefined()
+    {
+        return Ok(super::ctx::length_from(
+            super::ctx::heap_to_integer_or_infinity(heap, flat),
+        ));
     }
     let v = crate::internal_methods::dispatch_get(heap, obj, key, JsValue::object(obj))
         .map_err(Throw::Value)?;
@@ -154,12 +149,7 @@ fn array_like_len(heap: &mut Heap, obj: Handle<JsObject>) -> Result<f64, Throw> 
         // unbound array and a mapped `arguments`); anything else has none.
         let kind = heap.get(obj).kind;
         return Ok(if kind == v12_heap::Kind::Array {
-            match array_layout_len(heap, obj, key) {
-                Some(v) => {
-                    super::ctx::length_from(super::ctx::heap_to_integer_or_infinity(heap, v))
-                }
-                None => array_extent(heap, obj) as f64,
-            }
+            array_extent(heap, obj) as f64
         } else if kind == v12_heap::Kind::Arguments {
             element_extent(heap, obj) as f64
         } else {
@@ -180,45 +170,6 @@ fn array_like_len(heap: &mut Heap, obj: Handle<JsObject>) -> Result<f64, Throw> 
 /// its extent.
 fn element_extent(heap: &Heap, obj: Handle<JsObject>) -> i64 {
     heap.get(obj).elements.len() as i64
-}
-
-/// The `Kind::Array` length slot `properties[0]`, for the arrays whose bound
-/// shape does not describe it.
-///
-/// `JsObject::array` (v12-heap) pre-seeds `properties[0]` with the length and a
-/// *placeholder* `property_keys[0]`, and never binds a shape — so
-/// `Heap::shape_of` reports `num_own == 0`. `ordinary_set`'s growth path then
-/// appends the value at index 1 while `add_property` hands out slot 0, and the
-/// `[[Set]]` is a write nothing ever reads back: `push` returned 2, `pop`
-/// returned `undefined`, and `length` stayed 0. Engine-created arrays bind the
-/// canonical length shape and must go through `[[Get]]`/`[[Set]]`; the
-/// descriptor's absence is what distinguishes the two, so this returns `None`
-/// for every array the property path can serve.
-fn array_layout_len(heap: &Heap, obj: Handle<JsObject>, key: PropKey) -> Option<JsValue> {
-    let shape = heap.shape_of(obj);
-    if let Some(&v12_heap::Descriptor::Data { slot, .. }) = heap.get(shape).descriptors.find(key) {
-        return heap.get(obj).properties.get(slot as usize).copied();
-    }
-    // No descriptor: the array-layout contract, `properties[0]`. `JsObject::array`
-    // (v12-heap) pre-seeds it with a *placeholder* `property_keys[0]` and never
-    // binds a shape, so `ordinary_set`'s growth path would append at index 1
-    // while `add_property` handed out slot 0 — a `[[Set]]` nothing reads back.
-    heap.get(obj).properties.first().copied()
-}
-
-/// Writes the `Kind::Array` layout length slot — the write half of
-/// [`array_layout_len`], same slot, same reason.
-fn write_array_layout_len(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey, v: JsValue) {
-    let shape = heap.shape_of(obj);
-    if let Some(&v12_heap::Descriptor::Data { slot, .. }) = heap.get(shape).descriptors.find(key) {
-        if let Some(cell) = heap.get_mut(obj).properties.get_mut(slot as usize) {
-            *cell = v;
-            return;
-        }
-    }
-    if let Some(cell) = heap.get_mut(obj).properties.first_mut() {
-        *cell = v;
-    }
 }
 
 /// `Kind::Array`'s element-store extent: the highest index inserted, plus one.
@@ -499,8 +450,6 @@ fn set_array_len(heap: &mut Heap, obj: Handle<JsObject>, len: f64) -> Result<(),
             let keep = (len.max(0.0) as usize).min(kept.len());
             heap.get_mut(obj).replace_elements(kept[..keep].to_vec());
         }
-        write_array_layout_len(heap, obj, key, value);
-        return Ok(());
     }
     crate::internal_methods::dispatch_set(heap, obj, key, value, JsValue::object(obj))
         .map_err(Throw::Value)?;

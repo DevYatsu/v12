@@ -2933,71 +2933,62 @@ impl Interp<'_> {
         Ok(JsValue::from_f64(n))
     }
 
-    /// The receiver's length (array slot or element count for array-likes).
-    fn callback_len(&self, obj: Handle<JsObject>) -> u32 {
-        let o = self.heap.get(obj);
-        if o.kind == Kind::Array {
-            if let Some(&v) = o.properties.first() {
-                if let Some(n) = v.as_smi() {
-                    return n as u32;
-                }
-                if let Some(n) = v.as_f64()
-                    && n.is_finite()
-                    && n >= 0.0
-                {
-                    return n as u32;
-                }
-            }
-        }
-        o.element_len() as u32
+    /// Upper bound on the index range one callback call walks.
+    ///
+    /// `LengthOfArrayLike` can be 2^53-1 and a generic receiver has no
+    /// enumerable store, so walking `0..len` faithfully would be four billion
+    /// `[[HasProperty]]` probes on `new Array(2**32)`. A **declared** deviation,
+    /// the same one `builtins/array.rs`'s `MAX_SCAN_SPAN` declares and pins.
+    const MAX_CALLBACK_SCAN: u32 = 1_000_000;
+
+    /// ES `LengthOfArrayLike`: `ToLength(Get(O, "length"))`, through `[[Get]]`.
+    ///
+    /// This was the sixth straddle's length reader, and it never saw a `length`
+    /// *property*: it read `properties[0]` for `Kind::Array` and
+    /// `element_len()` otherwise, so `Object.create({length:3})` and every
+    /// string-`length` receiver answered 0. `some.call({0:"a",1:"b",2:"c",
+    /// length:3}, () => true)` therefore returned **`false`** — a positive
+    /// falsehood about three present elements.
+    ///
+    /// `internal_methods::dispatch_get` is the engine-side twin of this and is
+    /// NOT reachable from `v12-interp`: `v12-engine` is not a dependency of
+    /// this crate (verified by compile probe — `error[E0433]: cannot find
+    /// module or crate v12_engine`) and adding it would invert the DAG, since
+    /// `v12-engine` depends on `v12-interp`. So this routes through
+    /// `Interp::get_property`, which is the interpreter's own `[[Get]]` — the
+    /// same rungs `ordinary_get` has (proxy trap, `Kind::Array`/`Arguments`
+    /// element store, the structural surfaces, then shape + dictionary +
+    /// prototype walk), reached here without crossing a crate boundary.
+    fn callback_len(&mut self, obj: Handle<JsObject>) -> Result<u32, JSException> {
+        let key = self.new_temp_key("length");
+        let v = self.get_property(0, 0, JsValue::object(obj), key)?;
+        let n = self.to_number_value(v)?;
+        let n = if n.is_finite() && n > 0.0 { n.trunc() } else { 0.0 };
+        Ok(n.clamp(0.0, f64::from(Self::MAX_CALLBACK_SCAN)) as u32)
     }
 
-    /// The receiver's element at `i` (`None` when absent: hole or out of
-    /// range; ordinary array-likes read the flat `elements` vec, then
-    /// integer-indexed *shape* properties — `{0: 5}` binds `"0"` through
-    /// the shape, not the element store).
-    fn callback_elem(&mut self, obj: Handle<JsObject>, i: u32) -> Option<JsValue> {
-        let o = self.heap.get(obj);
-        if o.kind == Kind::Array {
-            return o.get_element(i);
+    /// ES `HasProperty(O, ToString(i))` + `Get(O, ToString(i))` as one answer:
+    /// `None` is "the index is not there", which `[[Get]]` alone cannot say
+    /// because it collapses a hole to `undefined`.
+    ///
+    /// The old `callback_elem` answered from the flat `elements` vec and then
+    /// the receiver's **own** shape, so it could not see an inherited index
+    /// (`Object.create({0:"inh", length:3})`) or a dictionary-rung key. This
+    /// is `Interp::op_in` for presence and `Interp::get_property` for the
+    /// value — the interpreter's `[[HasProperty]]` and `[[Get]]`, the same two
+    /// a bytecode `GetProp` uses.
+    fn callback_index(
+        &mut self,
+        obj: Handle<JsObject>,
+        i: u32,
+    ) -> Result<Option<JsValue>, JSException> {
+        let key = JsValue::string(self.heap.intern_text(&i.to_string()));
+        if !self.op_in(key, JsValue::object(obj))? {
+            return Ok(None);
         }
-        if let Some(v) = o.elements.get(i as usize).filter(|v| !v.is_hole()).copied() {
-            return Some(v);
-        }
-        let h = self.heap.intern_text(&i.to_string());
-        let key = v12_heap::PropKey::from_string(h);
-        let shape = self.heap.shape_of(obj);
-        let slot = self.heap.lookup_property(shape, key)?.slot()?;
-        self.heap.get(obj).properties.get(slot as usize).copied()
-    }
-
-    /// The highest index an element read can return data for, clamped to
-    /// `len` (mirrors the engine's `dense_bound`: the element store plus
-    /// shape-bound integer keys on non-arrays). Everything at or beyond it
-    /// reads as a hole, which the callback methods all skip.
-    fn callback_dense_bound(&mut self, obj: Handle<JsObject>, len: u32) -> u32 {
-        let mut bound = self.heap.get(obj).element_len() as u64;
-        if self.heap.get(obj).kind != Kind::Array {
-            let shape = self.heap.shape_of(obj);
-            let keys: Vec<_> = self
-                .heap
-                .get(shape)
-                .descriptors
-                .as_slice()
-                .iter()
-                .filter_map(|d| d.key().string())
-                .collect();
-            for h in keys {
-                let text = self.string_text(h);
-                if !text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit())
-                {
-                    if let Ok(n) = text.parse::<u64>() {
-                        bound = bound.max(n.saturating_add(1));
-                    }
-                }
-            }
-        }
-        bound.min(u64::from(len)) as u32
+        Ok(Some(
+            self.get_property(0, 0, JsValue::object(obj), key)?,
+        ))
     }
 
     fn callback_is_callable(&self, v: JsValue) -> Option<Handle<JsObject>> {
@@ -3031,16 +3022,21 @@ impl Interp<'_> {
         // root it so a collection during a nested call cannot free it.
         self.heap.add_root(JsValue::object(cb));
         let this_arg = args.get(1).copied().unwrap_or(JsValue::undefined());
-        // A huge `length` property on a sparse receiver describes mostly
-        // holes, which every one of these methods skips — so iterating only
-        // the dense bound (stored elements + shape-bound integer keys) is
-        // exact and keeps `0..len` from spinning billions of iterations
-        // outside the cooperative deadline's reach.
-        let len = self.callback_dense_bound(obj, self.callback_len(obj));
+        // `ToLength(Get(O, "length"))`, already clamped to
+        // `MAX_CALLBACK_SCAN` by `callback_len` — the declared deviation.
+        let len = self.callback_len(obj)?;
 
         // `reduce`/`reduceRight` pass the accumulator; everything else passes
         // a `thisArg`. Visited calls carry (element, index, receiver).
         let is_reduce = matches!(id, NativeId::ArrayReduce | NativeId::ArrayReduceRight);
+        // Every one of these methods skips an index the receiver does not
+        // *have* — it does not call back with `undefined`. `reduce` and
+        // `reduceRight` are in this set too, which is worth recording because
+        // it was the wrong assumption here first: probing `node` v24.21.0 with
+        // `{0:"a", 2:"c", length:4}` and a seed visits exactly `[0, 2]`, and
+        // `{0:"a", 1:undefined, length:3}` visits `[0, 1]` — so the test is
+        // presence, not `undefined`-ness. `callback_index`'s `Option` is
+        // exactly that distinction; `get_property` alone could not express it.
         let mut accumulator: Option<JsValue> = if is_reduce {
             match args.get(1).copied() {
                 Some(v) if !v.is_undefined() => Some(v),
@@ -3056,17 +3052,33 @@ impl Interp<'_> {
             Box::new(0..len)
         };
 
-        let mut mapped: Vec<JsValue> = Vec::new();
+        // `map`'s result array is `ArraySpeciesCreate(O, len)` and step 8b
+        // writes an own `undefined` for every index it skipped, so the result
+        // has the receiver's length with holes filled in. `filter`/`flatMap`
+        // create with `0` and only append, which is why they need no padding —
+        // `map.call(Object.create({length:3}), f)` is `[undefined, undefined,
+        // undefined]` in `node` and `[]` when the pushes are the only writer.
+        let mut mapped: Vec<JsValue> = if id == NativeId::ArrayMap {
+            vec![JsValue::undefined(); len as usize]
+        } else {
+            Vec::new()
+        };
         let mut found: Option<(JsValue, u32)> = None;
         for i in indices {
-            let Some(elem) = self.callback_elem(obj, i) else {
-                continue; // holes are skipped by every one of these methods
+            let Some(elem) = self.callback_index(obj, i)? else {
+                continue;
             };
-            // Non-reduce calls carry (element, index, receiver); reduce
-            // carries (accumulator, element, index).
-            let (first_arg, second_arg) = if is_reduce {
+            // `forEach`/`map`/`filter`/`every`/`some`/`find`/`findIndex` call
+            // back with `(element, index, array)`. `reduce`/`reduceRight` call
+            // with `(accumulator, value, index, array)` — **four** arguments.
+            // The seam passed three, so a `reduce` callback read the *receiver*
+            // where the index belongs: `(acc, v, i) => ...` had `i` bound to
+            // the array, and `[0,2]`-style index arithmetic silently operated on
+            // objects.
+            let index_v = JsValue::from_f64(f64::from(i));
+            let call_args: Vec<JsValue> = if is_reduce {
                 match accumulator {
-                    Some(acc) => (acc, elem),
+                    Some(acc) => vec![acc, elem, index_v, this_v],
                     // The first present element becomes the accumulator.
                     None => {
                         accumulator = Some(elem);
@@ -3074,9 +3086,8 @@ impl Interp<'_> {
                     }
                 }
             } else {
-                (elem, JsValue::from_f64(f64::from(i)))
+                vec![elem, index_v, this_v]
             };
-            let call_args: [JsValue; 3] = [first_arg, second_arg, this_v];
             let result = self.call_value(JsValue::object(cb), this_arg, &call_args)?;
             // Results collected across calls must survive the next call's
             // collection safepoint; the engine roots liberally by design.
@@ -3085,7 +3096,10 @@ impl Interp<'_> {
                 accumulator = Some(result);
             }
             match id {
-                NativeId::ArrayMap | NativeId::ArrayFlatMap => mapped.push(result),
+                // `map` writes at the index it visited, so the padding written
+                // above survives for the indices it skipped.
+                NativeId::ArrayMap => mapped[i as usize] = result,
+                NativeId::ArrayFlatMap => mapped.push(result),
                 NativeId::ArrayFilter => {
                     if result.is_true() {
                         mapped.push(elem);
@@ -5249,7 +5263,17 @@ impl Interp<'_> {
             .first()
             .copied()
             .and_then(|v| self.callback_is_callable(v));
-        let mut elems: Vec<JsValue> = self.heap.get(obj).elements_snapshot();
+        // `LengthOfArrayLike` then `SortIndexedProperties(O, len, SortCompare)`:
+        // read `0..len` through the same `[[HasProperty]]`/`[[Get]]` pair every
+        // other callback method uses. The deleted body snapshotted the element
+        // store, so on a generic receiver it read nothing at all and left the
+        // object untouched — `sort.call(Object.create({0:"inh",length:3}))`
+        // stayed `{}` where `node` leaves `{"0":"inh"}`.
+        let len = self.callback_len(obj)?;
+        let mut elems: Vec<JsValue> = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            elems.push(self.callback_index(obj, i)?.unwrap_or(JsValue::undefined()));
+        }
         // Undefined sorts last; holes after undefined. Sort the defined part.
         let undefined_count = elems.iter().filter(|v| v.is_undefined()).count();
         elems.retain(|v| !v.is_undefined() && !v.is_hole());
@@ -5287,8 +5311,27 @@ impl Interp<'_> {
         }
         let undefineds = vec![JsValue::undefined(); undefined_count];
         elems.extend(undefineds);
-        self.heap.get_mut(obj).replace_elements(elems);
-        Ok(JsValue::object(obj))
+        // `SortIndexedProperties` step 5: `Set(O, ToString(k), v, true)` for
+        // *every* `k` in `0..len`, holes included — which is why node's
+        // inherited-index receiver comes back owning index 0.
+        //
+        // `Kind::Array` keeps the lattice write. `Set` on an array index is
+        // `set_element` (`internal_methods.rs:1043`), so replacing the whole
+        // store with the `0..len` view is the same observable state at one
+        // allocation instead of `len` of them.
+        if self.heap.get(obj).kind == Kind::Array {
+            self.heap.get_mut(obj).replace_elements(elems);
+            return Ok(JsValue::object(obj));
+        }
+        let receiver = JsValue::object(obj);
+        for (i, &v) in elems.iter().enumerate() {
+            let key = JsValue::string(self.heap.intern_text(&i.to_string()));
+            self.set_property(receiver, key, v, true)?;
+        }
+        // No `length` write: `Array.prototype.sort` (23.1.3.34) has no such
+        // step. Re-asserting it turned a string `length` into a number and
+        // materialised an own `length` on a receiver that only inherited one.
+        Ok(receiver)
     }
 }
 

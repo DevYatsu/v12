@@ -678,50 +678,230 @@ fn a_huge_length_stays_a_bounded_object() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The gap this file does NOT close, stated so it cannot be read as closed.
+// 4. The callback seam — ADR-0004 Batch 2.
+//
+// `Interp::run_callback_builtin` (`v12-interp/src/call_setup.rs`) was the sixth
+// copy of the straddle, behind `callback_len` / `callback_elem` /
+// `callback_dense_bound`. It no longer is: all three are deleted and the seam
+// reads `ToLength(Get(O,"length"))` and `HasProperty`/`Get` through the
+// interpreter's own property path.
 // ---------------------------------------------------------------------------
 
-/// The callback seam (`run_callback_builtin`, `call_setup.rs:3010`) is the
-/// **sixth** copy of the straddle and is ADR-0004 Batch 2. `some` returning
-/// `false` on a receiver with three elements and an always-true predicate is the
-/// worst symptom in the whole finding and is still wrong here.
+/// `some` returning `false` on a receiver with three elements and an
+/// always-true predicate was the headline symptom of the whole finding — the
+/// one place v12 asserted something *positive and wrong* about present data.
 #[test]
-fn array_callback_seam_is_still_a_sixth_reader() {
-    for (what, src) in [
+fn callback_seam_agrees_with_node_on_a_generic_receiver() {
+    for (what, src, expected) in [
+        ("some", r#"Array.prototype.some.call(o, function(){ return true; })"#, "true"),
+        ("every", r#"Array.prototype.every.call(o, function(){ return true; })"#, "true"),
+        ("map", r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#, r#"["a","b","c"]"#),
+        ("filter", r#"JSON.stringify(Array.prototype.filter.call(o, function(){ return true; }))"#, r#"["a","b","c"]"#),
+        ("flatMap", r#"JSON.stringify(Array.prototype.flatMap.call(o, function(x){ return [x]; }))"#, r#"["a","b","c"]"#),
         (
-            "some",
+            "forEach visits 3",
+            r#"var n = 0; Array.prototype.forEach.call(o, function(){ n++; }); n"#,
+            "3",
+        ),
+        ("reduce", r#"Array.prototype.reduce.call(o, function(p,c){ return p + "-" + c; }, "R")"#, "R-a-b-c"),
+        ("find", r#"Array.prototype.find.call(o, function(x){ return x === "c"; })"#, "c"),
+        ("findIndex", r#"Array.prototype.findIndex.call(o, function(x){ return x === "c"; })"#, "2"),
+    ] {
+        assert_is(
+            &eval_json(&format!(
+                r#"var o = {{0:"a",1:"b",2:"c",length:3}}; {src}"#
+            )),
+            expected,
+            what,
+        );
+    }
+}
+
+/// The same, with the indices on the **prototype** — the case
+/// `callback_elem`'s own-shape-only lookup could not see.
+#[test]
+fn callback_seam_sees_inherited_indices() {
+    for (what, src, expected) in [
+        ("some", r#"Array.prototype.some.call(o, function(){ return true; })"#, "true"),
+        ("map pads the skipped indices", r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#, r#"["inh",null,null]"#),
+        ("filter appends only", r#"JSON.stringify(Array.prototype.filter.call(o, function(){ return true; }))"#, r#"["inh"]"#),
+        (
+            "forEach visits 1",
+            r#"var n = 0; Array.prototype.forEach.call(o, function(){ n++; }); n"#,
+            "1",
+        ),
+        ("reduce", r#"Array.prototype.reduce.call(o, function(p,c){ return p + "-" + c; }, "R")"#, "R-inh"),
+        ("findIndex", r#"Array.prototype.findIndex.call(o, function(x){ return x === "inh"; })"#, "0"),
+        ("sort materialises index 0", r#"Array.prototype.sort.call(o); JSON.stringify(o)"#, r#"{"0":"inh"}"#),
+    ] {
+        assert_is(
+            &eval_json(&format!(
+                r#"var o = Object.create({{0:"inh", length:3}}); {src}"#
+            )),
+            expected,
+            what,
+        );
+    }
+}
+
+/// A `length` on the prototype, and a **string** `length`, both reach the seam:
+/// `callback_len` used to read `properties[0]`/`element_len()` and never saw a
+/// `length` property at all, so every one of these answered "empty".
+#[test]
+fn callback_seam_reads_an_inherited_or_string_length() {
+    for (what, decl, src, expected) in [
+        (
+            "inherited length, some",
+            "var o = Object.create({length:3});",
             r#"Array.prototype.some.call(o, function(){ return true; })"#,
+            "false",
         ),
         (
-            "map",
+            "inherited length, map pads to length",
+            "var o = Object.create({length:3});",
             r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#,
+            r#"[null,null,null]"#,
+        ),
+        (
+            "inherited length, forEach visits 0",
+            "var o = Object.create({length:3});",
+            r#"var n = 0; Array.prototype.forEach.call(o, function(){ n++; }); n"#,
+            "0",
+        ),
+        (
+            "inherited length, reduce reads 3 holes",
+            "var o = Object.create({length:3});",
+            r#"Array.prototype.reduce.call(o, function(p,c){ return p + "-" + c; }, "R")"#,
+            "R",
+        ),
+        (
+            "string length, some",
+            r#"var o = {0:"a",1:"b",2:"c",length:"3"};"#,
+            r#"Array.prototype.some.call(o, function(){ return true; })"#,
+            "true",
+        ),
+        (
+            "string length, map",
+            r#"var o = {0:"a",1:"b",2:"c",length:"3"};"#,
+            r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#,
+            r#"["a","b","c"]"#,
+        ),
+    ] {
+        assert_is(&eval_json(&format!("{decl} {src}")), expected, what);
+    }
+}
+
+/// Holes are skipped by **every** method on this seam, `reduce` and
+/// `reduceRight` included — which is the wrong assumption this batch made
+/// first. The test is presence, not `undefined`-ness: `{0:"a", 1:undefined,
+/// length:3}` visits `[0, 1]`, `{0:"a", 2:"c", length:4}` visits `[0, 2]`.
+#[test]
+fn callback_seam_skips_holes_and_not_undefined() {
+    for (what, decl, src, expected) in [
+        (
+            "own sparse indices",
+            r#"var o = {0:"a",2:"c",length:4};"#,
+            r#"var v = []; Array.prototype.reduce.call(o, function(p,c,i){ v.push(i); return p; }, ""); v.join()"#,
+            "0,2",
+        ),
+        (
+            "a present undefined is visited",
+            r#"var o = {0:"a",1:undefined,length:3};"#,
+            r#"var v = []; Array.prototype.reduce.call(o, function(p,c,i){ v.push(i); return p; }, ""); v.join()"#,
+            "0,1",
+        ),
+        (
+            "holey real array",
+            r#"var o = ["a"]; o[3] = "d"; o.length = 5;"#,
+            r#"var v = []; Array.prototype.reduce.call(o, function(p,c,i){ v.push(i); return p; }, ""); v.join()"#,
+            "0,3",
+        ),
+        (
+            "holey map pads to length",
+            r#"var o = ["a"]; o[3] = "d"; o.length = 5;"#,
+            r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#,
+            r#"["a",null,null,"d",null]"#,
+        ),
+    ] {
+        assert_is(&eval_json(&format!("{decl} {src}")), expected, what);
+    }
+}
+
+/// `reduce`'s callback takes **four** arguments — `(accumulator, value, index,
+/// array)`. The seam passed three, so a `reduce` callback read the receiver
+/// where the index belongs.
+#[test]
+fn the_reduce_callback_receives_the_index() {
+    for (what, src, expected) in [
+        (
+            "reduce",
+            r#"var v = []; Array.prototype.reduce.call(["a","b","c"], function(acc,c,i){ v.push(i); return acc; }, ""); v.join()"#,
+            "0,1,2",
+        ),
+        (
+            "reduceRight",
+            r#"var v = []; Array.prototype.reduceRight.call(["a","b","c"], function(acc,c,i){ v.push(i); return acc; }, ""); v.join()"#,
+            "2,1,0",
         ),
         (
             "forEach",
-            r#"var n = 0; Array.prototype.forEach.call(o, function(){ n++; }); n"#,
+            r#"var v = []; ["a","b","c"].forEach(function(c,i){ v.push(i); }); v.join()"#,
+            "0,1,2",
         ),
         (
-            "filter",
-            r#"JSON.stringify(Array.prototype.filter.call(o, function(){ return true; }))"#,
-        ),
-        (
-            "reduce",
-            r#"Array.prototype.reduce.call(o, function(p,c){ return p + "-" + c; }, "R")"#,
-        ),
-        (
-            "sort on an inherited index",
-            r#"var h = Object.create({0:"inh", length:3});
-               Array.prototype.sort.call(h); JSON.stringify(h)"#,
+            "the fourth argument is the receiver",
+            r#"Array.prototype.reduce.call(["a"], function(acc,c,i,arr){ return arr.length; }, "")"#,
+            "1",
         ),
     ] {
-        let got = eval_json(&format!(r#"var o = {{0:"a",1:"b",2:"c",length:3}}; {src}"#));
-        // node: some true, map ["a","b","c"], forEach 3, filter ["a","b","c"],
-        // reduce "R-a-b-c". Recorded as the known-open Batch 2 delta; if this
-        // test ever needs changing, Batch 2 landed — do not silently update it.
-        assert_ne!(
-            got, "node-value",
-            "{what} is pinned as a known divergence, not as correct behaviour"
-        );
-        println!("BATCH2-OPEN {what} = {got}");
+        assert_is(&eval_json(src), expected, what);
     }
+}
+
+/// `MAX_CALLBACK_SCAN` is a declared deviation, like `MAX_SCAN_SPAN` in
+/// `builtins/array.rs`: `ToLength` can be 2^53-1 and a generic receiver has no
+/// enumerable store, so the walk is capped.
+#[test]
+fn max_callback_scan_is_a_declared_deviation() {
+    assert_is(
+        &eval_json(
+            r#"
+            var o = {};
+            var n = 0;
+            Array.prototype.forEach.call(o, function(){ n++; });
+            Array.prototype.some.call(o, function(){ return true; });
+            JSON.stringify([o.length === undefined, n]);
+            "#,
+        ),
+        r#"[true,0]"#,
+        "a receiver with no `length` is length 0 to the callback seam too",
+    );
+}
+
+/// The Batch-1 `array_layout_len`/`write_array_layout_len` workaround existed
+/// only because `Heap::add_property` handed out slot 0 while the write site
+/// pushed at index 1 for a `JsObject::array`-born array. The cause is fixed in
+/// `internal_methods::store_shape_extension`, so the length must now be an
+/// ordinary property: writing it through `[[Set]]` and reading it back through
+/// a plain `o.length` has to agree, on an array built by the raw heap
+/// constructor.
+#[test]
+fn a_heap_built_array_length_is_an_ordinary_property() {
+    // Driven from JS this exercises the engine-created array. The
+    // `JsObject::array` + `heap.alloc` shape is the unit test in
+    // `crates/v12-engine/src/tests.rs::builtin_tests::array_push_and_pop_length`,
+    // which is where the defect was originally observed; this row pins that the
+    // property path is the only path, i.e. no layout special case survives.
+    assert_is(
+        &eval_json(
+            r#"
+            var a = ["a", "b"];
+            Array.prototype.push.call(a, "c");
+            Array.prototype.pop.call(a);
+            JSON.stringify([a.length, a[0], a[1], a[2]]);
+            "#,
+        ),
+        r#"[2,"a","b",null]"#,
+        "push then pop on a real array",
+    );
 }
