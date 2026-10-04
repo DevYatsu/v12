@@ -1,6 +1,7 @@
 //! Every `Array.prototype` method that touches an index or `length` must
 //! agree with a plain property read **on the same object, at the same index,
-//! in the same tick**.
+//! in the same tick** — and, where v12 is known to differ, the difference must
+//! be a NAMED divergence rather than a transcription.
 //!
 //! # The defect this pins
 //!
@@ -19,28 +20,95 @@
 //! Array.prototype.indexOf.call(o,"q")  // v12  0    node  0
 //! ```
 //!
-//! Every `Array.prototype` method agreed the value was `"q"` while the plain
-//! read on the same object said `"a"`, with **no coercion bug involved**. The
-//! zero-tests-asserted-the-current-behaviour state is why `docs/adr/0004` calls
-//! this mutation-sensitive: `self_consistency_*` below fails for 17 of 24
-//! methods at `b0c3353e` and cannot pass while any reader disagrees with
-//! `ordinary_get`.
+//! # The oracle is GENERATED, and this file used to be its own worst enemy
 //!
-//! # Why values are compared through `JSON.stringify`
+//! Until this rewrite the expectations below were **hand-transcribed** —
+//! node's output copied by hand, row by row. That cannot report its own
+//! errors, and it did not: Batch 1 marked the `sparse`/`holey` columns as
+//! matching `node` while `new Array(3)` followed by `a[0] = "z"` reported
+//! `length` 1 where node reports 3. Two things now prevent a repeat.
 //!
-//! v12's `console.log` renders arrays comma-separated rather than as
-//! `[ 1, 2 ]`, so a display-compared array value manufactures false
-//! divergences. Every expected value below is the literal `node` v24.21.0
-//! prints for the same source, captured through `JSON.stringify`.
+//! 1. **The `expected` values are generated.**
+//!    `scripts/gen-array-receiver-table.py` reads
+//!    `scripts/array-receiver-table.txt` (the receiver/row source), builds the
+//!    observation program, runs it under `node`, and writes
+//!    `generated/array_receiver_table.rs`. Regenerating is a **command**:
 //!
-//! # Deliberately NOT pinned here
+//!    ```text
+//!    ./scripts/gen-array-receiver-table.py
+//!    ```
 //!
-//! `map`/`forEach`/`filter`/`reduce`/`some`/`every`/`sort` are the sixth copy of
-//! the straddle (`v12-interp/src/call_setup.rs:3010`, `run_callback_builtin`)
-//! and are out of ADR-0004's Batch 1 scope. `array_callback_seam_is_still_a_
-//! sixth_reader` records that they still diverge, so this file cannot be read
-//! as claiming the seam is fixed.
+//!    The program text is committed verbatim, so the Rust test executes
+//!    byte-for-byte what `node` answered — there is no second harness in Rust
+//!    that could drift from the oracle's.
+//!
+//! 2. **The row source is digest-linked to the generated file.** Edit a row in
+//!    `scripts/array-receiver-table.txt` without regenerating and
+//!    `the_generated_table_matches_its_row_source` fails on the FNV-1a/64
+//!    digest, instead of the row being quietly compared against a stale
+//!    oracle.
+//!
+//! **The second failure mode was subtler and needed the table itself fixed.**
+//! Every row in the old table was an `Array.prototype` *method* call, and every
+//! method either writes all indices in range (`fill`, `copyWithin`) or routes
+//! its length through `set_array_len` (`push`, `pop`, `splice`) — so **no row
+//! could ever observe a partial index write below a declared length**, which is
+//! the only thing that reaches `ArraySetLength`. The 315-row version of this
+//! table measured the same 105 divergences with and without the `new Array(n)`
+//! fix in it. The four `index_assign_*` / `length_lower` rows exist for that
+//! reason and are the only non-method rows in the file.
+//!
+//! # Self-consistency — the mutation-sensitive half
+//!
+//! `self_consistency_over_the_whole_corpus` compares the receiver against
+//! ITSELF after a mutating call, with no oracle at all, so it still catches a
+//! reader that disagrees with `ordinary_get` even if `node` moves.
+//!
+//! # What `KNOWN_DIVERGENCES` is, and is not
+//!
+//! It is a ratchet in BOTH directions: the test recomputes the divergence set
+//! and requires it to equal the declared set, so a new divergence fails and a
+//! FIXED one also fails (until the entry is deleted). An entry marked
+//! `absent: true` additionally has its excuse checked mechanically — v12's
+//! observation must actually contain `threw:TypeError`, so a row cannot be
+//! excused as "not implemented" while v12 quietly returns a wrong value.
+//!
+//! Measured at this commit: **108 of 351 rows diverge, across 19 methods**
+//! (9 receivers × 39 rows). 45 of those are five unimplemented methods on all
+//! nine receivers. The last committed claim, ADR-0004's "24", was measured on
+//! 306 rows with a single receiver and one observation per row; it is not
+//! comparable and is superseded by [`KNOWN_DIVERGENCES`].
+//!
+//! # Deliberately NOT covered here
+//!
+//! * The **direct** call form (`a.forEach(…)` on a real array) is a different
+//!   code path from `Array.prototype.forEach.call(a, …)` and has its own
+//!   divergences — the fast path visits holes that node skips. Every row here
+//!   uses the `call` form, which is what ADR-0004 is about.
+//! * `JSON.stringify` is deliberately NOT the observer (json.rs renders an
+//!   array from its element lattice rather than its `length`, which would
+//!   charge one pre-existing defect to every row returning an array); and
+//!   `to_display_string` is not either, because v12 renders arrays
+//!   comma-separated. The harness describes values through property reads only.
+//! * The `sixth_reader` marker this file used to carry in its header —
+//!   "the callback seam is a sixth copy of the straddle, out of scope" — is
+//!   **STALE and removed**. Batch 2 landed it: `callback_dense_bound` is deleted
+//!   and `callback_elem` became `callback_index`, and both `callback_len` and
+//!   `callback_index` now read through `Interp::get_property`/`Interp::op_in`,
+//!   the interpreter's own `[[Get]]`/`[[HasProperty]]`, instead of a private
+//!   store probe. (Verified at this commit: `callback_len` survives at
+//!   `v12-interp/src/call_setup.rs:2962` — the *name* was kept, its body was
+//!   rewritten — so "all three were deleted" would be the wrong claim to leave
+//!   behind.) What remains at that seam is a *different* defect, listed here:
+//!   `find`/`findIndex` skip holes where ES (and test262's
+//!   `predicate-called-for-each-array-property`) require the predicate to run
+//!   on every index, and `findLast`/`findLastIndex` walk forward instead of
+//!   backward.
+use std::collections::{BTreeMap, BTreeSet};
+
 use v12_engine::Engine;
+
+include!("generated/array_receiver_table.rs");
 
 fn eval_json(src: &str) -> String {
     let mut engine = Engine::new();
@@ -56,7 +124,399 @@ fn assert_is(actual: &str, expected: &str, what: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. The self-consistency assertion — the mutation-sensitive one.
+// 1. Generator linkage — the anti-staleness gate.
+// ---------------------------------------------------------------------------
+
+/// FNV-1a/64. A byte length alone would let a same-length edit through, and a
+/// real hash needs no dependency; the generator computes the identical value.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+#[test]
+fn the_generated_table_matches_its_row_source() {
+    let source = include_str!("../../../scripts/array-receiver-table.txt");
+    assert_eq!(
+        TABLE_SOURCE_BYTES,
+        source.len(),
+        "scripts/array-receiver-table.txt changed size since the table was \
+         generated — re-run ./scripts/gen-array-receiver-table.py"
+    );
+    assert_eq!(
+        TABLE_SOURCE_FNV1A,
+        fnv1a64(source.as_bytes()),
+        "scripts/array-receiver-table.txt changed since the table was generated \
+         — re-run ./scripts/gen-array-receiver-table.py. A stale table compares \
+         v12 against node's answers for rows v12 no longer runs, which is the \
+         exact failure mode this gate exists to stop."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2. The node-differential table, with its divergences named.
+// ---------------------------------------------------------------------------
+
+/// Every receiver, in row-source order.
+const ALL_RECEIVERS: &[&str] = &[
+    "own_numeric_length",
+    "own_string_length",
+    "inherited_indices",
+    "inherited_length",
+    "arguments_exotic",
+    "array_dense",
+    "array_holey",
+    "sparse_ctor",
+    "length_assigned",
+];
+
+/// One row of the divergence ledger.
+struct Known<'a> {
+    /// Method (or row) name, as it appears in the row source.
+    method: &'a str,
+    /// Receivers on which it diverges. Must be the COMPLETE set: a receiver
+    /// that starts (or stops) diverging flips this test.
+    receivers: &'a [&'a str],
+    /// The method does not exist in v12; the excuse is checked, not trusted.
+    absent: bool,
+    /// What is actually wrong. `absent: true` rows are excluded here.
+    why: &'a str,
+}
+
+/// The complete, current divergence set: **108 of 351 rows, 19 methods**.
+///
+/// Each entry is one *defect*, not one symptom, so the count is the number of
+/// things to fix rather than the number of places they show. Read with the
+/// caveat in the module header: 45 of the 108 rows are the five `absent`
+/// entries and say nothing about the index/length model.
+const KNOWN_DIVERGENCES: &[Known] = &[
+    // -- unimplemented: five rows below cover all nine receivers each --------
+    Known {
+        method: "toLocaleString",
+        receivers: ALL_RECEIVERS,
+        absent: true,
+        why: "Array.prototype.toLocaleString is not registered",
+    },
+    Known {
+        method: "with",
+        receivers: ALL_RECEIVERS,
+        absent: true,
+        why: "Array.prototype.with is not registered (ES2023 change-array-by-copy)",
+    },
+    Known {
+        method: "toReversed",
+        receivers: ALL_RECEIVERS,
+        absent: true,
+        why: "Array.prototype.toReversed is not registered (ES2023 change-array-by-copy)",
+    },
+    Known {
+        method: "toSorted",
+        receivers: ALL_RECEIVERS,
+        absent: true,
+        why: "Array.prototype.toSorted is not registered (ES2023 change-array-by-copy)",
+    },
+    Known {
+        method: "toSpliced",
+        receivers: ALL_RECEIVERS,
+        absent: true,
+        why: "Array.prototype.toSpliced is not registered (ES2023 change-array-by-copy)",
+    },
+    // -- holes materialised as present `undefined` ---------------------------
+    Known {
+        method: "slice",
+        receivers: &[
+            "inherited_indices",
+            "inherited_length",
+            "array_holey",
+            "sparse_ctor",
+            "length_assigned",
+        ],
+        absent: false,
+        why: "the RESULT array carries present `undefined` where the receiver had a \
+              hole; `i in result` is true at an index the source never had",
+    },
+    Known {
+        method: "map",
+        receivers: &[
+            "inherited_indices",
+            "inherited_length",
+            "array_holey",
+            "sparse_ctor",
+            "length_assigned",
+        ],
+        absent: false,
+        why: "same hole materialisation as slice, on the seam's result array",
+    },
+    Known {
+        method: "concat",
+        receivers: &["array_holey", "sparse_ctor", "length_assigned"],
+        absent: false,
+        why: "same hole materialisation as slice",
+    },
+    Known {
+        method: "splice",
+        receivers: &[
+            "own_numeric_length",
+            "own_string_length",
+            "inherited_indices",
+            "inherited_length",
+            "array_holey",
+            "sparse_ctor",
+            "length_assigned",
+        ],
+        absent: false,
+        why: "two defects in one row: the removed-element array materialises its \
+              hole, AND the deleted index stays in Object.keys on the two \
+              own-index receivers (see pop/shift)",
+    },
+    Known {
+        method: "sort",
+        receivers: &[
+            "inherited_indices",
+            "inherited_length",
+            "array_holey",
+            "sparse_ctor",
+            "length_assigned",
+        ],
+        absent: false,
+        why: "writes EVERY index 0..len-1, so a holey receiver gains present \
+              `undefined`s and own keys node never creates",
+    },
+    Known {
+        method: "reverse",
+        receivers: &[
+            "inherited_indices",
+            "inherited_length",
+            "array_holey",
+            "sparse_ctor",
+            "length_assigned",
+        ],
+        absent: false,
+        why: "same as sort: full-range rewrite instead of a hole-aware permutation",
+    },
+    // -- deleted keys stay visible to Object.keys ---------------------------
+    Known {
+        method: "pop",
+        receivers: &["own_numeric_length", "own_string_length"],
+        absent: false,
+        why: "`hasOwnProperty(o, i)` is false but `Object.keys(o)` still counts the \
+              deleted index: the shape descriptor survives the delete",
+    },
+    Known {
+        method: "shift",
+        receivers: &["own_numeric_length", "own_string_length"],
+        absent: false,
+        why: "same as pop: a deleted own index stays in Object.keys",
+    },
+    Known {
+        method: "length_lower",
+        receivers: &["array_dense", "array_holey"],
+        absent: false,
+        why: "`o.length = 1` on a real array drops the element but not its own key",
+    },
+    // -- the callback seam's hole handling and direction --------------------
+    Known {
+        method: "find",
+        receivers: &[
+            "inherited_length",
+            "array_holey",
+            "sparse_ctor",
+            "length_assigned",
+        ],
+        absent: false,
+        why: "the seam SKIPS holes; ES requires the predicate to run once per index \
+              (test262 find/predicate-called-for-each-array-property asserts the \
+              predicate is called 4 times for [undefined, , , 'foo'])",
+    },
+    Known {
+        method: "findIndex",
+        receivers: &[
+            "inherited_length",
+            "array_holey",
+            "sparse_ctor",
+            "length_assigned",
+        ],
+        absent: false,
+        why: "same seam hole-skip as find",
+    },
+    Known {
+        method: "findLast",
+        receivers: ALL_RECEIVERS,
+        absent: false,
+        why: "walks FORWARD: the visitation order is 0,1,2 rather than 2,1,0. The \
+              return value happens to agree on a dense receiver, so only the \
+              recorded invocations expose it",
+    },
+    Known {
+        method: "findLastIndex",
+        receivers: ALL_RECEIVERS,
+        absent: false,
+        why: "same forward-walking seam as findLast",
+    },
+    // -- arguments exotic ----------------------------------------------------
+    Known {
+        method: "index_assign_past",
+        receivers: &["arguments_exotic"],
+        absent: false,
+        why: "`arguments[7] = x` grows `arguments.length` to 8; the exotic's length \
+              is fixed at creation and an index write must not touch it",
+    },
+];
+
+/// Divergences this file knows about, folded into the same shape the test
+/// builds from the table, so one `assert_eq!` compares them.
+fn declared_divergences() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
+    KNOWN_DIVERGENCES
+        .iter()
+        .map(|k| (k.method, k.receivers.iter().copied().collect()))
+        .collect()
+}
+
+/// Runs every generated program once and returns, per receiver, the rows v12
+/// produced. Nine evals total — one per receiver, not one per row.
+fn observe() -> Vec<(&'static ReceiverTable, Vec<String>)> {
+    RECEIVERS
+        .iter()
+        .map(|receiver: &'static ReceiverTable| {
+            let observed = eval_json(receiver.program);
+            let rows: Vec<String> = observed.split(ROW_SEPARATOR).map(str::to_string).collect();
+            let expected_rows = receiver.expected.split(ROW_SEPARATOR).count();
+            assert_eq!(
+                rows.len(),
+                expected_rows,
+                "{}: the program produced {} observations but node's committed \
+                 answer has {} — one of them contains the {ROW_SEPARATOR:?} row \
+                 separator",
+                receiver.name,
+                rows.len(),
+                expected_rows,
+            );
+            (receiver, rows)
+        })
+        .collect()
+}
+
+#[test]
+fn the_generated_table_agrees_with_node_except_where_named() {
+    let observed = observe();
+
+    let mut actual: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
+    let mut rows_by_key: BTreeMap<(&'static str, &'static str), &str> = BTreeMap::new();
+    for (receiver, rows) in &observed {
+        for (got, want) in rows.iter().zip(receiver.expected.split(ROW_SEPARATOR)) {
+            let method = want.split('|').next().unwrap_or("");
+            rows_by_key.insert((method, receiver.name), got.as_str());
+            if got != want {
+                actual.entry(method).or_default().insert(receiver.name);
+            }
+        }
+    }
+
+    // The `absent` excuses are checked, not trusted: if one of those methods
+    // stops throwing, the row is no longer "not implemented" and the ledger
+    // entry has to change (and the method is now a real divergence).
+    for known in KNOWN_DIVERGENCES.iter().filter(|k| k.absent) {
+        for receiver in ALL_RECEIVERS {
+            let got = rows_by_key.get(&(known.method, receiver));
+            assert!(
+                got.is_some_and(|line| line.contains("threw:TypeError")),
+                "{} claims `absent` on {} but v12 answered {:?}; either the method \
+                 exists now or the row is a real divergence",
+                known.method,
+                receiver,
+                got.copied().unwrap_or("<row missing>"),
+            );
+        }
+    }
+
+    let declared = declared_divergences();
+    let total: usize = actual.values().map(BTreeSet::len).sum();
+    let mut ledger = String::new();
+    for known in KNOWN_DIVERGENCES {
+        ledger.push_str(&format!(
+            "\n  {:<18} {:>2} receiver(s)  {}{}",
+            known.method,
+            known.receivers.len(),
+            if known.absent { "[absent] " } else { "" },
+            known.why,
+        ));
+    }
+    assert_eq!(
+        actual,
+        declared,
+        "the divergence set moved. {} rows diverge today ({} methods); the ledger \
+         names {}. A NEW divergence and a FIXED one both fail here — that is the \
+         point of the ledger, so update KNOWN_DIVERGENCES in the same commit that \
+         changes the behaviour.\nledger:{ledger}",
+        total,
+        actual.len(),
+        declared.values().map(BTreeSet::len).sum::<usize>(),
+    );
+    assert_eq!(
+        total, 108,
+        "the divergence count moved without the ledger's shape changing"
+    );
+}
+
+/// The same table, re-answered by a **live** `node` instead of the committed
+/// literals. Ignored by default because CI may have no `node`; run it with
+///
+/// ```text
+/// cargo nextest run -p v12-engine --run-ignored -E 'test(live_node)'
+/// ```
+///
+/// after touching the harness in the generator, to prove the committed
+/// literals are still what this `node` says.
+#[test]
+#[ignore = "needs `node` on PATH; the committed literals are the CI-visible oracle"]
+fn the_committed_literals_still_match_a_live_node() {
+    // `node -e … -` does not mean "read the program from stdin" (it means "load
+    // the file named `-`"), so the program goes through a real temp file —
+    // the same path the generator takes.
+    let mut path = std::env::temp_dir();
+    path.push(format!("v12-array-receiver-row-{}.js", std::process::id()));
+    for receiver in RECEIVERS {
+        if std::fs::write(&path, receiver.program).is_err() {
+            panic!("cannot write {} for node", path.display());
+        }
+        let out = std::process::Command::new(
+            std::env::var("V12_NODE").unwrap_or_else(|_| "node".to_string()),
+        )
+        .arg("-e")
+        .arg(
+            "process.stdout.write(String(require('vm').runInThisContext(\
+             require('fs').readFileSync(process.argv[1],'utf8'),{filename:'row.js'})))",
+        )
+        .arg(&path)
+        .output();
+        let done = match out {
+            Ok(d) => d,
+            Err(e) => panic!("cannot run node: {e}"),
+        };
+        assert!(
+            done.status.success(),
+            "node failed on {}: {}",
+            receiver.name,
+            String::from_utf8_lossy(&done.stderr)
+        );
+        let live = String::from_utf8_lossy(&done.stdout).into_owned();
+        assert_eq!(
+            live, receiver.expected,
+            "{}: the committed literals no longer match this node — \
+             re-run ./scripts/gen-array-receiver-table.py",
+            receiver.name
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------------
+// 3. The self-consistency assertion — the mutation-sensitive one, and the one
+//    that needs no oracle at all.
 // ---------------------------------------------------------------------------
 
 /// After a mutating call, every index `i < ToLength(receiver)` must read back
@@ -137,492 +597,77 @@ fn self_consistency_over_the_whole_corpus() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. The node-agreement table, transcribed row by row.
-//    Every expected value is node v24.21.0's output for the same source.
+// 4. `ArraySetLength`: the defect this batch fixed, pinned directly.
 // ---------------------------------------------------------------------------
 
+/// ES `ArraySetLength` step 2.e: an index write sets `length` to
+/// `max(oldLength, index + 1)`. `Interp::array_set_element`
+/// (`v12-interp/src/property.rs`) derived the new value from the
+/// element-store EXTENT instead, so on a sparse receiver — where the store is
+/// below the declared length — writing one index *lowered* `length` to the
+/// extent. `new Array(3)` followed by `a[0] = "z"` reported `length` 1.
+///
+/// The generated table's `index_assign_low` / `index_assign_mid` rows are the
+/// differential form; this is the same invariant stated so that reading it does
+/// not require running `node`.
 #[test]
-fn node_table_numeric_length_own_indices() {
-    // Receiver {0:"a",1:"b",2:"c",length:3}.
-    for (what, src, expected) in [
+fn an_index_write_never_lowers_a_declared_length() {
+    for (what, src) in [
         (
-            "fill",
-            r#"Array.prototype.fill.call(o,"q",0,3); JSON.stringify(o)"#,
-            r#"{"0":"q","1":"q","2":"q","length":3}"#,
+            "new Array(3), write index 0",
+            r#"var a = new Array(3); a[0] = "z"; JSON.stringify([a.length, a[0]])"#,
         ),
         (
-            "copyWithin",
-            r#"Array.prototype.copyWithin.call(o,0,1,3); JSON.stringify(o)"#,
-            r#"{"0":"b","1":"c","2":"c","length":3}"#,
+            "new Array(3), write index 1",
+            r#"var a = new Array(3); a[1] = "z"; JSON.stringify([a.length, a[0], a[1]])"#,
         ),
         (
-            "slice",
-            r#"JSON.stringify(Array.prototype.slice.call(o))"#,
-            r#"["a","b","c"]"#,
-        ),
-        ("join", r#"Array.prototype.join.call(o,"-")"#, r#"a-b-c"#),
-        (
-            "sort",
-            r#"Array.prototype.sort.call(o); JSON.stringify(o)"#,
-            r#"{"0":"a","1":"b","2":"c","length":3}"#,
+            "new Array(10), write index 0",
+            r#"var a = new Array(10); a[0] = "z"; JSON.stringify([a.length, a[0]])"#,
         ),
         (
-            "reverse",
-            r#"Array.prototype.reverse.call(o); JSON.stringify(o)"#,
-            r#"{"0":"c","1":"b","2":"a","length":3}"#,
+            "assigned length 10, write index 3",
+            r#"var a = []; a.length = 10; a[3] = "z"; JSON.stringify([a.length, a[3]])"#,
         ),
         (
-            "shift",
-            r#"Array.prototype.shift.call(o); JSON.stringify(o)"#,
-            r#"{"0":"b","1":"c","length":2}"#,
+            "a dense write still raises length",
+            r#"var a = ["a"]; a[3] = "d"; JSON.stringify([a.length, a[3]])"#,
         ),
         (
-            "unshift",
-            r#"Array.prototype.unshift.call(o,"z"); JSON.stringify(o)"#,
-            r#"{"0":"z","1":"a","2":"b","3":"c","length":4}"#,
+            "a write past the end raises it to index + 1",
+            r#"var a = new Array(3); a[4] = "z"; JSON.stringify([a.length, a[4]])"#,
         ),
         (
-            "splice",
-            r#"JSON.stringify(Array.prototype.splice.call(o,1,1))"#,
-            r#"["b"]"#,
-        ),
-        (
-            "concat",
-            r#"JSON.stringify(Array.prototype.concat.call(o))"#,
-            r#"[{"0":"a","1":"b","2":"c","length":3}]"#,
-        ),
-        (
-            "toString",
-            r#"Array.prototype.toString.call(o)"#,
-            r#"[object Object]"#,
-        ),
-        (
-            "push",
-            r#"Array.prototype.push.call(o,"d"); JSON.stringify(o)"#,
-            r#"{"0":"a","1":"b","2":"c","3":"d","length":4}"#,
-        ),
-        (
-            "pop",
-            r#"Array.prototype.pop.call(o); JSON.stringify(o)"#,
-            r#"{"0":"a","1":"b","length":2}"#,
-        ),
-        ("indexOf", r#"Array.prototype.indexOf.call(o,"b")"#, "1"),
-        (
-            "lastIndexOf",
-            r#"Array.prototype.lastIndexOf.call(o,"b")"#,
-            "1",
-        ),
-        (
-            "includes",
-            r#"Array.prototype.includes.call(o,"b")"#,
-            "true",
-        ),
-        ("at", r#"Array.prototype.at.call(o,1)"#, r#"b"#),
-        (
-            "flat",
-            r#"JSON.stringify(Array.prototype.flat.call(o))"#,
-            r#"["a","b","c"]"#,
-        ),
-        (
-            "indexOf_after_fill_agrees_with_read",
-            r#"Array.prototype.fill.call(o,"q",0,3); [Array.prototype.indexOf.call(o,"q"), Array.prototype.indexOf.call(o,"a")].join()"#,
-            "0,-1",
+            "a second write does not move it",
+            r#"var a = new Array(3); a[0] = "z"; a[0] = "y"; JSON.stringify([a.length, a[0]])"#,
         ),
     ] {
-        assert_is(
-            &eval_json(&format!(r#"var o = {{0:"a",1:"b",2:"c",length:3}}; {src}"#)),
-            expected,
-            what,
+        // The expectation is computed from the declared length, never copied:
+        // `ArraySetLength` is `max(old, i+1)`, so that is what is asserted.
+        let (declared, index): (f64, f64) = match what {
+            "new Array(3), write index 0" => (3.0, 0.0),
+            "new Array(3), write index 1" => (3.0, 1.0),
+            "new Array(10), write index 0" => (10.0, 0.0),
+            "assigned length 10, write index 3" => (10.0, 3.0),
+            "a dense write still raises length" => (1.0, 3.0),
+            "a write past the end raises it to index + 1" => (3.0, 4.0),
+            "a second write does not move it" => (3.0, 0.0),
+            other => unreachable!("unlisted case {other}"),
+        };
+        let observed = eval_json(src);
+        let json = observed.trim_start_matches('[');
+        let want = declared.max(index + 1.0);
+        assert!(
+            json.starts_with(&format!("{want},")),
+            "{what}: length is {observed}, want {} (= max({declared}, {} + 1))",
+            want,
+            index
         );
-    }
-}
-
-#[test]
-fn node_table_string_length() {
-    // A *string* `length` is the coercion case the deleted `array_len`'s
-    // `as_smi().or(as_f64)` got wrong: "3" is not a number, so it became NaN
-    // and therefore 0.
-    for (what, src, expected) in [
-        ("at(0)", r#"Array.prototype.at.call(o,0)"#, r#"a"#),
-        ("at(1)", r#"Array.prototype.at.call(o,1)"#, r#"b"#),
-        (
-            "slice",
-            r#"JSON.stringify(Array.prototype.slice.call(o))"#,
-            r#"["a","b","c"]"#,
-        ),
-        ("join", r#"Array.prototype.join.call(o,"-")"#, r#"a-b-c"#),
-        (
-            "fill readable",
-            r#"Array.prototype.fill.call(o,"q",0,3); o[0]"#,
-            r#"q"#,
-        ),
-        ("indexOf(a)", r#"Array.prototype.indexOf.call(o,"a")"#, "0"),
-        (
-            "lastIndexOf(b)",
-            r#"Array.prototype.lastIndexOf.call(o,"b")"#,
-            "1",
-        ),
-        (
-            "includes(a)",
-            r#"Array.prototype.includes.call(o,"a")"#,
-            "true",
-        ),
-        (
-            "shift",
-            r#"Array.prototype.shift.call(o); JSON.stringify(o)"#,
-            r#"{"0":"b","1":"c","length":2}"#,
-        ),
-        (
-            "splice",
-            r#"Array.prototype.splice.call(o,1,1); JSON.stringify(o)"#,
-            r#"{"0":"a","1":"c","length":2}"#,
-        ),
-        (
-            "push",
-            r#"Array.prototype.push.call(o,"d"); JSON.stringify(o)"#,
-            r#"{"0":"a","1":"b","2":"c","3":"d","length":4}"#,
-        ),
-        (
-            "flat",
-            r#"JSON.stringify(Array.prototype.flat.call(o))"#,
-            r#"["a","b","c"]"#,
-        ),
-    ] {
-        assert_is(
-            &eval_json(&format!(
-                r#"var o = {{0:"a",1:"b",2:"c",length:"3"}}; {src}"#
-            )),
-            expected,
-            what,
-        );
-    }
-}
-
-#[test]
-fn node_table_inherited_indices() {
-    // `Object.create({0:"inh", length:3})` — the indices live on the
-    // prototype. Spec-correct in node because `[[Get]]`/`[[HasProperty]]` walk
-    // the chain; every hand-rolled reader here did not.
-    for (what, src, expected) in [
-        ("indexOf", r#"Array.prototype.indexOf.call(o,"inh")"#, "0"),
-        (
-            "slice",
-            r#"JSON.stringify(Array.prototype.slice.call(o))"#,
-            r#"["inh",null,null]"#,
-        ),
-        (
-            "slice(1)",
-            r#"JSON.stringify(Array.prototype.slice.call(o,1))"#,
-            r#"[null,null]"#,
-        ),
-        (
-            "includes",
-            r#"Array.prototype.includes.call(o,"inh")"#,
-            "true",
-        ),
-        ("at", r#"Array.prototype.at.call(o,0)"#, r#"inh"#),
-        ("join", r#"Array.prototype.join.call(o,"-")"#, r#"inh--"#),
-        (
-            "flat skips absent",
-            r#"JSON.stringify(Array.prototype.flat.call(o))"#,
-            r#"["inh"]"#,
-        ),
-        (
-            "concat appends receiver",
-            r#"JSON.stringify(Array.prototype.concat.call(o).length)"#,
-            "1",
-        ),
-        (
-            "toString",
-            r#"Array.prototype.toString.call(o)"#,
-            r#"[object Object]"#,
-        ),
-        (
-            "shift leaves no own index",
-            r#"Array.prototype.shift.call(o); JSON.stringify(o)"#,
-            r#"{"length":2}"#,
-        ),
-        (
-            "splice leaves no own index",
-            r#"Array.prototype.splice.call(o,1,1); JSON.stringify(o)"#,
-            r#"{"length":2}"#,
-        ),
-        (
-            "fill readable",
-            r#"Array.prototype.fill.call(o,"q",0,3); JSON.stringify(o)"#,
-            r#"{"0":"q","1":"q","2":"q"}"#,
-        ),
-        (
-            "unshift",
-            r#"Array.prototype.unshift.call(o,"z"); JSON.stringify(o)"#,
-            r#"{"0":"z","1":"inh","length":4}"#,
-        ),
-        (
-            "push",
-            r#"Array.prototype.push.call(o,"d"); JSON.stringify(o)"#,
-            r#"{"3":"d","length":4}"#,
-        ),
-    ] {
-        assert_is(
-            &eval_json(&format!(
-                r#"var o = Object.create({{0:"inh", length:3}}); {src}"#
-            )),
-            expected,
-            what,
-        );
-    }
-}
-
-#[test]
-fn node_table_inherited_length_only() {
-    for (what, src, expected) in [
-        ("join", r#"Array.prototype.join.call(o,"-")"#, r#"--"#),
-        (
-            "slice",
-            r#"JSON.stringify(Array.prototype.slice.call(o))"#,
-            r#"[null,null,null]"#,
-        ),
-        (
-            "flat skips absent",
-            r#"JSON.stringify(Array.prototype.flat.call(o))"#,
-            "[]",
-        ),
-        (
-            "push",
-            r#"Array.prototype.push.call(o,"d"); JSON.stringify(o)"#,
-            r#"{"3":"d","length":4}"#,
-        ),
-        (
-            "shift",
-            r#"Array.prototype.shift.call(o); JSON.stringify(o)"#,
-            r#"{"length":2}"#,
-        ),
-        (
-            "splice",
-            r#"Array.prototype.splice.call(o,1,1); JSON.stringify(o)"#,
-            r#"{"length":2}"#,
-        ),
-        (
-            "fill",
-            r#"Array.prototype.fill.call(o,"q",0,3); JSON.stringify(o)"#,
-            r#"{"0":"q","1":"q","2":"q"}"#,
-        ),
-        (
-            "toString",
-            r#"Array.prototype.toString.call(o)"#,
-            r#"[object Object]"#,
-        ),
-    ] {
-        assert_is(
-            &eval_json(&format!(r#"var o = Object.create({{length:3}}); {src}"#)),
-            expected,
-            what,
-        );
-    }
-}
-
-#[test]
-fn node_table_arguments_length_bookkeeping() {
-    // `arguments` keeps its elements in the flat store — the one receiver where
-    // `elements_snapshot()` is the right answer — and still diverged, because
-    // the length writers guarded on `kind == Array`.
-    for (what, src, expected) in [
-        (
-            "unshift",
-            r#"Array.prototype.unshift.call(a,"z"); [a.length, a[0], a[1], a[2], a[3]].join()"#,
-            r#"4,z,1,2,3"#,
-        ),
-        (
-            "splice",
-            r#"Array.prototype.splice.call(a,1,1); [a.length, a[0], a[1], a[2]].join()"#,
-            r#"2,1,3,"#,
-        ),
-        (
-            "splice insert",
-            r#"Array.prototype.splice.call(a,1,0,"Z"); [a.length, a[0], a[1], a[2], a[3]].join()"#,
-            r#"4,1,Z,2,3"#,
-        ),
-        (
-            "shift",
-            r#"Array.prototype.shift.call(a); [a.length, a[0], a[1], a[2]].join()"#,
-            r#"2,2,3,"#,
-        ),
-        (
-            "toString tag",
-            r#"Array.prototype.toString.call(a)"#,
-            r#"[object Arguments]"#,
-        ),
-    ] {
-        assert_is(
-            &eval_json(&format!(
-                r#"var a = (function(){{ return arguments; }})(1,2,3); {src}"#
-            )),
-            expected,
-            what,
-        );
-    }
-}
-
-#[test]
-fn node_table_kind_array_fast_path_is_intact() {
-    // The `Kind::Array` fast paths (`index_get`/`index_set`'s lattice rung,
-    // `array_range`'s snapshot, `dense_entries`) are kept deliberately; these
-    // rows are their regression gate.
-    for (what, src, expected) in [
-        (
-            "pop trims the store",
-            r#"a.pop(); [a.length, a[2]].join()"#,
-            r#"2,"#,
-        ),
-        (
-            "shift closes the gap",
-            r#"a.shift(); JSON.stringify(a)"#,
-            r#"["b","c"]"#,
-        ),
-        (
-            "splice",
-            r#"JSON.stringify(Array.prototype.splice.call(a,1,1))"#,
-            r#"["b"]"#,
-        ),
-        (
-            "reverse",
-            r#"a.reverse(); JSON.stringify(a)"#,
-            r#"["c","b","a"]"#,
-        ),
-        ("sort", r#"a.sort(); JSON.stringify(a)"#, r#"["a","b","c"]"#),
-        ("slice", r#"JSON.stringify(a.slice(1))"#, r#"["b","c"]"#),
-        ("join", r#"a.join("-")"#, r#"a-b-c"#),
-        ("toString", r#"a.toString()"#, r#"a,b,c"#),
-        (
-            "fill",
-            r#"a.fill("q",1,3); JSON.stringify(a)"#,
-            r#"["a","q","q"]"#,
-        ),
-        (
-            "copyWithin",
-            r#"a.copyWithin(0,1,3); JSON.stringify(a)"#,
-            r#"["b","c","c"]"#,
-        ),
-        (
-            "push",
-            r#"a.push("d"); JSON.stringify(a)"#,
-            r#"["a","b","c","d"]"#,
-        ),
-        ("flat", r#"JSON.stringify(a.flat())"#, r#"["a","b","c"]"#),
-        (
-            "unshift",
-            r#"a.unshift("z"); JSON.stringify(a)"#,
-            r#"["z","a","b","c"]"#,
-        ),
-        (
-            "concat",
-            r#"JSON.stringify(a.concat([1]))"#,
-            r#"["a","b","c",1]"#,
-        ),
-        ("indexOf", r#"a.indexOf("b")"#, "1"),
-    ] {
-        assert_is(
-            &eval_json(&format!(r#"var a = ["a","b","c"]; {src}"#)),
-            expected,
-            what,
-        );
-    }
-}
-
-#[test]
-fn node_table_sparse_and_holey_arrays_keep_their_length() {
-    for (what, decl, src, expected) in [
-        (
-            "sparse pop",
-            "var a = []; a.length = 3;",
-            "a.pop(); [a.length, a[0], a[1], a[2]].join()",
-            r#"2,,,"#,
-        ),
-        (
-            "sparse unshift",
-            "var a = []; a.length = 3;",
-            "a.unshift('z'); [a.length, a[0], a[1], a[2], a[3]].join()",
-            r#"4,z,,,"#,
-        ),
-        (
-            "sparse splice",
-            "var a = []; a.length = 3;",
-            "a.splice(1,1); [a.length, a[0], a[1], a[2]].join()",
-            r#"2,,,"#,
-        ),
-        (
-            "sparse splice insert",
-            "var a = []; a.length = 3;",
-            "a.splice(1,0,'Z'); [a.length, a[0], a[1], a[2], a[3]].join()",
-            r#"4,,Z,,"#,
-        ),
-        (
-            "sparse slice",
-            "var a = []; a.length = 3;",
-            "JSON.stringify(a.slice())",
-            r#"[null,null,null]"#,
-        ),
-        (
-            "sparse toString",
-            "var a = []; a.length = 3;",
-            "a.toString()",
-            r#",,"#,
-        ),
-        (
-            "sparse join",
-            "var a = []; a.length = 3;",
-            "a.join('-')",
-            r#"--"#,
-        ),
-        (
-            "holey shift",
-            "var a = ['a']; a[3] = 'd'; a.length = 5;",
-            "a.shift(); [a.length, a[0], a[1], a[2], a[3], a[4]].join()",
-            r#"4,,,d,,"#,
-        ),
-        (
-            "holey unshift",
-            "var a = ['a']; a[3] = 'd'; a.length = 5;",
-            "a.unshift('z'); [a.length, a[0], a[1], a[2], a[3], a[4], a[5]].join()",
-            r#"6,z,a,,,d,"#,
-        ),
-        (
-            "holey splice",
-            "var a = ['a']; a[3] = 'd'; a.length = 5;",
-            "a.splice(1,1); [a.length, a[0], a[1], a[2], a[3], a[4]].join()",
-            r#"4,a,,d,,"#,
-        ),
-        (
-            "holey fill",
-            "var a = ['a']; a[3] = 'd'; a.length = 5;",
-            "a.fill('q', 0, 3); [a.length, a[0], a[1], a[2], a[3], a[4]].join()",
-            r#"5,q,q,q,d,"#,
-        ),
-        (
-            "holey toString",
-            "var a = ['a']; a[3] = 'd'; a.length = 5;",
-            "a.toString()",
-            r#"a,,,d,"#,
-        ),
-        (
-            "holey join",
-            "var a = ['a']; a[3] = 'd'; a.length = 5;",
-            "a.join('-')",
-            r#"a---d-"#,
-        ),
-        (
-            "holey slice",
-            "var a = ['a']; a[3] = 'd'; a.length = 5;",
-            "JSON.stringify(a.slice(1))",
-            r#"[null,null,"d",null]"#,
-        ),
-    ] {
-        assert_is(&eval_json(&format!("{decl} {src}")), expected, what);
     }
 }
 
 // ---------------------------------------------------------------------------
-// 3. The declared deviations, pinned by name.
+// 5. The declared deviations, pinned by name.
 // ---------------------------------------------------------------------------
 
 /// `MAX_WRITE_SPAN` is a permanent deviation: `fill`/`copyWithin` will not
@@ -677,187 +722,6 @@ fn a_huge_length_stays_a_bounded_object() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4. The callback seam — ADR-0004 Batch 2.
-//
-// `Interp::run_callback_builtin` (`v12-interp/src/call_setup.rs`) was the sixth
-// copy of the straddle, behind `callback_len` / `callback_elem` /
-// `callback_dense_bound`. It no longer is: all three are deleted and the seam
-// reads `ToLength(Get(O,"length"))` and `HasProperty`/`Get` through the
-// interpreter's own property path.
-// ---------------------------------------------------------------------------
-
-/// `some` returning `false` on a receiver with three elements and an
-/// always-true predicate was the headline symptom of the whole finding — the
-/// one place v12 asserted something *positive and wrong* about present data.
-#[test]
-fn callback_seam_agrees_with_node_on_a_generic_receiver() {
-    for (what, src, expected) in [
-        ("some", r#"Array.prototype.some.call(o, function(){ return true; })"#, "true"),
-        ("every", r#"Array.prototype.every.call(o, function(){ return true; })"#, "true"),
-        ("map", r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#, r#"["a","b","c"]"#),
-        ("filter", r#"JSON.stringify(Array.prototype.filter.call(o, function(){ return true; }))"#, r#"["a","b","c"]"#),
-        ("flatMap", r#"JSON.stringify(Array.prototype.flatMap.call(o, function(x){ return [x]; }))"#, r#"["a","b","c"]"#),
-        (
-            "forEach visits 3",
-            r#"var n = 0; Array.prototype.forEach.call(o, function(){ n++; }); n"#,
-            "3",
-        ),
-        ("reduce", r#"Array.prototype.reduce.call(o, function(p,c){ return p + "-" + c; }, "R")"#, "R-a-b-c"),
-        ("find", r#"Array.prototype.find.call(o, function(x){ return x === "c"; })"#, "c"),
-        ("findIndex", r#"Array.prototype.findIndex.call(o, function(x){ return x === "c"; })"#, "2"),
-    ] {
-        assert_is(
-            &eval_json(&format!(
-                r#"var o = {{0:"a",1:"b",2:"c",length:3}}; {src}"#
-            )),
-            expected,
-            what,
-        );
-    }
-}
-
-/// The same, with the indices on the **prototype** — the case
-/// `callback_elem`'s own-shape-only lookup could not see.
-#[test]
-fn callback_seam_sees_inherited_indices() {
-    for (what, src, expected) in [
-        ("some", r#"Array.prototype.some.call(o, function(){ return true; })"#, "true"),
-        ("map pads the skipped indices", r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#, r#"["inh",null,null]"#),
-        ("filter appends only", r#"JSON.stringify(Array.prototype.filter.call(o, function(){ return true; }))"#, r#"["inh"]"#),
-        (
-            "forEach visits 1",
-            r#"var n = 0; Array.prototype.forEach.call(o, function(){ n++; }); n"#,
-            "1",
-        ),
-        ("reduce", r#"Array.prototype.reduce.call(o, function(p,c){ return p + "-" + c; }, "R")"#, "R-inh"),
-        ("findIndex", r#"Array.prototype.findIndex.call(o, function(x){ return x === "inh"; })"#, "0"),
-        ("sort materialises index 0", r#"Array.prototype.sort.call(o); JSON.stringify(o)"#, r#"{"0":"inh"}"#),
-    ] {
-        assert_is(
-            &eval_json(&format!(
-                r#"var o = Object.create({{0:"inh", length:3}}); {src}"#
-            )),
-            expected,
-            what,
-        );
-    }
-}
-
-/// A `length` on the prototype, and a **string** `length`, both reach the seam:
-/// `callback_len` used to read `properties[0]`/`element_len()` and never saw a
-/// `length` property at all, so every one of these answered "empty".
-#[test]
-fn callback_seam_reads_an_inherited_or_string_length() {
-    for (what, decl, src, expected) in [
-        (
-            "inherited length, some",
-            "var o = Object.create({length:3});",
-            r#"Array.prototype.some.call(o, function(){ return true; })"#,
-            "false",
-        ),
-        (
-            "inherited length, map pads to length",
-            "var o = Object.create({length:3});",
-            r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#,
-            r#"[null,null,null]"#,
-        ),
-        (
-            "inherited length, forEach visits 0",
-            "var o = Object.create({length:3});",
-            r#"var n = 0; Array.prototype.forEach.call(o, function(){ n++; }); n"#,
-            "0",
-        ),
-        (
-            "inherited length, reduce reads 3 holes",
-            "var o = Object.create({length:3});",
-            r#"Array.prototype.reduce.call(o, function(p,c){ return p + "-" + c; }, "R")"#,
-            "R",
-        ),
-        (
-            "string length, some",
-            r#"var o = {0:"a",1:"b",2:"c",length:"3"};"#,
-            r#"Array.prototype.some.call(o, function(){ return true; })"#,
-            "true",
-        ),
-        (
-            "string length, map",
-            r#"var o = {0:"a",1:"b",2:"c",length:"3"};"#,
-            r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#,
-            r#"["a","b","c"]"#,
-        ),
-    ] {
-        assert_is(&eval_json(&format!("{decl} {src}")), expected, what);
-    }
-}
-
-/// Holes are skipped by **every** method on this seam, `reduce` and
-/// `reduceRight` included — which is the wrong assumption this batch made
-/// first. The test is presence, not `undefined`-ness: `{0:"a", 1:undefined,
-/// length:3}` visits `[0, 1]`, `{0:"a", 2:"c", length:4}` visits `[0, 2]`.
-#[test]
-fn callback_seam_skips_holes_and_not_undefined() {
-    for (what, decl, src, expected) in [
-        (
-            "own sparse indices",
-            r#"var o = {0:"a",2:"c",length:4};"#,
-            r#"var v = []; Array.prototype.reduce.call(o, function(p,c,i){ v.push(i); return p; }, ""); v.join()"#,
-            "0,2",
-        ),
-        (
-            "a present undefined is visited",
-            r#"var o = {0:"a",1:undefined,length:3};"#,
-            r#"var v = []; Array.prototype.reduce.call(o, function(p,c,i){ v.push(i); return p; }, ""); v.join()"#,
-            "0,1",
-        ),
-        (
-            "holey real array",
-            r#"var o = ["a"]; o[3] = "d"; o.length = 5;"#,
-            r#"var v = []; Array.prototype.reduce.call(o, function(p,c,i){ v.push(i); return p; }, ""); v.join()"#,
-            "0,3",
-        ),
-        (
-            "holey map pads to length",
-            r#"var o = ["a"]; o[3] = "d"; o.length = 5;"#,
-            r#"JSON.stringify(Array.prototype.map.call(o, function(x){ return x; }))"#,
-            r#"["a",null,null,"d",null]"#,
-        ),
-    ] {
-        assert_is(&eval_json(&format!("{decl} {src}")), expected, what);
-    }
-}
-
-/// `reduce`'s callback takes **four** arguments — `(accumulator, value, index,
-/// array)`. The seam passed three, so a `reduce` callback read the receiver
-/// where the index belongs.
-#[test]
-fn the_reduce_callback_receives_the_index() {
-    for (what, src, expected) in [
-        (
-            "reduce",
-            r#"var v = []; Array.prototype.reduce.call(["a","b","c"], function(acc,c,i){ v.push(i); return acc; }, ""); v.join()"#,
-            "0,1,2",
-        ),
-        (
-            "reduceRight",
-            r#"var v = []; Array.prototype.reduceRight.call(["a","b","c"], function(acc,c,i){ v.push(i); return acc; }, ""); v.join()"#,
-            "2,1,0",
-        ),
-        (
-            "forEach",
-            r#"var v = []; ["a","b","c"].forEach(function(c,i){ v.push(i); }); v.join()"#,
-            "0,1,2",
-        ),
-        (
-            "the fourth argument is the receiver",
-            r#"Array.prototype.reduce.call(["a"], function(acc,c,i,arr){ return arr.length; }, "")"#,
-            "1",
-        ),
-    ] {
-        assert_is(&eval_json(src), expected, what);
-    }
-}
-
 /// `MAX_CALLBACK_SCAN` is a declared deviation, like `MAX_SCAN_SPAN` in
 /// `builtins/array.rs`: `ToLength` can be 2^53-1 and a generic receiver has no
 /// enumerable store, so the walk is capped.
@@ -878,20 +742,70 @@ fn max_callback_scan_is_a_declared_deviation() {
     );
 }
 
+/// `reduce`'s callback takes **four** arguments — `(accumulator, value, index,
+/// array)`. The seam passed three, so a `reduce` callback read the receiver
+/// where the index belongs. The expectations are the ARITY and the index
+/// ORDER, computed here rather than transcribed, so this cannot drift into
+/// asserting node's output for a seam that no longer exists.
+#[test]
+fn the_reduce_callback_receives_the_index() {
+    assert_is(
+        &eval_json(
+            r#"
+            var arity = 0; var v = [];
+            Array.prototype.reduce.call(["a","b","c"], function(acc, c, i, arr) {
+                arity = arguments.length; v.push(i);
+                return acc;
+            }, "");
+            JSON.stringify([arity, v.join(","), v.join(",") === [0,1,2].join(",")]);
+            "#,
+        ),
+        r#"[4,"0,1,2",true]"#,
+        "reduce's callback gets (acc, value, index, array)",
+    );
+    assert_is(
+        &eval_json(
+            r#"
+            var v = [];
+            Array.prototype.reduceRight.call(["a","b","c"], function(acc, c, i) {
+                v.push(i); return acc;
+            }, "");
+            v.join(",");
+            "#,
+        ),
+        &[2, 1, 0]
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        "reduceRight visits the indices in reverse",
+    );
+    assert_is(
+        &eval_json(
+            r#"
+            var seen = 0;
+            Array.prototype.reduce.call(["a"], function(acc, c, i, arr) {
+                seen = arr.length; return acc;
+            }, "");
+            String(seen);
+            "#,
+        ),
+        "1",
+        "the fourth argument is the receiver",
+    );
+}
+
 /// The Batch-1 `array_layout_len`/`write_array_layout_len` workaround existed
 /// only because `Heap::add_property` handed out slot 0 while the write site
 /// pushed at index 1 for a `JsObject::array`-born array. The cause is fixed in
 /// `internal_methods::store_shape_extension`, so the length must now be an
 /// ordinary property: writing it through `[[Set]]` and reading it back through
 /// a plain `o.length` has to agree, on an array built by the raw heap
-/// constructor.
+/// constructor. The `JsObject::array` + `heap.alloc` shape is the unit test in
+/// `crates/v12-engine/src/tests.rs::builtin_tests::array_push_and_pop_length`,
+/// which is where the defect was originally observed.
 #[test]
 fn a_heap_built_array_length_is_an_ordinary_property() {
-    // Driven from JS this exercises the engine-created array. The
-    // `JsObject::array` + `heap.alloc` shape is the unit test in
-    // `crates/v12-engine/src/tests.rs::builtin_tests::array_push_and_pop_length`,
-    // which is where the defect was originally observed; this row pins that the
-    // property path is the only path, i.e. no layout special case survives.
     assert_is(
         &eval_json(
             r#"

@@ -3727,23 +3727,52 @@ impl Interp<'_> {
     }
 
     /// Stores an element, hole-filling gaps and keeping `length` current.
+    ///
+    /// ES `ArraySetLength` step 2.e: an index write makes `length`
+    /// `max(oldLength, index + 1)` — it **raises** `length` and never lowers
+    /// it. Deriving the new value from the element-store extent
+    /// (`JsObject::element_len()`) instead broke every sparse receiver:
+    /// `new Array(3)` has an *empty* store behind a declared `length` of 3, so
+    /// `a[0] = "z"` grew the extent 0 → 1 and wrote `length = 1`. The declared
+    /// length was not consulted at all, and a dense write (`new Array(10)` then
+    /// `a[9] = "z"`) only matched `node` by accident, because there the extent
+    /// happens to land on 10.
+    ///
+    /// This is *not* the `store_shape_extension` slot defect
+    /// (`v12-engine/src/internal_methods.rs`): that one was a shape slot
+    /// (`num_own` 0 vs `properties.len()` 1) losing a write to an unbound
+    /// index. `Ctx::alloc_array_sparse` binds the canonical length shape, so
+    /// `new Array(n)` has `num_own == 1` and its `length` reads back `n`
+    /// correctly until an index write runs this function.
     pub(crate) fn array_set_element(&mut self, obj: Handle<JsObject>, idx: u32, value: JsValue) {
-        let len_before = self.heap.get(obj).element_len() as u32;
         self.heap.get_mut(obj).set_element(idx, value);
-        let len_after = self.heap.get(obj).element_len() as u32;
-        if len_after <= len_before {
-            return;
-        }
+        let wanted = idx.saturating_add(1);
         let len_key = self.length_key();
         let shape = self.shape_of(obj);
-        let slot = self
+        let Some(slot) = self
             .heap
             .lookup_property(shape, len_key)
             .and_then(|d| d.slot())
-            .map(|s| s as usize);
-        if let Some(slot) = slot {
-            self.heap.get_mut(obj).properties[slot] = ops::box_number(f64::from(len_after));
+            .map(|s| s as usize)
+        else {
+            return;
+        };
+        let current = self
+            .heap
+            .get(obj)
+            .properties
+            .get(slot)
+            .copied()
+            .unwrap_or(JsValue::undefined());
+        let current_n = current
+            .as_smi()
+            .map(f64::from)
+            .or(current.as_f64())
+            .unwrap_or(0.0);
+        if current_n >= f64::from(wanted) {
+            return;
         }
+        self.heap.get_mut(obj).properties[slot] = ops::box_number(f64::from(wanted));
     }
 }
 
