@@ -395,6 +395,7 @@ Every task reports all four, or it is not done:
 | ADR-0004 batch 4 | `fbc49842` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 | ADR-0004 batch 5 | `f6265203` | 24 590 tests, 19 080 pass → 19 080, net **+0**, BROKE 0, clean |
 | ADR-0004 batch 7 | `2479ac3c` | 24 590 tests, 19 080 pass → **19 086**, net **+6**, BROKE 0, clean. **First non-zero delta of the session.** 5 of the 6 are `language/expressions/delete/*`, which is precisely what the E3 fix touched. |
+| ADR-0004 batch 8 | `b720cf7c` | 24 590 tests, 19 080 pass → 19 086, net **+6**, BROKE 0, clean. **The same six tests as batch 7 — zero additional.** `faildiff` compares against the baseline, so a repeated +6 means batch 8 added no new conformance coverage; the frozen-delete and `Object.keys` defects are not in test262's `language` slice. |
 
 **A `net +0` on a batch that fixed real bugs is not a null result.** W3.3 fixed three confirmed spec violations (`parseInt("0x10",16)`, `toPrecision(3)`, `toFixed(undefined)`), and the `language` slice still moved zero. The same held for the whole `ContainsArguments` sequence — 28 violations closed, `FIXED 0` every time, because test262 has no coverage for that rule's statement or pattern halves. Conformance is a *regression* gate here, not a progress one; progress is measured by the direct-call and unit tests.
 
