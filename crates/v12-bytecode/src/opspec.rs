@@ -120,7 +120,7 @@ pub enum Role {
     /// (`CopyObjectRest` slot `c`).
     Excl,
     /// Base register of a packed `(getter, setter)` pair
-    /// (`DefineAccessor` slot `c`).
+    /// (`DefineAccessor` / `DefineAccessorEnumerable` slot `c`).
     Pair,
     /// Environment chain depth: how many hops up the frame's environment
     /// chain. An immediate, not a register.
@@ -551,6 +551,14 @@ const fn build_specs() -> [Option<OpSpec>; 256] {
     // expr.rs:771). read: `getter = stack[rc]`, `setter = stack[rc + 1]`
     // (execute.rs:985-999) — `c` names a packed pair base, not one value.
     table[Opcode::DefineAccessor as usize] = Some(OpSpec::new(Role::Obj, Role::Key, Role::Pair));
+    // The object-literal spelling, identical layout (ADR-0005). emit:
+    // `emit_reg3(DefineAccessorEnumerable, dst, key, pair)` (expr.rs:772).
+    // read: the same `getter = stack[rc]`, `setter = stack[rc + 1]`
+    // (execute.rs) — the pair *base* is what differs between an accessor and
+    // a plain value operand, and it is what makes this opcode share
+    // `KNOWN_INCONSISTENT_OPERAND_ORDER`'s eighth entry.
+    table[Opcode::DefineAccessorEnumerable as usize] =
+        Some(OpSpec::new(Role::Obj, Role::Key, Role::Pair));
     // emit: `emit_reg3(SetPrototype, 0, obj, proto)` (class.rs:99/104).
     // read: `op_set_prototype(stack[rb], stack[rc])` (execute.rs:840) — `a` is
     // written as a literal `0`, never read.
@@ -775,9 +783,9 @@ pub const KNOWN_INCONSISTENT_OPERAND_ORDER: &[(&str, &str)] = &[
          one and an argument-array register for the other",
     ),
     (
-        "SetProperty, DefineMethod / DefineAccessor",
+        "SetProperty, DefineMethod / DefineAccessor, DefineAccessorEnumerable",
         "`c` is a single value register for the first two and a packed \
-         (getter, setter) pair base for the third",
+         (getter, setter) pair base for the other two",
     ),
 ];
 

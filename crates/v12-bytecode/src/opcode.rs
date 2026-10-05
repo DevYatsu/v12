@@ -176,6 +176,22 @@ pub enum Opcode {
     ///
     /// No operands.
     PopEnvironment = 78,
+    /// [`Opcode::DefineAccessor`] for the **object-literal** spelling, where
+    /// the accessor is enumerable (`{ get x(){} }`, ES 10.1.6 step 6).
+    ///
+    /// A sibling opcode rather than an attribute operand on `DefineAccessor`,
+    /// for two reasons that are recorded in `docs/adr/`: the 32-bit
+    /// [`Instr`] word is *full* (opcode + `a`/`b`/`c`), so a fourth operand
+    /// cannot fit — it would force the `WideOp` path, whose entire purpose is
+    /// operands wider than a byte, and would make every accessor define
+    /// variable-width; and the difference between the two spellings is one
+    /// bit, which a 256-value opcode space prices at one byte.
+    ///
+    /// Operand layout is identical to `DefineAccessor` — `(obj, key, pair
+    /// base)` — and so is its share of the documented `c`-is-a-packed-pair
+    /// divergence. The class spelling keeps emitting `DefineAccessor`, so no
+    /// class-emitted byte changes.
+    DefineAccessorEnumerable = 79,
 }
 
 /// Every assigned [`Opcode`], in ascending discriminant order.
@@ -263,6 +279,7 @@ pub const ALL_OPCODES: &[Opcode] = &[
     Opcode::GetAsyncIterator,
     Opcode::GetPrototype,
     Opcode::PopEnvironment,
+    Opcode::DefineAccessorEnumerable,
 ];
 
 /// Number of assigned [`Opcode`] variants.
@@ -496,9 +513,15 @@ mod encoding_tests {
         (76, Opcode::GetAsyncIterator),
         (77, Opcode::GetPrototype),
         (78, Opcode::PopEnvironment),
+        // APPENDED, not renumbered. `DefineAccessorEnumerable = 79` is a new
+        // variant (ADR-0005), so the transcript above — which is a frozen
+        // record of the *bytes that already existed* — stays byte-for-byte
+        // intact and one row is appended. The equality assertion below is
+        // what forces this file and `ALL_OPCODES` to move together.
+        (79, Opcode::DefineAccessorEnumerable),
     ];
 
-    /// Every one of the 73 discriminants is pinned, not 13 of them.
+    /// Every one of the 74 discriminants is pinned, not 13 of them.
     ///
     /// Three things at once, and each catches a different failure the old
     /// 13-assert test could not:

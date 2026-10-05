@@ -37,7 +37,7 @@ use crate::{Instr, Opcode, WideOp, all_opcodes};
 /// makes adding one a deliberate act rather than an accident — and, since
 /// `opcode.rs` also pins every discriminant against a frozen transcript, a
 /// variant cannot land here without someone updating two counts on purpose.
-const OPCODE_COUNT: usize = 73;
+const OPCODE_COUNT: usize = 74;
 
 /// Distinct byte values stamped into `a`, `b`, `c`.
 ///
@@ -283,7 +283,7 @@ fn operand_tokens(op: Opcode) -> Vec<String> {
 // Coverage
 // ---------------------------------------------------------------------------
 
-/// The sweep list is complete: 73 assigned variants, strictly ascending, no
+/// The sweep list is complete: 74 assigned variants, strictly ascending, no
 /// duplicates, and it spans every discriminant `TryFrom<u8>` accepts.
 #[test]
 fn all_opcodes_sweep_covers_every_assigned_variant() {
@@ -334,7 +334,7 @@ fn every_assigned_opcode_has_a_spec() {
 /// The table and the disassembler must agree, for every opcode and every slot,
 /// except where a documented divergence says otherwise.
 ///
-/// This is the cross-check the task asks for: it walks all 73 opcodes and
+/// This is the cross-check the task asks for: it walks all 74 opcodes and
 /// compares, slot by slot, against a statement of the contract derived
 /// independently from the one the table was built from. The failure mode it
 /// exists to catch is a wrong *width* — `Add` is ternary and renders three
@@ -557,11 +557,11 @@ fn register_slots_are_a_subset_of_used_slots() {
 // Per-opcode coverage report
 // ---------------------------------------------------------------------------
 
-/// Prints the full 73-row cross-check table and asserts its shape. Run with
+/// Prints the full 74-row cross-check table and asserts its shape. Run with
 /// `cargo test -p v12-bytecode -- --nocapture` (nextest captures stdout) to
 /// read the report.
 ///
-/// This exists so "the test covers all 73" is a claim with output behind it
+/// This exists so "the test covers all 74" is a claim with output behind it
 /// rather than an assertion about a count.
 #[test]
 fn per_opcode_coverage_report() {

@@ -19,7 +19,7 @@ type Res<T> = Result<T, CompileError>;
 
 /// One object-literal accessor key: both closures plus the key register,
 /// batched until all properties are seen so a `get`/`set` pair shares one
-/// `DefineAccessor` (they must land on the same shape transition).
+/// `DefineAccessorEnumerable` (they must land on the same shape transition).
 struct AccessorPair {
     /// Static key text, for pairing getter/setter halves.
     text: String,
@@ -703,8 +703,8 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         let dst = self.new_temp();
         self.emit_reg3(Opcode::NewObject, dst, 0, 0, o.span);
         // Collect accessor halves by key so `{ get x(){}, set x(){} }` emits
-        // ONE `DefineAccessor` carrying both closures (the descriptor needs
-        // both halves on the same shape transition).
+        // ONE `DefineAccessorEnumerable` carrying both closures (the
+        // descriptor needs both halves on the same shape transition).
         let mut accessors: Vec<AccessorPair> = Vec::new();
         for prop_kind in &o.properties {
             match prop_kind {
@@ -768,7 +768,11 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 }
                 (None, None) => unreachable!("accessor with neither half"),
             }
-            self.emit_reg3(Opcode::DefineAccessor, dst, key, pair, span);
+            // A literal accessor is ENUMERABLE (ES 10.1.6 step 6); the class
+            // spelling is not, and the two differ by one attribute bit — hence
+            // two opcodes (ADR-0005) rather than one with an attribute the
+            // 32-bit word has no room for.
+            self.emit_reg3(Opcode::DefineAccessorEnumerable, dst, key, pair, span);
         }
         Ok(dst)
     }

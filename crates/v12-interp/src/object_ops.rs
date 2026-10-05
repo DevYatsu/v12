@@ -202,14 +202,22 @@ impl Interp<'_> {
         Ok(())
     }
 
-    /// `DefineAccessor`: defines an accessor property on `obj` at `key` with
-    /// the given getter/setter function objects (or `undefined` for absent).
+    /// `DefineAccessor` / `DefineAccessorEnumerable`: defines an accessor
+    /// property on `obj` at `key` with the given getter/setter function objects
+    /// (or `undefined` for absent) and the given attributes.
+    ///
+    /// The attributes are the *whole* difference between the two spellings and
+    /// the reason they are two opcodes: a class accessor is non-enumerable, an
+    /// object-literal one is (ADR-0005). The class path still passes
+    /// [`Attrs::BUILTIN`], bit for bit what it passed before this parameter
+    /// existed.
     pub(crate) fn op_define_accessor(
         &mut self,
         obj_v: JsValue,
         key_v: JsValue,
         getter_v: JsValue,
         setter_v: JsValue,
+        attrs: Attrs,
     ) -> Result<(), JSException> {
         let Some(obj) = obj_v.as_object() else {
             return Err(JSException(
@@ -221,9 +229,7 @@ impl Interp<'_> {
         let setter = accessor_target(self.heap, setter_v);
         self.gc_protect();
         let shape = self.shape_of(obj);
-        let child = self
-            .heap
-            .define_accessor(shape, key, getter, setter, Attrs::BUILTIN);
+        let child = self.heap.define_accessor(shape, key, getter, setter, attrs);
         self.bind_shape(obj, child);
         // Accessor slots hold a hole in `properties`; ensure one exists.
         let slot = child_slot(self.heap, child);

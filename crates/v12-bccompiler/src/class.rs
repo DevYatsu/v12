@@ -166,6 +166,12 @@ fn define_elements(
                 }
                 match m.kind {
                     MethodDefinitionKind::Get => {
+                        // A CLASS accessor is non-enumerable (ES 15.7.6), so it
+                        // keeps the plain `DefineAccessor`; the object-literal
+                        // spelling emits `DefineAccessorEnumerable` instead
+                        // (ADR-0005). Nothing here changed, which is what makes
+                        // "the class case is unaffected" a statement about the
+                        // emitted bytes and not only about the answers.
                         let pair = cx.new_temps(2);
                         let getter = method_fn(cx, m)?;
                         cx.move_reg(pair, getter, m.span);

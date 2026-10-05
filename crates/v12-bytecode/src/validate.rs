@@ -382,8 +382,8 @@ fn check_register(
 /// are read from the instruction the roles belong to.
 ///
 /// * `NewArray` reads the contiguous element window `[b, b + c)`.
-/// * `DefineAccessor` reads a packed `(getter, setter)` pair, so the setter at
-///   `c + 1` is read too.
+/// * `DefineAccessor` / `DefineAccessorEnumerable` read a packed
+///   `(getter, setter)` pair, so the setter at `c + 1` is read too.
 ///
 /// The `Call`/`Construct` header window (`[callee][this][args…]`, see
 /// [`crate::Role::Callee`]) is **not** checked: its size is
@@ -392,6 +392,13 @@ fn check_register(
 /// statement of the call ABI that nothing cross-checks — the exact hazard this
 /// crate's table exists to remove. W2.4 routes `call_setup.rs` through the one
 /// `CALL_HEADER_REGS`; the check becomes writable in the same change.
+///
+/// **This function is matched by opcode, so adding an opcode that needs it does
+/// not force adding it here** — a sibling of `DefineAccessor` that omits its own
+/// row keeps every test in this crate green (measured, ADR-0005). Unlike the
+/// checks driven off `Role`, there is no table entry to make it mandatory; the
+/// arm below is justified by the two `OpSpec` role citations and must be extended
+/// by hand.
 fn check_positional_windows(
     at: u32,
     op: Opcode,
@@ -402,7 +409,9 @@ fn check_positional_windows(
         // `b` = element base, `c` = element count.
         Opcode::NewArray => (operands[1], operands[2], "element window b + c"),
         // `c` = pair base; the setter sits at `c + 1`.
-        Opcode::DefineAccessor => (operands[2], 1, "accessor pair base + 1"),
+        Opcode::DefineAccessor | Opcode::DefineAccessorEnumerable => {
+            (operands[2], 1, "accessor pair base + 1")
+        }
         _ => return Ok(()),
     };
     let last = u32::from(base) + u32::from(count);

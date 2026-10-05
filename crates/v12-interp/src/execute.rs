@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use v12_bytecode::{BytecodeError, Const, Instr, Opcode, WideOp};
-use v12_heap::{Handle, JsObject, JsValue, Kind, V12Str};
+use v12_heap::{Attrs, Handle, JsObject, JsValue, Kind, V12Str};
 
 use super::{CallOutcome, DEADLINE_CHECK_INTERVAL, Interp, JSException, env_display_push};
 use crate::feedback::{Lattice, TYPE_NAMES};
@@ -982,7 +982,7 @@ impl Interp<'_> {
                     attempt!(self.op_merge_object(dst_v, src_v));
                     self.set_pc(pc + op_width);
                 }
-                Opcode::DefineAccessor => {
+                Opcode::DefineAccessor | Opcode::DefineAccessorEnumerable => {
                     let obj_v = self.stack[base + usize::from(ra)];
                     let key_v = self.stack[base + usize::from(rb)];
                     let pair_base = base + usize::from(rc);
@@ -996,7 +996,15 @@ impl Interp<'_> {
                         .get(pair_base + 1)
                         .copied()
                         .unwrap_or(JsValue::undefined());
-                    attempt!(self.op_define_accessor(obj_v, key_v, getter_v, setter_v));
+                    // The opcode *is* the attribute: a class accessor is
+                    // non-enumerable, an object-literal one is enumerable, and
+                    // nothing else about the two definitions differs (ADR-0005).
+                    let attrs = if op == Opcode::DefineAccessorEnumerable {
+                        Attrs::ENUMERABLE_ACCESSOR
+                    } else {
+                        Attrs::BUILTIN
+                    };
+                    attempt!(self.op_define_accessor(obj_v, key_v, getter_v, setter_v, attrs));
                     self.set_pc(pc + op_width);
                 }
                 Opcode::GetGlobal => {

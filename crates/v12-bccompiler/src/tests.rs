@@ -3811,3 +3811,80 @@ fn the_class_extends_env_leak_repro_emits_only_unbiased_depths() {
         "h has no scoped environment, so every access is at depth 0; saw {depths:?} in:\n{fb}"
     );
 }
+
+/// The two accessor spellings must be **distinguishable in the bytecode**,
+/// because the only thing that separates them is one attribute bit and the
+/// interpreter cannot recover a bit it was never given (ADR-0005).
+///
+/// An object literal's accessor is enumerable (ES 10.1.6 step 6) and a class
+/// accessor's is not (ES 15.7.6), so they emit *different* opcodes. This test
+/// is the negative control for the whole fix: a change that made accessors
+/// enumerable uniformly — the naive reading of the defect — would keep
+/// `class_accessor_emits_the_non_enumerable_opcode` green and turn
+/// `object_literal_accessor_emits_the_enumerable_opcode` red, and vice versa.
+/// Both halves are asserted, so neither spelling can be changed alone.
+///
+/// It also pins that the class side kept the byte it already had: the emitter
+/// line in `class.rs` is unchanged by ADR-0005, and this is the assertion that
+/// says so.
+#[test]
+fn object_literal_accessor_emits_the_enumerable_opcode() {
+    let fb = compile_source_with_strings(
+        r#"var o = { get g(){ return 1 }, set g(v){}, get h(){ return 2 } };"#,
+    )
+    .unwrap();
+    // The accessor definitions live in the unit that builds the literal, not
+    // in the method bodies, so every unit is swept rather than `last()`.
+    let units = &fb.0.functions;
+    let enumerable = units
+        .iter()
+        .flat_map(|f| f.instrs.iter())
+        .filter(|i| i.op() == Some(Opcode::DefineAccessorEnumerable))
+        .count();
+    assert_eq!(
+        enumerable, 2,
+        "both accessor keys must be defined with the enumerable spelling: {units:?}"
+    );
+    assert_eq!(
+        units
+            .iter()
+            .flat_map(|f| f.instrs.iter())
+            .filter(|i| i.op() == Some(Opcode::DefineAccessor))
+            .count(),
+        0,
+        "an object literal must not emit the class spelling: {units:?}"
+    );
+}
+
+/// The other half of
+/// [`object_literal_accessor_emits_the_enumerable_opcode`]: a class accessor —
+/// instance or static — keeps `DefineAccessor`, which the interpreter gives
+/// `Attrs::BUILTIN` (non-enumerable). Both the `get` and `set` kinds, and both
+/// targets, go through one `class.rs` site, so all four are covered by two
+/// asserts on the count.
+#[test]
+fn class_accessor_emits_the_non_enumerable_opcode() {
+    let fb = compile_source_with_strings(
+        r#"class C { get g(){ return 1 } set g(v){} static get s(){ return 2 } static set t(v){} }"#,
+    )
+    .unwrap();
+    let units = &fb.0.functions;
+    assert_eq!(
+        units
+            .iter()
+            .flat_map(|f| f.instrs.iter())
+            .filter(|i| i.op() == Some(Opcode::DefineAccessor))
+            .count(),
+        4,
+        "all four class accessors keep the non-enumerable spelling: {units:?}"
+    );
+    assert_eq!(
+        units
+            .iter()
+            .flat_map(|f| f.instrs.iter())
+            .filter(|i| i.op() == Some(Opcode::DefineAccessorEnumerable))
+            .count(),
+        0,
+        "a class must not emit the object-literal spelling: {units:?}"
+    );
+}

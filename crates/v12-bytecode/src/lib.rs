@@ -558,6 +558,7 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::ToNumber => "to_number",
         Opcode::MergeObject => "merge_object",
         Opcode::DefineAccessor => "define_accessor",
+        Opcode::DefineAccessorEnumerable => "define_accessor_enumerable",
         Opcode::JumpIfNullish => "jump_if_nullish",
         Opcode::SetPrototype => "set_prototype",
         Opcode::GetPrototype => "get_prototype",
@@ -614,7 +615,9 @@ pub(crate) fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> 
         }
         Opcode::GenResumeMode => write!(f, " r{a}"),
         Opcode::MergeObject => write!(f, " r{b}, r{c}"),
-        Opcode::DefineAccessor => write!(f, " r{a}, r{b}, r{c}"),
+        Opcode::DefineAccessor | Opcode::DefineAccessorEnumerable => {
+            write!(f, " r{a}, r{b}, r{c}")
+        }
         Opcode::SetPrototype => write!(f, " r{b}, r{c}"),
         Opcode::GetPrototype => write!(f, " r{a}, r{b}"),
         Opcode::GetIterator => write!(f, " r{a}, r{b}"),

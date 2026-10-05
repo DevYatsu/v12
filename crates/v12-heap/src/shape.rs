@@ -79,6 +79,19 @@ impl Attrs {
     /// links): writable + configurable but **not** enumerable.
     pub const BUILTIN: Attrs = Attrs(Self::WRITABLE | Self::CONFIGURABLE);
 
+    /// Spec shape for an accessor defined by an **object literal**
+    /// (`{ get x(){} }`, ES 10.1.6 step 6): enumerable + configurable.
+    ///
+    /// Deliberately *not* [`Attrs::DEFAULT`], though the two happen to share a
+    /// bit pattern today: `WRITABLE` is not a meaningful attribute of an
+    /// accessor — ES 10.1.6 never sets it, and 10.2.5 reports `writable:
+    /// false` for every accessor regardless of what is stored here. Writing the
+    /// literal's two bits instead of reusing `DEFAULT` states the intent, and
+    /// stops a future `DEFAULT` from silently redefining a literal accessor.
+    /// A class accessor keeps [`Attrs::BUILTIN`], whose `WRITABLE` bit is
+    /// equally unobservable and equally pre-existing.
+    pub const ENUMERABLE_ACCESSOR: Attrs = Attrs(Self::ENUMERABLE | Self::CONFIGURABLE);
+
     /// A function's own `prototype` property: writable, non-enumerable,
     /// non-configurable (ES 10.2.5 / 15.7.3.1). Not `BUILTIN`, which is
     /// writable+configurable.
