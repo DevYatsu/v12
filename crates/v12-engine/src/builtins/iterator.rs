@@ -1407,10 +1407,7 @@ pub fn iterator_zip(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<J
     for entry in entries {
         columns.push(drain_one(ctx, "Iterator.zip", entry)?);
     }
-    let (rows, fault) = zip_shape(
-        &columns.iter().map(Vec::len).collect::<Vec<_>>(),
-        mode,
-    );
+    let (rows, fault) = zip_shape(&columns.iter().map(Vec::len).collect::<Vec<_>>(), mode);
     let mut out = Vec::with_capacity(rows);
     for i in 0..rows {
         let row: Vec<JsValue> = columns

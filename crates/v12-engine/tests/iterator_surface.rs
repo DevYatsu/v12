@@ -261,8 +261,7 @@ fn take_clamps_a_non_positive_or_non_finite_limit_to_zero() {
     assert!(thrown("[1,2,3].values().take(NaN);").starts_with("RangeError"));
     assert!(thrown("[1,2,3].values().take();").starts_with("RangeError"));
     assert!(
-        thrown("[1,2,3].values().take(Number.MAX_SAFE_INTEGER + 1);")
-            .starts_with("RangeError")
+        thrown("[1,2,3].values().take(Number.MAX_SAFE_INTEGER + 1);").starts_with("RangeError")
     );
     // The two counter-cases the spec deliberately exempts: `-0.5` truncates to
     // `-0` (and `-0 < 0` is false) and `Infinity` is not finite.

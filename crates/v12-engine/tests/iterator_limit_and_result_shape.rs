@@ -69,7 +69,10 @@ fn eval_throw_kind(src: &str) -> Result<String, String> {
 fn take_rejects_nan_limit() {
     // `take()` and `take(undefined)` are the NaN arm: `ToNumber(undefined)` is
     // NaN, so an absent argument is an error rather than a take-nothing.
-    assert_eq!(eval_throw_kind("[1,2,3].values().take()"), Ok("RangeError".into()));
+    assert_eq!(
+        eval_throw_kind("[1,2,3].values().take()"),
+        Ok("RangeError".into())
+    );
     assert_eq!(
         eval_throw_kind("[1,2,3].values().take(undefined)"),
         Ok("RangeError".into())
@@ -139,12 +142,12 @@ fn join_renders_nullish_contents_as_empty_fields() {
         eval_display("['one', null, 'two', undefined].values().join()"),
         "one,,two,"
     );
-    assert_eq!(
-        eval_display("[null, undefined, 2].values().join()"),
-        ",,2"
-    );
+    assert_eq!(eval_display("[null, undefined, 2].values().join()"), ",,2");
     // A non-default separator still applies between the empty fields.
-    assert_eq!(eval_display("[null, 'a', undefined].values().join('-')"), "-a-");
+    assert_eq!(
+        eval_display("[null, 'a', undefined].values().join('-')"),
+        "-a-"
+    );
     // nullish contents do not shorten the result, unlike the pre-fix behaviour.
     assert_eq!(eval_display("[null].values().join()"), "");
 }
@@ -163,21 +166,15 @@ fn iterator_result_inherits_object_prototype() {
     // Every `next` result flows through one shared constructor, so this covers
     // the Array, Iterator and Set iterators at once.
     assert_eq!(
-        eval_display(
-            "Object.getPrototypeOf([1].values().next()) === Object.prototype"
-        ),
+        eval_display("Object.getPrototypeOf([1].values().next()) === Object.prototype"),
         "true"
     );
     assert_eq!(
-        eval_display(
-            "Object.getPrototypeOf([1,2].entries().next()) === Object.prototype"
-        ),
+        eval_display("Object.getPrototypeOf([1,2].entries().next()) === Object.prototype"),
         "true"
     );
     assert_eq!(
-        eval_display(
-            "Object.getPrototypeOf(new Set([1]).values().next()) === Object.prototype"
-        ),
+        eval_display("Object.getPrototypeOf(new Set([1]).values().next()) === Object.prototype"),
         "true"
     );
     // The done result is built by the same constructor, so it is not a special
@@ -245,15 +242,11 @@ fn zip_strict_completes_normally_on_equal_columns() {
     // Equal columns have nothing to fault on, so the iterator completes instead
     // of throwing — the other half of the same mode.
     assert_eq!(
-        eval_display(
-            "Iterator.zip([[1,2],[3,4]], { mode: 'strict' }).next().done"
-        ),
+        eval_display("Iterator.zip([[1,2],[3,4]], { mode: 'strict' }).next().done"),
         "false"
     );
     assert_eq!(
-        eval_display(
-            "Iterator.zip([[1,2],[3,4]], { mode: 'strict' }).toArray().length"
-        ),
+        eval_display("Iterator.zip([[1,2],[3,4]], { mode: 'strict' }).toArray().length"),
         "2"
     );
     let done_src = "var it = Iterator.zip([[1,2],[3,4]], { mode: 'strict' });\
@@ -270,9 +263,7 @@ fn zip_longest_pads_with_the_padding_option() {
         "1,3,2,"
     );
     assert_eq!(
-        eval_display(
-            "Iterator.zip([[1,2],[3]], { mode: 'longest', padding: 0 }).toArray()"
-        ),
+        eval_display("Iterator.zip([[1,2],[3]], { mode: 'longest', padding: 0 }).toArray()"),
         "1,3,2,0"
     );
     // Shortest is unaffected by `padding` entirely.
@@ -281,8 +272,6 @@ fn zip_longest_pads_with_the_padding_option() {
         "1,3"
     );
 }
-
-
 
 // -- JSON raw JSON: the stringify half ----------------------------------------
 //

@@ -892,8 +892,7 @@ fn collect_own_string_keys(
     // Copied out before the liveness test: `descriptor_is_live` needs `obj`,
     // and holding a borrow on the shape's descriptor vec across that would
     // alias the heap.
-    let descriptors: Vec<v12_heap::Descriptor> =
-        heap.get(shape).descriptors.as_slice().to_vec();
+    let descriptors: Vec<v12_heap::Descriptor> = heap.get(shape).descriptors.as_slice().to_vec();
     let mut keys: Vec<Handle<V12Str>> = descriptors
         .iter()
         .filter(|d| descriptor_is_live(heap, obj, d))

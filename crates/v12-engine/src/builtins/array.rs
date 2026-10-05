@@ -245,7 +245,6 @@ fn index_get(heap: &mut Heap, obj: Handle<JsObject>, i: i64) -> Result<(JsValue,
     Ok((v, !v.is_hole()))
 }
 
-
 /// ES `Set(O, ToString(i), v, true)` — the `true` is `Throw`, so a refusal is
 /// a `TypeError` rather than a silent no-op.
 ///
@@ -551,7 +550,9 @@ fn set_array_len(ctx: &mut Ctx, obj: Handle<JsObject>, len: f64) -> Result<(), T
         if len < old_view {
             let kept = ctx.heap.get(obj).elements_snapshot();
             let keep = (len.max(0.0) as usize).min(kept.len());
-            ctx.heap.get_mut(obj).replace_elements(kept[..keep].to_vec());
+            ctx.heap
+                .get_mut(obj)
+                .replace_elements(kept[..keep].to_vec());
         }
     }
     Ok(())

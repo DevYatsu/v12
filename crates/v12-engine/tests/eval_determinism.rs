@@ -172,9 +172,8 @@ fn repeated_compilation_is_identical_over_eval_shapes() {
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for _ in 0..32 {
             let mut interner = v12_bccompiler::Interner::default();
-            let program =
-                v12_bccompiler::compile_source_with_interner(source, &mut interner)
-                    .expect("source compiles");
+            let program = v12_bccompiler::compile_source_with_interner(source, &mut interner)
+                .expect("source compiles");
             let mut record = String::new();
             for function in &program.functions {
                 if let Some(metadata) = &function.eval_metadata {
@@ -201,7 +200,10 @@ fn repeated_compilation_is_identical_over_eval_shapes() {
 fn direct_eval_writes_to_the_caller_scope() {
     // `var` in a direct eval is created in the caller's *variable*
     // environment, so the caller sees it and the global does not.
-    assert_eq!(result("function f(){ eval('var b = 99;'); return b; } f()"), "99");
+    assert_eq!(
+        result("function f(){ eval('var b = 99;'); return b; } f()"),
+        "99"
+    );
     assert_eq!(
         result("function f(){ eval('var b = 99;'); } f(); typeof b"),
         "undefined"
@@ -219,8 +221,14 @@ fn direct_eval_writes_to_the_caller_scope() {
         "eval"
     );
     // Lexical bindings are readable from a direct eval.
-    assert_eq!(result("function f(){ let L = 7; return eval('L'); } f()"), "7");
-    assert_eq!(result("function f(){ const C = 8; return eval('C'); } f()"), "8");
+    assert_eq!(
+        result("function f(){ let L = 7; return eval('L'); } f()"),
+        "7"
+    );
+    assert_eq!(
+        result("function f(){ const C = 8; return eval('C'); } f()"),
+        "8"
+    );
 }
 
 /// Indirect eval — `(0, eval)(...)` — must keep global-only scope.
@@ -250,5 +258,8 @@ fn indirect_eval_stays_global_only() {
     );
     // Direct eval, by contrast, sees the caller's `x` and leaves the global
     // alone. Contrast the two lines: same body, different scope.
-    assert_eq!(result("function f(){ var x = 10; return eval('x'); } f()"), "10");
+    assert_eq!(
+        result("function f(){ var x = 10; return eval('x'); } f()"),
+        "10"
+    );
 }

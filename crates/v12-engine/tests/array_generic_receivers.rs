@@ -73,31 +73,32 @@
 //! observation must actually contain `threw:TypeError`, so a row cannot be
 //! excused as "not implemented" while v12 quietly returns a wrong value.
 //!
-//! Measured at this commit: **156 of 663 rows diverge, across all 39 methods**
-//! (17 receivers × 39 rows). 85 of those are five unimplemented methods on all
-//! seventeen receivers and say nothing about the index/length model. The rest is
-//! three clusters, itemised at [`KNOWN_DIVERGENCES`]: the two accessor defects
-//! that no pre-Batch-6 receiver could reach (E1 and E2 below), the
-//! arguments-exotic `index_assign_past` row, and three `length_lower` rows on
-//! real arrays.
+//! Measured at this commit: **107 of 663 rows diverge, across 20 of the 39
+//! methods** (17 receivers × 39 rows). 85 of those are five unimplemented
+//! methods on all seventeen receivers and say nothing about the index/length
+//! model. The rest is two clusters, itemised at [`KNOWN_DIVERGENCES`]: E2, the
+//! native path's inability to invoke a bytecode getter (19 rows), and five
+//! rows that are neither E1 nor E2 — two `length_lower` rows on real arrays
+//! and the arguments-exotic `index_assign_past` row.
 //!
-//! **Batch 7 fixed one of the three defects it set out to fix, and could not
-//! fix the other two — both because their fix lives outside this batch's file
-//! set.** What was settled here, per defect:
+//! **Batch 9 fixed E1 — the last of the three defects this file found — and it
+//! is fixed in the bytecode, which is why the count fell by 49 rather than
+//! 25.** E1 was that an accessor written in an *object literal* is created
+//! **non-enumerable** (`Object.keys({0:"a", get length(){…}})` answered `["0"]`
+//! where node answers `["0","length"]`), because `DefineAccessor` carried no
+//! attribute operand and its interpreter arm hardcoded the class spelling's
+//! `Attrs::BUILTIN`. It is now `DefineAccessorEnumerable = 79`, emitted only
+//! by the literal lowering, and the class spelling still emits
+//! `DefineAccessor = 66` — verified by a byte-identical disassembly of a class
+//! program before and after the change, not only by the answers agreeing with
+//! node. See [`E1_ACCESSOR_NON_ENUMERABLE`] and ADR-0005.
 //!
-//! * **E3 is FIXED.** A `delete`d property handed the internal `Hole` tag to
-//!   JavaScript. Seven rungs disagreed about what a `hole` cell means; they now
-//!   all say "absent", which is what ES 10.1.8 `OrdinaryGet` step 2 says. See
-//!   [`KNOWN_HOLE_READ_ERRORS`] and
-//!   [`a_deleted_property_never_hands_javascript_the_hole_sentinel`].
-//! * **E2 is OPEN and is not patch-shaped.** `FunctionTarget::Bytecode` is a
-//!   bare index into a program table that `Ctx`'s single `&mut Heap` cannot
-//!   reach, so the two `invoke_accessor_getter` call sites cannot be repaired
-//!   in place — it needs seam interception (25 methods) or a `NativeHandler`
-//!   signature change.
-//! * **E1 is OPEN and the fix is in `v12-bytecode` + `v12-bccompiler`**, which
-//!   this batch may not modify: `DefineAccessor` carries no attribute operand,
-//!   so the interpreter cannot tell a class accessor from a literal one.
+//! E2 is untouched and remains 19 rows on the two accessor receivers. The two
+//! E2 entries that had claimed `accessor_index` as well as `length_getter`
+//! (`fill`, `splice`, `indexOf`, `lastIndexOf`, `includes`, `at`) were narrowed:
+//! `accessor_index`'s accessor sits at an *index* key, which the native path
+//! reads from the property store rather than through `[[Get]]`, so E2 never
+//! applied there and E1's removal exposed the difference.
 //!
 //! # `frozen_object` — the integrity-level rung (found in Batch 7, FIXED in Batch 8)
 //!
@@ -142,7 +143,8 @@
 //! | batch 5 | 9 × 351 | 54 | 10 |
 //! | batch 6 | 16 × 624 | 165 | 39 |
 //! | batch 7 | 17 × 663 | 177 | 39 |
-//! | **batch 8 (this one)** | **17 × 663** | **156** | **39** |
+//! | batch 8 | 17 × 663 | 156 | 39 |
+//! | **batch 9 (this one)** | **17 × 663** | **107** | **20** |
 //!
 //! The 24 → 108 step is the one that matters: it is what a stronger instrument
 //! found when a transcribed table was replaced by a generated one. The
@@ -166,6 +168,15 @@
 //! receiver without an accessor, and the six "hole materialised as an own
 //! `undefined`" rows stay fixed on `holey_object`, which is a holey receiver no
 //! earlier batch had).
+//!
+//! 156 → **107** is the largest single drop in the table's history, and the
+//! per-receiver accounting is the part worth keeping: on `accessor_index` 39
+//! divergent rows → 11, on `length_getter` 39 → 18, and on the fifteen
+//! receivers with no accessor the count is **unchanged at 78** — which is the
+//! floor this file can no longer argue down without fixing E2. That is also
+//! the check on the claim that the fix was surgical: a change to how
+//! accessors are created that moved a row on a receiver with no accessor would
+//! have shown up here immediately.
 //!
 //! What did change is *coverage*: on the six new receivers that carry no
 //! accessor, 5 of 39 rows diverge (`holey_object`, `length_float`,
@@ -564,8 +575,10 @@ const DELETED_KEY_IN_DESCRIPTOR_LIST: &str = "FIXED in Batch 8 — no row carrie
 /// `Object.keys(o).length` column could not see either.
 ///
 /// Batch 8 fixed B, so the `+1` went away and the `−1` became visible for the
-/// first time. The row is now attributed to E1, whose fix is in
-/// `v12-bytecode` + `v12-bccompiler` and therefore not this batch's.
+/// first time. The row was attributed to E1, whose fix was in
+/// `v12-bytecode` + `v12-bccompiler` and therefore not that batch's. **Batch 9
+/// fixed E1** and `pop` on `accessor_index` is clean: v12 now reports the same
+/// 3 own keys as node, for the right reason.
 ///
 /// The transferable lesson, recorded because this table has now been wrong three
 /// different ways: **an observable that two defects can cancel in is an
@@ -584,44 +597,41 @@ const E1_UNMASKED_BY_BATCH_8: &str = "E1, UNMASKED by the Batch-8 fix to the del
 /// therefore almost always named separately in the ledger below.
 const ACCESSOR_RECEIVERS: &[&str] = &["accessor_index", "length_getter"];
 
-/// Cause **E1**: an accessor written in an object literal is registered
-/// **non-enumerable**, so `Object.keys` omits it while node reports it.
+/// Cause **E1**: an accessor written in an object literal was registered
+/// **non-enumerable**, so `Object.keys` omitted it while node reported it.
 ///
-/// **STILL OPEN after Batch 7 — the fix is in a crate this batch may not
-/// touch.** `Interp::op_define_accessor` hardcodes `Attrs::BUILTIN`, and
+/// **FIXED in Batch 9, in `v12-bytecode` + `v12-bccompiler` (ADR-0005).**
+/// `Interp::op_define_accessor` hardcoded `Attrs::BUILTIN`, and
 /// `Attrs::BUILTIN` is `WRITABLE | CONFIGURABLE`, i.e. `enumerable == false`.
 /// That is *correct* for a class accessor (`class C { get g(){} }` must be
 /// non-enumerable — verified against node) and wrong for an object-literal one
-/// (`{ get g(){} }` must be enumerable). Both reach the same opcode
-/// (`DefineAccessor = 66`), from `v12-bccompiler`'s `expr.rs:771` (literal) and
-/// `class.rs:173`/`:180` (class), and `Opcode::DefineAccessor`'s three operands
-/// are `Obj`, `Key`, `Pair` — there is **no attribute operand**, so the
-/// interpreter cannot tell the two spellings apart. The fix is one attribute
-/// carried from the compiler: an attribute operand on `DefineAccessor`, or a
-/// sibling opcode for the literal spelling. Either needs
-/// `crates/v12-bytecode/**` and `crates/v12-bccompiler/**`.
+/// (`{ get g(){} }` must be enumerable). Both reached the same opcode
+/// (`DefineAccessor = 66`), from `v12-bccompiler`'s `expr.rs` (literal) and
+/// `class.rs` (class), and `Opcode::DefineAccessor`'s three operands are
+/// `Obj`, `Key`, `Pair` — there was **no attribute operand**, so the
+/// interpreter could not tell the two spellings apart.
 ///
-/// Nothing depends on the old value. The *only* consumer of the literal's
-/// enumerability in this table is `Object.keys`, and the class accessor stays
-/// non-enumerable either way because it takes the same code path with a
-/// different attribute. Measured at this commit: `{ m(){} }` (a method
-/// shorthand) IS enumerable, because `expr.rs`'s `object_prop` routes `Init`
-/// through `SetProperty` and never reaches `op_define_accessor` — so this is
-/// the accessor spelling only.
+/// The fix is a sibling opcode, `DefineAccessorEnumerable = 79`, emitted only
+/// by the literal lowering; the class spelling still emits `DefineAccessor =
+/// 66`, so no class-emitted byte changed (proved by a byte-identical
+/// disassembly of a class program across the change, not only by the answers).
+/// The attributes are now a parameter of `op_define_accessor`:
+/// `Attrs::BUILTIN` for the class spelling — bit for bit what it hardcoded —
+/// and the new `Attrs::ENUMERABLE_ACCESSOR` for the literal one.
 ///
-/// This is NOT an index/length defect and it is charged to every row of both
-/// accessor receivers through the harness's `Object.keys(o).length` column —
-/// the same conflation the harness docstring avoids for `JSON.stringify`. It
-/// is reported rather than hidden, because suppressing it would mean the table
-/// quietly stopped being a differential table on two of seventeen receivers.
-/// Verified at this commit: `Object.getOwnPropertyNames({0:"a", get length(){…}})`
-/// answers `0,length` in v12 (the key IS in the shape) while
-/// `getOwnPropertyDescriptor(…).enumerable` answers `false` where node answers
-/// `true`, which is what makes `Object.keys` drop it.
-const E1_ACCESSOR_NON_ENUMERABLE: &str = "E1: an object-literal accessor is created non-enumerable, so `Object.keys` omits it \
-     (v12 `getOwnPropertyDescriptor(o, k).enumerable` is false where node's is true) and the \
-     harness's key count is one low. An `Object.keys` defect, not an index/length one. OPEN: \
-     `DefineAccessor` carries no attribute operand, so the fix is in v12-bytecode + v12-bccompiler.";
+/// Nothing depended on the old value. The *only* consumer of the literal's
+/// enumerability in this table was `Object.keys`. `{ m(){} }` (a method
+/// shorthand) was and remains enumerable and never reached
+/// `op_define_accessor`: `expr.rs`'s `object_prop` routes `Init` through
+/// `SetProperty`. That was true before the fix and is still true, which is why
+/// the ledger could say "the accessor spelling only" and be right.
+///
+/// At the time it was written the diagnosis also recorded what was NOT wrong:
+/// `getOwnPropertyNames({0:"a", get length(){…}})` answered `0,length` in v12
+/// — the key was in the shape all along — while
+/// `getOwnPropertyDescriptor(…).enumerable` answered `false`. One attribute,
+/// one observer.
+const E1_ACCESSOR_NON_ENUMERABLE: &str = "FIXED in Batch 9 — no row carries this any more.";
 
 /// Cause **E2**: `internal_methods::invoke_accessor_getter` cannot run a
 /// **bytecode** getter — it matches `FunctionTarget::Native`/`Host` and returns
@@ -689,7 +699,7 @@ struct Known<'a> {
     why: &'a str,
 }
 
-/// The complete, current divergence set: **156 of 663 rows, 39 methods**
+/// The complete, current divergence set: **107 of 663 rows, 20 methods**
 /// (17 receivers × 39 rows).
 ///
 /// A `Known` entry is one (method, receivers, cause) triple, and **a method may
@@ -698,21 +708,25 @@ struct Known<'a> {
 /// instead of letting a later entry overwrite an earlier one, which is what
 /// makes per-cause attribution possible without a second table.
 ///
-/// # How the 156 rows divide
+/// # How the 107 rows divide
 ///
 /// * **85 rows** are the five `absent` methods on all seventeen receivers. They
 ///   say nothing about the index/length model; they were 45 of 351 before
 ///   Batch 6 and are still the same five methods.
-/// * **62 rows** are E1 on the two accessor receivers (`accessor_index` and
-///   `length_getter`), plus 3 `length_lower`/`array_dense`/`array_holey` rows.
-///   E1 is a literal accessor registered non-enumerable; it is open and its fix
-///   is in `v12-bytecode` + `v12-bccompiler`.
-/// * **7 rows** are E2 on `length_getter` (the callback-seam methods read
-///   `length` through the interpreter and agree with node; the native path does
-///   not).
+/// * **19 rows** are E2 — 6 on `accessor_index` (`copyWithin`, `slice`,
+///   `reverse`, `shift`, `unshift`, `flat`) and 13 on `length_getter` (those
+///   six plus `fill`, `splice`, `pop`, `indexOf`, `lastIndexOf`, `includes`,
+///   `at`). The callback-seam methods read `length` through the interpreter
+///   and agree with node on these receivers; the native path does not.
+/// * **2 rows** are `length_lower` on `array_dense` and `array_holey` — a real
+///   array's element store and its shape disagree after `o.length = 1`. The
+///   accessor receivers' `length_lower` rows were E1's and are now fixed.
 /// * **1 row** is `index_assign_past` on `arguments_exotic`.
-/// * **1 row** is `pop` on `accessor_index` — see
-///   [`E1_UNMASKED_BY_BATCH_8`].
+///
+/// 85 + 19 + 2 + 1 = 107, and 20 of the 39 methods carry at least one row.
+/// **No row is charged to E1 any more**: Batch 9 removed all 24 of its ledger
+/// entries, including its two `length_lower` ones — the accessor receivers'
+/// `length_lower` rows agree with node without any further claim.
 ///
 /// # Batch 8: 177 → 156, and the one row it ADDED
 ///
@@ -730,7 +744,22 @@ struct Known<'a> {
 /// (whose stale key v12 was still counting). The two errors cancelled to zero.
 /// Fixing B removed the +1 and exposed E1's −1 underneath it. A tolerance for
 /// "the count matches" would have hidden this permanently; a test asserting the
-/// composition would not have. See [`E1_UNMASKED_BY_BATCH_8`].
+/// composition would not have. See [`E1_UNMASKED_BY_BATCH_8`]. Batch 9 removed
+/// the −1, and `pop` on `accessor_index` is now clean.
+///
+/// # Batch 9: 156 → 107, and six E2 entries narrowed
+///
+/// E1's 24 entries were deleted outright — every one of them a method whose
+/// divergence was E1 *alone* or E1 unioned with a cause that survives. Six E2
+/// entries had listed `ACCESSOR_RECEIVERS` while E2 in fact only ever applied
+/// to `length_getter` (`fill`, `splice`, `indexOf`, `lastIndexOf`, `includes`,
+/// `at`), and are now narrowed to it. The union in [`declared_divergences`]
+/// had been masking that: E1 claimed both receivers for those methods, so the
+/// over-broad E2 claim was never the *observed* set, and removing E1 exposed
+/// it. `accessor_index`'s accessor is at an integer key, which the native
+/// reader takes from the property store; `length_getter`'s accessor is
+/// `length` itself, which every native path must go through `[[Get]]` to
+/// learn. That is the whole reason the two receivers need separate claims.
 ///
 /// Every batch number recorded against 351 is stated against a denominator this
 /// table no longer has; see the header.
@@ -770,35 +799,30 @@ const KNOWN_DIVERGENCES: &[Known] = &[
     //
     // ONE defect behind these entries, which the generated table separated for
     // us: `hasOwnProperty(o, i)` said false but `Object.keys(o)` still counted
-    // the index. **Batch 8 FIXED this**, so the cluster is gone: every entry
-    // below now carries only the cause that REMAINS on that receiver, and a
-    // reader diffing Batch 7 against Batch 8 should expect these receiver sets
-    // to be much smaller. See [`DELETED_KEY_IN_DESCRIPTOR_LIST`].
-    Known {
-        method: "pop",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "shift",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "splice",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    // `holey_object` used to extend the same cluster to three more methods
-    // (`copyWithin`, `sort`, `unshift`). All three are gone — the delete they
-    // made is now observed by `DeletePropertyOrThrow`, and the holed cell is
-    // now filtered out of the descriptor list — and `copyWithin`/`fill`/
-    // `unshift` on `frozen_object` are gone too, so those receiver sets were
-    // DELETED rather than narrowed. The ratchet fails in both directions, so
-    // leaving them would have been a failure, not a harmless leftover.
+    // the index. **Batch 8 FIXED this**; **Batch 9 FIXED the E1 residue**, so
+    // this whole section is gone. `pop` and `shift` below survived Batch 8
+    // carrying E1 alone, and `splice` carried E1 on `length_getter` — all
+    // three now agree with node (`pop` on `accessor_index` was the row whose
+    // two cancelling errors Batch 8 unmasked; see
+    // [`E1_UNMASKED_BY_BATCH_8`]). The ratchet fails in both directions, so
+    // leaving the entries would have been a failure, not a harmless leftover.
+    // `holey_object` had extended the same cluster to `copyWithin`, `sort` and
+    // `unshift` before Batch 8. See [`DELETED_KEY_IN_DESCRIPTOR_LIST`].
+    //
+    // `length_lower` on `array_dense`/`array_holey` below is NOT part of that
+    // cluster: it is `o.length = 1` on a real array dropping the element but
+    // not its own key, and it has nothing to do with `Object.keys` seeing a
+    // deleted key.
+    // `o.length = 1` drops the element but not its own key: the element store
+    // and the shape descriptor disagree after the write.
+    //
+    // This entry did NOT grow in Batch 9, and that is worth stating because it
+    // was expected to: E1's `length_lower` entries on both accessor receivers
+    // were deleted as FIXED, and it would have been tidy to widen this one to
+    // cover them instead. The measured set says otherwise — on both accessor
+    // receivers `length_lower` now agrees with node, so the two rows here are
+    // the only two, and the cause is the real-array store/shape disagreement
+    // alone.
     Known {
         method: "length_lower",
         receivers: &["array_dense", "array_holey"],
@@ -816,15 +840,15 @@ const KNOWN_DIVERGENCES: &[Known] = &[
     // -- E2: the accessor receivers, one entry per method --------------------
     //
     // `accessor_index` and `length_getter` are the two receivers with an
-    // accessor property, and between them they diverge on 38 and 39 of their 39
-    // rows. Every entry below is `ACCESSOR_RECEIVERS`; the two `why` texts say
-    // which of E1/E2 the row carries, because they are separable and only one
-    // of them is an index/length defect.
+    // accessor property, and they now diverge on 11 and 18 of their 39 rows.
+    // Both carry E2 — and only E2. E1 is gone (Batch 9), so there is no longer
+    // a second `why` to disambiguate here, and the receiver sets below are the
+    // *measured* ones rather than a union with an accessor's key count.
     //
     // E2 BEYOND THE KEY COUNT — the native path really does misread the receiver.
     Known {
         method: "fill",
-        receivers: ACCESSOR_RECEIVERS,
+        receivers: &["length_getter"],
         absent: false,
         why: E2_ACCESSOR_GETTER_UNREADABLE,
     },
@@ -860,7 +884,7 @@ const KNOWN_DIVERGENCES: &[Known] = &[
     },
     Known {
         method: "splice",
-        receivers: ACCESSOR_RECEIVERS,
+        receivers: &["length_getter"],
         absent: false,
         why: E2_ACCESSOR_GETTER_UNREADABLE,
     },
@@ -872,25 +896,25 @@ const KNOWN_DIVERGENCES: &[Known] = &[
     },
     Known {
         method: "indexOf",
-        receivers: ACCESSOR_RECEIVERS,
+        receivers: &["length_getter"],
         absent: false,
         why: E2_ACCESSOR_GETTER_UNREADABLE,
     },
     Known {
         method: "lastIndexOf",
-        receivers: ACCESSOR_RECEIVERS,
+        receivers: &["length_getter"],
         absent: false,
         why: E2_ACCESSOR_GETTER_UNREADABLE,
     },
     Known {
         method: "includes",
-        receivers: ACCESSOR_RECEIVERS,
+        receivers: &["length_getter"],
         absent: false,
         why: E2_ACCESSOR_GETTER_UNREADABLE,
     },
     Known {
         method: "at",
-        receivers: ACCESSOR_RECEIVERS,
+        receivers: &["length_getter"],
         absent: false,
         why: E2_ACCESSOR_GETTER_UNREADABLE,
     },
@@ -900,142 +924,27 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         absent: false,
         why: E2_ACCESSOR_GETTER_UNREADABLE,
     },
-    // E1 ALONE — the method's own answer agrees with node on both receivers and
-    // only the harness's `Object.keys` column differs. Twenty-six rows' worth,
-    // and NOT one index/length defect: this is the cost of putting an accessor
-    // in a receiver and is stated here so nobody reads these as 26 method bugs.
+    // E1 ALONE — DELETED IN BATCH 9, and this is the record of what it was.
+    //
+    // Twenty-one entries, every one of them a method whose own answer already
+    // agreed with node on both accessor receivers and whose ONLY divergence was
+    // the harness's `Object.keys(o).length` column: `join`, `sort`, `concat`,
+    // `toString`, `push`, `flatMap`, `map`, `forEach`, `filter`, `reduce`,
+    // `reduceRight`, `some`, `every`, `find`, `findIndex`, `findLast`,
+    // `findLastIndex`, `index_assign_low`, `index_assign_mid`,
+    // `index_assign_past`, `length_lower`. Not one index/length defect: it was
+    // the cost of putting a literal accessor in a receiver, and it is recorded
+    // here so nobody reads those 21 methods as 21 method bugs.
     //
     // The seam methods (`map`, `forEach`, `filter`, `some`, `every`, `find*`,
-    // `flatMap`, `reduce`, `reduceRight`) are in this group and that is the
-    // point: they read `length` through `Interp::get_property`, so they get the
-    // getter right and would have been the only rows in the table that could
-    // have shown the split between the two readers.
-    Known {
-        method: "join",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "sort",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "concat",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "toString",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "push",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "flatMap",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "map",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "forEach",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "filter",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "reduce",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "reduceRight",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "some",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "every",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "find",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "findIndex",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "findLast",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "findLastIndex",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "index_assign_low",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "index_assign_mid",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "index_assign_past",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
-    Known {
-        method: "length_lower",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E1_ACCESSOR_NON_ENUMERABLE,
-    },
+    // `flatMap`, `reduce`, `reduceRight`) were in that group and that was the
+    // point: they read `length` through `Interp::get_property`, so they got the
+    // getter right and were the only rows in the table that could have shown
+    // the split between the two readers.
+    //
+    // `length_lower` is the one name that SURVIVES the deletion, and it is
+    // charged to a different cause — see the `array_dense`/`array_holey` entry
+    // above, which Batch 9 extended to both accessor receivers.
     // -- FROZEN: the integrity-level receiver ------------------------------
     //
     // **Batch 8 FIXED all seven of these.** `frozen_object` now diverges on
@@ -1144,7 +1053,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 156,
+        total, 107,
         "the divergence count moved without the ledger's shape changing"
     );
 }
@@ -2403,5 +2312,94 @@ fn a_delete_performed_by_a_method_lowers_the_own_key_count() {
         ),
         r#"[3,3,"0,1,length",true,false]"#,
         "sort writes index 1 and deletes the vacated index 2",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E1: the two accessor spellings, pinned separately
+// ---------------------------------------------------------------------------
+
+/// An accessor in an **object literal** is enumerable, and both key readers
+/// agree — this is E1, the defect that made `Object.keys({0:"a", get
+/// length(){return 3}})` answer `["0"]` where node answers `["0","length"]`.
+///
+/// Every expectation here was read off `node` for this commit, not off v12:
+///
+/// ```text
+/// $ node -e 'console.log(JSON.stringify(Object.keys({0:"a", get length(){return 3}})))'
+/// ["0","length"]
+/// ```
+///
+/// The descriptor is checked as well as the key set, because the two are
+/// separate facts and E1 was a descriptor fact that only *showed up* through
+/// `Object.keys`: `Object.getOwnPropertyNames` already answered `0,length`
+/// before the fix, which is what narrowed the diagnosis to one attribute.
+#[test]
+fn an_object_literal_accessor_is_enumerable_and_node_agrees() {
+    assert_is(
+        &eval_json(
+            r#"var o = {0:"a", get length(){return 3}};
+               var forin = []; for (var k in o) { forin.push(k); }
+               var d = Object.getOwnPropertyDescriptor(o, "length");
+               JSON.stringify([Object.keys(o), forin, Object.getOwnPropertyNames(o),
+                               d.enumerable, d.configurable, String(o.length),
+                               Object.keys({get g(){return 1}, set g(v){}}).join(","),
+                               Object.getOwnPropertyNames({get g(){return 1}}).join(",")]);"#,
+        ),
+        r#"[["0","length"],["0","length"],["0","length"],true,true,"3","g","g"]"#,
+        "a literal accessor is enumerable to every own-key reader (node agrees)",
+    );
+}
+
+/// The other half of the same decision: a **class** accessor is
+/// **non-enumerable**, and it must stay that way.
+///
+/// This is the negative control for the fix. `DefineAccessorEnumerable` is
+/// emitted only by the literal lowering, so a change that made accessors
+/// enumerable *uniformly* — the naive reading of E1 — turns this test red. The
+/// mutation is run and confirmed red in the batch notes; `node` is the oracle:
+///
+/// ```text
+/// $ node -e 'console.log(JSON.stringify(Object.keys(new (class C { get g(){return 3} })())))'
+/// []
+/// ```
+///
+/// `static` is included because the class emitter routes both the instance and
+/// the static spelling through the same `DefineAccessor` (class.rs), so a
+/// half-applied fix would show up on exactly one of them.
+#[test]
+fn a_class_accessor_stays_non_enumerable_and_node_agrees() {
+    assert_is(
+        &eval_json(
+            r#"class C { get g(){return 3} set g(v){} static get s(){return 4} m(){} }
+               var i = new C();
+               var di = Object.getOwnPropertyDescriptor(C.prototype, "g");
+               var ds = Object.getOwnPropertyDescriptor(C, "s");
+               JSON.stringify([Object.keys(i), Object.keys(C.prototype), Object.keys(C),
+                               di.enumerable, di.configurable, ds.enumerable,
+                               Object.keys(C.prototype).join(","),
+                               i.g, C.s, typeof i.m]);"#,
+        ),
+        r#"[[],[],[],false,true,false,"",3,4,"function"]"#,
+        "a class accessor is non-enumerable on both the prototype and the ctor",
+    );
+}
+
+/// Method shorthand is a third spelling and was never E1's problem: it routes
+/// through `SetProperty`, never reached `op_define_accessor`, and must still be
+/// enumerable. Pinning it separately is what stops a future "make all accessors
+/// enumerable" fix from being written as "make all literal properties
+/// enumerable".
+#[test]
+fn a_method_shorthand_is_still_enumerable_and_node_agrees() {
+    assert_is(
+        &eval_json(
+            r#"var o = {m(){}, 0:"a", b:2, get g(){return 1}};
+               var d = Object.getOwnPropertyDescriptor(o, "m");
+               JSON.stringify([Object.keys(o), d.enumerable, d.writable, d.configurable,
+                               typeof o.m, Object.keys({m(){}}).join(",")]);"#,
+        ),
+        r#"[["0","m","b","g"],true,true,true,"function","m"]"#,
+        "a method shorthand keeps all three attributes; node reports the same",
     );
 }

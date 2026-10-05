@@ -87,7 +87,10 @@ fn low_lone_surrogate_is_accepted() {
 
 #[test]
 fn range_boundaries_still_hold() {
-    assert_eq!(units("String.fromCodePoint(0x10FFFF)"), vec![0xDBFF, 0xDFFF]);
+    assert_eq!(
+        units("String.fromCodePoint(0x10FFFF)"),
+        vec![0xDBFF, 0xDFFF]
+    );
     assert!(throws_range_error("String.fromCodePoint(0x110000)"));
     assert!(throws_range_error("String.fromCodePoint(-1)"));
 }
@@ -102,9 +105,11 @@ fn many_surrogates_survive_a_large_apply() {
     // The shape the generated RegExp tests use: `String.fromCodePoint.apply`
     // over a big array of surrogate code points.
     assert_eq!(
-        run("var a = []; for (var i = 0; i < 10000; i++) { a[i] = 0xDC00 + (i % 1024); } \
+        run(
+            "var a = []; for (var i = 0; i < 10000; i++) { a[i] = 0xDC00 + (i % 1024); } \
              var s = String.fromCodePoint.apply(null, a); \
-             throw s.length;"),
+             throw s.length;"
+        ),
         "10000"
     );
 }

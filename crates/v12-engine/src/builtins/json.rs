@@ -516,6 +516,73 @@ fn array_length(ctx: &Ctx, arr: Handle<JsObject>) -> u32 {
     ctx.heap.get(arr).element_len() as u32
 }
 
+/// `LengthOfArrayLike(O)` (7.3.19) — the spec algorithm `SerializeJSONArray`
+/// step 3 names, as opposed to the `properties[0]` guess [`array_length`].
+///
+/// This is a *second* length reader in this file and the old one was wrong
+/// twice over, which is what made J1 invisible from here:
+///
+/// * It read `properties.first()`, which for a sparse array holds `length` but
+///   for any array carrying a named own property holds **that property's
+///   value**. `var a = [1,2,3]; a.x = 2;` therefore reported length 2.
+/// * It fell back to `element_len()`, the element *lattice* — present entries
+///   only — so an array with no `length` slot at all reported its highest
+///   present index plus one. `new Array(5)` reported 0.
+///
+/// `dispatch_get` is the spec's `Get(O, "length")` and is the same rung
+/// `array_like_len` (`builtins/array.rs`) uses, so the two agree by
+/// construction rather than by coincidence. An `Err` here is a `Proxy` trap,
+/// which this engine does not implement for a receiver that also has to be a
+/// `Kind::Array` to reach [`write_array`]; absent is the spec's answer for an
+/// absent `length`, and no array this engine builds is in that position.
+fn length_of_array_like(ctx: &mut Ctx, obj: Handle<JsObject>) -> u32 {
+    {
+        let key = v12_heap::PropKey::from_string(ctx.heap.intern_text("length"));
+        let len =
+            match crate::internal_methods::dispatch_get(ctx.heap, obj, key, JsValue::object(obj)) {
+                Ok(v) => {
+                    super::ctx::length_from(super::ctx::heap_to_integer_or_infinity(ctx.heap, v))
+                }
+                Err(_) => 0.0,
+            };
+        // `SerializeJSONArray` iterates `0..len`; only a non-negative integer in
+        // range can be walked, and `ToUint32`-style saturation keeps a `length` of
+        // `2**53` from wrapping into a short array.
+        if len.is_finite() && len >= 0.0 {
+            if len >= f64::from(u32::MAX) {
+                u32::MAX
+            } else {
+                len as u32
+            }
+        } else {
+            0
+        }
+    }
+}
+
+/// `Get(O, ToString(k))` — `SerializeJSONArray` step 6.a.
+///
+/// The element-store rung first, and it is not a shortcut: it is the *first*
+/// rung of `ordinary_get` (`internal_methods.rs`), which
+/// `builtins/array.rs::index_get` documents and keeps for the same reason
+/// (re-deriving the key text per index is measurable on the GC-stress tests).
+/// A lattice hole is an absent index, so it falls through to `dispatch_get`,
+/// which also reaches an index a `Object.defineProperty` put in the shape
+/// rather than the store, and an accessor installed at an index.
+fn json_array_element(ctx: &mut Ctx, arr: Handle<JsObject>, i: u32) -> JsValue {
+    if matches!(
+        ctx.heap.get(arr).kind,
+        v12_heap::Kind::Array | v12_heap::Kind::Arguments
+    ) && let Some(v) = ctx.heap.get(arr).get_element(i)
+        && !v.is_hole()
+    {
+        return v;
+    }
+    let key = v12_heap::PropKey::from_string(ctx.heap.intern_text(&i.to_string()));
+    crate::internal_methods::dispatch_get(ctx.heap, arr, key, JsValue::object(arr))
+        .unwrap_or(JsValue::undefined())
+}
+
 pub fn json_stringify(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or(JsValue::undefined());
     let replacer = args.get(1).copied();
@@ -642,18 +709,26 @@ fn write_array(
     seen: &mut Vec<Handle<JsObject>>,
     list: Option<&[String]>,
 ) -> Result<bool, WriteErr> {
-    let elems = ctx.heap.get(arr).elements_snapshot();
-    if elems.is_empty() {
+    // J1: the bound is `LengthOfArrayLike(value)` (step 3), NOT the element
+    // lattice. Walking `elements_snapshot()` made the serialised length a
+    // function of which slots happened to be present, so a holey array with
+    // `length` 5 and four present entries serialised four entries — dropping a
+    // slot the spec requires and, symmetrically, ignoring a `length` that had
+    // been *lowered*. The bound now comes from `length` and each index is read
+    // on its own, so a hole is an absent index that step 6.a turns into
+    // `undefined` and step 6.b into `null`: `[1,null,3]`, exactly as in node.
+    let len = length_of_array_like(ctx, arr);
+    if len == 0 {
         out.push_str("[]");
         return Ok(true);
     }
     out.push('[');
-    for (i, &v) in elems.iter().enumerate() {
+    for i in 0..len {
         if i > 0 {
             out.push(',');
         }
         newline_indent(unit, depth + 1, out);
-        let v = if v.is_hole() { JsValue::null() } else { v };
+        let v = json_array_element(ctx, arr, i);
         // Arrays represent holes/undefined/functions as null; a cycle or a
         // BigInt still throws (propagated, not nulled). The PropertyList
         // propagates into object elements.
@@ -704,6 +779,36 @@ fn enumerable_own_keys(ctx: &mut Ctx, obj: Handle<JsObject>) -> Vec<(Handle<V12S
             continue; // deleted data property: descriptor kept, slot holed
         }
         raw.push((h, value));
+    }
+    // J2: the ELEMENT STORE, which the two rungs above do not cover at all.
+    // `Kind::Arguments` keeps its indices there rather than in the shape or the
+    // dictionary, so before this rung `JSON.stringify(arguments)` walked an
+    // object with no descriptors at all and answered `{}` — while
+    // `Object.keys(arguments)` (which is `collect_enumerable_string_keys`,
+    // `builtins/object.rs`) reported every index, in the same tick, on the same
+    // object. This is the same defect shape as E1 in that file (a wrong
+    // enumerability answer producing an empty object) and the same lesson: a
+    // second, narrower copy of "the own enumerable string keys" is a second
+    // copy of every future bug.
+    //
+    // The bound is `element_len()` (the store's own extent, holes included)
+    // and each index is tested rather than assumed, mirroring
+    // `collect_enumerable_string_keys` exactly. Only `Kind::Array` and
+    // `Kind::Arguments` have such a store; for every other kind `elements` is
+    // empty and this rung contributes nothing.
+    if matches!(
+        ctx.heap.get(obj).kind,
+        v12_heap::Kind::Array | v12_heap::Kind::Arguments
+    ) {
+        let bound = ctx.heap.get(obj).element_len() as u32;
+        for i in 0..bound {
+            if let Some(v) = ctx.heap.get(obj).get_element(i)
+                && !v.is_hole()
+            {
+                let h = ctx.heap.intern_text(&i.to_string());
+                raw.push((h, v));
+            }
+        }
     }
     // Dictionary-rung overflow (past the shape spill threshold), in insertion
     // sequence order.
@@ -792,6 +897,13 @@ fn write_object(
                     .lookup_property(shape, key)
                     .and_then(|d| d.slot())
                     .and_then(|slot| ctx.heap.get(obj).properties.get(slot as usize).copied());
+                // A third copy of the own-key lookup, and it needed the same
+                // element-store rung as `enumerable_own_keys` (J2): under a
+                // one-name replacer `JSON.stringify(arguments, ['1'])` reached
+                // this branch and still found nothing, because a
+                // `Kind::Arguments` index is in the store and not in the shape.
+                let value =
+                    value.or_else(|| array_index(name).map(|i| json_array_element(ctx, obj, i)));
                 if let Some(v) = value
                     && !v.is_hole()
                 {
@@ -890,8 +1002,8 @@ fn raw_json_of(ctx: &mut Ctx, obj: Handle<JsObject>) -> Option<String> {
 /// that throws there would turn a type test into an exception.
 fn inherited_raw_json_prop(ctx: &mut Ctx, proto: Handle<JsObject>) -> Option<Handle<JsObject>> {
     let key = v12_heap::PropKey::from_string(ctx.heap.intern_text("rawJSON"));
-    let value = crate::internal_methods::dispatch_get(ctx.heap, proto, key, JsValue::object(proto))
-        .ok()?;
+    let value =
+        crate::internal_methods::dispatch_get(ctx.heap, proto, key, JsValue::object(proto)).ok()?;
     value.as_object()
 }
 
@@ -915,11 +1027,7 @@ fn is_raw_json_proto(ctx: &mut Ctx, proto: Handle<JsObject>) -> bool {
 /// additionally accept an object whose *prototype* carries a well-formed raw-JSON
 /// proto, which is the shape a raw JSON value takes once something has copied it
 /// rather than moved it.
-pub fn json_is_raw_json(
-    ctx: &mut Ctx,
-    _this: JsValue,
-    args: &[JsValue],
-) -> Result<JsValue, Throw> {
+pub fn json_is_raw_json(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let value = args.first().copied().unwrap_or(JsValue::undefined());
     let Some(obj) = value.as_object() else {
         // Step 1: a primitive is never raw JSON.
@@ -963,9 +1071,7 @@ pub fn json_raw_json(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<
         return Err(throw_kind(
             ctx,
             "SyntaxError",
-            &format!(
-                "JSON.rawJSON text contains an unescaped control character U+{bad:04X}"
-            ),
+            &format!("JSON.rawJSON text contains an unescaped control character U+{bad:04X}"),
         ));
     }
     let serialized = ctx.string_text(h);

@@ -224,7 +224,9 @@ fn nested_loops_pop_exactly_the_exited_iteration_environments() {
 #[test]
 fn uncaptured_loop_variable_is_unaffected() {
     assert_eq!(
-        eval_display("function f() { let acc = 0; for (const v of [1, 2, 3]) { acc = acc + v; } return acc; } f()"),
+        eval_display(
+            "function f() { let acc = 0; for (const v of [1, 2, 3]) { acc = acc + v; } return acc; } f()"
+        ),
         "6"
     );
 }
@@ -358,7 +360,9 @@ fn nested_for_statements_pop_exactly_the_exited_environments() {
 #[test]
 fn uncaptured_for_statement_counter_is_unaffected() {
     assert_eq!(
-        eval_display("function f() { let acc = 0; for (let i = 0; i < 100; i++) { acc = acc + i; } return acc; } f()"),
+        eval_display(
+            "function f() { let acc = 0; for (let i = 0; i < 100; i++) { acc = acc + i; } return acc; } f()"
+        ),
         "4950"
     )
 }
@@ -388,4 +392,3 @@ fn closure_created_after_a_for_statement_captures_the_right_environment() {
         "real3"
     )
 }
-
