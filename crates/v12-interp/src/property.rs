@@ -3168,8 +3168,8 @@ impl Interp<'_> {
             if let Some(setter) = own.set.as_object() {
                 self.call_accessor_with(setter, receiver, &[value])?;
             }
-            Ok(true)
-        }
+Ok(true)
+    }
     }
 
     /// Proxy `[[HasProperty]]` (ES 10.5.6): consult the handler's `has` trap.
@@ -3796,6 +3796,31 @@ impl Interp<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// ES 13.5.1.3 `DeletePropertyOrThrow(O, P)`: `[[Delete]]`, and a `false`
+    /// result is a `TypeError`.
+    ///
+    /// Split out of [`Self::delete_property`] because that function is
+    /// `[[Delete]]` — it answers the boolean, which is what a `delete`
+    /// expression and `Reflect.deleteProperty` want. Every **spec algorithm
+    /// step** that says `? DeletePropertyOrThrow` wants the throwing form, and
+    /// the two were previously the same call with the boolean dropped: the one
+    /// caller with a spec step to honour,
+    /// [`array_sort_callback`](crate::Interp::array_sort_callback)'s
+    /// `SortIndexedProperties` step 6, wrote `self.delete_property(receiver,
+    /// key)?;` and so deleted nothing observable when the receiver refused.
+    pub(crate) fn delete_property_or_throw(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+    ) -> Result<(), JSException> {
+        if self.delete_property(obj_v, key_v)? {
+            return Ok(());
+        }
+        Err(JSException(
+            self.type_error("Cannot delete property of an object"),
+        ))
     }
 
     pub(crate) fn array_element(&self, obj: Handle<JsObject>, idx: u32) -> JsValue {

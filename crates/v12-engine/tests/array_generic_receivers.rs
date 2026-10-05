@@ -73,15 +73,13 @@
 //! observation must actually contain `threw:TypeError`, so a row cannot be
 //! excused as "not implemented" while v12 quietly returns a wrong value.
 //!
-//! Measured at this commit: **177 of 663 rows diverge, across all 39 methods**
+//! Measured at this commit: **156 of 663 rows diverge, across all 39 methods**
 //! (17 receivers × 39 rows). 85 of those are five unimplemented methods on all
 //! seventeen receivers and say nothing about the index/length model. The rest is
-//! five clusters, itemised at [`KNOWN_DIVERGENCES`]: the pre-existing
-//! `Object.keys`-after-delete defect (17 rows), two accessor defects that no
-//! pre-Batch-6 receiver could reach (E1 and E2 below, 21 rows with a
-//! behavioural difference plus 47 rows that differ only in the harness's key
-//! count), the arguments-exotic `index_assign_past` row, and the seven
-//! `frozen_object` rows Batch 7 added.
+//! three clusters, itemised at [`KNOWN_DIVERGENCES`]: the two accessor defects
+//! that no pre-Batch-6 receiver could reach (E1 and E2 below), the
+//! arguments-exotic `index_assign_past` row, and three `length_lower` rows on
+//! real arrays.
 //!
 //! **Batch 7 fixed one of the three defects it set out to fix, and could not
 //! fix the other two — both because their fix lives outside this batch's file
@@ -101,7 +99,7 @@
 //!   this batch may not modify: `DefineAccessor` carries no attribute operand,
 //!   so the interpreter cannot tell a class accessor from a literal one.
 //!
-//! # `frozen_object` — the integrity-level rung (Batch 7)
+//! # `frozen_object` — the integrity-level rung (found in Batch 7, FIXED in Batch 8)
 //!
 //! Every one of the previous sixteen receivers has a WRITABLE `length` and
 //! writable indices, so no row had ever reached the branch where a required
@@ -113,9 +111,23 @@
 //! `true`. That is state corruption plus a false integrity report, not merely a
 //! missing `TypeError`. `copyWithin` and `shift` do the same delete; `fill`,
 //! `unshift`, `splice` and `pop` complete silently after a refused write.
-//! `push` is correct, so the refusal machinery is reachable and it is the
-//! observation of it that is missing. Recorded, **not fixed** — see
-//! [`FROZEN_REFUSAL_UNOBSERVED`].
+//! `push` was correct, so the refusal machinery was reachable and it was the
+//! observation of it that was missing.
+//!
+//! **Batch 8 fixed all seven rows.** The rule was never missing — the
+//! interpreter's own `[[Delete]]` refused correctly and left the receiver
+//! bit-identical all along; `builtins/array.rs` was reaching the operation
+//! through a **second implementation** with no descriptor check and no failure
+//! channel, and was dropping `[[Set]]`'s refusal boolean on the floor. Adding
+//! `internal_methods::dispatch_delete` (the table slot had existed since the
+//! beginning, with `Reflect.deleteProperty` as its only caller) and routing
+//! through it fixed it. See [`FROZEN_REFUSAL_UNOBSERVED`] and
+//! [`a_refused_delete_leaves_the_receiver_uncorrupted`].
+//!
+//! What Batch 8 could **not** fix, and says so rather than papering over: a
+//! frozen real ARRAY's index delete is still unreffusable, because v12 models no
+//! per-index attributes for `Kind::Array` at all. That is a `v12-heap` gap; see
+//! [`a_frozen_array_index_delete_is_a_declared_deviation`].
 //!
 //! # Every number in this file's history was stated against 351 rows
 //!
@@ -129,7 +141,8 @@
 //! | batch 4 | 9 × 351 | 80 | 14 |
 //! | batch 5 | 9 × 351 | 54 | 10 |
 //! | batch 6 | 16 × 624 | 165 | 39 |
-//! | **batch 7 (this one)** | **17 × 663** | **177** | **39** |
+//! | batch 7 | 17 × 663 | 177 | 39 |
+//! | **batch 8 (this one)** | **17 × 663** | **156** | **39** |
 //!
 //! The 24 → 108 step is the one that matters: it is what a stronger instrument
 //! found when a transcribed table was replaced by a generated one. The
@@ -139,6 +152,16 @@
 //! re-counted on the new receiver and seven of them a defect no earlier
 //! receiver could reach. In both steps **no row an earlier batch claimed fixed
 //! has come back**
+//!
+//! 177 → **156** is the first DOWNWARD step, and it is the first one where a
+//! batch fixed two defects that had been found by *different* batches and
+//! measured in the *same* instrument. Batch 8 removed 22 rows and **added one**:
+//! `pop` on `accessor_index`, where the deleted-key bug's `+1` and E1's `−1` had
+//! been cancelling to zero for as long as the row existed. See
+//! [`E1_UNMASKED_BY_BATCH_8`] — it is the most transferable thing in this
+//! batch.
+//!
+//! **In both prior up-steps no row an earlier batch claimed fixed has come back**
 //! (`slice`/`map`/`concat`/`sort`/`reverse`/`splice` are still clean on every
 //! receiver without an accessor, and the six "hole materialised as an own
 //! `undefined`" rows stay fixed on `holey_object`, which is a holey receiver no
@@ -458,36 +481,103 @@ const ALL_RECEIVERS: &[&str] = &[
     "frozen_object",
 ];
 
-/// The seven mutating rows `frozen_object` diverges on, and what it found.
+/// Cause **A/FROZEN**: a mutating method that must delete a NON-CONFIGURABLE
+/// own property deleted it anyway, and separately every mutating method
+/// discarded `[[Set]]`/`[[Delete]]`'s refusal.
 ///
-/// **Not fixed in this batch, by instruction** — the receiver was added to
-/// *measure* the integrity-level rung, and the answer is worse than "a missing
-/// `TypeError`":
+/// **FIXED in Batch 8.** The rule was never missing — `Interp::delete_property`
+/// and `Reflect.deleteProperty` both refused correctly and left the receiver
+/// bit-identical, all along — the array builtins were reaching the operation
+/// through a **second implementation** (`array.rs::index_delete`, no descriptor
+/// check, no failure channel) and through `.map_err(Throw::Value)?` on
+/// `dispatch_set`, which keeps the `Err` and drops the `Ok(false)`. Batch 8
+/// added `internal_methods::dispatch_delete` (the `[[Delete]]` table slot had
+/// existed since the beginning with `Reflect.deleteProperty` as its only
+/// caller), routed the delete through it, and made `index_set`/`set_array_len`
+/// observe the boolean as `Set(O, k, v, true)` requires. All seven rows below
+/// now match node.
 ///
-/// * `Array.prototype.reverse.call(Object.freeze({0:"a",length:3}))` **deleted
-///   the non-configurable own property `0`** — `o[0]` became `undefined` and
-///   `Object.keys(o)` dropped it — while `Object.isFrozen(o)` still answered
-///   `true`. That is a state-corrupting violation, not just an unthrown one:
-///   the object is left reporting an integrity level it no longer has.
-///   `copyWithin` and `shift` do the same delete. `index_delete`
-///   (`builtins/array.rs`) holes the cell with no descriptor check at all.
-/// * `fill` refuses to write (the read-only index keeps its value) but returns
-///   the receiver instead of throwing, because `index_set` discards
-///   `dispatch_set`'s `false`.
-/// * `unshift` computed `length` 4, **wrote** nothing, and **returned 4**.
-/// * `splice`/`pop` computed a new `length`, could not write it, and returned
-///   normally.
+/// `set_array_len` also had to be reordered to write the `length` property
+/// BEFORE trimming the element store: trimming first meant a refused length
+/// write on a frozen array threw *after* it had already shortened the store,
+/// which is the "throws the right error and corrupts the object anyway" shape.
 ///
-/// `push` is the one mutator that agrees: it throws, because adding index 3 hits
-/// the non-extensible check. So the refusal machinery exists and is reachable —
-/// it is the two steps that must *observe* it (`DeletePropertyOrThrow`,
-/// `Set(O, k, v, true)`) that are missing.
-const FROZEN_REFUSAL_UNOBSERVED: &str = "FROZEN: on an integrity-level receiver every mutating method whose spec step \
-     requires a write to succeed proceeds as if it had. reverse/copyWithin/shift additionally DELETE the \
-     non-configurable own index (Object.isFrozen still answers true afterwards), fill returns the receiver \
-     after a refused index write, unshift returns a length it could not write, and splice/pop return normally \
-     after a refused length write. push is correct (it throws), so the refusal is reachable — it is the \
-     DeletePropertyOrThrow / Set(...,true) observation of it that is missing.";
+/// What is left, and is NOT fixed here: **a frozen real ARRAY's index delete is
+/// still unreffusable**, because v12 models no per-index attributes for
+/// `Kind::Array` at all (`Object.freeze([1,2,3])` leaves every element
+/// reporting `writable:true, configurable:true`). That needs per-element
+/// attribute storage in `v12-heap/src/elements.rs` — a different crate — and is
+/// pinned as a canary by
+/// [`a_frozen_array_index_delete_is_a_declared_deviation`].
+const FROZEN_REFUSAL_UNOBSERVED: &str = "FROZEN (FIXED in Batch 8 — kept as the \
+     audit trail for the fix, no longer attached to any row): on an integrity-level \
+     receiver every mutating method whose spec step requires a write to succeed proceeded \
+     as if it had. reverse/copyWithin/shift additionally DELETEd the non-configurable own \
+     index while Object.isFrozen still answered true, fill returned the receiver after a \
+     refused index write, unshift returned a length it could not write, and splice/pop \
+     returned normally after a refused length write. Cause: array.rs re-implemented \
+     [[Delete]] without the configurable check and discarded [[Set]]'s refusal boolean; \
+     the interpreter's own machinery was correct throughout and merely bypassed.";
+
+/// Cause **B/DELETED-KEY**: `Object.keys` reported an own key that had been
+/// deleted, because the descriptor list and the cell disagreed.
+///
+/// **FIXED in Batch 8.** A `delete` stores `hole` in a data slot and leaves the
+/// shared shape descriptor, so the descriptor list is not the own-key set. Every
+/// other observer already filtered on liveness — `hasOwnProperty`,
+/// `Object.hasOwn` and `getOwnPropertyDescriptor` through `descriptor_is_live`
+/// in `builtins/object.rs`, `[[Get]]`/`[[HasProperty]]` in `ordinary_get`,
+/// `Reflect.ownKeys` by an inline copy of the same test — and
+/// `collect_own_string_keys` was the ONE reader that consulted nothing. It is
+/// now the single place the filter is applied, which is what brought
+/// `Object.keys`, `for-in`, `Object.getOwnPropertyNames`, `Object.entries` and
+/// `Object.values` into agreement with `[[Get]]` at the same key in the same
+/// tick.
+///
+/// This is the fourth observer census finding worth recording: the `[[Delete]]`
+/// table slot and the own-key reader were wrong in the SAME way, in two crates,
+/// for the same one-line reason. "Seven rungs across two crates" was the shape
+/// of the earlier Hole defect and this batch found its mirror image.
+const DELETED_KEY_IN_DESCRIPTOR_LIST: &str = "FIXED in Batch 8 — no row carries this any more.";
+
+/// The one row Batch 8 **added**: `pop` on `accessor_index`.
+///
+/// Not a new defect — an old one that two other defects were hiding behind each
+/// other, and the clearest argument in this file's history for fixing causes
+/// instead of tolerating them.
+///
+/// On `accessor_index` (`{0:"a", get 1(){return "acc";}, 2:"c", length:3}`),
+/// `pop` deletes index 2 and lowers `length` to 2. Three independent things are
+/// true of the resulting own-key count:
+///
+/// * **node: 3** — keys `0`, `1`, `length`.
+/// * **v12 before Batch 8: 3** — keys `0`, `2`, `length`.
+/// * **v12 after Batch 8: 2** — keys `0`, `length`.
+///
+/// The middle answer matched the first for two unrelated wrong reasons. v12's
+/// extra key was B's bug: index 2's cell was holed and its descriptor left
+/// behind, so the descriptor list still counted a deleted key. v12's *missing*
+/// key was E1: the literal accessor at index 1 is registered non-enumerable
+/// (`DefineAccessor` carries no attribute operand), so `Object.keys` omits it —
+/// `getOwnPropertyDescriptor(o,"1")` reports `enumerable:false` where node
+/// reports `true`. `+1` and `−1` cancelled to `0`, and the generated table's
+/// `Object.keys(o).length` column could not see either.
+///
+/// Batch 8 fixed B, so the `+1` went away and the `−1` became visible for the
+/// first time. The row is now attributed to E1, whose fix is in
+/// `v12-bytecode` + `v12-bccompiler` and therefore not this batch's.
+///
+/// The transferable lesson, recorded because this table has now been wrong three
+/// different ways: **an observable that two defects can cancel in is an
+/// observable that will report a pass for a wrong reason.** The harness's
+/// `snap` is a single number, and a single number is the worst possible probe
+/// for a two-defect receiver. `a_deleted_own_key_is_invisible_to_every_observer`
+/// asserts the per-key composition instead, which is what made the +1 visible
+/// in the first place.
+const E1_UNMASKED_BY_BATCH_8: &str = "E1, UNMASKED by the Batch-8 fix to the deleted-key defect: \
+     the literal accessor at index 1 is registered non-enumerable, so Object.keys omits it. \
+     Before Batch 8 this row's key count coincided with node's because a DELETED index 2 \
+     was still being counted on the other side; the two errors cancelled.";
 
 /// The two receivers that carry an accessor property. Both diverge on almost
 /// every row, for two reasons that have nothing to do with each other and are
@@ -599,7 +689,7 @@ struct Known<'a> {
     why: &'a str,
 }
 
-/// The complete, current divergence set: **177 of 663 rows, 39 methods**
+/// The complete, current divergence set: **156 of 663 rows, 39 methods**
 /// (17 receivers × 39 rows).
 ///
 /// A `Known` entry is one (method, receivers, cause) triple, and **a method may
@@ -608,31 +698,42 @@ struct Known<'a> {
 /// instead of letting a later entry overwrite an earlier one, which is what
 /// makes per-cause attribution possible without a second table.
 ///
-/// How the 177 rows divide, because the raw total is close to meaningless on
-/// its own:
+/// # How the 156 rows divide
 ///
 /// * **85 rows** are the five `absent` methods on all seventeen receivers. They
 ///   say nothing about the index/length model; they were 45 of 351 before
 ///   Batch 6 and are still the same five methods.
-/// * **17 rows** are the pre-existing "a deleted own index stays in
-///   `Object.keys`" cluster, now on six receivers instead of four (the six
-///   `holey_object` rows and the three `length_float` rows are new; the eight
-///   `own_*`/`array_*` rows are the ones earlier batches recorded). **Batch 7
-///   did not move this cluster**, deliberately: `Object.keys`,
-///   `Object.getOwnPropertyNames` and `for-in` read the *descriptor list*
-///   through `collect_own_string_keys`, which consults liveness nowhere, so
-///   they are untouched by a fix to the `[[Get]]`/`[[HasProperty]]` cells.
-/// * **21 rows** are genuinely new behavioural divergences, on the two accessor
-///   receivers, from E1 and E2 above.
-/// * The remaining rows on the accessor receivers (47 of the 64 that differ
-///   ONLY in the harness's key count) are E1 alone.
-/// * **12 rows** are the `frozen_object` receiver: five `absent` methods
-///   re-counted on the new receiver, and seven mutating methods that proceed
-///   after a refused write (`FROZEN_REFUSAL_UNOBSERVED`).
+/// * **62 rows** are E1 on the two accessor receivers (`accessor_index` and
+///   `length_getter`), plus 3 `length_lower`/`array_dense`/`array_holey` rows.
+///   E1 is a literal accessor registered non-enumerable; it is open and its fix
+///   is in `v12-bytecode` + `v12-bccompiler`.
+/// * **7 rows** are E2 on `length_getter` (the callback-seam methods read
+///   `length` through the interpreter and agree with node; the native path does
+///   not).
+/// * **1 row** is `index_assign_past` on `arguments_exotic`.
+/// * **1 row** is `pop` on `accessor_index` — see
+///   [`E1_UNMASKED_BY_BATCH_8`].
 ///
-/// Pre-Batch-6, the same table said 54 of 351 across 10 methods, of which 9
-/// rows were real. **Every batch number recorded against 351 is stated against
-/// a denominator this table no longer has**; see the header.
+/// # Batch 8: 177 → 156, and the one row it ADDED
+///
+/// 22 rows were fixed (all seven `frozen_object` mutators, and the
+/// deleted-key cluster on `own_numeric_length`, `own_string_length`,
+/// `holey_object` and `length_float`) and **one row was added**: `pop` on
+/// `accessor_index`.
+///
+/// That addition is worth reading twice, because it is the argument for fixing
+/// defects rather than tolerating them. Before Batch 8, `pop` on
+/// `accessor_index` reported 3 own keys and node reported 3 — and **both were
+/// wrong for unrelated reasons**: v12's +1 was B's bug (a deleted index left in
+/// the descriptor list) and node's real answer was also 3 because `pop` *writes*
+/// index 1 (which v12 could not see as enumerable) while *deleting* index 2
+/// (whose stale key v12 was still counting). The two errors cancelled to zero.
+/// Fixing B removed the +1 and exposed E1's −1 underneath it. A tolerance for
+/// "the count matches" would have hidden this permanently; a test asserting the
+/// composition would not have. See [`E1_UNMASKED_BY_BATCH_8`].
+///
+/// Every batch number recorded against 351 is stated against a denominator this
+/// table no longer has; see the header.
 const KNOWN_DIVERGENCES: &[Known] = &[
     // -- unimplemented: five rows below cover all seventeen receivers each -----
     Known {
@@ -665,74 +766,39 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         absent: true,
         why: "Array.prototype.toSpliced is not registered (ES2023 change-array-by-copy)",
     },
-    // -- deleted keys stay visible to Object.keys ---------------------------
+    // -- deleted keys stayed visible to Object.keys -------------------------
     //
-    // ONE defect behind these entries, which the generated table separates for
-    // us: `hasOwnProperty(o, i)` says false but `Object.keys(o)` still counts
-    // the index, because `index_delete`/`delete_property` hole the storage cell
-    // and leave the shape descriptor behind. Every entry below is a case where
-    // that makes the `Object.keys` column differ from node's — and it is the
-    // ONLY field that differs on all of them.
+    // ONE defect behind these entries, which the generated table separated for
+    // us: `hasOwnProperty(o, i)` said false but `Object.keys(o)` still counted
+    // the index. **Batch 8 FIXED this**, so the cluster is gone: every entry
+    // below now carries only the cause that REMAINS on that receiver, and a
+    // reader diffing Batch 7 against Batch 8 should expect these receiver sets
+    // to be much smaller. See [`DELETED_KEY_IN_DESCRIPTOR_LIST`].
     Known {
         method: "pop",
-        receivers: &[
-            "own_numeric_length",
-            "own_string_length",
-            "holey_object",
-            "length_float",
-        ],
+        receivers: ACCESSOR_RECEIVERS,
         absent: false,
-        why: "`hasOwnProperty(o, i)` is false but `Object.keys(o)` still counts the \
-              deleted index: the shape descriptor survives the delete",
+        why: E1_ACCESSOR_NON_ENUMERABLE,
     },
     Known {
         method: "shift",
-        receivers: &[
-            "own_numeric_length",
-            "own_string_length",
-            "holey_object",
-            "length_float",
-        ],
+        receivers: &["length_getter"],
         absent: false,
-        why: "same as pop: a deleted own index stays in Object.keys",
+        why: E1_ACCESSOR_NON_ENUMERABLE,
     },
     Known {
         method: "splice",
-        receivers: &[
-            "own_numeric_length",
-            "own_string_length",
-            "holey_object",
-            "length_float",
-        ],
+        receivers: &["length_getter"],
         absent: false,
-        why: "same as pop/shift, and it is the ONLY remaining defect on these four \
-              receivers: the hole materialisation in the removed-element array \
-              this entry used to also carry is fixed (see `a_hole_is_never_\
-              materialised_as_an_own_undefined`)",
+        why: E1_ACCESSOR_NON_ENUMERABLE,
     },
-    // `holey_object` extends the same cluster to three more methods, because
-    // deleting its index 1 is the case the deleted-key defect is worst at: the
-    // index is a hole, so every reader agrees it is absent and only the key
-    // count can still be wrong.
-    Known {
-        method: "copyWithin",
-        receivers: &["holey_object"],
-        absent: false,
-        why: "holey_object: same deleted-key-counts defect — copyWithin deletes index 1 and \
-              the shape descriptor survives",
-    },
-    Known {
-        method: "sort",
-        receivers: &["holey_object"],
-        absent: false,
-        why: "holey_object: same deleted-key-counts defect — sort deletes the hole at index 1",
-    },
-    Known {
-        method: "unshift",
-        receivers: &["holey_object"],
-        absent: false,
-        why: "holey_object: same deleted-key-counts defect — unshift deletes the hole at index 1",
-    },
+    // `holey_object` used to extend the same cluster to three more methods
+    // (`copyWithin`, `sort`, `unshift`). All three are gone — the delete they
+    // made is now observed by `DeletePropertyOrThrow`, and the holed cell is
+    // now filtered out of the descriptor list — and `copyWithin`/`fill`/
+    // `unshift` on `frozen_object` are gone too, so those receiver sets were
+    // DELETED rather than narrowed. The ratchet fails in both directions, so
+    // leaving them would have been a failure, not a harmless leftover.
     Known {
         method: "length_lower",
         receivers: &["array_dense", "array_holey"],
@@ -970,56 +1036,14 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         absent: false,
         why: E1_ACCESSOR_NON_ENUMERABLE,
     },
-    // -- FROZEN: the integrity-level receiver, seven mutating rows ------------
+    // -- FROZEN: the integrity-level receiver ------------------------------
     //
-    // One cause behind all seven, and the worst finding of this batch: a
-    // mutating method whose spec step requires a write to SUCCEED proceeds as if
-    // it had. `push` is correct and is therefore NOT listed — it throws,
-    // because adding index 3 hits the non-extensible check — so the refusal
-    // machinery is reachable and it is the two steps that must *observe* it
-    // (`DeletePropertyOrThrow`, `Set(O, k, v, true)`) that are missing.
-    Known {
-        method: "reverse",
-        receivers: &["frozen_object"],
-        absent: false,
-        why: FROZEN_REFUSAL_UNOBSERVED,
-    },
-    Known {
-        method: "copyWithin",
-        receivers: &["frozen_object"],
-        absent: false,
-        why: FROZEN_REFUSAL_UNOBSERVED,
-    },
-    Known {
-        method: "shift",
-        receivers: &["frozen_object"],
-        absent: false,
-        why: FROZEN_REFUSAL_UNOBSERVED,
-    },
-    Known {
-        method: "fill",
-        receivers: &["frozen_object"],
-        absent: false,
-        why: FROZEN_REFUSAL_UNOBSERVED,
-    },
-    Known {
-        method: "unshift",
-        receivers: &["frozen_object"],
-        absent: false,
-        why: FROZEN_REFUSAL_UNOBSERVED,
-    },
-    Known {
-        method: "splice",
-        receivers: &["frozen_object"],
-        absent: false,
-        why: FROZEN_REFUSAL_UNOBSERVED,
-    },
-    Known {
-        method: "pop",
-        receivers: &["frozen_object"],
-        absent: false,
-        why: FROZEN_REFUSAL_UNOBSERVED,
-    },
+    // **Batch 8 FIXED all seven of these.** `frozen_object` now diverges on
+    // exactly five rows, all of them the `absent` methods above: every mutating
+    // method agrees with node, throwing the spec's `TypeError` and leaving the
+    // receiver bit-identical. See [`FROZEN_REFUSAL_UNOBSERVED`] for the cause
+    // and [`a_refused_delete_leaves_the_receiver_uncorrupted`] for the
+    // surviving-state assertions that hold it there.
 ];
 
 /// Divergences this file knows about, folded into the same shape the test
@@ -1120,7 +1144,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 177,
+        total, 156,
         "the divergence count moved without the ledger's shape changing"
     );
 }
@@ -2139,5 +2163,245 @@ fn a_heap_built_array_length_is_an_ordinary_property() {
         ),
         r#"[2,"a","b",null]"#,
         "push then pop on a real array",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Defect A — a mutating method that must delete a NON-CONFIGURABLE own
+//    property has to throw AND leave the object uncorrupted.
+//
+//    Asserting only "it throws" is the WEAKER test, and it is the one that
+//    reads like a fix: an implementation that throws `TypeError` and *then*
+//    holes the cell passes it while still corrupting the receiver — and it
+//    corrupts it SILENTLY, because the descriptor is gone while
+//    `Object.isFrozen` keeps answering `true` over a property that no longer
+//    exists. That breaches the integrity-level invariant CONTEXT.md states.
+//    Every assertion below is therefore on the SURVIVING STATE too.
+//
+//    Every `expected` here is node's verbatim answer, produced by
+//    `/tmp`-equivalent `node -e` of the identical program; none is authored by
+//    hand.
+// ---------------------------------------------------------------------------
+
+/// The frozen control receiver's state, as node reports it. Used as a prefix so
+/// one assertion sees the throw AND the corruption in the same JSON array.
+const FROZEN_CONTROL: &str = r#"[true,"a","{\"value\":\"a\",\"writable\":false,\"enumerable\":true,\"configurable\":false}",3]"#;
+
+/// The receiver after every one of these methods threw: `isFrozen`, `"0" in o`,
+/// the value, the own-key answer, the descriptor, the key list, the length.
+/// Identical for all seven methods because in node none of them writes.
+const FROZEN_AFTER: &str = r#",true,true,"a",true,"{\"value\":\"a\",\"writable\":false,\"enumerable\":true,\"configurable\":false}","0,length",3"#;
+
+#[test]
+fn a_refused_delete_leaves_the_receiver_uncorrupted() {
+    for method in [
+        "Array.prototype.reverse.call(o)",
+        "Array.prototype.copyWithin.call(o,0,1,3)",
+        "Array.prototype.shift.call(o)",
+        "Array.prototype.fill.call(o,\"q\",0,3)",
+        "Array.prototype.unshift.call(o,\"z\")",
+        "Array.prototype.splice.call(o,1,1)",
+        "Array.prototype.pop.call(o)",
+    ] {
+        let probe = |body: &str| {
+            eval_json(&format!(
+                r#"var o = Object.freeze({{0:"a",length:3}});
+                   // Control read first, on the untouched receiver: a probe that
+                   // failed to build the frozen object (and so had nothing to
+                   // corrupt) fails HERE rather than passing the loop vacuously.
+                   var control = [Object.isFrozen(o), String(o[0]),
+                                  JSON.stringify(Object.getOwnPropertyDescriptor(o,"0")),
+                                  o.length];
+                   var r = {{}};
+                   try {{ {body}; r.threw = false; }} catch (e) {{ r.threw = true; r.name = e.name; }}
+                   JSON.stringify([r.threw ? "threw:"+r.name : "no-throw",
+                                   control,
+                                   Object.isFrozen(o),
+                                   "0" in o,
+                                   String(o[0]),
+                                   Object.prototype.hasOwnProperty.call(o,"0"),
+                                   JSON.stringify(Object.getOwnPropertyDescriptor(o,"0")),
+                                   Object.keys(o).join(","),
+                                   o.length]);"#
+            ))
+        };
+        assert_is(
+            &probe("var unusedProbe = 0;"),
+            &format!(r#"["no-throw",{FROZEN_CONTROL}{FROZEN_AFTER}]"#),
+            "control: a frozen receiver no method has touched",
+        );
+        assert_is(
+            &probe(method),
+            &format!(r#"["threw:TypeError",{FROZEN_CONTROL}{FROZEN_AFTER}]"#),
+            method,
+        );
+    }
+}
+
+/// # DECLARED DEVIATION — a frozen ARRAY's index delete is still unreffusable
+///
+/// The one part of defect A this batch does **not** fix, and it is out of the
+/// file set rather than out of reach: **v12 models no per-index attributes for a
+/// real array.** `Object.defineProperty(a, 2, {configurable: false})` is
+/// silently dropped and `Object.freeze([1,2,3])` leaves every element
+/// reporting `writable:true, configurable:true` — so there is no attribute for
+/// `ordinary_delete`'s element-store rung to read and none for
+/// `array.rs::delete_index_or_throw`'s. Closing it needs per-element attribute
+/// storage in `v12-heap/src/elements.rs`, which is a different crate from the
+/// one this batch owns.
+///
+/// So `pop()` on a frozen array throws (the `length` write is refused and now
+/// throws *before* the store trim) but has already deleted element 2, where
+/// node refuses at the `DeletePropertyOrThrow` step and touches nothing.
+///
+/// Asserted as a CANARY, not as correctness: this pins v12's current answer so
+/// that closing the gap in `v12-heap` turns this test RED and forces the
+/// expectation to be rewritten, rather than the fix landing silently. The
+/// `gopd` row in the expectation is the direct evidence for the diagnosis —
+/// v12 reports `writable:true, configurable:true` for an index `node` reports
+/// `writable:false, configurable:false`.
+#[test]
+fn a_frozen_array_index_delete_is_a_declared_deviation() {
+    assert_is(
+        &eval_json(
+            r#"var a = [1,2,3];
+               Object.freeze(a);
+               var r = "";
+               try { Array.prototype.pop.call(a); r = "no-throw"; }
+               catch (e) { r = "threw:" + e.name; }
+               JSON.stringify([r, [a.length, a[0], a[1], a[2]],
+                               2 in a,
+                               JSON.stringify(Object.getOwnPropertyDescriptor(a,"2")),
+                               Object.isFrozen(a),
+                               JSON.stringify(Object.getOwnPropertyDescriptor(a,"0"))]);"#,
+        ),
+        r#"["threw:TypeError",[3,1,2,null],false,null,true,"{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}"]"#,
+        "DECLARED DEVIATION: v12 models no per-index attributes, so a frozen \
+         array's index delete cannot be refused — see this test's doc comment",
+    );
+}
+
+/// `Set(O, k, v, true)` must OBSERVE the refusal, which is the half of A that
+/// has nothing to do with `delete`. The interpreter's machinery already answers
+/// the boolean (`Reflect.set` on a frozen key is `false` in v12); `index_set`
+/// discarded it.
+///
+/// `fill` is the isolating row and `sort` is deliberately NOT: `sort` is
+/// intercepted at the seam into `Interp::array_sort_callback`, which goes
+/// through the interpreter's own strict `set_property` and therefore already
+/// throws. An earlier version of this test used `sort` and PASSED against the
+/// unfixed engine — a false pass, because v12 also failed to reorder, so the
+/// two answers coincided for the wrong reason. `fill` stays native, and every
+/// index it touches is present-or-absent, so no delete can corrupt anything and
+/// the write refusal is the only thing under test.
+#[test]
+fn a_refused_write_is_observed_by_the_method_that_must_throw() {
+    assert_is(
+        &eval_json(
+            r#"var o = Object.freeze({0:"a",length:3});
+               var r = "";
+               try { Array.prototype.fill.call(o,"q",0,3); r = "no-throw"; }
+               catch (e) { r = "threw:" + e.name; }
+               JSON.stringify([r, String(o[0]), Object.keys(o).join(","), o.length,
+                               JSON.stringify(Object.getOwnPropertyDescriptor(o,"0"))]);"#,
+        ),
+        r#"["threw:TypeError","a","0,length",3,"{\"value\":\"a\",\"writable\":false,\"enumerable\":true,\"configurable\":false}"]"#,
+        "fill() on a frozen receiver throws and writes nothing",
+    );
+}
+
+/// Guards the obvious over-correction: a fix that made EVERY delete refuse
+/// would pass every row above. This one deletes an index the receiver does not
+/// own (a successful no-op per ES) and then still hits the refused `length`
+/// write, so it pins "refusal is per property", not "refuse everything".
+#[test]
+fn a_refusal_is_per_property_not_a_blanket_refusal() {
+    assert_is(
+        &eval_json(
+            r#"var o = Object.freeze({0:"a",1:"b",length:3});
+               var r = [];
+               try { Array.prototype.pop.call(o); r.push("pop-no-throw"); }
+               catch (e) { r.push("pop-threw:"+e.name); }
+               try { Array.prototype.splice.call(o, 2, 0); r.push("splice-no-throw"); }
+               catch (e) { r.push("splice-threw:"+e.name); }
+               JSON.stringify([r, Object.keys(o).join(","), String(o[0]), String(o[1]), o.length]);"#,
+        ),
+        r#"[["pop-threw:TypeError","splice-threw:TypeError"],"0,1,length","a","b",3]"#,
+        "a frozen receiver refuses the index delete and the length write, and nothing else changes",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Defect B — a deleted own key must be invisible to EVERY observer.
+//
+//    `Object.keys`/`for-in`/`entries` read the DESCRIPTOR LIST; `[[Get]]`/
+//    `hasOwnProperty` read the CELL. `delete` holes the cell and leaves the
+//    descriptor, so the two families disagree — and the descriptor list is the
+//    one that is wrong. Every observer is asserted here, INCLUDING the ones
+//    that were already right (`Reflect.ownKeys`, `gopd`, `JSON.stringify`), so
+//    a fix that only patches `Object.keys` and leaves `for-in` or `entries`
+//    wrong fails here rather than reading as done.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_deleted_own_key_is_invisible_to_every_observer() {
+    // Written by the INTERPRETER's delete, and written by a METHOD's
+    // `index_delete` — two different writers, so two rows.
+    assert_is(
+        &eval_json(
+            r#"var o = {0:"a",1:"b",length:2};
+               // Control: the CELL-reading observers, BEFORE the delete. They
+               // already answered "absent" after it, and they are what the
+               // descriptor-list readers have to agree WITH — not merely with
+               // each other.
+               var control = ["0" in o, Object.prototype.hasOwnProperty.call(o,"0"),
+                              String(o[0]),
+                              Object.getOwnPropertyDescriptor(o,"0") === undefined];
+               delete o[0];
+               var forin = []; for (var k in o) { forin.push(k); }
+               JSON.stringify([control,
+                               Object.keys(o), forin, Object.getOwnPropertyNames(o),
+                               Object.entries(o), Object.values(o), Reflect.ownKeys(o),
+                               ["0" in o, Object.prototype.hasOwnProperty.call(o,"0"),
+                                Object.hasOwn(o,"0"), Reflect.has(o,"0"), String(o[0]),
+                                Object.getOwnPropertyDescriptor(o,"0") === undefined,
+                                "0" in Object.getOwnPropertyDescriptors(o),
+                                JSON.stringify(o)]]);"#,
+        ),
+        r#"[[true,true,"a",false],["1","length"],["1","length"],["1","length"],[["1","b"],["length",2]],["b",2],["1","length"],[false,false,false,false,"undefined",true,false,"{\"1\":\"b\",\"length\":2}"]]"#,
+        "after `delete o[0]`, the descriptor-list observers agree with [[Get]]",
+    );
+    assert_is(
+        &eval_json(
+            r#"var o = {0:"a",1:"b",2:"c",length:3};
+               Array.prototype.pop.call(o);
+               var forin = []; for (var k in o) { forin.push(k); }
+               JSON.stringify([Object.keys(o), forin, Object.getOwnPropertyNames(o),
+                               "2" in o, Object.prototype.hasOwnProperty.call(o,"2"),
+                               String(o[2]), Object.entries(o).length]);"#,
+        ),
+        r#"[["0","1","length"],["0","1","length"],["0","1","length"],false,false,"undefined",3]"#,
+        "index_delete's own hole is invisible to the descriptor list too",
+    );
+}
+
+/// The descent case the generated table measures: `sort` on `holey_object`
+/// vacates index 2 (the only index `node` deletes here — the ledger used to say
+/// index 1, which is the index `node` *writes*), so the own-key count must fall
+/// from 3 to 3-becoming-2-plus-the-written-one and never exceed node's.
+#[test]
+fn a_delete_performed_by_a_method_lowers_the_own_key_count() {
+    assert_is(
+        &eval_json(
+            r#"var o = {0:"a",2:"c",length:3};
+               var before = Object.keys(o).length;
+               Array.prototype.sort.call(o);
+               JSON.stringify([before, Object.keys(o).length,
+                               Object.keys(o).join(","),
+                               Object.prototype.hasOwnProperty.call(o,"1"),
+                               Object.prototype.hasOwnProperty.call(o,"2")]);"#,
+        ),
+        r#"[3,3,"0,1,length",true,false]"#,
+        "sort writes index 1 and deletes the vacated index 2",
     );
 }

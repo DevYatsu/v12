@@ -856,21 +856,53 @@ fn collect_enumerable_string_keys(
 /// properties defined via [[DefineOwnProperty]] never touch the parallel
 /// `property_keys` vec), plus dictionary-rung overflow keys in insertion
 /// order (the two stores never overlap).
+///
+/// # THE liveness filter — this is the single place it is applied
+///
+/// A `delete` stores `hole` in a data property's slot and leaves the shared
+/// shape descriptor (or the dictionary entry) in place, so **the descriptor
+/// list is not the own-key set**: a hole means the property is gone. Every
+/// other observer already filters — `hasOwnProperty` and `Object.hasOwn`
+/// through [`descriptor_is_live`], `getOwnPropertyDescriptor` through it too,
+/// `[[Get]]`/`[[HasProperty]]` in `ordinary_get`/`ordinary_has_property`, and
+/// `Reflect.ownKeys` by an inline copy of the same test. This collector was the
+/// one reader that consulted nothing, which is why `delete o[0]` left `"0"` in
+/// `Object.keys`, `for-in`, `Object.getOwnPropertyNames` and `Object.entries`
+/// while `o[0]`, `"0" in o` and `hasOwnProperty(o,"0")` all said absent — the
+/// interpreter and the collector disagreed about the same object at the same
+/// key in the same tick, which is the whole subject of ADR-0004.
+///
+/// Deliberately NOT applied to the element-store rung, which the four callers
+/// already filter themselves with a `!is_hole()` test (`object.rs` element
+/// loops) — one filter per storage, not two.
+///
+/// The remaining gap, recorded rather than hidden: v12 models no per-index
+/// ATTRIBUTES for a real array, so `Object.defineProperty(a, 2,
+/// {configurable: false})` is silently dropped and `Object.freeze([1,2,3])`
+/// leaves the elements writable (`getOwnPropertyDescriptor` says
+/// `writable:true, configurable:true`). That is a missing feature in
+/// `v12-heap`, not a liveness bug, and it is why `Object.freeze([1,2,3]).pop()`
+/// still cannot be refused. See the frozen-array note on
+/// `array.rs::delete_index_or_throw`.
 fn collect_own_string_keys(
     heap: &mut v12_heap::Heap,
     obj: Handle<v12_heap::JsObject>,
 ) -> Vec<Handle<V12Str>> {
     let shape = heap.shape_of(obj);
-    let mut keys: Vec<Handle<V12Str>> = heap
-        .get(shape)
-        .descriptors
-        .as_slice()
+    // Copied out before the liveness test: `descriptor_is_live` needs `obj`,
+    // and holding a borrow on the shape's descriptor vec across that would
+    // alias the heap.
+    let descriptors: Vec<v12_heap::Descriptor> =
+        heap.get(shape).descriptors.as_slice().to_vec();
+    let mut keys: Vec<Handle<V12Str>> = descriptors
         .iter()
+        .filter(|d| descriptor_is_live(heap, obj, d))
         .filter_map(|d| d.key().string())
         .collect();
     if let Some(map) = heap.get(obj).dictionary.as_ref() {
         let mut overflow: Vec<(u32, Handle<V12Str>)> = map
             .iter()
+            .filter(|(_, e)| dict_entry_is_live(heap, obj, e))
             .filter_map(|(k, e)| k.string().map(|h| (e.seq, h)))
             .collect();
         overflow.sort_by_key(|&(seq, _)| seq);

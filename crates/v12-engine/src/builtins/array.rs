@@ -29,10 +29,10 @@ pub fn array_push(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVa
     // Spec places appended items at `length`-based indices, so a sparse
     // receiver (`new Array(len)`) grows at `len`, not at its store end.
     for (i, &item) in args.iter().enumerate() {
-        index_set(&mut *ctx.heap, obj, len as i64 + i as i64, item)?;
+        index_set(ctx, obj, len as i64 + i as i64, item)?;
     }
     let new_len = len + args.len() as f64;
-    set_array_len(&mut *ctx.heap, obj, new_len)?;
+    set_array_len(ctx, obj, new_len)?;
     Ok(helpers::smi_or_f64(new_len as i64))
 }
 
@@ -41,13 +41,13 @@ pub fn array_pop(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsVa
     let obj = ctx.this_object(this, "Array.prototype.pop", None)?;
     let len = array_like_len(&mut *ctx.heap, obj)?;
     if len < 1.0 {
-        set_array_len(&mut *ctx.heap, obj, 0.0)?;
+        set_array_len(ctx, obj, 0.0)?;
         return Ok(JsValue::undefined());
     }
     let last = len - 1.0;
     let value = index_get(&mut *ctx.heap, obj, last as i64)?.0;
-    index_delete(&mut *ctx.heap, obj, last as i64);
-    set_array_len(&mut *ctx.heap, obj, last)?;
+    delete_index_or_throw(ctx, obj, last as i64)?;
+    set_array_len(ctx, obj, last)?;
     Ok(value)
 }
 
@@ -115,10 +115,10 @@ pub fn array_sort(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsV
     // delete an index the receiver owns that sorting left below `len`.
     let n = present.len() as i64;
     for i in 0..n.min(len) {
-        index_set(&mut *ctx.heap, obj, i, present[i as usize])?;
+        index_set(ctx, obj, i, present[i as usize])?;
     }
     for i in n..len.min(MAX_SCAN_SPAN) {
-        index_delete(&mut *ctx.heap, obj, i);
+        delete_index_or_throw(ctx, obj, i)?;
     }
     Ok(this)
 }
@@ -245,14 +245,24 @@ fn index_get(heap: &mut Heap, obj: Handle<JsObject>, i: i64) -> Result<(JsValue,
     Ok((v, !v.is_hole()))
 }
 
-/// `Set(O, ToString(i), v, O)`.
+
+/// ES `Set(O, ToString(i), v, true)` — the `true` is `Throw`, so a refusal is
+/// a `TypeError` rather than a silent no-op.
 ///
-/// Behaviour change this file now owns: for a **Proxy** receiver this reaches
-/// `proxy_set` (`internal_methods.rs:1237`) and throws `TypeError` from the
-/// unimplemented-trap stub, where the deleted `write_index` silently wrote a
-/// store the plain property read never consulted. That is the correct honest
-/// failure — the spec requires a real `[[Set]]` — but it is a change.
-fn index_set(heap: &mut Heap, obj: Handle<JsObject>, i: i64, v: JsValue) -> Result<(), Throw> {
+/// Takes `&mut Ctx`, not `&mut Heap`, because the throw needs the realm's
+/// `TypeError` intrinsic (`Ctx::type_error`) and `Heap` does not carry the
+/// global. Every mutating method below therefore routes its spec writes through
+/// this one function rather than reaching the store directly.
+///
+/// `dispatch_set` already answers the boolean correctly (it is what
+/// `Reflect.set` reports, and `Reflect.set(o, k, v)` on a frozen key answers
+/// `false` in v12 exactly as in node). **This helper used to discard it**
+/// (`.map_err(Throw::Value)?` keeps the `Err` and drops the `Ok(false)`), which
+/// is why seven mutating methods proceeded as though a refused write had
+/// succeeded. Only `push` threw, because appending to a frozen receiver reached
+/// the non-extensible check on a NEW index rather than the writable check on an
+/// existing one.
+fn index_set(ctx: &mut Ctx, obj: Handle<JsObject>, i: i64, v: JsValue) -> Result<(), Throw> {
     if i < 0 || i > i64::from(u32::MAX) - 1 {
         return Ok(());
     }
@@ -262,50 +272,71 @@ fn index_set(heap: &mut Heap, obj: Handle<JsObject>, i: i64, v: JsValue) -> Resu
     // heap string per index, and the interpreter's GC-stress tests collect on
     // every safepoint, so the extra allocations widened a root window in
     // `promise_capability_seam` far enough to lose a live record.
-    let kind = heap.get(obj).kind;
+    //
+    // CONCESSION, and it is a real one: this rung cannot honour a refusal,
+    // because v12 models **no per-index attributes for a real array** —
+    // `Object.defineProperty(a, 2, {configurable: false})` is silently dropped
+    // and `Object.freeze([1,2,3])` leaves every element reporting
+    // `writable:true, configurable:true` (measured; named in the frozen-array
+    // test in `tests/array_generic_receivers.rs`). `ordinary_set` has the
+    // identical hole for the identical reason, so this is ONE missing
+    // `v12-heap` feature rather than two omissions — and answering
+    // "configurable" unconditionally here would make the rung LOOK correct
+    // while `getOwnPropertyDescriptor` still reported the opposite, which is
+    // the same class of lie this whole batch is about.
+    let kind = ctx.heap.get(obj).kind;
     if matches!(kind, v12_heap::Kind::Array | v12_heap::Kind::Arguments) {
-        heap.get_mut(obj).set_element(i as u32, v);
+        ctx.heap.get_mut(obj).set_element(i as u32, v);
         return Ok(());
     }
-    let key = index_prop(heap, i);
-    crate::internal_methods::dispatch_set(heap, obj, key, v, JsValue::object(obj))
-        .map_err(Throw::Value)?;
+    let key = index_prop(&mut *ctx.heap, i);
+    if !crate::internal_methods::dispatch_set(&mut *ctx.heap, obj, key, v, JsValue::object(obj))
+        .map_err(Throw::Value)?
+    {
+        return Err(ctx.type_error("TypeError: cannot assign to read only property"));
+    }
     Ok(())
 }
 
-/// `Delete(O, ToString(i))` — `pop`/`shift`/`splice`'s DeletePropertyOrThrow.
+/// ES `DeletePropertyOrThrow(O, ToString(i))` — the spec's own step 7/8
+/// primitive, used by `pop`/`shift`/`splice`/`sort` and by `write_slot`'s
+/// "absent source DELETES the destination" rule.
 ///
-/// There is no `dispatch_delete` to route through (only the table slot at
-/// `internal_methods.rs:67` exists), so this mirrors the two rungs a `[[Delete]]`
-/// has: the element store for the kinds that own one, and the receiver's own
-/// shape/dictionary storage — hole-out, keeping the descriptor — which is what
-/// `Interp::delete_property` (`v12-interp/src/property.rs:3623`) does for
-/// ordinary objects. An index the receiver does not own is a successful no-op,
-/// so an inherited index is never touched.
-fn index_delete(heap: &mut Heap, obj: Handle<JsObject>, i: i64) {
+/// # This replaced a second implementation of `[[Delete]]`
+///
+/// The deleted `index_delete` returned `()` and did the hole-out by hand: the
+/// element store for `Kind::Array`, then the receiver's own shape/dictionary
+/// storage. It performed **no descriptor check at all**, so
+/// `Array.prototype.reverse.call(Object.freeze({0:"a",length:3}))` deleted a
+/// non-configurable own property and answered no question — the descriptor was
+/// gone while `Object.isFrozen` kept answering `true`, which is the
+/// integrity-level invariant `CONTEXT.md` states. The rule was never missing:
+/// `Interp::delete_property` (`v12-interp/src/property.rs`) has carried the
+/// `configurable` refusal since before this file existed, and the interpreter's
+/// own probe (`Reflect.deleteProperty`, and plain `delete` on the same
+/// receiver) answers `false` and leaves the object bit-identical. The array
+/// builtins were **bypassing existing machinery**, so this calls it
+/// ([`internal_methods::dispatch_delete`]) rather than growing a new copy.
+///
+/// A refused delete leaves the receiver completely untouched: no hole, no
+/// descriptor change, no `length` write, because the `?` unwinds before the
+/// caller's next step. Asserting only "it throws" cannot tell that apart from
+/// "throw, then corrupt" — which is why every row of
+/// `a_refused_delete_leaves_the_receiver_uncorrupted` also reads the surviving
+/// state.
+///
+/// Same concession as `index_set`'s `Kind::Array` rung, for the same reason:
+/// `ordinary_delete`'s element-store rung has nothing to check either, because
+/// the attributes do not exist to check.
+fn delete_index_or_throw(ctx: &mut Ctx, obj: Handle<JsObject>, i: i64) -> Result<(), Throw> {
     if i < 0 || i > i64::from(u32::MAX) - 1 {
-        return;
+        return Ok(());
     }
-    let idx = i as u32;
-    if heap.get(obj).kind == v12_heap::Kind::Array {
-        // Hole the slot, never truncate: `shift`/`splice` call this in a loop
-        // and a truncate needs the lattice extent, which costs a full
-        // `elements_snapshot()` — quadratic. `set_array_len` does the one
-        // trim per call, after the loop.
-        heap.get_mut(obj).set_element(idx, JsValue::hole());
-        return;
+    let key = index_prop(&mut *ctx.heap, i);
+    if !crate::internal_methods::dispatch_delete(&mut *ctx.heap, obj, key).map_err(Throw::Value)? {
+        return Err(ctx.type_error("TypeError: cannot delete a non-configurable property"));
     }
-    if let Some(slot) = heap.get_mut(obj).elements.get_mut(idx as usize) {
-        *slot = JsValue::hole();
-    }
-    let key = index_prop(heap, i);
-    let shape = heap.shape_of(obj);
-    if let Some(desc) = heap.lookup_property(shape, key)
-        && let Some(slot) = desc.slot()
-        && let Some(cell) = heap.get_mut(obj).properties.get_mut(slot as usize)
-    {
-        *cell = JsValue::hole();
-    }
+    Ok(())
 }
 
 /// One past the highest index that can hold data on `obj` **or anywhere on its
@@ -456,50 +487,73 @@ fn read_slots(
 /// `shift`/`unshift`/`copyWithin` and now `sort`/`reverse` all need. Writing
 /// `undefined` at a hole is the bug this helper exists to make impossible: it
 /// leaves an own property the receiver never had.
-fn write_slot(heap: &mut Heap, obj: Handle<JsObject>, i: i64, slot: Slot) -> Result<(), Throw> {
+fn write_slot(ctx: &mut Ctx, obj: Handle<JsObject>, i: i64, slot: Slot) -> Result<(), Throw> {
     match slot {
-        Some(v) => index_set(heap, obj, i, v),
-        None => {
-            index_delete(heap, obj, i);
-            Ok(())
-        }
+        Some(v) => index_set(ctx, obj, i, v),
+        None => delete_index_or_throw(ctx, obj, i),
     }
 }
 
-/// `Set(O, "length", len, O)` — the one length writer.
+/// `Set(O, "length", len, true)` — the one length writer, and the other half
+/// of defect A: `true` is `Throw`, so a frozen `length` is a `TypeError`.
 ///
 /// The deleted `set_array_len` only ever lowered `length` on `Kind::Array`,
 /// which is why `unshift` on an `arguments` object returned the right count
 /// and left `length` at the old value, and why a generic receiver's `length`
-/// was never lowered at all. Routing the write through `[[Set]]` also gives a
-/// frozen receiver the spec's refusal instead of a silent overwrite.
+/// was never lowered at all. Routing the write through `[[Set]]` gives a frozen
+/// receiver the spec's refusal — but it gave this helper the BOOLEAN, and the
+/// boolean was discarded, so the refusal reached nobody.
 ///
-/// `Kind::Array` keeps its store shrink first: `length` is not implemented as
-/// an array-length exotic here, so lowering the property alone would leave the
-/// lattice holding entries past the new `length` (`push` would then append
-/// into them).
-fn set_array_len(heap: &mut Heap, obj: Handle<JsObject>, len: f64) -> Result<(), Throw> {
+/// The `Kind::Array` store trim happens AFTER the `[[Set]]`, matching ES
+/// `ArraySetLength`, so a refused length write throws having mutated nothing.
+fn set_array_len(ctx: &mut Ctx, obj: Handle<JsObject>, len: f64) -> Result<(), Throw> {
     let len = len.min(f64::from(u32::MAX));
-    let key = length_prop(heap);
+    let key = length_prop(&mut *ctx.heap);
     let value = helpers::smi_or_f64(len as i64);
-    if heap.get(obj).kind == v12_heap::Kind::Array {
+    // The OLD length view, read BEFORE the write. It is the trim's bound, and
+    // it has to be: `array_like_len` reads the `length` property, so asking it
+    // after the write returns the NEW length and `len < view` is never true —
+    // which silently stopped `pop` from trimming at all
+    // (`builtin_tests::array_push_and_pop_length` caught it).
+    //
+    // Read before the write rather than before this function for the same
+    // reason the write is before the trim: a refusal must be able to happen
+    // before any mutation. Trimming first meant a refused length write on a
+    // frozen array threw *after* it had already shortened the element store, so
+    // `Object.freeze([1,2,3]).pop()` left `[3,1,2,<hole>]` — a throw that still
+    // corrupted, which is the exact shape
+    // `a_refused_delete_leaves_the_receiver_uncorrupted` exists to reject.
+    let is_array = ctx.heap.get(obj).kind == v12_heap::Kind::Array;
+    let old_view = array_like_len(&mut *ctx.heap, obj)?;
+
+    // `Set` BEFORE the store trim, which is ES `ArraySetLength`'s own order
+    // (step 1 writes the property, step 2 deletes the indices at/above it).
+    let wrote = crate::internal_methods::dispatch_set(
+        &mut *ctx.heap,
+        obj,
+        key,
+        value,
+        JsValue::object(obj),
+    )
+    .map_err(Throw::Value)?;
+    if !wrote {
+        return Err(ctx.type_error("TypeError: cannot assign to read only property"));
+    }
+    if is_array {
         // `length` is not an array-length exotic here, so lowering the
         // property alone leaves the lattice holding entries past the new
         // `length` — `pop` returned `"c"` and `a[2]` still read `"c"` at
-        // `length === 2`. Trim the store first.
+        // `length === 2`.
         //
         // Gated on the length *view*, not on a snapshot: `push` lowers
         // nothing, and a snapshot per `push` would make a 1e5-element push
         // loop quadratic.
-        let view = array_like_len(heap, obj)?;
-        if len < view {
-            let kept = heap.get(obj).elements_snapshot();
+        if len < old_view {
+            let kept = ctx.heap.get(obj).elements_snapshot();
             let keep = (len.max(0.0) as usize).min(kept.len());
-            heap.get_mut(obj).replace_elements(kept[..keep].to_vec());
+            ctx.heap.get_mut(obj).replace_elements(kept[..keep].to_vec());
         }
     }
-    crate::internal_methods::dispatch_set(heap, obj, key, value, JsValue::object(obj))
-        .map_err(Throw::Value)?;
     Ok(())
 }
 
@@ -744,7 +798,7 @@ pub fn array_reverse(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<
     // all a `Vec<JsValue>` could do — left three present `undefined`s where
     // `reverse(new Array(3))` leaves none.
     for (i, slot) in slots.iter().enumerate() {
-        write_slot(&mut *ctx.heap, obj, i as i64, *slot)?;
+        write_slot(ctx, obj, i as i64, *slot)?;
     }
     Ok(this)
 }
@@ -752,41 +806,41 @@ pub fn array_reverse(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<
 /// `Array.prototype.shift()` – removes and returns the first element.
 pub fn array_shift(ctx: &mut Ctx, this: JsValue, _args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.shift", None)?;
-    let heap = &mut *ctx.heap;
-    let len = array_like_len(heap, obj)? as i64;
+    // No `heap` local: the writers take `&mut Ctx` (they can throw), so the
+    // read-only reborrow would have to be re-taken on every line.
+    let len = array_like_len(&mut *ctx.heap, obj)? as i64;
     if len == 0 {
         return Ok(JsValue::undefined());
     }
-    let first = index_get(heap, obj, 0)?.0;
+    let first = index_get(&mut *ctx.heap, obj, 0)?.0;
     // Spec: an absent source index DELETES the destination rather than
     // writing `undefined` — which is why shifting `Object.create({0:"inh",
     // length:3})` leaves no own index behind instead of two `undefined`s.
     for k in 1..len {
-        let slot = slot_of(index_get(heap, obj, k)?);
-        write_slot(heap, obj, k - 1, slot)?;
+        let slot = slot_of(index_get(&mut *ctx.heap, obj, k)?);
+        write_slot(ctx, obj, k - 1, slot)?;
     }
-    index_delete(heap, obj, len - 1);
-    set_array_len(heap, obj, (len - 1) as f64)?;
+    delete_index_or_throw(ctx, obj, len - 1)?;
+    set_array_len(ctx, obj, (len - 1) as f64)?;
     Ok(first)
 }
 
 /// `Array.prototype.unshift(...items)` – prepends, returns the new length.
 pub fn array_unshift(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.unshift", None)?;
-    let heap = &mut *ctx.heap;
-    let len = array_like_len(heap, obj)? as i64;
+    let len = array_like_len(&mut *ctx.heap, obj)? as i64;
     let n = args.len() as i64;
     // Back to front, so no read is clobbered by an earlier write.
     for k in (0..len).rev() {
-        let slot = slot_of(index_get(heap, obj, k)?);
-        write_slot(heap, obj, k + n, slot)?;
+        let slot = slot_of(index_get(&mut *ctx.heap, obj, k)?);
+        write_slot(ctx, obj, k + n, slot)?;
     }
     for (i, &item) in args.iter().enumerate() {
-        index_set(heap, obj, i as i64, item)?;
+        index_set(ctx, obj, i as i64, item)?;
     }
     // No `if kind == Array` guard: the deleted guard is why `unshift` on an
     // `arguments` object returned 4 and left `length` at 3.
-    set_array_len(heap, obj, (len + n) as f64)?;
+    set_array_len(ctx, obj, (len + n) as f64)?;
     Ok(helpers::js_number((len + n) as f64))
 }
 
@@ -801,9 +855,8 @@ pub fn array_unshift(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<J
 /// 2:"c",length:3}` returned `[]` and changed nothing.
 pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsValue, Throw> {
     let obj = ctx.this_object(this, "Array.prototype.splice", None)?;
-    let heap = &mut *ctx.heap;
-    let len = array_like_len(heap, obj)? as i64;
-    let start = relative_index(heap, args.first().copied(), len, 0)
+    let len = array_like_len(&mut *ctx.heap, obj)? as i64;
+    let start = relative_index(&mut *ctx.heap, args.first().copied(), len, 0)
         .max(0)
         .min(len);
     let delete_count = match args.get(1).copied() {
@@ -811,7 +864,7 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
         Some(v) if v.is_undefined() => len - start,
         Some(v) => {
             // W3.2: fourth copy of the same coercion, same replacement.
-            let d = super::ctx::heap_to_integer_or_infinity(heap, v) as i64;
+            let d = super::ctx::heap_to_integer_or_infinity(&mut *ctx.heap, v) as i64;
             d.max(0).min(len - start)
         }
     };
@@ -824,34 +877,34 @@ pub fn array_splice(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<Js
     // `[<3 empty items>]`, not three `undefined`s.
     let mut removed: Vec<Slot> = Vec::new();
     for j in 0..delete_count.min(MAX_SCAN_SPAN) {
-        let (value, present) = index_get(heap, obj, start + j)?;
+        let (value, present) = index_get(&mut *ctx.heap, obj, start + j)?;
         removed.push(present.then_some(value));
     }
 
     if insert_count < delete_count {
         // Step 7: close the gap down, then delete the tail that fell out of it.
         for k in start..len - delete_count {
-            let slot = slot_of(index_get(heap, obj, k + delete_count)?);
-            write_slot(heap, obj, k, slot)?;
+            let slot = slot_of(index_get(&mut *ctx.heap, obj, k + delete_count)?);
+            write_slot(ctx, obj, k, slot)?;
         }
         for k in (len - delete_count)..(len - insert_count) {
-            index_delete(heap, obj, k);
+            delete_index_or_throw(ctx, obj, k)?;
         }
     } else if insert_count > delete_count {
         // Step 8: open a gap of `insert_count - delete_count` and slide the
         // tail up into it, back to front so no read is clobbered.
         let mut k = len - delete_count;
         while k > start {
-            let slot = slot_of(index_get(heap, obj, k + delete_count - 1)?);
-            write_slot(heap, obj, k + insert_count - 1, slot)?;
+            let slot = slot_of(index_get(&mut *ctx.heap, obj, k + delete_count - 1)?);
+            write_slot(ctx, obj, k + insert_count - 1, slot)?;
             k -= 1;
         }
     }
 
     for (i, &item) in items.iter().enumerate() {
-        index_set(heap, obj, start + i as i64, item)?;
+        index_set(ctx, obj, start + i as i64, item)?;
     }
-    set_array_len(heap, obj, (len - delete_count + insert_count).max(0) as f64)?;
+    set_array_len(ctx, obj, (len - delete_count + insert_count).max(0) as f64)?;
     Ok(new_array_slots(ctx, removed))
 }
 
@@ -886,7 +939,7 @@ pub fn array_fill(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Result<JsVa
     // read consulted and left the object literally unchanged.
     let hi = end.min(start + MAX_WRITE_SPAN);
     for i in start..hi {
-        index_set(heap, obj, i, value)?;
+        index_set(ctx, obj, i, value)?;
     }
     Ok(this)
 }
@@ -913,7 +966,7 @@ pub fn array_copy_within(ctx: &mut Ctx, this: JsValue, args: &[JsValue]) -> Resu
     for (k, slot) in src.into_iter().enumerate() {
         // An absent source deletes the destination; writing `undefined` there
         // would leave an own property the spec never creates.
-        write_slot(heap, obj, target + k as i64, slot)?;
+        write_slot(ctx, obj, target + k as i64, slot)?;
     }
     Ok(this)
 }
@@ -1059,7 +1112,7 @@ pub fn array_from(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<JsV
         .collect();
     let arr_v = new_array(ctx, items);
     if let Some(arr) = arr_v.as_object() {
-        set_array_len(&mut *ctx.heap, arr, len as f64)?;
+        set_array_len(ctx, arr, len as f64)?;
     }
     Ok(arr_v)
 }

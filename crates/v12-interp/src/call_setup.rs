@@ -5398,7 +5398,12 @@ impl Interp<'_> {
         }
         for i in n..len {
             let key = JsValue::string(self.heap.intern_text(&i.to_string()));
-            self.delete_property(receiver, key)?;
+            // `SortIndexedProperties` step 6 is `DeletePropertyOrThrow`, not
+            // `[[Delete]]`. Writing `self.delete_property(..)?;` discarded the
+            // boolean, so a receiver that refused the delete lost its element
+            // silently — the interpreter-side twin of the `index_delete` defect
+            // fixed in `builtins/array.rs`.
+            self.delete_property_or_throw(receiver, key)?;
         }
         // No `length` write: `Array.prototype.sort` (23.1.3.34) has no such
         // step. Re-asserting it turned a string `length` into a number and

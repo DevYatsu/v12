@@ -1284,18 +1284,44 @@ fn ordinary_delete(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey) -> Inte
 
 fn ordinary_own_property_keys(heap: &Heap, obj: Handle<JsObject>) -> Vec<PropKey> {
     let shape = shape_of(heap, obj);
+    // Same liveness filter as every other own-key reader (see the census note
+    // on `builtins/object.rs::collect_own_string_keys`): a `delete` leaves the
+    // shared shape descriptor with a holed slot, and a holed descriptor is not
+    // an own key. This slot is currently reachable only through
+    // `Reflect.ownKeys`'s own walker, which carries an inline copy of the same
+    // test — so fixing it here is what keeps the TABLE honest if a caller is
+    // ever added, rather than leaving a fourth wrong reader in place.
     let mut keys: Vec<PropKey> = heap
         .get(shape)
         .descriptors
         .as_slice()
         .iter()
+        .filter(|d| match d {
+            v12_heap::Descriptor::Data { slot, .. } => heap
+                .get(obj)
+                .properties
+                .get(*slot as usize)
+                .is_some_and(|v| !v.is_hole()),
+            v12_heap::Descriptor::Accessor { .. } => true,
+        })
         .map(|d| d.key())
         .collect();
     // Overflow keys append in insertion order (`seq`), matching the base
     // path's insertion-order convention. The two stores never overlap
     // (post-spill keys enter only the map), so nothing double-reports.
     if let Some(map) = heap.get(obj).dictionary.as_ref() {
-        let mut overflow: Vec<(u32, PropKey)> = map.iter().map(|(k, e)| (e.seq, *k)).collect();
+        let mut overflow: Vec<(u32, PropKey)> = map
+            .iter()
+            .filter(|(_, e)| {
+                e.is_accessor
+                    || heap
+                        .get(obj)
+                        .properties
+                        .get(e.slot as usize)
+                        .is_some_and(|v| !v.is_hole())
+            })
+            .map(|(k, e)| (e.seq, *k))
+            .collect();
         overflow.sort_by_key(|&(seq, _)| seq);
         keys.extend(overflow.into_iter().map(|(_, k)| k));
     }
@@ -1427,6 +1453,24 @@ pub fn dispatch_has(heap: &mut Heap, obj: Handle<JsObject>, key: PropKey) -> Int
     let kind = kind_of(heap, obj);
     let table = methods_for(kind);
     (table.has_property)(heap, obj, key)
+}
+
+/// Dispatches `[[Delete]]`.
+///
+/// The table slot at line 67 existed from the start and **`Reflect.deleteProperty`
+/// was the only caller** — `builtins/array.rs` had its own `index_delete`, a
+/// second implementation of the same operation that omitted the
+/// non-configurable refusal. That is the whole of ADR-0004's defect A: not a
+/// missing rule, a rule reached through one of two doors. This fn is the other
+/// door, and it is what `index_delete` now routes through.
+pub fn dispatch_delete(
+    heap: &mut Heap,
+    obj: Handle<JsObject>,
+    key: PropKey,
+) -> InternalResult<bool> {
+    let kind = kind_of(heap, obj);
+    let table = methods_for(kind);
+    (table.delete)(heap, obj, key)
 }
 
 // ---------------------------------------------------------------------------
