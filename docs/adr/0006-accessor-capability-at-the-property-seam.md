@@ -487,3 +487,53 @@ grep -rn "dispatch_get(" crates/v12-engine/src crates/v12-interp/src \
   | grep -v "pub fn" | grep -v "///" | grep -v "^\S*: *//" | wc -l    # 21 = 20 + def
 grep -rn "dispatch_set(" crates/v12-engine/src | grep -v "pub fn"        # 4 = 3 + tests
 ```
+
+## Amendment, measured 2026-10-06: Rule 1 is NOT independently landable
+
+This ADR sequenced "Rule 1 first: delete `invoke_accessor_getter`, make the
+accessor case a `Throw`". A lane implemented exactly that and the implementation was
+**correct in isolation** — 13/13 on its own `accessor_seam` tests, and the E2 symptom
+was genuinely fixed (`Array.prototype.slice.call({0:"a",get length(){return 3}})`
+threw instead of silently reporting `length 0`, which is the whole point).
+
+**It still could not be landed.** `crates/v12-engine/tests/regexp_prototype.rs` went
+from 32/32 to 28/32, because the new throw fires on `Symbol.iterator`:
+
+    threw: TypeError: internal [[Get]] cannot invoke the FunctionTarget::Bytecode
+    accessor for key a symbol key: ... The owning object is a Function.
+
+THE REASON THIS BREAKS WORKING CODE, and it was not in the original analysis:
+**symbol-keyed accessors on built-in prototypes are legitimately `Bytecode`.**
+`Array.prototype[Symbol.iterator]`, `Function.prototype[Symbol.toPrimitive]` and
+friends are ordinary JS accessors compiled to bytecode. Any native path that reaches
+them through `dispatch_get` now hits the `Bytecode` arm of the new throw. So Rule 1
+does not merely convert silent wrong answers into loud failures — it converts
+*correct* answers into failures, across the iterator protocol, `Array.isArray`,
+`RegExp` results, and anything else reading a symbol-keyed prototype accessor from a
+native.
+
+The distinguishing fact: the E2 defect is a `Bytecode` accessor on a **plain object
+supplied by the embedder or user**, which the native path should never be able to
+invoke. The regression is a `Bytecode` accessor on an **engine-owned prototype**,
+which the native path reaches only to confirm it exists. One rule cannot distinguish
+them by `FunctionTarget` alone.
+
+## Consequence for sequencing
+
+Rule 1 is only sound **after** the seam migration that this ADR listed as a later
+step, because the migration is what stops native paths from resolving
+engine-owned prototype accessors at all. Do not attempt Rule 1 as a standalone
+first batch; the ordering in this ADR is wrong on that point and this amendment
+supersedes it.
+
+Two further notes from the same attempt, both unfixed:
+- `accessor_throw` builds its error through `type_error(heap, "TypeError: …")`, and
+  the `"TypeError: "` prefix IS the house convention (`parse_error_text` expects it,
+  as at `object.rs:27`). That part was right.
+- But the thrown object is malformed: `String(e)` yields `"[object Error]"` with
+  `name` and `message` undefined and `instanceof Error` false, where a normal
+  `new TypeError("hi")` gives `{"name":"TypeError","msg":"hi","isErr":true}`.
+  Whatever `accessor_throw` routes through is not producing a real error object.
+
+The implementation is preserved (43 347-byte patch plus `accessor_seam.rs`) and was
+reverted rather than committed with its regressions.
