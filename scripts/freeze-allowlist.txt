@@ -244,3 +244,29 @@ ERR_VAL crates/v12-interp/src/execute.rs:174 # "ScriptRuntimeError: execution de
 # v12-interp), exactly as in the interpreter batches.  This same file DOES use
 # `ctx.type_error` at lines 185/206, inside `handle_import(ctx: &mut Ctx, …)`
 # — which is why the distinction has to be made per site, not per file.
+
+# ARRAY_DIRECT_ACCESS — ADR-0006 anti-drift. See scripts/freeze-lint.sh for why
+# the MECHANISM is watched rather than helper names. array.rs is at ZERO and is
+# deliberately absent from this list; these 22 are the callback seam only.
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/object_ops.rs:769 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:147 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:150 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:151 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:427 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:430 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:431 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:575 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:578 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:579 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:702 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:729 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:1144 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:1147 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:1148 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:1384 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:2334 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:2452 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:2455 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:2456 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:3895 # callback-seam hand-rolled index access, deliberate
+ARRAY_DIRECT_ACCESS crates/v12-interp/src/call_setup.rs:3898 # callback-seam hand-rolled index access, deliberate
