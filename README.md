@@ -13,21 +13,30 @@ start, small in memory, and correct enough to run real programs.
 > tested. Generators, async functions, and Promise microtasks are wired end to
 > end. Expect breaking changes.
 >
-> Measured on 2026-10-01 at `eaa495b5` (test count) / `e925647d` (conformance):
-> - `cargo nextest run --workspace` → **1 273 tests, 1 273 passed, 2 skipped**
->   (~15 s). This is the canonical gate; see `CONTEXT.md`. The count drops when a
->   crate's tests go with it — it was 1 295 until the unused `v12-intl` crate
->   (22 tests) was deleted.
+> Measured on 2026-10-06 at `86268805` (test count) / `e925647d` (conformance):
+> - `cargo nextest run --workspace` → **1 414 tests, 1 414 passed, 3 skipped**.
+>   This is the canonical gate; see `CONTEXT.md`. The count drops when a crate's
+>   tests go with it — it was 1 295 until the unused `v12-intl` crate (22 tests)
+>   was deleted, and 1 387 → 1 379 when the node-differential table was
+>   regenerated (17 test functions replaced by 9 plus one `#[ignore]`d, while the
+>   assertion surface grew from ~90 rows to 351).
 > - Test262 `language` → **77.6 % pass** (19 080 / 24 590; 41 skipped) — the
 >   Phase 1 target is ≥60 %, so it is met. The committed baseline is
 >   `conformance/baseline/language.json`; CI gates on **fail sets** via
 >   `conformance/faildiff.sh`, not on pass rate.
+> - Architecture gates, all four enforced in CI: `scripts/freeze-lint.sh`,
+>   `scripts/unwrap-lint.sh`, `scripts/check-architecture.sh`, and the fail-set
+>   gate above.
 >
 > These two numbers were stale for weeks (the README claimed 563 tests and
 > 32.1 %) precisely because they were hand-maintained. If you change them, pin
 > the commit and date as above — and regenerate the baseline only via
->   `scripts/update-conformance-baseline.sh`, which requires a `faildiff`
->   showing BROKE 0 to justify the raise.
+> `scripts/update-conformance-baseline.sh`, which requires a `faildiff`
+> showing BROKE 0 to justify the raise.
+>
+> A conformance `net +0` is not evidence that a fix did nothing. Several
+> verified, node-checked fixes moved the count by zero because test262 does not
+> exercise the layer they were in. See `CONTEXT.md`.
 
 ## Why another engine?
 
@@ -133,11 +142,35 @@ echo 'function* g(){ yield 1; yield 2; } console.log([...g()]);' | cargo run --b
 echo 'Promise.resolve(2).then(v => console.log("got " + v));' | cargo run --bin v12
 ```
 
-Run the test suite (563 tests, `cargo nextest run --workspace`):
+Run the test suite (1 414 tests, `cargo nextest run --workspace --no-fail-fast`):
 
 ```sh
-cargo nextest run --workspace
+# --no-fail-fast matters: without it nextest CANCELS the rest of the run on the
+# first failure, so one failure hides the state of every test after it.
+cargo nextest run --workspace --no-fail-fast
 ```
+
+The architecture gates, all four enforced in CI:
+
+```sh
+./scripts/freeze-lint.sh          # no new sites in frozen pre-Ctx idioms
+./scripts/unwrap-lint.sh          # no new unwrap/expect/panic in non-test code
+./scripts/check-architecture.sh   # crate DAG + clippy budget
+./conformance/faildiff.sh conformance/baseline/language.json after.json
+```
+
+The differential table that drove the array receiver work is **generated, not
+transcribed**:
+
+```sh
+./scripts/gen-array-receiver-table.py           # regenerate (needs node)
+./scripts/gen-array-receiver-table.py --check   # staleness; exits 1 if drifted
+./scripts/table-divergence.py                   # count divergences WITHOUT the ledger
+```
+
+`scripts/table-divergence.py` exists because every measurement taken through the
+ledger is a measurement the ledger could flatter. See
+`docs/adr/0004-arraylike-index-access.md`.
 
 ## Design principles
 
