@@ -823,20 +823,7 @@ const KNOWN_DIVERGENCES: &[Known] = &[
     // receivers `length_lower` now agrees with node, so the two rows here are
     // the only two, and the cause is the real-array store/shape disagreement
     // alone.
-    Known {
-        method: "length_lower",
-        receivers: &["array_dense", "array_holey"],
-        absent: false,
-        why: "`o.length = 1` on a real array drops the element but not its own key",
-    },
     // -- arguments exotic ----------------------------------------------------
-    Known {
-        method: "index_assign_past",
-        receivers: &["arguments_exotic"],
-        absent: false,
-        why: "`arguments[7] = x` grows `arguments.length` to 8; the exotic's length \
-              is fixed at creation and an index write must not touch it",
-    },
     // -- FROZEN: the integrity-level receiver ------------------------------
     //
     // **Batch 8 FIXED all seven of these.** `frozen_object` now diverges on
@@ -945,7 +932,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 88,
+        total, 85,
         "the divergence count moved without the ledger's shape changing"
     );
 }

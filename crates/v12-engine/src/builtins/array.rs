@@ -284,9 +284,26 @@ fn index_set(ctx: &mut Ctx, obj: Handle<JsObject>, i: i64, v: JsValue) -> Result
     // while `getOwnPropertyDescriptor` still reported the opposite, which is
     // the same class of lie this whole batch is about.
     let kind = ctx.heap.get(obj).kind;
-    if matches!(kind, v12_heap::Kind::Array | v12_heap::Kind::Arguments) {
+    if kind == v12_heap::Kind::Array {
         ctx.heap.get_mut(obj).set_element(i as u32, v);
         return Ok(());
+    }
+    if kind == v12_heap::Kind::Arguments {
+        // An `arguments` object's `length` is fixed at creation; a write
+        // past it must not grow the lattice or `length` (the
+        // `index_assign_past` defect). Ordinary (dispatched) set is used
+        // past the current declared length.
+        let key = length_prop(&mut *ctx.heap);
+        let declared_v = crate::internal_methods::dispatch_get(
+            &mut *ctx.heap, obj, key, JsValue::object(obj),
+        ).map_err(Throw::Value)?;
+        let declared = declared_v.as_smi().map(i64::from)
+            .or(declared_v.as_f64().map(|n| n as i64))
+            .unwrap_or(0);
+        if i < declared {
+            ctx.heap.get_mut(obj).set_element(i as u32, v);
+            return Ok(());
+        }
     }
     let key = index_prop(&mut *ctx.heap, i);
     if !crate::internal_methods::dispatch_set(&mut *ctx.heap, obj, key, v, JsValue::object(obj))
