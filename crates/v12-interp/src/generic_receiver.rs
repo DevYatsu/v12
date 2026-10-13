@@ -76,6 +76,7 @@ use crate::Kind;
 /// here instead of hanging the runner. A **declared** deviation, matching
 /// the two existing bounds.
 const MAX_SCAN_SPAN: i64 = 1_000_000;
+const MAX_WRITE_SPAN: i64 = 1_000_000;
 
 /// One element of a receiver: `Absent` is a hole, which is not the same as a
 /// present `undefined` and must travel with the value through `splice`,
@@ -327,7 +328,8 @@ impl<'i> crate::Interp<'i> {
         let value = args.first().copied().unwrap_or_else(JsValue::undefined);
         let start = self.relative_index(args.get(1).copied(), len, 0);
         let end = self.relative_index(args.get(2).copied(), len, len);
-        for i in start..end.max(start) {
+        let hi = end.min(start + MAX_WRITE_SPAN);
+        for i in start..hi.max(start) {
             self.generic_set(obj, i, value)?;
         }
         Ok(this_v)
@@ -344,7 +346,7 @@ impl<'i> crate::Interp<'i> {
         let to = self.relative_index(args.first().copied(), len, 0);
         let from = self.relative_index(args.get(1).copied(), len, 0);
         let final_ = self.relative_index(args.get(2).copied(), len, len);
-        let count = (final_ - from).min(len - to).max(0);
+        let count = (final_ - from).min(len - to).max(0).min(MAX_WRITE_SPAN);
         // Steps 8-11: `direction` picks ascending vs descending, and the
         // descending case is what makes an overlapping copy correct.
         let (mut from, mut to, mut count) = (from, to, count);
