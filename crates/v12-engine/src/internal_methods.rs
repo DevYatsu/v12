@@ -940,35 +940,134 @@ fn dict_property_descriptor(value: JsValue, entry: DictEntry) -> PropertyDescrip
 }
 
 /// Invokes an accessor getter found on `owner` (shared by the shape walk
-/// and the dictionary rung): native/host callables run directly, bytecode
-/// bodies report `undefined` (the interpreter's `get_property` provides
-/// the eval path), and a missing getter reads `undefined`.
+/// and the dictionary rung).
+///
+/// ## The two cases, and why `FunctionTarget` alone cannot tell them apart
+///
+/// `FunctionTarget::Bytecode(u32)` is **overloaded**: `Ctx::alloc_accessor_fn`
+/// and its two siblings stamp engine accessors with
+/// `Bytecode(u32::from(NativeId))`, and user closures carry
+/// `Bytecode(index_into_Program_functions)`. Both payloads are small
+/// integers, so the variant cannot discriminate and neither can the owner —
+/// a user can put a bytecode getter straight onto `Array.prototype` and node
+/// still invokes it (`Array.prototype.slice.call({length: 2})` answers
+/// `["FROM-PROTO", …]`). [`JsObject::FLAG_ENGINE_ACCESSOR`] is stamped by the
+/// engine's own allocator and is not forgeable from JavaScript, so it is the
+/// discriminator: it names the *getter function's provenance*, not the realm
+/// it happens to be installed on.
+///
+/// ## The engine-owned case: dispatched by `NativeId`
+///
+/// A flagged `Bytecode(idx)` is routed through `builtin_dispatch(idx, …)`,
+/// which is the engine's own table of `NativeHandler`s — exactly the route
+/// `NativeRegistry::call_native` takes. So `Set.prototype.size`,
+/// `RegExp.prototype.source` and `Array.prototype[Symbol.iterator]` are
+/// **invoked**, not reported absent. That is the distinction the blanket
+/// `Throw` of ADR-0006's Rule 1 could not express: those reads are *live
+/// reads of an engine-owned prototype accessor*, and answering them wrongly
+/// broke 15 tests in `crates/v12-engine` (5 `regexp_prototype`, 9
+/// `es2025_surface` Set-relational, 1 ledger).
+///
+/// ## The user case: still `undefined`, and now for a stated reason
+///
+/// An unflagged `Bytecode` is a user closure, whose body lives in a
+/// `Program.functions` table that `&mut Heap` cannot name. The engine has no
+/// machine, so it cannot run it; `undefined` is the only answer available to
+/// a pure `&mut Heap` reader. **This is the residual E2 defect and it is NOT
+/// fixed here** — closing it needs the call seam
+/// (`docs/adr/0006-accessor-capability-at-the-property-seam.md`, Rule 3):
+/// migrate the array methods that read a *user-supplied receiver* so their
+/// `length`/index reads go through `Interp::get_property`.
+///
+/// A missing getter reads `undefined`, which is also the spec's answer for
+/// `get: undefined` (22.2.6.1-style accessors and every
+/// `Object.defineProperty(o, k, {get: undefined})`).
 fn invoke_accessor_getter(
     heap: &mut Heap,
     owner: Handle<JsObject>,
     getter: Option<Handle<JsObject>>,
 ) -> InternalResult<JsValue> {
-    if let Some(getter) = getter {
-        // The getter is a function object. Native/host handlers can be
-        // invoked directly with only the heap; a bytecode getter needs
-        // the interpreter, which the engine's `get_property` path
-        // provides — this internal-method fallback reports `undefined`
-        // for it.
-        match heap.get(getter).callable {
-            v12_heap::FunctionTarget::Native(f) => {
-                return f(heap, JsValue::object(owner), &[]);
-            }
-            v12_heap::FunctionTarget::Host(c) => {
-                return c.call(heap, JsValue::object(owner), &[]);
-            }
-            v12_heap::FunctionTarget::Bytecode(_)
-            | v12_heap::FunctionTarget::RealmEval(_)
-            | v12_heap::FunctionTarget::Bound(_) => {
-                return Ok(JsValue::undefined());
+    let Some(getter) = getter else {
+        // `get: undefined` is a legal accessor, and `Get` on it is
+        // `undefined` — not an error, and not a hole in the walk.
+        return Ok(JsValue::undefined());
+    };
+    // The getter is a function object. `Native`/`Host` are callable from
+    // `&mut Heap` alone, so they run directly.
+    match heap.get(getter).callable {
+        v12_heap::FunctionTarget::Native(f) => {
+            return f(heap, JsValue::object(owner), &[]);
+        }
+        v12_heap::FunctionTarget::Host(c) => {
+            return c.call(heap, JsValue::object(owner), &[]);
+        }
+        // `FLAG_ENGINE_ACCESSOR` says this `Bytecode` payload is a `NativeId`,
+        // so the engine's own handler table can serve it — no interpreter, no
+        // `Program`, no machine. Unflagged, the same payload is an index into
+        // a `Program.functions` table that lives in `Interp`, and `&mut Heap`
+        // cannot name it.
+        v12_heap::FunctionTarget::Bytecode(idx)
+            if heap.get(getter).flags & JsObject::FLAG_ENGINE_ACCESSOR != 0 =>
+        {
+            let Ok(id) = <v12_native::NativeId as TryFrom<u32>>::try_from(idx) else {
+                return Err(accessor_internal_error(
+                    heap,
+                    owner,
+                    "an engine accessor carries a payload that is not a NativeId",
+                ));
+            };
+            // Stateful natives (RegExp prototype accessors, Promise @@species,
+            // …) live in the registry's intercept table rather than the
+            // compile-time `builtin_dispatch` jump table, so route through a
+            // freshly built registry: one `NativeRegistry` per read is
+            // wasteful but allocation-free enough for accessor reads, and keeps
+            // the call non-reentrant. A failure surfaces as the thrown value;
+            // an "unknown id" answers `undefined` to stay consistent with the
+            // bare-heap fallback the interpreter's own seam replaced.
+            let result = {
+                let mut reg = crate::builtins::NativeRegistry::new();
+                v12_native::NativeRegistry::call_native(&mut reg, heap, JsValue::object(owner), &[], id)
+            };
+            match result {
+                Ok(v) => Ok(v),
+                Err(t) => Err(t.into_js(heap)),
             }
         }
+        // The residual E2 case: a user closure. See the doc comment.
+        v12_heap::FunctionTarget::Bytecode(_) => return Ok(JsValue::undefined()),
+        // `RealmEval`/`Bound` share this arm with the user-closure case
+        // because neither is reachable as an engine-installed accessor (an
+        // engine accessor is always a `NativeId`), and neither can be run
+        // from `&mut Heap`. Split per ADR-0006 consequence 3 so a future
+        // variant cannot be folded back in here.
+        v12_heap::FunctionTarget::RealmEval(_) => return Ok(JsValue::undefined()),
+        v12_heap::FunctionTarget::Bound(_) => return Ok(JsValue::undefined()),
     }
-    Ok(JsValue::undefined())
+}
+
+/// A well-formed `Error` for the two engine-side accessor faults, so the
+/// thrown object carries `name`/`message` and satisfies `instanceof Error`.
+///
+/// ADR-0006's amendment recorded that the discarded Rule-1 attempt routed
+/// through `type_error(heap, "TypeError: …")` and produced a *malformed*
+/// throw — `String(e)` was `[object Error]` with `name`/`message` undefined
+/// and `instanceof Error` false. `v12_native::error_object` allocates a real
+/// `Kind::Error` with the `[name, message]` layout the display paths read, so
+/// both of those hold. The message names the receiver's kind so a conformance
+/// row that trips it identifies itself without a debugger.
+fn accessor_internal_error(heap: &mut Heap, owner: Handle<JsObject>, detail: &str) -> JsValue {
+    let kind_label = match heap.get(owner).kind {
+        v12_heap::Kind::Function => "a Function",
+        v12_heap::Kind::Array => "an Array",
+        v12_heap::Kind::Arguments => "an arguments object",
+        v12_heap::Kind::Error => "an Error",
+        _ => "an ordinary object",
+    };
+    v12_native::error_object(
+        heap,
+        "InternalError",
+        &format!("internal [[Get]] cannot reach an accessor on {kind_label}: {detail}"),
+    )
 }
 
 fn ordinary_has_property(
@@ -1102,7 +1201,7 @@ fn ordinary_get(
             .copied()
         {
             if entry.is_accessor {
-                return invoke_accessor_getter(heap, o, entry.getter);
+                return invoke_accessor_getter(heap, obj, entry.getter);
             }
             heap.stub_record_proto(obj, recv_shape, key, o, o_shape, entry.slot);
             if let Some(&v) = heap.get(o).properties.get(entry.slot as usize)
@@ -1130,7 +1229,7 @@ fn ordinary_get(
                     // Deleted own key: continue to the prototype (step 3).
                 }
                 v12_heap::Descriptor::Accessor { getter, .. } => {
-                    return invoke_accessor_getter(heap, o, getter);
+                    return invoke_accessor_getter(heap, obj, getter);
                 }
             }
         }

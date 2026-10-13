@@ -300,6 +300,42 @@ impl JsObject {
     /// Every own property also non-writable: frozen.
     pub const FLAG_FROZEN: u8 = 0b0000_0100;
 
+    /// This `KIND_FUNCTION` object was allocated by the **engine** as a
+    /// built-in accessor, so its [`crate::function::FunctionTarget::Bytecode`]
+    /// payload is a [`v12_native::NativeId`] rather than an index into some
+    /// `Program`'s function table.
+    ///
+    /// ## Why a flag, and not the index
+    ///
+    /// A user closure and an engine accessor are *both* `Bytecode(u32)`, and
+    /// both payloads are small integers, so no test on the number separates
+    /// them — `Bytecode(42)` is a user closure in one program and
+    /// `NativeId` 42 in another. The engine installs its accessors through
+    /// `Ctx::alloc_accessor_fn` / `define_size_getter` /
+    /// `define_symbol_getter`, which is the one place that *knows* which of
+    /// the two it allocated, so the bit is stamped there and read back by
+    /// `internal_methods::invoke_accessor_getter`.
+    ///
+    /// ## Why the owner is not the discriminator
+    ///
+    /// The tempting alternative — "is the accessor's owner an engine-owned
+    /// prototype?" — is **wrong**, and not merely fragile. A user can install
+    /// a bytecode getter directly on an engine intrinsic prototype and a
+    /// native must still invoke it:
+    ///
+    /// ```js
+    /// Object.defineProperty(Array.prototype, "0",
+    ///   { get: function () { return "FROM-PROTO" }, configurable: true });
+    /// Array.prototype.slice.call({ length: 2 });   // node: ["FROM-PROTO", <hole>]
+    /// ```
+    ///
+    /// node answers `["FROM-PROTO", …]` here, so keying on the owner would
+    /// keep that divergence. Keying on the *getter function's own provenance*
+    /// gets it right, and it is realm-independent: intrinsics are per-realm,
+    /// but "the engine allocated this function object" is not a property of any
+    /// realm and cannot be forged from JavaScript.
+    pub const FLAG_ENGINE_ACCESSOR: u8 = 0b0001_0000;
+
     /// True once sealed (or frozen): no property may be removed or
     /// reconfigured.
     pub fn is_sealed(&self) -> bool {

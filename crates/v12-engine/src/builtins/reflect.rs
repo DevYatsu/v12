@@ -215,16 +215,21 @@ fn own_keys_ordered(heap: &mut Heap, obj: Handle<JsObject>) -> Vec<PropKey> {
     keys
 }
 
-/// Allocates an array value (rooted) linked to `%Array.prototype%`.
+/// Allocates an array value (rooted, linked to `%Array.prototype%`, carrying
+/// the canonical `length` shape).
+///
+/// This used to hand-roll the idiom — `heap.alloc(JsObject::array(..))` plus
+/// a manual `prototype` stamp — and that omission is the whole
+/// `Reflect.ownKeys` bug: without `finish_array` the fresh object keeps the
+/// empty root shape while `properties[0]` already holds the length Smi, so
+/// (a) `Get(O, "length")` misses own `length`, walks to
+/// `Array.prototype.length` (0), and `JSON.stringify` rendered the result
+/// `[]`; (b) the next `add_property` was handed slot 0 and `properties.push`
+/// appended at index 1, so `arr.foo = 42` read back the length.
+/// `Ctx::alloc_array` is the documented single canonical allocator — see its
+/// doc comment and `ARRAY_DIRECT_ACCESS` in `check-architecture.sh`.
 fn array_value(ctx: &mut Ctx, items: Vec<JsValue>) -> JsValue {
-    let arr = ctx.heap.alloc(JsObject::array(items));
-    if let Some(ctor) = ctx.intrinsic("Array").and_then(|v| v.as_object())
-        && let Some(proto) = ctx.heap.get(ctor).prototype
-    {
-        ctx.heap.get_mut(arr).prototype = Some(proto);
-    }
-    ctx.add_root(JsValue::object(arr));
-    JsValue::object(arr)
+    JsValue::object(ctx.alloc_array(items))
 }
 
 /// `Reflect` methods have no `[[Construct]]`. The interpreter's native

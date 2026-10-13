@@ -179,6 +179,14 @@ fn static_key_or_default(key: &PropertyKey<'_>) -> String {
 
 /// `ClassElementName` text for a private name (`#x` → `#x`); `None` for
 /// public/computed keys.
+///
+/// `PropertyKey` flattens to 46 variants — two direct
+/// (`StaticIdentifier`, `PrivateIdentifier`) plus every `Expression` through
+/// `INHERIT`. The `_` is a genuine general fallback, not a leftover: this
+/// function's whole answer is "is this key a private name?", and no
+/// `Expression` variant is one, so all 44 of them share the `PrivateIdentifier`
+/// arm's answer. Naming them individually would be 44 arms of `=> None` that
+/// say nothing a reader does not already get from the type.
 fn private_name_text(key: &oxc_ast::ast::PropertyKey<'_>) -> Option<String> {
     match key {
         oxc_ast::ast::PropertyKey::PrivateIdentifier(p) => Some(format!("#{}", p.name)),
@@ -192,18 +200,21 @@ fn private_name_text(key: &oxc_ast::ast::PropertyKey<'_>) -> Option<String> {
 fn declared_private_names(c: &oxc_ast::ast::Class<'_>) -> Vec<String> {
     let mut names = Vec::new();
     for el in &c.body.body {
-        match el {
-            oxc_ast::ast::ClassElement::MethodDefinition(m) => {
-                if let Some(n) = private_name_text(&m.key) {
-                    names.push(n);
-                }
-            }
-            oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
-                if let Some(n) = private_name_text(&p.key) {
-                    names.push(n);
-                }
-            }
-            _ => {}
+        // `ClassElement` has 5 variants and no `INHERIT`. `StaticBlock` and
+        // `AccessorProperty` are real JavaScript that declares a private name
+        // (`class C { static { C.#x } }`, `class C { accessor #x = 1 }`) — both
+        // are rejected downstream by Pass B (`class.rs:237`/`:243`, "not
+        // supported yet"), so naming them here records *where* the gap is
+        // rather than letting a reader assume nobody looked.
+        let key = match el {
+            oxc_ast::ast::ClassElement::MethodDefinition(m) => &m.key,
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) => &p.key,
+            oxc_ast::ast::ClassElement::StaticBlock(_)
+            | oxc_ast::ast::ClassElement::AccessorProperty(_)
+            | oxc_ast::ast::ClassElement::TSIndexSignature(_) => continue,
+        };
+        if let Some(n) = private_name_text(key) {
+            names.push(n);
         }
     }
     names
@@ -234,7 +245,26 @@ fn contains_arguments(e: &Expression<'_>) -> bool {
                 oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
                     id.name.as_str() == "arguments"
                 }
-                _ => false,
+                // The update *target* is a member, but `ContainsArguments`
+                // reaches through it to the object: `(arguments).x++` reads
+                // `arguments`. These were `=> false` under a wildcard, so
+                // `class C { x = (arguments).x++ }`, `(arguments)[0]++` and
+                // `(arguments.x)++` all compiled; node rejects all three
+                // (`SyntaxError`, verified on node 24).
+                oxc_ast::ast::SimpleAssignmentTarget::ComputedMemberExpression(c) => {
+                    walk_expr(&c.object) || walk_expr(&c.expression)
+                }
+                oxc_ast::ast::SimpleAssignmentTarget::StaticMemberExpression(s) => {
+                    walk_expr(&s.object)
+                }
+                oxc_ast::ast::SimpleAssignmentTarget::PrivateFieldExpression(p) => {
+                    walk_expr(&p.object)
+                }
+                // Never produced: the parser is never asked for TypeScript.
+                oxc_ast::ast::SimpleAssignmentTarget::TSAsExpression(_)
+                | oxc_ast::ast::SimpleAssignmentTarget::TSSatisfiesExpression(_)
+                | oxc_ast::ast::SimpleAssignmentTarget::TSNonNullExpression(_)
+                | oxc_ast::ast::SimpleAssignmentTarget::TSTypeAssertion(_) => false,
             },
             Expression::AssignmentExpression(a) => {
                 // The whole left side, not just an identifier: `({a: b =
@@ -1024,28 +1054,7 @@ impl<'s> Collector<'s> {
             Statement::ForInStatement(f) => {
                 // `for (const k in obj)`: declare the left binding pattern
                 // (the loop variable), then walk the right and body.
-                let unit = self.cur_unit();
-                match &f.left {
-                    oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
-                        let is_const =
-                            matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
-                        let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
-                        for d in &v.declarations {
-                            self.record_declared_names(unit, binding_names(&d.id), is_var);
-                            if is_const && let Some(sym) = binding_symbol(&d.id) {
-                                self.plans.const_bindings.insert(sym);
-                            }
-                            self.binding_pattern(&d.id);
-                        }
-                    }
-                    oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
-                        if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
-                            self.note_ref(sym);
-                        }
-                        self.mark_arguments(id.name.as_str(), id.reference_id.get());
-                    }
-                    _ => {}
-                }
+                self.for_left(&f.left);
                 self.expr(&f.right);
                 self.control_depth += 1;
                 self.stmt(&f.body);
@@ -1055,28 +1064,7 @@ impl<'s> Collector<'s> {
                 // `for (const x of iterable)`: the left binding pattern is a
                 // fresh per-iteration binding — declare it in the current
                 // unit so `access()` resolves a real register, not r0.
-                let unit = self.cur_unit();
-                match &f.left {
-                    oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
-                        let is_const =
-                            matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
-                        let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
-                        for d in &v.declarations {
-                            self.record_declared_names(unit, binding_names(&d.id), is_var);
-                            if is_const && let Some(sym) = binding_symbol(&d.id) {
-                                self.plans.const_bindings.insert(sym);
-                            }
-                            self.binding_pattern(&d.id);
-                        }
-                    }
-                    oxc_ast::ast::ForStatementLeft::AssignmentTargetIdentifier(id) => {
-                        if let Some(sym) = self.ref_symbol(id.reference_id.get()) {
-                            self.note_ref(sym);
-                        }
-                        self.mark_arguments(id.name.as_str(), id.reference_id.get());
-                    }
-                    _ => {}
-                }
+                self.for_left(&f.left);
                 self.expr(&f.right);
                 self.control_depth += 1;
                 self.stmt(&f.body);
@@ -1233,7 +1221,14 @@ impl<'s> Collector<'s> {
                     };
                     (n, false, false)
                 }
-                _ => continue,
+                // `StaticBlock` / `AccessorProperty` *can* declare a private
+                // name, and a duplicate one there would be an error Pass B
+                // never reaches (it rejects both forms outright — see
+                // `class.rs:237`/`:243`). Named so the gap is visible rather
+                // than looking like a considered "these declare nothing".
+                oxc_ast::ast::ClassElement::StaticBlock(_)
+                | oxc_ast::ast::ClassElement::AccessorProperty(_)
+                | oxc_ast::ast::ClassElement::TSIndexSignature(_) => continue,
             };
             if let Some(existing) = seen_private.iter_mut().find(|(n, _, _)| *n == name) {
                 // A get/set pair is the only legal repeat: one get and one set.
@@ -1289,7 +1284,13 @@ impl<'s> Collector<'s> {
             {
                 Some(m)
             }
-            _ => None,
+            // A `constructor` is spelled as a `MethodDefinition` and nothing
+            // else; the remaining four `ClassElement` variants cannot be one.
+            oxc_ast::ast::ClassElement::MethodDefinition(_)
+            | oxc_ast::ast::ClassElement::PropertyDefinition(_)
+            | oxc_ast::ast::ClassElement::StaticBlock(_)
+            | oxc_ast::ast::ClassElement::AccessorProperty(_)
+            | oxc_ast::ast::ClassElement::TSIndexSignature(_) => None,
         });
         if let Some(m) = ctor_el {
             // The explicit constructor is a Function; register its params and
@@ -1334,22 +1335,27 @@ impl<'s> Collector<'s> {
         // Computed class-element names (`class { [expr]() {} }`,
         // `[expr] = v`) evaluate in the class's strict, private-aware context.
         for el in &c.body.body {
-            match el {
-                oxc_ast::ast::ClassElement::MethodDefinition(m) if m.computed => {
-                    if let Some(kx) = m.key.as_expression() {
-                        self.unit_stack.push(idx);
-                        self.expr(kx);
-                        self.unit_stack.pop();
-                    }
-                }
-                oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.computed => {
-                    if let Some(kx) = p.key.as_expression() {
-                        self.unit_stack.push(idx);
-                        self.expr(kx);
-                        self.unit_stack.pop();
-                    }
-                }
-                _ => {}
+            let key = match el {
+                oxc_ast::ast::ClassElement::MethodDefinition(m) if m.computed => &m.key,
+                oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.computed => &p.key,
+                // Not computed, so there is no key expression to walk. The
+                // first two arms' guards fall through to here when their key
+                // is static.
+                oxc_ast::ast::ClassElement::MethodDefinition(_)
+                | oxc_ast::ast::ClassElement::PropertyDefinition(_) => continue,
+                // `StaticBlock` and `AccessorProperty` also have a computed
+                // key in principle (`class C { accessor [e] = 1 }`), but
+                // neither is lowered today — Pass B rejects both outright
+                // (`class.rs:237`/`:243`) — so there is nothing to walk, and
+                // the key loop must not be what decides that.
+                oxc_ast::ast::ClassElement::StaticBlock(_)
+                | oxc_ast::ast::ClassElement::AccessorProperty(_)
+                | oxc_ast::ast::ClassElement::TSIndexSignature(_) => continue,
+            };
+            if let Some(kx) = key.as_expression() {
+                self.unit_stack.push(idx);
+                self.expr(kx);
+                self.unit_stack.pop();
             }
         }
         // Walk field initializers for `this`/`super`/captures (e.g. `#x = () => this.#y`).
@@ -1393,9 +1399,14 @@ impl<'s> Collector<'s> {
                     format!("<method>{}", Self::static_key_or_default(&m.key)),
                 );
                 let prefix = match m.kind {
+                    // `MethodDefinitionKind` has 4 variants and no
+                    // `INHERIT`. Only the two accessors have a prefix; a
+                    // `constructor` cannot reach here (the loop condition
+                    // above excludes it) and a plain method has none.
                     oxc_ast::ast::MethodDefinitionKind::Get => "get ",
                     oxc_ast::ast::MethodDefinitionKind::Set => "set ",
-                    _ => "",
+                    oxc_ast::ast::MethodDefinitionKind::Method
+                    | oxc_ast::ast::MethodDefinitionKind::Constructor => "",
                 };
                 mplan.function_name =
                     crate::expr::static_key_text(&m.key).map(|k| format!("{prefix}{k}"));
@@ -1526,10 +1537,22 @@ impl<'s> Collector<'s> {
         match &d.declaration {
             oxc_ast::ast::Declaration::VariableDeclaration(v) => {
                 // Record each binding as an export.
+                //
+                // `binding_symbols`, not `binding_symbol`: `export const [a] =
+                // [1]` and `export var {p, q} = …` are ordinary module syntax
+                // and export *every* binding the pattern introduces, but
+                // `binding_symbol` returns `None` for anything that is not a
+                // bare `BindingIdentifier`, so the whole export was silently
+                // dropped and the module exported nothing at all. Measured on
+                // `2411f4cb`: `export const [a] = [1]` produced an empty
+                // export table where node produces `['a']`. The exported name
+                // is the *binding's* name — `scoping.symbol_name` — which for
+                // a pattern leaf is the identifier the pattern binds, so this
+                // is what `ident_name_of_binding` answered for the
+                // identifier case.
                 for decl in &v.declarations {
-                    if let Some(sym) = binding_symbol(&decl.id) {
-                        let exported = ident_name_of_binding(&decl.id)
-                            .unwrap_or_else(|| self.scoping.symbol_name(sym).to_string());
+                    for sym in binding_symbols(&decl.id) {
+                        let exported = self.scoping.symbol_name(sym).to_string();
                         self.plans.exports.push(ExportEntry {
                             specifier: None,
                             imported: None,
@@ -1569,8 +1592,24 @@ impl<'s> Collector<'s> {
                         span,
                     });
                 }
+                // Known gap, not a wildcard: `export class C {}` records the
+                // export entry but never calls `class_unit`, so the class body
+                // is not walked for captures/`super`/field initializers the way
+                // a plain `class C {}` declaration is. Left alone — the fix is
+                // a behaviour change needing conformance measurement.
             }
-            _ => {}
+            // `Declaration` has 10 variants and no `INHERIT`. The three above
+            // are the only ones a JavaScript module can export a *runtime*
+            // binding from; the other seven are TypeScript declarations, which
+            // never produce a runtime binding and are never parsed (the parser
+            // is only ever given `SourceType::script()`/`mjs()`).
+            oxc_ast::ast::Declaration::TSTypeAliasDeclaration(_)
+            | oxc_ast::ast::Declaration::TSInterfaceDeclaration(_)
+            | oxc_ast::ast::Declaration::TSEnumDeclaration(_)
+            | oxc_ast::ast::Declaration::TSExternalModuleDeclaration(_)
+            | oxc_ast::ast::Declaration::TSNamespaceDeclaration(_)
+            | oxc_ast::ast::Declaration::TSGlobalDeclaration(_)
+            | oxc_ast::ast::Declaration::TSImportEqualsDeclaration(_) => {}
         }
     }
 
@@ -1628,7 +1667,22 @@ impl<'s> Collector<'s> {
             oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
                 c.id.as_ref().and_then(|id| id.symbol_id.get())
             }
-            _ => None,
+            // Documented general fallback. `ExportDefaultDeclarationKind` is
+            // `FunctionDeclaration`/`ClassDeclaration`/`TSInterfaceDeclaration`
+            // plus every `Expression` (47 flattened). The `TS*` variant is
+            // named; the remaining `other` is the 44 `Expression` variants,
+            // and none of them can introduce a *local binding* —
+            // `export default 1` and `export default (class {})` are
+            // expressions with no name to bind. Naming 44 arms of `=> None`
+            // would restate the type, not add information.
+            oxc_ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => None,
+            other => {
+                debug_assert!(
+                    other.as_expression().is_some(),
+                    "ExportDefaultDeclarationKind must be a declaration, an interface, or an expression",
+                );
+                None
+            }
         };
         if let Some(sym) = local_sym {
             // The binding is declared at module top level if it has a name.
@@ -1654,12 +1708,24 @@ impl<'s> Collector<'s> {
                 self.fn_unit(f, false, "<default fn>", false);
             }
             oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
+                // KNOWN GAP, not a wildcard: a default-exported class is *not*
+                // walked, so `export default class C extends A {}` never
+                // notes the heritage reference `A`, and a field initializer
+                // never gets its `this`/`super`/capture analysis. Left as is
+                // deliberately — giving a default-exported class a unit is a
+                // layout change that needs conformance measurement, not a
+                // refactor. Recorded here so it reads as "known", the way the
+                // `_ => {}` it replaced did not.
                 let _ = c;
             }
             oxc_ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {}
-            _ => {
-                // Expression form: `export default 1` – no extra decls.
-                if let Some(expr) = d.declaration.as_expression() {
+            // Documented general fallback: the 44 `Expression` variants, all
+            // of which are the expression form — `export default 1`. Delegated
+            // through `as_expression()` rather than spelled out, which keeps
+            // the recursion in one place: an `Expression` variant added later
+            // is a compile error in `Collect::expr`, which this reaches.
+            other => {
+                if let Some(expr) = other.as_expression() {
                     self.expr(expr);
                 }
             }
@@ -1723,11 +1789,7 @@ impl<'s> Collector<'s> {
                     .extend(binding_symbols(&d.id));
             }
             if is_const {
-                if let Some(sym) = binding_symbol(&d.id) {
-                    self.plans.const_bindings.insert(sym);
-                } else {
-                    self.collect_const_bindings(&d.id);
-                }
+                self.plans.const_bindings.extend(binding_symbols(&d.id));
             }
             if is_var_at_top {
                 self.collect_global_bindings(&d.id);
@@ -1764,35 +1826,6 @@ impl<'s> Collector<'s> {
             }
             BindingPattern::AssignmentPattern(ap) => {
                 self.collect_global_bindings(&ap.left);
-            }
-        }
-    }
-
-    fn collect_const_bindings(&mut self, pat: &BindingPattern<'_>) {
-        match pat {
-            BindingPattern::BindingIdentifier(id) => {
-                if let Some(sym) = id.symbol_id.get() {
-                    self.plans.const_bindings.insert(sym);
-                }
-            }
-            BindingPattern::ObjectPattern(o) => {
-                for prop in &o.properties {
-                    self.collect_const_bindings(&prop.value);
-                }
-                if let Some(rest) = &o.rest {
-                    self.collect_const_bindings(&rest.argument);
-                }
-            }
-            BindingPattern::ArrayPattern(a) => {
-                for el in a.elements.iter().flatten() {
-                    self.collect_const_bindings(el);
-                }
-                if let Some(rest) = &a.rest {
-                    self.collect_const_bindings(&rest.argument);
-                }
-            }
-            BindingPattern::AssignmentPattern(ap) => {
-                self.collect_const_bindings(&ap.left);
             }
         }
     }
@@ -2176,8 +2209,16 @@ impl<'s> Collector<'s> {
                     match el {
                         ArrayExpressionElement::SpreadElement(s) => self.expr(&s.argument),
                         ArrayExpressionElement::Elision(_) => {}
-                        _ => {
-                            if let Some(x) = el.as_expression() {
+                        // Documented general fallback: `ArrayExpressionElement`
+                        // is `SpreadElement`/`Elision` plus every `Expression`
+                        // (46 flattened), and an array element that *is* an
+                        // expression is by definition something to walk. The
+                        // delegation is what makes this exhaustive in practice —
+                        // a new `Expression` variant is a compile error in
+                        // `Collect::expr`, which this reaches. Same shape as
+                        // the `ObjectPropertyKind` arm above.
+                        other => {
+                            if let Some(x) = other.as_expression() {
                                 self.expr(x);
                             }
                         }
@@ -2217,15 +2258,102 @@ impl<'s> Collector<'s> {
         }
     }
 
-    fn walk_assignment_target(&mut self, target: &oxc_ast::ast::AssignmentTarget<'_>) {
-        if let Some(simple) = target.as_simple_assignment_target() {
-            self.simple_target(simple);
-            return;
+    /// The `left` of a for-in/of head — `ForStatementLeft` (16 flattened
+    /// variants). One method for both loops: the two statement arms were
+    /// byte-identical, so any fix to one had to be made twice and a
+    /// one-sided edit was a latent divergence.
+    ///
+    /// `ForStatementLeft` is `VariableDeclaration` plus `INHERIT(AssignmentTarget)`,
+    /// i.e. the 15 `AssignmentTarget` variants verbatim. This used to match
+    /// only `VariableDeclaration` and `AssignmentTargetIdentifier` and drop
+    /// the other 13 behind a `_ => {}`, which is *not* a harmless
+    /// "nothing to collect":
+    ///
+    /// - the dropped member heads (`for (o.x of xs)`, `for (o[k] of xs)`)
+    ///   carry a read of `o` / `k`, and
+    /// - the dropped destructuring heads (`for ([a] of xs)`,
+    ///   `for ({x: a} of xs)`, `for ([a = 1] of xs)`) carry writes of `a`
+    ///   plus the references inside every default.
+    ///
+    /// A reference that is never noted is a reference `finalize` cannot see,
+    /// so the binding is never marked `captured`, the *declaring* unit never
+    /// sets `has_env`, no environment is allocated, and the inner frame's
+    /// write lands in a register of its own — the exact failure ADR-0004
+    /// records for `class … extends`. Measured on `2411f4cb`:
+    /// `let o={x:1}; let g=function(){ for (o.x of [5]) {} }` emitted **zero**
+    /// `NewEnvironment` in the enclosing function, where the same write
+    /// spelled `o.x = 5` emitted one.
+    ///
+    /// The remaining `other =>` arm is a *delegation*, not a swallow: the
+    /// four `TS*` variants (the only `ForStatementLeft` variants that are not
+    /// an `AssignmentTarget`) are named above, and every other variant is
+    /// handed to `walk_assignment_target`, which is exhaustive over
+    /// `AssignmentTarget` — so a new `AssignmentTarget` variant is a compile
+    /// error *there* and is reached from here. This is the same shape as
+    /// `contains_arguments::walk_for_left` (`:449`) and `walk_assignment_target`
+    /// itself (`:2216`).
+    fn for_left(&mut self, left: &oxc_ast::ast::ForStatementLeft<'_>) {
+        match left {
+            oxc_ast::ast::ForStatementLeft::VariableDeclaration(v) => {
+                // `for (const k in obj)` / `for (let x of xs)`: declare the
+                // head bindings in the current unit so `access()` resolves a
+                // real register, not r0.
+                let unit = self.cur_unit();
+                let is_const = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Const);
+                let is_var = matches!(v.kind, oxc_ast::ast::VariableDeclarationKind::Var);
+                for d in &v.declarations {
+                    self.record_declared_names(unit, binding_names(&d.id), is_var);
+                    if is_const {
+                        // Every binding the head introduces is const, at any
+                        // pattern depth. `binding_symbol` reached only the
+                        // bare-identifier shape, so `for (const [y] of xs)`
+                        // lost the "Assignment to constant variable" early
+                        // error that `for (const y of xs)` fired — the
+                        // `var_decl` path already had the pattern fallback
+                        // (`collect_const_bindings`), and this is the same
+                        // answer without the second walker.
+                        self.plans.const_bindings.extend(binding_symbols(&d.id));
+                    }
+                    self.binding_pattern(&d.id);
+                }
+            }
+            // Never produced: the parser is only ever given
+            // `SourceType::script()`/`mjs()`, neither of which sets
+            // `with_typescript`.
+            oxc_ast::ast::ForStatementLeft::TSAsExpression(_)
+            | oxc_ast::ast::ForStatementLeft::TSSatisfiesExpression(_)
+            | oxc_ast::ast::ForStatementLeft::TSNonNullExpression(_)
+            | oxc_ast::ast::ForStatementLeft::TSTypeAssertion(_) => {}
+            other => {
+                // Includes `AssignmentTargetIdentifier` (`for (x of xs)`), so
+                // the head is now noted exactly as the same write would be
+                // outside a loop head: the reference, the `arguments` mark,
+                // and the strict-mode reserved-word early error that
+                // `"use strict"; for (yield of xs) {}` needs and that only
+                // `simple_target` checks.
+                if let Some(target) = other.as_assignment_target() {
+                    self.walk_assignment_target(target);
+                }
+            }
         }
+    }
+
+    fn walk_assignment_target(&mut self, target: &oxc_ast::ast::AssignmentTarget<'_>) {
         // Complex destructuring assignment targets: recurse into nested
         // patterns so references, captures, and nested functions inside
         // defaults are all registered (emission mirrors this recursion in
         // `destructure_assign`, including `lower_default` initializers).
+        //
+        // The match is exhaustive over `AssignmentTarget`'s flattened 15
+        // (`SimpleAssignmentTarget` 9 + `AssignmentTargetPattern` 2, resolved
+        // through `INHERIT`) *modulo the `other` delegation below*, which
+        // exists because `simple_target` takes a `&SimpleAssignmentTarget` and
+        // there is no way to narrow an `&AssignmentTarget` to one without
+        // `as_simple_assignment_target()`. Note the shape this replaced: an
+        // early `if let … { return; }` above the match, which hid the six
+        // simple variants from rustc and left a `_ => {}` covering them —
+        // which is how `ArrayAssignmentTarget`'s sibling arms drifted without
+        // anyone noticing.
         match target {
             oxc_ast::ast::AssignmentTarget::ArrayAssignmentTarget(arr) => {
                 for el in arr.elements.iter().flatten() {
@@ -2298,7 +2426,22 @@ impl<'s> Collector<'s> {
                     self.walk_assignment_target(&rest.target);
                 }
             }
-            _ => {}
+            // The two destructuring patterns are matched above and every
+            // `SimpleAssignmentTarget` is delegated below, so nothing is
+            // dropped. What the guard actually is, precisely: a new
+            // `AssignmentTarget` variant is either a new *pattern* variant —
+            // a compile error here, because both patterns are named — or a new
+            // `SimpleAssignmentTarget` variant, which is a compile error in
+            // `simple_target`, whose 9 variants are all named. The `other` arm
+            // also absorbs the four `TS*` variants, which
+            // `as_simple_assignment_target()` rejects and the parser never
+            // produces; that is the one thing this arm drops, and it is a
+            // deliberate no-op rather than an oversight.
+            other => {
+                if let Some(simple) = other.as_simple_assignment_target() {
+                    self.simple_target(simple);
+                }
+            }
         }
     }
 
@@ -2335,7 +2478,15 @@ impl<'s> Collector<'s> {
                 self.check_private_name_ref(&format!("#{}", p.field.name), p.span);
                 self.expr(&p.object);
             }
-            _ => {}
+            // `SimpleAssignmentTarget` has 9 variants: the identifier and the
+            // three member forms above, plus the four `TS*` ones — none of
+            // which is ever produced (the parser is never asked for
+            // TypeScript). Naming them so a new variant cannot be dropped
+            // here unnoticed.
+            SimpleAssignmentTarget::TSAsExpression(_)
+            | SimpleAssignmentTarget::TSSatisfiesExpression(_)
+            | SimpleAssignmentTarget::TSNonNullExpression(_)
+            | SimpleAssignmentTarget::TSTypeAssertion(_) => {}
         }
     }
 }
@@ -2456,10 +2607,33 @@ fn resolve_eval_sites(plans: &mut Plans, scoping: &Scoping, nodes: Option<&AstNo
     }
 }
 
+/// The symbol of a binding pattern that is a **bare name**, or `None` for any
+/// pattern that introduces more than one binding or destructures.
+///
+/// `None` is a real answer here, not a resolution failure, and its one
+/// remaining caller depends on it: `register_formals` (`:1858`) reads
+/// `formal_idents` positionally against the incoming formal window, where a
+/// `None` means "this formal is a pattern — leave the incoming register as
+/// scratch for the prologue destructure, and let `decl_order` place the
+/// leaves" (`finalize` step 1 at `:2748` skips on it, step 3 at `:2783` picks
+/// the leaves up). Turning that call site into `binding_symbols` would move
+/// a destructuring formal's leaves into the reserved window and double-allocate
+/// them.
+///
+/// For "every symbol this pattern introduces", use [`binding_symbols`]. The
+/// asymmetry between the two is what silently dropped the exports of
+/// `export const [a] = [1]` and the const-ness of `for (const [y] of xs)`;
+/// both now use `binding_symbols`.
 fn binding_symbol(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<SymbolId> {
     match p {
         oxc_ast::ast::BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
-        _ => None,
+        // Not "cannot resolve": these three *are* resolved, they just bind
+        // more than one name (or none, for a bare rest/default). Named rather
+        // than wildcarded so a new `BindingPattern` variant cannot be added
+        // without deciding which of the two answers it is.
+        oxc_ast::ast::BindingPattern::ObjectPattern(_)
+        | oxc_ast::ast::BindingPattern::ArrayPattern(_)
+        | oxc_ast::ast::BindingPattern::AssignmentPattern(_) => None,
     }
 }
 
@@ -2537,13 +2711,6 @@ fn expected_args(items: &[oxc_ast::ast::FormalParameter<'_>]) -> usize {
         count += 1;
     }
     count
-}
-
-fn ident_name_of_binding(p: &oxc_ast::ast::BindingPattern<'_>) -> Option<String> {
-    match p {
-        oxc_ast::ast::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-        _ => None,
-    }
 }
 
 fn resolve_block_functions(plans: &mut Plans, scoping: &Scoping) {

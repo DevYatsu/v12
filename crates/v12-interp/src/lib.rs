@@ -63,6 +63,7 @@ mod eval_context;
 mod execute;
 pub mod feedback;
 mod generator_async;
+mod generic_receiver;
 mod globals;
 mod module_eval;
 mod object_ops;

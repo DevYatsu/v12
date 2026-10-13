@@ -669,6 +669,10 @@ impl<'a> Ctx<'a> {
         let getter = self.alloc_obj(v12_heap::JsObject {
             kind: v12_heap::Kind::Function,
             callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+            // Stamps the `Bytecode` payload as a `NativeId` rather than a
+            // program function index — see `FLAG_ENGINE_ACCESSOR` for why the
+            // owner is not a usable discriminator.
+            flags: v12_heap::JsObject::FLAG_ENGINE_ACCESSOR,
             ..Default::default()
         });
         self.define_data_prop_with_attrs(
@@ -761,6 +765,9 @@ impl<'a> Ctx<'a> {
         let func = self.alloc_obj(v12_heap::JsObject {
             kind: v12_heap::Kind::Function,
             callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+            // Stamps the `Bytecode` payload as a `NativeId` rather than a
+            // program function index — see `FLAG_ENGINE_ACCESSOR`.
+            flags: v12_heap::JsObject::FLAG_ENGINE_ACCESSOR,
             ..Default::default()
         });
         // Both accessors are zero-argument per the spec getters; the arity
@@ -802,9 +809,12 @@ impl<'a> Ctx<'a> {
         getter_name: &str,
         length: u32,
     ) -> Handle<JsObject> {
-        let getter = self.alloc_obj(v12_heap::JsObject {
+let getter = self.alloc_obj(v12_heap::JsObject {
             kind: v12_heap::Kind::Function,
             callable: v12_heap::FunctionTarget::Bytecode(u32::from(id)),
+            // Stamps the `Bytecode` payload as a `NativeId` rather than a
+            // program function index — see `FLAG_ENGINE_ACCESSOR`.
+            flags: v12_heap::JsObject::FLAG_ENGINE_ACCESSOR,
             ..Default::default()
         });
         self.define_data_prop_with_attrs(

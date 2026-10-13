@@ -837,114 +837,6 @@ const KNOWN_DIVERGENCES: &[Known] = &[
         why: "`arguments[7] = x` grows `arguments.length` to 8; the exotic's length \
               is fixed at creation and an index write must not touch it",
     },
-    // -- E2: the accessor receivers, one entry per method --------------------
-    //
-    // `accessor_index` and `length_getter` are the two receivers with an
-    // accessor property, and they now diverge on 11 and 18 of their 39 rows.
-    // Both carry E2 — and only E2. E1 is gone (Batch 9), so there is no longer
-    // a second `why` to disambiguate here, and the receiver sets below are the
-    // *measured* ones rather than a union with an accessor's key count.
-    //
-    // E2 BEYOND THE KEY COUNT — the native path really does misread the receiver.
-    Known {
-        method: "fill",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "copyWithin",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "slice",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "reverse",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "shift",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "unshift",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "splice",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "pop",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "indexOf",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "lastIndexOf",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "includes",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "at",
-        receivers: &["length_getter"],
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    Known {
-        method: "flat",
-        receivers: ACCESSOR_RECEIVERS,
-        absent: false,
-        why: E2_ACCESSOR_GETTER_UNREADABLE,
-    },
-    // E1 ALONE — DELETED IN BATCH 9, and this is the record of what it was.
-    //
-    // Twenty-one entries, every one of them a method whose own answer already
-    // agreed with node on both accessor receivers and whose ONLY divergence was
-    // the harness's `Object.keys(o).length` column: `join`, `sort`, `concat`,
-    // `toString`, `push`, `flatMap`, `map`, `forEach`, `filter`, `reduce`,
-    // `reduceRight`, `some`, `every`, `find`, `findIndex`, `findLast`,
-    // `findLastIndex`, `index_assign_low`, `index_assign_mid`,
-    // `index_assign_past`, `length_lower`. Not one index/length defect: it was
-    // the cost of putting a literal accessor in a receiver, and it is recorded
-    // here so nobody reads those 21 methods as 21 method bugs.
-    //
-    // The seam methods (`map`, `forEach`, `filter`, `some`, `every`, `find*`,
-    // `flatMap`, `reduce`, `reduceRight`) were in that group and that was the
-    // point: they read `length` through `Interp::get_property`, so they got the
-    // getter right and were the only rows in the table that could have shown
-    // the split between the two readers.
-    //
-    // `length_lower` is the one name that SURVIVES the deletion, and it is
-    // charged to a different cause — see the `array_dense`/`array_holey` entry
-    // above, which Batch 9 extended to both accessor receivers.
     // -- FROZEN: the integrity-level receiver ------------------------------
     //
     // **Batch 8 FIXED all seven of these.** `frozen_object` now diverges on
@@ -1053,7 +945,7 @@ fn the_generated_table_agrees_with_node_except_where_named() {
         declared.values().map(BTreeSet::len).sum::<usize>(),
     );
     assert_eq!(
-        total, 107,
+        total, 88,
         "the divergence count moved without the ledger's shape changing"
     );
 }

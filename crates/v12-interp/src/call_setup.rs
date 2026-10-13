@@ -1602,6 +1602,17 @@ impl Interp<'_> {
             }
             NativeId::ArrayJoin => self.array_join_fallback(this_v, args),
             NativeId::ArrayPush => self.array_push_fallback(this_v, args),
+            // The generic-receiver array methods (`slice`, `at`, `indexOf`,
+            // …): routed here when — and only when — the receiver's `length`
+            // or an index resolves through a **user** accessor, which the
+            // registry native's `[[Get]]` cannot invoke
+            // (`docs/adr/0006-accessor-capability-at-the-property-seam.md`).
+            // `generic_receiver_seam_applies` is the whole predicate: a plain
+            // array, a dense object and a sparse array all answer `false`
+            // and keep running the registry body.
+            _ if self.generic_receiver_seam_applies(id, this_v) => {
+                self.run_generic_receiver(id, this_v, args)
+            }
             NativeId::ConsoleLog => {
                 let mut parts = Vec::with_capacity(args.len());
                 for &v in args {

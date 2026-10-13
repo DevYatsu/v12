@@ -113,26 +113,38 @@ impl<'p> Parser<'p> {
         }
     }
 
+    /// `SerializeJSONProperty` of an array: elements are accumulated and the
+    /// object is allocated once by `Ctx::alloc_array`.
+    ///
+    /// Both the allocator and the accumulate-then-allocate shape are load
+    /// bearing. `alloc_array` stamps the canonical `root --length--> child`
+    /// shape and links `%Array.prototype%` (the old hand-rolled
+    /// `alloc_obj(JsObject::array(..))` + `link_parsed_proto` left the result
+    /// on the empty root shape, so `Get(O,"length")` missed own `length`,
+    /// walked to `Array.prototype.length` (0) and `JSON.stringify` emitted
+    /// `[]`; the next `add_property` was then handed slot 0, already occupied
+    /// by the length Smi, so `parsed.foo = 7` read back `0`). Accumulating
+    /// first is what gives the allocated array its final `length`: appending
+    /// with `set_element` after allocation never rewrote `properties[0]`, so
+    /// `JSON.parse('[1,2,3]').length` was `0`. Every element is rooted by
+    /// `Ctx::alloc_obj` when it is parsed, so nothing is collectable in the
+    /// window before the array exists.
     fn array(&mut self, ctx: &mut Ctx) -> Result<JsValue, String> {
         self.expect(b'[')?;
-        let items: Vec<JsValue> = Vec::new();
-        let arr = ctx.alloc_obj(JsObject::array(items));
-        link_parsed_proto(ctx, arr, "Array");
+        let mut items: Vec<JsValue> = Vec::new();
         self.ws();
         if self.peek() == Some(b']') {
             self.pos += 1;
-            return Ok(JsValue::object(arr));
+            return Ok(JsValue::object(ctx.alloc_array(items)));
         }
         loop {
-            let value = self.value(ctx)?;
-            let len = ctx.heap.get(arr).element_len() as u32;
-            ctx.heap.get_mut(arr).set_element(len, value);
+            items.push(self.value(ctx)?);
             self.ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
                 Some(b']') => {
                     self.pos += 1;
-                    return Ok(JsValue::object(arr));
+                    return Ok(JsValue::object(ctx.alloc_array(items)));
                 }
                 _ => return Err(format!("Expected ',' or ']' at position {}", self.pos)),
             }
