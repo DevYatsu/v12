@@ -620,35 +620,9 @@ pub fn reflect_set(ctx: &mut Ctx, _this: JsValue, args: &[JsValue]) -> Result<Js
     }
 }
 
-/// Whether `obj` satisfies `IsConstructor` for the paths v1 can distinguish:
-/// a function object whose callable is a bytecode index (a real program
-/// function) or one of the constructible engine natives. Native-seam
-/// placeholders that decode to a `NativeId` are non-constructors.
+/// `IsConstructor` (ES 7.2.4): whether `obj` has `[[Construct]]`.
 fn is_constructor(heap: &Heap, obj: Handle<JsObject>) -> bool {
-    let o = heap.get(obj);
-    if o.kind != v12_heap::Kind::Function {
-        return false;
-    }
-    match o.callable {
-        v12_heap::FunctionTarget::Bytecode(idx) => match v12_native::NativeId::try_from(idx) {
-            Ok(id) => matches!(
-                id,
-                v12_native::NativeId::ObjectConstruct
-                    | v12_native::NativeId::ArrayConstruct
-                    | v12_native::NativeId::BooleanConstruct
-                    | v12_native::NativeId::ErrorCreate
-                    | v12_native::NativeId::TypeErrorCreate
-                    | v12_native::NativeId::RangeErrorCreate
-                    | v12_native::NativeId::ReferenceErrorCreate
-                    | v12_native::NativeId::SyntaxErrorCreate
-                    | v12_native::NativeId::EvalErrorCreate
-                    | v12_native::NativeId::UriErrorCreate
-                    | v12_native::NativeId::AggregateErrorCreate
-            ),
-            Err(_) => true,
-        },
-        _ => false,
-    }
+    heap.get(obj).is_constructor()
 }
 
 /// `CreateListFromArrayLike(argumentsList)` for `Reflect.apply`/`construct`:

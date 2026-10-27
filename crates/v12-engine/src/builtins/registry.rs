@@ -620,6 +620,10 @@ impl v12_native::NativeRegistry for NativeRegistry {
                     .position(|f| f.name_hint.as_deref() == Some("<fn>:__f"))
             })
             .unwrap_or(1) as u32;
+        let is_constructor = program
+            .functions
+            .get(fn_idx as usize)
+            .is_some_and(|f| f.is_constructor);
         let program_id = {
             let mut table = programs.borrow_mut();
             let id = table.len() as u32;
@@ -632,6 +636,9 @@ impl v12_native::NativeRegistry for NativeRegistry {
         let mut func =
             v12_heap::JsObject::function(v12_heap::FunctionTarget::Bytecode(fn_idx), None);
         func.program_id = program_id;
+        if is_constructor {
+            func.flags |= v12_heap::JsObject::FLAG_CONSTRUCTOR;
+        }
         let handle = heap.alloc(func);
         heap.add_root(JsValue::object(handle));
         Ok(JsValue::object(handle))

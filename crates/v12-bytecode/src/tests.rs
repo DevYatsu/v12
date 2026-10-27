@@ -37,7 +37,7 @@ use crate::{Instr, Opcode, WideOp, all_opcodes};
 /// makes adding one a deliberate act rather than an accident — and, since
 /// `opcode.rs` also pins every discriminant against a frozen transcript, a
 /// variant cannot land here without someone updating two counts on purpose.
-const OPCODE_COUNT: usize = 74;
+const OPCODE_COUNT: usize = 81;
 
 /// Distinct byte values stamped into `a`, `b`, `c`.
 ///

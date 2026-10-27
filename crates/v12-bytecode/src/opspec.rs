@@ -566,6 +566,23 @@ const fn build_specs() -> [Option<OpSpec>; 256] {
     // emit: `emit_reg3(GetPrototype, dst, this, 0)` (expr.rs:2414).
     // read: `op_get_prototype(stack[rb])` into `stack[ra]` (execute.rs:846).
     table[Opcode::GetPrototype as usize] = Some(OpSpec::new(Role::Dst, Role::Src, Role::Unused));
+    // emit: `emit_super_construct(dst, block, argc)` (model.rs) — the block is
+    // `[F][new.target][args…]`, exactly a `Construct` call block.
+    table[Opcode::SuperConstruct as usize] =
+        Some(OpSpec::new(Role::Dst, Role::Callee, Role::Count));
+    // emit: `emit_reg3(SuperConstructApply, dst, block, args_arr)` (expr.rs).
+    table[Opcode::SuperConstructApply as usize] =
+        Some(OpSpec::new(Role::Dst, Role::Callee, Role::ArgsArr));
+    // emit: `emit_reg3(CheckThis | CheckThisUnbound, this, 0, 0)` (expr.rs).
+    table[Opcode::CheckThis as usize] = Some(OpSpec::new(Role::Src, Role::Unused, Role::Unused));
+    table[Opcode::CheckThisUnbound as usize] =
+        Some(OpSpec::new(Role::Src, Role::Unused, Role::Unused));
+    // emit: `emit_reg3(DerivedResult, dst, value, this)` (stmt.rs / unit.rs).
+    table[Opcode::DerivedResult as usize] = Some(OpSpec::new(Role::Dst, Role::Src, Role::Src));
+    // emit: `emit_reg3(CheckHeritage, proto_parent, parent, 0)` (class.rs).
+    table[Opcode::CheckHeritage as usize] = Some(OpSpec::new(Role::Dst, Role::Src, Role::Unused));
+    // emit: `emit_reg3(DefineField, obj, key, value)` (class.rs).
+    table[Opcode::DefineField as usize] = Some(OpSpec::new(Role::Obj, Role::Key, Role::Val));
 
     // --- allocation and environments -------------------------------------------
     // emit: `emit_reg3(NewObject, dst, 0, 0)` (expr.rs:704, class.rs:81).

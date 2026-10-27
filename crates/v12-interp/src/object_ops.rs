@@ -240,6 +240,61 @@ impl Interp<'_> {
         Ok(())
     }
 
+    /// `CreateDataPropertyOrThrow` (ES §7.3.7) — the `DefineField` of a class
+    /// field. A Private Name key never reaches here (private fields lower to
+    /// `DefinePrivateW`).
+    pub(crate) fn op_define_field(
+        &mut self,
+        obj_v: JsValue,
+        key_v: JsValue,
+        value: JsValue,
+    ) -> Result<(), JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(
+                self.type_error("cannot define property on non-object"),
+            ));
+        };
+        let key = self.property_key(key_v)?;
+        let desc = crate::property::OwnDesc {
+            has_value: true,
+            value,
+            has_writable: true,
+            writable: true,
+            has_enumerable: true,
+            enumerable: true,
+            has_configurable: true,
+            configurable: true,
+            ..Default::default()
+        };
+        if self.object_define_own_property(obj, key, desc)? {
+            Ok(())
+        } else {
+            Err(JSException(self.type_error("Cannot define property on object")))
+        }
+    }
+
+    /// ES §15.7.14 step 8: validates a class heritage and returns the
+    /// prototype parent.
+    pub(crate) fn class_heritage(&mut self, parent: JsValue) -> Result<JsValue, JSException> {
+        if parent.is_null() {
+            return Ok(JsValue::null());
+        }
+        let Some(parent_obj) = parent.as_object().filter(|&p| self.is_constructor_object(p)) else {
+            return Err(JSException(
+                self.type_error("Class extends value is not a constructor or null"),
+            ));
+        };
+        let key = self.new_temp_key("prototype");
+        let proto = self.get_property(0, 0, JsValue::object(parent_obj), key)?;
+        if proto.is_null() || proto.as_object().is_some() {
+            Ok(proto)
+        } else {
+            Err(JSException(self.type_error(
+                "Class extends value does not have valid prototype property",
+            )))
+        }
+    }
+
     /// `DefineMethod`: defines an own data property on `obj` at `key` with
     /// spec method attributes. Never walks the prototype chain, never invokes
     /// a setter. If the key already exists as own data, the value is

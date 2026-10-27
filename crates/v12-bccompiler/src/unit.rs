@@ -4,7 +4,7 @@
 
 use oxc_ast::ast::{
     ArrowFunctionExpression, BindingPattern, Class, FormalParameters, Function, FunctionType,
-    MethodDefinitionKind, Program, PropertyKey,
+    MethodDefinitionKind, Program,
 };
 use oxc_semantic::SymbolId;
 use oxc_span::GetSpan;
@@ -22,82 +22,41 @@ pub enum UnitNode<'a> {
     Class(&'a Class<'a>),
     /// A non-constructor class method.
     Method(&'a Function<'a>),
+    /// A class's instance-members initializer (see
+    /// [`crate::model::ClassInitUnits`]).
+    InstanceInit(&'a Class<'a>),
+    /// A class's static initializer.
+    StaticInit(&'a Class<'a>),
 }
 
-/// Emits ES `InitializeInstanceElements` for `c` on `this`: the instance
-/// private methods and accessors first, then every instance field in
-/// declaration order (`DefineField`) — `SetProperty this.<key> = <init>` for a
-/// public field, `PrivateFieldAdd` for a private one. A field with no
-/// initializer installs `undefined`.
-pub(crate) fn emit_instance_fields(
+/// The default derived constructor's body (ES §15.7.14 step 14.a,
+/// `constructor(...args) { super(...args); }`), which forwards the argument
+/// list *without* observable array iteration: `collect` reserved a rest
+/// register (`r1`, the unit has arity 0) that the call ABI fills with the
+/// arguments, and `SuperConstructApply` spreads it directly.
+fn emit_default_derived_ctor(
     cx: &mut FnCtx<'_, '_, '_, '_>,
     c: &Class<'_>,
+    scope_idx: usize,
 ) -> Result<(), CompileError> {
-    crate::class::emit_instance_private_methods(cx, c)?;
-    for el in &c.body.body {
-        let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el else {
-            continue;
-        };
-        if p.r#static {
-            continue;
-        }
-        let value_reg = if let Some(value) = &p.value {
-            crate::class::apply_field_function_name(cx, &p.key, p.computed, value);
-            cx.expr(value)?
-        } else {
-            let d = cx.new_temp();
-            cx.load_undefined(d, p.span);
-            d
-        };
-        if let PropertyKey::PrivateIdentifier(id) = &p.key {
-            let name = crate::class::load_private_name(cx, &id.name, p.span)?;
-            let words = v12_bytecode::WideOp::DefinePrivateW {
-                obj: crate::model::REG_THIS,
-                name,
-                value: value_reg,
-            }
-            .encode();
-            cx.emit_words(words, p.span);
-            continue;
-        }
-        let key_reg = crate::class::property_key_reg(cx, &p.key, p.computed, p.span)?;
-        cx.emit_reg3(
-            Opcode::SetProperty,
-            crate::model::REG_THIS,
-            key_reg,
-            value_reg,
-            p.span,
-        );
-    }
-    Ok(())
-}
-
-/// Emits the forwarding step of a class's spec-mandated default derived
-/// constructor: `super(...args)` (ES §15.7.1, `DefaultDerivedConstructor`).
-///
-/// The unit has no AST `super` node to lower, so this mirrors
-/// [`crate::expr`]'s `super_ctor`/`super_env_depth` pair directly. `collect`
-/// reserved a rest register for the unit (arity 0, so `r1`); the call ABI
-/// materializes the forwarded arguments there as a real array, which
-/// `CallApply` spreads into the parent constructor with the current `this`.
-fn emit_default_derived_super(
-    cx: &mut FnCtx<'_, '_, '_, '_>,
-    c: &Class<'_>,
-) -> Result<(), CompileError> {
-    // Env depth from this frame to the class scope captured by the nearest
-    // non-arrow unit that uses `super` (this constructor). Shares the walk with
-    // `expr::FnCtx::super_env_depth` — one home, so the two cannot drift apart
-    // the way two hand-copied `u8` accumulators did.
-    let depth = cx.comp.plans.super_env_depth_between(cx.unit);
-    // Layout: [callee][this]; `CallApply` reads the args array from its third
-    // operand. `collect` set `has_rest`, so `r{arity+1}` holds the forwarded
-    // argument list (arity is 0 for the synthesised constructor).
     let rest_reg = cx.comp.plans.units[cx.unit].arity as u16 + 1;
+    let depth = cx.comp.plans.super_env_depth_between(cx.unit);
     let block = cx.new_temps(crate::model::CALL_HEADER_REGS);
-    cx.emit_get_env(block, depth, crate::class::SLOT_SUPER_CTOR, c.span);
-    cx.move_reg(block + 1, REG_THIS, c.span);
-    cx.emit_reg3(Opcode::CallApply, block, block, rest_reg, c.span);
+    cx.emit_get_env(block, depth, crate::class::SLOT_HOME_CTOR, c.span);
+    cx.emit_reg2(Opcode::GetNewTarget, block + 1, 0, c.span);
+    cx.emit_reg3(Opcode::SuperConstructApply, block, block, rest_reg, c.span);
+    cx.move_reg(REG_THIS, block, c.span);
+    crate::class::emit_instance_init_call(cx, scope_idx, block, c.span)?;
     Ok(())
+}
+
+/// A derived constructor's epilogue: falling off the end returns `this`,
+/// which must have been bound by `super()` (`DerivedResult`).
+fn emit_derived_epilogue(cx: &mut FnCtx<'_, '_, '_, '_>) -> Result<(), CompileError> {
+    let span = oxc_span::Span::default();
+    let undef = cx.new_temp();
+    cx.load_undefined(undef, span);
+    cx.emit_derived_return(undef, span)
 }
 
 fn placeholder(name_hint: Option<String>) -> FunctionBytecode {
@@ -199,6 +158,17 @@ fn compile_unit_body(
         Vec::new()
     };
 
+    // `[[Construct]]` exists only on plain functions and class constructors;
+    // an object-literal method is planned as a `Fn` but is a method.
+    let is_constructor = match &node {
+        UnitNode::Fn(f) => !f.generator && !f.r#async && !comp.plans.units[idx].is_object_method,
+        UnitNode::Class(_) => true,
+        UnitNode::Arrow(_)
+        | UnitNode::Main(_)
+        | UnitNode::Method(_)
+        | UnitNode::InstanceInit(_)
+        | UnitNode::StaticInit(_) => false,
+    };
     let uses_seeded_env = idx == 0 && comp.plans.is_module;
     let mut cx = FnCtx::new(comp, idx);
     cx.b.is_top_level = idx == 0;
@@ -234,6 +204,11 @@ fn compile_unit_body(
             cx.b.is_async = f.r#async;
             cx.b.is_arrow = false;
         }
+        UnitNode::InstanceInit(_) | UnitNode::StaticInit(_) => {
+            cx.b.is_generator = false;
+            cx.b.is_async = false;
+            cx.b.is_arrow = false;
+        }
     }
     let params: Option<&FormalParameters<'_>> = match &node {
         UnitNode::Fn(f) => Some(&f.params),
@@ -247,7 +222,7 @@ fn compile_unit_body(
             }
             _ => None,
         }),
-        UnitNode::Main(_) => None,
+        UnitNode::Main(_) | UnitNode::InstanceInit(_) | UnitNode::StaticInit(_) => None,
     };
     emit_prologue(&mut cx, idx, params, self_symbol)?;
     if cx.b.is_generator {
@@ -339,7 +314,14 @@ fn compile_unit_body(
             }
         },
         UnitNode::Class(c) => {
-            // Find the explicit `constructor` element.
+            // `class_expression` registered this class's scope before
+            // compiling its constructor.
+            let scope_idx = cx
+                .comp
+                .class_scopes
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| cx.err(c.span, "internal: constructor outside its class scope"))?;
             let ctor = c.body.body.iter().find_map(|el| match el {
                 oxc_ast::ast::ClassElement::MethodDefinition(m)
                     if m.kind == MethodDefinitionKind::Constructor =>
@@ -348,44 +330,29 @@ fn compile_unit_body(
                 }
                 _ => None,
             });
-            if c.heritage.is_none() {
-                // Base-class instance fields initialize on `this` at the top of
-                // the constructor, before the body (ES `InitializeInstanceElements`
-                // runs after `OrdinaryCreateFromConstructor` with no super step).
-                emit_instance_fields(&mut cx, c)?;
+            let derived = c.heritage.is_some();
+            if !derived {
+                // A base constructor initializes its instance elements before
+                // its body runs (ES §10.2.2 step 6.b).
+                crate::class::emit_instance_init_call(&mut cx, scope_idx, REG_THIS, c.span)?;
             }
             if let Some(m) = ctor {
                 let Some(body) = m.value.body.as_deref() else {
                     return Err(cx.err(m.span, "constructor without a body is not supported"));
                 };
-                if c.heritage.is_none() {
-                    cx.push_scope(m.value.scope_id.get());
-                    let result = cx.stmt_list(&body.statements);
-                    cx.pop_scope(m.value.scope_id.get());
-                    result?;
-                } else {
-                    // Derived fields initialize only after `super()` returns
-                    // (ES `InitializeInstanceElements` runs in the derived
-                    // constructor after the super call). Hook the first
-                    // top-level `super(...)` statement.
-                    cx.push_scope(m.value.scope_id.get());
-                    let result = cx.ctor_body_f(&body.statements, |cx| emit_instance_fields(cx, c));
-                    cx.pop_scope(m.value.scope_id.get());
-                    result?;
-                }
-            } else if c.heritage.is_some() {
-                // Default derived constructor (ES §15.7.1):
-                // `constructor(...args) { super(...args); }`. `collect`
-                // reserved a rest register for this unit, so the call ABI
-                // materialized the forwarded arguments into `r{arity+1}`
-                // (arity 0 here, so `r1`). Emit the parent-constructor call
-                // with `this`, then initialize instance fields after it
-                // returns (ES `InitializeInstanceElements`).
-                emit_default_derived_super(&mut cx, c)?;
-                emit_instance_fields(&mut cx, c)?;
+                cx.push_scope(m.value.scope_id.get());
+                let result = cx.stmt_list(&body.statements);
+                cx.pop_scope(m.value.scope_id.get());
+                result?;
+            } else if derived {
+                emit_default_derived_ctor(&mut cx, c, scope_idx)?;
             }
-            // Default base constructor: field initializers above, then `return undefined`.
+            if derived {
+                emit_derived_epilogue(&mut cx)?;
+            }
         }
+        UnitNode::InstanceInit(c) => crate::class::emit_instance_initializer(&mut cx, c)?,
+        UnitNode::StaticInit(c) => crate::class::emit_static_initializer(&mut cx, c)?,
         UnitNode::Method(f) => {
             let Some(body) = f.body.as_deref() else {
                 return Err(cx.err(f.span(), "class method without a body is not supported"));
@@ -398,6 +365,8 @@ fn compile_unit_body(
     }
     let mut fb = cx.finish()?;
     fb.uses_seeded_env = uses_seeded_env;
+    fb.ctor_kind = comp.plans.units[idx].ctor_kind;
+    fb.is_constructor = is_constructor;
     fb.env_slots = comp.plans.units[idx].env_slot_count;
     fb.name_hint = Some(comp.plans.units[idx].name_hint.clone());
     // Top-level await: nested functions compile to their own units, so any
@@ -623,6 +592,12 @@ fn emit_prologue(
 
     if let Some(slot) = this_slot {
         cx.emit_set_env(0, slot, REG_THIS, oxc_span::Span::default());
+    }
+    if let Some(slot) = cx.comp.plans.units[idx].new_target_slot {
+        let span = oxc_span::Span::default();
+        let nt = cx.new_temp();
+        cx.emit_reg2(Opcode::GetNewTarget, nt, 0, span);
+        cx.emit_set_env(0, slot, nt, span);
     }
 
     if let Some(sym) = self_symbol {

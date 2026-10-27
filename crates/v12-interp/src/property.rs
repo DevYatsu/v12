@@ -1476,15 +1476,18 @@ impl Interp<'_> {
             }
             if let Some(d) = self.ordinary_own_descriptor(cur, key) {
                 if d.is_accessor() {
-                    if d.set.is_undefined() {
+                    // OrdinarySetWithOwnDescriptor steps 5-7: the setter
+                    // found on `base`'s chain runs with `this` = receiver.
+                    let Some(setter) = d.set.as_object() else {
                         if strict {
                             return Err(JSException(
                                 self.type_error("cannot assign to accessor without setter"),
                             ));
                         }
                         return Ok(());
-                    }
-                    return self.set_property(receiver_v, key_v, value, strict);
+                    };
+                    self.call_accessor_with(setter, receiver_v, &[value])?;
+                    return Ok(());
                 }
                 if d.has_writable && !d.writable {
                     if strict {

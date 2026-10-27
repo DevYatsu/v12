@@ -723,40 +723,21 @@ fn reflect_construct_on_a_subclass_yields_the_subclass_instance() {
 }
 
 #[test]
-fn promise_call_on_a_plain_object_initializes_it_in_place() {
-    // The one documented v1 divergence, pinned as a test so it stays a
-    // decision: because a derived `super(executor)` reaches `%Promise%` through
-    // the *Call* seam, `Promise.call(obj, executor)` and
-    // `Reflect.apply(Promise, obj, « executor »)` are indistinguishable from it
-    // here, so all three initialize `obj` as a promise. Real engines throw for
-    // the first two (`%Promise%` has no `[[Call]]`); making them
-    // distinguishable needs the compiler to lower `super(…)` to a real
-    // `Construct` with a `newTarget`, which is a separate change.
-    //
-    // `r === o` and `r.then(…)` working are the substance. `o instanceof
-    // Promise` is *false* and correctly so: arm B initializes in place and
-    // leaves `[[Prototype]]` alone, so the receiver keeps whatever prototype
-    // it was born with (`%Object.prototype%` for a plain `{}`).
+fn promise_call_on_a_plain_object_throws() {
+    // `%Promise%` has no usable `[[Call]]` (ES 27.2.3.1 step 1: `NewTarget`
+    // is undefined), so calling it on a plain receiver is a `TypeError` and
+    // leaves the receiver untouched. This was the one documented v1
+    // divergence while a derived `super(executor)` reached `%Promise%`
+    // through the *Call* seam; `super(…)` is a real `Construct` now.
     assert_eq!(
         settled(
-            "globalThis.__out = 'unset'; \
-             let o = {}; \
-             let r = Promise.call(o, function (resolve) { resolve(5); }); \
-             globalThis.__same = (r === o); \
-             r.then(function (v) { globalThis.__out = 'v:' + v; }, \
-                    function (e) { globalThis.__out = 'e:' + e; });",
-            "globalThis.__out + '|' + globalThis.__same"
-        ),
-        "v:5|true"
-    );
-    assert_eq!(
-        settled(
-            "let o = {}; \
-             let r = Promise.call(o, function () {}); \
-             globalThis.__out = [r === o, o instanceof Promise, \
-                                 Object.getPrototypeOf(o) === Object.prototype].join(',');",
+            "let o = {}; let r; \
+             try { Promise.call(o, function () {}); r = 'no throw'; } \
+             catch (e) { r = (e instanceof TypeError) + ',' + \
+                         (Object.getPrototypeOf(o) === Object.prototype); } \
+             globalThis.__out = r;",
             "globalThis.__out"
         ),
-        "true,false,true"
+        "true,true"
     );
 }

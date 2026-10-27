@@ -32,9 +32,12 @@ pub const KNOWN_DISCRIMINANTS: &[u8] = &[
     77, // GetPrototype
     78, // PopEnvironment
     79, // DefineAccessorEnumerable
+    80, 81, // SuperConstruct, SuperConstructApply
+    82, 83, 84, // CheckThis, CheckThisUnbound, DerivedResult
+    85, 86, // CheckHeritage, DefineField
 ];
 
-pub const EXPECTED_OPCODE_COUNT: usize = 74;
+pub const EXPECTED_OPCODE_COUNT: usize = 81;
 
 /// Seeded splitmix64. Deterministic across platforms and runs.
 pub struct Rng(u64);

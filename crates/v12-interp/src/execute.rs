@@ -90,6 +90,15 @@ pub(crate) fn decode_instr(instrs: &[Instr], pc: usize) -> (Opcode, u16, u16, u1
 /// Returns `Err` on corrupt bytecode instead of panicking — callers turn it
 /// into a JS `TypeError` (or, for the Await resume path, fall back to
 /// undefined advancement) rather than unwinding the native stack.
+/// Opcodes whose parked frame completes with the construct return-value
+/// adjustment (ES 10.2.2 step 12): `new` and both `super(…)` spellings.
+fn parks_construct(op: Option<Opcode>) -> bool {
+    matches!(
+        op,
+        Some(Opcode::Construct | Opcode::SuperConstruct | Opcode::SuperConstructApply)
+    )
+}
+
 pub(crate) fn decode_parked_call(
     instrs: &[Instr],
     pc: usize,
@@ -115,7 +124,7 @@ pub(crate) fn decode_parked_call(
                 } else {
                     u16::from(narrow.a())
                 };
-                let is_construct = narrow.op() == Some(Opcode::Construct);
+                let is_construct = parks_construct(narrow.op());
                 Ok((is_construct, dst, 3))
             }
             other => Err(BytecodeError::InvalidFunction {
@@ -123,7 +132,7 @@ pub(crate) fn decode_parked_call(
             }),
         },
         _ => Ok((
-            instr.op() == Some(Opcode::Construct),
+            parks_construct(instr.op()),
             u16::from(instr.a()),
             1,
         )),
@@ -691,6 +700,84 @@ impl Interp<'_> {
                         }
                     }
                     continue 'drive;
+                }
+                Opcode::SuperConstruct | Opcode::SuperConstructApply => {
+                    // `[F][new.target][args…]`: the super constructor is
+                    // read *now* (ES §13.3.7.1 `GetSuperConstructor`), so a
+                    // `setPrototypeOf` on the class after definition is seen.
+                    let block = base + usize::from(rb);
+                    let class_v = self.stack[block];
+                    let new_target = self.stack[block + 1];
+                    let parent = attempt!(self.super_constructor(class_v));
+                    let args = if op == Opcode::SuperConstruct {
+                        let start = block + usize::from(v12_bytecode::CALL_HEADER_REGS);
+                        self.stack[start..start + usize::from(rc)].to_vec()
+                    } else {
+                        attempt!(self.spread_arguments(self.stack[base + usize::from(rc)]))
+                    };
+                    self.gc_protect();
+                    match attempt!(
+                        self.prepare_construct_values(base, max_regs, parent, &args, new_target)
+                    ) {
+                        CallOutcome::Pushed => continue 'drive,
+                        CallOutcome::Value(v) => {
+                            self.stack[base + usize::from(ra)] = v;
+                            self.set_pc(pc + op_width);
+                        }
+                    }
+                    continue 'drive;
+                }
+                Opcode::CheckThis => {
+                    if self.stack[base + usize::from(ra)].is_hole() {
+                        let exc = self.reference_error(
+                            "Must call super constructor in derived class before accessing 'this' or returning from derived constructor",
+                        );
+                        throw_js!(exc);
+                    }
+                    self.set_pc(pc + op_width);
+                }
+                Opcode::CheckThisUnbound => {
+                    if !self.stack[base + usize::from(ra)].is_hole() {
+                        let exc = self.reference_error("Super constructor may only be called once");
+                        throw_js!(exc);
+                    }
+                    self.set_pc(pc + op_width);
+                }
+                Opcode::DerivedResult => {
+                    let v = self.stack[base + usize::from(rb)];
+                    let result = if v.as_object().is_some() {
+                        v
+                    } else if v.is_undefined() {
+                        let this_v = self.stack[base + usize::from(rc)];
+                        if this_v.is_hole() {
+                            let exc = self.reference_error(
+                                "Must call super constructor in derived class before accessing 'this' or returning from derived constructor",
+                            );
+                            throw_js!(exc);
+                        }
+                        this_v
+                    } else {
+                        let exc = self
+                            .type_error("Derived constructors may only return object or undefined");
+                        throw_js!(exc);
+                    };
+                    self.stack[base + usize::from(ra)] = result;
+                    self.set_pc(pc + op_width);
+                }
+                Opcode::CheckHeritage => {
+                    let parent = self.stack[base + usize::from(rb)];
+                    self.gc_protect();
+                    let proto_parent = attempt!(self.class_heritage(parent));
+                    self.stack[base + usize::from(ra)] = proto_parent;
+                    self.set_pc(pc + op_width);
+                }
+                Opcode::DefineField => {
+                    let obj_v = self.stack[base + usize::from(ra)];
+                    let key_v = self.stack[base + usize::from(rb)];
+                    let value = self.stack[base + usize::from(rc)];
+                    self.gc_protect();
+                    attempt!(self.op_define_field(obj_v, key_v, value));
+                    self.set_pc(pc + op_width);
                 }
                 Opcode::GetNewTarget => {
                     let new_target = self.frames.last().expect("frame").new_target;

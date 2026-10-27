@@ -356,13 +356,10 @@ crates/v12-interp/src/call_setup.rs:912  expect  let popped = self.frames.pop().
 crates/v12-interp/src/call_setup.rs:1162  expect  .expect("bound target is an object"),
 crates/v12-interp/src/call_setup.rs:2471  expect  .expect("bound target is an object"),
 crates/v12-interp/src/call_setup.rs:2560  expect  u16::try_from(self.stack.len() - base).expect("arguments fit a frame window");
-crates/v12-interp/src/call_setup.rs:2561  expect  let argc = u16::try_from(args.len()).expect("argument count fits u16");
 crates/v12-interp/src/call_setup.rs:3942  expect  .get(state.as_object().expect("a state object"))
 crates/v12-interp/src/call_setup.rs:4415  expect  let idx = intrinsic_slot("Promise").expect("Promise intrinsic");
 crates/v12-interp/src/call_setup.rs:4571  expect  .expect("the fresh marker fits Smi");
 crates/v12-interp/src/call_setup.rs:4600  expect  let ctor_obj = ctor.as_object().expect("IsConstructor implies an object");
-crates/v12-interp/src/call_setup.rs:2522  unreachable  v12_heap::FunctionTarget::Bound(_) => unreachable!("handled above"),
-crates/v12-interp/src/call_setup.rs:2524  unreachable  unreachable!("handled above")
 crates/v12-interp/src/call_setup.rs:3223  unreachable  _ => unreachable!("only Map and Set constructors use this seam"),
 crates/v12-interp/src/call_setup.rs:4257  unreachable  unreachable!("callable_or_err rejects a non-object executor")
 crates/v12-interp/src/eval_context.rs:139  expect  env: owner_frame.env.expect("owner env binding has environment"),

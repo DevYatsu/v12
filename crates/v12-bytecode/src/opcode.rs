@@ -192,6 +192,38 @@ pub enum Opcode {
     /// divergence. The class spelling keeps emitting `DefineAccessor`, so no
     /// class-emitted byte changes.
     DefineAccessorEnumerable = 79,
+    /// `super(args…)` (ES §13.3.7.1): `r{b}` holds the active class
+    /// constructor `F` and `r{b+1}` the `new.target`; `argc={c}` arguments
+    /// follow. Constructs `F.[[GetPrototypeOf]]()` — the *dynamic* super
+    /// constructor — with that `new.target`, parked like [`Opcode::Construct`],
+    /// and writes the result to `r{a}`. Binding `this` is the compiler's next
+    /// instruction ([`Opcode::CheckThisUnbound`]).
+    SuperConstruct = 80,
+    /// The spread spelling of [`Opcode::SuperConstruct`]: `r{b}`/`r{b+1}` as
+    /// there, `r{c}` an arguments array (as for [`Opcode::CallApply`]).
+    SuperConstructApply = 81,
+    /// `this` TDZ (ES §9.1.1.3.4 `GetThisBinding` step 2): throws
+    /// `ReferenceError` when `r{a}` holds the uninitialized-`this` marker.
+    /// Emitted after every `this` read in a derived constructor's scope.
+    CheckThis = 82,
+    /// ES §9.1.1.3.1 `BindThisValue` step 2: throws `ReferenceError` when
+    /// `r{a}` already holds a bound `this` (a second `super()` call).
+    CheckThisUnbound = 83,
+    /// A derived constructor's return value (ES §10.2.2 steps 10–12):
+    /// `r{a} =` `r{b}` when it is an object; else, when `r{b}` is
+    /// `undefined`, the bound `this` in `r{c}` (`ReferenceError` if `super()`
+    /// never ran); else `TypeError`.
+    DerivedResult = 84,
+    /// `class … extends r{b}` (ES §15.7.14 step 8): `r{a} =` the prototype
+    /// parent — `null` for `extends null`, else `r{b}.prototype`, which must
+    /// be an object or `null`. Throws `TypeError` when `r{b}` is neither
+    /// `null` nor a constructor.
+    CheckHeritage = 85,
+    /// `CreateDataPropertyOrThrow(r{a}, r{b}, r{c})` (ES §7.3.7): defines an
+    /// own enumerable, writable, configurable data property — never runs an
+    /// inherited setter, unlike [`Opcode::SetProperty`]. Class fields
+    /// (`DefineField`, ES §7.3.33).
+    DefineField = 86,
 }
 
 /// Every assigned [`Opcode`], in ascending discriminant order.
@@ -280,6 +312,13 @@ pub const ALL_OPCODES: &[Opcode] = &[
     Opcode::GetPrototype,
     Opcode::PopEnvironment,
     Opcode::DefineAccessorEnumerable,
+    Opcode::SuperConstruct,
+    Opcode::SuperConstructApply,
+    Opcode::CheckThis,
+    Opcode::CheckThisUnbound,
+    Opcode::DerivedResult,
+    Opcode::CheckHeritage,
+    Opcode::DefineField,
 ];
 
 /// Number of assigned [`Opcode`] variants.
@@ -519,6 +558,15 @@ mod encoding_tests {
         // intact and one row is appended. The equality assertion below is
         // what forces this file and `ALL_OPCODES` to move together.
         (79, Opcode::DefineAccessorEnumerable),
+        // Appended with the derived-constructor model (`super()` as a real
+        // `[[Construct]]`).
+        (80, Opcode::SuperConstruct),
+        (81, Opcode::SuperConstructApply),
+        (82, Opcode::CheckThis),
+        (83, Opcode::CheckThisUnbound),
+        (84, Opcode::DerivedResult),
+        (85, Opcode::CheckHeritage),
+        (86, Opcode::DefineField),
     ];
 
     /// Every one of the 74 discriminants is pinned, not 13 of them.

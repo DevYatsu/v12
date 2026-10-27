@@ -200,59 +200,6 @@ fn create_promise(
     promise
 }
 
-/// The instance a `Promise` construction initializes, when the receiver is
-/// already the object to initialize (spec 27.5.1.1, arm B of
-/// [`promise_capability`]).
-///
-/// `None` means arm A: allocate a fresh promise. That covers the constructor
-/// itself, every other callable receiver, and a proxy in front of one — a
-/// proxy is callable, so it belongs on the arm-A side even though it is neither
-/// a `Kind::Function` nor a promise, and turning one into a `Kind::Promise`
-/// would be meaningless.
-fn in_place_instance(heap: &Heap, this: JsValue) -> Option<v12_heap::Handle<JsObject>> {
-    let instance = this.as_object()?;
-    if !matches!(heap.get(instance).kind, Kind::Promise)
-        && !matches!(heap.get(instance).kind, Kind::Function | Kind::Proxy)
-        && !is_promise(heap, this)
-    {
-        Some(instance)
-    } else {
-        None
-    }
-}
-
-/// Arm B of [`promise_capability`]: turns `instance` into a pending promise
-/// where it stands.
-///
-/// `create_promise` is exactly these three fields plus an allocation, and the
-/// allocation is the part arm B does not do — spec 9.7.1's `[[Construct]]`
-/// chain already made the object (`OrdinaryCreateFromConstructor`) before the
-/// base constructor ran, so the base fills it in. The receiver is therefore
-/// fresh: no own property exists to lose, which is why `property_keys` is left
-/// alone rather than resized to match.
-fn init_promise_in_place(
-    heap: &mut Heap,
-    instance: v12_heap::Handle<JsObject>,
-) -> v12_heap::Handle<JsObject> {
-    let reactions = heap.alloc(JsObject::array(Vec::new()));
-    heap.add_pinned_root(reactions);
-    // The reserved promise shape, as `alloc_promise` binds it, so a
-    // user-defined own property added after `super(...)` is numbered past the
-    // three internal slots instead of aliasing them.
-    let promise_shape = heap.promise_shape();
-    let obj = heap.get_mut(instance);
-    obj.shape = promise_shape;
-    obj.kind = Kind::Promise;
-    obj.properties = smallvec::smallvec![
-        smi(STATE_PENDING),
-        JsValue::undefined(),
-        JsValue::object(reactions)
-    ];
-    // `[[Prototype]]` stays as the construct chain set it (`new_target.prototype`).
-    heap.add_pinned_root(instance);
-    instance
-}
-
 /// `Promise.resolve(x)`: identity for promises; otherwise a fulfilled promise
 /// carrying `x` (`undefined` when the argument is missing).
 ///
@@ -1159,38 +1106,16 @@ fn thenable_job(
 /// `combinator::begin`'s `IsConstructor` gate is applied by
 /// `Interp::run_promise_combinator`.
 ///
-/// The receiver picks the arm, per [`in_place_instance`]:
-///
-/// - **Arm A** — the receiver is the constructor (or a callable wrapper on it),
-///   so a *fresh* promise is allocated with `[[Prototype]]` read off the
-///   receiver's `prototype` field, which is where `%Promise.prototype%` lives.
-/// - **Arm B** — the receiver is already the instance a derived constructor's
-///   `super(executor)` made, so it is initialized in place and keeps the
-///   `[[Prototype]]` the construct chain gave it (`newTarget.prototype`).
-///   Without this arm a subclass's promise was a different object from the one
-///   its constructor body had been given, and `super(executor)` threw
-///   `TypeError: Promise constructor requires 'new'` on the way.
-///
-///   Arm B is also what `Promise.call(obj, executor)` and
-///   `Reflect.apply(Promise, obj, « executor »)` reach, because a derived
-///   `super(…)` is lowered to a `Call` and is therefore indistinguishable from
-///   them at this seam: all three initialize `obj` as a promise, where a real
-///   engine throws for the first two (`%Promise%` has no `[[Call]]`). That is
-///   the one documented v1 divergence of this path;
-///   `promise_call_on_a_plain_object_initializes_it_in_place` pins it as a test
-///   rather than leaving it an accident. Making the three distinguishable needs
-///   the compiler to lower `super(…)` to a real `Construct` with a
-///   `newTarget` — a separate change, not a promise one.
+/// The receiver is the constructor `C` (`Construct` passes the native
+/// itself; a subclass's `super(executor)` is a real `Construct` too, whose
+/// result then takes `newTarget.prototype` in the interpreter's construct
+/// entry). A fresh promise is allocated with `[[Prototype]]` read off the
+/// receiver's `prototype` field, which is where `%Promise.prototype%` lives.
 pub fn promise_capability(ctx: &mut Ctx, this: JsValue) -> Result<JsValue, Throw> {
-    let promise = match in_place_instance(ctx.heap, this) {
-        Some(instance) => init_promise_in_place(ctx.heap, instance),
-        None => {
-            let prototype = this
-                .as_object()
-                .and_then(|ctor| ctx.heap.get(ctor).prototype);
-            create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined())
-        }
-    };
+    let prototype = this
+        .as_object()
+        .and_then(|ctor| ctx.heap.get(ctor).prototype);
+    let promise = create_promise(ctx.heap, prototype, STATE_PENDING, JsValue::undefined());
     let pending: Rc<RefCell<Vec<Job>>> = ctx.pending.clone().unwrap_or_default();
     // Capability: the resolve/reject function objects handed to the executor.
     // They are ordinary function objects whose targets are host closures

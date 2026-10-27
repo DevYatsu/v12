@@ -366,6 +366,19 @@ impl JsObject {
     /// realm and cannot be forged from JavaScript.
     pub const FLAG_ENGINE_ACCESSOR: u8 = 0b0001_0000;
 
+    /// The object has a `[[Construct]]` internal method (ES 7.2.4
+    /// `IsConstructor`). Stamped once, where the object is created: built-in
+    /// constructors at realm install, closures from
+    /// `FunctionBytecode::is_constructor`, and bound functions and proxies
+    /// from their target (BoundFunctionCreate step 4, ProxyCreate step 7).
+    /// Revoking a proxy keeps the bit, as the spec keeps `[[Construct]]`.
+    pub const FLAG_CONSTRUCTOR: u8 = 0b0010_0000;
+
+    /// `IsConstructor` for an object: whether it has `[[Construct]]`.
+    pub fn is_constructor(&self) -> bool {
+        self.flags & Self::FLAG_CONSTRUCTOR != 0
+    }
+
     /// True once sealed (or frozen): no property may be removed or
     /// reconfigured.
     pub fn is_sealed(&self) -> bool {

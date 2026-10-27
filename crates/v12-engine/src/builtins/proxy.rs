@@ -54,6 +54,10 @@ fn create_proxy(ctx: &mut Ctx, args: &[JsValue]) -> Result<JsValue, Throw> {
         );
     };
     let proxy = ctx.alloc_obj(JsObject::proxy(target_obj, handler_obj));
+    // ProxyCreate step 7: `[[Construct]]` iff the target has one.
+    if ctx.heap.get(target_obj).is_constructor() {
+        ctx.heap.get_mut(proxy).flags |= JsObject::FLAG_CONSTRUCTOR;
+    }
     Ok(JsValue::object(proxy))
 }
 

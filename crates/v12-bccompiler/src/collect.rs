@@ -1167,6 +1167,60 @@ impl<'s> Collector<'s> {
     /// walking their bodies for nested functions/arrows/references. The
     /// constructor unit's span is the *class* span so the lowering can find
     /// it; each method unit's span is the method function's span.
+    /// An arrow reading `new.target` (and, for `super()`, binding `this`)
+    /// observes its nearest non-arrow ancestor's, which must therefore thread
+    /// them through its Environment.
+    fn thread_from_owner(&mut self, also_this: bool) {
+        let cur = self.cur_unit();
+        let owner = self.plans.this_home(cur);
+        if owner != cur {
+            self.plans.units[owner].needs_new_target = true;
+            if also_this {
+                self.plans.units[owner].needs_this = true;
+            }
+        }
+    }
+
+    /// Plans one synthetic class-element initializer unit (see
+    /// [`crate::model::ClassInitUnits`]) and walks `fields` inside it.
+    fn class_init_unit(
+        &mut self,
+        parent: usize,
+        name: &str,
+        is_static: bool,
+        fields: &[&oxc_ast::ast::PropertyDefinition<'_>],
+    ) -> usize {
+        let idx = self.plans.units.len();
+        let mut plan = UnitPlan::new(Some(parent), false, name.to_string());
+        plan.is_strict = true;
+        plan.allows_super = true;
+        plan.static_method = is_static;
+        self.plans.units.push(plan);
+        self.unit_stack.push(idx);
+        self.strict_stack.push(true);
+        // A field initializer may read `super.x` but may never call `super()`
+        // (ES §15.7.1: `Initializer Contains SuperCall`) nor reference
+        // `arguments` (`Initializer ContainsArguments`).
+        self.super_allowed_stack.push(true);
+        self.super_call_allowed_stack.push(false);
+        for p in fields {
+            if let Some(init) = &p.value {
+                if contains_arguments(init) {
+                    self.record_early_error(
+                        init.span(),
+                        "SyntaxError: 'arguments' is not allowed in a class field initializer",
+                    );
+                }
+                self.expr(init);
+            }
+        }
+        self.super_call_allowed_stack.pop();
+        self.super_allowed_stack.pop();
+        self.strict_stack.pop();
+        self.unit_stack.pop();
+        idx
+    }
+
     fn class_unit(&mut self, c: &oxc_ast::ast::Class<'_>) {
         // The class name binds in the enclosing unit. All class definitions
         // are strict mode code (ES §15.7.1/§15.8.1), so the name itself must
@@ -1182,7 +1236,12 @@ impl<'s> Collector<'s> {
                 );
             }
             self.declare(sym);
-            if self.cur_unit() == 0 && !self.plans.is_module {
+            // A class *expression*'s name is bound only in its class scope
+            // (ES §15.7.14 step 3), so it is never a global binding.
+            if self.cur_unit() == 0
+                && !self.plans.is_module
+                && c.r#type == oxc_ast::ast::ClassType::ClassDeclaration
+            {
                 self.plans.global_vars.insert(sym);
             }
         }
@@ -1269,6 +1328,11 @@ impl<'s> Collector<'s> {
         );
         plan.is_strict = true;
         plan.allows_super = true;
+        plan.ctor_kind = if c.heritage.is_some() {
+            v12_bytecode::ConstructorKind::Derived
+        } else {
+            v12_bytecode::ConstructorKind::Base
+        };
         self.plans.units.push(plan);
         self.plans.fn_index.insert(c.span, idx);
         // The constructor's params/body come from the explicit `constructor`
@@ -1352,45 +1416,56 @@ impl<'s> Collector<'s> {
                 | oxc_ast::ast::ClassElement::AccessorProperty(_)
                 | oxc_ast::ast::ClassElement::TSIndexSignature(_) => continue,
             };
+            // Keys evaluate in the code that evaluates the class (ES
+            // §15.7.14 `ClassElementEvaluation`), not in the constructor.
             if let Some(kx) = key.as_expression() {
-                self.unit_stack.push(idx);
                 self.expr(kx);
-                self.unit_stack.pop();
             }
         }
-        // Walk field initializers for `this`/`super`/captures (e.g. `#x = () => this.#y`).
-        // The initializer runs in the class's strict context; `super` property
-        // access is legal there but a `super()` *call* is not (checked in the
-        // emitter, which has the parent-heritage information).
+        // Field initializers run in synthetic initializer units, one for
+        // the instance elements and one for the static ones.
+        let mut instance_fields = Vec::new();
+        let mut static_fields = Vec::new();
+        let mut instance_private_methods = false;
         for el in &c.body.body {
-            if let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el
-                && let Some(init) = &p.value
-            {
-                // Instance field initializers conceptually run in constructor;
-                // attribute any `this` inside them to the constructor unit so
-                // `this` slot is planned. We push constructor idx as current.
-                // A field initializer may read `super.x` but may never call
-                // `super()` (ES §15.7.1: `Initializer Contains SuperCall`) nor
-                // reference `arguments` (`Initializer ContainsArguments`).
-                if contains_arguments(init) {
-                    self.record_early_error(
-                        init.span(),
-                        "SyntaxError: 'arguments' is not allowed in a class field initializer",
-                    );
+            match el {
+                oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.r#static => {
+                    static_fields.push(&**p);
                 }
-                // Static initializers are emitted in the enclosing unit (the
-                // class environment is live there), so they are planned there
-                // too; otherwise closures created inside them record the
-                // constructor as their parent and over-count env depth.
-                self.unit_stack.push(if p.r#static { parent } else { idx });
-                self.super_allowed_stack.push(true);
-                self.super_call_allowed_stack.push(false);
-                self.expr(init);
-                self.super_call_allowed_stack.pop();
-                self.super_allowed_stack.pop();
-                self.unit_stack.pop();
+                oxc_ast::ast::ClassElement::PropertyDefinition(p) => instance_fields.push(&**p),
+                oxc_ast::ast::ClassElement::MethodDefinition(m)
+                    if !m.r#static
+                        && matches!(m.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_)) =>
+                {
+                    instance_private_methods = true;
+                }
+                oxc_ast::ast::ClassElement::MethodDefinition(_)
+                | oxc_ast::ast::ClassElement::StaticBlock(_)
+                | oxc_ast::ast::ClassElement::AccessorProperty(_)
+                | oxc_ast::ast::ClassElement::TSIndexSignature(_) => {}
             }
         }
+        let mut inits = crate::model::ClassInitUnits::default();
+        if !instance_fields.is_empty() || instance_private_methods {
+            inits.instance = Some(self.class_init_unit(
+                parent,
+                "<instance_members_initializer>",
+                false,
+                &instance_fields,
+            ));
+        }
+        if !static_fields.is_empty() {
+            inits.static_ = Some(self.class_init_unit(
+                parent,
+                "<static_initializer>",
+                true,
+                &static_fields,
+            ));
+        }
+        let mut class_units: Vec<usize> = vec![idx];
+        class_units.extend(inits.instance);
+        class_units.extend(inits.static_);
+        self.plans.class_inits.insert(c.span, inits);
         // Each non-constructor method is its own unit.
         for el in &c.body.body {
             if let oxc_ast::ast::ClassElement::MethodDefinition(m) = el
@@ -1435,6 +1510,7 @@ impl<'s> Collector<'s> {
                 );
                 self.plans.units.push(mplan);
                 self.plans.fn_index.insert(m.value.span, midx);
+                class_units.push(midx);
                 self.unit_stack.push(midx);
                 self.strict_stack.push(true);
                 self.super_allowed_stack.push(true);
@@ -1453,6 +1529,18 @@ impl<'s> Collector<'s> {
                 self.super_allowed_stack.pop();
                 self.super_call_allowed_stack.pop();
             }
+        }
+        let uses_super = class_units.iter().any(|&u| self.plans.units[u].uses_super);
+        let has_private_names = self.private_name_scopes.last().is_some_and(|s| !s.is_empty());
+        let has_computed_field = c.body.body.iter().any(|el| {
+            matches!(el, oxc_ast::ast::ClassElement::PropertyDefinition(p) if p.computed)
+        });
+        if let Some(inits) = self.plans.class_inits.get_mut(&c.span) {
+            inits.needs_env = c.heritage.is_some()
+                || uses_super
+                || has_private_names
+                || has_computed_field
+                || inits.instance.is_some();
         }
         // Pop the class-body strict and private-name frames pushed above.
         self.strict_stack.pop();
@@ -1946,6 +2034,7 @@ impl<'s> Collector<'s> {
                 }
                 self.mark_arguments(id.name.as_str(), id.reference_id.get());
             }
+            Expression::NewTarget(_) => self.thread_from_owner(false),
             Expression::ThisExpression(_) => {
                 // Arrows observe the nearest non-arrow unit's `this`; that
                 // unit must thread it through its Environment.
@@ -2050,6 +2139,12 @@ impl<'s> Collector<'s> {
                         "`super()` is only allowed in a derived class constructor",
                     );
                     return;
+                }
+                if c.callee.is_super() {
+                    // `super()` reads the constructor's `new.target` and binds
+                    // its `this`; from an arrow both live in the
+                    // constructor's Environment.
+                    self.thread_from_owner(true);
                 }
                 self.expr(&c.callee);
                 for arg in &c.arguments {
@@ -2250,7 +2345,6 @@ impl<'s> Collector<'s> {
             | Expression::RegExpLiteral(_)
             | Expression::StringLiteral(_)
             | Expression::ImportMeta(_)
-            | Expression::NewTarget(_)
             | Expression::TSAsExpression(_)
             | Expression::TSSatisfiesExpression(_)
             | Expression::TSTypeAssertion(_)
@@ -2872,7 +2966,11 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
                 .decl_order
                 .iter()
                 .any(|s| plans.captured.contains(s) && homes.get(s).is_some_and(|h| *h == ui));
-            (escapes, unit.needs_this, unit.eval_reachable)
+            (
+                escapes,
+                unit.needs_this || unit.needs_new_target,
+                unit.eval_reachable,
+            )
         };
         {
             let unit = &mut plans.units[ui];
@@ -3073,6 +3171,13 @@ fn finalize(plans: &mut Plans) -> Result<(), CompileError> {
         unit.binding_descriptors = descriptors;
         if unit.needs_this && unit.has_env {
             unit.this_slot = Some(slot);
+            slot = slot.checked_add(1).ok_or_else(|| CompileError {
+                message: "too many functions/constants".into(),
+                span: Some((0, 0)),
+            })?;
+        }
+        if unit.needs_new_target && unit.has_env {
+            unit.new_target_slot = Some(slot);
             slot = slot.checked_add(1).ok_or_else(|| CompileError {
                 message: "too many functions/constants".into(),
                 span: Some((0, 0)),

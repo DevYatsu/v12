@@ -426,7 +426,14 @@ impl<'p> Mini<'p> {
                 | Opcode::GetAsyncIterator
                 | Opcode::IteratorNext
                 | Opcode::IteratorClose
-                | Opcode::GetNewTarget => {
+                | Opcode::GetNewTarget
+                | Opcode::SuperConstruct
+                | Opcode::SuperConstructApply
+                | Opcode::CheckThis
+                | Opcode::CheckThisUnbound
+                | Opcode::DerivedResult
+                | Opcode::CheckHeritage
+                | Opcode::DefineField => {
                     panic!(
                         "generator/async/copy/define opcodes not expected in tier-1 mini programs"
                     )

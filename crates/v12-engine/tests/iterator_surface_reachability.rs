@@ -273,7 +273,7 @@ fn a_subclass_of_iterator_reaches_the_helpers_through_the_real_prototype() {
     assert_eq!(
         thrown(
             "class X extends Iterator { \
-                 constructor() { this.n = 0; } \
+                 constructor() { super(); this.n = 0; } \
                  next() { this.n += 1; return this.n === 1 \
                           ? { value: 1, done: false } : { value: undefined, done: true }; } \
                } \

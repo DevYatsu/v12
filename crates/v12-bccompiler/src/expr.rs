@@ -452,11 +452,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Expression::Super(x) => self.super_expr(x.span),
             Expression::ImportMeta(x) => Err(self.err(x.span, "`import.meta` is not supported")),
-            Expression::NewTarget(x) => {
-                let dst = self.new_temp();
-                self.emit_reg2(Opcode::GetNewTarget, dst, 0, x.span);
-                Ok(dst)
-            }
+            Expression::NewTarget(x) => self.read_new_target(x.span),
             Expression::PrivateInExpression(x) => {
                 let name = crate::class::load_private_name(self, &x.left.name, x.left.span)?;
                 let obj = self.expr(&x.right)?;
@@ -2111,6 +2107,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         if c.optional {
             return Err(self.err(c.span, "optional calls are not supported"));
         }
+        if c.callee.is_super() {
+            return self.super_call(c);
+        }
         let has_spread = c
             .arguments
             .iter()
@@ -2121,12 +2120,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             // Layout: [callee][this][arg…]; see `CALL_HEADER_REGS`.
             let block = self.new_temps(argc + CALL_HEADER_REGS);
 
-            if c.callee.is_super() {
-                // `super(...)`: call the parent constructor with `this`.
-                let super_ctor = self.super_ctor(c.span)?;
-                self.move_reg(block, super_ctor, c.span);
-                self.move_reg(block + 1, REG_THIS, c.span);
-            } else if let Some(m) = c.callee.as_member_expression() {
+            if let Some(m) = c.callee.as_member_expression() {
                 // Method call: obj + key evaluate first, `this` = object.
                 // `super.x(...)` uses `this` as the receiver (the home object
                 // supplies the method, the current `this` the receiver).
@@ -2170,11 +2164,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
         // Spread path: build args array and use CallApply. Callee/receiver
         // layout mirrors the non-spread path above, `super(...)` included.
         let block = self.new_temps(CALL_HEADER_REGS);
-        if c.callee.is_super() {
-            let super_ctor = self.super_ctor(c.span)?;
-            self.move_reg(block, super_ctor, c.span);
-            self.move_reg(block + 1, REG_THIS, c.span);
-        } else if let Some(m) = c.callee.as_member_expression() {
+        if let Some(m) = c.callee.as_member_expression() {
             let (obj, key) = self.member_parts(m)?;
             self.emit_member_load(block, obj, key, m.object().is_super(), c.span)?;
             if m.object().is_super() {
@@ -2302,25 +2292,119 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// the enclosing unit's `this` env slot when the current unit is an arrow
     /// (arrows have no own `this` binding, they close over the nearest
     /// non-arrow function's).
+    ///
+    /// In a derived constructor's scope `this` may still be uninitialized,
+    /// so the read is followed by the `CheckThis` TDZ test (ES §9.1.1.3.4).
     pub(crate) fn read_this(&mut self, span: Span) -> Res<u16> {
-        let dst = self.new_temp();
-        let home = self.comp.plans.this_home(self.unit);
-        if home == self.unit {
-            self.move_reg(dst, REG_THIS, span);
-            return Ok(dst);
-        }
-        let plan = &self.comp.plans.units[home];
-        if let Some(slot) = plan.this_slot {
-            let depth = self.comp.plans.env_depth_between(self.unit, home)?;
-            self.emit_get_env(dst, depth, slot, span);
-        } else {
-            // Home did not allocate a `this` env slot (e.g. class field
-            // initializer `this` not walked during collect). Fall back to
-            // direct `this` register — the arrow captures the same frame's
-            // REG_THIS.
-            self.move_reg(dst, REG_THIS, span);
+        let dst = self.read_this_raw(span)?;
+        if self.this_is_derived() {
+            self.emit_reg3(Opcode::CheckThis, dst, 0, 0, span);
         }
         Ok(dst)
+    }
+
+    /// True when the current `this` is a derived constructor's binding.
+    fn this_is_derived(&self) -> bool {
+        let home = self.comp.plans.this_home(self.unit);
+        self.comp.plans.units[home].ctor_kind == v12_bytecode::ConstructorKind::Derived
+    }
+
+    /// [`Self::read_this`] without the TDZ test.
+    ///
+    /// A unit whose `this` is threaded through its environment reads the env
+    /// slot even from its own body: in a derived constructor an arrow's
+    /// `super()` binds `this` there, and `REG_THIS` would be stale.
+    pub(crate) fn read_this_raw(&mut self, span: Span) -> Res<u16> {
+        let dst = self.new_temp();
+        let home = self.comp.plans.this_home(self.unit);
+        let plan = &self.comp.plans.units[home];
+        match plan.this_slot {
+            Some(slot) if home != self.unit || plan.ctor_kind == v12_bytecode::ConstructorKind::Derived => {
+                let depth = self.comp.plans.env_depth_between(self.unit, home)?;
+                let depth = self.biased_depth(depth);
+                self.emit_get_env(dst, depth, slot, span);
+            }
+            // The unit's own frame (or a home that never threads `this`,
+            // whose arrows therefore never read it).
+            _ => self.move_reg(dst, REG_THIS, span),
+        }
+        Ok(dst)
+    }
+
+    /// `BindThisValue` (ES §9.1.1.3.1) after `super()`: `this` becomes
+    /// `value` in the constructor's frame and, when threaded, its env slot.
+    fn bind_this(&mut self, value: u16, span: Span) -> Res<()> {
+        let home = self.comp.plans.this_home(self.unit);
+        if home == self.unit {
+            self.move_reg(REG_THIS, value, span);
+        }
+        if let Some(slot) = self.comp.plans.units[home].this_slot {
+            let depth = self.comp.plans.env_depth_between(self.unit, home)?;
+            let depth = self.biased_depth(depth);
+            self.emit_set_env(depth, slot, value, span);
+        }
+        Ok(())
+    }
+
+    /// `new.target` as seen from the current unit (ES §13.3.12): the frame's
+    /// own, or for an arrow its non-arrow home's, threaded through the env.
+    fn read_new_target(&mut self, span: Span) -> Res<u16> {
+        let dst = self.new_temp();
+        let home = self.comp.plans.this_home(self.unit);
+        match self.comp.plans.units[home].new_target_slot {
+            Some(slot) if home != self.unit => {
+                let depth = self.comp.plans.env_depth_between(self.unit, home)?;
+                let depth = self.biased_depth(depth);
+                self.emit_get_env(dst, depth, slot, span);
+            }
+            _ => self.emit_reg2(Opcode::GetNewTarget, dst, 0, span),
+        }
+        Ok(dst)
+    }
+
+    /// `super(args…)` (ES §13.3.7.1): construct the dynamic super
+    /// constructor with this constructor's `new.target`, bind `this`, then
+    /// run the class's instance-members initializer on it.
+    fn super_call(&mut self, c: &CallExpression<'_>) -> Res<u16> {
+        let has_spread = c
+            .arguments
+            .iter()
+            .any(|a| matches!(a, oxc_ast::ast::Argument::SpreadElement(_)));
+        let argc = u8::try_from(c.arguments.len()).ok();
+        let block = match argc {
+            Some(argc) if !has_spread => {
+                let block = self.new_temps(u16::from(argc) + CALL_HEADER_REGS);
+                let class = self.home_slot(crate::class::SLOT_HOME_CTOR, c.span)?;
+                self.move_reg(block, class, c.span);
+                let new_target = self.read_new_target(c.span)?;
+                self.move_reg(block + 1, new_target, c.span);
+                for (i, arg) in c.arguments.iter().enumerate() {
+                    let Some(x) = arg.as_expression() else {
+                        return Err(self.err(arg.span(), "spread arguments are not supported"));
+                    };
+                    self.expr_into(x, block + 2 + i as u16)?;
+                }
+                self.emit_super_construct(block, block, argc, c.span);
+                block
+            }
+            _ => {
+                let block = self.new_temps(CALL_HEADER_REGS);
+                let class = self.home_slot(crate::class::SLOT_HOME_CTOR, c.span)?;
+                self.move_reg(block, class, c.span);
+                let new_target = self.read_new_target(c.span)?;
+                self.move_reg(block + 1, new_target, c.span);
+                let args = self.build_args_array(&c.arguments, c.span)?;
+                self.emit_reg3(Opcode::SuperConstructApply, block, block, args, c.span);
+                block
+            }
+        };
+        let current = self.read_this_raw(c.span)?;
+        self.emit_reg3(Opcode::CheckThisUnbound, current, 0, 0, c.span);
+        self.bind_this(block, c.span)?;
+        if let Some(scope) = crate::class::ctor_class_scope(self) {
+            crate::class::emit_instance_init_call(self, scope, block, c.span)?;
+        }
+        Ok(block)
     }
 
     /// The unit that owns the `super` binding in scope: the nearest enclosing
@@ -2351,8 +2435,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// `super` in expression position: resolves the parent constructor from
     /// the class env. For member access the caller additionally dereferences
     /// `.prototype` for instance methods.
-    fn super_ctor(&mut self, span: Span) -> Res<u16> {
-        // Walk up to find the nearest non-arrow unit that uses super (the class method/constructor).
+    /// Slot `slot` of the class scope that owns the `super` binding in
+    /// scope (the home objects `F` / `F.prototype`).
+    fn home_slot(&mut self, slot: u16, span: Span) -> Res<u16> {
         let units = &self.comp.plans.units;
         let mut cur = Some(self.unit);
         let mut found = false;
@@ -2367,8 +2452,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             return Err(self.err(span, "`super` outside a class method is not supported"));
         }
         let depth = self.super_env_depth();
+        let depth = self.biased_depth(depth);
         let d = self.new_temp();
-        self.emit_get_env(d, depth, crate::class::SLOT_SUPER_CTOR, span);
+        self.emit_get_env(d, depth, slot, span);
         Ok(d)
     }
 
@@ -2396,16 +2482,18 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             self.emit_reg3(Opcode::GetPrototype, base, this, 0, span);
             return Ok(base);
         }
-        let ctor = self.super_ctor(span)?;
-        let is_static = self.comp.plans.units[self.unit].static_method;
-        if is_static {
-            return Ok(ctor);
-        }
-        let proto = self.new_temp();
-        let key = self.new_temp();
-        self.load_str(key, "prototype", span)?;
-        self.emit_reg3(Opcode::GetProperty, proto, ctor, key, span);
-        Ok(proto)
+        // `HomeObject.[[GetPrototypeOf]]()` (ES §13.3.7.3 step 2): the home
+        // is `F` for static code and `F.prototype` for everything else
+        // (methods, the constructor, field initializers).
+        let home_slot = if self.comp.plans.units[owner].static_method {
+            crate::class::SLOT_HOME_CTOR
+        } else {
+            crate::class::SLOT_HOME_PROTO
+        };
+        let home = self.home_slot(home_slot, span)?;
+        let base = self.new_temp();
+        self.emit_reg3(Opcode::GetPrototype, base, home, 0, span);
+        Ok(base)
     }
 
     pub(crate) fn emit_closure_instr(&mut self, dst: u16, idx: usize, span: Span) -> Res<()> {

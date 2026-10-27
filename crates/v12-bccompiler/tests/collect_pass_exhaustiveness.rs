@@ -317,10 +317,15 @@ fn a_computed_class_element_key_is_still_walked_once() {
     assert_compiles("let e = 'k'; class C { [e]() {} }");
     assert_compiles("let e = 'k'; class C { [e] = 1; }");
     assert_compiles("class C { k() {} }");
-    // A computed key that references a binding from the enclosing function is
-    // still captured by the enclosing unit.
+    // A computed key is evaluated in the enclosing unit (ES §15.7.14 step
+    // 26), so reading `e` there captures nothing; only a closure that reads
+    // `e` forces it into an environment.
     assert!(
-        main_allocates_env("let e='k'; class C { [e]() {} }"),
-        "a computed class key reads `e` from the enclosing unit",
+        !main_allocates_env("let e='k'; class C { [e]() {} }"),
+        "a computed class key reads `e` directly in the enclosing unit",
+    );
+    assert!(
+        main_allocates_env("let e='k'; class C { [e]() { return e; } }"),
+        "a method body that reads `e` still captures it",
     );
 }

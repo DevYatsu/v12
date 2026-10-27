@@ -179,8 +179,10 @@ impl FunctionBuilder {
             is_generator: self.is_generator,
             is_async: self.is_async,
             is_arrow: self.is_arrow,
+            is_constructor: false,
             is_top_level: self.is_top_level,
             uses_seeded_env: false,
+            ctor_kind: crate::ConstructorKind::None,
             eval_metadata: None,
         }
     }

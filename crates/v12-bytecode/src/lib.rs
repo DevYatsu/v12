@@ -281,11 +281,32 @@ pub struct FunctionBytecode {
     /// Arrow functions lack a `prototype` property (they are not
     /// constructible). Set from the compiler's unit plan.
     pub is_arrow: bool,
+    /// The function has `[[Construct]]`: a plain function or a class
+    /// constructor. Arrows, methods, accessors, generators and async
+    /// functions do not (ES 10.2.3 `OrdinaryFunctionCreate`, 15.4.4).
+    pub is_constructor: bool,
     /// True for the script/eval main unit, not an ordinary function unit.
     pub is_top_level: bool,
     /// Module main uses a loader-seeded environment instead of creating one.
     pub uses_seeded_env: bool,
+    /// Which constructor this function is (ES `[[ConstructorKind]]`), or
+    /// that it is not a class constructor at all.
+    pub ctor_kind: ConstructorKind,
     pub eval_metadata: Option<EvalFunctionMetadata>,
+}
+
+/// ES `[[ConstructorKind]]` plus "not a class constructor".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConstructorKind {
+    /// An ordinary function (or method): `[[Call]]` runs the body.
+    #[default]
+    None,
+    /// A base class constructor: `[[Call]]` throws; `[[Construct]]`
+    /// allocates `this` from `new.target.prototype`.
+    Base,
+    /// A derived class constructor: `[[Call]]` throws; `[[Construct]]`
+    /// leaves `this` uninitialized until `super()` binds it.
+    Derived,
 }
 
 impl FunctionBytecode {
@@ -312,8 +333,10 @@ impl FunctionBytecode {
             is_generator: false,
             is_async: false,
             is_arrow: false,
+            is_constructor: false,
             is_top_level: false,
             uses_seeded_env: false,
+            ctor_kind: ConstructorKind::None,
             eval_metadata: None,
         }
     }
@@ -573,6 +596,13 @@ pub fn mnemonic(op: Opcode) -> &'static str {
         Opcode::JumpIfNullish => "jump_if_nullish",
         Opcode::SetPrototype => "set_prototype",
         Opcode::GetPrototype => "get_prototype",
+        Opcode::SuperConstruct => "super_construct",
+        Opcode::SuperConstructApply => "super_construct_apply",
+        Opcode::CheckThis => "check_this",
+        Opcode::CheckThisUnbound => "check_this_unbound",
+        Opcode::DerivedResult => "derived_result",
+        Opcode::CheckHeritage => "check_heritage",
+        Opcode::DefineField => "define_field",
         Opcode::GetIterator => "get_iterator",
         Opcode::GetAsyncIterator => "get_async_iterator",
         Opcode::IteratorNext => "iterator_next",
@@ -639,7 +669,14 @@ pub(crate) fn fmt_operands(f: &mut fmt::Formatter<'_>, op: Opcode, i: Instr) -> 
         Opcode::Jump => write!(f, " -> {}", i.imm24()),
         Opcode::JumpIfFalse | Opcode::JumpIfTrue => write!(f, " r{a}, -> {}", i.imm16()),
         Opcode::LoopHeader => Ok(()),
-        Opcode::Call | Opcode::Construct => write!(f, " r{a}, r{b}, argc={c}"),
+        Opcode::Call | Opcode::Construct | Opcode::SuperConstruct => {
+            write!(f, " r{a}, r{b}, argc={c}")
+        }
+        Opcode::SuperConstructApply | Opcode::DerivedResult | Opcode::DefineField => {
+            write!(f, " r{a}, r{b}, r{c}")
+        }
+        Opcode::CheckHeritage => write!(f, " r{a}, r{b}"),
+        Opcode::CheckThis | Opcode::CheckThisUnbound => write!(f, " r{a}"),
         Opcode::Return | Opcode::Throw => write!(f, " r{a}"),
         Opcode::GetProperty | Opcode::DeleteProperty => write!(f, " r{a}, r{b}, r{c}"),
         Opcode::SetProperty => write!(f, " r{a}, r{b}, r{c}"),

@@ -883,7 +883,11 @@ fn wire_callable(
     native: NativeId,
 ) {
     if let Some(o) = intrinsics.get(name).and_then(|v| v.as_object()) {
-        heap.get_mut(o).callable = v12_heap::FunctionTarget::Bytecode(u32::from(native));
+        let ctor = heap.get_mut(o);
+        ctor.callable = v12_heap::FunctionTarget::Bytecode(u32::from(native));
+        // Every intrinsic wired here is a built-in constructor; `Proxy`
+        // needs the bit from this site because it has no `prototype` link.
+        ctor.flags |= v12_heap::JsObject::FLAG_CONSTRUCTOR;
     }
 }
 

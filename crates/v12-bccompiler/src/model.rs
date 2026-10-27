@@ -302,8 +302,16 @@ pub struct UnitPlan {
     pub creation_bias: u16,
     /// An arrow-descendant reads `this`, forcing an Environment to thread it.
     pub needs_this: bool,
+    /// An arrow-descendant reads `new.target` or calls `super()`, so the
+    /// unit threads its `new.target` through its Environment (arrows have
+    /// none of their own, ES §15.3).
+    pub needs_new_target: bool,
     pub env_slots: HashMap<SymbolId, u16>,
     pub this_slot: Option<u16>,
+    /// Env slot carrying `new.target` when [`Self::needs_new_target`].
+    pub new_target_slot: Option<u16>,
+    /// `[[ConstructorKind]]` of a class constructor unit.
+    pub ctor_kind: v12_bytecode::ConstructorKind,
     pub env_slot_count: u16,
     /// TDZ ("temporal dead zone") flag locations for the unit's `let`/`const`
     /// bindings — see [`UnitPlan::tdz_flag_of`].
@@ -389,8 +397,11 @@ impl UnitPlan {
             has_env: false,
             creation_bias: 0,
             needs_this: false,
+            needs_new_target: false,
             env_slots: HashMap::new(),
             this_slot: None,
+            new_target_slot: None,
+            ctor_kind: v12_bytecode::ConstructorKind::None,
             env_slot_count: 0,
             tdz_flags: HashMap::new(),
             arity: 0,
@@ -435,6 +446,30 @@ impl UnitPlan {
     }
 }
 
+/// The synthetic function units a class body needs besides its constructor
+/// and methods (the `<instance_members_initializer>` /
+/// `<static_initializer>` functions of production engines).
+///
+/// Field initializers are function bodies of their own in the spec (each is
+/// a `ClassFieldDefinition` closure run by `DefineField`), and they run with
+/// a different `this` than the code around the class: the instance for
+/// instance fields, the constructor for static ones. Planning them as units
+/// gives each the right `this`, `new.target` (undefined), `super` home and
+/// capture layout without special cases.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClassInitUnits {
+    /// `InitializeInstanceElements`: instance private methods/accessors, then
+    /// instance fields in order. `None` when the class has neither.
+    pub instance: Option<usize>,
+    /// Static fields in order, run once with `this` = the constructor.
+    pub static_: Option<usize>,
+    /// Whether anything reads the class-scope environment: a derived
+    /// constructor (`super()` reads the home constructor), a `super`
+    /// reference, a Private Name, a computed field key, or the instance
+    /// initializer slot. A class with none of these allocates no scope.
+    pub needs_env: bool,
+}
+
 /// Global layout tables produced by [`crate::collect`].
 #[derive(Debug, Default)]
 pub struct Plans {
@@ -447,6 +482,8 @@ pub struct Plans {
     pub symbol_names: HashMap<SymbolId, String>,
     /// Function / arrow expression node span → program function index.
     pub fn_index: HashMap<Span, usize>,
+    /// Class span → its synthetic element-initializer units.
+    pub class_inits: HashMap<Span, ClassInitUnits>,
     /// `(symbol, referencing unit)` pairs gathered during the walk; joined
     /// into `captured` by the finalize step.
     pub ref_sites: Vec<(SymbolId, usize)>,
@@ -610,26 +647,35 @@ pub struct Compiler<'s, 'i> {
     pub is_eval_payload: bool,
     pub eval_var_target: v12_bytecode::EvalVarTarget,
     /// The class bodies being compiled, innermost last: each resolves the
-    /// `#names` it declares (ES `PrivateEnvironment`, §9.2).
-    pub private_scopes: Vec<PrivateScope>,
+    /// `#names` it declares (ES `PrivateEnvironment`, §9.2) and owns the
+    /// class-scope environment its element closures capture.
+    pub class_scopes: Vec<ClassScope>,
     /// `env_bias` of the unit currently being emitted, mirrored here so
     /// `compile_unit` can record a nested unit's `creation_bias`.
     pub live_env_bias: u16,
 }
 
-/// One class body's private names, as seen by the compiler.
+/// One class body being compiled: its class-scope environment and what lives
+/// in it (see the `SLOT_*` constants in `class.rs`).
 ///
-/// The names live in the class-scope environment (slot
-/// `SLOT_FIRST_PRIVATE_NAME + index`), created fresh by each evaluation of the
-/// class, so a reference compiles to a `GetEnvSlot` from that environment.
+/// Every evaluation of the class creates a fresh environment, so the Private
+/// Names, the computed field keys and the home objects in it are per
+/// evaluation, and a reference compiles to a `GetEnvSlot` from it.
 #[derive(Debug)]
-pub struct PrivateScope {
+pub struct ClassScope {
     /// Declared `#names` (with the `#`), in slot order.
     pub names: Vec<String>,
     /// The unit whose code evaluates the class (and pushes its scope).
     pub outer_unit: usize,
     /// The outer unit's `env_bias` with the class scope pushed.
     pub bias_level: u16,
+    /// The class constructor's unit.
+    pub ctor_unit: usize,
+    /// The instance-members initializer unit, when the class has one.
+    pub instance_init: Option<usize>,
+    /// Computed field keys, evaluated once at class definition: the field's
+    /// span and the env slot holding its `ToPropertyKey`'d key.
+    pub field_keys: Vec<(Span, u16)>,
 }
 
 impl<'s, 'i> Compiler<'s, 'i> {
@@ -1818,6 +1864,13 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             0b0011,
             span,
         );
+    }
+
+    /// `SuperConstruct` over a `[F][new.target][args…]` block. `argc` must
+    /// fit the narrow slot (the caller routes larger argument lists through
+    /// `SuperConstructApply`); registers escape through `RegExt`.
+    pub fn emit_super_construct(&mut self, dst: u16, block: u16, argc: u8, span: oxc_span::Span) {
+        self.emit_regs(Opcode::SuperConstruct, dst, block, u16::from(argc), 0b0011, span);
     }
 
     /// `NewArray dst, base, len` — `len` is an immediate and must fit the

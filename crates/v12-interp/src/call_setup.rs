@@ -236,7 +236,7 @@ impl Interp<'_> {
         if self.is_generator_fn_for(target_idx, callee_program) {
             // Bind `this` at call time (OrdinaryCallBindThis); the generator
             // body observes the bound receiver when resumed.
-            let gen_this = self.bind_this(target_idx, callee_program, this_v);
+            let gen_this = self.bind_this(target_idx, callee_program, this_v)?;
             let r#gen = self.create_generator_object(
                 target_idx,
                 callee_program,
@@ -292,7 +292,7 @@ impl Interp<'_> {
                 (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
             };
             let mut window = vec![JsValue::undefined(); usize::from(callee_max_regs)];
-            window[0] = self.bind_this(target_idx, callee_program, this_v);
+            window[0] = self.bind_this(target_idx, callee_program, this_v)?;
             let arg_src = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
             let actuals = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
             let arguments =
@@ -344,7 +344,7 @@ impl Interp<'_> {
         self.stack.resize(window_end, JsValue::undefined());
         // ES OrdinaryCallBindThis: resolve the frame's `this` binding for the
         // callee's strictness *before* the frame runs.
-        let bound_this = self.bind_this(target_idx, callee_program, this_v);
+        let bound_this = self.bind_this(target_idx, callee_program, this_v)?;
         self.stack[new_base] = bound_this;
         crate::call::fill_stack_call_window(
             self,
@@ -605,8 +605,9 @@ impl Interp<'_> {
                 let callee_max_regs = funcs[fn_idx as usize].max_regs;
                 let new_base = self.stack.len();
                 let window_end = new_base + usize::from(callee_max_regs);
+                let bound_this = self.bind_this(fn_idx, func_program, this)?;
                 self.stack.resize(window_end, JsValue::undefined());
-                self.stack[new_base] = self.bind_this(fn_idx, func_program, this);
+                self.stack[new_base] = bound_this;
                 let (callee_has_rest, callee_fixed, callee_rest_reg) = {
                     let f = &funcs[fn_idx as usize];
                     (f.has_rest, f.fixed_params, f.rest_reg)
@@ -662,20 +663,34 @@ impl Interp<'_> {
     /// v1 has no primitive wrapper objects (`String`/`Number`/`Boolean`
     /// boxing is a documented engine-wide gap), so a primitive receiver is
     /// left as the primitive rather than boxed.
-    fn bind_this(&self, fn_idx: u32, program: u32, this_v: JsValue) -> JsValue {
+    /// The `this` a `[[Call]]` of a bytecode function binds (ES §10.2.1.2
+    /// `OrdinaryCallBindThis`), or the `TypeError` a class constructor's
+    /// `[[Call]]` throws (ES §10.2.1 step 2) — every call path that pushes a
+    /// bytecode frame goes through here, so that rule has one home.
+    fn bind_this(
+        &mut self,
+        fn_idx: u32,
+        program: u32,
+        this_v: JsValue,
+    ) -> Result<JsValue, JSException> {
         let funcs = self.functions_for_program(program);
         let Some(f) = funcs.get(fn_idx as usize) else {
-            return this_v;
+            return Ok(this_v);
         };
+        if f.ctor_kind != v12_bytecode::ConstructorKind::None {
+            return Err(JSException(
+                self.type_error("Class constructor cannot be invoked without 'new'"),
+            ));
+        }
         if f.is_strict || f.is_arrow {
-            return this_v;
+            return Ok(this_v);
         }
         if (this_v.is_null() || this_v.is_undefined())
             && let Some(g) = self.global
         {
-            return JsValue::object(g);
+            return Ok(JsValue::object(g));
         }
-        this_v
+        Ok(this_v)
     }
 
     /// Completes the top frame with `result`: deposits it into the caller's
@@ -1184,8 +1199,8 @@ impl Interp<'_> {
         let caller_frame_regs = caller_max_regs;
         let new_base = caller_base + usize::from(caller_frame_regs);
         let window_end = new_base + usize::from(callee_max_regs);
+        let bound_this = self.bind_this(target_idx, callee_program, this_v)?;
         self.stack.resize(window_end, JsValue::undefined());
-        let bound_this = self.bind_this(target_idx, callee_program, this_v);
         self.stack[new_base] = bound_this;
         // Handle rest param for callee if present.
         let has_rest = callee_has_rest;
@@ -1213,7 +1228,12 @@ impl Interp<'_> {
             self.stack[new_base + rest_reg] = rest_v;
             // Ensure any param registers beyond fixed+rest remain undefined (already).
         } else {
-            let copied = (argc as usize).min(usize::from(callee_max_regs).saturating_sub(1));
+            // Declared formals only, as `call::fill_call_window`: an extra
+            // actual must not overwrite the compiler's reserved `undefined`
+            // register past the locals.
+            let copied = fixed
+                .min(argc as usize)
+                .min(usize::from(callee_max_regs).saturating_sub(1));
             for (i, &v) in elements.iter().enumerate().take(copied) {
                 self.stack[new_base + 1 + i] = if v.is_hole() { JsValue::undefined() } else { v };
             }
@@ -1261,150 +1281,92 @@ impl Interp<'_> {
     ) -> Result<CallOutcome, JSException> {
         let callee_slot = base + usize::from(callee_reg);
         let callee_v = self.stack[callee_slot];
+        let arg_src = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
+        let args = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
+        let outcome = self.prepare_construct_values(base, caller_max_regs, callee_v, &args, callee_v)?;
+        if matches!(outcome, CallOutcome::Pushed)
+            && let Some(frame) = self.frames.last()
+        {
+            self.call_args.insert(frame.base, (arg_src, usize::from(argc)));
+        }
+        Ok(outcome)
+    }
 
+    /// `Construct(callee, args, new_target)` (ES §7.3.15) from the dispatch
+    /// loop: a bytecode constructor gets a frame above the caller's window
+    /// (`Pushed`, completed by `complete_frame`'s construct adjustment);
+    /// everything else runs to a `Value`. The single implementation behind
+    /// `new`, `super(…)` and their spread spellings.
+    ///
+    /// `this` follows `[[ConstructorKind]]` (ES §10.2.2): a base constructor
+    /// allocates it from `new_target.prototype`; a derived one leaves it the
+    /// uninitialized marker (`JsValue::hole`) until `super()` binds it. A
+    /// native constructor builds its own object, which then takes
+    /// `new_target.prototype` when `new_target` is not the native itself —
+    /// that is what makes `class A extends Array` produce an array exotic
+    /// object whose prototype is `A.prototype`.
+    pub(crate) fn prepare_construct_values(
+        &mut self,
+        base: usize,
+        caller_max_regs: u16,
+        callee_v: JsValue,
+        args: &[JsValue],
+        new_target: JsValue,
+    ) -> Result<CallOutcome, JSException> {
         let Some(callee_obj) = callee_v.as_object() else {
             return Err(JSException(self.type_error("value is not a constructor")));
         };
+        // ES 7.3.14 `Construct` is only reached for `IsConstructor` callees.
+        if !self.heap.get(callee_obj).is_constructor() {
+            return Err(JSException(self.type_error("value is not a constructor")));
+        }
         // Proxy exotic: `[[Construct]]` is the `construct` trap (ES 10.5.13).
         if self.heap.get(callee_obj).kind == Kind::Proxy {
-            let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
-            let args_end = args_start + usize::from(argc);
-            let args_vec = self.stack[args_start..args_end].to_vec();
             return self
-                .proxy_construct(callee_obj, &args_vec, callee_v)
+                .proxy_construct(callee_obj, args, new_target)
                 .map(CallOutcome::Value);
         }
         if self.heap.get(callee_obj).kind != Kind::Function {
             return Err(JSException(self.type_error("value is not a constructor")));
         }
-        // Read the callable target, captured environment, and program id
-        // from the object. The program id lets a closure created in another
-        // program (eval) resolve its bytecode against the right table.
-        let (target, _captured_env, callee_program) = {
+        let (target, callee_program) = {
             let c = self.heap.get(callee_obj);
-            (c.callable, c.captured_env, c.program_id)
+            (c.callable, c.program_id)
         };
 
-        // Native seam: constructor-shaped natives (Boolean, Error) dispatch
-        // their handler directly. Out-of-range bytecode indices (placeholders,
-        // engine natives) route through the registry, which rejects
-        // unregistered indices as not a constructor.
         let target_idx = match target {
             v12_heap::FunctionTarget::Bytecode(idx) => {
                 if (idx as usize) >= self.functions_for_program(callee_program).len() {
-                    // `onFulfilledElement` is a `CreateBuiltinFunction` and has
-                    // no `[[Construct]]` (spec 27.5.4.1.1 step 4), so `new` on
-                    // it is a `TypeError` — and the *spec's* `TypeError`, not
-                    // the registry's "not registered", which is neither a
-                    // `TypeError` object nor the right message.
-                    if idx == u32::from(NativeId::PromiseCombinatorElement) {
-                        return Err(JSException(self.type_error("not a constructor")));
-                    }
-                    let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
-                    let args_end = args_start + usize::from(argc);
                     self.gc_protect();
                     let id = self.native_id_for(idx)?;
-                    // Statics with no `[[Construct]]` at all. Their handlers
-                    // ignore `this` and would otherwise build a value under
-                    // `new` instead of throwing (spec 10.4.1).
-                    if v12_native::is_non_constructible(id) {
-                        return Err(JSException(self.type_error("not a constructor")));
-                    }
-                    // One router: `new Function(params…, body)` compiles via
-                    // the Function arm; constructor-shaped natives ignore the
-                    // receiver per spec except for the identity read below
-                    // (`callee_v` as `this`, e.g. `new Promise` linking
-                    // instances to `Promise.prototype`).
-                    let args_slice = self.stack[args_start..args_end].to_vec();
+                    // Constructor-shaped natives read the receiver only for
+                    // its identity (`callee_v` as `this`, e.g. `new Promise`
+                    // linking instances to `Promise.prototype`).
+                    let v = self.dispatch_native(id, callee_v, args)?;
                     return self
-                        .dispatch_native(id, callee_v, &args_slice)
+                        .adopt_new_target_prototype(v, callee_v, new_target)
                         .map(CallOutcome::Value);
-                }
-                // `IsConstructor` (ES 10.1.14) for a source-defined function.
-                // This arm used to fall straight through, so `new (()=>{})`,
-                // `new (function*(){})` and `new (async function(){})` all
-                // built an instance instead of throwing — and because a bound
-                // function's `[[Construct]]` forwards to its target, it also
-                // made `new (arrow.bind())` silently succeed. The prototype
-                // materialization below is what papered it over: an arrow has
-                // no `prototype`, so the fallback allocated one.
-                if !self.bytecode_is_constructor(idx, callee_program) {
-                    return Err(JSException(self.type_error("value is not a constructor")));
                 }
                 idx
             }
             v12_heap::FunctionTarget::Native(f) => {
-                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
-                let args_end = args_start + usize::from(argc);
                 self.gc_protect();
-                let result = {
-                    let args = &self.stack[args_start..args_end];
-                    f(self.heap, JsValue::undefined(), args)
-                };
-                return result.map(CallOutcome::Value).map_err(JSException);
+                let v = f(self.heap, JsValue::undefined(), args).map_err(JSException)?;
+                return self
+                    .adopt_new_target_prototype(v, callee_v, new_target)
+                    .map(CallOutcome::Value);
             }
-            v12_heap::FunctionTarget::Host(_) => {
-                return Err(JSException(self.type_error("value is not a constructor")));
-            }
-            v12_heap::FunctionTarget::RealmEval(_) => {
-                // Realm-bound eval functions are not constructors.
+            v12_heap::FunctionTarget::Host(_) | v12_heap::FunctionTarget::RealmEval(_) => {
                 return Err(JSException(self.type_error("value is not a constructor")));
             }
             v12_heap::FunctionTarget::Bound(_) => {
-                // `new bf(...)` is `Construct(bf, args, bf)` (ES 10.2.2
-                // step 13) — the *bound function itself* is the newTarget.
-                // `construct_object` is the interpreter's nested construct
-                // entry and already implements ES 10.4.1.1 `[[Construct]]`,
-                // including step 3's `SameValue(F, newTarget)` rewrite that
-                // turns that `newTarget` into the bound target. Delegating
-                // (rather than inlining a second copy here) keeps the `new`
-                // opcode, `Reflect.construct`, and the proxy `construct` trap
-                // on one implementation, which is the whole point: they differ
-                // only in where the args come from.
-                //
-                // Safe to nest `execute()` from here: the `Kind::Proxy` arm
-                // above already does exactly this, and `construct_object`
-                // brackets itself with `stop_at_frames` + a stack truncate back
-                // to the window it pushed, so the caller's frame is untouched.
-                let args_start = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
-                let args_end = args_start + usize::from(argc);
-                let args_vec = self.stack[args_start..args_end].to_vec();
+                // ES 10.4.1.2 `[[Construct]]`: `construct_object` owns the
+                // bound-function rules, including step 3's `SameValue(F,
+                // newTarget)` rewrite to the bound target.
                 return self
-                    .construct_object(callee_obj, &args_vec, callee_v)
+                    .construct_object(callee_obj, args, new_target)
                     .map(CallOutcome::Value);
             }
-        };
-
-        // Bytecode function. Resolve or lazily create `.prototype`.
-        let proto_key = self.prototype_key();
-        let proto_val: Option<JsValue> = {
-            let shape = self.shape_of(callee_obj);
-            match self.heap.lookup_property(shape, proto_key) {
-                Some(Descriptor::Data { slot, .. }) => {
-                    Some(self.heap.get(callee_obj).properties[*slot as usize])
-                }
-                _ => None,
-            }
-        };
-        let proto_v = match proto_val {
-            Some(v) if v.as_object().is_some() => v,
-            _ => {
-                // Fallback for function objects created outside `Closure`
-                // (host-created) that lack the spec-mandated property.
-                self.gc_protect();
-                let key_handle = self.heap.intern_text("prototype");
-                let p = self.heap.alloc(JsObject::default());
-                // Untracked until `set_property` stores it behind the callee;
-                // that path allocates, so root it for the duration.
-                let p_val = JsValue::object(p);
-                self.heap.add_root(p_val);
-                self.set_property(callee_v, JsValue::string(key_handle), p_val, false)?;
-                p_val
-            }
-        };
-        let Some(proto) = proto_v.as_object() else {
-            // Guarded above by `v.as_object().is_some()`; kept exhaustive.
-            return Err(JSException(self.type_error("value is not a constructor")));
         };
 
         if self.frames.len() >= MAX_CALL_DEPTH {
@@ -1413,54 +1375,54 @@ impl Interp<'_> {
             ));
         }
 
-        // Allocate the instance with [[Prototype]] linking, then push the
-        // frame with `this` = instance.
-        self.gc_protect();
-        let instance = self.heap.alloc(JsObject::environment(0, Some(proto)));
-        let instance_v = JsValue::object(instance);
-
-        let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {
+        let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg, ctor_kind) = {
             // Program-aware: the callee was range-checked against its own
-            // program's table at the top of `prepare_construct`.
+            // program's table above.
             let f = &self.functions_for_program(callee_program)[target_idx as usize];
-            (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg)
+            (f.max_regs, f.has_rest, f.fixed_params, f.rest_reg, f.ctor_kind)
         };
+        let instance_v = if ctor_kind == v12_bytecode::ConstructorKind::Derived {
+            // ES 10.2.2 step 6: a derived constructor's `this` stays
+            // uninitialized; `super()` is the only thing that binds it.
+            JsValue::hole()
+        } else {
+            let proto = if new_target == callee_v {
+                self.own_prototype_object(callee_obj, callee_v)?
+            } else {
+                self.prototype_from_constructor(new_target)?
+            };
+            self.gc_protect();
+            JsValue::object(self.heap.alloc(JsObject::environment(0, Some(proto))))
+        };
+
         let new_base = base + usize::from(caller_max_regs);
         let window_end = new_base + usize::from(callee_max_regs);
-
-        let arg_src = callee_slot + usize::from(v12_bytecode::CALL_HEADER_REGS);
-        let passed: Vec<JsValue> = self.stack[arg_src..arg_src + usize::from(argc)].to_vec();
+        let argc = args.len();
         self.stack.resize(window_end, JsValue::undefined());
         self.stack[new_base] = instance_v;
         if callee_has_rest {
             let fixed = callee_fixed as usize;
             let rest_reg = callee_rest_reg as usize;
             let fixed_to_copy = fixed
-                .min(argc as usize)
+                .min(argc)
                 .min(usize::from(callee_max_regs).saturating_sub(1));
-            for i in 0..fixed_to_copy {
-                self.stack[new_base + 1 + i] = self.stack[arg_src + i];
-            }
-            let rest_start = fixed;
-            let rest_len = (argc as usize).saturating_sub(rest_start);
-            let rest_slice = if rest_len > 0 {
-                self.stack[arg_src + rest_start..arg_src + rest_start + rest_len].to_vec()
-            } else {
-                Vec::new()
-            };
+            self.stack[new_base + 1..new_base + 1 + fixed_to_copy]
+                .copy_from_slice(&args[..fixed_to_copy]);
+            let rest_slice = args.get(fixed..).map(<[JsValue]>::to_vec).unwrap_or_default();
             self.gc_protect();
             let rest_v = crate::call::alloc_rest_array(self, rest_slice);
             if rest_reg < usize::from(callee_max_regs) {
                 self.stack[new_base + rest_reg] = rest_v;
             }
         } else {
-            let copied = usize::from(argc).min(usize::from(callee_max_regs).saturating_sub(1));
-            for i in 0..copied {
-                self.stack[new_base + 1 + i] = self.stack[arg_src + i];
-            }
+            // Declared formals only (see `call::fill_call_window`).
+            let copied = usize::from(callee_fixed)
+                .min(argc)
+                .min(usize::from(callee_max_regs).saturating_sub(1));
+            self.stack[new_base + 1..new_base + 1 + copied].copy_from_slice(&args[..copied]);
         }
 
-        let frame_args = self.frame_arguments_for(target_idx, callee_program, &passed, callee_v);
+        let frame_args = self.frame_arguments_for(target_idx, callee_program, args, callee_v);
         let captured_env = self.heap.get(callee_obj).captured_env;
         let env_display = self.env_display_for(captured_env);
         self.frames.push(Frame {
@@ -1473,13 +1435,114 @@ impl Interp<'_> {
             env_display,
             generator: None,
             yield_dst: None,
-            new_target: Some(callee_v),
+            new_target: Some(new_target),
             arguments: frame_args,
         });
-        self.call_args
-            .insert(new_base, (arg_src, usize::from(argc)));
         self.note_entry(target_idx);
         Ok(CallOutcome::Pushed)
+    }
+
+    /// ES §13.3.7.1 `GetSuperConstructor`: the active class constructor's
+    /// `[[GetPrototypeOf]]()`, which must be a constructor.
+    pub(crate) fn super_constructor(&mut self, class_v: JsValue) -> Result<JsValue, JSException> {
+        let parent = class_v.as_object().and_then(|f| self.heap.get(f).prototype);
+        match parent {
+            Some(p) if self.is_constructor_object(p) => Ok(JsValue::object(p)),
+            _ => Err(JSException(
+                self.type_error("Super constructor is not a constructor"),
+            )),
+        }
+    }
+
+    /// The argument list a spread call materialized into an array (holes
+    /// read as `undefined`).
+    pub(crate) fn spread_arguments(&mut self, args_v: JsValue) -> Result<Vec<JsValue>, JSException> {
+        let Some(args_obj) = args_v.as_object() else {
+            return Err(JSException(self.type_error("args is not an array")));
+        };
+        Ok(self
+            .heap
+            .get(args_obj)
+            .elements_array
+            .iter()
+            .map(|v| if v.is_hole() { JsValue::undefined() } else { v })
+            .collect())
+    }
+
+    /// The callee's own `prototype` object for `new F` with `new_target ==
+    /// F` — the hot path, a direct shape lookup. A function object created
+    /// outside `Closure` (host-created) can lack the property; it gets one.
+    fn own_prototype_object(
+        &mut self,
+        callee_obj: Handle<JsObject>,
+        callee_v: JsValue,
+    ) -> Result<Handle<JsObject>, JSException> {
+        let proto_key = self.prototype_key();
+        let shape = self.shape_of(callee_obj);
+        if let Some(Descriptor::Data { slot, .. }) = self.heap.lookup_property(shape, proto_key) {
+            let v = self.heap.get(callee_obj).properties[*slot as usize];
+            if let Some(p) = v.as_object() {
+                return Ok(p);
+            }
+            // A non-object `prototype` falls back to `%Object.prototype%`
+            // (ES 10.1.14 `GetPrototypeFromConstructor` step 4).
+            if let Some(p) = self.object_prototype() {
+                return Ok(p);
+            }
+        }
+        self.gc_protect();
+        let key_handle = self.heap.intern_text("prototype");
+        let p = self.heap.alloc(JsObject::default());
+        let p_val = JsValue::object(p);
+        // Untracked until `set_property` stores it behind the callee; that
+        // path allocates, so root it for the duration.
+        self.heap.add_root(p_val);
+        self.set_property(callee_v, JsValue::string(key_handle), p_val, false)?;
+        Ok(p)
+    }
+
+    /// ES 10.1.14 `GetPrototypeFromConstructor(new_target, %Object.prototype%)`:
+    /// `[[Get]]` of `prototype`, so a proxy or accessor runs.
+    pub(crate) fn prototype_from_constructor(
+        &mut self,
+        new_target: JsValue,
+    ) -> Result<Handle<JsObject>, JSException> {
+        let key = self.new_temp_key("prototype");
+        let v = self.get_property(0, 0, new_target, key)?;
+        match v.as_object().or_else(|| self.object_prototype()) {
+            Some(p) => Ok(p),
+            None => Err(JSException(self.type_error("no prototype for new.target"))),
+        }
+    }
+
+    /// Gives a native constructor's result `new_target.prototype` when the
+    /// construction came through a subclass (`new_target` is not the native
+    /// itself) — the `OrdinaryCreateFromConstructor` step every built-in
+    /// constructor performs.
+    pub(crate) fn adopt_new_target_prototype(
+        &mut self,
+        result: JsValue,
+        callee_v: JsValue,
+        new_target: JsValue,
+    ) -> Result<JsValue, JSException> {
+        if new_target == callee_v {
+            return Ok(result);
+        }
+        let proto = self.prototype_from_constructor(new_target)?;
+        let Some(obj) = result.as_object() else {
+            // `Number`/`String`/`Boolean` answer `new` with a primitive (v12
+            // has no wrapper exotic objects). A subclass construct still
+            // needs `OrdinaryCreateFromConstructor(newTarget, …)`: allocate
+            // that instance; only its `[[NumberData]]`-style slot is absent.
+            if result.is_undefined() || result.is_null() {
+                return Ok(result);
+            }
+            self.gc_protect();
+            let inst = self.heap.alloc(JsObject::environment(0, Some(proto)));
+            return Ok(JsValue::object(inst));
+        };
+        self.heap.get_mut(obj).prototype = Some(proto);
+        Ok(result)
     }
 
     /// Counts one loop-header crossing for `fn_idx`.
@@ -1698,6 +1761,11 @@ impl Interp<'_> {
                     v12_heap::FunctionTarget::Bound(state_h),
                     None,
                 ));
+                // BoundFunctionCreate step 4: `[[Construct]]` iff the target
+                // has one.
+                if self.heap.get(target).is_constructor() {
+                    self.heap.get_mut(bound).flags |= JsObject::FLAG_CONSTRUCTOR;
+                }
                 // ES 10.2.4 / `BoundFunctionCreate` (10.4.1.1): a bound
                 // function's `[[Prototype]]` is `%Function.prototype%`, the
                 // same as its target's. Without this the object had no
@@ -2306,103 +2374,21 @@ impl Interp<'_> {
         }
     }
 
-    /// True when `obj` has a `[[Construct]]` (a `Kind::Function` that is not
-    /// an arrow/method, or a proxy whose target is a constructor).
-    ///
-    /// A `Native`/`Host` callable is a built-in function object and has no
-    /// `[[Construct]]` unless it is one of the engine's registered
-    /// constructor-shaped natives (mirrors `builtins::reflect::is_constructor`
-    /// and the `prepare_construct` native seam). An out-of-range bytecode
-    /// index names an engine-installed native, so it is constructible only
-    /// when it maps to one of those ids.
-    pub(crate) fn is_constructor_object(&mut self, obj: Handle<JsObject>) -> bool {
-        match self.heap.get(obj).kind {
-            Kind::Function => {
-                let program = self.heap.get(obj).program_id;
-                let callable = self.heap.get(obj).callable;
-                match callable {
-                    v12_heap::FunctionTarget::Native(_) | v12_heap::FunctionTarget::Host(_) => {
-                        false
-                    }
-                    v12_heap::FunctionTarget::RealmEval(_) => false,
-                    v12_heap::FunctionTarget::Bound(state_h) => {
-                        // A bound function is constructible iff its target is.
-                        let inner = self.heap.get(state_h).elements[0].as_object();
-                        inner.is_some_and(|t| self.is_constructor_object(t))
-                    }
-                    v12_heap::FunctionTarget::Bytecode(idx) => {
-                        let funcs = self.functions_for_program(program);
-                        if (idx as usize) < funcs.len() {
-                            self.bytecode_is_constructor(idx, program)
-                        } else {
-                            // Out-of-range index: an engine native. Only the
-                            // registered constructor-shaped ids qualify.
-                            self.native_constructor_id(idx)
-                        }
-                    }
-                }
-            }
-            Kind::Proxy => {
-                let target = self.heap.get(obj).proxy_target;
-                target.is_some_and(|t| self.is_constructor_object(t))
-            }
-            _ => false,
-        }
+    /// `IsConstructor` (ES 7.2.4): whether `obj` has `[[Construct]]`, which
+    /// is fixed when the object is created (see `JsObject::FLAG_CONSTRUCTOR`).
+    pub(crate) fn is_constructor_object(&self, obj: Handle<JsObject>) -> bool {
+        self.heap.get(obj).is_constructor()
     }
 
     /// `IsConstructor(C)` for `NewPromiseCapability` (spec 27.5.1.5 step 1,
     /// 27.2.4.1 step 6 / 27.2.4.2 step 3), which is what makes
     /// `Promise.all.call(eval, …)` throw a `TypeError` before the iterator is
-    /// touched, and what keeps a derived `super(executor)`'s pre-made instance
-    /// out of the gate in `run_promise_construct`.
-    ///
-    /// Now just [`Self::is_constructor_object`]: `%Promise%` is wired as an
-    /// out-of-range bytecode index ([`NativeId::PromiseConstruct`]) and
-    /// [`Self::native_constructor_id`] names it, so the shared oracle answers
-    /// for it and `Reflect.construct(Promise, …)` reaches the construct path as
-    /// well. A proxy in front of the constructor inherits the answer, per
-    /// `IsConstructor` on a proxy exotic object (and a proxy with no target
-    /// answers false there too, revoked or not).
+    /// touched.
     fn is_capability_constructor(&mut self, v: JsValue) -> bool {
         let Some(obj) = v.as_object() else {
             return false;
         };
         self.is_constructor_object(obj)
-    }
-
-    /// `IsConstructor` (ES 10.1.14) for a function whose callable is an
-    /// in-range `FunctionTarget::Bytecode(idx)`.
-    ///
-    /// One predicate, two callers that must not disagree:
-    /// [`Self::is_constructor_object`] (the `instanceof`/`Reflect.construct`/
-    /// proxy oracle) and [`Self::prepare_construct`] (the `new` opcode). When
-    /// these were two independent expressions they did disagree — the oracle
-    /// consulted `is_arrow` and the `new` path consulted nothing at all — and
-    /// `new (arrow.bind())` was the visible symptom: the oracle said "not a
-    /// constructor", the opcode disagreed, and the bound forward built an
-    /// instance.
-    ///
-    /// `is_arrow`, `is_generator` and `is_async` are the three source-level
-    /// constructs ES 10.1.14 excludes from `[[Construct]]`. **Methods are also
-    /// non-constructible and are not covered**: v12's `FunctionBytecode` has no
-    /// `is_method` flag, so `new o.m()` still succeeds. Closing that needs a
-    /// field in `crates/v12-bytecode` and a set in
-    /// `crates/v12-bccompiler` — neither is this lane's to touch.
-    fn bytecode_is_constructor(&mut self, idx: u32, program: u32) -> bool {
-        self.functions_for_program(program)
-            .get(idx as usize)
-            .is_some_and(|f| !f.is_arrow && !f.is_generator && !f.is_async)
-    }
-
-    /// True when a bytecode-table index names one of the engine's
-    /// constructor-shaped natives (`new Object/Array/Boolean/Error/Promise/…`).
-    ///
-    /// Delegates to [`v12_native::native_is_constructor_id`], which
-    /// `Ctx::is_constructor` also uses: the interpreter can answer
-    /// `IsConstructor` exactly, but an engine-side check cannot see the program
-    /// table, so the native half of the question has one shared answer.
-    fn native_constructor_id(&self, idx: u32) -> bool {
-        NativeId::try_from(idx).is_ok_and(v12_native::native_is_constructor_id)
     }
 
     /// `Construct(target, args, new_target)`: the interpreter's construct
@@ -2471,86 +2457,48 @@ impl Interp<'_> {
         if self.heap.get(target).kind != Kind::Function {
             return Err(JSException(self.type_error("target is not a constructor")));
         }
-        // A native/host constructor invoked without a parked `Construct`
-        // opcode: call its handler directly and take its object result (the
-        // engine's native constructors return the fresh instance). Mirrors
-        // `prepare_construct`'s `Native`/`Host` arms.
+        // A native/host constructor runs its handler directly (receiver: the
+        // constructor) and its object result takes `new_target.prototype`;
+        // bytecode goes through the dispatch loop's construct entry with a
+        // nested run to completion.
         match self.heap.get(target).callable {
             v12_heap::FunctionTarget::Native(f) => {
                 self.gc_protect();
-                return f(self.heap, target_v, args).map_err(JSException);
+                let v = f(self.heap, target_v, args).map_err(JSException)?;
+                return self.adopt_new_target_prototype(v, target_v, new_target);
             }
             v12_heap::FunctionTarget::Host(c) => {
                 self.gc_protect();
-                return c.call(self.heap, target_v, args).map_err(JSException);
+                let v = c.call(self.heap, target_v, args).map_err(JSException)?;
+                return self.adopt_new_target_prototype(v, target_v, new_target);
             }
             _ => {}
         }
-        let program = self.heap.get(target).program_id;
-        let idx = match self.heap.get(target).callable {
-            v12_heap::FunctionTarget::Bytecode(i) => i,
-            v12_heap::FunctionTarget::RealmEval(_) => {
-                return Err(JSException(self.type_error("target is not a constructor")));
-            }
-            v12_heap::FunctionTarget::Bound(_) => unreachable!("handled above"),
-            v12_heap::FunctionTarget::Native(_) | v12_heap::FunctionTarget::Host(_) => {
-                unreachable!("handled above")
-            }
-        };
-        if (idx as usize) >= self.functions_for_program(program).len() {
-            // Out-of-range bytecode index: an engine-installed native
-            // constructor (Boolean/Error/…). Route through the registry.
-            // `onFulfilledElement` is the one native here with no
-            // `[[Construct]]` at all (see `prepare_construct`).
-            if idx == u32::from(NativeId::PromiseCombinatorElement) {
-                return Err(JSException(self.type_error("not a constructor")));
-            }
-            let id = self.native_id_for(idx)?;
-            if v12_native::is_non_constructible(id) {
-                return Err(JSException(self.type_error("not a constructor")));
-            }
-            return self.dispatch_native(id, target_v, args);
-        }
-        // Instance `[[Prototype]]` = `new_target.prototype` (ES 10.2.2 step 9).
-        // The read goes through `[[Get]]` so a proxy new_target resolves its
-        // own `get` trap; a non-object `new_target` falls back to the target.
-        let nt = new_target.as_object().unwrap_or(target);
-        let proto = {
-            let proto_key_v = self.new_temp_key("prototype");
-            let pv = self.get_property(0, 0, JsValue::object(nt), proto_key_v)?;
-            pv.as_object().or_else(|| self.object_prototype())
-        };
-        // Lay out `[callee][instance][args…]` and reuse `prepare_construct`.
+        // Lay out `[callee][this][args…]` above the live stack and reuse the
+        // frame-pushing construct entry.
         let base = self.stack.len();
         self.stack.push(target_v);
         self.stack.push(JsValue::undefined());
         self.stack.extend_from_slice(args);
         let caller_max_regs =
             u16::try_from(self.stack.len() - base).expect("arguments fit a frame window");
-        let argc = u16::try_from(args.len()).expect("argument count fits u16");
         let saved = self.stop_at_frames;
         self.stop_at_frames = Some(self.frames.len());
         let boundary = self.stop_at_frames;
         self.top_result = None;
-        let outcome = self.prepare_construct(base, caller_max_regs, 0, argc);
+        let outcome = self.prepare_construct_values(base, caller_max_regs, target_v, args, new_target);
         let result = match outcome {
             Ok(CallOutcome::Pushed) => {
-                // The instance prepared by `prepare_construct` sits in r0 of
-                // the new frame. The nested `complete_frame` boundary exit
-                // cannot apply the construct return-value adjustment (there is
-                // no parked `Construct` header), so capture it here and apply
-                // ES 10.2.2 step 12 below.
+                // The nested `complete_frame` boundary exit cannot apply the
+                // construct return-value adjustment (there is no parked
+                // `Construct` header), so capture `this` from r0 and apply
+                // ES 10.2.2 step 12 below. A derived constructor's own
+                // `DerivedResult` already returned an object.
                 let instance_v = self
                     .frames
                     .last()
                     .and_then(|f| self.stack.get(f.base).copied())
                     .unwrap_or(JsValue::undefined());
-                // Override the instance prototype to `new_target.prototype`.
-                if let Some(primary) = proto
-                    && let Some(inst) = instance_v.as_object()
-                {
-                    self.heap.get_mut(inst).prototype = Some(primary);
-                }
                 let exec = self.execute();
                 let returned = match exec {
                     Ok(()) => self.top_result.take(),
@@ -4278,14 +4226,9 @@ impl Interp<'_> {
         // is also step 1's `NewTarget is undefined` in practice: a plain call's
         // receiver never carries the construct target. A proxy in front of
         // `Promise` is honored, as `IsConstructor` on a proxy exotic object
-        // requires.
-        //
-        // The gate is skipped when the receiver is already the instance — a
-        // derived constructor's `super(executor)`, which is a `Call` with the
-        // pre-made `this`, not a `Construct`. The engine's
-        // `promise_capability` initializes that object in place rather than
-        // allocating a second one, so this arm returns the receiver itself.
-        if !self.promise_instance_receiver(this_v) && !self.is_capability_constructor(this_v) {
+        // requires. A subclass's `super(executor)` is a real `Construct`, so
+        // it arrives here with the constructor as receiver like `new` does.
+        if !self.is_capability_constructor(this_v) {
             return Err(JSException(
                 self.type_error("Promise constructor requires 'new'"),
             ));
@@ -4353,25 +4296,6 @@ impl Interp<'_> {
             .map_err(|t| JSException::from_throw(self.heap, t))
     }
 
-    /// True when `this_v` is the object a derived constructor's
-    /// `super(executor)` passes — a `Call`, not a `Construct`, so the receiver
-    /// is the pre-made instance rather than the constructor.
-    ///
-    /// A deliberately shallow mirror of the engine's `in_place_instance`
-    /// (which is the authority on whether the receiver really is initialized in
-    /// place): both are structural header reads, and the two agreeing is what
-    /// keeps the `IsConstructor` gate from rejecting a legitimate subclass
-    /// while still rejecting `Promise.call({})`-shaped nonsense from arm A's
-    /// perspective. A disagreement would surface as a `TypeError`, never as a
-    /// mis-shaped object.
-    fn promise_instance_receiver(&self, this_v: JsValue) -> bool {
-        this_v.as_object().is_some_and(|obj| {
-            !matches!(
-                self.heap.get(obj).kind,
-                Kind::Function | Kind::Proxy | Kind::Promise
-            )
-        })
-    }
 
     /// The `SpeciesConstructor(O, defaultConstructor)` sequence of spec
     /// 27.5.5.4 step 3, inlined.

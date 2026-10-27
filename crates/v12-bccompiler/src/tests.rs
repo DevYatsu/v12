@@ -1914,15 +1914,16 @@ fn object_method_super_reads_the_receiver_prototype() {
             .any(|i| i.op() == Some(Opcode::GetPrototype)),
         "object-method `super.x` must start at `[[GetPrototypeOf]](this)`: {body}"
     );
-    // A class method keeps the constructor-based lowering instead.
+    // A class method's HomeObject is `C.prototype`, held in the class scope:
+    // the lowering reads that slot, then takes its `[[GetPrototypeOf]]`.
     let fb = compile_source_with_strings("class C { m() { return super.x; } }").unwrap();
     let body = fb.0.functions.last().expect("method unit");
+    let ops: Vec<_> = body.instrs.iter().filter_map(|i| i.op()).collect();
+    let home = ops.iter().position(|o| *o == Opcode::GetEnvSlot);
+    let proto = ops.iter().position(|o| *o == Opcode::GetPrototype);
     assert!(
-        !body
-            .instrs
-            .iter()
-            .any(|i| i.op() == Some(Opcode::GetPrototype)),
-        "class-method `super.x` must keep resolving through the constructor: {body}"
+        matches!((home, proto), (Some(h), Some(p)) if h < p),
+        "class-method `super.x` must start at `[[GetPrototypeOf]](HomeObject)`: {body}"
     );
 }
 
@@ -2941,7 +2942,7 @@ fn with_unit_ctx<R>(src: &str, f: impl FnOnce(&mut FnCtx<'_, '_, '_, '_>) -> R) 
         emit_eval_metadata: false,
         is_eval_payload: false,
         eval_var_target: Default::default(),
-        private_scopes: Vec::new(),
+        class_scopes: Vec::new(),
         live_env_bias: 0,
     };
     let mut cx = FnCtx::new(&mut comp, 0);
@@ -2968,7 +2969,7 @@ fn with_unit_ctx_owned<R>(src: &str, f: impl FnOnce(FnCtx<'_, '_, '_, '_>) -> R)
         emit_eval_metadata: false,
         is_eval_payload: false,
         eval_var_target: Default::default(),
-        private_scopes: Vec::new(),
+        class_scopes: Vec::new(),
         live_env_bias: 0,
     };
     f(FnCtx::new(&mut comp, 0))

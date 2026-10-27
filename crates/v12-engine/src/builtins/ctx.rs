@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use v12_heap::{Handle, Heap, JsObject, JsValue};
-use v12_native::{NativeId, Throw};
+use v12_native::Throw;
 
 use super::helpers;
 use crate::job_queue::Job;
@@ -282,65 +282,10 @@ impl<'a> Ctx<'a> {
         Ok(obj)
     }
 
-    /// ES `IsConstructor(v)` as far as the heap alone can answer it.
-    ///
-    /// Needed by the two spec algorithms that gate on it from inside a
-    /// `&mut Ctx` body — `NewPromiseCapability` (27.2.3.1 step 1, so
-    /// `Promise.allKeyed.call(eval)` is a `TypeError`) and `SpeciesConstructor`
-    /// (7.3.24 step 8, so a `@@species` of `true` is a `TypeError`).
-    ///
-    /// **This over-approximates, in one direction only.** A `Kind::Function`
-    /// carries a `FunctionTarget::Bytecode(idx)`, and `idx` is an index into
-    /// *either* the owning program's function table (a real closure) *or* the
-    /// `NativeId` space (an engine native) — the two number spaces overlap, and
-    /// telling them apart needs the per-program table that only the interpreter
-    /// has (`Interp::is_constructor_object` makes the exact call by comparing
-    /// against `functions_for_program(len)`). So a bytecode target is reported
-    /// **constructible** unless it is on the explicit
-    /// [`v12_native::is_non_constructible`] deny-list. The error is always a
-    /// *missing* `TypeError` for a non-constructor static used as a receiver
-    /// (`Promise.allKeyed.call(Promise.all)`), never a spurious one for
-    /// something constructible — which is why `ctx-ctor-constructed.js`, whose
-    /// receiver is an ordinary function declaration, is answered correctly.
-    ///
-    /// The arms that *are* exact are the ones the corpus actually exercises: a
-    /// realm-bound `eval`, a `Host` closure and a bare `Native` function are all
-    /// reported non-constructible, and a `Bound` function forwards to its
-    /// target.
+    /// `IsConstructor` (ES 7.2.4): whether `v` is an object with
+    /// `[[Construct]]` (see `JsObject::FLAG_CONSTRUCTOR`).
     pub fn is_constructor(&self, v: JsValue) -> bool {
-        let Some(obj) = v.as_object() else {
-            return false;
-        };
-        let js = self.heap.get(obj);
-        match js.kind {
-            v12_heap::Kind::Function => match js.callable {
-                // A host closure and a bare `Native` function have no
-                // `[[Construct]]`; a realm-bound `eval` is spec-explicitly not
-                // a constructor.
-                v12_heap::FunctionTarget::Native(_)
-                | v12_heap::FunctionTarget::Host(_)
-                | v12_heap::FunctionTarget::RealmEval(_) => false,
-                // A bound function is constructible iff its target is.
-                v12_heap::FunctionTarget::Bound(state) => self
-                    .heap
-                    .get(state)
-                    .elements
-                    .first()
-                    .copied()
-                    .is_some_and(|target| self.is_constructor(target)),
-                // Constructible unless it is on the deny-list. See the doc
-                // comment: this arm cannot tell a closure from a native.
-                v12_heap::FunctionTarget::Bytecode(idx) => {
-                    !NativeId::try_from(idx).is_ok_and(v12_native::is_non_constructible)
-                }
-            },
-            v12_heap::Kind::Proxy => self
-                .heap
-                .get(obj)
-                .proxy_target
-                .is_some_and(|t| self.is_constructor(JsValue::object(t))),
-            _ => false,
-        }
+        v.as_object().is_some_and(|o| self.heap.get(o).is_constructor())
     }
 
     /// ES ToNumber subset: Smi/double pass through; `true`→1.0,
@@ -940,6 +885,7 @@ let getter = self.alloc_obj(v12_heap::JsObject {
     /// expected rooted by the caller (realm roots hold them).
     pub fn install_ctor_link(&mut self, ctor: Handle<JsObject>, proto: Handle<JsObject>) {
         use v12_heap::{PropKey, V12Str};
+        self.heap.get_mut(ctor).flags |= JsObject::FLAG_CONSTRUCTOR;
         self.heap.get_mut(ctor).prototype = Some(proto);
         // Idempotent: the Promise path wires before the generic loop, so
         // skip the `prototype` install when already present.

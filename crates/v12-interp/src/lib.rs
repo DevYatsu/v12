@@ -872,12 +872,15 @@ impl<'a> Interp<'a> {
         env: Option<Handle<JsObject>>,
     ) -> Handle<JsObject> {
         let funcs = self.functions_for_program(program_id);
-        let (is_arrow, expected_args, function_name) = funcs
+        let (is_constructor, is_generator, expected_args, function_name) = funcs
             .get(fn_idx as usize)
-            .map(|f| (f.is_arrow, f.expected_args, f.function_name.clone()))
-            .unwrap_or((false, 0, None));
+            .map(|f| (f.is_constructor, f.is_generator, f.expected_args, f.function_name.clone()))
+            .unwrap_or((false, false, 0, None));
         let mut obj = JsObject::function(v12_heap::FunctionTarget::Bytecode(fn_idx), env);
         obj.program_id = program_id;
+        if is_constructor {
+            obj.flags |= JsObject::FLAG_CONSTRUCTOR;
+        }
         let h = self.heap.alloc(obj);
         // ES 10.2.4: `[[Prototype]]` is `%Function.prototype%`. Set before
         // any property install so `install_function_length` / `name` /
@@ -906,7 +909,10 @@ impl<'a> Interp<'a> {
             debug_assert!(installed.is_ok(), "name install cannot fail");
             self.stack.truncate(frame);
         }
-        if !is_arrow {
+        // Constructors own a `prototype` (ES 10.2.5 MakeConstructor); so do
+        // generators, whose instances inherit from it (15.5.4). Arrows,
+        // methods, accessors and async functions have none.
+        if is_constructor || is_generator {
             // Park the fresh closure on the stack: materialization allocates
             // (prototype object, shape transitions) and the collector can run
             // before the `Closure` arm stores `h` into its register.
