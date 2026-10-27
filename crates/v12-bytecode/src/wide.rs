@@ -38,6 +38,10 @@ use crate::{BytecodeError, Instr, Opcode};
 /// | `NewEnvironmentW` | 0               | `depth << 16 \| slots`                               |
 /// | `SetPropertyR`    | 0               | `base << 16 \| key`, `value << 16 \| receiver`       |
 /// | `GetSuperW`       | 0               | `dst << 16 \| base`, `key << 16 \| receiver`          |
+/// | `NewPrivateNameW` | 0               | `dst << 16 \| kind`, `description`                  |
+/// | `SetPrivateMethodW` | 0             | `name << 16 \| value`, `slot << 16`                 |
+/// | `DefinePrivateW`  | 0               | `obj << 16 \| value`, `name << 16`                  |
+/// | `HasPrivateW`     | 0               | `dst << 16 \| obj`, `name << 16`                    |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WideOp {
     LoadConstW {
@@ -110,29 +114,37 @@ pub enum WideOp {
         depth: u16,
         slots: u16,
     },
-    GetPrivateW {
+    /// `dst = fresh Private Name` (ES §6.2.12): one per `#name` per class
+    /// *evaluation*, so two evaluations of the same class body never share
+    /// a name. `kind` is a [`private_kind`] constant; `description` is the
+    /// interned `#name` text, used only for error messages.
+    NewPrivateNameW {
         dst: u16,
-        obj: u16,
-        class_id: u32,
-        name_id: u32,
+        kind: u16,
+        description: u32,
     },
-    SetPrivateW {
-        obj: u16,
-        class_id: u32,
-        name_id: u32,
+    /// Attaches a private method (`slot` 0) or accessor half (`slot` 0 =
+    /// getter, 1 = setter) to the Private Name in `name`. Methods are shared
+    /// by every instance, so the function lives on the name, not the object.
+    SetPrivateMethodW {
+        name: u16,
         value: u16,
+        slot: u16,
     },
+    /// `PrivateFieldAdd` / `PrivateMethodOrAccessorAdd` (ES §7.3.31–32):
+    /// adds the Private Name in `name` to `obj`, throwing `TypeError` when it
+    /// is already present. `value` is the field value (ignored for methods
+    /// and accessors).
     DefinePrivateW {
         obj: u16,
-        class_id: u32,
-        name_id: u32,
+        name: u16,
         value: u16,
     },
+    /// `dst = #name in obj` (ES §13.10.1): `TypeError` for a non-object.
     HasPrivateW {
         dst: u16,
         obj: u16,
-        class_id: u32,
-        name_id: u32,
+        name: u16,
     },
     /// `base[key] = value` with an explicit receiver — ES `base.[[Set]](key,
     /// value, receiver)`. Narrow `SetProperty` always uses `base` as the
@@ -178,8 +190,8 @@ impl WideOp {
     pub const DISC_CLOSURE_W: u32 = 8;
     pub const DISC_NEW_ENVIRONMENT_W: u32 = 9;
     pub const DISC_CONSTRUCT_W: u32 = 10;
-    pub const DISC_GET_PRIVATE_W: u32 = 11;
-    pub const DISC_SET_PRIVATE_W: u32 = 12;
+    pub const DISC_NEW_PRIVATE_NAME_W: u32 = 11;
+    pub const DISC_SET_PRIVATE_METHOD_W: u32 = 12;
     pub const DISC_DEFINE_PRIVATE_W: u32 = 13;
     pub const DISC_HAS_PRIVATE_W: u32 = 14;
     pub const DISC_SET_PROPERTY_R: u32 = 15;
@@ -263,49 +275,29 @@ impl WideOp {
                 hdr(0, Self::DISC_NEW_ENVIRONMENT_W),
                 Instr(pack_hi_lo(depth, slots)),
             ],
-            Self::GetPrivateW {
+            Self::NewPrivateNameW {
                 dst,
-                obj,
-                class_id,
-                name_id,
+                kind,
+                description,
             } => vec![
-                hdr(0, Self::DISC_GET_PRIVATE_W),
-                Instr(pack_hi_lo(dst, obj)),
-                Instr(class_id),
-                Instr(name_id),
+                hdr(0, Self::DISC_NEW_PRIVATE_NAME_W),
+                Instr(pack_hi_lo(dst, kind)),
+                Instr(description),
             ],
-            Self::SetPrivateW {
-                obj,
-                class_id,
-                name_id,
-                value,
-            } => vec![
-                hdr(0, Self::DISC_SET_PRIVATE_W),
-                Instr(pack_hi_lo(obj, value)),
-                Instr(class_id),
-                Instr(name_id),
+            Self::SetPrivateMethodW { name, value, slot } => vec![
+                hdr(0, Self::DISC_SET_PRIVATE_METHOD_W),
+                Instr(pack_hi_lo(name, value)),
+                Instr(pack_hi_lo(slot, 0)),
             ],
-            Self::DefinePrivateW {
-                obj,
-                class_id,
-                name_id,
-                value,
-            } => vec![
+            Self::DefinePrivateW { obj, name, value } => vec![
                 hdr(0, Self::DISC_DEFINE_PRIVATE_W),
                 Instr(pack_hi_lo(obj, value)),
-                Instr(class_id),
-                Instr(name_id),
+                Instr(pack_hi_lo(name, 0)),
             ],
-            Self::HasPrivateW {
-                dst,
-                obj,
-                class_id,
-                name_id,
-            } => vec![
+            Self::HasPrivateW { dst, obj, name } => vec![
                 hdr(0, Self::DISC_HAS_PRIVATE_W),
                 Instr(pack_hi_lo(dst, obj)),
-                Instr(class_id),
-                Instr(name_id),
+                Instr(pack_hi_lo(name, 0)),
             ],
             Self::SetPropertyR {
                 base,
@@ -435,61 +427,32 @@ impl WideOp {
                 let (depth, slots) = unpack_hi_lo(payload(1)?);
                 Ok((Self::NewEnvironmentW { depth, slots }, 2))
             }
-            Self::DISC_GET_PRIVATE_W => {
-                let (dst, obj) = unpack_hi_lo(payload(1)?);
-                let class_id = payload(2)?;
-                let name_id = payload(3)?;
+            Self::DISC_NEW_PRIVATE_NAME_W => {
+                let (dst, kind) = unpack_hi_lo(payload(1)?);
+                let description = payload(2)?;
                 Ok((
-                    Self::GetPrivateW {
+                    Self::NewPrivateNameW {
                         dst,
-                        obj,
-                        class_id,
-                        name_id,
+                        kind,
+                        description,
                     },
-                    4,
+                    3,
                 ))
             }
-            Self::DISC_SET_PRIVATE_W => {
-                let (obj, value) = unpack_hi_lo(payload(1)?);
-                let class_id = payload(2)?;
-                let name_id = payload(3)?;
-                Ok((
-                    Self::SetPrivateW {
-                        obj,
-                        class_id,
-                        name_id,
-                        value,
-                    },
-                    4,
-                ))
+            Self::DISC_SET_PRIVATE_METHOD_W => {
+                let (name, value) = unpack_hi_lo(payload(1)?);
+                let (slot, _) = unpack_hi_lo(payload(2)?);
+                Ok((Self::SetPrivateMethodW { name, value, slot }, 3))
             }
             Self::DISC_DEFINE_PRIVATE_W => {
                 let (obj, value) = unpack_hi_lo(payload(1)?);
-                let class_id = payload(2)?;
-                let name_id = payload(3)?;
-                Ok((
-                    Self::DefinePrivateW {
-                        obj,
-                        class_id,
-                        name_id,
-                        value,
-                    },
-                    4,
-                ))
+                let (name, _) = unpack_hi_lo(payload(2)?);
+                Ok((Self::DefinePrivateW { obj, name, value }, 3))
             }
             Self::DISC_HAS_PRIVATE_W => {
                 let (dst, obj) = unpack_hi_lo(payload(1)?);
-                let class_id = payload(2)?;
-                let name_id = payload(3)?;
-                Ok((
-                    Self::HasPrivateW {
-                        dst,
-                        obj,
-                        class_id,
-                        name_id,
-                    },
-                    4,
-                ))
+                let (name, _) = unpack_hi_lo(payload(2)?);
+                Ok((Self::HasPrivateW { dst, obj, name }, 3))
             }
             Self::DISC_SET_PROPERTY_R => {
                 let (base, key) = unpack_hi_lo(payload(1)?);
@@ -562,13 +525,20 @@ impl WideOp {
             }
             Self::RegExt { .. } | Self::NewEnvironmentW { .. } => {}
             Self::ClosureW { dst, .. } => f("dst", dst),
-            Self::GetPrivateW { dst, obj, .. } | Self::HasPrivateW { dst, obj, .. } => {
+            Self::NewPrivateNameW { dst, .. } => f("dst", dst),
+            Self::SetPrivateMethodW { name, value, .. } => {
+                f("name", name);
+                f("value", value);
+            }
+            Self::DefinePrivateW { obj, name, value } => {
+                f("obj", obj);
+                f("name", name);
+                f("value", value);
+            }
+            Self::HasPrivateW { dst, obj, name } => {
                 f("dst", dst);
                 f("obj", obj);
-            }
-            Self::SetPrivateW { obj, value, .. } | Self::DefinePrivateW { obj, value, .. } => {
-                f("obj", obj);
-                f("value", value);
+                f("name", name);
             }
             Self::SetPropertyR {
                 base,
@@ -664,42 +634,23 @@ impl fmt::Display for WideOp {
             Self::NewEnvironmentW { depth, slots } => {
                 write!(f, "new_environment_w depth={depth}, slots={slots}")
             }
-            Self::GetPrivateW {
+            Self::NewPrivateNameW {
                 dst,
-                obj,
-                class_id,
-                name_id,
+                kind,
+                description,
             } => write!(
                 f,
-                "get_private_w r{dst}, r{obj}, class={class_id} name={name_id}"
+                "new_private_name_w r{dst}, kind={kind} desc={description}"
             ),
-            Self::SetPrivateW {
-                obj,
-                class_id,
-                name_id,
-                value,
-            } => write!(
-                f,
-                "set_private_w r{obj}, class={class_id} name={name_id} r{value}"
-            ),
-            Self::DefinePrivateW {
-                obj,
-                class_id,
-                name_id,
-                value,
-            } => write!(
-                f,
-                "define_private_w r{obj}, class={class_id} name={name_id} r{value}"
-            ),
-            Self::HasPrivateW {
-                dst,
-                obj,
-                class_id,
-                name_id,
-            } => write!(
-                f,
-                "has_private_w r{dst}, r{obj}, class={class_id} name={name_id}"
-            ),
+            Self::SetPrivateMethodW { name, value, slot } => {
+                write!(f, "set_private_method_w r{name}, r{value}, slot={slot}")
+            }
+            Self::DefinePrivateW { obj, name, value } => {
+                write!(f, "define_private_w r{obj}, r{name}, r{value}")
+            }
+            Self::HasPrivateW { dst, obj, name } => {
+                write!(f, "has_private_w r{dst}, r{obj}, r{name}")
+            }
             Self::SetPropertyR {
                 base,
                 key,

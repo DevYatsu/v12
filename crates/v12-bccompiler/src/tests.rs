@@ -2941,6 +2941,8 @@ fn with_unit_ctx<R>(src: &str, f: impl FnOnce(&mut FnCtx<'_, '_, '_, '_>) -> R) 
         emit_eval_metadata: false,
         is_eval_payload: false,
         eval_var_target: Default::default(),
+        private_scopes: Vec::new(),
+        live_env_bias: 0,
     };
     let mut cx = FnCtx::new(&mut comp, 0);
     f(&mut cx)
@@ -2966,6 +2968,8 @@ fn with_unit_ctx_owned<R>(src: &str, f: impl FnOnce(FnCtx<'_, '_, '_, '_>) -> R)
         emit_eval_metadata: false,
         is_eval_payload: false,
         eval_var_target: Default::default(),
+        private_scopes: Vec::new(),
+        live_env_bias: 0,
     };
     f(FnCtx::new(&mut comp, 0))
 }

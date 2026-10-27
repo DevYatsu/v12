@@ -210,8 +210,16 @@ pub struct JsObject {
     /// registry holding serials lives on the heap. Not on the shape-lookup
     /// hot path — `shape` is the shape binding.
     pub validity_cell: ValidityCellId,
-    pub private_brand: Option<u32>,
-    pub private_fields: Option<Box<rustc_hash::FxHashMap<u32, crate::JsValue>>>,
+    /// `Some` exactly when this object *is* a Private Name (ES §6.2.12): a
+    /// hidden heap value created once per `#name` per class evaluation and
+    /// never reachable from script. Its handle is the name's identity.
+    pub private_name: Option<Box<PrivateName>>,
+    /// The object's `[[PrivateElements]]`: one entry per Private Name added
+    /// to it. A field entry holds the field's value; a method or accessor
+    /// entry holds `undefined` (the function lives on the [`PrivateName`]).
+    /// A short list, not a map: classes declare few private names, and the
+    /// key handles must be traced, which a `Vec` makes direct.
+    pub private_elements: Option<Box<Vec<(Handle<JsObject>, crate::JsValue)>>>,
     /// Named-property dictionary rung (`None` = shape-backed mode). Past
     /// the spill threshold, overflow properties live here instead of
     /// forking ever-larger shapes; reads stay O(1) via the map while the
@@ -233,6 +241,28 @@ pub struct JsObject {
     pub arguments_callee: Option<crate::JsValue>,
     /// Strict arguments objects expose an own throwing `callee` accessor.
     pub arguments_strict: bool,
+}
+
+/// What a Private Name names (ES §6.2.10 `PrivateElement.[[Kind]]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivateNameKind {
+    Field,
+    Method,
+    Accessor,
+}
+
+/// The payload of a Private Name object (see [`JsObject::private_name`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrivateName {
+    pub kind: PrivateNameKind,
+    /// The `#name` source text, for error messages only — identity is the
+    /// handle, never this text.
+    pub description: Box<str>,
+    /// The method function (`Method`) or the getter (`Accessor`);
+    /// `undefined` when absent.
+    pub method: crate::JsValue,
+    /// The setter (`Accessor`); `undefined` when absent.
+    pub setter: crate::JsValue,
 }
 
 impl Default for JsObject {
@@ -258,8 +288,8 @@ impl Default for JsObject {
             binding_cell: None,
             module_namespace: None,
             validity_cell: ValidityCellId::NONE,
-            private_brand: None,
-            private_fields: None,
+            private_name: None,
+            private_elements: None,
             dictionary: None,
             dict_seq: 0,
             arguments_mapped: None,
@@ -1011,8 +1041,13 @@ impl Trace for JsObject {
         // The callable target can itself carry heap handles (`RealmEval`
         // global, `Bound` state object); trace it so those stay reachable.
         self.callable.trace(sink);
-        if let Some(m) = &self.private_fields {
-            for v in m.values() {
+        if let Some(name) = &self.private_name {
+            name.method.trace(sink);
+            name.setter.trace(sink);
+        }
+        if let Some(elements) = &self.private_elements {
+            for (name, v) in elements.iter() {
+                sink.mark_object(*name);
                 v.trace(sink);
             }
         }

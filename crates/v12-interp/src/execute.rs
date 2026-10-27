@@ -376,44 +376,78 @@ impl Interp<'_> {
                         WideOp::RegExt { .. } => {
                             panic!("corrupt bytecode: bare RegExt reached dispatch")
                         }
-                        WideOp::GetPrivateW {
+                        WideOp::NewPrivateNameW {
                             dst,
-                            obj,
-                            class_id,
-                            name_id,
+                            kind,
+                            description,
                         } => {
-                            let obj_v = self.stack[base + usize::from(obj)];
-                            let v = attempt!(self.private_get(obj_v, class_id, name_id));
-                            self.stack[base + usize::from(dst)] = v;
+                            let kind = match kind {
+                                v12_bytecode::private_kind::METHOD => {
+                                    v12_heap::PrivateNameKind::Method
+                                }
+                                v12_bytecode::private_kind::ACCESSOR => {
+                                    v12_heap::PrivateNameKind::Accessor
+                                }
+                                _ => v12_heap::PrivateNameKind::Field,
+                            };
+                            let description: Box<str> = self
+                                .strings_for_program(program)
+                                .get(description as usize)
+                                .map(|d| d.as_str().into())
+                                .unwrap_or_default();
+                            self.gc_protect();
+                            let h = self.heap.alloc(JsObject::default());
+                            self.heap.get_mut(h).private_name =
+                                Some(Box::new(v12_heap::PrivateName {
+                                    kind,
+                                    description,
+                                    method: v12_heap::JsValue::undefined(),
+                                    setter: v12_heap::JsValue::undefined(),
+                                }));
+                            self.stack[base + usize::from(dst)] = v12_heap::JsValue::object(h);
                         }
-                        WideOp::SetPrivateW {
-                            obj,
-                            class_id,
-                            name_id,
-                            value,
-                        } => {
-                            let obj_v = self.stack[base + usize::from(obj)];
+                        WideOp::SetPrivateMethodW { name, value, slot } => {
+                            let name_v = self.stack[base + usize::from(name)];
                             let val = self.stack[base + usize::from(value)];
-                            attempt!(self.private_set(obj_v, class_id, name_id, val));
+                            let Some(name_h) = self.private_name_of(name_v) else {
+                                let exc = self.error_value_kind(
+                                    "InternalError",
+                                    "SetPrivateMethodW operand is not a Private Name",
+                                );
+                                throw_js!(exc);
+                            };
+                            if let Some(data) = self.heap.get_mut(name_h).private_name.as_mut() {
+                                if slot == 0 {
+                                    data.method = val;
+                                } else {
+                                    data.setter = val;
+                                }
+                            }
                         }
-                        WideOp::DefinePrivateW {
-                            obj,
-                            class_id,
-                            name_id,
-                            value,
-                        } => {
+                        WideOp::DefinePrivateW { obj, name, value } => {
                             let obj_v = self.stack[base + usize::from(obj)];
+                            let name_v = self.stack[base + usize::from(name)];
                             let val = self.stack[base + usize::from(value)];
-                            attempt!(self.private_define(obj_v, class_id, name_id, val));
+                            let Some(name_h) = self.private_name_of(name_v) else {
+                                let exc = self.error_value_kind(
+                                    "InternalError",
+                                    "DefinePrivateW operand is not a Private Name",
+                                );
+                                throw_js!(exc);
+                            };
+                            attempt!(self.private_define(obj_v, name_h, val));
                         }
-                        WideOp::HasPrivateW {
-                            dst,
-                            obj,
-                            class_id,
-                            name_id,
-                        } => {
+                        WideOp::HasPrivateW { dst, obj, name } => {
                             let obj_v = self.stack[base + usize::from(obj)];
-                            let present = self.private_has(obj_v, class_id, name_id);
+                            let name_v = self.stack[base + usize::from(name)];
+                            let Some(name_h) = self.private_name_of(name_v) else {
+                                let exc = self.error_value_kind(
+                                    "InternalError",
+                                    "HasPrivateW operand is not a Private Name",
+                                );
+                                throw_js!(exc);
+                            };
+                            let present = attempt!(self.private_has(obj_v, name_h));
                             self.stack[base + usize::from(dst)] =
                                 v12_heap::JsValue::from_bool(present);
                         }

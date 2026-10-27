@@ -252,7 +252,7 @@ fn known_discriminants_exactly_match_opcode_enum() {
 #[test]
 fn wide_headers_with_unknown_discriminants_error_cleanly() {
     // Discriminants 17.. are unassigned (7..16 name RegExt, ClosureW,
-    // NewEnvironmentW, ConstructW, GetPrivateW, SetPrivateW, DefinePrivateW,
+    // NewEnvironmentW, ConstructW, NewPrivateNameW, SetPrivateMethodW, DefinePrivateW,
     // HasPrivateW, SetPropertyR, GetSuperW).
     for disc in [17u32, 31, 99, 255] {
         let words = [

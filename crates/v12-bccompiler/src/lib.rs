@@ -504,6 +504,8 @@ fn compile_ast_inner(
         eval_var_target: eval_caller_facts
             .map(|facts| facts.var_target)
             .unwrap_or_default(),
+        private_scopes: Vec::new(),
+        live_env_bias: 0,
     };
     unit::compile_unit(&mut comp, 0, unit::UnitNode::Main(program))?;
     for fb in &comp.functions {
@@ -546,6 +548,8 @@ fn compile_ast_as_module_inner(
         emit_eval_metadata: false,
         is_eval_payload: false,
         eval_var_target: Default::default(),
+        private_scopes: Vec::new(),
+        live_env_bias: 0,
     };
     unit::compile_unit(&mut comp, 0, unit::UnitNode::Main(program))?;
     for fb in &comp.functions {

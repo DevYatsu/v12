@@ -24,20 +24,21 @@ pub enum UnitNode<'a> {
     Method(&'a Function<'a>),
 }
 
-/// Emits the `SetProperty this.<key> = <init>` sequence for every instance
-/// public (non-private) field of `c`, in declaration order (ES
-/// `InitializeInstanceElements` / `DefineField`). A field with no initializer
-/// installs `undefined`. Private fields are handled by the construct-clone
-/// path and are skipped here.
+/// Emits ES `InitializeInstanceElements` for `c` on `this`: the instance
+/// private methods and accessors first, then every instance field in
+/// declaration order (`DefineField`) — `SetProperty this.<key> = <init>` for a
+/// public field, `PrivateFieldAdd` for a private one. A field with no
+/// initializer installs `undefined`.
 pub(crate) fn emit_instance_fields(
     cx: &mut FnCtx<'_, '_, '_, '_>,
     c: &Class<'_>,
 ) -> Result<(), CompileError> {
+    crate::class::emit_instance_private_methods(cx, c)?;
     for el in &c.body.body {
         let oxc_ast::ast::ClassElement::PropertyDefinition(p) = el else {
             continue;
         };
-        if p.r#static || matches!(&p.key, PropertyKey::PrivateIdentifier(_)) {
+        if p.r#static {
             continue;
         }
         let value_reg = if let Some(value) = &p.value {
@@ -48,6 +49,17 @@ pub(crate) fn emit_instance_fields(
             cx.load_undefined(d, p.span);
             d
         };
+        if let PropertyKey::PrivateIdentifier(id) = &p.key {
+            let name = crate::class::load_private_name(cx, &id.name, p.span)?;
+            let words = v12_bytecode::WideOp::DefinePrivateW {
+                obj: crate::model::REG_THIS,
+                name,
+                value: value_reg,
+            }
+            .encode();
+            cx.emit_words(words, p.span);
+            continue;
+        }
         let key_reg = crate::class::property_key_reg(cx, &p.key, p.computed, p.span)?;
         cx.emit_reg3(
             Opcode::SetProperty,
@@ -136,6 +148,22 @@ pub fn compile_unit(
         comp.functions.push(placeholder(Some(hint)));
     }
     let strict = comp.plans.units[idx].is_strict;
+    // The parent is mid-emission at this unit's closure-creation point, so
+    // its live class scopes are exactly the ones this closure will capture.
+    let parent_bias = comp.live_env_bias;
+    comp.plans.units[idx].creation_bias = parent_bias;
+    comp.live_env_bias = 0;
+    let result = compile_unit_body(comp, idx, node, strict);
+    comp.live_env_bias = parent_bias;
+    result
+}
+
+fn compile_unit_body(
+    comp: &mut Compiler<'_, '_>,
+    idx: usize,
+    node: UnitNode<'_>,
+    strict: bool,
+) -> Result<(), CompileError> {
 
     // Named function *expressions* re-create themselves in their prologue so
     // their own name resolves inside every activation (self-recursion).

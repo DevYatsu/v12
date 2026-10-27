@@ -137,8 +137,8 @@ pub use gc::{GcPolicy, Heap, MarkSink, RootSet, Trace, WellKnownSymbol};
 pub use handle::{Handle, HeapSpace, Space};
 pub use object::{
     BindingCellData, DictEntry, GeneratorExt, GeneratorState, HeapExt, IntegrityLevel, JsObject,
-    Kind, ModuleNamespaceRecord, ModuleNamespaceVariant, PromiseExt, PromiseState, V12BigInt,
-    V12Symbol,
+    Kind, ModuleNamespaceRecord, ModuleNamespaceVariant, PrivateName, PrivateNameKind, PromiseExt,
+    PromiseState, V12BigInt, V12Symbol,
 };
 pub use prop_key::PropKey;
 pub use shape::{

@@ -162,8 +162,8 @@ impl<'p> Mini<'p> {
                         | WideOp::CopyObjectRestW { .. }
                         | WideOp::CopyArrayRestW { .. }
                         | WideOp::RegExt { .. }
-                        | WideOp::GetPrivateW { .. }
-                        | WideOp::SetPrivateW { .. }
+                        | WideOp::NewPrivateNameW { .. }
+                        | WideOp::SetPrivateMethodW { .. }
                         | WideOp::DefinePrivateW { .. }
                         | WideOp::HasPrivateW { .. }
                         | WideOp::SetPropertyR { .. }

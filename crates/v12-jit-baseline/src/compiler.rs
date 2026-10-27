@@ -259,8 +259,8 @@ fn build_and_verify_ir(bytecode: &FunctionBytecode) -> Result<Vec<PcMapEntry>, J
                 | WideOp::NewEnvironmentW { .. }
                 | WideOp::ConstructW { .. }
                 | WideOp::RegExt { .. }
-                | WideOp::GetPrivateW { .. }
-                | WideOp::SetPrivateW { .. }
+                | WideOp::NewPrivateNameW { .. }
+                | WideOp::SetPrivateMethodW { .. }
                 | WideOp::DefinePrivateW { .. }
                 | WideOp::HasPrivateW { .. }
                 | WideOp::SetPropertyR { .. }

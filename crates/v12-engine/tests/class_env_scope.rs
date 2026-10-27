@@ -156,3 +156,30 @@ fn closure_created_after_class_captures_the_right_environment() {
         "real"
     );
 }
+
+/// A method closure captures the class scope, so a read of an enclosing
+/// function's binding from inside the method must cross it. The structural
+/// walk counted only units, landing one hop short ("environment slot out of
+/// range"); `UnitPlan::creation_bias` records the scope the closure was
+/// created under.
+#[test]
+fn method_reads_enclosing_binding_across_class_scope() {
+    assert_eq!(
+        eval_display(
+            "function g() { let x = 8; class A extends Object { m() { return x; } } return new A().m(); } g()"
+        ),
+        "8"
+    );
+    assert_eq!(
+        eval_display(
+            "function f() { let x = 7; class A extends Object { m() { return () => x; } } return new A().m()(); } f()"
+        ),
+        "7"
+    );
+    assert_eq!(
+        eval_display(
+            "function p() { let x = 6; class A { #y = 1; m() { return x + this.#y; } } return new A().m(); } p()"
+        ),
+        "7"
+    );
+}

@@ -1429,92 +1429,171 @@ impl<'a> Interp<'a> {
         id
     }
 
-    fn private_get(
+    /// The Private Name `key` denotes, when it is one. Private Names reach
+    /// `GetProperty`/`SetProperty` as ordinary key registers (the compiler
+    /// loads them from the class scope), so every member-expression path —
+    /// calls, compound assignment, update, destructuring targets, optional
+    /// chains — gets private semantics without its own opcode.
+    pub(crate) fn private_name_of(&self, key: crate::JsValue) -> Option<Handle<JsObject>> {
+        let h = key.as_object()?;
+        self.heap.get(h).private_name.is_some().then_some(h)
+    }
+
+    fn private_description(&self, name: Handle<JsObject>) -> String {
+        self.heap
+            .get(name)
+            .private_name
+            .as_ref()
+            .map(|n| n.description.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `PrivateElementFind` (ES §7.3.30): the slot index of `name` in
+    /// `obj`'s `[[PrivateElements]]`.
+    fn private_element_index(&self, obj: Handle<JsObject>, name: Handle<JsObject>) -> Option<usize> {
+        self.heap
+            .get(obj)
+            .private_elements
+            .as_ref()?
+            .iter()
+            .position(|(n, _)| *n == name)
+    }
+
+    /// The object `obj_v` must be to carry `name`, or the brand-check
+    /// `TypeError` every private access shares.
+    fn private_receiver(
         &mut self,
         obj_v: crate::JsValue,
-        class_id: u32,
-        name_id: u32,
-    ) -> Result<crate::JsValue, JSException> {
-        let Some(h) = obj_v.as_object() else {
-            return Err(JSException(self.type_error(
-                "Cannot read private member from an object whose class did not declare it",
-            )));
-        };
-        let o = self.heap.get(h);
-        if o.private_brand != Some(class_id) {
-            return Err(JSException(self.type_error(
-                "Cannot read private member from an object whose class did not declare it",
-            )));
-        }
-        if let Some(m) = &o.private_fields
-            && let Some(v) = m.get(&name_id)
+        name: Handle<JsObject>,
+        verb: &str,
+    ) -> Result<(Handle<JsObject>, usize), JSException> {
+        if let Some(obj) = obj_v.as_object()
+            && let Some(i) = self.private_element_index(obj, name)
         {
-            return Ok(*v);
+            return Ok((obj, i));
         }
-        Ok(crate::JsValue::undefined())
+        let desc = self.private_description(name);
+        Err(JSException(self.type_error(&format!(
+            "Cannot {verb} private member {desc} from an object whose class did not declare it"
+        ))))
     }
-    fn private_has(&self, obj_v: crate::JsValue, class_id: u32, name_id: u32) -> bool {
-        if let Some(h) = obj_v.as_object() {
-            let o = self.heap.get(h);
-            if o.private_brand != Some(class_id) {
-                return false;
-            }
-            if let Some(m) = &o.private_fields {
-                return m.contains_key(&name_id);
-            }
-        }
-        false
+
+    fn private_name_data(&self, name: Handle<JsObject>) -> v12_heap::PrivateName {
+        self.heap
+            .get(name)
+            .private_name
+            .as_deref()
+            .cloned()
+            .unwrap_or(v12_heap::PrivateName {
+                kind: v12_heap::PrivateNameKind::Field,
+                description: "".into(),
+                method: crate::JsValue::undefined(),
+                setter: crate::JsValue::undefined(),
+            })
     }
-    fn private_define(
+
+    /// `PrivateGet` (ES §7.3.33).
+    pub(crate) fn private_get(
         &mut self,
         obj_v: crate::JsValue,
-        class_id: u32,
-        name_id: u32,
-        val: crate::JsValue,
-    ) -> Result<(), JSException> {
-        let Some(h) = obj_v.as_object() else {
-            return Err(JSException(
-                self.type_error("Cannot define private field on non-object"),
-            ));
-        };
-        let o = self.heap.get_mut(h);
-        if o.private_brand.is_none() {
-            o.private_brand = Some(class_id);
+        name: Handle<JsObject>,
+    ) -> Result<crate::JsValue, JSException> {
+        let (obj, i) = self.private_receiver(obj_v, name, "read")?;
+        let data = self.private_name_data(name);
+        match data.kind {
+            v12_heap::PrivateNameKind::Field => Ok(self
+                .heap
+                .get(obj)
+                .private_elements
+                .as_ref()
+                .map_or(crate::JsValue::undefined(), |e| e[i].1)),
+            v12_heap::PrivateNameKind::Method => Ok(data.method),
+            v12_heap::PrivateNameKind::Accessor => {
+                let Some(getter) = data.method.as_object() else {
+                    return Err(JSException(self.type_error(&format!(
+                        "'{}' was defined without a getter",
+                        data.description
+                    ))));
+                };
+                self.call_accessor(getter, obj_v)
+            }
         }
-        if o.private_brand != Some(class_id) {
-            return Err(JSException(self.type_error(
-                "Cannot read private member from an object whose class did not declare it",
-            )));
-        }
-        let m = o
-            .private_fields
-            .get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
-        m.insert(name_id, val);
-        Ok(())
     }
-    fn private_set(
+
+    /// `PrivateSet` (ES §7.3.34).
+    pub(crate) fn private_set(
         &mut self,
         obj_v: crate::JsValue,
-        class_id: u32,
-        name_id: u32,
+        name: Handle<JsObject>,
         val: crate::JsValue,
     ) -> Result<(), JSException> {
-        let Some(h) = obj_v.as_object() else {
+        let (obj, i) = self.private_receiver(obj_v, name, "write")?;
+        let data = self.private_name_data(name);
+        match data.kind {
+            v12_heap::PrivateNameKind::Field => {
+                if let Some(e) = self.heap.get_mut(obj).private_elements.as_mut() {
+                    e[i].1 = val;
+                }
+                Ok(())
+            }
+            v12_heap::PrivateNameKind::Method => Err(JSException(self.type_error(&format!(
+                "Private method '{}' is not writable",
+                data.description
+            )))),
+            v12_heap::PrivateNameKind::Accessor => {
+                let Some(setter) = data.setter.as_object() else {
+                    return Err(JSException(self.type_error(&format!(
+                        "'{}' was defined without a setter",
+                        data.description
+                    ))));
+                };
+                self.call_accessor_with(setter, obj_v, &[val])?;
+                Ok(())
+            }
+        }
+    }
+
+    /// `PrivateFieldAdd` / `PrivateMethodOrAccessorAdd` (ES §7.3.31–32):
+    /// adding a name the object already carries is a `TypeError` — the
+    /// "return override" trick (`class B extends A` whose `A` returns an
+    /// existing object) is how script reaches that state.
+    pub(crate) fn private_define(
+        &mut self,
+        obj_v: crate::JsValue,
+        name: Handle<JsObject>,
+        val: crate::JsValue,
+    ) -> Result<(), JSException> {
+        let Some(obj) = obj_v.as_object() else {
             return Err(JSException(
-                self.type_error("Cannot set private member on non-object"),
+                self.type_error("Cannot define private member on non-object"),
             ));
         };
-        let o = self.heap.get_mut(h);
-        if o.private_brand != Some(class_id) {
-            return Err(JSException(self.type_error(
-                "Cannot read private member from an object whose class did not declare it",
-            )));
+        if self.private_element_index(obj, name).is_some() {
+            let desc = self.private_description(name);
+            return Err(JSException(self.type_error(&format!(
+                "Cannot initialize {desc} twice on the same object"
+            ))));
         }
-        let m = o
-            .private_fields
-            .get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()));
-        m.insert(name_id, val);
+        self.heap
+            .get_mut(obj)
+            .private_elements
+            .get_or_insert_with(Default::default)
+            .push((name, val));
         Ok(())
+    }
+
+    /// `#name in obj` (ES §13.10.1 `PrivateInExpression`).
+    pub(crate) fn private_has(
+        &mut self,
+        obj_v: crate::JsValue,
+        name: Handle<JsObject>,
+    ) -> Result<bool, JSException> {
+        let Some(obj) = obj_v.as_object() else {
+            return Err(JSException(
+                self.type_error("right-hand side of 'in' should be an object"),
+            ));
+        };
+        Ok(self.private_element_index(obj, name).is_some())
     }
 
     /// Applies ES `ToString` from outside the machine — diagnostics and test

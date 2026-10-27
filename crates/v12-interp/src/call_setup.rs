@@ -1417,21 +1417,6 @@ impl Interp<'_> {
         // frame with `this` = instance.
         self.gc_protect();
         let instance = self.heap.alloc(JsObject::environment(0, Some(proto)));
-        // Clone private field template from constructor to instance for brand check
-        {
-            let brand = self.heap.get(callee_obj).private_brand;
-            let fields = self
-                .heap
-                .get(callee_obj)
-                .private_fields
-                .as_ref()
-                .map(|m| m.as_ref().clone());
-            let inst = self.heap.get_mut(instance);
-            inst.private_brand = brand;
-            if let Some(f) = fields {
-                inst.private_fields = Some(Box::new(f));
-            }
-        }
         let instance_v = JsValue::object(instance);
 
         let (callee_max_regs, callee_has_rest, callee_fixed, callee_rest_reg) = {

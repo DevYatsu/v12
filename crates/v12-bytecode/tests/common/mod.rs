@@ -142,29 +142,25 @@ pub fn random_wide_op(rng: &mut Rng) -> WideOp {
             depth: rng.next_u32() as u16,
             slots: rng.next_u32() as u16,
         },
-        10 => WideOp::GetPrivateW {
+        10 => WideOp::NewPrivateNameW {
             dst: rng.next_u32() as u16,
-            obj: rng.next_u32() as u16,
-            class_id: rng.next_u32(),
-            name_id: rng.next_u32(),
+            kind: rng.next_u32() as u16,
+            description: rng.next_u32(),
         },
-        11 => WideOp::SetPrivateW {
-            obj: rng.next_u32() as u16,
-            class_id: rng.next_u32(),
-            name_id: rng.next_u32(),
+        11 => WideOp::SetPrivateMethodW {
+            name: rng.next_u32() as u16,
             value: rng.next_u32() as u16,
+            slot: rng.next_u32() as u16,
         },
         12 => WideOp::DefinePrivateW {
             obj: rng.next_u32() as u16,
-            class_id: rng.next_u32(),
-            name_id: rng.next_u32(),
+            name: rng.next_u32() as u16,
             value: rng.next_u32() as u16,
         },
         13 => WideOp::HasPrivateW {
             dst: rng.next_u32() as u16,
             obj: rng.next_u32() as u16,
-            class_id: rng.next_u32(),
-            name_id: rng.next_u32(),
+            name: rng.next_u32() as u16,
         },
         14 => WideOp::ConstructW {
             dst: rng.next_u32() as u16,

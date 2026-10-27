@@ -124,6 +124,11 @@ impl Interp<'_> {
         obj_v: JsValue,
         key_v: JsValue,
     ) -> Result<JsValue, JSException> {
+        // `obj.#x`: a Private Name key never consults properties, prototypes
+        // or proxy traps (ES §13.3.2.1 → `PrivateGet`).
+        if let Some(name) = self.private_name_of(key_v) {
+            return self.private_get(obj_v, name);
+        }
         // Primitives have no wrappers yet: reads yield undefined, matching
         // real JS minus the built-ins that would populate the wrappers
         // (string primitives do get the regexp method surface). Null and
@@ -1590,6 +1595,9 @@ impl Interp<'_> {
         value: JsValue,
         strict: bool,
     ) -> Result<(), JSException> {
+        if let Some(name) = self.private_name_of(key_v) {
+            return self.private_set(obj_v, name, value);
+        }
         let Some(obj) = obj_v.as_object() else {
             if obj_v.is_null() || obj_v.is_undefined() {
                 return Err(JSException(

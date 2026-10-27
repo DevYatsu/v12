@@ -43,6 +43,17 @@ pub use opspec::{
 };
 pub use wide::WideOp;
 
+/// `kind` operand of [`WideOp::NewPrivateNameW`]: what a class element
+/// declared under a Private Name is (ES §6.2.10 `PrivateElement.[[Kind]]`).
+pub mod private_kind {
+    /// A private field: each object holds its own value.
+    pub const FIELD: u16 = 0;
+    /// A private method: one function shared by every instance.
+    pub const METHOD: u16 = 1;
+    /// A private accessor: a getter and/or setter shared by every instance.
+    pub const ACCESSOR: u16 = 2;
+}
+
 // ---------------------------------------------------------------------------
 // Stage 3: data structures
 // ---------------------------------------------------------------------------

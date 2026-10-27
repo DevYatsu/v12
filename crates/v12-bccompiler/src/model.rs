@@ -294,6 +294,12 @@ pub struct UnitPlan {
     /// The unit owns a heap Environment iff some local escapes into an inner
     /// function or an arrow-descendant reads `this`.
     pub has_env: bool,
+    /// Scoped environments (class scopes) that were live in the parent unit
+    /// when this unit's closure was created. They sit between this unit's
+    /// captured environment and the parent's own, so every walk from this
+    /// unit to an ancestor crosses them. Recorded by `compile_unit`, which
+    /// runs at the closure's creation point; 0 for most units.
+    pub creation_bias: u16,
     /// An arrow-descendant reads `this`, forcing an Environment to thread it.
     pub needs_this: bool,
     pub env_slots: HashMap<SymbolId, u16>,
@@ -381,6 +387,7 @@ impl UnitPlan {
             vars: HashMap::new(),
             decl_order: Vec::new(),
             has_env: false,
+            creation_bias: 0,
             needs_this: false,
             env_slots: HashMap::new(),
             this_slot: None,
@@ -503,9 +510,8 @@ impl Plans {
             if u == to_unit {
                 return Ok(depth);
             }
-            if self.units[u].has_env {
-                depth = depth.checked_add(1).ok_or_else(Self::env_depth_err)?;
-            }
+            let hops = u16::from(self.units[u].has_env) + self.units[u].creation_bias;
+            depth = depth.checked_add(hops).ok_or_else(Self::env_depth_err)?;
             cur = self.units[u].parent;
         }
         // Not on ancestor chain — return 0 to avoid panic; the access will be treated as global.
@@ -539,6 +545,9 @@ impl Plans {
             if !self.units[u].is_arrow && self.units[u].uses_super {
                 break;
             }
+            // Below the owner, a class scope live at this unit's creation
+            // (an arrow in a nested class's computed key) is one more hop.
+            depth = depth.saturating_add(self.units[u].creation_bias);
             cur = self.units[u].parent;
         }
         depth
@@ -600,6 +609,27 @@ pub struct Compiler<'s, 'i> {
     pub emit_eval_metadata: bool,
     pub is_eval_payload: bool,
     pub eval_var_target: v12_bytecode::EvalVarTarget,
+    /// The class bodies being compiled, innermost last: each resolves the
+    /// `#names` it declares (ES `PrivateEnvironment`, §9.2).
+    pub private_scopes: Vec<PrivateScope>,
+    /// `env_bias` of the unit currently being emitted, mirrored here so
+    /// `compile_unit` can record a nested unit's `creation_bias`.
+    pub live_env_bias: u16,
+}
+
+/// One class body's private names, as seen by the compiler.
+///
+/// The names live in the class-scope environment (slot
+/// `SLOT_FIRST_PRIVATE_NAME + index`), created fresh by each evaluation of the
+/// class, so a reference compiles to a `GetEnvSlot` from that environment.
+#[derive(Debug)]
+pub struct PrivateScope {
+    /// Declared `#names` (with the `#`), in slot order.
+    pub names: Vec<String>,
+    /// The unit whose code evaluates the class (and pushes its scope).
+    pub outer_unit: usize,
+    /// The outer unit's `env_bias` with the class scope pushed.
+    pub bias_level: u16,
 }
 
 impl<'s, 'i> Compiler<'s, 'i> {
@@ -1820,6 +1850,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     pub fn emit_scoped_env(&mut self, depth: u16, slots: u16, span: oxc_span::Span) {
         self.emit_new_env(depth, slots, span);
         self.env_bias = self.env_bias.saturating_add(1);
+        self.comp.live_env_bias = self.env_bias;
     }
 
     /// Retires the environment [`Self::emit_scoped_env`] pushed, so the unit is
@@ -1827,6 +1858,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
     /// this without a matching `emit_scoped_env` would underflow the bias.
     pub fn emit_pop_env(&mut self, span: oxc_span::Span) {
         self.env_bias = self.env_bias.saturating_sub(1);
+        self.comp.live_env_bias = self.env_bias;
         self.emit_spanned(Instr::new(Opcode::PopEnvironment, 0, 0, 0), span);
     }
 

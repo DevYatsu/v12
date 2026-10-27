@@ -1378,7 +1378,11 @@ impl<'s> Collector<'s> {
                         "SyntaxError: 'arguments' is not allowed in a class field initializer",
                     );
                 }
-                self.unit_stack.push(idx);
+                // Static initializers are emitted in the enclosing unit (the
+                // class environment is live there), so they are planned there
+                // too; otherwise closures created inside them record the
+                // constructor as their parent and over-count env depth.
+                self.unit_stack.push(if p.r#static { parent } else { idx });
                 self.super_allowed_stack.push(true);
                 self.super_call_allowed_stack.push(false);
                 self.expr(init);

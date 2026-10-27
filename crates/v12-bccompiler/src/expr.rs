@@ -219,21 +219,9 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
             }
             Expression::PrivateFieldExpression(p) => {
                 let obj = self.expr(&p.object)?;
+                let key = crate::class::load_private_name(self, &p.field.name, p.span)?;
                 let dst = self.new_temp();
-                let name_id = crate::model::str_id_of(
-                    self.comp
-                        .strings
-                        .get_or_intern(format!("#{}", p.field.name)),
-                );
-                // class_id 0 for minimal brand check
-                let words = v12_bytecode::WideOp::GetPrivateW {
-                    dst,
-                    obj,
-                    class_id: 0,
-                    name_id,
-                }
-                .encode();
-                self.emit_words(words, p.span);
+                self.emit_reg3(Opcode::GetProperty, dst, obj, key, p.span);
                 Ok(dst)
             }
             Expression::FunctionExpression(f) => {
@@ -470,18 +458,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok(dst)
             }
             Expression::PrivateInExpression(x) => {
+                let name = crate::class::load_private_name(self, &x.left.name, x.left.span)?;
                 let obj = self.expr(&x.right)?;
                 let dst = self.new_temp();
-                let name_id = crate::model::str_id_of(
-                    self.comp.strings.get_or_intern(format!("#{}", x.left.name)),
-                );
-                let words = v12_bytecode::WideOp::HasPrivateW {
-                    dst,
-                    obj,
-                    class_id: 0,
-                    name_id,
-                }
-                .encode();
+                let words = v12_bytecode::WideOp::HasPrivateW { dst, obj, name }.encode();
                 self.emit_words(words, x.span);
                 Ok(dst)
             }
@@ -1622,10 +1602,10 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                 Ok((obj, key))
             }
             MemberExpression::PrivateFieldExpression(p) => {
-                // private assign targets not yet fully spec-correct; fallback to GetPrivate semantics
+                // The key register holds the Private Name itself, which
+                // `GetProperty`/`SetProperty` route to `PrivateGet`/`PrivateSet`.
                 let obj = self.expr(&p.object)?;
-                let key = self.new_temp();
-                self.load_str(key, &format!("#{}", p.field.name), p.span)?;
+                let key = crate::class::load_private_name(self, &p.field.name, p.span)?;
                 Ok((obj, key))
             }
         }
@@ -1855,9 +1835,7 @@ impl<'c, 's, 'i, 'a> FnCtx<'c, 's, 'i, 'a> {
                             self.expr(&c.expression)?
                         }
                         MemberExpression::PrivateFieldExpression(p) => {
-                            let r = self.new_temp();
-                            self.load_str(r, &format!("#{}", p.field.name), p.span)?;
-                            r
+                            crate::class::load_private_name(self, &p.field.name, p.span)?
                         }
                     };
                     prev_recv = Some(cur);
