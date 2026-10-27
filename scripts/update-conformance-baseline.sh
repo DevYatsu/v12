@@ -45,12 +45,15 @@ trap 'rm -rf "$TMP"' EXIT
 echo "==> running test262 --filter ${FILTER} (this builds the 'runner' profile; ~15 min cold)"
 # --format tap,json is required together: `--format json --json-out F` alone
 # silently writes nothing (CONTEXT.md).
+# The runner exits non-zero whenever any test fails, which is the normal state
+# below 100 %; under `set -e` that aborted the script before it wrote anything.
+# A missing report is the real failure, and the check below catches it.
 ./conformance/run.sh \
   --filter "$FILTER" \
   --jobs 4 \
   --format tap,json \
   --json-out "$TMP/report.json" \
-  --tap-out "$TMP/report.tap"
+  --tap-out "$TMP/report.tap" || true
 
 if [ ! -s "$TMP/report.json" ]; then
   echo "update-conformance-baseline: FAIL — no JSON report produced" >&2
